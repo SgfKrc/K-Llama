@@ -52,6 +52,7 @@ CONTROL_CONTRACT_ERROR_CODES = frozenset(
         "control_certificate_leader_unknown",
         "control_certificate_signature_invalid",
         "control_certificate_duplicate_vote",
+        "control_certificate_watermark_invalid",
         "control_voter_unknown",
         "control_crypto_unavailable",
         "control_static_role_invalid",
@@ -60,6 +61,8 @@ CONTROL_CONTRACT_ERROR_CODES = frozenset(
 )
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _B64URL = re.compile(r"^[A-Za-z0-9_-]+$")
+#: journal checkpoint 摘要口径（与 `journal_replication.JournalCheckpoint.checkpoint_digest` 一致）。
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ControlContractError(ValueError):
@@ -258,6 +261,57 @@ class VoterSignature:
 
 
 @dataclass(frozen=True)
+class CommitWatermark:
+    """一条「已提交前缀」承诺：某 workflow 的 checkpoint 链上被多数耐久持有的那一点。
+
+    与 `journal_replication.JournalCheckpoint` 同口径：`last_sequence` 是该 workflow 事件
+    序列的最后一条序号，`checkpoint_digest` 是 checkpoint 的整体摘要。它由 leader 在证书里
+    **提议**，voter 只有在**自己耐久持有**该前缀时才签名（见
+    `cluster_quorum.QuorumVoter.sign_vote`）⇒ 多数签名即「多数一致前缀」。
+    """
+
+    workflow_id: str
+    last_sequence: int
+    checkpoint_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "workflow_id", _safe_id(self.workflow_id, field="workflow_id"))
+        object.__setattr__(
+            self,
+            "last_sequence",
+            _non_negative_int(self.last_sequence, field="last_sequence"),
+        )
+        digest = self.checkpoint_digest
+        if not isinstance(digest, str) or not _SHA256_HEX.match(digest):
+            raise ControlContractError(
+                "control_certificate_watermark_invalid",
+                "commit watermark digest must be a lowercase sha256 hex string",
+            )
+        object.__setattr__(self, "checkpoint_digest", digest)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workflow_id": self.workflow_id,
+            "last_sequence": self.last_sequence,
+            "checkpoint_digest": self.checkpoint_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CommitWatermark":
+        required = {"workflow_id", "last_sequence", "checkpoint_digest"}
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ControlContractError(
+                "control_certificate_watermark_invalid",
+                "commit watermark fields are not canonical",
+            )
+        return cls(
+            workflow_id=value["workflow_id"],
+            last_sequence=value["last_sequence"],
+            checkpoint_digest=value["checkpoint_digest"],
+        )
+
+
+@dataclass(frozen=True)
 class QuorumCertificate:
     """A quorum-certified writable lease for one cluster term."""
 
@@ -268,6 +322,8 @@ class QuorumCertificate:
     lease_id: str
     expires_at_ms: int
     signatures: tuple[VoterSignature, ...] | Sequence[VoterSignature]
+    #: leader 提议的「已提交前缀」集合；**空 = 不声明**（与引入本字段之前的行为一致）。
+    commit_watermark: tuple[CommitWatermark, ...] | Sequence[CommitWatermark] = ()
     schema_version: str = CONTROL_SCHEMA_VERSION
     document_type: str = CERTIFICATE_TYPE
 
@@ -296,10 +352,30 @@ class QuorumCertificate:
             "signatures",
             tuple(sorted(signatures, key=lambda signature: signature.voter_id)),
         )
+        watermarks = tuple(self.commit_watermark)
+        if any(not isinstance(item, CommitWatermark) for item in watermarks):
+            raise ControlContractError(
+                "control_certificate_watermark_invalid",
+                "certificate commit watermark is invalid",
+            )
+        if len({item.workflow_id for item in watermarks}) != len(watermarks):
+            raise ControlContractError(
+                "control_certificate_watermark_invalid",
+                "certificate commit watermark repeats a workflow_id",
+            )
+        object.__setattr__(
+            self,
+            "commit_watermark",
+            tuple(sorted(watermarks, key=lambda item: item.workflow_id)),
+        )
 
     def signing_payload(self) -> dict[str, Any]:
-        """Return the exact payload every voter signs; signatures are excluded."""
-        return {
+        """Return the exact payload every voter signs; signatures are excluded.
+
+        ``commit_watermark`` 只在**非空**时进入 payload ⇒ 空水位的证书与引入本字段之前
+        逐字节相同，既有证书与既有签名继续有效（向后兼容）。
+        """
+        payload: dict[str, Any] = {
             "schema_version": self.schema_version,
             "document_type": self.document_type,
             "cluster_id": self.cluster_id,
@@ -309,6 +385,9 @@ class QuorumCertificate:
             "lease_id": self.lease_id,
             "expires_at_ms": self.expires_at_ms,
         }
+        if self.commit_watermark:
+            payload["commit_watermark"] = [item.to_dict() for item in self.commit_watermark]
+        return payload
 
     def signing_bytes(self) -> bytes:
         return _canonical(self.signing_payload())
@@ -325,6 +404,7 @@ class QuorumCertificate:
             lease_id=self.lease_id,
             expires_at_ms=self.expires_at_ms,
             signatures=tuple(signatures),
+            commit_watermark=tuple(self.commit_watermark),
             schema_version=self.schema_version,
             document_type=self.document_type,
         )
@@ -341,10 +421,18 @@ class QuorumCertificate:
             "schema_version", "document_type", "cluster_id", "voter_set_epoch",
             "term", "leader_id", "lease_id", "expires_at_ms", "signatures",
         }
-        if not isinstance(value, Mapping) or set(value) != required:
+        # `commit_watermark` 是**可选键**：本字段引入之前签发的证书里没有它，仍必须可解析
+        # （否则升级即破坏旧证书）；其它未知键一律拒绝。
+        optional = {"commit_watermark"}
+        if not isinstance(value, Mapping) or set(value) - optional != required:
             raise ControlContractError("control_certificate_invalid", "certificate fields are not canonical")
         if not isinstance(value["signatures"], list):
             raise ControlContractError("control_certificate_invalid", "signatures must be a list")
+        watermarks = value.get("commit_watermark", [])
+        if not isinstance(watermarks, list):
+            raise ControlContractError(
+                "control_certificate_watermark_invalid", "commit watermark must be a list",
+            )
         return cls(
             cluster_id=value["cluster_id"],
             voter_set_epoch=value["voter_set_epoch"],
@@ -353,6 +441,7 @@ class QuorumCertificate:
             lease_id=value["lease_id"],
             expires_at_ms=value["expires_at_ms"],
             signatures=tuple(VoterSignature.from_dict(item) for item in value["signatures"]),
+            commit_watermark=tuple(CommitWatermark.from_dict(item) for item in watermarks),
             schema_version=value["schema_version"],
             document_type=value["document_type"],
         )

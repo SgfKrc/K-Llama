@@ -16,9 +16,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from cluster_control_contract import (
+    CommitWatermark,
     ControlContractError,
     QuorumCertificate,
     VoterSet,
@@ -44,6 +45,9 @@ QUORUM_ERROR_CODES = frozenset(
         "quorum_invalid_identity",
         "quorum_invalid_leader",
         "quorum_invalid_policy",
+        # ★ #93：voter 在签名前必须确认**自己耐久持有**证书里提议的已提交前缀。
+        "quorum_watermark_unheld",
+        "quorum_watermark_unavailable",
     }
 )
 
@@ -417,6 +421,7 @@ class QuorumVoter:
         private_key: Any,
         voter_set: VoterSet,
         ledger: SQLiteVoterLedger,
+        watermark_source: Callable[[str], "CommitWatermark | None"] | None = None,
     ) -> None:
         if (
             voter_id not in voter_set.voter_map
@@ -441,6 +446,9 @@ class QuorumVoter:
         self.private_key = private_key
         self.voter_set = voter_set
         self.ledger = ledger
+        #: #93：查询「本 voter **自己耐久持有**的某 workflow 已提交前缀」的钩子。缺失时，
+        #  只要证书里带了 `commit_watermark` 就必须拒签（fail-closed，不给错误的一致性承诺）。
+        self.watermark_source = watermark_source
 
     def reserve_term(self, leader_id: str, *, now_ms: int | None = None) -> int:
         if leader_id not in self.voter_set.voter_map:
@@ -452,9 +460,47 @@ class QuorumVoter:
             raise QuorumError("quorum_invalid_leader", "leader_id is not a voter")
         self.ledger.prepare(leader_id, term, now_ms=now_ms)
 
+    def _require_held_watermark(self, certificate: QuorumCertificate) -> None:
+        """#93：证书提议了「已提交前缀」时，voter 必须**自己耐久持有**它才允许签名。
+
+        持有判据（链摘要保证同 sequence 只有唯一合法点）：
+        - 本地已到**更高的** sequence ⇒ 前缀必然包含提议点 ⇒ 通过；
+        - 恰为同一 sequence ⇒ digest 必须一致（不一致即分叉 ⇒ 拒绝）；
+        - 落后、无记录、或压根没有耐久日志来源 ⇒ 拒签（fail-closed）。
+        """
+        watermarks = tuple(certificate.commit_watermark)
+        if not watermarks:
+            return
+        if self.watermark_source is None:
+            raise QuorumError(
+                "quorum_watermark_unavailable",
+                "certificate declares a commit watermark but this voter has no durable journal",
+            )
+        for watermark in watermarks:
+            held = self.watermark_source(watermark.workflow_id)
+            if held is None:
+                raise QuorumError(
+                    "quorum_watermark_unheld",
+                    "voter does not durably hold the declared committed prefix",
+                )
+            if held.last_sequence < watermark.last_sequence:
+                raise QuorumError(
+                    "quorum_watermark_unheld",
+                    "voter durable prefix is behind the declared commit watermark",
+                )
+            if (
+                held.last_sequence == watermark.last_sequence
+                and held.checkpoint_digest != watermark.checkpoint_digest
+            ):
+                raise QuorumError(
+                    "quorum_watermark_unheld",
+                    "voter durable prefix diverges from the declared commit watermark",
+                )
+
     def sign_vote(self, certificate: QuorumCertificate, *, now_ms: int | None = None) -> VoterSignature:
         if certificate.leader_id not in self.voter_set.voter_map:
             raise QuorumError("quorum_invalid_leader", "leader_id is not a voter")
+        self._require_held_watermark(certificate)
         return self.ledger.sign_vote(certificate, private_key=self.private_key, now_ms=now_ms)
 
     def commit_certificate(self, certificate: QuorumCertificate, *, now_ms: int | None = None) -> None:
@@ -498,6 +544,7 @@ class QuorumCollector:
         available_voter_ids: Sequence[str] | None = None,
         now_ms: int | None = None,
         lease_id: str | None = None,
+        commit_watermark: Sequence[CommitWatermark] = (),
     ) -> QuorumOutcome:
         now = _now_ms(now_ms)
         if leader_id not in self.voter_set.voter_map:
@@ -525,6 +572,9 @@ class QuorumCollector:
         if len(prepared) < self.voter_set.quorum_size:
             return QuorumOutcome(False, "quorum_unavailable", term=term, contacted_voters=available)
         selected_lease_id = lease_id or f"lease-{uuid.uuid4().hex}"
+        # #93：`commit_watermark` 由 leader **提议**（它认为已被多数耐久持有的前缀），
+        # voter 会在 `sign_vote` 里先校验自己是否真的耐久持有（否则拒签）⇒ 拿到多数签名
+        # 就等于「多数一致前缀」，无需再事后聚合。
         unsigned = QuorumCertificate(
             cluster_id=self.voter_set.cluster_id,
             voter_set_epoch=self.voter_set.voter_set_epoch,
@@ -533,16 +583,23 @@ class QuorumCollector:
             lease_id=selected_lease_id,
             expires_at_ms=now + self.policy.lease_duration_ms,
             signatures=tuple(),
+            commit_watermark=tuple(commit_watermark),
         )
         signatures: list[VoterSignature] = []
+        watermark_error = ""
         for voter_id in prepared:
             try:
                 signatures.append(self.voters[voter_id].sign_vote(unsigned, now_ms=now))
-            except QuorumError:
+            except QuorumError as exc:
+                # 区分「多数不可用」与「多数不持有被提议的已提交前缀」：后者必须让调用方
+                # 看得见（否则会误判成容量/网络问题而重试，掩盖一致性风险）。
+                code = str(getattr(exc, "code", ""))
+                if code.startswith("quorum_watermark"):
+                    watermark_error = code
                 continue
         if len(signatures) < self.voter_set.quorum_size:
             return QuorumOutcome(
-                False, "quorum_unavailable", term=term,
+                False, watermark_error or "quorum_unavailable", term=term,
                 contacted_voters=available,
                 signed_voters=tuple(sorted(signature.voter_id for signature in signatures)),
             )
@@ -590,6 +647,7 @@ class QuorumCollector:
                 continue
         if len(prepared) < self.voter_set.quorum_size:
             return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
+        # #93：续期必须**保留**已提交前缀承诺（否则一次续期就把提交证明丢掉了）。
         renewed_unsigned = QuorumCertificate(
             cluster_id=certificate.cluster_id,
             voter_set_epoch=certificate.voter_set_epoch,
@@ -598,15 +656,23 @@ class QuorumCollector:
             lease_id=certificate.lease_id,
             expires_at_ms=now + self.policy.lease_duration_ms,
             signatures=tuple(),
+            commit_watermark=tuple(certificate.commit_watermark),
         )
         signatures = []
+        watermark_error = ""
         for voter_id in prepared:
             try:
                 signatures.append(self.voters[voter_id].sign_vote(renewed_unsigned, now_ms=now))
-            except QuorumError:
+            except QuorumError as exc:
+                code = str(getattr(exc, "code", ""))
+                if code.startswith("quorum_watermark"):
+                    watermark_error = code
                 continue
         if len(signatures) < self.voter_set.quorum_size:
-            return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
+            return QuorumOutcome(
+                False, watermark_error or "quorum_unavailable",
+                term=certificate.term, contacted_voters=available,
+            )
         renewed = renewed_unsigned.with_signatures(signatures)
         validate_certificate(renewed, self.voter_set, now_ms=now)
         try:
