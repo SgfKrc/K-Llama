@@ -485,7 +485,43 @@ class LlamaCppEngine:
         if not resolved_path or not os.path.isfile(resolved_path):
             raise FileNotFoundError(f"GGUF 模型文件未找到: {resolved_path or '(未提供路径)'}")
         if layer_range is not None:
-            raise ValueError("GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明")
+            # ★ 2026-10-11（ROG+Y700+本机三机验收实测）：llama.cpp 的段由**裁层工件**
+            #   表达（`model_load_resolver.ENGINE_CAPABILITIES[LLAMA_CPP].layer_range_mode
+            #   == "precut_artifact"`）。但 Route A 的本地 commit 仍会带上本机段区间 ⇒
+            #   此前一律拒绝，表现为 `pipeline_local_commit_failed`，GGUF 主节点**无法**
+            #   参与层流水线。现在只在**与所加载工件 manifest 声明的区间一致**时接受
+            #   （即"加载的正是这一段工件"），其余情况保持 fail-closed（整模仍拒绝）。
+            try:
+                from relay_segment_info import read_artifact_manifest
+            except ImportError:  # 以包形式导入本模块时（src.llama_engine）
+                from .relay_segment_info import read_artifact_manifest
+
+            # 区间声明来源优先级：**先 `QLH_LAYER_GGUF`**（主节点以"整模 + 本地裁层
+            # 工件"表达自己的段，从而对外仍提供**整模身份** `model_sha256`，
+            # Android 侧据此匹配工件的 `source_model_sha256`），再退回所加载文件自身
+            # 的 manifest（"直接加载该段工件"的用法）。
+            declared: list[int] | None = None
+            _bases = []
+            _env_gguf = os.environ.get("QLH_LAYER_GGUF", "").strip()
+            if _env_gguf:
+                _bases.append(Path(_env_gguf))
+            _bases.append(Path(resolved_path))
+            for _base in _bases:
+                for manifest_path in (
+                    _base.with_suffix(".manifest.json"),
+                    Path(str(_base) + ".manifest.json"),
+                ):
+                    _info = read_artifact_manifest(manifest_path) or {}
+                    _span = _info.get("source_layer_range")
+                    if isinstance(_span, (list, tuple)) and len(_span) == 2:
+                        declared = [int(_span[0]), int(_span[1])]
+                        break
+                if declared is not None:
+                    break
+            if declared != [int(layer_range[0]), int(layer_range[1])]:
+                raise ValueError(
+                    "GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明"
+                )
         if self.is_loaded or self._mtmd_context is not None:
             self.unload()
         self._model_path = resolved_path
@@ -2133,9 +2169,19 @@ class LlamaCppEngine:
             # 不用 `layer_inp`：shim 把它限制为 `cut_layer < n_layer`
             # （scripts/model_tools/keep_head_shim/qlh_keep_head.c:111），取不到
             # `lid == n_layer`（= 末层输出）这个恰好需要的挂点。
+            # ★ 2026-10-11（三机验收实测）：默认 `n_batch=512` 下，qwen3.5（M-RoPE）
+            #   的 embd 批次按 `4 × n_tokens` 读 pos ⇒ `n_tokens_all > n_batch` ⇒
+            #   llama.cpp 的 `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` 触发、worker
+            #   在 init 后立刻退出（master 只见 `keep-head worker exited before response`）。
+            #   这正是上游 #28963 家族（M-RoPE + embd）在本机的复现。这里把批次上限
+            #   放大到能容纳 4× 放大，并保留 `QLH_KEEP_HEAD_N_BATCH` 旋钮。
             self._keep_head = KeepHeadUpstream(
                 shim, str(artifact), mode="nextn",
-                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096))
+                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096),
+                n_batch=max(
+                    512,
+                    int(os.environ.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
+                ))
         except Exception:  # noqa: BLE001 - 语义不兼容时由调用方 fail-closed
             logger.warning(
                 "keep-head 上游构造失败；层接力将 fail-closed，不交付 embeddings hidden "

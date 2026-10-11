@@ -52,9 +52,46 @@ async def get_current_model(request: Request = None):
 
     info = _api_module.model_manager.get_model_info()
     mem = _api_module.model_manager.get_memory_usage()
+    # ★ 2026-10-11（ROG+Y700+本机三机实测）：整模加载态此前**不返回** `descriptor`，
+    #   只有 `pipeline_prepared` 态才返回。后果：Android worker 的
+    #   `MainViewModel` 要求 `descriptor.model_sha256` 为 64-hex 才认定
+    #   `hasCoordinatorIdentity` ⇒ 恒为 false ⇒ 不扫描/不广告层段工件 ⇒ 容量求解器
+    #   看不到该节点（实测 `candidate_node_count=1`）⇒ Route A 无法 prepare，
+    #   而 prepare 又正是 descriptor 出现的条件 ⇒ 死锁。
+    #   这里补**完整**身份：优先复用**公开流水线描述符**（`public_pipeline_descriptor`，
+    #   白名单含 `total_layers` / `hidden_size` / `tokenizer_sha256` / `model_sha256`）——
+    #   前三项正是 `model_preflight.descriptor_missing` 的判据，缺一即
+    #   `model_preflight_descriptor_incomplete`（实测三机接力就卡在这一层）。
+    #   拿不到描述符时退回 `_active_task_graph_model_identity()`（pytorch 整模走
+    #   `compute_model_sha256`，带 `model.sha256` + 指纹缓存）。投影失败只降级，
+    #   **不让端点 500**（替身 manager 缺属性时仍返回原结构）。
+    descriptor = {}
+    get_pipeline_descriptor = getattr(
+        _api_module.model_manager, "get_pipeline_descriptor", None
+    )
+    if callable(get_pipeline_descriptor):
+        try:
+            from pipeline_model_descriptor import public_pipeline_descriptor
+
+            descriptor = public_pipeline_descriptor(get_pipeline_descriptor() or {})
+        except Exception:
+            _api_module.logger.warning("整模流水线描述符投影失败", exc_info=True)
+            descriptor = {}
+    try:
+        identity = _api_module._active_task_graph_model_identity()
+    except Exception:
+        _api_module.logger.warning("整模身份投影失败", exc_info=True)
+        identity = None
+    if identity is not None:
+        descriptor = {
+            **descriptor,
+            "model_id": descriptor.get("model_id") or identity.model_id,
+            "model_sha256": descriptor.get("model_sha256") or identity.sha256,
+        }
     return {
         "loaded": True,
         "model_id": _api_module.model_manager.active_model_id,
+        "descriptor": descriptor,
         "quant_type": _api_module.model_host.current_quant,
         # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴，见
         #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。按活跃模型 id 兜底。
