@@ -361,10 +361,17 @@ async def prepare_pipeline_model(req: PreparePipelineModelRequest):
     This endpoint deliberately does not set ``model_loaded`` and does not
     instantiate a Transformers model. The first local weight materialization
     happens only when the scheduler's master assignment is executed.
+
+    ★ 2026-10-11：引擎改为 **auto** —— 此前硬编码 pytorch，导致 GGUF 裁层工件
+    （`llama_engine.LlamaCppEngine.prepare_pipeline_model`，契约同样是
+    "without constructing llama.cpp"）无法只声明层元数据 ⇒ GGUF 主节点的
+    `total_layers` 只能靠加载模型获得 ⇒ 与远端区间冲突。改由
+    `_resolve_model_load_plan` 按落盘格式选引擎：目录模型走 pytorch 动态层段，
+    GGUF 工件走 llama.cpp 只声明元数据。
     """
     resolution = _api_module._resolve_model_load_plan(
         req.model_id,
-        "pytorch",
+        "auto",
         req.quant_type,
         operation=_api_module.OP_DYNAMIC_LAYER_RANGE,
     )

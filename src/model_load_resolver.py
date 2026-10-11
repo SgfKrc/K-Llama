@@ -174,7 +174,26 @@ def _select_engine(
         )
 
     if operation == OP_DYNAMIC_LAYER_RANGE:
-        if not facts.has_safetensors or not facts.safetensors_path:
+        # ★ 2026-10-11（三机实测 / total_layers 缺口）：**仅有 GGUF 裁层工件**时，
+        #   允许走 llama.cpp 分支 —— `llama_engine.LlamaCppEngine.prepare_pipeline_model`
+        #   的契约原文就是 Prepare GGUF pipeline metadata without constructing llama.cpp，
+        #   段区间由工件 manifest 的 `source_layer_range` 声明。
+        #   此前这里一律要求 Safetensors，后果是 GGUF 主节点**无法只声明** descriptor ⇒
+        #   master 的 `total_layers` 只能靠**加载**模型获得，而加载的是裁层工件 ⇒
+        #   视图被钉成该段层数 ⇒ 远端区间恒被拒
+        #   （实测 node[android-8e8240bf].layer_ranges[0] exceeds total_layers=16）。
+        #   ⚠️ 既有契约**不变**：双格式或显式要求 precut engine 时仍按原样判决
+        #   （`LAYER_RANGE_MODE_MISMATCH` / 优先 pytorch），见
+        #   tests/test_model_load_resolver.py 的 test_dynamic_layer_range_rejects_explicit_precut_engine。
+        has_gguf = bool(facts.has_gguf and facts.gguf_path)
+        has_safetensors = bool(facts.has_safetensors and facts.safetensors_path)
+        if not has_safetensors and has_gguf:
+            return (
+                BackendId.LLAMA_CPP,
+                "DYNAMIC_LAYER_RANGE_REQUIRES_LLAMA_CPP",
+                "仅落了 GGUF 裁层工件：用 llama.cpp 只声明层元数据（不物化权重）。",
+            )
+        if not has_safetensors or not facts.safetensors_path:
             raise ModelLoadResolutionError(
                 "DYNAMIC_LAYER_ARTIFACT_UNAVAILABLE",
                 "动态层段物化需要已落盘的 Safetensors 模型目录。",
