@@ -472,6 +472,35 @@ def _pane_text(widget) -> str:
     return ""
 
 
+def test_status_table_renders_model_and_pipeline_independently():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = _StubApi()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.4)
+            screen = app.screen
+            for loaded, prepared in ((False, False), (False, True), (True, False), (True, True)):
+                screen.fill_status(
+                    {"status": "ok"},
+                    {
+                        "model_loaded": loaded,
+                        "pipeline_prepared": prepared,
+                        "model_name": "Qwen",
+                        "active_model_id": "qwen" if loaded else None,
+                    },
+                    {},
+                    {},
+                )
+                rows = {name: value for name, value in _rows(screen, "#status-table")}
+                assert rows["模型"] == f"Qwen（{'已加载' if loaded else '未加载'}）"
+                assert rows["流水线"] == ("已准备" if prepared else "未准备")
+
+    _run(_main())
+
+
 def test_model_loading_summary_is_consistent_with_table():
     """★ 2026-10-09（#73-②，用户截图实证）：加载期间**摘要 pane** 必须与 `model_text` 同源。
 

@@ -1528,7 +1528,8 @@ def test_current_model_when_loaded(monkeypatch):
     assert result["model_name"] == "Qwen-1.8B-Chat"
 
 
-def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch):
+@pytest.mark.parametrize("host_loaded", [False, True])
+def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch, host_loaded):
     class PartialManager:
         active_model_id = "tiny-qwen2"
         _engine_type = "pytorch"
@@ -1548,7 +1549,7 @@ def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch):
             }
 
     monkeypatch.setattr(api_server, "model_manager", PartialManager())
-    monkeypatch.setattr(model_host, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", host_loaded)
     monkeypatch.setattr(model_host, "current_quant", "fp32")
 
     result = asyncio.run(api_server.get_current_model())
