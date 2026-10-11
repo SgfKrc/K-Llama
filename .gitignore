@@ -262,6 +262,10 @@ scripts/*
 # PC 层段 worker 启动器（替代已过时的 build/perf/rog-start-worker.ps1：
 # 旧脚本硬编码过期密钥 + 走 PyTorch peer 路径 ⇒ 进不了 Route A 候选）
 !scripts/start_pc_layer_worker.ps1
+# #93 部署缺口：journal replica 接收端的正式启动器 + 换版同步检查单
+!scripts/start_journal_replica_receiver.py
+!scripts/start_journal_replica_receiver.ps1
+!scripts/verify_journal_replication_sync.ps1
 
 # 根目录：过时日志 / 备份（2026-09-20 剔除）
 # `bjtu.bat` / `bjtu.sh` 保留：它们是活跃入口 —— `tests/test_qlh_cli.py` 与
