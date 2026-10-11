@@ -161,6 +161,31 @@ def _normalize_layer_artifacts(
             "artifact_sha256": artifact_sha256,
             "source_model_sha256": source_sha256,
         }
+        # ★ 2026-10-11（方案 A）：worker 申报的**本段局部**逐层字节。主节点据此按
+        #   `layer_range` 平移到源模型坐标系，补齐自己那份 descriptor 的缺口
+        #   （接力不加载整模 ⇒ 主节点只有本段字节，而求解器要求每层正字节）。
+        #   长度必须等于本段跨度；任一层非正即拒绝（不让残缺容量账进入求解器）。
+        segment_bytes = item.get("layer_weight_bytes")
+        if segment_bytes is not None:
+            if not isinstance(segment_bytes, list) or not segment_bytes:
+                raise PipelineCapacityError(
+                    f"{item_field}.layer_weight_bytes must be a non-empty list"
+                )
+            if len(segment_bytes) != layer_range[1] - layer_range[0]:
+                raise PipelineCapacityError(
+                    f"{item_field}.layer_weight_bytes length must equal the segment span"
+                )
+            sizes = [
+                _non_negative_int(
+                    value, f"{item_field}.layer_weight_bytes[{offset}]",
+                )
+                for offset, value in enumerate(segment_bytes)
+            ]
+            if any(size <= 0 for size in sizes):
+                raise PipelineCapacityError(
+                    f"{item_field}.layer_weight_bytes must be all positive"
+                )
+            normalized_item["layer_weight_bytes"] = sizes
         if present_contract_fields:
             source_model_id = str(item.get("source_model_id", "") or "").strip()
             tokenizer_sha256 = str(
