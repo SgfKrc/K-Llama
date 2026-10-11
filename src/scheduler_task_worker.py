@@ -1509,6 +1509,12 @@ class SchedulerTaskWorkerMixin:
                 elif message.message_type in {
                     "stage_accept", "stage_result", "stage_error",
                     "stage_cancelled",
+                    # ★ 2026-10-11（ROG+Y700+本机三机实测）：**回程分片**。
+                    #   此前这一层方向白名单没有它 ⇒ 分片被逐条以
+                    #   `invalid_message_direction` 拒掉（真机日志：7 条 rejected），
+                    #   随后的 `stage_result` 于是装配不齐（`incomplete_chunks`），
+                    #   主节点侧只能看到 60 s `remote Stage response timed out`。
+                    "stage_result_chunk",
                 }:
                     provider = self._remote_task_worker_providers.get(client_id)
                     if provider is None:
