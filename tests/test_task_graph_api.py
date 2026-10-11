@@ -1610,6 +1610,22 @@ def test_workflow_api_fences_unknown_valid_id_and_rejects_invalid_id(task_graph_
     assert cancel_error.value.status_code == 400
 
 
+def test_auto_role_refuses_unreplicated_task_graph_writes(task_graph_api, monkeypatch):
+    monkeypatch.setattr(api_server, "NODE_ROLE", "auto")
+    listed = asyncio.run(api_server.list_workflows())
+    assert listed["local_available"] is False
+    request = api_server.ChatRequest(message="unreplicated", use_task_graph=True)
+    with pytest.raises(HTTPException) as rejected:
+        api_server._execute_task_graph_chat(request)
+    assert rejected.value.status_code == 503
+    with pytest.raises(HTTPException) as cancelled:
+        asyncio.run(api_server.cancel_workflow("wf_pending_auto"))
+    assert cancelled.value.status_code == 503
+    with pytest.raises(HTTPException) as cleaned:
+        asyncio.run(api_server.cleanup_task_journal())
+    assert cleaned.value.status_code == 503
+
+
 def test_chat_threadpool_allows_concurrent_workflow_cancellation(
     task_graph_api, monkeypatch,
 ):

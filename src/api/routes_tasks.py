@@ -62,6 +62,7 @@ async def list_workflows(limit: int = 20, session_id: str = "", summary: bool = 
     local_available = bool(
         _api_module.TASK_GRAPH_ENABLED
         and role == "master"
+        and _api_module.NODE_ROLE != "auto"
         and bool(journal.get("available", False))
         and not provider_error
     )
@@ -102,6 +103,8 @@ async def cleanup_task_journal(
 ):
     if _api_module.scheduler._effective_role() != "master":
         raise _api_module.HTTPException(403, "只有主节点可以清理任务图 journal。")
+    if _api_module.NODE_ROLE == "auto":
+        raise _api_module.HTTPException(503, "自动选主尚无 journal 多数提交水位，禁止清理。")
     if not _api_module.TASK_GRAPH_ENABLED:
         raise _api_module.HTTPException(409, "任务链实验未启用。")
     age_days = (
@@ -183,6 +186,10 @@ async def get_workflow(workflow_id: str):
         raise _api_module.HTTPException(503, str(exc)) from exc
 
 async def cancel_workflow(workflow_id: str):
+    if _api_module.scheduler._effective_role() != "master":
+        raise _api_module.HTTPException(403, "只有主节点可以取消工作流。")
+    if _api_module.NODE_ROLE == "auto":
+        raise _api_module.HTTPException(503, "自动选主尚无 journal 多数提交水位，禁止修改工作流。")
     try:
         workflow = _api_module.task_graph_coordinator.request_cancel(workflow_id)
     except _api_module.TaskGraphUnavailable as exc:

@@ -1307,6 +1307,8 @@ class Scheduler(
                 decision.get("accepted"), decision.get("state"),
                 decision.get("runtime_role"), decision.get("reason"),
             )
+            if runtime is not None:
+                runtime.start_lease_renewal(self._auto_role_controller)
 
         self.init_nodes()
         if self._effective_role() == "master":
@@ -1524,6 +1526,9 @@ class Scheduler(
         """停止调度器"""
         self._startup_cancel_event.set()
         self._running = False
+        runtime = getattr(self, "_auto_role_runtime", None)
+        if runtime is not None:
+            runtime.stop_lease_renewal()
         controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             try:
@@ -1614,16 +1619,14 @@ class Scheduler(
         config.NODE_ROLE。
         """
         configured_role = NODE_ROLE
+        controller = getattr(self, "_auto_role_controller", None)
+        if configured_role == "auto":
+            return controller.runtime_role if controller is not None else "client"
         override = getattr(self, '_role_override', None)
         if override:
             return override
-        controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             return controller.runtime_role
-        if configured_role == "auto":
-            # Before the composition root has attached the controller, auto
-            # mode has no authority and must present as a read-only client.
-            return "client"
         return configured_role
 
     # ================================================================

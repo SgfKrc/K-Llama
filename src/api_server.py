@@ -3109,6 +3109,10 @@ def _execute_task_graph_chat(
         )
     if scheduler._effective_role() != "master":
         raise HTTPException(409, "任务链协调器当前只允许在主节点运行。")
+    if NODE_ROLE == "auto":
+        raise coded_http_error(
+            503, "ha_commit_unavailable", "自动选主尚无 journal 多数提交水位，拒绝任务链写入。",
+        )
 
     if not _task_graph_execution_slot.acquire(blocking=False):
         raise HTTPException(429, "已有任务链正在执行，请稍后重试。")

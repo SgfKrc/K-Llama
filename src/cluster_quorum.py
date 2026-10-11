@@ -579,11 +579,16 @@ class QuorumCollector:
             validate_certificate(certificate, self.voter_set, now_ms=now)
         except (ControlContractError, TypeError, ValueError):
             return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
-        signer_ids = tuple(sorted(
-            signature.voter_id for signature in certificate.signatures
-            if signature.voter_id in available
-        ))
-        if len(signer_ids) < self.voter_set.quorum_size:
+        if now + self.policy.lease_duration_ms <= certificate.expires_at_ms:
+            return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
+        prepared = []
+        for voter_id in available:
+            try:
+                self.voters[voter_id].prepare(certificate.leader_id, certificate.term, now_ms=now)
+                prepared.append(voter_id)
+            except QuorumError:
+                continue
+        if len(prepared) < self.voter_set.quorum_size:
             return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
         renewed_unsigned = QuorumCertificate(
             cluster_id=certificate.cluster_id,
@@ -595,7 +600,7 @@ class QuorumCollector:
             signatures=tuple(),
         )
         signatures = []
-        for voter_id in signer_ids:
+        for voter_id in prepared:
             try:
                 signatures.append(self.voters[voter_id].sign_vote(renewed_unsigned, now_ms=now))
             except QuorumError:

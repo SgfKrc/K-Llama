@@ -218,6 +218,34 @@ def test_authority_does_not_auto_activate_or_accept_same_term_conflict():
     assert conflict.value.code == "control_certificate_conflict"
 
 
+def test_same_term_renewal_only_extends_identical_lease_and_revocation_is_final():
+    keys, voter_set, _, original = _fixture()
+    authority = ControlPlaneAuthority(cluster_id="cluster-test", voter_set=voter_set)
+    authority.install_certificate(original, now_ms=1_000)
+    extension = QuorumCertificate(
+        cluster_id="cluster-test", voter_set_epoch=4, term=7,
+        leader_id="node-0", lease_id="lease-7", expires_at_ms=3_000,
+        signatures=tuple(),
+    )
+    renewed = extension.with_signatures(tuple(
+        sign_certificate(extension, voter_id=f"node-{index}", private_key=keys[index][0])
+        for index in (0, 2)
+    ))
+    authority.install_certificate(renewed, now_ms=1_001)
+    assert authority.current_certificate() == renewed
+    with pytest.raises(ControlContractError) as old:
+        authority.admit_control_write(original, now_ms=1_002)
+    assert old.value.code == "control_certificate_not_current"
+    with pytest.raises(ControlContractError) as regression:
+        authority.install_certificate(original, now_ms=1_002)
+    assert regression.value.code == "control_certificate_conflict"
+    assert authority.revoke_certificate(original) is False
+    assert authority.revoke_certificate(renewed) is True
+    with pytest.raises(ControlContractError) as replay:
+        authority.install_certificate(renewed, now_ms=1_003)
+    assert replay.value.code == "control_certificate_stale"
+
+
 def test_certificate_mapping_rejects_noncanonical_fields():
     _, _, _, certificate = _fixture()
     payload = certificate.to_dict()

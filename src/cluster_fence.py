@@ -122,11 +122,31 @@ class ControlFence:
         self.authority = authority
         self.required = bool(required)
         self.audit_sink = audit_sink
+        self.role_guard: Callable[[], bool] | None = None
+
+    def set_role_guard(self, guard: Callable[[], bool] | None) -> None:
+        if guard is not None and not callable(guard):
+            raise TypeError("role guard must be callable")
+        self.role_guard = guard
+
+    def _require_local_role(self, action: str, source: str) -> None:
+        if self.role_guard is None or source == "auto_role":
+            return
+        if not self.role_guard():
+            error = ControlFenceError(
+                "control_certificate_not_current",
+                "local node has no current leader authority",
+                action=action,
+            )
+            self._audit(action, source, "", error=error)
+            raise error
 
     @classmethod
     def from_environment(cls) -> "ControlFence":
         """Build only from explicit configuration; never invent voter keys."""
-        required = _env_bool("QLH_CONTROL_FENCE_REQUIRED", False)
+        required = _env_bool("QLH_CONTROL_FENCE_REQUIRED", False) or (
+            os.environ.get("QLH_NODE_ROLE", "").strip().lower() == "auto"
+        )
         raw_voters = os.environ.get("QLH_CONTROL_VOTER_SET", "").strip()
         authority = None
         if raw_voters:
@@ -193,6 +213,7 @@ class ControlFence:
     ) -> ControlWritePermit | None:
         if not self.required:
             return None
+        self._require_local_role(action, source)
         if self.authority is None:
             error = ControlFenceError(
                 "control_fence_unavailable",
@@ -222,6 +243,20 @@ class ControlFence:
             )
             self._audit(action, "scheduler", "", error=error)
             raise error
+        self._require_local_role(action, "scheduler")
+        certificate = self.authority.current_certificate() if self.authority else None
+        try:
+            if certificate is None or certificate.digest() != permit.certificate_digest:
+                raise ControlFenceError(
+                    "control_certificate_not_current",
+                    "control write permit is no longer current",
+                    action=action,
+                )
+            self.authority.admit_control_write(certificate)
+        except ControlContractError as exc:
+            error = ControlFenceError(exc.code, str(exc), action=action)
+            self._audit(action, "scheduler", "", error=error)
+            raise error from exc
         return permit
 
     def current_permit(self) -> ControlWritePermit | None:

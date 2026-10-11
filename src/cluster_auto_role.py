@@ -103,6 +103,7 @@ class AutoRoleController:
         self._certificate: QuorumCertificate | None = None
         self._last_outcome: QuorumOutcome | None = None
         self._reconnect_requires_new_quorum = False
+        self._generation = 0
 
     @property
     def state(self) -> str:
@@ -111,6 +112,8 @@ class AutoRoleController:
 
     @property
     def runtime_role(self) -> str:
+        if self.mode == "auto" and self.state == "leader":
+            self.can_write()
         with self._lock:
             return "master" if self._state == "leader" else "client"
 
@@ -131,6 +134,8 @@ class AutoRoleController:
             return self._transition("leader", "static_master", accepted=True)
         if self.mode == "client":
             return self._transition("follower", "static_client", accepted=True)
+        if self.state == "stopped":
+            self._transition("starting", "startup_pending", accepted=False)
         if available_voter_ids is None:
             return self._transition("read_only", "quorum_unavailable", accepted=False)
         return self.attempt_takeover(available_voter_ids=available_voter_ids, now_ms=now_ms)
@@ -146,9 +151,15 @@ class AutoRoleController:
 
         if self.mode != "auto":
             return self._transition("read_only", "auto_mode_disabled", accepted=False)
+        if self.state == "stopped":
+            return self._transition("stopped", "stopped", accepted=False)
         collector = self.collector
         if collector is None:
             return self._transition("read_only", "quorum_unavailable", accepted=False)
+        with self._lock:
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
+            generation = self._generation
         try:
             outcome = collector.acquire(
                 self.node_id,
@@ -157,12 +168,44 @@ class AutoRoleController:
                 lease_id=lease_id,
             )
         except (ControlContractError, ValueError, RuntimeError) as exc:
-            return self._transition("read_only", "quorum_unavailable", accepted=False, outcome=None)
+            with self._lock:
+                if generation != self._generation:
+                    return self._transition(self._state, "role_changed", accepted=False)
+                return self._transition("read_only", "quorum_unavailable", accepted=False)
         with self._lock:
+            if generation != self._generation:
+                return self._transition(self._state, "role_changed", accepted=False)
             self._last_outcome = outcome
-        if not outcome.accepted or outcome.certificate is None:
-            return self._transition("read_only", outcome.reason, accepted=False, outcome=outcome)
-        return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+            if not outcome.accepted or outcome.certificate is None:
+                return self._transition("read_only", outcome.reason, accepted=False, outcome=outcome)
+            return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+
+    def renew_lease(
+        self,
+        *,
+        available_voter_ids: Sequence[str],
+        now_ms: int | None = None,
+    ) -> AutoRoleDecision:
+        """Renew only the currently installed lease, fencing on quorum loss."""
+        with self._lock:
+            certificate = self._certificate
+            generation = self._generation
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
+            if self._state != "leader" or certificate is None or self.collector is None:
+                return self._transition("read_only", "quorum_unavailable", accepted=False)
+        try:
+            outcome = self.collector.renew(
+                certificate, available_voter_ids=tuple(available_voter_ids), now_ms=now_ms,
+            )
+        except (ControlContractError, ValueError, RuntimeError):
+            outcome = None
+        with self._lock:
+            if self._generation != generation or self._certificate is not certificate:
+                return self._transition(self._state, "role_changed", accepted=False)
+            if outcome is None or not outcome.accepted or outcome.certificate is None:
+                return self.on_quorum_loss(outcome.reason if outcome is not None else "quorum_unavailable")
+            return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
 
     def consume_certificate(
         self,
@@ -173,36 +216,36 @@ class AutoRoleController:
     ) -> AutoRoleDecision:
         """Install and consume a quorum certificate, demoting on any failure."""
 
-        try:
-            if self.fence is not None:
-                self.fence.install_certificate(certificate, now_ms=now_ms)
-                current = self.fence.authority.current_certificate() if self.fence.authority else None
-            elif self.authority is not None:
-                self.authority.install_certificate(certificate, now_ms=now_ms)
-                current = self.authority.current_certificate()
-            else:
-                raise AutoRoleError("authority_unavailable", "auto role has no control authority")
-            if current is None:
-                raise AutoRoleError("certificate_missing", "certificate was not installed")
-            if outcome is not None:
-                with self._lock:
-                    self._last_outcome = outcome
-        except (AutoRoleError, ControlContractError, TypeError, ValueError) as exc:
-            reason = getattr(exc, "code", "control_certificate_invalid")
-            with self._lock:
-                self._certificate = None
-            return self._transition("read_only", str(reason), accepted=False)
-
         with self._lock:
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
+            try:
+                if self.fence is not None:
+                    self.fence.install_certificate(certificate, now_ms=now_ms)
+                    current = self.fence.authority.current_certificate() if self.fence.authority else None
+                elif self.authority is not None:
+                    self.authority.install_certificate(certificate, now_ms=now_ms)
+                    current = self.authority.current_certificate()
+                else:
+                    raise AutoRoleError("authority_unavailable", "auto role has no control authority")
+                if current is None:
+                    raise AutoRoleError("certificate_missing", "certificate was not installed")
+            except (AutoRoleError, ControlContractError, TypeError, ValueError) as exc:
+                reason = getattr(exc, "code", "control_certificate_invalid")
+                return self._transition("read_only", str(reason), accepted=False)
+            if outcome is not None:
+                self._last_outcome = outcome
             self._certificate = current
             self._reconnect_requires_new_quorum = False
-        if current.leader_id == self.node_id:
-            return self._transition("leader", "quorum_certificate_accepted", accepted=True)
-        return self._transition("follower", "valid_certificate_other_leader", accepted=True)
+            if current.leader_id == self.node_id:
+                return self._transition("leader", "quorum_certificate_accepted", accepted=True)
+            return self._transition("follower", "valid_certificate_other_leader", accepted=True)
 
     def on_quorum_loss(self, reason: str = "quorum_unavailable") -> AutoRoleDecision:
         """Drop write authority immediately when voter reachability is lost."""
         with self._lock:
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
             self._reconnect_requires_new_quorum = True
         return self._transition("read_only", str(reason or "quorum_unavailable"), accepted=False)
 
@@ -244,23 +287,24 @@ class AutoRoleController:
         with self._lock:
             state = self._state
             certificate = self._certificate
-        if self.mode == "master" and self.fence is None:
-            return state == "leader"
-        if state != "leader" or certificate is None:
-            return False
-        try:
-            if self.fence is not None:
-                self.fence.admit(certificate, action="auto_role.write", source="auto_role", now_ms=now_ms)
-            elif self.authority is not None:
-                self.authority.admit_control_write(certificate, now_ms=now_ms)
-            else:
+            if self.mode == "master" and self.fence is None:
+                return state == "leader"
+            if state != "leader" or certificate is None:
                 return False
-            return True
-        except (ControlContractError, ValueError, TypeError):
-            self.on_quorum_loss("control_certificate_not_current")
-            return False
+            try:
+                if self.fence is not None:
+                    self.fence.admit(certificate, action="auto_role.write", source="auto_role", now_ms=now_ms)
+                elif self.authority is not None:
+                    self.authority.admit_control_write(certificate, now_ms=now_ms)
+                else:
+                    return False
+                return True
+            except (ControlContractError, ValueError, TypeError):
+                self.on_quorum_loss("control_certificate_not_current")
+                return False
 
     def snapshot(self, *, now_ms: int | None = None) -> dict[str, Any]:
+        writable = self.can_write(now_ms=now_ms)
         with self._lock:
             certificate = self._certificate
             outcome = self._last_outcome
@@ -273,7 +317,7 @@ class AutoRoleController:
             "node_id": self.node_id,
             "state": state,
             "runtime_role": "master" if state == "leader" else "client",
-            "writable": self.can_write(now_ms=now_ms),
+            "writable": writable,
             "reason": reason,
             "certificate": certificate_view,
             "last_outcome": outcome.to_dict() if outcome is not None else None,
@@ -290,6 +334,14 @@ class AutoRoleController:
         if state not in AUTO_ROLE_STATES:
             raise AutoRoleError("state_invalid", "unsupported auto role state")
         with self._lock:
+            if (
+                state in {"read_only", "stopped"}
+                and self.mode == "auto"
+                and self.authority is not None
+                and self._certificate is not None
+            ):
+                self.authority.revoke_certificate(self._certificate)
+            self._generation += 1
             self._state = state
             self._reason = str(reason)
             if outcome is not None:

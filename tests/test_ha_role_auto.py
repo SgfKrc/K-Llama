@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -176,6 +177,7 @@ def test_scheduler_can_attach_controller_without_enabling_global_auto_mode(tmp_p
     from scheduler import Scheduler
 
     voter_set, collector, authority, fence = _fixture(tmp_path)
+    collector.policy = QuorumPolicy(lease_duration_ms=10_000)
     controller = AutoRoleController(
         "voter-0", authority=authority, collector=collector, fence=fence
     )
@@ -185,15 +187,97 @@ def test_scheduler_can_attach_controller_without_enabling_global_auto_mode(tmp_p
     scheduler.set_auto_role_controller(controller)
 
     assert scheduler._effective_role() == "client"
+    now_ms = int(time.time() * 1000)
     started = scheduler.start_auto_role(
-        available_voter_ids=tuple(voter_set.voter_map), now_ms=1_000
+        available_voter_ids=tuple(voter_set.voter_map), now_ms=now_ms
     )
     assert started["accepted"] is True
     assert scheduler._effective_role() == "master"
-    assert scheduler.get_auto_role_snapshot(now_ms=1_001)["enabled"] is True
+    assert scheduler.get_auto_role_snapshot(now_ms=now_ms + 1)["enabled"] is True
     assert scheduler.auto_role_on_disconnect()["state"] == "read_only"
     assert scheduler.auto_role_on_reconnect(
-        certificate=controller.certificate, now_ms=1_001
+        certificate=controller.certificate, now_ms=now_ms + 1
     )["reason"] == "quorum_unavailable"
     scheduler.set_auto_role_controller(None)
     assert scheduler.get_auto_role_snapshot()["enabled"] is False
+
+
+def test_renewal_updates_authority_and_losing_quorum_revokes_old_permits(tmp_path: Path):
+    voter_set, collector, authority, fence = _fixture(tmp_path)
+    controller = AutoRoleController("voter-0", authority=authority, collector=collector, fence=fence)
+    assert controller.start(available_voter_ids=tuple(voter_set.voter_map), now_ms=1_000).accepted
+    first = controller.certificate
+
+    renewed = controller.renew_lease(available_voter_ids=("voter-0", "voter-1"), now_ms=1_050)
+    assert renewed.accepted and renewed.term == first.term
+    assert controller.certificate.expires_at_ms == 1_150
+    assert authority.current_certificate() == controller.certificate
+    assert controller.can_write(now_ms=1_101)
+    with pytest.raises(Exception) as stale:
+        fence.admit(first, action="test.old", now_ms=1_051)
+    assert stale.value.code == "control_certificate_not_current"
+
+    lost = controller.renew_lease(available_voter_ids=("voter-0",), now_ms=1_110)
+    assert lost.state == "read_only"
+    assert controller.can_write(now_ms=1_111) is False
+    assert authority.current_certificate() is None
+    with pytest.raises(Exception) as revoked:
+        fence.admit(controller.certificate, action="test.revoked", now_ms=1_111)
+    assert revoked.value.code == "control_certificate_not_current"
+
+
+def test_stopping_auto_role_fences_unexpired_certificate(tmp_path: Path):
+    voter_set, collector, authority, fence = _fixture(tmp_path)
+    controller = AutoRoleController("voter-0", authority=authority, collector=collector, fence=fence)
+    assert controller.start(available_voter_ids=tuple(voter_set.voter_map), now_ms=1_000).accepted
+    certificate = controller.certificate
+    assert controller.stop().state == "stopped"
+    assert controller.on_quorum_loss().state == "stopped"
+    assert controller.renew_lease(available_voter_ids=tuple(voter_set.voter_map)).state == "stopped"
+    assert authority.current_certificate() is None
+    with pytest.raises(Exception) as stopped:
+        fence.admit(certificate, action="test.stopped", now_ms=1_001)
+    assert stopped.value.code == "control_certificate_not_current"
+
+
+def test_in_flight_renewal_cannot_restore_authority_after_stop(tmp_path: Path, monkeypatch):
+    import threading
+
+    voter_set, collector, authority, fence = _fixture(tmp_path)
+    controller = AutoRoleController("voter-0", authority=authority, collector=collector, fence=fence)
+    assert controller.start(available_voter_ids=tuple(voter_set.voter_map), now_ms=1_000).accepted
+    entered = threading.Event()
+    release = threading.Event()
+    real_renew = collector.renew
+
+    def slow_renew(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_renew(*args, **kwargs)
+
+    monkeypatch.setattr(collector, "renew", slow_renew)
+    results = []
+    thread = threading.Thread(target=lambda: results.append(controller.renew_lease(
+        available_voter_ids=tuple(voter_set.voter_map), now_ms=1_050,
+    )))
+    thread.start()
+    try:
+        assert entered.wait(timeout=5)
+        controller.stop()
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert results[0].accepted is False
+    assert controller.state == "stopped"
+    assert authority.current_certificate() is None
+
+
+def test_auto_role_override_cannot_claim_master_without_a_certificate(monkeypatch):
+    import scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "NODE_ROLE", "auto")
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler._auto_role_controller = None
+    scheduler._role_override = "master"
+    assert scheduler._effective_role() == "client"

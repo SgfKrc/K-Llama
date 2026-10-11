@@ -12,7 +12,10 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import logging
+import math
 import os
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -33,6 +36,7 @@ from cluster_quorum import (
 AUTO_ROLE_RPC_HEADER = "X-QLH-Quorum-Secret"
 AUTO_ROLE_RPC_PATH = "/api/cluster/quorum/voter"
 AUTO_ROLE_RPC_TIMEOUT_SECONDS = 8.0
+logger = logging.getLogger(__name__)
 
 
 class AutoRoleRuntimeError(RuntimeError):
@@ -146,6 +150,9 @@ class AutoRoleRuntime:
         self.voter = voter
         self.collector = collector
         self.secret = str(secret)
+        self._renewal_lock = threading.Lock()
+        self._renewal_thread: threading.Thread | None = None
+        self._renewal_stop: threading.Event | None = None
 
     @property
     def available_voter_ids(self) -> tuple[str, ...]:
@@ -153,6 +160,46 @@ class AutoRoleRuntime:
 
     def authenticate(self, provided: str | None) -> bool:
         return bool(self.secret) and hmac.compare_digest(str(provided or ""), self.secret)
+
+    def start_lease_renewal(self, controller: AutoRoleController) -> None:
+        with self._renewal_lock:
+            if self._renewal_thread is not None and self._renewal_thread.is_alive():
+                return
+            stop = threading.Event()
+            self._renewal_stop = stop
+            self._renewal_thread = threading.Thread(
+                target=self._renew_lease_loop,
+                args=(controller, stop),
+                name="auto-role-lease-renewal",
+                daemon=True,
+            )
+            self._renewal_thread.start()
+
+    def stop_lease_renewal(self) -> None:
+        with self._renewal_lock:
+            stop = self._renewal_stop
+            thread = self._renewal_thread
+            self._renewal_stop = None
+            self._renewal_thread = None
+            if stop is not None:
+                stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+
+    def _renew_lease_loop(self, controller: AutoRoleController, stop: threading.Event) -> None:
+        interval = max(0.01, min(self.collector.policy.lease_duration_ms / 3000.0, 5.0))
+        while not stop.wait(interval):
+            if stop.is_set() or controller.state != "leader":
+                continue
+            try:
+                decision = controller.renew_lease(available_voter_ids=self.available_voter_ids)
+            except Exception:
+                if not stop.is_set():
+                    controller.on_quorum_loss()
+                logger.exception("auto-role lease renewal failed closed")
+                continue
+            if not decision.accepted:
+                logger.warning("auto-role lease renewal fenced: %s", decision.reason)
 
     def handle_rpc(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one authenticated local-voter RPC without exposing exceptions."""
@@ -216,8 +263,15 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRun
     peers = _json_env("QLH_CONTROL_VOTER_PEERS", {})
     if not isinstance(peers, Mapping):
         raise AutoRoleRuntimeError("auto_role_peers_invalid", "QLH_CONTROL_VOTER_PEERS must be a JSON object")
-    voters: dict[str, Any] = {voter_id: local}
+    lease_ms = int(os.environ.get("QLH_CONTROL_VOTER_LEASE_MS", "10000"))
+    if lease_ms < 1000:
+        raise AutoRoleRuntimeError("auto_role_lease_too_short", "auto-role lease must be at least one second")
     timeout = float(os.environ.get("QLH_CONTROL_VOTER_RPC_TIMEOUT", AUTO_ROLE_RPC_TIMEOUT_SECONDS))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise AutoRoleRuntimeError("auto_role_rpc_timeout_invalid", "voter RPC timeout must be positive and finite")
+    peer_count = max(1, len(peers))
+    timeout = min(timeout, lease_ms / (8000.0 * peer_count))
+    voters: dict[str, Any] = {voter_id: local}
     for peer_id, endpoint in peers.items():
         peer_id = str(peer_id)
         if peer_id == voter_id:
@@ -227,7 +281,6 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRun
         voters[peer_id] = HTTPRemoteVoter(peer_id, str(endpoint), secret=secret, timeout=timeout)
     if len(voters) < voter_set.quorum_size:
         raise AutoRoleRuntimeError("auto_role_peers_incomplete", "configured voter peers cannot form a quorum")
-    lease_ms = int(os.environ.get("QLH_CONTROL_VOTER_LEASE_MS", "10000"))
     collector = QuorumCollector(voter_set=voter_set, voters=voters, policy=QuorumPolicy(lease_duration_ms=lease_ms))
     return AutoRoleRuntime(voter=local, collector=collector, secret=secret)
 
@@ -252,6 +305,7 @@ def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = No
         fence = ControlFence(authority, required=True)
         scheduler.set_control_fence(fence)
     controller = AutoRoleController(runtime.voter.voter_id, mode="auto", authority=authority, collector=runtime.collector, fence=fence)
+    fence.set_role_guard(controller.can_write)
     scheduler.set_auto_role_controller(controller)
     scheduler._auto_role_runtime = runtime
     return runtime

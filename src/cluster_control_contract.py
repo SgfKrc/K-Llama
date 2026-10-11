@@ -541,15 +541,37 @@ class ControlPlaneAuthority:
                     "certificate term is older than the committed term",
                 )
             if cert.term == self._committed_term and self._certificate is not None:
-                if digest != self._certificate.digest():
+                previous = self._certificate
+                if cert.leader_id != previous.leader_id or cert.lease_id != previous.lease_id:
                     raise ControlContractError(
                         "control_certificate_conflict",
                         "two different certificates claim the same term",
                     )
+                if cert.expires_at_ms < previous.expires_at_ms or (
+                    cert.expires_at_ms == previous.expires_at_ms and digest != previous.digest()
+                ):
+                    raise ControlContractError(
+                        "control_certificate_conflict",
+                        "certificate renewal must strictly extend the same lease",
+                    )
+                self._certificate = cert
                 return validation
+            if cert.term == self._committed_term:
+                raise ControlContractError(
+                    "control_certificate_stale",
+                    "a revoked certificate cannot be installed again",
+                )
             self._certificate = cert
             self._committed_term = cert.term
             return validation
+
+    def revoke_certificate(self, certificate: QuorumCertificate) -> bool:
+        """Fence this node's current lease without forgetting its committed term."""
+        with self._lock:
+            if self._certificate is None or self._certificate.digest() != certificate.digest():
+                return False
+            self._certificate = None
+            return True
 
     def snapshot(self, *, now_ms: int | None = None) -> ControlPlaneSnapshot:
         current = _now_ms(now_ms)

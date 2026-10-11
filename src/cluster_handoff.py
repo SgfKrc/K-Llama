@@ -239,9 +239,13 @@ class HandoffCoordinator:
                 raise HandoffError("handoff_aborted", "handoff has been aborted")
             if record.state == "failed":
                 raise HandoffError("handoff_failed", "handoff is terminally failed")
-            if record.old_certificate_digest != (
-                self.authority.current_certificate().digest()
-                if self.authority.current_certificate() is not None else ""
+            current_certificate = self.authority.current_certificate()
+            current_digest = current_certificate.digest() if current_certificate is not None else ""
+            if (
+                record.state == "prepared" and current_digest != record.old_certificate_digest
+            ) or (
+                record.state == "awaiting_quorum"
+                and current_digest not in {"", record.old_certificate_digest}
             ):
                 raise HandoffError("handoff_certificate_changed", "current certificate changed after handoff preparation")
             if self.old_role_controller is not None:
