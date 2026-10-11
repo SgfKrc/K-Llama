@@ -41,6 +41,32 @@ _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
 _REQUEST_DEADLINE_EXCEEDED = "request_deadline_exceeded"
 
 
+def keep_head_shim_available() -> bool:
+    """本机是否具备可用的 keep-head shim（llama.cpp 层段的另一条执行路径）。
+
+    ★ 2026-10-11（ROG+Y700+本机三机实测）：`_task_worker_capabilities` 此前只用
+    `importlib.util.find_spec("llama_cpp")` 判断"能不能跑 llama.cpp"。但**层段执行**
+    走的是 shim（`QLH_KEEP_HEAD_SHIM` 指向的 `qlh_keep_head.dll` + 同目录私有
+    libllama/ggml），**不需要 pip 包** ⇒ ROG 明明配了 shim 与裁层工件，却被协议判为
+    「model engine was not declared by the worker」，HELLO 直接被拒。
+    这里把 shim 作为同等有效的判据（事实源与 `keep_head_shim.resolve_keep_head_shim`
+    一致，避免第二套推导）。
+    """
+    try:
+        from keep_head_shim import resolve_keep_head_shim
+    except ImportError:
+        return False
+    try:
+        path = resolve_keep_head_shim()
+    except Exception:  # noqa: BLE001 - 判据失败按"不可用"处理，绝不抛出
+        return False
+    # `resolve_keep_head_shim` 只负责"取值"（显式 > env > 仓库默认，**不校验存在性**）；
+    # 本判据问的是**可用性** ⇒ 必须确认文件真的在，否则一个指错的 env 就会被当成能力。
+    from pathlib import Path
+
+    return bool(path) and Path(path).is_file()
+
+
 def _verified_layer_artifact_sha256(path) -> str:
     """Hash one configured GGUF once per stable filesystem identity."""
     try:
@@ -192,6 +218,9 @@ class SchedulerTaskWorkerMixin:
             engines.append("pytorch")
         try:
             if importlib.util.find_spec("llama_cpp") is not None:
+                engines.append("llama_cpp")
+            elif keep_head_shim_available():
+                # shim 路径同样能执行 llama.cpp 层段（见 keep_head_shim_available 的说明）。
                 engines.append("llama_cpp")
         except (ImportError, ValueError):
             pass

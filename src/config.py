@@ -511,7 +511,11 @@ PREFER_PYTORCH = _env_bool("QLH_PREFER_PYTORCH", False)
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
 
 # 流水线推理超时与并发控制
-PIPELINE_TIMEOUT = 120                   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
+#: ★ 2026-10-11（ROG+Y700+本机三机实测）：此前是硬编码 `120`，而三机层接力每步约
+#:   0.2s ⇒ 长思考请求（`show_thinking=true` + 大 `max_new_tokens`）跑到 500+ 步就撞上，
+#:   表现为 `request_deadline_exceeded`，现场只能改源码。现在可用 `QLH_PIPELINE_TIMEOUT`
+#:   调整（默认仍是 120，既有行为不变）。
+PIPELINE_TIMEOUT = _env_int("QLH_PIPELINE_TIMEOUT", 120)   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
 PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
     "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK
