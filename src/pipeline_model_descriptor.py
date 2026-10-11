@@ -487,5 +487,13 @@ def public_pipeline_descriptor(descriptor: dict[str, Any]) -> dict[str, Any]:
         "pipeline_runtime_supported",
         "runtime_block_reason",
         "model_sha256",
+        # ★ 2026-10-11（Y700 反复重选无效排查）：裁层工件必须能对外声明**源模型**摘要。
+        #   客户端（Android LayerArtifactCatalog）的跨段校验是「工件的 source_model_sha256
+        #   或 artifact_sha256 等于主节点报的摘要」。每段的 artifact_sha256 天然不同
+        #   （head 296fce32… / tail d8167678…），而三段共享同一个 source_model_sha256
+        #   （9be22744…）⇒ 只有暴露源摘要，非主节点段才能通过校验；否则远端 worker 恒
+        #   source_digest_mismatch、不上报 layer_ranges（实测 ranges=None），
+        #   容量求解器看不到该节点（triple 实测 3 节点只 admitted 1 个）。
+        "source_model_sha256",
     }
     return {key: descriptor[key] for key in allowed if key in descriptor}
