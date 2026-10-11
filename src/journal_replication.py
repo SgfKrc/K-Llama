@@ -538,6 +538,138 @@ class DurableJournalReplica:
             finally:
                 connection.close()
 
+    def truncate_to(
+        self,
+        workflow_id: str,
+        *,
+        last_sequence: int,
+        event_chain_head: str | None = None,
+        received_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Drop the **uncommitted tail**, leaving the durable prefix ending at the committed point.
+
+        为什么需要它（#93）：旧主可能在「还没有拿到多数耐久确认」时就把事件写到本地
+        （= 未提交尾部）。新主一旦接管，若照原样继续服务，就会把**从未提交**的事件
+        当成既成事实 ⇒ 违反一致性承诺。
+
+        安全约束（不满足即拒绝，绝不"尽力而为"）：
+        - ``last_sequence == 0`` 合法（截成空链）；
+        - 否则本地链上**必须存在**该 sequence（哈希链保证该点唯一）⇒ 不允许凭空造点；
+          ``event_chain_head`` 若传入则必须与该点摘要一致（口径 = 事件链摘要）。
+        - 只删 ``sequence > last_sequence`` 的事件。快照行**不删**：它的内容对应更高的点、
+          已不可再当可信前缀，因此记入 ``truncated:<workflow_id>`` 元数据留作取证。
+        """
+        sequence = int(last_sequence)
+        if sequence < 0:
+            raise JournalReplicationError("last_sequence must be >= 0")
+        arrival = time.time() if received_at is None else float(received_at)
+        if not math.isfinite(arrival):
+            raise JournalReplicationError("received_at must be finite")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if sequence > 0:
+                    row = connection.execute(
+                        "SELECT event_digest FROM replicated_events "
+                        "WHERE workflow_id = ? AND sequence = ?",
+                        (workflow_id, sequence),
+                    ).fetchone()
+                    if row is None:
+                        raise JournalReplicationGap(
+                            "cannot truncate to a point the replica does not durably hold"
+                        )
+                    if event_chain_head is not None and str(row["event_digest"]) != str(event_chain_head):
+                        raise JournalReplicationConflict(
+                            "truncate target digest does not match the durable event chain"
+                        )
+                removed = connection.execute(
+                    "DELETE FROM replicated_events WHERE workflow_id = ? AND sequence > ?",
+                    (workflow_id, sequence),
+                ).rowcount
+                snapshot = connection.execute(
+                    "SELECT last_sequence FROM replicated_snapshots WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                # 快照仍指向被截断掉的更高点 ⇒ 它是一个**过期的**前缀，必须留痕。
+                stale = snapshot is not None and int(snapshot["last_sequence"]) > sequence
+                if stale:
+                    connection.execute(
+                        "INSERT INTO replication_metadata(key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (f"truncated:{workflow_id}", f"{sequence}@{int(arrival)}"),
+                    )
+                connection.execute("COMMIT")
+                return {
+                    "accepted": True,
+                    "workflow_id": workflow_id,
+                    "durable_sequence": sequence,
+                    "removed_events": max(0, int(removed or 0)),
+                    "snapshot_stale": stale,
+                    "source_node_id": self.source_node_id,
+                    "stream_id": self.stream_id,
+                }
+            except (JournalReplicationError, sqlite3.IntegrityError):
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            except sqlite3.Error as exc:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise JournalReplicationError(f"failed to truncate journal replica: {exc}") from exc
+            finally:
+                connection.close()
+
+    def durable_prefix(self, workflow_id: str) -> dict[str, Any]:
+        """只读诊断：本地**事件链**现状（**不**做快照一致性校验）。
+
+        截断后副本必然处于「链不完整」状态（`recovery_status.verified` 为 False），
+        此时仍要能看到自己手里到底有什么，才能决定追赶起点。
+        """
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS n, MIN(sequence) AS first_sequence,
+                           MAX(sequence) AS last_sequence
+                    FROM replicated_events WHERE workflow_id = ?
+                    """,
+                    (workflow_id,),
+                ).fetchone()
+                head = connection.execute(
+                    "SELECT event_digest FROM replicated_events "
+                    "WHERE workflow_id = ? ORDER BY sequence DESC LIMIT 1",
+                    (workflow_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+        count = int(row["n"] or 0) if row is not None else 0
+        return {
+            "workflow_id": workflow_id,
+            "event_count": count,
+            "first_sequence": None if count == 0 else int(row["first_sequence"]),
+            "last_sequence": 0 if count == 0 else int(row["last_sequence"]),
+            "event_chain_head": "" if head is None else str(head["event_digest"]),
+        }
+
+    def truncated_watermark(self, workflow_id: str) -> str:
+        """Return the recorded truncation marker for a workflow, if any (diagnostics)."""
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT value FROM replication_metadata WHERE key = ?",
+                    (f"truncated:{workflow_id}",),
+                ).fetchone()
+            finally:
+                connection.close()
+        return "" if row is None else str(row["value"])
+
     def recovery_status(self, workflow_id: str) -> dict[str, Any]:
         with self._lock:
             connection = self._connect()
