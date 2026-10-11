@@ -126,7 +126,14 @@ class HTTPRemoteVoter:
             raise QuorumError("quorum_unavailable", "voter peer is unreachable") from exc
         if not isinstance(value, dict) or not value.get("ok", False):
             code = str(value.get("code", "quorum_unavailable")) if isinstance(value, dict) else "quorum_unavailable"
-            if code not in {"quorum_unavailable", "quorum_vote_rejected", "quorum_active_lease", "quorum_term_stale", "quorum_duplicate_vote", "quorum_expiry_regressed"}:
+            # ★ #93（真机演练暴露）：白名单**必须**含水位类错误码，否则「voter 不持有被
+            #   提议的已提交前缀」会被降级成通用的 quorum_unavailable，主节点就无法区分
+            #   「多数不可用」与「多数不持有」—— 这正是本票要消除的歧义。
+            if code not in {
+                "quorum_unavailable", "quorum_vote_rejected", "quorum_active_lease",
+                "quorum_term_stale", "quorum_duplicate_vote", "quorum_expiry_regressed",
+                "quorum_watermark_unheld", "quorum_watermark_unavailable",
+            }:
                 code = "quorum_unavailable"
             raise QuorumError(code, "voter peer rejected the request")
         return value
@@ -339,7 +346,12 @@ class AutoRoleRuntime:
             if operation == "snapshot":
                 return {"ok": True, "snapshot": self.voter.snapshot().to_dict()}
             return {"ok": False, "code": "quorum_unavailable"}
-        except (KeyError, TypeError, ValueError, QuorumError, ControlContractError):
+        except (QuorumError, ControlContractError) as exc:
+            # ★ #93（真机演练暴露）：**保留稳定契约码**。一律返回 quorum_unavailable 会让
+            #   远程调用方把「voter 不持有被提议的已提交前缀」误当成容量/网络问题，
+            #   从而掩盖一致性风险 —— 与 collector 侧的区分逻辑配套。
+            return {"ok": False, "code": str(getattr(exc, "code", "") or "quorum_unavailable")}
+        except (KeyError, TypeError, ValueError):
             return {"ok": False, "code": "quorum_unavailable"}
 
 

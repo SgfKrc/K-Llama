@@ -237,3 +237,65 @@ def test_authority_accepts_matching_commitment(tmp_path):
     authority.enforce(type("C", (), {"commit_watermark": (held,)})())  # 不抛即通过
     assert authority.truncated == {}
     replica.close()
+
+
+# ---------------------------------------------------------------------------
+# #93 远程 voter：拒签原因必须能被主节点看见（真机演练暴露的吞码缺陷）
+# ---------------------------------------------------------------------------
+
+def test_voter_rpc_keeps_the_watermark_code(tmp_path):
+    """voter 的 RPC 层必须保留 `quorum_watermark_*`，否则主节点会把「多数不持有」
+    误当成「多数不可用」—— 这正是本票要消除的歧义（真机演练里就踩到了）。"""
+    from cluster_auto_role_runtime import AutoRoleRuntime
+    from cluster_control_contract import QuorumCertificate
+
+    voter_set, collector, _authority = _voters(tmp_path)  # 无 holders ⇒ voter 没有耐久来源
+    local = collector.voters["voter-0"]
+    runtime = AutoRoleRuntime(voter=local, collector=collector, secret="s" * 40)
+    certificate = QuorumCertificate(
+        cluster_id=voter_set.cluster_id,
+        voter_set_epoch=voter_set.voter_set_epoch,
+        term=1, leader_id="voter-0", lease_id="lease-x", expires_at_ms=10**12,
+        signatures=(), commit_watermark=(_watermark(),),
+    )
+    result = runtime.handle_rpc({"op": "sign_vote", "certificate": certificate.to_dict()})
+    assert result["ok"] is False
+    assert result["code"] == "quorum_watermark_unavailable"
+
+
+def test_remote_voter_call_propagates_watermark_code():
+    """`HTTPRemoteVoter` 不得把水位码降级成通用码（白名单必须放行它）。"""
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from cluster_auto_role_runtime import HTTPRemoteVoter
+    from cluster_quorum import QuorumError
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):  # noqa: D102 - silence
+            return
+
+        def do_POST(self):  # noqa: N802 - http.server API
+            body = _json.dumps({"ok": False, "code": "quorum_watermark_unheld"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        remote = HTTPRemoteVoter("rog-voter", f"http://{host}:{port}", secret="s" * 40, timeout=3.0)
+        with pytest.raises(QuorumError) as excinfo:
+            remote.snapshot()
+        assert excinfo.value.code == "quorum_watermark_unheld"
+    finally:
+        server.shutdown()
+        server.server_close()
