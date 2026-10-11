@@ -588,6 +588,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   后者是"当前已就绪、马上能跑的区间"，前者是"能承载的上限"。
     if "layer_budget" in capabilities:
         expected_fields.add("layer_budget")
+    # ★ 2026-10-11（方案 A：worker 上报本段逐层字节）：接力不加载整模 ⇒ 主节点只持有
+    #   **本段**的逐层字节，而容量求解需要**整模**的逐层字节 ⇒ 由各 worker 在
+    #   `layer_artifacts` 里申报自己那一段，主节点按 `layer_range` 平移拼出整模视图。
+    #   与其余可选键同法：出现才纳入精确字段集，向后兼容旧 worker。
+    if "layer_weight_bytes" in capabilities:
+        expected_fields.add("layer_weight_bytes")
     # ★ 2026-10-03：relay 中段角色（本节点不加载层，段由远端 relay 服务持有）。
     #   声明侧早已在发这个键（`scheduler_task_worker._task_worker_capabilities`），
     #   但这里没有放行 ⇒ 该 worker 的 hello 会以 `unknown=['relay_middle']` 被判

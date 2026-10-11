@@ -98,6 +98,12 @@ def _normalize_layer_artifacts(
             "layer_range", "segment_mode", "model_id", "artifact_sha256",
             "source_model_sha256", "source_model_id", "hidden_size",
             "tokenizer_sha256",
+            # ★ 2026-10-11（方案 A：worker 上报本段逐层字节）：
+            #   接力不加载整模 ⇒ 主节点只持有**本段**的逐层字节，而求解器需要**整模**的
+            #   逐层字节（`_descriptor_costs` 的 `every decoder layer must have a positive
+            #   byte count` 与各节点容量账都用它）。因此让每个 worker 在 `layer_artifacts`
+            #   里申报**自己那一段**的逐层字节，主节点按 `layer_range` 平移拼出整模视图。
+            "layer_weight_bytes",
         }
         required = {
             "layer_range", "segment_mode", "model_id", "artifact_sha256",
