@@ -2743,74 +2743,6 @@ class Scheduler(
                 )
         return released
 
-    def _merge_descriptor_layer_bytes(
-        self, descriptor: dict, capacity_nodes: list[dict],
-    ) -> dict:
-        """用各 worker 申报的本段逐层字节补齐 descriptor 的整模视图。
-
-        ★ 2026-10-11（方案 A 第三步）：接力不加载整模 ⇒ 主节点只有**本段**逐层字节，
-        而容量求解要求每一层都有正字节数（`pipeline_capacity._descriptor_costs`）。
-        各 worker 在 `layer_artifacts[].layer_weight_bytes` 里申报**本段局部**口径的
-        逐层字节（下标 0 = 段内第一层），这里按 `layer_range` 平移到源模型坐标系后填缺口。
-
-        只在「原表确有缺口、且缺的每一层都被补齐」时才返回补齐后的副本；否则原样返回
-        （保持 fail-closed：宁可拒绝，也不给求解器一份臆造的容量账）。
-        """
-        if not isinstance(descriptor, dict):
-            return descriptor
-        raw = descriptor.get("layer_weight_bytes")
-        if not isinstance(raw, list) or not raw:
-            return descriptor
-        try:
-            total = int(descriptor.get("total_layers", 0) or 0)
-        except (TypeError, ValueError):
-            return descriptor
-        if total <= 0 or len(raw) != total:
-            return descriptor
-        try:
-            merged = [int(value) for value in raw]
-        except (TypeError, ValueError):
-            return descriptor
-        if all(value > 0 for value in merged):
-            return descriptor  # 已是完整视图（主节点握着整模）
-        filled = 0
-        for node in capacity_nodes or []:
-            artifacts = node.get("layer_artifacts") if isinstance(node, dict) else None
-            if not isinstance(artifacts, list):
-                continue
-            for artifact in artifacts:
-                if not isinstance(artifact, dict):
-                    continue
-                segment_bytes = artifact.get("layer_weight_bytes")
-                span = artifact.get("layer_range")
-                if not isinstance(segment_bytes, list) or not segment_bytes:
-                    continue
-                if not (isinstance(span, (list, tuple)) and len(span) == 2):
-                    continue
-                start, end = int(span[0]), int(span[1])
-                if end - start != len(segment_bytes):
-                    continue
-                for offset, value in enumerate(segment_bytes):
-                    index = start + offset
-                    if not (0 <= index < total) or merged[index] > 0:
-                        continue
-                    try:
-                        size = int(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if size > 0:
-                        merged[index] = size
-                        filled += 1
-        if filled <= 0 or any(value <= 0 for value in merged):
-            return descriptor
-        logger.info(
-            "容量求解前补齐整模逐层字节: filled=%d/%d 来源=worker layer_artifacts",
-            filled, total,
-        )
-        merged_descriptor = dict(descriptor)
-        merged_descriptor["layer_weight_bytes"] = merged
-        return merged_descriptor
-
     def _get_pipeline_capacity_nodes(
         self, eligible_node_ids: Optional[set[str]] = None,
     ) -> list[dict]:
@@ -3442,12 +3374,6 @@ class Scheduler(
                 sorted(eligible_node_ids) if eligible_node_ids else None,
             )
             capacity_nodes = self._get_pipeline_capacity_nodes(eligible_node_ids)
-            # ★ 2026-10-11（方案 A 第三步）：接力不加载整模 ⇒ 主节点的 descriptor 只含
-            #   **本段**逐层字节，而求解器要求每层都有正字节数
-            #   （`pipeline_capacity._descriptor_costs`）。这里用各 worker 在
-            #   `layer_artifacts[].layer_weight_bytes` 里申报的本段字节，按 `layer_range`
-            #   平移到源模型坐标系后补齐缺口；补不齐就保持原样，让求解器照旧 fail-closed。
-            descriptor = self._merge_descriptor_layer_bytes(descriptor, capacity_nodes)
             result = solve_pipeline_capacity(
                 descriptor,
                 capacity_nodes,

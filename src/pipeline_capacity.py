@@ -485,6 +485,71 @@ def _uncovered_layer_ranges(ranges, total_layers: int) -> list[tuple[int, int]]:
     return gaps
 
 
+def _merge_source_layer_bytes(
+    descriptor: dict[str, Any], nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """用各 worker 申报的本段逐层字节补齐 descriptor 的**整模**视图。
+
+    ★ 2026-10-11（方案 A）：接力不加载整模（用户裁定：这是接力的初衷）⇒ 主节点只持有
+    **本段**逐层字节，而 `_descriptor_costs` 要求每一层都有正字节数。各 worker 在
+    `layer_artifacts[].layer_weight_bytes` 里申报**本段局部**口径的逐层字节
+    （下标 0 = 段内第一层），这里按 `layer_range` 平移到源模型坐标系后填入缺口。
+
+    只在「原表确有缺口、且缺的每一层都被补齐」时才返回补齐后的副本；否则原样返回 ——
+    保持 fail-closed：宁可拒绝，也不给求解器一份臆造的容量账。
+    """
+    if not isinstance(descriptor, dict):
+        return descriptor
+    raw = descriptor.get("layer_weight_bytes")
+    if not isinstance(raw, list) or not raw:
+        return descriptor
+    try:
+        total = int(descriptor.get("total_layers", 0) or 0)
+    except (TypeError, ValueError):
+        return descriptor
+    if total <= 0 or len(raw) != total:
+        return descriptor
+    try:
+        merged = [int(value) for value in raw]
+    except (TypeError, ValueError):
+        return descriptor
+    if all(value > 0 for value in merged):
+        return descriptor  # 已是完整视图（例如主节点握着整模）
+    filled = 0
+    for node in nodes or []:
+        artifacts = node.get("layer_artifacts") if isinstance(node, dict) else None
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            segment_bytes = artifact.get("layer_weight_bytes")
+            span = artifact.get("layer_range")
+            if not isinstance(segment_bytes, list) or not segment_bytes:
+                continue
+            if not (isinstance(span, (list, tuple)) and len(span) == 2):
+                continue
+            start, end = int(span[0]), int(span[1])
+            if end - start != len(segment_bytes):
+                continue
+            for offset, value in enumerate(segment_bytes):
+                index = start + offset
+                if not (0 <= index < total) or merged[index] > 0:
+                    continue
+                try:
+                    size = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if size > 0:
+                    merged[index] = size
+                    filled += 1
+    if filled <= 0 or any(value <= 0 for value in merged):
+        return descriptor
+    merged_descriptor = dict(descriptor)
+    merged_descriptor["layer_weight_bytes"] = merged
+    return merged_descriptor
+
+
 def solve_pipeline_capacity(
     descriptor: dict[str, Any],
     nodes: list[dict[str, Any]],
@@ -515,6 +580,12 @@ def solve_pipeline_capacity(
     safety_margin = _positive_float(safety_margin, "safety_margin")
     if safety_margin < 1.0:
         raise PipelineCapacityError("safety_margin must be at least 1.0")
+    # ★ 2026-10-11（方案 A）：接力不加载整模 ⇒ 主节点的 descriptor 只含**本段**逐层字节，
+    #   而 `_descriptor_costs` 要求每层都有正字节数。这里先尝试用各 worker 在
+    #   `layer_artifacts[].layer_weight_bytes` 里申报的**本段**字节补齐整模视图。
+    #   放在这里（而非某个调用点）是因为它是**所有**调用者的公共入口：prepare 走
+    #   `start_pipeline_model_transaction`、规划走 scheduler，都会经过本函数。
+    descriptor = _merge_source_layer_bytes(descriptor, nodes)
     layer_bytes, embedding_bytes, per_node_bytes, output_bytes = _descriptor_costs(
         descriptor
     )
