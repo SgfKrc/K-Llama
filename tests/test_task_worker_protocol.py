@@ -530,6 +530,23 @@ def test_hello_capabilities_may_advertise_unusable_artifact_reasons():
         "layer_artifact_diagnostics"
     ] == [unreadable]
 
+    unavailable = {
+        **identity_fields,
+        "error_code": "fallback_storage_unavailable",
+        "manifest": "default-storage",
+        "architecture": "",
+        "mode": "",
+        "layer_range": None,
+    }
+    assert hello([unavailable]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [unavailable]
+
+    ambiguous = {**identity_fields, "error_code": "artifact_ambiguous"}
+    assert hello([ambiguous]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [ambiguous]
+
     # 空列表没有信息量：要么不给该键，要么给非空列表
     with pytest.raises(WorkerProtocolError) as empty:
         hello([])

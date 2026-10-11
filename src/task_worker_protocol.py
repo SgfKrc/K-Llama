@@ -131,6 +131,8 @@ _LAYER_ARTIFACT_DIAGNOSTIC_CODES = frozenset({
     "source_digest_mismatch",
     "artifact_missing",
     "artifact_digest_mismatch",
+    "fallback_storage_unavailable",
+    "artifact_ambiguous",
 })
 _LAYER_ARTIFACT_DIAGNOSTIC_MAX = 32
 
