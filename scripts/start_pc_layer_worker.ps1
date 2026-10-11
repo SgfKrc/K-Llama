@@ -44,7 +44,16 @@ param(
   [string]$ApiPort       = '8001',
   [string]$ServerPort    = '8889',
   [string]$Python        = 'python',
-  [switch]$PreflightOnly
+  [switch]$PreflightOnly,
+  # Added 2026-10-11 (measured). Starting a long-lived worker over ssh requires
+  # detaching from the sshd job object, otherwise the whole process tree is killed
+  # when ssh disconnects (symptom: ports never listen, log stops at "starting",
+  # no error anywhere). -Detach re-launches this same script (without -Detach)
+  # through Register-ScheduledTask, which is hosted by the Task Scheduler service.
+  # Second trap: -Python must point at an interpreter that HAS llama_cpp
+  # (e.g. <RepoRoot>\.venv-test\Scripts\python.exe); the host python lacks it and
+  # the worker silently exits right after starting.
+  [switch]$Detach
 )
 
 $ErrorActionPreference = 'Continue'
@@ -129,5 +138,20 @@ $env:QLH_LAYER_GGUF = $LayerGguf
 $env:QLH_KEEP_HEAD_SHIM = $KeepHeadShim
 
 Set-Location -LiteralPath $RepoRoot
+
+if ($Detach) {
+  $inner = "-ExecutionPolicy Bypass -NoProfile -File `"$PSCommandPath`" " +
+           "-MasterHost $MasterHost -MasterTcpPort $MasterTcpPort -NodeId `"$NodeId`" -NodeType $NodeType " +
+           "-RepoRoot `"$RepoRoot`" -LayerGguf `"$LayerGguf`" -KeepHeadShim `"$KeepHeadShim`" " +
+           "-ClusterSecret `"$ClusterSecret`" -ApiPort $ApiPort -ServerPort $ServerPort -Python `"$Python`""
+  $taskName = "qlh_layer_worker_$NodeId"
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $inner -WorkingDirectory $RepoRoot
+  Register-ScheduledTask -TaskName $taskName -Action $action -Force | Out-Null
+  Start-ScheduledTask -TaskName $taskName
+  Write-Output "=== detached: scheduled task '$taskName' started ==="
+  Write-Output "  watch: Get-ScheduledTaskInfo -TaskName $taskName ; Get-NetTCPConnection -State Listen"
+  exit 0
+}
+
 Write-Output "=== starting api_server.py (client mode) ==="
 & $Python 'src\api_server.py'
