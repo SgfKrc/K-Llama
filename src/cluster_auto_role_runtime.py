@@ -37,6 +37,7 @@ from cluster_quorum import (
     SQLiteVoterLedger,
 )
 from journal_replication import DurableJournalReplica
+from journal_replication_service import JournalReplicationSettings, recover_journal_prefix
 
 
 AUTO_ROLE_RPC_HEADER = "X-QLH-Quorum-Secret"
@@ -159,12 +160,29 @@ class JournalPrefixAuthority:
       之后仍落后或无法自证 ⇒ 抛错（fail-closed，必须先靠 checkpoint 追赶/重建）。
     """
 
-    def __init__(self, replica: DurableJournalReplica, *, workflows: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        replica: DurableJournalReplica,
+        *,
+        workflows: Sequence[str] = (),
+        recovery: Any = None,
+    ) -> None:
         self.replica = replica
         self.workflows = tuple(sorted({str(item) for item in workflows if str(item)}))
+        #: #93：落后时「主动追赶一次」的钩子；默认没有 ⇒ 就只能拒绝接管（fail-closed）。
+        self.recovery = recovery
         self._lock = threading.RLock()
         #: 诊断：本次进程内因接管核对而被截断的 workflow → 被丢弃的事件数。
         self.truncated: dict[str, int] = {}
+
+    def _recover(self, workflow_id: str) -> None:
+        """落后时主动追赶一次；追赶失败不改结论（仍然是「不够格接管」）。"""
+        if self.recovery is None:
+            return
+        try:
+            self.recovery(workflow_id)
+        except Exception:  # noqa: BLE001 - 追赶失败不改变判定
+            return
 
     def held(self, workflow_id: str) -> CommitWatermark | None:
         """本地耐久持有且**自洽**的前缀；不完整（例如刚截断过）时为 None。"""
@@ -205,6 +223,10 @@ class JournalPrefixAuthority:
                     )
                     self.truncated[workflow_id] = int(result.get("removed_events", 0))
                 held = self.held(workflow_id)
+                if held is None or held.last_sequence < int(watermark.last_sequence):
+                    # 落后（或截断后不自洽）⇒ 先尝试**主动追赶一次**，再判定。
+                    self._recover(workflow_id)
+                    held = self.held(workflow_id)
             if held is None:
                 raise AutoRoleRuntimeError(
                     "committed_prefix_behind",
@@ -354,13 +376,26 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRun
             for item in os.environ.get("QLH_COMMIT_WATERMARK_WORKFLOWS", "").split(",")
             if item.strip()
         ]
+        replica = DurableJournalReplica(
+            replica_path,
+            source_node_id=os.environ.get("QLH_JOURNAL_SOURCE_NODE_ID", "").strip() or voter_id,
+            stream_id=os.environ.get("QLH_JOURNAL_STREAM_ID", "").strip() or "journal-1",
+        )
+        # #93：配置了 quorum peers 就意味着「落后时可以主动追赶」——从对端拉回一个
+        # 已自洽的 checkpoint 再重试接管核对；没配就保持「拒绝接管」，绝不凑合上线。
+        replication_settings = JournalReplicationSettings.from_env()
+        recovery = None
+        if replication_settings.quorum_peers:
+
+            def recovery(  # noqa: F811 - 有意覆盖上面的 None
+                workflow_id: str,
+                _replica: DurableJournalReplica = replica,
+                _settings: JournalReplicationSettings = replication_settings,
+            ) -> None:
+                recover_journal_prefix(_replica, workflow_id=workflow_id, settings=_settings)
+
         prefix_authority = JournalPrefixAuthority(
-            DurableJournalReplica(
-                replica_path,
-                source_node_id=os.environ.get("QLH_JOURNAL_SOURCE_NODE_ID", "").strip() or voter_id,
-                stream_id=os.environ.get("QLH_JOURNAL_STREAM_ID", "").strip() or "journal-1",
-            ),
-            workflows=workflows,
+            replica, workflows=workflows, recovery=recovery,
         )
     local = QuorumVoter(
         voter_id=voter_id,

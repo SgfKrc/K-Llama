@@ -780,6 +780,67 @@ class DurableJournalReplica:
             "reason": "verified" if verified else "replica_chain_verification_failed",
         }
 
+    def export_checkpoint(
+        self, workflow_id: str, *, created_at: float | None = None,
+    ) -> JournalCheckpoint:
+        """把一个**已自洽**的 workflow 导出成 checkpoint（供落后的对端追赶）。
+
+        与 `recovery_status().verified` 同一判据：不自洽（例如刚截断过尾部、快照与事件链
+        对不上）就**拒绝导出** —— 否则等于把一段没人担保的前缀当成「已提交」发出去。
+        """
+        status = self.recovery_status(workflow_id)
+        if not status.get("verified"):
+            raise JournalReplicationError(
+                f"workflow is not durably replicated: {status.get('reason', 'unverified')}"
+            )
+        with self._lock:
+            connection = self._connect()
+            try:
+                snapshot_row = connection.execute(
+                    "SELECT last_sequence, event_chain_head, checkpoint_digest, snapshot_json "
+                    "FROM replicated_snapshots WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                event_rows = connection.execute(
+                    "SELECT sequence, event_json, event_digest, previous_digest "
+                    "FROM replicated_events WHERE workflow_id = ? ORDER BY sequence",
+                    (workflow_id,),
+                ).fetchall()
+            finally:
+                connection.close()
+        if snapshot_row is None:
+            raise JournalReplicationError(f"workflow snapshot not found: {workflow_id}")
+        records: list[dict[str, Any]] = []
+        for row in event_rows:
+            try:
+                event = json.loads(row["event_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise JournalReplicationError("replicated event is not valid JSON") from exc
+            records.append({
+                "event": event,
+                "event_digest": str(row["event_digest"]),
+                "previous_digest": str(row["previous_digest"]),
+            })
+        try:
+            snapshot = json.loads(snapshot_row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise JournalReplicationError("replicated snapshot is not valid JSON") from exc
+        # `JournalCheckpoint` 的构造会**重新校验**整条摘要链与 checkpoint_digest：
+        # 万一库被改坏，这里就会抛，而不是把坏前缀发出去。
+        return JournalCheckpoint(
+            source_node_id=self.source_node_id,
+            stream_id=self.stream_id,
+            workflow_id=workflow_id,
+            created_at=time.time() if created_at is None else float(created_at),
+            snapshot=snapshot,
+            # ⚠️ 必须是 **tuple**：`JournalCheckpoint.__post_init__` 拿
+            #    `_validate_event_sequence()`（返回 tuple）与传入值做**结构比较**，
+            #    传 list 会永远不相等，报「checkpoint event digest chain is invalid」（踩过）。
+            records=tuple(records),
+            event_chain_head=str(snapshot_row["event_chain_head"]),
+            checkpoint_digest=str(snapshot_row["checkpoint_digest"]),
+        )
+
     def recovery_projection(self, workflow_id: str) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         status = self.recovery_status(workflow_id)
         if not status.get("verified"):

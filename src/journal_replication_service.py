@@ -36,6 +36,7 @@ from journal_replication import (
 from journal_replication_transport import (
     JournalReplicationTcpServer,
     JournalReplicationTransportError,
+    request_checkpoint,
     send_checkpoint,
 )
 
@@ -371,6 +372,57 @@ def replicate_journal_to_quorum(
     }
 
 
+def recover_journal_prefix(
+    replica: Any,
+    *,
+    workflow_id: str,
+    settings: JournalReplicationSettings | None = None,
+) -> dict[str, Any]:
+    """#93：让**落后的副本主动追赶** —— 从对端拉回一个已自洽的 checkpoint 并应用。
+
+    与栅栏（推）严格对偶：单个目标失败**不抛**（要能继续试别的目标），但**一个都没成功**
+    时返回 `recovered=False` ⇒ 调用方必须继续拒绝接管，绝不允许「凑合上线」。
+    """
+
+    resolved = settings or JournalReplicationSettings.from_env()
+    resolved.require_quorum_peers()
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise JournalReplicationError("workflow_id is required")
+
+    applied: list[str] = []
+    failures: dict[str, str] = {}
+    durable_sequence: int | None = None
+    for host, port in resolved.quorum_peers:
+        label = f"{host}:{port}"
+        try:
+            checkpoint = request_checkpoint(
+                host,
+                port,
+                source_node_id=resolved.source_node_id,
+                stream_id=resolved.stream_id,
+                workflow_id=workflow_id,
+                secret=resolved.secret_bytes,
+                timeout=resolved.timeout_s,
+            )
+            result = replica.apply_checkpoint(checkpoint)
+        except (JournalReplicationTransportError, JournalReplicationError, OSError) as exc:
+            failures[label] = type(exc).__name__
+            continue
+        applied.append(label)
+        durable_sequence = result.get("durable_sequence")
+    recovered = bool(applied)
+    return {
+        "status": "recovered" if recovered else "unrecovered",
+        "recovered": recovered,
+        "workflow_id": workflow_id,
+        "source_node_id": resolved.source_node_id,
+        "stream_id": resolved.stream_id,
+        "durable_sequence": durable_sequence,
+        "applied_peers": applied,
+        "failures": failures,
+    }
+
+
 class JournalReplicaReceiver:
     """follower 侧接收端：``DurableJournalReplica`` + 认证 TCP 服务。
 
@@ -431,4 +483,5 @@ __all__ = [
     "JournalReplicationTransportError",
     "replicate_journal_once",
     "replicate_journal_to_quorum",
+    "recover_journal_prefix",
 ]
