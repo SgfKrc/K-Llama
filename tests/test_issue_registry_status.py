@@ -22,8 +22,10 @@ REPO_ROOT = Path(__file__).parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "check_issue_registry_status.py"
 REGISTRY = REPO_ROOT / "docs" / "已知问题记录.md"
 
-#: 迁移前的已知基数（2026-10-11：5 条）。迁移完成后改为 0。
-R1_BASELINE = 5
+#: R1a 基线（2026-10-11：8 条已挂账后应为 0）。新滞留会立刻让它变红。
+R1A_BASELINE = 0
+#: R1b（已挂账、待搬区）允许存在；搬区完成后应归零。
+R1B_BASELINE = 5
 
 
 def _load_checker():
@@ -51,11 +53,21 @@ def test_no_duplicate_ticket_ids():
     assert report["duplicate_ticket_ids"] == [], report["duplicate_ticket_ids"]
 
 
-def test_fixed_but_still_open_does_not_grow():
-    """R1：允许既有基数，但不得新增（防清单继续漂移）。"""
+def test_no_unaccounted_fixed_entries_in_open_section():
+    """R1a：未闭环区里「自述已修且**未挂账**」的条目必须为 0。
+
+    挂账方式 = 标题旁写一句「待归档」（本轮给 #51/#52/#53/#58/#68/#79/#91/#92 都加了）。
+    """
     report = _analyse()
     offenders = report["fixed_but_still_open"]
-    assert len(offenders) <= R1_BASELINE, [item["ticket"] for item in offenders]
+    assert offenders == [], [item["ticket"] for item in offenders]
+
+
+def test_declared_for_archive_does_not_grow():
+    """R1b：已挂账待搬区的条目不得新增（搬区完成后应收紧到 0）。"""
+    report = _analyse()
+    declared = report["declared_for_archive"]
+    assert len(declared) <= R1B_BASELINE, [item["ticket"] for item in declared]
 
 
 def test_cli_reports_machine_readable_json():

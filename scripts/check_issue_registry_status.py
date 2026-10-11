@@ -50,6 +50,8 @@ FIXED_SECTIONS = ("2. 已修复", "3. 上游缺陷")
 FIXED_WORDS = re.compile(r"已修复|已修|已完成|已闭环|主缺口已修")
 #: ... unless they are explicitly scoped as partial / still pending
 PARTIAL_WORDS = re.compile(r"部分|待做|待实网|待真机|待归档|未接线|待接线")
+#: 标题下已声明「待归档」的条目 = 已挂账（不算未挂账违规，只是还没搬区）
+ARCHIVE_MARKER = re.compile(r"待归档")
 TICKET_ID = re.compile(r"^###\s*#(\d+(?:\.\d+)?[a-z]?)")
 
 
@@ -68,7 +70,11 @@ def _sections(lines: list[str]) -> list[tuple[str, int, int]]:
 
 
 def analyse(lines: list[str]) -> dict:
-    report: dict = {"fixed_but_still_open": [], "duplicate_ticket_ids": []}
+    report: dict = {
+        "fixed_but_still_open": [],
+        "declared_for_archive": [],
+        "duplicate_ticket_ids": [],
+    }
     seen: dict[str, list[int]] = {}
 
     for title, start, end in _sections(lines):
@@ -81,9 +87,18 @@ def analyse(lines: list[str]) -> dict:
             ticket = "#" + match.group(1)
             seen.setdefault(ticket, []).append(index + 1)
             if is_open and FIXED_WORDS.search(line) and not PARTIAL_WORDS.search(line):
-                report["fixed_but_still_open"].append(
-                    {"line": index + 1, "ticket": ticket, "title": line[4:].strip()[:110]}
-                )
+                entry = {"line": index + 1, "ticket": ticket, "title": line[4:].strip()[:110]}
+                # 标题旁的注记若已声明「待归档」，说明作者已经挂账 ⇒ 单独计数，
+                # 不再算「未挂账的清单漂移」（基线才能逐步收紧到 0）。
+                note = ""
+                for probe in range(index + 1, min(index + 5, end)):
+                    if lines[probe].strip():
+                        note = lines[probe]
+                        break
+                if ARCHIVE_MARKER.search(note):
+                    report["declared_for_archive"].append(entry)
+                else:
+                    report["fixed_but_still_open"].append(entry)
 
     for ticket, line_numbers in seen.items():
         if len(line_numbers) > 1:
@@ -110,8 +125,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if report["duplicate_ticket_ids"] else 0
 
     still_open = report["fixed_but_still_open"]
-    print(f"R1 自述已修但仍在未闭环区: {len(still_open)} 条（报告级；建议迁往「已修复」区）")
+    declared = report["declared_for_archive"]
+    print(f"R1a 自述已修却仍在未闭环、**且未挂账**: {len(still_open)} 条（应趋于 0）")
     for item in still_open:
+        print(f"   L{item['line']:<5} {item['ticket']:<8} {item['title']}")
+    print(f"R1b 已声明「待归档」（已挂账，待搬区）: {len(declared)} 条")
+    for item in declared:
         print(f"   L{item['line']:<5} {item['ticket']:<8} {item['title']}")
 
     duplicates = report["duplicate_ticket_ids"]
