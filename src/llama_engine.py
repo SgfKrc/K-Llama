@@ -375,9 +375,39 @@ class LlamaCppEngine:
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
         if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
-        total_layers = int(info.get("n_layer", 0) or 0)
-        if total_layers <= 0:
+        local_total_layers = int(info.get("n_layer", 0) or 0)
+        if local_total_layers <= 0:
             return {}
+        # ★ 2026-10-11（三机实测 / total_layers 缺口，用户裁定「不能加载整模，这是接力的初衷」）：
+        #   裁层工件的 GGUF 头只含**本段**层（head=16），而容量求解器的区间判据要的是
+        #   **源模型**总层数（`pipeline_capacity.py:490` 取 `total_layers = len(layer_bytes)`，
+        #   `:74` 用它校验各节点 `layer_ranges` 上界）。此前 `total_layers` 直接取工件头部的
+        #   `n_layer` ⇒ 视图被钉成 16 ⇒ 远端 `[16,24)` / `[24,32)` 恒被拒
+        #   ⇒ 只能靠"加载整模"绕过，而那**违背接力初衷** ⇒ 这里按工件 manifest 的
+        #   `n_layer`/`source_layer_range` 把视图还原成源模型坐标系。
+        artifact_info = {}
+        for manifest_path in (
+            Path(path).with_suffix(".manifest.json"),
+            Path(str(path) + ".manifest.json"),
+        ):
+            manifest_info = read_artifact_manifest(manifest_path)
+            if manifest_info:
+                artifact_info = manifest_info
+                break
+        declared_range = artifact_info.get("source_layer_range")
+        segment_start = 0
+        if isinstance(declared_range, (list, tuple)) and len(declared_range) == 2:
+            try:
+                segment_start = int(declared_range[0])
+            except (TypeError, ValueError):
+                segment_start = 0
+        try:
+            declared_total = int(artifact_info.get("n_layer", 0) or 0)
+        except (TypeError, ValueError):
+            declared_total = 0
+        total_layers = declared_total if declared_total > 0 else local_total_layers
+        if total_layers < local_total_layers + segment_start:
+            total_layers = local_total_layers + segment_start
         # `pipeline_capacity` 的容量账要**逐层字节**与**分量字节**，两者都必须 exact
         # （它按此判定哪个 worker 装得下哪几层）。GGUF 里只有张量表，所以现场按
         # ggml 类型算一遍 —— 这也是「不用 offset 差值」的原因，差值含 32 字节对齐填充。
@@ -394,7 +424,9 @@ class LlamaCppEngine:
         for tensor_name, size in tensor_bytes.items():
             block = block_prefix.match(tensor_name)
             if block:
-                index = int(block.group(1))
+                # 工件内的 blk 索引是**本段局部**的（0..local_total_layers-1），
+                # 要按 manifest 的 source_layer_range 平移到源模型坐标系。
+                index = segment_start + int(block.group(1))
                 if index < total_layers:
                     layer_weight_bytes[index] += size
                     continue
@@ -406,7 +438,13 @@ class LlamaCppEngine:
                 component_weight_bytes["lm_head"] += size
             else:
                 component_weight_bytes["other"] += size
-        if any(size <= 0 for size in layer_weight_bytes):
+        # 只要求**本段**覆盖到字节：其它层属于别的段（远端执行），不是"缺失"。
+        segment_span = (segment_start, segment_start + local_total_layers)
+        if any(
+            size <= 0
+            for index, size in enumerate(layer_weight_bytes)
+            if segment_span[0] <= index < segment_span[1]
+        ):
             return {}
         try:
             weight_bytes = int(os.path.getsize(path))
