@@ -639,6 +639,16 @@ class RemoteFullWorkerProvider:
             payload=raw,
             payload_sha256=str(payload.get("payload_sha256") or ""),
         )
+        # 落盘到达痕迹：之前只有"装配成功"才打日志，导致"分片没到"与"分片到了但没触发
+        # 装配"两种情况无法区分（真机实测：ROG 侧已 `stage_result_chunked` + `sent`，
+        # 而 master 侧既无装配日志也无错误，只能看到 60s 超时）。
+        logger.info(
+            "event=task_worker_stage_result_chunk_received attempt_id=%s index=%d count=%d bytes=%d",
+            pending.attempt.attempt_id,
+            int(payload.get("chunk_index", -1)),
+            int(payload.get("chunk_count", 0)),
+            len(raw),
+        )
 
     def _expand_result_chunks_locked(
         self, pending: "_PendingRemoteAttempt", output: Any,

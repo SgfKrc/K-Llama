@@ -27,7 +27,6 @@ from task_worker_chunks import (
     stage_chunk_ref,
 )
 from task_worker_protocol import (
-    MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
     RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
@@ -254,8 +253,19 @@ class SchedulerTaskWorkerMixin:
         hidden = output.get("hidden_out_f32") if isinstance(output, Mapping) else None
         if not isinstance(hidden, str) or not hidden:
             return [_result(result_payload)]
-        if task_worker_message_bytes(_result(result_payload)) <= MAX_MESSAGE_BYTES:
-            return [_result(result_payload)]
+        # ⚠️ 不能用"构造一次看是否成功"之外的方式测量：`build_message`/`validate_message`
+        #   **在超限时直接抛 `message_too_large`**，拿它的返回值做 `<= MAX_MESSAGE_BYTES`
+        #   的判断永远走不到分片分支（真机实测：ROG 代码已更新仍报
+        #   `message exceeds maximum size`）。这里按协议自身的判定分流：能构造就直接发，
+        #   抛 `message_too_large` 才切分片。
+        try:
+            direct = _result(result_payload)
+        except WorkerProtocolError as exc:
+            if getattr(exc, "code", "") != "message_too_large":
+                raise
+            direct = None
+        if direct is not None:
+            return [direct]
         try:
             raw = base64.b64decode(hidden, validate=True)
             plan = plan_stage_payload_chunks(raw)
@@ -289,7 +299,12 @@ class SchedulerTaskWorkerMixin:
         new_output.pop("hidden_out_f32", None)
         new_output["hidden_out_ref"] = stage_chunk_ref(plan)
         shrunk["output"] = new_output
-        shrunk["output_sha256"] = task_worker_sha256(output)
+        # ⚠️ 协议层（`_validate_payload` 的 stage_result 分支）强制
+        #   `output_sha256 == stage_output_sha256(output)`，且校验的是**实际发送的 output
+        #   对象** ⇒ 切分片后必须按**新 output**（含 `hidden_out_ref`）重算摘要。
+        #   原始 hidden 的完整性由 `hidden_out_ref.payload_sha256`（装配摘要）保证，
+        #   output 内既有的 `hidden_out_sha256` 因字节未变而继续有效。
+        shrunk["output_sha256"] = task_worker_sha256(new_output)
         messages.append(_result(shrunk))
         logger.info(
             "event=task_worker_stage_result_chunked attempt_id=%s chunks=%d bytes=%d",
