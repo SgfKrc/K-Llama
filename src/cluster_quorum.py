@@ -626,6 +626,7 @@ class QuorumCollector:
         *,
         available_voter_ids: Sequence[str] | None = None,
         now_ms: int | None = None,
+        commit_watermark: Sequence[CommitWatermark] | None = None,
     ) -> QuorumOutcome:
         now = _now_ms(now_ms)
         available = self._available(available_voter_ids)
@@ -647,7 +648,12 @@ class QuorumCollector:
                 continue
         if len(prepared) < self.voter_set.quorum_size:
             return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
-        # #93：续期必须**保留**已提交前缀承诺（否则一次续期就把提交证明丢掉了）。
+        # #93：续期默认**保留**原承诺（`commit_watermark=None`），也允许调用方提议新的
+        # （提交点前进）；无论哪条路径，voter 都会重新校验自己是否耐久持有。
+        renewed_watermark = (
+            tuple(certificate.commit_watermark) if commit_watermark is None
+            else tuple(commit_watermark)
+        )
         renewed_unsigned = QuorumCertificate(
             cluster_id=certificate.cluster_id,
             voter_set_epoch=certificate.voter_set_epoch,
@@ -656,7 +662,7 @@ class QuorumCollector:
             lease_id=certificate.lease_id,
             expires_at_ms=now + self.policy.lease_duration_ms,
             signatures=tuple(),
-            commit_watermark=tuple(certificate.commit_watermark),
+            commit_watermark=renewed_watermark,
         )
         signatures = []
         watermark_error = ""

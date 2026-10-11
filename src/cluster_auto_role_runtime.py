@@ -19,10 +19,15 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from cluster_auto_role import AutoRoleController
-from cluster_control_contract import ControlContractError, ControlPlaneAuthority, VoterSet
+from cluster_control_contract import (
+    CommitWatermark,
+    ControlContractError,
+    ControlPlaneAuthority,
+    VoterSet,
+)
 from cluster_fence import ControlFence
 from cluster_quorum import (
     QuorumCollector,
@@ -31,6 +36,7 @@ from cluster_quorum import (
     QuorumVoter,
     SQLiteVoterLedger,
 )
+from journal_replication import DurableJournalReplica
 
 
 AUTO_ROLE_RPC_HEADER = "X-QLH-Quorum-Secret"
@@ -143,13 +149,100 @@ class HTTPRemoteVoter:
         return dict(self._call({"op": "snapshot"}).get("snapshot", {}))
 
 
+class JournalPrefixAuthority:
+    """#93：把本地 journal 复制副本当成「已提交前缀」的权威。
+
+    两个方向的能力：
+    - ``held(workflow_id)``：本节点**耐久持有且自洽**的前缀（供 voter 签名前自检、
+      以及 leader 提议水位）；
+    - ``enforce(certificate)``：接管前核对证书承诺 —— 本地**多出的未提交尾部先截断**，
+      之后仍落后或无法自证 ⇒ 抛错（fail-closed，必须先靠 checkpoint 追赶/重建）。
+    """
+
+    def __init__(self, replica: DurableJournalReplica, *, workflows: Sequence[str] = ()) -> None:
+        self.replica = replica
+        self.workflows = tuple(sorted({str(item) for item in workflows if str(item)}))
+        self._lock = threading.RLock()
+        #: 诊断：本次进程内因接管核对而被截断的 workflow → 被丢弃的事件数。
+        self.truncated: dict[str, int] = {}
+
+    def held(self, workflow_id: str) -> CommitWatermark | None:
+        """本地耐久持有且**自洽**的前缀；不完整（例如刚截断过）时为 None。"""
+        with self._lock:
+            try:
+                status = self.replica.recovery_status(str(workflow_id))
+            except Exception:  # noqa: BLE001 - 读不出来就当「不持有」，绝不猜
+                return None
+        if not status.get("verified"):
+            return None
+        return CommitWatermark(
+            workflow_id=str(workflow_id),
+            last_sequence=int(status["durable_sequence"]),
+            checkpoint_digest=str(status["checkpoint_digest"]),
+        )
+
+    def propose(self) -> tuple[CommitWatermark, ...]:
+        """leader 提议：只声明**已经自洽**的 workflow（读不到的就不承诺）。"""
+        proposed = []
+        for workflow_id in self.workflows:
+            item = self.held(workflow_id)
+            if item is not None:
+                proposed.append(item)
+        return tuple(proposed)
+
+    def enforce(self, certificate: Any) -> None:
+        """接管前核对：先截断未提交尾部，再要求本地前缀 ≥ 且一致于证书承诺。"""
+        watermarks = tuple(getattr(certificate, "commit_watermark", ()) or ())
+        if not watermarks:
+            return
+        for watermark in watermarks:
+            workflow_id = watermark.workflow_id
+            with self._lock:
+                prefix = self.replica.durable_prefix(workflow_id)
+                if int(prefix["last_sequence"]) > int(watermark.last_sequence):
+                    result = self.replica.truncate_to(
+                        workflow_id, last_sequence=int(watermark.last_sequence),
+                    )
+                    self.truncated[workflow_id] = int(result.get("removed_events", 0))
+                held = self.held(workflow_id)
+            if held is None:
+                raise AutoRoleRuntimeError(
+                    "committed_prefix_behind",
+                    f"replica prefix for {workflow_id} is not self-consistent yet",
+                )
+            if held.last_sequence < watermark.last_sequence:
+                raise AutoRoleRuntimeError(
+                    "committed_prefix_behind",
+                    f"replica prefix {held.last_sequence} < committed {watermark.last_sequence}",
+                )
+            if (
+                held.last_sequence == watermark.last_sequence
+                and held.checkpoint_digest != watermark.checkpoint_digest
+            ):
+                raise AutoRoleRuntimeError(
+                    "committed_prefix_forked",
+                    f"replica prefix diverges from the committed point {watermark.last_sequence}",
+                )
+
+
 class AutoRoleRuntime:
     """Configured local voter, collector, and local RPC handler."""
 
-    def __init__(self, *, voter: QuorumVoter, collector: QuorumCollector, secret: str) -> None:
+    def __init__(
+        self,
+        *,
+        voter: QuorumVoter,
+        collector: QuorumCollector,
+        secret: str,
+        commit_watermark_provider: Any = None,
+        committed_prefix_guard: Any = None,
+    ) -> None:
         self.voter = voter
         self.collector = collector
         self.secret = str(secret)
+        #: #93：透传给 AutoRoleController 的提交证明来源与接管核对钩子。
+        self.commit_watermark_provider = commit_watermark_provider
+        self.committed_prefix_guard = committed_prefix_guard
         self._renewal_lock = threading.Lock()
         self._renewal_thread: threading.Thread | None = None
         self._renewal_stop: threading.Event | None = None
@@ -251,11 +344,30 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRun
     ledger_path = os.environ.get("QLH_CONTROL_VOTER_LEDGER", "").strip()
     if not ledger_path:
         ledger_path = str(Path(os.environ.get("QLH_STATE_DIR", ".qlh-state")).expanduser() / f"quorum-{voter_id}.sqlite3")
+    # #93：若部署给了本地 journal 复制副本，就用它当「已提交前缀」的权威：
+    # ① voter 签名前自检是否耐久持有；② leader 提议水位；③ 接管前核对（截断/拒绝）。
+    replica_path = os.environ.get("QLH_JOURNAL_REPLICA", "").strip()
+    prefix_authority: JournalPrefixAuthority | None = None
+    if replica_path:
+        workflows = [
+            item.strip()
+            for item in os.environ.get("QLH_COMMIT_WATERMARK_WORKFLOWS", "").split(",")
+            if item.strip()
+        ]
+        prefix_authority = JournalPrefixAuthority(
+            DurableJournalReplica(
+                replica_path,
+                source_node_id=os.environ.get("QLH_JOURNAL_SOURCE_NODE_ID", "").strip() or voter_id,
+                stream_id=os.environ.get("QLH_JOURNAL_STREAM_ID", "").strip() or "journal-1",
+            ),
+            workflows=workflows,
+        )
     local = QuorumVoter(
         voter_id=voter_id,
         private_key=private_key,
         voter_set=voter_set,
         ledger=SQLiteVoterLedger(ledger_path, voter_id=voter_id, cluster_id=voter_set.cluster_id, voter_set_epoch=voter_set.voter_set_epoch),
+        watermark_source=prefix_authority.held if prefix_authority is not None else None,
     )
     secret = os.environ.get("QLH_CONTROL_VOTER_RPC_SECRET", "") or os.environ.get("QLH_CLUSTER_SECRET", "")
     if not secret:
@@ -282,7 +394,13 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRun
     if len(voters) < voter_set.quorum_size:
         raise AutoRoleRuntimeError("auto_role_peers_incomplete", "configured voter peers cannot form a quorum")
     collector = QuorumCollector(voter_set=voter_set, voters=voters, policy=QuorumPolicy(lease_duration_ms=lease_ms))
-    return AutoRoleRuntime(voter=local, collector=collector, secret=secret)
+    return AutoRoleRuntime(
+        voter=local,
+        collector=collector,
+        secret=secret,
+        commit_watermark_provider=prefix_authority.propose if prefix_authority is not None else None,
+        committed_prefix_guard=prefix_authority.enforce if prefix_authority is not None else None,
+    )
 
 
 def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = None) -> AutoRoleRuntime | None:
@@ -304,7 +422,12 @@ def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = No
         # static master merely because the API module was not imported.
         fence = ControlFence(authority, required=True)
         scheduler.set_control_fence(fence)
-    controller = AutoRoleController(runtime.voter.voter_id, mode="auto", authority=authority, collector=runtime.collector, fence=fence)
+    controller = AutoRoleController(
+        runtime.voter.voter_id, mode="auto", authority=authority,
+        collector=runtime.collector, fence=fence,
+        commit_watermark_provider=runtime.commit_watermark_provider,
+        committed_prefix_guard=runtime.committed_prefix_guard,
+    )
     fence.set_role_guard(controller.can_write)
     scheduler.set_auto_role_controller(controller)
     scheduler._auto_role_runtime = runtime
@@ -317,6 +440,7 @@ __all__ = [
     "AutoRoleRuntime",
     "AutoRoleRuntimeError",
     "HTTPRemoteVoter",
+    "JournalPrefixAuthority",
     "build_auto_role_runtime",
     "install_auto_role_controller",
 ]
