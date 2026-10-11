@@ -104,6 +104,48 @@ def _verified_layer_artifact_sha256(path) -> str:
         return value
 
 
+def _layer_weight_bytes_of(artifact_path, local_layers: int) -> list[int]:
+    """统计**本段局部**的逐层字节（按 `blk.N.` 前缀聚合 GGUF 张量表）。
+
+    与 `llama_engine.get_pipeline_descriptor` 对工件的算法同源：现场按 ggml 类型算，
+    **不用** offset 差值（差值含 32 字节对齐填充 ⇒ 与容量账不符）。
+
+    ★ 2026-10-11（方案 A）：接力不加载整模 ⇒ 主节点只有本段字节，而容量求解需要整模的
+    逐层字节 ⇒ 由各 worker 申报自己那一段，主节点按 `layer_range` 平移后拼成整模视图。
+
+    返回**本段局部**口径（长度 = 段层数，下标 0 = 段内第一层）；任一层取不到字节即返回
+    空列表（宁可不上报，也不上报一份残缺的容量账）。
+    """
+    try:
+        from relay_segment_info import read_gguf_tensor_bytes
+    except ImportError:  # 以包形式导入本模块时（src.scheduler_task_worker）
+        try:
+            from .relay_segment_info import read_gguf_tensor_bytes
+        except ImportError:
+            return []
+    count = int(local_layers or 0)
+    if count <= 0:
+        return []
+    try:
+        tensor_bytes = read_gguf_tensor_bytes(str(artifact_path))
+    except Exception:
+        return []
+    if not tensor_bytes:
+        return []
+    sizes = [0] * count
+    pattern = re.compile(r"^blk\.(\d+)\.")
+    for name, size in tensor_bytes.items():
+        matched = pattern.match(str(name))
+        if not matched:
+            continue
+        index = int(matched.group(1))
+        if 0 <= index < count:
+            sizes[index] += int(size)
+    if any(value <= 0 for value in sizes):
+        return []
+    return sizes
+
+
 @dataclass
 class _TaskWorkerActiveAttempt:
     workflow_id: str
@@ -209,6 +251,16 @@ class SchedulerTaskWorkerMixin:
             "revision": str(data.get("generator_version", "") or ""),
             "segment_mode": segment_mode,
         }
+        # ★ 2026-10-11（方案 A：worker 上报本段逐层字节）：接力不加载整模 ⇒ 主节点只持有
+        #   **本段**的逐层字节，而容量求解需要**整模**的逐层字节 ⇒ 各 worker 各报自己那一段，
+        #   主节点按 `layer_range` 平移到源模型坐标系后拼出整模视图。
+        #   这里是**本段局部**口径（0..段层数-1），与 `llama_engine.get_pipeline_descriptor`
+        #   对工件的算法同源（现场按 ggml 类型算，不用 offset 差值）。
+        segment_layer_bytes = _layer_weight_bytes_of(
+            artifact_path, int(value[1]) - int(value[0])
+        )
+        if segment_layer_bytes:
+            result["layer_weight_bytes"] = segment_layer_bytes
         if contract_complete:
             result.update({
                 "source_model_id": source_model_id,
