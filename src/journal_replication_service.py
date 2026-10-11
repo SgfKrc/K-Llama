@@ -89,6 +89,51 @@ def _env_timeout(env: Mapping[str, str], name: str, default: float = 5.0) -> flo
     return value
 
 
+def _env_int(
+    env: Mapping[str, str],
+    name: str,
+    default: int = 0,
+    *,
+    minimum: int = 0,
+    maximum: int = 4096,
+) -> int:
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if not (minimum <= value <= maximum):
+        return default
+    return value
+
+
+def _parse_quorum_peers(value: str) -> tuple[tuple[str, int], ...]:
+    """解析 ``host:port,host:port``；**非法项直接丢弃**（绝不猜端口、绝不回退到默认端口）。"""
+
+    peers: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for item in str(value or "").split(","):
+        text = item.strip()
+        if not text:
+            continue
+        host, _, port_text = text.rpartition(":")
+        host = host.strip()
+        try:
+            port = int(port_text)
+        except (TypeError, ValueError):
+            continue
+        if not host or not (0 < port <= 65535):
+            continue
+        entry = (host, port)
+        if entry in seen:
+            continue
+        seen.add(entry)
+        peers.append(entry)
+    return tuple(peers)
+
+
 @dataclass(frozen=True)
 class JournalReplicationSettings:
     """复制链路的运行参数。`enabled` 默认 **False** —— 不显式开启就什么都不做。"""
@@ -103,10 +148,22 @@ class JournalReplicationSettings:
     peer_port: int = 0
     timeout_s: float = 5.0
     secret: bytes = b""
+    #: #93：**回包前栅栏**的多数耐久目标。空 = 不做多数判定（退回单 peer 语义，行为不变）。
+    quorum_peers: tuple[tuple[str, int], ...] = ()
+    quorum_size: int = 0
 
     @property
     def secret_bytes(self) -> bytes:
         return bytes(self.secret)
+
+    @property
+    def required_quorum(self) -> int:
+        """栅栏阈值：未显式指定时按**多数**取（``len(peers)//2 + 1``）；无对端 ⇒ 0。"""
+        if not self.quorum_peers:
+            return 0
+        if self.quorum_size > 0:
+            return min(self.quorum_size, len(self.quorum_peers))
+        return len(self.quorum_peers) // 2 + 1
 
     def validate(self) -> None:
         """配置自检。**只在开启时才严格要求** —— 关着的时候允许缺项。"""
@@ -125,6 +182,10 @@ class JournalReplicationSettings:
             raise JournalReplicationError(
                 f"QLH_JOURNAL_REPLICATION_SECRET must be at least {MIN_SECRET_BYTES} bytes"
             )
+        if self.quorum_size > len(self.quorum_peers):
+            raise JournalReplicationError(
+                "QLH_JOURNAL_REPLICATION_QUORUM_SIZE cannot exceed the configured quorum peers"
+            )
 
     def require_enabled(self) -> None:
         if not self.enabled:
@@ -142,6 +203,15 @@ class JournalReplicationSettings:
                 "QLH_JOURNAL_REPLICATION_PEER_HOST / _PEER_PORT are required to push a checkpoint"
             )
 
+    def require_quorum_peers(self) -> None:
+        """#93：回包前栅栏需要**多个** replica 目标，否则「多数」没有意义。"""
+
+        self.require_enabled()
+        if not self.quorum_peers:
+            raise JournalReplicationError(
+                "QLH_JOURNAL_REPLICATION_QUORUM_PEERS is required for the quorum barrier"
+            )
+
     def public(self) -> dict[str, Any]:
         """对外可见的状态 —— **绝不回显 secret**。"""
 
@@ -154,6 +224,11 @@ class JournalReplicationSettings:
             "peer": {"host": self.peer_host, "port": self.peer_port},
             "timeout_s": self.timeout_s,
             "secret_present": len(self.secret_bytes) >= MIN_SECRET_BYTES,
+            "quorum": {
+                "peers": [f"{host}:{port}" for host, port in self.quorum_peers],
+                "size": self.quorum_size,
+                "required": self.required_quorum,
+            },
         }
 
     @classmethod
@@ -183,6 +258,10 @@ class JournalReplicationSettings:
             peer_port=_env_port(env, "QLH_JOURNAL_REPLICATION_PEER_PORT", 0),
             timeout_s=_env_timeout(env, "QLH_JOURNAL_REPLICATION_TIMEOUT_S", 5.0),
             secret=secret_text.encode("utf-8"),
+            quorum_peers=_parse_quorum_peers(
+                _env_text(env, "QLH_JOURNAL_REPLICATION_QUORUM_PEERS")
+            ),
+            quorum_size=_env_int(env, "QLH_JOURNAL_REPLICATION_QUORUM_SIZE", 0),
         )
 
 
@@ -225,6 +304,70 @@ def replicate_journal_once(
         "durable_sequence": result.get("durable_sequence"),
         "checkpoint_digest": result.get("checkpoint_digest"),
         "event_count": len(checkpoint.records),
+    }
+
+
+def replicate_journal_to_quorum(
+    journal: Any,
+    *,
+    workflow_id: str,
+    settings: JournalReplicationSettings | None = None,
+) -> dict[str, Any]:
+    """#93「回包前栅栏」：把**同一个** checkpoint 推给多个 replica，达到多数耐久才回 OK。
+
+    与 `replicate_journal_once` 的差别就是**不**在第一个 ACK 上返回：
+
+    - 只做一次 `build_checkpoint` ⇒ 所有目标看到的是**同一个**快照与摘要（不会各拿一份）；
+    - 单个目标失败**不抛**（要能继续收集多数），失败原因逐个记进 `failures`；
+    - 返回 `accepted`（是否达到 `required_quorum`）与 `durable_acks`，HTTP 语义交给调用方；
+      调用方在 `accepted=False` 时**必须**回错误，否则这道栅栏等于不存在。
+
+    `send_checkpoint` 自身已校验对端回显的 `durable_sequence` / `checkpoint_digest`
+    ⇒ 这里的一个 ACK 就等于「对端**耐久**持有到该点」。
+    """
+
+    resolved = settings or JournalReplicationSettings.from_env()
+    resolved.require_quorum_peers()
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise JournalReplicationError("workflow_id is required")
+
+    checkpoint: JournalCheckpoint = build_checkpoint(
+        journal,
+        source_node_id=resolved.source_node_id,
+        stream_id=resolved.stream_id,
+        workflow_id=workflow_id,
+    )
+    required = resolved.required_quorum
+    durable: list[str] = []
+    failures: dict[str, str] = {}
+    for host, port in resolved.quorum_peers:
+        label = f"{host}:{port}"
+        try:
+            send_checkpoint(
+                host,
+                port,
+                checkpoint,
+                secret=resolved.secret_bytes,
+                timeout=resolved.timeout_s,
+            )
+        except (JournalReplicationTransportError, OSError) as exc:
+            failures[label] = type(exc).__name__
+            continue
+        durable.append(label)
+    accepted = len(durable) >= required
+    return {
+        "status": "replicated" if accepted else "quorum_not_reached",
+        "accepted": accepted,
+        "workflow_id": workflow_id,
+        "source_node_id": resolved.source_node_id,
+        "stream_id": resolved.stream_id,
+        "durable_sequence": checkpoint.last_sequence,
+        "checkpoint_digest": checkpoint.checkpoint_digest,
+        "event_count": len(checkpoint.records),
+        "durable_acks": len(durable),
+        "required_quorum": required,
+        "durable_peers": durable,
+        "failures": failures,
     }
 
 
@@ -287,4 +430,5 @@ __all__ = [
     "JournalReplicationSettings",
     "JournalReplicationTransportError",
     "replicate_journal_once",
+    "replicate_journal_to_quorum",
 ]

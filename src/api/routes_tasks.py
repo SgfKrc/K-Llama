@@ -12,6 +12,7 @@ from journal_replication_service import (
     JournalReplicationSettings,
     JournalReplicationTransportError,
     replicate_journal_once,
+    replicate_journal_to_quorum,
 )
 
 router = APIRouter()
@@ -149,6 +150,20 @@ async def replicate_journal(workflow_id: str):
     if journal is None:
         raise _api_module.HTTPException(503, "任务图 journal 不可用，无法取快照。")
     try:
+        if settings.quorum_peers:
+            # #93「回包前栅栏」：配置了多个 replica 目标 ⇒ **多数耐久 ACK 才回 OK**。
+            # 未达成多数时按契约回 503（服务无法给出一致性承诺），并把达成度一并告知。
+            outcome = replicate_journal_to_quorum(
+                journal, workflow_id=workflow_id, settings=settings
+            )
+            if not outcome.get("accepted"):
+                raise _api_module.HTTPException(
+                    503,
+                    "journal 多数耐久未达成（durable_acks={0}/{1}），已拒绝回包。".format(
+                        outcome.get("durable_acks"), outcome.get("required_quorum"),
+                    ),
+                )
+            return outcome
         return replicate_journal_once(journal, workflow_id=workflow_id, settings=settings)
     except JournalReplicationDisabled as exc:
         raise _api_module.HTTPException(409, str(exc)) from exc
