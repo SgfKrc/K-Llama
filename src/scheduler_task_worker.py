@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib
 import logging
@@ -11,7 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from scheduler_types import NodeRole
 from task_provider import (
@@ -20,7 +21,13 @@ from task_provider import (
     sanitize_result_metadata as sanitize_task_result_metadata,
 )
 from task_worker_adapter import RemoteFullWorkerProvider, remote_provider_id
+from task_worker_chunks import (
+    build_stage_chunk,
+    plan_stage_payload_chunks,
+    stage_chunk_ref,
+)
 from task_worker_protocol import (
+    MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
     RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
@@ -210,6 +217,85 @@ class SchedulerTaskWorkerMixin:
                 "tokenizer_sha256": tokenizer_sha256,
             })
         return result
+
+    def _task_worker_stage_result_messages(
+        self,
+        result_payload: dict,
+        *,
+        offer: Mapping[str, Any],
+        attempt_id: str,
+        provider_id: str,
+    ) -> list:
+        """构造 stage_result；`output.hidden_out_f32` 超单帧预算时先切**回程分片**。
+
+        ★ 2026-10-11（ROG+Y700+本机三机实测）：协议此前只做了**输入方向**分片，回程
+        hidden 必须整体塞进 `MAX_MESSAGE_BYTES`（8 MiB）⇒ 长 prefill（实测 1004 tokens，
+        f32 ≈ 8.2 MiB、base64 后 ≈ 11 MiB）必然 `message exceeds maximum size`，主节点
+        只看到 `remote worker reported a Stage error`。
+
+        这里复用输入方向的 `plan_stage_payload_chunks` 与
+        `build_stage_chunk(message_type="stage_result_chunk")`：先发有序分片，再发一条引用
+        它们的 `stage_result`（`output.hidden_out_ref`）。对端若不认识该类型会以
+        `unsupported_message_type` 拒绝 ⇒ 与「超限失败」等价的 fail-closed，无静默降级。
+        `output_sha256` 仍按**原始完整 output** 计算（对端还原后可自行复核）。
+        """
+        now_ms = int(time.time() * 1000)
+
+        def _result(payload: dict):
+            return build_task_worker_message(
+                "stage_result",
+                payload,
+                message_id=f"msg_result_{uuid.uuid4().hex}",
+                sent_at_ms=now_ms,
+                version=TASK_WORKER_PROTOCOL_VERSION,
+            )
+
+        output = result_payload.get("output")
+        hidden = output.get("hidden_out_f32") if isinstance(output, Mapping) else None
+        if not isinstance(hidden, str) or not hidden:
+            return [_result(result_payload)]
+        if task_worker_message_bytes(_result(result_payload)) <= MAX_MESSAGE_BYTES:
+            return [_result(result_payload)]
+        try:
+            raw = base64.b64decode(hidden, validate=True)
+            plan = plan_stage_payload_chunks(raw)
+        except Exception:
+            # 切分失败不得掩盖真因：照常返回原消息，让「超限」错误原样暴露。
+            logger.warning(
+                "event=task_worker_stage_result_chunk_plan_failed attempt_id=%s",
+                attempt_id, exc_info=True,
+            )
+            return [_result(result_payload)]
+        messages = []
+        for index, chunk in enumerate(plan.chunks):
+            messages.append(build_stage_chunk(
+                workflow_id=str(offer["workflow_id"]),
+                stage_id=str(offer["stage_id"]),
+                attempt_id=attempt_id,
+                lease_id=str(offer["lease_id"]),
+                lease_epoch=int(offer["lease_epoch"]),
+                provider_id=provider_id,
+                chunk_index=index,
+                chunk_count=plan.chunk_count,
+                payload=chunk,
+                total_bytes=plan.total_bytes,
+                message_id=f"msg_chunk_{uuid.uuid4().hex}",
+                sent_at_ms=now_ms,
+                version=TASK_WORKER_PROTOCOL_VERSION,
+                message_type="stage_result_chunk",
+            ))
+        shrunk = dict(result_payload)
+        new_output = dict(output)
+        new_output.pop("hidden_out_f32", None)
+        new_output["hidden_out_ref"] = stage_chunk_ref(plan)
+        shrunk["output"] = new_output
+        shrunk["output_sha256"] = task_worker_sha256(output)
+        messages.append(_result(shrunk))
+        logger.info(
+            "event=task_worker_stage_result_chunked attempt_id=%s chunks=%d bytes=%d",
+            attempt_id, plan.chunk_count, plan.total_bytes,
+        )
+        return messages
 
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
@@ -1120,24 +1206,25 @@ class SchedulerTaskWorkerMixin:
                 "output_sha256": task_worker_sha256(output),
                 "metadata": sanitize_task_result_metadata(output),
             })
-            response = build_task_worker_message(
-                "stage_result",
+            responses = self._task_worker_stage_result_messages(
                 result_payload,
-                message_id=f"msg_result_{uuid.uuid4().hex}",
-                sent_at_ms=int(time.time() * 1000),
-                version=TASK_WORKER_PROTOCOL_VERSION,
+                offer=offer,
+                attempt_id=attempt_id,
+                provider_id=expected_provider,
             )
-            try:
-                self._send_task_worker_response(message.message_id, response)
-            except Exception:
-                logger.warning(
-                    "event=task_worker_stage_result_send_failed attempt_id=%s",
-                    attempt_id, exc_info=True,
-                )
-                return
+            for response in responses:
+                try:
+                    self._send_task_worker_response(message.message_id, response)
+                except Exception:
+                    logger.warning(
+                        "event=task_worker_stage_result_send_failed attempt_id=%s",
+                        attempt_id, exc_info=True,
+                    )
+                    return
             logger.info(
-                "event=task_worker_stage_result_sent workflow_id=%s stage_id=%s attempt_id=%s",
+                "event=task_worker_stage_result_sent workflow_id=%s stage_id=%s attempt_id=%s chunks=%d",
                 offer["workflow_id"], offer["stage_id"], attempt_id,
+                max(0, len(responses) - 1),
             )
         except Exception as exc:
             with self._task_worker_stage_lock:

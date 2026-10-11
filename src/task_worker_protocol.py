@@ -65,6 +65,9 @@ MESSAGE_TYPES = frozenset({
     "stage_cancelled",
     #: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的有序分片（v3 起）。
     "stage_chunk",
+    #: ★ 2026-10-11（三机实测）：回程分片（worker → master）。见 `_PAYLOAD_FIELDS`
+    #: 里同名字段的说明；只对声明 `stage_chunked_output` 的对端使用。
+    "stage_result_chunk",
 })
 
 _MESSAGE_ID = re.compile(r"^msg_[A-Za-z0-9_-]{8,96}$")
@@ -194,6 +197,15 @@ _PAYLOAD_FIELDS = {
     #: `payload_b64` 是**原始字节**的 base64；`payload_sha256` 是这些字节的摘要，
     #: 使接收端能在装配前逐片校验（装配完仍以 `stage_offer.hidden_sha256` 兜底）。
     "stage_chunk": _IDENTITY_FIELDS | {
+        "provider_id", "chunk_index", "chunk_count", "payload_b64",
+        "payload_sha256", "total_bytes",
+    },
+    #: ★ 2026-10-11（ROG+Y700+本机三机实测）：**回程**分片。
+    #: `stage_result.output.hidden_out_f32` 超过单帧预算时，worker 先发 N 条本类型，
+    #: 再发一条引用它们的 `stage_result`（`output.hidden_out_ref`）。字段与 `stage_chunk`
+    #: **同形**，以便复用两侧既有装配器；仅对在 HELLO 里声明 `stage_chunked_output`
+    #: 的对端使用，旧对端行为不变。
+    "stage_result_chunk": _IDENTITY_FIELDS | {
         "provider_id", "chunk_index", "chunk_count", "payload_b64",
         "payload_sha256", "total_bytes",
     },
@@ -1198,10 +1210,12 @@ def _validate_payload(
             max_length=64,
         )
         _require_bool(payload["retryable"], "payload.retryable")
-    elif message_type == "stage_chunk":
+    elif message_type in {"stage_chunk", "stage_result_chunk"}:
         # ★ 2026-10-07（DIST-NEXT-2b）：分片的形状与硬上限。顺序语义（不得乱序、
         #   不得重复、集齐才装配）由接收端状态机 `task_worker_chunks.StageChunkAssembler`
         #   保证 —— 协议层只拒绝「单条就不合法」的分片。
+        # ★ 2026-10-11：**回程**分片 `stage_result_chunk` 与输入分片**同形**，因此共用本
+        #   分支的全部约束（片数/单片/总字节上限、摘要格式、v3 起支持）。
         if version < 3:
             raise _error(
                 "unsupported_message_type", "message_type",

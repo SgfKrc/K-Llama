@@ -613,6 +613,65 @@ class RemoteFullWorkerProvider:
         self._outbound_stop = threading.Event()
         self._outbound_start_lock = threading.Lock()
         self._outbound_thread: Optional[threading.Thread] = None
+        #: ★ 2026-10-11（三机实测）：**回程**分片装配器。与输入方向共用同一实现
+        #:   （`StageChunkAssembler` 的语义、上限与错误码完全一致）。
+        from task_worker_chunks import StageChunkAssembler
+
+        self._result_chunk_assembler = StageChunkAssembler()
+
+    def _absorb_result_chunk_locked(
+        self, pending: "_PendingRemoteAttempt", payload: Mapping[str, Any],
+    ) -> None:
+        """累积一条回程分片（调用方持锁）。不合法即抛错，不落半条。"""
+        encoded = payload.get("payload_b64")
+        try:
+            raw = base64.b64decode(str(encoded or ""), validate=True)
+        except Exception as exc:  # noqa: BLE001 - 规范化为协议错误码
+            raise WorkerProtocolError(
+                "stage_result_chunk payload is not valid base64",
+                code="invalid_chunk_payload",
+                field="payload.payload_b64",
+            ) from exc
+        self._result_chunk_assembler.add(
+            attempt_id=pending.attempt.attempt_id,
+            chunk_index=int(payload.get("chunk_index", -1)),
+            chunk_count=int(payload.get("chunk_count", 0)),
+            payload=raw,
+            payload_sha256=str(payload.get("payload_sha256") or ""),
+        )
+
+    def _expand_result_chunks_locked(
+        self, pending: "_PendingRemoteAttempt", output: Any,
+    ) -> Any:
+        """把 `output.hidden_out_ref` 还原成内联 `hidden_out_f32`（调用方持锁）。
+
+        分片未齐 ⇒ `incomplete_chunks`；摘要不符 ⇒ `chunk_digest_mismatch`（两者都 fail-closed）。
+        还原成功后丢弃该 attempt 的分片状态。
+        """
+        if not isinstance(output, Mapping):
+            return output
+        ref = output.get("hidden_out_ref")
+        if not isinstance(ref, Mapping):
+            return output
+        attempt_id = pending.attempt.attempt_id
+        raw = self._result_chunk_assembler.assemble(attempt_id)
+        self._result_chunk_assembler.discard(attempt_id)
+        declared = str(ref.get("payload_sha256") or "").strip().lower()
+        actual = hashlib.sha256(raw).hexdigest()
+        if declared and declared != actual:
+            raise WorkerProtocolError(
+                "assembled stage result payload digest mismatch",
+                code="chunk_digest_mismatch",
+                field="payload.output.hidden_out_ref",
+            )
+        restored = dict(output)
+        restored.pop("hidden_out_ref", None)
+        restored["hidden_out_f32"] = base64.b64encode(raw).decode("ascii")
+        logger.info(
+            "event=task_worker_stage_result_chunks_assembled attempt_id=%s bytes=%d",
+            attempt_id, len(raw),
+        )
+        return restored
 
     def _send_outbound_messages(self) -> None:
         while True:
@@ -1420,6 +1479,8 @@ class RemoteFullWorkerProvider:
         message = decode_message(raw)
         if message.message_type not in {
             "stage_accept", "stage_result", "stage_error", "stage_cancelled",
+            # ★ 2026-10-11（三机实测）：**回程**分片，与输入方向的 `stage_chunk` 对称。
+            "stage_result_chunk",
         }:
             raise WorkerProtocolError(
                 "message is not a coordinator-side Stage response",
@@ -1465,6 +1526,12 @@ class RemoteFullWorkerProvider:
                     code="attempt_identity_mismatch",
                     field="payload",
                 )
+            if message.message_type == "stage_result_chunk":
+                # ★ 2026-10-11（三机实测）：**回程**分片。只按 attempt 累积、**不推进终态**；
+                #   随后的 `stage_result`（其 `output.hidden_out_ref` 引用这些分片）才决定结果。
+                #   与输入方向 `stage_chunk` 的语义完全对称。
+                self._absorb_result_chunk_locked(pending, payload)
+                return message
             terminal_kind = pending.terminal_snapshot()[0]
             if terminal_kind and message.message_type in {
                 "stage_accept", "stage_result", "stage_error",
@@ -1519,7 +1586,7 @@ class RemoteFullWorkerProvider:
                         field="message_type",
                     )
                 result = StageResult(
-                    output=payload["output"],
+                    output=self._expand_result_chunks_locked(pending, payload["output"]),
                     provider_id=payload["provider_id"],
                     metadata=payload["metadata"],
                     attempt_id=payload["attempt_id"],

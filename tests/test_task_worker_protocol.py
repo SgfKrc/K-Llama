@@ -36,9 +36,12 @@ def test_v1_golden_messages_round_trip_canonically(golden):
     assert golden["protocol"] == PROTOCOL_NAME
     decoded = [decode_message(message) for message in golden["messages"]]
 
-    # v1 golden 覆盖 v1 时代的全部类型；`stage_chunk` 是 v3 引入的大 payload 分片
-    # （DIST-NEXT-2b），不在 v1 fixture 范围内（其往返由 test_task_worker_chunks 覆盖）。
-    assert {message.message_type for message in decoded} == MESSAGE_TYPES - {"stage_chunk"}
+    # v1 golden 覆盖 v1 时代的全部类型；`stage_chunk`（DIST-NEXT-2b）与
+    # `stage_result_chunk`（2026-10-11 回程分片）都是 v3 引入的大 payload 分片，
+    # 不在 v1 fixture 范围内（其往返由 test_task_worker_chunks 覆盖）。
+    assert {message.message_type for message in decoded} == (
+        MESSAGE_TYPES - {"stage_chunk", "stage_result_chunk"}
+    )
     assert [message.snapshot() for message in decoded] == golden["messages"]
     for message in decoded:
         assert decode_message(canonical_message_bytes(message)) == message
