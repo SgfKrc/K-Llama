@@ -3349,6 +3349,12 @@ class SchedulerClusterMixin:
         self._distributed_inference_enabled = bool(enabled)
         self._client_reconnect_enabled = bool(enabled)
         if not enabled:
+            supply_worker = getattr(self, "_model_supply_worker", None)
+            if supply_worker is not None:
+                supply_worker.cancel()
+            supply = getattr(self, "_model_supply", None)
+            if supply is not None:
+                supply.cancel_active()
             self.release_pipeline_worker_for_local_model()
             client = getattr(self, "_tcp_client", None)
             if client is not None:

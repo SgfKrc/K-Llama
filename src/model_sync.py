@@ -52,6 +52,8 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
 
     cache_path = root / "model.sha256"
     metadata_path = root / _HASH_META_NAME
+    # Supply directories have an exact member whitelist; hashing must not add files.
+    cache_writable = not (root / "supply.manifest.json").exists()
     artifact_files = sorted(
         path for path in root.rglob("*")
         if (
@@ -73,7 +75,7 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
         }
         for path in artifact_files
     ]
-    if use_cache and cache_path.is_file() and metadata_path.is_file():
+    if cache_writable and use_cache and cache_path.is_file() and metadata_path.is_file():
         try:
             cached = cache_path.read_text(encoding="utf-8").strip().split()[0]
             cached_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -90,14 +92,15 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
             f"{relative}\0{path.stat().st_size}\0{file_sha}\n".encode("utf-8")
         )
     value = digest.hexdigest()
-    try:
-        cache_path.write_text(f"{value}  {root.name}\n", encoding="utf-8")
-        metadata_path.write_text(
-            json.dumps(fingerprint, ensure_ascii=True, sort_keys=True),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    if cache_writable:
+        try:
+            cache_path.write_text(f"{value}  {root.name}\n", encoding="utf-8")
+            metadata_path.write_text(
+                json.dumps(fingerprint, ensure_ascii=True, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
     return value
 
 

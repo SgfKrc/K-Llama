@@ -564,7 +564,8 @@ class LlamaCppEngine:
             # 的 manifest（"直接加载该段工件"的用法）。
             declared: list[int] | None = None
             _bases = []
-            _env_gguf = os.environ.get("QLH_LAYER_GGUF", "").strip()
+            from model_supply_worker import selected_gguf_path
+            _env_gguf = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
             if _env_gguf:
                 _bases.append(Path(_env_gguf))
             _bases.append(Path(resolved_path))
@@ -668,8 +669,15 @@ class LlamaCppEngine:
             raise RuntimeError("无法确定预切 GGUF 的源整模摘要，拒绝按层区间猜测工件")
 
         wanted = [int(start), int(end)]
+        from model_supply_worker import selected_gguf_path
+        supplied = selected_gguf_path()
+        candidates = sorted(directory.glob("*.manifest.json"))
+        if supplied:
+            supplied_path = _Path(supplied)
+            candidates = [supplied_path.with_suffix(".manifest.json")]
+            directory = supplied_path.parent
         matches: list[str] = []
-        for manifest in sorted(directory.glob("*.manifest.json")):
+        for manifest in candidates:
             info = read_artifact_manifest(manifest)
             if not info:
                 continue

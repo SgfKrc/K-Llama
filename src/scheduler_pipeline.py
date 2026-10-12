@@ -186,6 +186,46 @@ _PIPELINE_RECOVERY_PHASES = frozenset({
 })
 
 
+class _PipelineSupplyError(ValueError):
+    """A registered segment must never fall back to a different artifact."""
+
+    def __init__(self, field: str, *, changed: bool = False):
+        self.reason_code = (
+            "pipeline_supply_selection_changed" if changed
+            else "pipeline_supply_identity_mismatch"
+        )
+        super().__init__(f"{self.reason_code}: {field}")
+
+
+def _validate_pipeline_supply(
+    selected: dict, *, model_id: str, model_sha256: str,
+    total_layers: int, layer_range: tuple[int, int],
+    tokenizer_sha256: str = "", model_type: str = "",
+) -> None:
+    manifest = selected["manifest"]
+    expected = {
+        "source_model_id": model_id,
+        "source_model_sha256": model_sha256.lower(),
+        "total_layers": total_layers,
+        "layer_range": list(layer_range),
+    }
+    if tokenizer_sha256:
+        expected["tokenizer_sha256"] = tokenizer_sha256.lower()
+    if model_type:
+        expected["model_type"] = model_type
+    for field, value in expected.items():
+        if manifest.get(field) != value:
+            raise _PipelineSupplyError(field)
+    directory = str(selected.get("directory", "") or "")
+    model_path = str(selected.get("model_path", "") or "")
+    if (
+        not directory or not os.path.isdir(directory)
+        or os.path.normcase(os.path.abspath(model_path))
+        != os.path.normcase(os.path.abspath(directory))
+    ):
+        raise _PipelineSupplyError("directory")
+
+
 def _kv_state_seq_len(past, model_type: str) -> tuple[int, int]:
     """从 KV 状态里取 `(槽位数, 已缓存序列长度)` —— **同时支持 tuple 与 Cache 对象**。
 
@@ -472,6 +512,15 @@ def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
 
 
 class SchedulerPipelineMixin:
+    def _selected_pipeline_safetensors(self) -> dict | None:
+        from model_supply_worker import get_selected_model
+
+        worker = getattr(self, "_model_supply_worker", None)
+        selected = get_selected_model(getattr(worker, "root", None))
+        if selected and selected.get("manifest", {}).get("format") == "safetensors":
+            return selected
+        return None
+
     def _pipeline_lifecycle_snapshot_locked(self) -> dict | None:
         """Return a bounded JSON-safe transaction record for restart recovery."""
         transaction = self._pipeline_load_transaction
@@ -517,6 +566,8 @@ class SchedulerPipelineMixin:
             "model_id": str(plan.get("model_id", "") or ""),
             "model_type": str(plan.get("model_type", "") or ""),
             "model_sha256": str(plan.get("model_sha256", "") or ""),
+            "total_layers": int(plan.get("total_layers", 0) or 0),
+            "tokenizer_sha256": str(plan.get("tokenizer_sha256", "") or ""),
             "quant_type": str(plan.get("quant_type", "") or ""),
             "plan_id": str(plan.get("plan_id", "") or ""),
             "worker_ids": sorted(
@@ -827,6 +878,9 @@ class SchedulerPipelineMixin:
             action = str(item.get("action", "") or "")
             payload = item.get("payload")
             if node_id == "master":
+                # Recovery runs in a new master process. Its old in-memory
+                # candidate and previous runtime died with the prior process;
+                # remote candidates may still be alive and must be replayed.
                 continue
             if (
                 not cleanup_id
@@ -948,10 +1002,10 @@ class SchedulerPipelineMixin:
     def _restore_pipeline_model_for_recovery(self) -> bool:
         """Restore distributed-only model metadata before workers reconnect.
 
-        The lifecycle record intentionally contains no absolute path. Resolve
-        the persisted model identity through the local model registry (also
-        accepting the historical directory-name identity), then prepare only
-        metadata. No full model is materialized here.
+        The lifecycle record intentionally contains no absolute path. Prefer
+        the current verified supply and its persisted local assignment; ordinary
+        registry resolution also accepts the historical directory-name identity.
+        Prepare only metadata without materializing a full model.
         """
         if not self._pipeline_recovery_pending:
             return True
@@ -962,60 +1016,95 @@ class SchedulerPipelineMixin:
         if not model_id:
             self._pipeline_recovery_failure = "pipeline_recovery_model_identity_missing"
             return False
+        supplied = self._selected_pipeline_safetensors()
+        supply_range = None
+        if supplied is not None:
+            try:
+                local_ids = {"master", self.get_effective_node_id()}
+                assignment = next((
+                    item for item in state.get("assignments", [])
+                    if isinstance(item, dict) and item.get("node_id") in local_ids
+                ), None)
+                if assignment is None:
+                    raise _PipelineSupplyError("layer_range_missing")
+                supply_range = (
+                    int(assignment["start_layer"]), int(assignment["end_layer"]),
+                )
+                _validate_pipeline_supply(
+                    supplied, model_id=model_id,
+                    model_sha256=str(state.get("model_sha256", "") or ""),
+                    # Earlier lifecycle records did not persist total_layers.
+                    total_layers=int(
+                        state.get("total_layers", 0)
+                        or supplied["manifest"]["total_layers"]
+                    ),
+                    layer_range=supply_range,
+                    tokenizer_sha256=str(state.get("tokenizer_sha256", "") or ""),
+                    model_type=str(state.get("model_type", "") or "").lower(),
+                )
+            except (ValueError, TypeError, KeyError) as exc:
+                self._pipeline_recovery_failure = getattr(
+                    exc, "reason_code", "pipeline_supply_identity_mismatch",
+                )
+                logger.error("pipeline supply recovery rejected: %s", exc)
+                return False
         if self._get_active_pipeline_model_info():
             return True
 
         model_paths: list[str] = []
-        try:
-            from model_config import (
-                get_builtin_models,
-                get_model_config,
-                resolve_model_path,
-            )
-            from local_store import get_local_experimental_models
-
+        if supplied is not None:
+            model_paths.append(supplied["directory"])
+        else:
             try:
-                db_models = get_local_experimental_models()
+                from model_config import (
+                    get_builtin_models,
+                    get_model_config,
+                    resolve_model_path,
+                )
+                from local_store import get_local_experimental_models
+
+                try:
+                    db_models = get_local_experimental_models()
+                except Exception:
+                    db_models = []
+                    logger.warning(
+                        "failed to read local model registry during pipeline recovery",
+                        exc_info=True,
+                    )
+                configured = get_model_config(model_id, db_models)
+                candidates = [configured] if configured is not None else []
+                candidates.extend(
+                    item for item in get_builtin_models()
+                    if item is not configured
+                )
+                for candidate in candidates:
+                    resolved_paths = [
+                        resolve_model_path(str(getattr(candidate, key, "") or ""))
+                        for key in ("model_path", "gguf_path")
+                    ]
+                    candidate_matches = (
+                        str(getattr(candidate, "model_id", "") or "") == model_id
+                        or any(
+                            path and (
+                                os.path.basename(os.path.normpath(path)) == model_id
+                                or os.path.splitext(os.path.basename(path))[0] == model_id
+                            )
+                            for path in resolved_paths
+                        )
+                    )
+                    if not candidate_matches:
+                        continue
+                    for resolved in resolved_paths:
+                        if resolved and (os.path.isdir(resolved) or os.path.isfile(resolved)):
+                            normalized = os.path.abspath(resolved)
+                            if normalized not in model_paths:
+                                model_paths.append(normalized)
             except Exception:
-                db_models = []
                 logger.warning(
-                    "failed to read local model registry during pipeline recovery",
+                    "failed to resolve persisted pipeline model: model=%s",
+                    model_id,
                     exc_info=True,
                 )
-            configured = get_model_config(model_id, db_models)
-            candidates = [configured] if configured is not None else []
-            candidates.extend(
-                item for item in get_builtin_models()
-                if item is not configured
-            )
-            for candidate in candidates:
-                resolved_paths = [
-                    resolve_model_path(str(getattr(candidate, key, "") or ""))
-                    for key in ("model_path", "gguf_path")
-                ]
-                candidate_matches = (
-                    str(getattr(candidate, "model_id", "") or "") == model_id
-                    or any(
-                        path and (
-                            os.path.basename(os.path.normpath(path)) == model_id
-                            or os.path.splitext(os.path.basename(path))[0] == model_id
-                        )
-                        for path in resolved_paths
-                    )
-                )
-                if not candidate_matches:
-                    continue
-                for resolved in resolved_paths:
-                    if resolved and (os.path.isdir(resolved) or os.path.isfile(resolved)):
-                        normalized = os.path.abspath(resolved)
-                        if normalized not in model_paths:
-                            model_paths.append(normalized)
-        except Exception:
-            logger.warning(
-                "failed to resolve persisted pipeline model: model=%s",
-                model_id,
-                exc_info=True,
-            )
 
         prepare = getattr(self._host, "prepare_pipeline_model", None)
         if not model_paths or not callable(prepare):
@@ -1035,9 +1124,13 @@ class SchedulerPipelineMixin:
                     model_id=model_id,
                     model_path=model_path,
                     quant_type=(str(state.get("quant_type", "") or "") or None),
-                    # The persisted digest is an expectation, not evidence about
-                    # the bytes present after this restart. Recompute locally.
-                    model_sha256=None,
+                    # Supply selection verifies the live segment and its source
+                    # identity. Ordinary registry artifacts recompute their SHA.
+                    model_sha256=(
+                        supplied["manifest"]["source_model_sha256"]
+                        if supplied is not None else None
+                    ),
+                    **({"layer_range": supply_range} if supplied is not None else {}),
                 )
                 actual_sha256 = str(
                     candidate_descriptor.get("model_sha256", "")
@@ -2595,6 +2688,7 @@ class SchedulerPipelineMixin:
             if transaction and transaction.get("phase") not in {
                 "aborted", "rejected", "invalidated",
             }:
+                published = transaction.get("phase") == "ready"
                 transaction["phase"] = "invalidated"
                 transaction["reason_code"] = reason_code
                 transaction["reason"] = reason
@@ -2602,13 +2696,19 @@ class SchedulerPipelineMixin:
                     self._layer_config_generation + 1,
                     time.time_ns(),
                 )
-                cleanup_records.extend(
-                    self._record_pipeline_candidate_abort_cleanup_locked(
-                        transaction,
-                        generation=self._layer_config_generation,
-                        reason_code=reason_code,
+                # Ready is the publication boundary, even if finalize still
+                # owes cleanup of the previous runtime. Retiring that published
+                # assignment cannot roll it back or abort a finalized candidate.
+                # Keep existing finalize obligations fenced and retryable; the
+                # model-change owner releases the active runtime separately.
+                if not published:
+                    cleanup_records.extend(
+                        self._record_pipeline_candidate_abort_cleanup_locked(
+                            transaction,
+                            generation=self._layer_config_generation,
+                            reason_code=reason_code,
+                        )
                     )
-                )
                 self._persist_pipeline_lifecycle_locked()
             self._active_pipeline_capacity_plan = None
             self._prepared_layer_configs.clear()
@@ -4488,14 +4588,42 @@ class SchedulerPipelineMixin:
                     or prepared.get("assignment_id") != ack_assignment_id
                     or prepared.get("layer_range") != [start, end]
                     or prepared.get("model_sha256") != expected_sha256
+                    or any(
+                        field in prepared and prepared[field] != value
+                        for field, value in (
+                            ("generation", ack_generation),
+                            ("total_layers", total_layers),
+                            ("model_id", model_id),
+                            ("model_type", expected_model_type),
+                            ("has_embedding", has_embed),
+                            ("has_lm_head", has_lm),
+                            ("tokenizer_sha256", str(cfg.get("tokenizer_sha256", "") or "")),
+                        )
+                    )
                 ):
                     raise RuntimeError("commit 未命中同代际 prepared 记录")
 
             local_sha256 = ""
             local_model_path = None
+            # Commit retains the already materialized transaction even when
+            # the registration pointer has changed or has been revoked.
+            supplied = (
+                None if phase == "commit" and plan_id
+                else self._selected_pipeline_safetensors()
+            )
+            if supplied is not None:
+                _validate_pipeline_supply(
+                    supplied, model_id=model_id, model_sha256=expected_sha256,
+                    total_layers=total_layers, layer_range=(start, end),
+                    tokenizer_sha256=str(cfg.get("tokenizer_sha256", "") or ""),
+                    model_type=expected_model_type,
+                )
             if phase == "commit" and plan_id:
                 local_sha256 = str(prepared.get("model_sha256", "") or "")
                 local_model_path = prepared.get("model_path")
+            elif supplied is not None:
+                local_model_path = supplied["directory"]
+                local_sha256 = supplied["manifest"]["source_model_sha256"]
             elif phase == "prepare" and plan_id and cfg.get("assignment_manifest"):
                 from model_sync import (
                     ensure_pipeline_assignment_available,
@@ -4593,6 +4721,17 @@ class SchedulerPipelineMixin:
                     or start < 0 or end <= start or end > total_layers
                 ):
                     raise ValueError("worker 工件描述器与 prepare 契约不一致")
+                if supplied is not None:
+                    manifest = supplied["manifest"]
+                    for field in (
+                        "source_model_id", "source_model_sha256", "tokenizer_sha256",
+                    ):
+                        if descriptor.get(field) != manifest[field]:
+                            raise _PipelineSupplyError(field)
+                    if descriptor.get("supply_manifest_sha256") != manifest["manifest_sha256"]:
+                        raise _PipelineSupplyError("manifest_sha256")
+                    if descriptor.get("assignment_layer_range") != [start, end]:
+                        raise _PipelineSupplyError("layer_range")
                 profile = dict(self._local_device_profile or {})
                 gpu = self._select_scoring_gpu(profile)
                 cuda_discrete = bool(
@@ -4644,7 +4783,21 @@ class SchedulerPipelineMixin:
                     total_layers=total_layers or None,
                     model_id=model_id or None,
                 )
+                if supplied is not None:
+                    current = self._selected_pipeline_safetensors()
+                    if (
+                        current is None
+                        or current["directory"] != supplied["directory"]
+                        or current["manifest"]["manifest_sha256"]
+                        != supplied["manifest"]["manifest_sha256"]
+                    ):
+                        raise _PipelineSupplyError("registration", changed=True)
                 prepared_record = {
+                    "generation": ack_generation,
+                    "total_layers": total_layers,
+                    "has_embedding": has_embed,
+                    "has_lm_head": has_lm,
+                    "tokenizer_sha256": str(cfg.get("tokenizer_sha256", "") or ""),
                     "assignment_id": ack_assignment_id,
                     "config_id": config_id,
                     "plan_id": plan_id,
@@ -4857,6 +5010,7 @@ class SchedulerPipelineMixin:
                 "model_type": expected_model_type,
                 "engine": expected_engine,
                 "error": str(e),
+                **({"reason_code": e.reason_code} if isinstance(e, _PipelineSupplyError) else {}),
                 "timestamp": time.time(),
             })
 

@@ -572,6 +572,11 @@ class EngineHost:
         # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
         #   由它自理；这里只负责按 env 配置创建一次并复用（重载 500MB GGUF 代价高）。
         self._layer_upstream: Any = None
+        # A filtered manager follows current.json; KV is per workflow/sequence.
+        self._supplied_layer_manager: Any = None
+        self._supplied_layer_key: Any = None
+        self._supplied_layer_workflow: Any = None
+        self._supplied_layer_caches: dict = {}
         self._gen_lock = threading.RLock()
         self._generations: Dict[str, threading.Event] = {}
         # 1.2c 宿主适配状态（api_server 全局 → 实例属性）
@@ -956,6 +961,7 @@ class EngineHost:
             import config as _cfg
 
             _cfg.USE_COMPILE = bool(use_compile)
+            self._unload_supplied_layer_manager()
             result = self._host.load_model(
                 engine=engine,
                 quant_type=quant_type,
@@ -978,6 +984,7 @@ class EngineHost:
 
     def unload_model(self) -> Dict[str, Any]:
         with self._model_lifecycle_lock():
+            self._unload_supplied_layer_manager()
             if self._llm_is_loaded():
                 self._host.unload_model()
             self._layers.clear()
@@ -994,6 +1001,7 @@ class EngineHost:
         resolution: ModelLoadResolution | None = None,
     ) -> Dict[str, Any]:
         with self._model_lifecycle_lock():
+            self._unload_supplied_layer_manager()
             result = self._host.switch_model(
                 model_id=model_id,
                 engine=engine,
@@ -1015,6 +1023,8 @@ class EngineHost:
             return result if isinstance(result, dict) else {"success": True, "data": result}
 
     def close(self) -> None:
+        with self._model_lifecycle_lock():
+            self._unload_supplied_layer_manager()
         coordinator = self._task_graph_coordinator
         self._task_graph_coordinator = None
         if coordinator is not None:
@@ -2544,9 +2554,14 @@ class EngineHost:
         # ★ 2026-10-08（#53）：与 master 侧共用 shim 定位（含"仓库默认构建产物"一档）。
         from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 
+        from model_supply_worker import selected_gguf_path
+        model_path = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
         if self._layer_upstream is not None:
-            return self._layer_upstream
-        model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
+            previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
+            if not previous_path or previous_path == model_path:
+                return self._layer_upstream
+            self._layer_upstream.close()
+            self._layer_upstream = None
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
@@ -2569,6 +2584,7 @@ class EngineHost:
                 return default
 
         try:
+            self._layer_upstream_model_path = model_path
             self._layer_upstream = KeepHeadUpstream(
                 shim_path,
                 model_path,
@@ -2581,6 +2597,174 @@ class EngineHost:
         except KeepHeadUnavailable as exc:
             raise TaskGraphError(f"层段 keep-head 上游不可用：{exc}") from exc
         return self._layer_upstream
+
+    def _unload_supplied_layer_manager(self) -> None:
+        """Release segment weights and every KV reference before replacing them."""
+        manager = getattr(self, "_supplied_layer_manager", None)
+        self._supplied_layer_manager = None
+        self._supplied_layer_key = None
+        self._supplied_layer_workflow = None
+        self._supplied_layer_caches = {}
+        if manager is not None:
+            manager.unload_model()
+
+    @staticmethod
+    def _supplied_layer_selection_key(selected: dict) -> tuple:
+        from pathlib import Path
+
+        return (selected["manifest_sha256"], str(Path(selected["directory"]).resolve()))
+
+    def _supplied_layer_manager_for(self, selected: dict, provider_cancel_event):
+        """Materialize only the registered range, never a complete-model load."""
+        from task_graph import TaskGraphError as _StageError
+
+        if provider_cancel_event.is_set():
+            raise _StageError("supplied_stage_cancelled")
+        key = self._supplied_layer_selection_key(selected)
+        if getattr(self, "_supplied_layer_manager", None) is not None:
+            return self._supplied_layer_manager
+
+        import config
+        from model_module import ModelManager
+
+        upstream = getattr(self, "_layer_upstream", None)
+        if upstream is not None:
+            upstream.close()
+            self._layer_upstream = None
+        manifest = selected["manifest"]
+        start, end = manifest["layer_range"]
+        model_id = "supply-" + manifest["artifact_sha256"][:24]
+        manager = ModelManager()
+        try:
+            manager.prepare_pipeline_model(
+                model_id=model_id,
+                model_path=selected["directory"],
+                quant_type=config.QUANT_TYPE,
+                layer_range=(start, end),
+                model_sha256=manifest["artifact_sha256"],
+            )
+            if provider_cancel_event.is_set():
+                raise _StageError("supplied_stage_cancelled")
+            manager.load_layer_range(
+                start_layer=start,
+                end_layer=end,
+                has_embedding=manifest.get("has_embedding", start == 0),
+                has_lm_head=manifest.get("has_lm_head", end == manifest["total_layers"]),
+                model_path=selected["directory"],
+                quant_type=config.QUANT_TYPE,
+                total_layers=manifest["total_layers"],
+                model_id=model_id,
+            )
+            if provider_cancel_event.is_set():
+                raise _StageError("supplied_stage_cancelled")
+        except Exception:
+            manager.unload_model()
+            raise
+        self._supplied_layer_manager = manager
+        self._supplied_layer_key = key
+        return manager
+
+    def _execute_supplied_layer_forward(
+        self, selected, stage_request, hidden, *, want_hidden, n_past,
+        positions, seq_ids, provider_cancel_event,
+    ):
+        """Adapt v3 hidden/KV to ModelManager's existing batched forward API."""
+        import torch
+        from task_graph import TaskGraphError as _StageError
+
+        manifest = selected["manifest"]
+        fields = stage_request.stage_fields or {}
+        if fields.get("layer_range") != manifest["layer_range"]:
+            raise _StageError("supplied_layer_range_mismatch")
+        if hidden.shape[1] != manifest["hidden_size"]:
+            raise _StageError("supplied_hidden_size_mismatch")
+        identity = getattr(stage_request, "model_identity", None)
+        if identity is not None:
+            identity = identity.snapshot() if hasattr(identity, "snapshot") else identity
+            if identity != {
+                "model_id": "supply-" + manifest["artifact_sha256"][:24],
+                "engine": "pytorch", "format": "safetensors", "revision": "1",
+                "sha256": manifest["artifact_sha256"],
+            }:
+                raise _StageError("supplied_model_identity_mismatch")
+        if not want_hidden and not manifest.get(
+            "has_lm_head", manifest["layer_range"][1] == manifest["total_layers"],
+        ):
+            raise _StageError("supplied_segment_has_no_lm_head")
+
+        n_tokens = hidden.shape[0]
+        seq_ids = [0] * n_tokens if seq_ids is None else seq_ids
+        if (not isinstance(seq_ids, (list, tuple)) or len(seq_ids) != n_tokens
+                or any(type(value) is not int or value < 0 for value in seq_ids)):
+            raise _StageError("supplied_seq_ids_invalid")
+        if positions is None:
+            counters = {}
+            positions = []
+            for seq in seq_ids:
+                position = counters.get(seq, n_past)
+                positions.append(position)
+                counters[seq] = position + 1
+        if (not isinstance(positions, (list, tuple)) or len(positions) != n_tokens
+                or any(type(value) is not int or value < 0 for value in positions)):
+            raise _StageError("supplied_positions_invalid")
+        groups = {}
+        for index, seq in enumerate(seq_ids):
+            groups.setdefault(seq, []).append(index)
+        workflow = stage_request.workflow_id
+        if getattr(self, "_supplied_layer_workflow", None) != workflow:
+            self._supplied_layer_caches = {}
+            self._supplied_layer_workflow = workflow
+        # Validate a working mapping first: one sequence's reset must not
+        # erase committed KV when a later sequence fails input validation.
+        caches = dict(getattr(self, "_supplied_layer_caches", {}))
+        for seq, indices in groups.items():
+            seq_positions = [positions[index] for index in indices]
+            if seq_positions != list(range(seq_positions[0], seq_positions[0] + len(indices))):
+                raise _StageError("supplied_positions_must_be_contiguous")
+            if seq_positions[0] == 0:
+                caches.pop(seq, None)
+            elif seq not in caches or caches[seq][1] != seq_positions[0]:
+                raise _StageError("supplied_decode_requires_matching_prefill")
+
+        try:
+            manager = self._supplied_layer_manager_for(selected, provider_cancel_event)
+            states = torch.from_numpy(hidden.copy()).unsqueeze(0)
+            output = torch.empty((n_tokens, hidden.shape[1]), dtype=torch.float32) if want_hidden else None
+            token = None
+            for seq, indices in groups.items():
+                if provider_cancel_event.is_set():
+                    raise _StageError("supplied_stage_cancelled")
+                index_tensor = torch.tensor(indices, dtype=torch.long)
+                result = manager.forward_layers(
+                    hidden_states=states.index_select(1, index_tensor),
+                    position_ids=torch.tensor([[positions[index] for index in indices]], dtype=torch.long),
+                    past_key_values=caches[seq][0] if seq in caches else None,
+                    use_cache=True,
+                    apply_lm_head=False,
+                )
+                if provider_cancel_event.is_set():
+                    raise _StageError("supplied_stage_cancelled")
+                # Preserve hybrid recurrent state: the tuple is a lossy fallback.
+                cache = result.get("cache")
+                if cache is None:
+                    cache = result.get("past_key_values")
+                if cache is None:
+                    raise _StageError("supplied_forward_missing_kv_cache")
+                caches[seq] = (cache, positions[indices[-1]] + 1)
+                out = result["hidden_states"]
+                if want_hidden:
+                    output.index_copy_(0, index_tensor, out[0].detach().to(device="cpu", dtype=torch.float32))
+                elif seq == seq_ids[-1]:
+                    logits = manager.forward_lm_head(out[:, -1:, :])
+                    token = int(logits[0, -1].argmax().item())
+            if provider_cancel_event.is_set():
+                raise _StageError("supplied_stage_cancelled")
+        except Exception:
+            # Cache objects mutate during forward; partial failures cannot resume.
+            self._supplied_layer_caches = {}
+            raise
+        self._supplied_layer_caches = caches
+        return output.numpy() if want_hidden else token
 
     def _execute_layer_forward_stage(
         self,
@@ -2634,6 +2818,34 @@ class EngineHost:
         n_past = int(root_input.get("pos_base", 0) or 0)
 
         hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
+        from model_supply_worker import get_selected_model
+
+        selected = get_selected_model()
+        supplied = selected is not None and selected["manifest"]["format"] == "safetensors"
+        if (not supplied or getattr(self, "_supplied_layer_key", None)
+                != self._supplied_layer_selection_key(selected)):
+            self._unload_supplied_layer_manager()
+        identity = getattr(stage_request, "model_identity", None)
+        if hasattr(identity, "snapshot"):
+            identity = identity.snapshot()
+        if (not supplied and isinstance(identity, dict)
+                and identity.get("engine") == "pytorch"
+                and identity.get("format") == "safetensors"):
+            raise _StageError("supplied_registration_unavailable")
+        if supplied:
+            out = self._execute_supplied_layer_forward(
+                selected, stage_request, hidden, want_hidden=want_hidden,
+                n_past=n_past, positions=positions, seq_ids=seq_ids,
+                provider_cancel_event=provider_cancel_event,
+            )
+            if not want_hidden:
+                return {"token_argmax": int(out)}
+            out_raw = np.ascontiguousarray(out, dtype=np.float32).tobytes()
+            return {
+                "hidden_out_f32": base64.b64encode(out_raw).decode("ascii"),
+                "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
+                "token_argmax": None,
+            }
         upstream = self._layer_forward_upstream()
 
         # ★ 2026-10-03：批次**从位置 0 开始**就说明这是新 prompt 的 prefill ⇒ 必须先清
@@ -3894,6 +4106,7 @@ class EngineHost:
         ModelHost 执行锁，等价单机拓扑。）
         """
         with self._host.full_chat_execution_lock:
+            self._unload_supplied_layer_manager()
             sched = self._scheduler
             if sched is None:
                 result = change()

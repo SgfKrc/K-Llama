@@ -279,14 +279,11 @@ class SchedulerTaskWorkerMixin:
             layer_artifact = self._configured_layer_artifact()
             if (
                 layer_artifact is not None
-                and snapshot["engine"] == "llama_cpp"
-                and snapshot["format"] == "gguf"
                 and snapshot["sha256"] == layer_artifact["sha256"]
             ):
-                # A cropped GGUF can be opened by the ordinary model host and
-                # therefore look "loaded", but it is not a complete-model
-                # execution identity. Digest equality is the physical fact;
-                # model_id/revision aliases must not turn the same artifact
+                # A registered segment may look loaded to the ordinary host,
+                # but it is not a complete-model execution identity. Digest
+                # equality is the physical fact; aliases must not turn it
                 # back into a full_inference/aggregate capability.
                 return None
             return snapshot
@@ -303,8 +300,8 @@ class SchedulerTaskWorkerMixin:
             return None
         return {
             "model_id": artifact["model_id"],
-            "engine": "llama_cpp",
-            "format": "gguf",
+            "engine": artifact.get("engine", "llama_cpp"),
+            "format": artifact.get("format", "gguf"),
             "revision": artifact["revision"],
             "sha256": artifact["sha256"],
         }
@@ -329,11 +326,7 @@ class SchedulerTaskWorkerMixin:
         for model in capabilities.get("models") or []:
             if not isinstance(model, Mapping):
                 continue
-            if (
-                model.get("engine") == "llama_cpp"
-                and model.get("format") == "gguf"
-                and model.get("sha256") in layer_artifact_digests
-            ):
+            if model.get("sha256") in layer_artifact_digests:
                 continue
             identities.append(dict(model))
         return identities
@@ -369,13 +362,51 @@ class SchedulerTaskWorkerMixin:
         import json
         from pathlib import Path
 
-        model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
+        supply_worker = getattr(self, "_model_supply_worker", None)
+        if supply_worker is not None:
+            from model_supply_worker import get_selected_model
+
+            selected = get_selected_model(getattr(supply_worker, "root", None))
+            if selected is not None and selected["manifest"]["format"] == "safetensors":
+                # The selector validates pointer, inventory, bytes and source
+                # proof. This is registration, not an engine-ready ACK.
+                from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+
+                manifest = selected["manifest"]
+                start, end = manifest["layer_range"]
+                model_type = manifest.get("model_type")
+                if not model_type:
+                    config_path = Path(selected["directory"]) / "config.json"
+                    model_type = json.loads(config_path.read_text(encoding="utf-8")).get("model_type")
+                return {
+                    "start": start,
+                    "end": end,
+                    "model_id": "supply-" + manifest["artifact_sha256"][:24],
+                    "engine": "pytorch",
+                    "format": "safetensors",
+                    "runtime_supported": bool(
+                        torch_available() and model_type in PIPELINE_RUNTIME_MODEL_TYPES
+                    ),
+                    "revision": "1",  # qlh.segment_supply.v1
+                    "sha256": manifest["artifact_sha256"],
+                    "source_model_id": manifest["source_model_id"],
+                    "source_model_sha256": manifest["source_model_sha256"],
+                    "tokenizer_sha256": manifest["tokenizer_sha256"],
+                    "hidden_size": manifest["hidden_size"],
+                    "segment_mode": manifest["segment_mode"],
+                    # Supply uses absolute indices; v3 uses segment-local ones.
+                    "layer_weight_bytes": manifest["layer_weight_bytes"][start:end],
+                }
+        supplied_path = supply_worker.selected_artifact_path() if supply_worker else ""
+        model_path = supplied_path or os.environ.get("QLH_LAYER_GGUF", "").strip()
         if not model_path:
             return None
         artifact_path = Path(model_path)
         if not artifact_path.is_file():
             return None
         manifest_path = artifact_path.with_suffix(".manifest.json")
+        if not manifest_path.is_file():
+            manifest_path = Path(str(artifact_path) + ".manifest.json")
         if not manifest_path.is_file():
             return None
         try:
@@ -617,10 +648,10 @@ class SchedulerTaskWorkerMixin:
             # advertising a stale active range from the previous generation.
             layer_worker = False
         if artifact is not None:
-            # A fixed GGUF segment is executable only for the exact manifest
+            # A registered segment is executable only for the exact manifest
             # range.  Never let a stale active config publish a second range
             # beside the per-artifact contract.
-            layer_worker = True
+            layer_worker = bool(artifact.get("runtime_supported", True))
             layer_ranges.append([artifact["start"], artifact["end"]])
         elif layer_worker:
             layer_range = active_layer_config.get("layer_range")
@@ -662,7 +693,7 @@ class SchedulerTaskWorkerMixin:
             # layer-config contract, so advertising no full-model identity
             # must not cause the coordinator to opt it out of layer work.
             "layer_worker": layer_worker,
-            # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
+            # Exact registered/assigned ranges, without a loaded-ready ACK.
             "layer_ranges": layer_ranges,
             # ★ 2026-10-08（DIST-NEXT-2b）：声明**能接收分片 hidden**。接收侧
             #   （`_handle_task_worker_stage_chunk` + `hidden_ref` 装配）早已实现，但此前

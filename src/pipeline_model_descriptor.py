@@ -529,6 +529,21 @@ def inspect_pipeline_model(
     root = Path(model_path).resolve()
     if not root.is_dir():
         raise PipelineModelDescriptorError("模型目录不存在")
+    supply_manifest = None
+    supply_path = root / "supply.manifest.json"
+    if supply_path.is_file():
+        from model_supply_assets import validate_supply_manifest, _verify_files
+        try:
+            supply_manifest = validate_supply_manifest(_read_json_object(supply_path))
+            if supply_manifest["format"] != "safetensors":
+                raise PipelineModelDescriptorError("Supply format differs from Safetensors runtime")
+            _verify_files(root, supply_manifest)
+        except ValueError as exc:
+            raise PipelineModelDescriptorError("Supply segment manifest or files failed validation") from exc
+        declared_range = tuple(supply_manifest["layer_range"])
+        if layer_range is not None and tuple(layer_range) != declared_range:
+            raise PipelineModelDescriptorError("Runtime assignment differs from supplied segment")
+        layer_range = declared_range
     config = _read_json_object(root / "config.json")
     model_type = str(config.get("model_type", "") or "").strip().lower()
     layout = _ARCHITECTURE_LAYOUTS.get(model_type)
@@ -659,7 +674,34 @@ def inspect_pipeline_model(
     }
     if partial_range:
         descriptor["assignment_layer_range"] = list(partial_range)
-    descriptor.update(cross_format_pipeline_identity(root))
+    if supply_manifest is not None:
+        if (supply_manifest["total_layers"] != total_layers
+                or supply_manifest["hidden_size"] != hidden_size
+                or supply_manifest["layer_weight_bytes"] != layer_bytes):
+            raise PipelineModelDescriptorError("Supplied segment tensor metadata changed")
+        actual_tokenizer = _sha256_file(root / "tokenizer.json")
+        proof = supply_manifest.get("conversion_proof")
+        expected_tokenizer = supply_manifest["tokenizer_sha256"]
+        if proof is not None:
+            unsigned = dict(proof)
+            declared_proof_digest = unsigned.pop("provenance_sha256", "")
+            if (_canonical_sha256(unsigned) != declared_proof_digest
+                    or proof.get("kind") != _CROSS_FORMAT_KIND
+                    or proof.get("schema_version") != 1
+                    or proof.get("source", {}).get("tokenizer_sha256") != actual_tokenizer
+                    or proof.get("target", {}).get("artifact_sha256") != supply_manifest["source_model_sha256"]
+                    or proof.get("target", {}).get("tokenizer_sha256") != expected_tokenizer):
+                raise PipelineModelDescriptorError("Supplied cross-format identity is invalid")
+            descriptor["source_tokenizer_sha256"] = actual_tokenizer
+            descriptor["cross_format_provenance_sha256"] = declared_proof_digest
+        elif actual_tokenizer != expected_tokenizer:
+            raise PipelineModelDescriptorError("Supplied tokenizer identity differs from support files")
+        descriptor.update(source_model_id=supply_manifest["source_model_id"],
+                          source_model_sha256=supply_manifest["source_model_sha256"],
+                          tokenizer_sha256=expected_tokenizer,
+                          supply_manifest_sha256=supply_manifest["manifest_sha256"])
+    else:
+        descriptor.update(cross_format_pipeline_identity(root))
     return descriptor
 
 

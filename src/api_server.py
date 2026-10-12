@@ -501,7 +501,19 @@ async def api_boundary_middleware(request: Request, call_next):
     if request.method == "OPTIONS" or not path.startswith("/api/"):
         return await call_next(request)
 
-    if path not in _API_SOURCE_EXEMPT_PATHS:
+    supply_file_request = request.method == "GET" and re.fullmatch(
+        r"/api/models/supply/(supply_[0-9a-f]{32})/files/([^/]+)/(.+)", path,
+    )
+    if supply_file_request:
+        from model_supply import ModelSupplyError
+        try:
+            scheduler._model_supply.authorize_file(
+                *supply_file_request.groups(),
+                request.headers.get("X-QLH-Supply-Token", ""),
+            )
+        except ModelSupplyError as exc:
+            return _boundary_response(403, {"code": exc.code, "message": exc.message})
+    if not supply_file_request and path not in _API_SOURCE_EXEMPT_PATHS:
         try:
             require_model_api_source(request)
         except HTTPException as exc:
@@ -509,6 +521,7 @@ async def api_boundary_middleware(request: Request, call_next):
 
     if (
         auth_service.auth_required()
+        and not supply_file_request
         and path not in _API_AUTH_EXEMPT_PATHS
         and not (path == "/api/users" and request.method == "POST"
                  and auth_service.is_bootstrap_open())
@@ -6591,6 +6604,7 @@ from api import routes_health as _health_routes
 from api import routes_logs as _logs_routes
 from api import routes_cluster as _cluster_routes
 from api import routes_models as _models_routes
+from api import routes_model_supply as _supply_routes
 from api import routes_auth as _auth_routes
 from api import routes_sessions as _sessions_routes
 from api import routes_tasks as _tasks_routes
@@ -6598,7 +6612,7 @@ from api import routes_chat as _chat_routes
 from api import routes_system as _system_routes
 
 _api_route_modules = (
-    _health_routes, _device_routes, _cluster_routes, _models_routes,
+    _health_routes, _device_routes, _cluster_routes, _models_routes, _supply_routes,
     _auth_routes, _sessions_routes, _tasks_routes, _chat_routes,
     _system_routes, _logs_routes,
 )

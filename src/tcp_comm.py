@@ -301,6 +301,7 @@ class MessageType(str, Enum):
     INFER_RESULT = "infer_result"    # 主节点 → 从节点：推理结果回传
     INFER_CANCEL = "infer_cancel"    # 从节点 → 主节点：取消转发推理请求
     LAYER_CONFIG = "layer_config"    # 主节点 → 从节点：推送分层配置
+    MODEL_SUPPLY = "model_supply"      # master-owned segment inventory / supply
     LAYER_CONFIG_ACK = "layer_config_ack"  # 从节点 → 主节点：模型层加载结果
     QWEN3_PIPELINE_DRY_RUN = "qwen3_pipeline_dry_run"
     QWEN3_PIPELINE_DRY_RUN_ACK = "qwen3_pipeline_dry_run_ack"
@@ -341,6 +342,7 @@ class MessageType(str, Enum):
 FENCED_CONTROL_MESSAGE_TYPES = frozenset({
     MessageType.TASK_START.value, MessageType.TASK_STOP.value,
     MessageType.LAYER_CONFIG.value, MessageType.LAYER_CONFIG_ACK.value,
+    MessageType.MODEL_SUPPLY.value,
     MessageType.QWEN3_PIPELINE_DRY_RUN.value,
     MessageType.QWEN3_PIPELINE_DRY_RUN_ACK.value,
     MessageType.LAYER_WORKER_OPT_OUT.value, MessageType.LAYER_WORKER_OPT_IN.value,

@@ -1009,6 +1009,10 @@ class Scheduler(
         # 否则从未连接过主节点的实例在错误路径直接访问
         # self._tcp_client 会抛 AttributeError 而不是优雅返回 False
         self._tcp_client = None
+        from model_supply import ModelSupplyCoordinator
+        from model_supply_worker import ModelSupplyWorker
+        self._model_supply_worker = ModelSupplyWorker(self)
+        self._model_supply = ModelSupplyCoordinator(self)
 
         # 从节点：等待主节点推理结果
         self._client_pending_results: dict = {}
@@ -4231,6 +4235,14 @@ class Scheduler(
                         "event=tcp_heartbeat_ack_failed client_id=%s error=%s",
                         client_id, exc,
                     )
+
+        elif msg_type == "model_supply":
+            payload = msg.get("data")
+            if isinstance(payload, dict):
+                if self._effective_role() == "master":
+                    self._model_supply.handle(client_id, payload)
+                elif client_id == "master":
+                    self._model_supply_worker.handle(payload, self._tcp_client)
 
         elif msg_type == "task_worker":
             self._handle_task_worker_message(client_id, msg)

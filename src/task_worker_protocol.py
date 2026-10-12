@@ -899,14 +899,13 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                     f"payload.capabilities.layer_artifacts[{index}].artifact_sha256",
                     "layer artifact digest must match its advertised model identity",
                 )
-            if (
-                advertised_model.get("engine") != "llama_cpp"
-                or advertised_model.get("format") != "gguf"
-            ):
+            if (advertised_model.get("engine"), advertised_model.get("format")) not in {
+                ("llama_cpp", "gguf"), ("pytorch", "safetensors"),
+            }:
                 raise _error(
                     "invalid_capabilities",
                     f"payload.capabilities.layer_artifacts[{index}].model_id",
-                    "layer artifact identity must reference a llama_cpp/gguf model",
+                    "layer artifact identity must reference a supported engine/format pair",
                 )
     max_concurrency = _require_int(
         capabilities["max_concurrency"],
