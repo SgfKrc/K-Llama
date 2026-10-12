@@ -36,7 +36,10 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
     )
     monkeypatch.setattr(
         "relay_segment_info.read_artifact_manifest",
-        lambda _path: {"source_model_sha256": "e" * 64},
+        lambda _path: {
+            "source_model_id": "qwen3-5-2b",
+            "source_model_sha256": "e" * 64,
+        },
     )
     monkeypatch.setattr(
         "model_config.get_builtin_model",
@@ -65,6 +68,7 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
     assert descriptor["pipeline_runtime_supported"] is True
     assert descriptor["hidden_size"] == 2048
     assert descriptor["tokenizer_sha256"] == tokenizer_sha256
+    assert descriptor["source_model_id"] == "qwen3-5-2b"
     assert descriptor["source_model_sha256"] == "e" * 64
     assert descriptor["layer_weight_bytes"] == [4, 4]
 
@@ -91,6 +95,57 @@ def test_prepare_pipeline_model_is_metadata_only(monkeypatch, tmp_path):
     assert result == descriptor
     assert engine.is_loaded is False
     assert engine.is_pipeline_prepared is True
+
+
+def test_dead_keep_head_worker_is_recreated(monkeypatch, tmp_path):
+    from llama_keep_head import KeepHeadUpstream
+
+    artifact = tmp_path / "head.gguf"
+    artifact.write_bytes(b"head")
+    shim = tmp_path / "keep-head.dll"
+    shim.write_bytes(b"shim")
+    closed = []
+    old = types.SimpleNamespace(
+        is_available=False, close=lambda: closed.append(True),
+    )
+    fresh = types.SimpleNamespace(is_available=True)
+    engine = LlamaCppEngine()
+    engine._model_path = str(artifact)
+    engine._pipeline_descriptor = {
+        "loaded_artifact": str(artifact),
+        "assignment_layer_range": [0, 4],
+    }
+    engine._keep_head_key = (str(artifact), 4)
+    engine._keep_head = old
+    monkeypatch.setattr("llama_engine.resolve_keep_head_shim", lambda: str(shim))
+    monkeypatch.setattr(KeepHeadUpstream, "__new__", lambda cls, *args, **kwargs: fresh)
+
+    assert engine._keep_head_upstream() is fresh
+    assert closed == [True]
+
+
+def test_gguf_pipeline_descriptor_rejects_manifest_tokenizer_mismatch(monkeypatch, tmp_path):
+    model = tmp_path / "head.gguf"
+    model.write_bytes(b"GGUF metadata-only fixture")
+    model.with_suffix(".manifest.json").write_text(json.dumps({
+        "source_layer_range": [0, 1], "n_layer": 2,
+        "tokenizer_sha256": "b" * 64,
+    }), encoding="utf-8")
+    monkeypatch.setattr("relay_segment_info.read_gguf_layer_info", lambda _: {
+        "architecture": "qwen35", "n_layer": 1, "n_embd": 4096,
+    })
+    monkeypatch.setattr("relay_segment_info.read_gguf_tensor_bytes", lambda _: {
+        "token_embd.weight": 8, "blk.0.attn_q.weight": 24,
+    })
+    monkeypatch.setattr("relay_segment_info.read_gguf_tokenizer_sha256", lambda _: "a" * 64)
+    engine = LlamaCppEngine()
+    engine._model_path = str(model)
+    assert engine.get_pipeline_descriptor() == {}
+
+    monkeypatch.setattr("relay_segment_info.read_gguf_tokenizer_sha256", lambda _: "b" * 64)
+    descriptor = engine.get_pipeline_descriptor()
+    assert descriptor["tokenizer_sha256"] == "b" * 64
+    assert descriptor["total_layers"] == 2
 
 
 def test_abort_pipeline_materialization_restores_whole_descriptor():

@@ -588,12 +588,6 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   后者是"当前已就绪、马上能跑的区间"，前者是"能承载的上限"。
     if "layer_budget" in capabilities:
         expected_fields.add("layer_budget")
-    # ★ 2026-10-11（方案 A：worker 上报本段逐层字节）：接力不加载整模 ⇒ 主节点只持有
-    #   **本段**的逐层字节，而容量求解需要**整模**的逐层字节 ⇒ 由各 worker 在
-    #   `layer_artifacts` 里申报自己那一段，主节点按 `layer_range` 平移拼出整模视图。
-    #   与其余可选键同法：出现才纳入精确字段集，向后兼容旧 worker。
-    if "layer_weight_bytes" in capabilities:
-        expected_fields.add("layer_weight_bytes")
     # ★ 2026-10-03：relay 中段角色（本节点不加载层，段由远端 relay 服务持有）。
     #   声明侧早已在发这个键（`scheduler_task_worker._task_worker_capabilities`），
     #   但这里没有放行 ⇒ 该 worker 的 hello 会以 `unknown=['relay_middle']` 被判
@@ -725,6 +719,8 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             expected_artifact_fields = {
                 "layer_range", "segment_mode", "model_id", "artifact_sha256",
             }
+            if "layer_weight_bytes" in artifact:
+                expected_artifact_fields.add("layer_weight_bytes")
             if "source_model_sha256" in artifact:
                 expected_artifact_fields.add("source_model_sha256")
             contract_fields = {
@@ -754,6 +750,17 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                     "invalid_capabilities", f"{item_field}.layer_range",
                     "layer_range must be a non-empty [start, end) integer range",
                 )
+            if "layer_weight_bytes" in artifact:
+                sizes = artifact["layer_weight_bytes"]
+                if not isinstance(sizes, list) or len(sizes) != layer_range[1] - layer_range[0]:
+                    raise _error(
+                        "invalid_capabilities", f"{item_field}.layer_weight_bytes",
+                        "layer_weight_bytes must match the segment span",
+                    )
+                for offset, size in enumerate(sizes):
+                    _require_int(
+                        size, f"{item_field}.layer_weight_bytes[{offset}]", minimum=1,
+                    )
             mode = _require_string(
                 artifact["segment_mode"], f"{item_field}.segment_mode",
             )

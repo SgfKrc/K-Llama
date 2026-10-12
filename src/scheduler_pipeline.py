@@ -1948,13 +1948,22 @@ class SchedulerPipelineMixin:
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
             if transaction and transaction.get("config_id") == config_id:
+                phase = str(transaction.get("phase", "") or "")
                 result.update({
                     "config_id": config_id,
                     "generation": generation,
-                    "transaction_phase": str(
-                        transaction.get("phase", "") or ""
-                    ),
+                    "transaction_phase": phase,
                 })
+                if phase in {"aborted", "invalidated", "rejected"}:
+                    result.update({
+                        "status": "rejected",
+                        "admitted": False,
+                        "reason_code": str(
+                            transaction.get("reason_code", "")
+                            or f"pipeline_transaction_{phase}"
+                        ),
+                        "reason": str(transaction.get("reason", "") or ""),
+                    })
         return result
 
 

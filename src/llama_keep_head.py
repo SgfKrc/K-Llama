@@ -181,6 +181,7 @@ class KeepHeadUpstream:
 
         self._worker = None
         self.n_seq_max = max(1, int(n_seq_max))
+        self.n_batch = max(1, int(n_batch))
         # ★ 2026-09-24：**每序列可用 ctx** —— llama.cpp 把 `n_ctx` 按 `n_seq_max` **均分**，
         #   单序列长 decode 一旦超过 `n_ctx / n_seq_max` 就会在中途报 llama.cpp 的
         #   "failed to find a memory slot for batch"（`llama_decode rc=1`），现象是 `runner_failed`，
@@ -371,6 +372,12 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable("keep-head worker response is not an object")
         return value
 
+    @property
+    def is_available(self) -> bool:
+        if self._worker is not None:
+            return self._worker.poll() is None
+        return self._lib is not None and self._handle is not None
+
     def _worker_request(self, payload: dict[str, object]) -> dict[str, object]:
         process = self._worker
         if process is None or process.poll() is not None or process.stdin is None:
@@ -426,6 +433,15 @@ class KeepHeadUpstream:
         n_tokens = len(toks)
         if n_tokens == 0:
             raise ValueError("tokens 不能为空")
+        if n_tokens > self.n_batch:
+            raise KeepHeadUnavailable(
+                f"keep-head batch exceeds n_batch: tokens={n_tokens} limit={self.n_batch}"
+            )
+        if n_past < 0 or n_past + n_tokens > self.ctx_per_seq:
+            raise KeepHeadUnavailable(
+                f"keep-head context exceeds per-sequence limit: "
+                f"past={n_past} tokens={n_tokens} limit={self.ctx_per_seq}"
+            )
         if self._worker is not None:
             return self._worker_array(self._worker_request({
                 "op": "tokens", "tokens": toks, "n_past": int(n_past)}))

@@ -176,6 +176,33 @@ def test_read_gguf_layer_info_is_none_on_bad_input(tmp_path: Path) -> None:
     assert R.read_gguf_layer_info(tmp_path / "missing.gguf") is None
 
 
+def test_gguf_tokenizer_fingerprint_is_order_independent_and_header_only(tmp_path: Path) -> None:
+    tokenizer = [
+        ("tokenizer.ggml.model", 8, _kv_str("gpt2")),
+        ("tokenizer.ggml.tokens", 9,
+         struct.pack("<IQ", 8, 2) + _kv_str("hello") + _kv_str("world")),
+        ("tokenizer.chat_template", 8, _kv_str("{{ messages }}")),
+    ]
+    first = _write_gguf(tmp_path / "first.gguf", _arch_kvs("qwen35", 8) + tokenizer)
+    second = _write_gguf(tmp_path / "second.gguf", list(reversed(tokenizer)) + _arch_kvs("qwen35", 4))
+    first.write_bytes(first.read_bytes() + b"unread tensor payload")
+
+    field_hashes = {
+        key: hashlib.sha256(struct.pack("<I", kind) + value).digest()
+        for key, kind, value in tokenizer
+    }
+    expected = hashlib.sha256(b"".join(
+        key.encode() + b"\0" + field_hashes[key] for key in sorted(field_hashes)
+    )).hexdigest()
+    assert R.read_gguf_tokenizer_sha256(first) == expected
+    assert R.read_gguf_tokenizer_sha256(second) == expected
+    changed = _write_gguf(tmp_path / "changed.gguf", tokenizer[:-1] + [
+        ("tokenizer.chat_template", 8, _kv_str("different")),
+    ])
+    assert R.read_gguf_tokenizer_sha256(changed) != expected
+    assert R.read_gguf_tokenizer_sha256(_write_gguf(tmp_path / "missing.gguf", tokenizer[:1])) is None
+
+
 def test_read_artifact_manifest_reads_layer_range(tmp_path: Path) -> None:
     """★ 「来自源模型的哪几层」只能由 manifest 自证（工件头里**没有**这个信息）。"""
     manifest = tmp_path / "mid8-16.gguf.manifest.json"

@@ -126,6 +126,39 @@ class TestNotLoaded:
 
         assert eng._find_layer_artifact(0, 8) == str(right)
 
+    def test_precut_head_uses_source_digest_not_head_digest(
+        self, monkeypatch, tmp_path,
+    ):
+        from llama_engine import LlamaCppEngine
+
+        source_sha = hashlib.sha256(b"unloaded-whole-model").hexdigest()
+        head = tmp_path / "head4.gguf"
+        head.write_bytes(b"verified-head-segment")
+        head_sha = hashlib.sha256(head.read_bytes()).hexdigest()
+        manifest = tmp_path / "head4.manifest.json"
+        manifest.write_text(json.dumps({
+            "source_layer_range": [0, 4],
+            "source_model_sha256": source_sha,
+            "artifact_sha256": head_sha,
+        }), encoding="utf-8")
+
+        engine = LlamaCppEngine()
+        engine._model_path = str(head)
+        engine._pipeline_descriptor = {
+            "model_path": str(head),
+            "model_sha256": head_sha,
+            "source_model_sha256": source_sha,
+        }
+        monkeypatch.delenv("QLH_LAYER_ARTIFACT_DIR", raising=False)
+
+        assert engine._find_layer_artifact(0, 4) == str(head)
+        manifest.write_text(json.dumps({
+            "source_layer_range": [0, 4],
+            "source_model_sha256": head_sha,
+            "artifact_sha256": head_sha,
+        }), encoding="utf-8")
+        assert engine._find_layer_artifact(0, 4) == ""
+
     def test_layer_artifact_selection_rejects_digest_mismatch(
         self, monkeypatch, tmp_path,
     ):

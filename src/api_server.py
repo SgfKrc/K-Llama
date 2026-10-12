@@ -4232,7 +4232,8 @@ def _execute_chat_full(
                 "当前无法转发到主节点，已拒绝覆盖分层模型。",
             )
         if not model_host.model_loaded or not model_manager.is_loaded:
-            _auto_load_default_model()
+            if req.routing_preference != 'distributed_required':
+                _auto_load_default_model()
 
     if _pipeline_worker_is_reserved():
         raise HTTPException(
@@ -4340,7 +4341,9 @@ def _execute_chat_full(
                         except Exception:
                             pass
 
-                    if backend_id_for(model_manager) in ("llama_cpp", "island"):
+                    if _pipeline_model_is_prepared():
+                        followups = _fallback_followups(history, [])
+                    elif backend_id_for(model_manager) in ("llama_cpp", "island"):
                         followups = _generate_followups_llama(history)
                     elif backend_id_for(model_manager) == "pytorch":
                         # 流水线成功后主节点仍保留首段裁剪模型，不能拿它生成追问。
@@ -4805,6 +4808,12 @@ def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
         model_host.model_loaded and model_manager.is_loaded
     ):
         return
+    if req is not None and req.routing_preference == 'distributed_required':
+        raise coded_http_error(
+            503,
+            'DISTRIBUTED_PIPELINE_NOT_READY',
+            'distributed_required_pipeline_not_ready',
+        )
     _auto_load_default_model()
 
 

@@ -505,7 +505,15 @@ def bind_model_preflight(
     result = dict(plan)
     assignments = [dict(item) for item in result.get("assignments", [])]
     verdict = preflight_pipeline_artifacts(
-        model_id=str(descriptor.get("model_id", "") or ""),
+        # Precut GGUF artifacts are often registered under a local deployment
+        # alias. Their manifest-declared source_model_id is the logical model
+        # identity that must match every remote segment. Descriptors without
+        # that field retain the historical model_id contract.
+        model_id=str(
+            descriptor.get("source_model_id", "")
+            or descriptor.get("model_id", "")
+            or ""
+        ),
         total_layers=descriptor.get("total_layers", 0),
         hidden_size=descriptor.get("hidden_size", 0),
         tokenizer_sha256=str(descriptor.get("tokenizer_sha256", "") or ""),

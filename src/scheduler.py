@@ -2935,6 +2935,21 @@ class Scheduler(
                         if available_bytes > 0:
                             capacity_gb = available_bytes / (1024 ** 3)
                             capacity_source = "memory.available_bytes"
+                if (
+                    capacity_source == "ram.available_gb"
+                    and (node_id == effective_id or (
+                        node.role == NodeRole.MASTER
+                        and self._effective_role() == "master"
+                    ))
+                ):
+                    try:
+                        import psutil
+
+                        available_bytes = int(psutil.virtual_memory().available)
+                    except (ImportError, OSError, ValueError):
+                        available_bytes = 0
+                    capacity_gb = max(0, available_bytes) / (1024 ** 3)
+                    capacity_source = "ram.available_bytes_live" if available_bytes > 0 else ""
             record = {
                 "node_id": node_id,
                 "role": node.role,

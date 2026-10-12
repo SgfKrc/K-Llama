@@ -47,6 +47,85 @@ _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
 _REQUEST_DEADLINE_EXCEEDED = "request_deadline_exceeded"
 
 
+def _task_worker_capability_log_summary(
+    capabilities: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a bounded, identity-focused summary of validated capabilities."""
+    if not isinstance(capabilities, Mapping):
+        capabilities = {}
+
+    artifacts = [
+        artifact
+        for artifact in capabilities.get("layer_artifacts") or []
+        if isinstance(artifact, Mapping)
+    ]
+    artifacts_by_model_id = {
+        artifact.get("model_id"): artifact
+        for artifact in artifacts
+        if artifact.get("model_id")
+    }
+
+    def digest_prefix(value: Any) -> str | None:
+        return value[:12] if isinstance(value, str) and value else None
+
+    models = []
+    for model in capabilities.get("models") or []:
+        if not isinstance(model, Mapping):
+            continue
+        artifact = artifacts_by_model_id.get(model.get("model_id"))
+        source_sha256 = (
+            artifact.get("source_model_sha256")
+            if artifact is not None else None
+        ) or model.get("source_model_sha256") or model.get("sha256")
+        tokenizer_sha256 = (
+            artifact.get("tokenizer_sha256")
+            if artifact is not None else None
+        ) or model.get("tokenizer_sha256")
+        models.append({
+            "model_id": model.get("model_id"),
+            "source_model_sha256_prefix": digest_prefix(source_sha256),
+            "tokenizer_sha256_prefix": digest_prefix(tokenizer_sha256),
+        })
+
+    artifact_summaries = []
+    for artifact in artifacts:
+        weight_bytes = artifact.get("layer_weight_bytes")
+        if not isinstance(weight_bytes, list):
+            weight_bytes = []
+        artifact_summaries.append({
+            "source_model_id": artifact.get("source_model_id"),
+            "source_model_sha256_prefix": digest_prefix(
+                artifact.get("source_model_sha256")
+            ),
+            "tokenizer_sha256_prefix": digest_prefix(
+                artifact.get("tokenizer_sha256")
+            ),
+            "artifact_sha256_prefix": digest_prefix(
+                artifact.get("artifact_sha256")
+            ),
+            "layer_range": artifact.get("layer_range"),
+            "weight_bytes_count": len(weight_bytes),
+            "weight_bytes_all_positive": bool(weight_bytes) and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in weight_bytes
+            ),
+        })
+
+    resource_gate = capabilities.get("resource_gate")
+    return {
+        "stage_types": list(capabilities.get("stage_types") or []),
+        "layer_ranges": list(capabilities.get("layer_ranges") or []),
+        "models": models,
+        "layer_artifacts": artifact_summaries,
+        "resource_gate_admitted": (
+            resource_gate.get("admitted")
+            if isinstance(resource_gate, Mapping) else None
+        ),
+    }
+
+
 def keep_head_shim_available() -> bool:
     """本机是否具备可用的 keep-head shim（llama.cpp 层段的另一条执行路径）。
 
@@ -167,6 +246,115 @@ class _TaskWorkerActiveAttempt:
 
 
 class SchedulerTaskWorkerMixin:
+    def _task_worker_full_model_identity(
+        self, engines: list[str] | None = None,
+    ) -> dict | None:
+        """Return the currently loaded full-model identity, if executable."""
+        try:
+            has_loaded_model = getattr(self._host, "has_loaded_model", None)
+            if callable(has_loaded_model):
+                full_model_loaded = bool(has_loaded_model())
+            else:
+                full_model_loaded = bool(
+                    getattr(self._host, "model_loaded", False)
+                    and getattr(self._host, "is_loaded", False)
+                )
+            if (
+                not full_model_loaded
+                or getattr(self._host, "layer_range", None) is not None
+            ):
+                return None
+            identity = self._require_callbacks().active_task_graph_model_identity()
+            if identity is None or (
+                engines is not None and identity.engine not in engines
+            ):
+                return None
+            snapshot = {
+                "model_id": identity.model_id,
+                "engine": identity.engine,
+                "format": identity.format,
+                "revision": identity.revision,
+                "sha256": identity.sha256,
+            }
+            layer_artifact = self._configured_layer_artifact()
+            if (
+                layer_artifact is not None
+                and snapshot["engine"] == "llama_cpp"
+                and snapshot["format"] == "gguf"
+                and snapshot["sha256"] == layer_artifact["sha256"]
+            ):
+                # A cropped GGUF can be opened by the ordinary model host and
+                # therefore look "loaded", but it is not a complete-model
+                # execution identity. Digest equality is the physical fact;
+                # model_id/revision aliases must not turn the same artifact
+                # back into a full_inference/aggregate capability.
+                return None
+            return snapshot
+        except Exception:
+            logger.warning(
+                "failed to build PC full-worker model capability snapshot",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _task_worker_layer_artifact_identity(artifact: dict | None) -> dict | None:
+        if artifact is None or not artifact.get("sha256"):
+            return None
+        return {
+            "model_id": artifact["model_id"],
+            "engine": "llama_cpp",
+            "format": "gguf",
+            "revision": artifact["revision"],
+            "sha256": artifact["sha256"],
+        }
+
+    @staticmethod
+    def _task_worker_full_model_identities(
+        capabilities: Mapping[str, Any],
+    ) -> list[dict]:
+        """Return only identities executable by a complete-model stage."""
+        stage_types = capabilities.get("stage_types") or []
+        if not any(
+            stage_type in stage_types
+            for stage_type in ("full_inference", "aggregate")
+        ):
+            return []
+        layer_artifact_digests = {
+            artifact.get("artifact_sha256")
+            for artifact in capabilities.get("layer_artifacts") or []
+            if isinstance(artifact, Mapping)
+        }
+        identities = []
+        for model in capabilities.get("models") or []:
+            if not isinstance(model, Mapping):
+                continue
+            if (
+                model.get("engine") == "llama_cpp"
+                and model.get("format") == "gguf"
+                and model.get("sha256") in layer_artifact_digests
+            ):
+                continue
+            identities.append(dict(model))
+        return identities
+
+    def _task_worker_offer_model_identity_matches(
+        self, offer: Mapping[str, Any], capabilities: Mapping[str, Any],
+    ) -> bool:
+        """Match an offer against the identity valid for its execution path."""
+        if offer.get("stage_type") == "layer_forward":
+            expected = self._task_worker_layer_artifact_identity(
+                self._configured_layer_artifact()
+            )
+            return expected is not None and offer.get("model_identity") == expected
+
+        offered = offer.get("model_identity")
+        if not isinstance(offered, Mapping):
+            return False
+        return dict(offered) in self._task_worker_full_model_identities(
+            capabilities
+        )
+
     def _configured_layer_artifact(self) -> dict | None:
         """从 env 指定的层段工件推导身份与层区间；取不到返回 None。
 
@@ -235,6 +423,13 @@ class SchedulerTaskWorkerMixin:
         )
         if contract_present and not contract_complete:
             return None
+        if contract_complete:
+            try:
+                from relay_segment_info import read_gguf_tokenizer_sha256
+            except ImportError:
+                from .relay_segment_info import read_gguf_tokenizer_sha256
+            if read_gguf_tokenizer_sha256(artifact_path) != tokenizer_sha256:
+                return None
         model_id = artifact_path.name
         if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", model_id) is None:
             return None
@@ -399,48 +594,12 @@ class SchedulerTaskWorkerMixin:
             # the schema valid also makes a broken installation visible in hello.
             engines.append("pytorch")
 
-        models = []
-        try:
-            # 阶段 0.2：完整模型判定直接走 host 代理（不依赖内部 manager 容器
-            # 的 _instance 结构，阶段 1 替换远程 host 适配器后依然成立）
-            has_loaded_model = getattr(self._host, "has_loaded_model", None)
-            if callable(has_loaded_model):
-                # ModelHost owns the authoritative loaded-state check and
-                # correctly accounts for its lazy manager proxy.  Requiring
-                # the legacy ``is_loaded`` attribute here made a real full
-                # Safetensors worker advertise an empty model list.
-                full_model_loaded = bool(has_loaded_model())
-            else:
-                full_model_loaded = bool(
-                    getattr(self._host, "model_loaded", False)
-                    and getattr(self._host, "is_loaded", False)
-                )
-            full_model_loaded = bool(
-                full_model_loaded and getattr(self._host, "layer_range", None) is None
-            )
-            if full_model_loaded:
-                identity = self._require_callbacks().active_task_graph_model_identity()
-                if identity is not None and identity.engine in engines:
-                    models.append({
-                        "model_id": identity.model_id,
-                        "engine": identity.engine,
-                        "format": identity.format,
-                        "revision": identity.revision,
-                        "sha256": identity.sha256,
-                    })
-        except Exception:
-            logger.warning(
-                "构建 PC Full Worker 模型能力快照失败，暂不上报模型",
-                exc_info=True,
-            )
+        full_model_identity = self._task_worker_full_model_identity(engines)
+        models = [full_model_identity] if full_model_identity is not None else []
         active_layer_config = getattr(self, "_active_layer_config", None) or {}
         layer_worker = bool(
             active_layer_config or getattr(self._host, "layer_range", None)
         )
-        # ★ 2026-10-03：载了层段工件就同时承担 v3 层段 Stage。此前 `stage_types` 硬编码
-        #   两个整模类型，而层段执行路径（`_handle_task_worker_stage_offer`）已实现 ——
-        #   结果是 PC worker 永远不会被派到 `layer_forward`。
-        stage_types = ["full_inference", "aggregate"]
         layer_ranges: list[list[int]] = []
         # ★ #28：**工件身份**（「我手上有哪份权重」）与**就绪区间**（「我现在能跑哪几层」）
         #   是两件事，此前共用一个 `if layer_worker / else` 分支 ⇒ 只要 `layer_range` 残留
@@ -474,20 +633,11 @@ class SchedulerTaskWorkerMixin:
                 )
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
-        if artifact is not None and artifact.get("sha256"):
-            # 层段 worker 不加载整模 ⇒ 只靠上面的整模分支时 `models` 会是空的，而 Route A
-            # 的 offer 身份正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链
-            # 会以 `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
-            # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
-            # 整模身份优先（上面已填 `models` 时不覆盖）—— 两者冲突说明本机同时握着整模
-            # 与工件，此时以整模为准是保守选择。
-            artifact_model = {
-                "model_id": artifact["model_id"],
-                "engine": "llama_cpp",
-                "format": "gguf",
-                "revision": artifact["revision"],
-                "sha256": artifact["sha256"],
-            }
+        artifact_model = self._task_worker_layer_artifact_identity(artifact)
+        if artifact_model is not None:
+            # Protocol v3 requires layer_artifacts to reference a physical
+            # identity in models.  This is an artifact registry entry only;
+            # full-stage admission independently requires a loaded full model.
             existing = next((
                 item for item in models
                 if item.get("model_id") == artifact_model["model_id"]
@@ -496,6 +646,9 @@ class SchedulerTaskWorkerMixin:
                 models.append(artifact_model)
             elif existing != artifact_model:
                 raise RuntimeError("layer_artifact_model_identity_conflict")
+        stage_types = ["full_inference", "aggregate"]
+        if layer_worker and full_model_identity is None:
+            stage_types = []
         if layer_worker and "layer_forward" not in stage_types:
             stage_types.append("layer_forward")
         capabilities = {
@@ -536,6 +689,8 @@ class SchedulerTaskWorkerMixin:
             }
             if artifact.get("source_model_sha256"):
                 item["source_model_sha256"] = artifact["source_model_sha256"]
+            if artifact.get("layer_weight_bytes"):
+                item["layer_weight_bytes"] = artifact["layer_weight_bytes"]
             if artifact.get("source_model_id"):
                 item.update({
                     "source_model_id": artifact["source_model_id"],
@@ -585,9 +740,13 @@ class SchedulerTaskWorkerMixin:
                     self._task_worker_refresh_generation > refresh_generation
                 )
             target.send_data(message.snapshot(), MessageType.TASK_WORKER)
+            advertised_layers = [
+                (artifact.get("layer_range"), len(artifact.get("layer_weight_bytes") or []))
+                for artifact in message.payload["capabilities"].get("layer_artifacts", [])
+            ]
             logger.info(
-                "event=task_worker_hello_sent node_id=%s version=%s",
-                self.get_effective_node_id(), message.version,
+                "event=task_worker_hello_sent node_id=%s version=%s artifact_byte_layers=%s",
+                self.get_effective_node_id(), message.version, advertised_layers,
             )
             return True
         except Exception as exc:
@@ -1122,7 +1281,9 @@ class SchedulerTaskWorkerMixin:
             if offer["stage_type"] not in capabilities["stage_types"]:
                 reject_reason = "unsupported_stage_type"
                 reject_retryable = True
-            elif offer["model_identity"] not in capabilities["models"]:
+            elif not self._task_worker_offer_model_identity_matches(
+                offer, capabilities,
+            ):
                 reject_reason = "model_identity_mismatch"
                 reject_retryable = True
 
@@ -1446,6 +1607,18 @@ class SchedulerTaskWorkerMixin:
                             exc_info=True,
                         )
                         raise
+                    advertised_capabilities = (
+                        message.payload.get("capabilities", {})
+                        if isinstance(message.payload, dict)
+                        else {}
+                    )
+                    logger.info(
+                        "event=task_worker_hello_capabilities node_id=%s summary=%s",
+                        client_id,
+                        _task_worker_capability_log_summary(
+                            advertised_capabilities
+                        ),
+                    )
                     self._send_task_worker_to_node(client_id, ack)
                     # The registration fence must end for both an accepted
                     # hello and a definitive rejection.  A rejected hello is
@@ -1495,11 +1668,6 @@ class SchedulerTaskWorkerMixin:
                             message.payload.get("capabilities", {}).get("models", [])
                             if isinstance(message.payload, dict)
                             else []
-                        )
-                        advertised_capabilities = (
-                            message.payload.get("capabilities", {})
-                            if isinstance(message.payload, dict)
-                            else {}
                         )
                         is_layer_stage_worker = bool(
                             isinstance(advertised_capabilities, dict)
@@ -1664,8 +1832,9 @@ class SchedulerTaskWorkerMixin:
                 str(worker.get("node_id", ""))
                 for worker in healthy_workers
                 if isinstance(worker.get("capabilities"), dict)
-                and bool(worker["capabilities"].get("models"))
-                and not bool(worker["capabilities"].get("layer_worker"))
+                and bool(self._task_worker_full_model_identities(
+                    worker["capabilities"]
+                ))
                 and (
                     worker.get("worker_kind") != "android_full_worker"
                     or (
@@ -1686,14 +1855,18 @@ class SchedulerTaskWorkerMixin:
                 if worker.get("layer_stage_dispatch_enabled")
             )
         else:
-            local_models = self._task_worker_capabilities().get("models", [])
+            local_caps = self._task_worker_capabilities()
+            local_full_models = self._task_worker_full_model_identities(
+                local_caps
+            )
             full_model_worker_ids = (
-                [self.get_effective_node_id()] if connected and local_models else []
+                [self.get_effective_node_id()]
+                if connected and local_full_models else []
             )
             workers_missing_full_model = (
-                [self.get_effective_node_id()] if connected and not local_models else []
+                [self.get_effective_node_id()]
+                if connected and not local_full_models else []
             )
-            local_caps = self._task_worker_capabilities()
             layer_stage_worker_ids = (
                 [self.get_effective_node_id()]
                 if connected

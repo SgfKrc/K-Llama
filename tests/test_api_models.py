@@ -945,6 +945,50 @@ def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
     assert len(aborted) == 1
 
 
+def test_prepare_pipeline_model_rejects_synchronous_aborted_commit(
+    monkeypatch, tmp_path,
+):
+    aborted = []
+    monkeypatch.setattr(api_server, "model_host", types.SimpleNamespace(
+        prepare_pipeline_candidate=lambda transaction_id, **kwargs: {
+            "model_id": kwargs["model_id"],
+            "model_type": "qwen3_5",
+            "total_layers": 32,
+            "pipeline_runtime_supported": True,
+            "model_sha256": "a" * 64,
+        },
+        abort_pipeline_candidate=lambda transaction_id: aborted.append(transaction_id),
+    ))
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="q35-artifacts", engine="llama_cpp",
+            model_path=str(tmp_path / "head4.gguf"), quant_type="gguf",
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "start_pipeline_model_transaction",
+        lambda **kwargs: {
+            "admitted": True,
+            "transaction_phase": "aborted",
+            "reason_code": "pipeline_local_commit_failed",
+            "reason": "no matching local segment",
+        },
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        asyncio.run(api_server.prepare_pipeline_model(
+            api_server.PreparePipelineModelRequest(model_id="q35-artifacts")
+        ))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.error_code == "pipeline_local_commit_failed"
+    assert "no matching local segment" in exc_info.value.detail
+    assert len(aborted) == 1
+
+
 def test_load_model_reports_effective_cpu_quant(monkeypatch):
     """CPU loader 归一为 FP32 后，API 状态不能继续上报请求的 FP16。"""
     class FakeManager:
@@ -1271,6 +1315,54 @@ def test_pipeline_deadline_is_504_and_never_enters_local_fallback(monkeypatch):
         "request_deadline_exceeded"
     )
     assert calls == {"chat": 0, "ensure": 0}
+
+
+def test_prepared_gguf_pipeline_never_generates_local_followups(monkeypatch):
+    req = api_server.ChatRequest(
+        message="2+2?", routing_preference="distributed_required",
+    )
+    monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
+    monkeypatch.setattr(api_server, "_pipeline_model_is_prepared", lambda: True)
+    monkeypatch.setattr(api_server, "runtime_supports", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        api_server, "model_manager",
+        types.SimpleNamespace(engine_type="llama_cpp"),
+    )
+    monkeypatch.setattr(
+        api_server, "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False),
+    )
+    monkeypatch.setattr(
+        api_server, "_prepare_chat_context",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            session_id="test-prepared-gguf", revision=0,
+            history=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        ),
+    )
+    monkeypatch.setattr(api_server, "_commit_chat_context_turn", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        api_server, "_generate_followups_llama",
+        lambda *_a, **_kw: pytest.fail("partial model used for followups"),
+    )
+    monkeypatch.setattr(api_server, "_fallback_followups", lambda *_a, **_kw: ["next question?"])
+    monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: True)
+    monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
+    monkeypatch.setattr(api_server.scheduler, "has_pipeline_worker_reservation", lambda: False)
+    monkeypatch.setattr(api_server.scheduler, "run_pipeline_safe", lambda *_a, **_kw: {
+        "response": "4", "metrics": {
+            "distributed_used": True, "fallback": False,
+            "execution_mode": "route_a_stage_offer_v3",
+            "workers_used": ["surface", "y700"],
+        },
+    })
+
+    result = api_server._execute_chat_full(req)
+
+    assert result["content"] == "4"
+    assert result["followups"] == ["next question?"]
 
 
 @pytest.mark.parametrize("engine", ["pytorch", "llama_cpp"])

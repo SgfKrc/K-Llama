@@ -320,6 +320,39 @@ class TestRoutingPreference:
         monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
         return client, calls
 
+    @pytest.mark.parametrize('streaming_mode', ['full', 'interactive', 'fast'])
+    def test_required_cold_start_never_auto_loads_full_model(
+        self, interactive_env, monkeypatch, streaming_mode,
+    ):
+        client, calls = interactive_env
+        calls['distributed_enabled'] = True
+        calls['role'] = 'master'
+        monkeypatch.setattr(api_server, 'RUN_MODE', 'distributed')
+        monkeypatch.setattr(api_server.model_host, 'model_loaded', False)
+        monkeypatch.setattr(
+            api_server, 'model_manager',
+            SimpleNamespace(is_loaded=False, is_pipeline_prepared=False),
+        )
+        monkeypatch.setattr(api_server, 'runtime_supports', lambda *_: False)
+        auto_load_calls = []
+        monkeypatch.setattr(
+            api_server, '_auto_load_default_model',
+            lambda: auto_load_calls.append(True),
+        )
+
+        response = client.post('/api/chat/stream', json={
+            'message': 'hi',
+            'streaming_mode': streaming_mode,
+            'routing_preference': 'distributed_required',
+        })
+
+        assert not auto_load_calls
+        assert response.status_code == 200
+        errors = [event for event in _sse_events(response) if event.get('error')]
+        assert errors
+        if streaming_mode == 'full':
+            assert errors[0]['outcome_reason'] == 'DISTRIBUTED_PIPELINE_NOT_READY'
+
     def test_client_without_local_only_guides_to_master(self, interactive_env, monkeypatch):
         client, calls = self._set_client_scene(interactive_env, monkeypatch)
         response = client.post("/api/chat/stream", json={

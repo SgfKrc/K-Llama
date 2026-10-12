@@ -343,6 +343,35 @@ def test_reserved_pipeline_worker_does_not_auto_load_full_model(monkeypatch):
     assert auto_load_calls == []
 
 
+def test_required_route_does_not_auto_load_full_model_before_pipeline(monkeypatch):
+    class UnloadedManager:
+        is_loaded = False
+        is_pipeline_prepared = False
+
+    monkeypatch.setattr(model_host, 'model_loaded', False)
+    monkeypatch.setattr(api_server, 'model_manager', UnloadedManager())
+    monkeypatch.setattr(
+        api_server.scheduler, 'get_distributed_inference_enabled', lambda: True,
+    )
+    monkeypatch.setattr(api_server.scheduler, '_effective_role', lambda: 'master')
+    monkeypatch.setattr(api_server, 'RUN_MODE', 'distributed')
+    auto_load_calls = []
+    monkeypatch.setattr(
+        api_server, '_auto_load_default_model', lambda: auto_load_calls.append(True),
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._ensure_chat_model_or_forwarding(
+            api_server.ChatRequest(
+                message='ping', routing_preference='distributed_required',
+            ),
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == 'distributed_required_pipeline_not_ready'
+    assert auto_load_calls == []
+
+
 def test_reserved_worker_rejects_local_model_even_when_already_loaded(monkeypatch):
     class SegmentManager:
         is_loaded = True

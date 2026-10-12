@@ -150,6 +150,27 @@ def test_matching_chain_freezes_exact_physical_identities():
     assert len(plan["assignments"][1]["stage_capability_sha256"]) == 64
 
 
+def test_manifest_source_model_id_overrides_local_registry_alias():
+    assignments, nodes = _chain()
+    plan = bind_model_preflight(
+        {"admitted": True, "status": "admitted", "assignments": assignments},
+        descriptor={
+            "model_id": "local-deployment-alias",
+            "source_model_id": MODEL,
+            "total_layers": TOTAL,
+            "hidden_size": HIDDEN,
+            "tokenizer_sha256": TOKENIZER,
+            "source_model_sha256": SOURCE_SHA,
+        },
+        nodes=nodes,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is True
+    assert plan["model_preflight"]["model_id"] == MODEL
+    assert plan["assignments"][1]["stage_model_identity"]["model_id"] == "middle.gguf"
+
+
 def test_logical_model_id_is_not_the_physical_artifact_id():
     assignments, nodes = _chain()
     nodes[1]["layer_artifacts"][0]["source_model_id"] = "qwen2.5-0.5b"

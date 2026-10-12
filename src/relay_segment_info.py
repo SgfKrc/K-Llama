@@ -30,6 +30,7 @@ __all__ = [
     "load_ready_build",
     "read_artifact_manifest",
     "read_gguf_layer_info",
+    "read_gguf_tokenizer_sha256",
     "unknown_remote_build",
 ]
 
@@ -161,6 +162,54 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
         "n_layer": max(0, block_count - int(nextn)),
         "n_embd": max(0, int(n_embd)),
     }
+
+
+def read_gguf_tokenizer_sha256(path: str | Path) -> str | None:
+    """Fingerprint serialized tokenizer GGUF metadata without reading tensor payloads."""
+    target = Path(path)
+    try:
+        file_size = target.stat().st_size
+        with target.open("rb") as handle:
+            if handle.read(4) != _GGUF_MAGIC:
+                return None
+            (version,) = struct.unpack("<I", handle.read(4))
+            if version < 2:
+                return None
+            handle.read(8)
+            (metadata_count,) = struct.unpack("<Q", handle.read(8))
+            if metadata_count > 100_000:
+                return None
+            values: dict[str, bytes] = {}
+            for _ in range(metadata_count):
+                key = _gguf_read_string(handle)
+                (value_type,) = struct.unpack("<I", handle.read(4))
+                start = handle.tell()
+                _gguf_skip_value(handle, value_type)
+                end = handle.tell()
+                if end > file_size:
+                    return None
+                if not key.startswith("tokenizer."):
+                    continue
+                if key in values or end - start > 128 * 1024 * 1024:
+                    return None
+                field_digest = hashlib.sha256(struct.pack("<I", value_type))
+                handle.seek(start)
+                remaining = end - start
+                while remaining:
+                    chunk = handle.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        return None
+                    field_digest.update(chunk)
+                    remaining -= len(chunk)
+                values[key] = field_digest.digest()
+            if not {"tokenizer.ggml.model", "tokenizer.ggml.tokens"}.issubset(values):
+                return None
+            digest = hashlib.sha256()
+            for key in sorted(values):
+                digest.update(key.encode("utf-8") + b"\0" + values[key])
+            return digest.hexdigest()
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        return None
 
 
 #: GGML 张量类型 → `(每个 block 的元素数, 每个 block 的字节数)`。

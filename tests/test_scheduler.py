@@ -506,6 +506,30 @@ class TestComputeLayerAssignment:
             "score": records[0]["score"],
         }]
 
+    def test_master_capacity_uses_live_memory_instead_of_startup_snapshot(
+            self, sched, monkeypatch):
+        gib = 1024 ** 3
+        sched._role_override = "master"
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                device_info={"ram": {"available_gb": 1.0}},
+            ),
+            "remote": NodeInfo(
+                node_id="remote", role="client", state=NodeState.ONLINE,
+                device_info={"ram": {"available_gb": 7.0}},
+            ),
+        }
+        import psutil
+
+        monkeypatch.setattr(psutil, "virtual_memory", lambda: type("Memory", (), {
+            "available": 5 * gib,
+        })())
+        records = {record["node_id"]: record for record in sched._get_pipeline_capacity_nodes()}
+        assert records["master"]["capacity_bytes"] == 5 * gib
+        assert records["master"]["capacity_source"] == "ram.available_bytes_live"
+        assert records["remote"]["capacity_bytes"] == 7 * gib
+
     def test_android_task_worker_ranges_reach_capacity_solver(self, sched, monkeypatch):
         """Admitted v3 ranges are preserved as solver constraints."""
         monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)

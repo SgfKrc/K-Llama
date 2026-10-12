@@ -652,6 +652,40 @@ class TestPipelineCandidateTransaction:
         assert host.peek_manager() is active
         assert active.closed == 0
 
+    def test_gguf_candidate_commit_retains_layer_forward_capability(
+        self, monkeypatch, tmp_path,
+    ):
+        from koakuma_engine import Capability, runtime_supports
+        from llama_engine import LlamaCppEngine
+
+        model_path = tmp_path / "head.gguf"
+        model_path.write_bytes(b"header-only-fixture")
+
+        def prepare(engine, **kwargs):
+            engine._model_path = kwargs["model_path"]
+            engine._pipeline_distributed_only = True
+            engine._pipeline_descriptor = {
+                "model_id": kwargs["model_id"],
+                "model_sha256": "a" * 64,
+                "pipeline_runtime_supported": True,
+            }
+            return dict(engine._pipeline_descriptor)
+
+        def materialize(engine, **kwargs):
+            engine._loaded = True
+            return {"success": True}
+
+        monkeypatch.setattr(LlamaCppEngine, "prepare_pipeline_model", prepare)
+        monkeypatch.setattr(LlamaCppEngine, "load_layer_range", materialize)
+        host = ModelHost()
+        host.prepare_pipeline_candidate("txn-head", "model", str(model_path))
+        host.materialize_pipeline_candidate("txn-head", 0, 4, True, False)
+        host.commit_pipeline_candidate("txn-head")
+
+        assert host.engine_type == "llama_cpp"
+        assert runtime_supports(host, Capability.FORWARD_LAYERS) is True
+        assert host.model_loaded is False
+
     def test_tokenizer_only_candidate_can_commit_without_local_layers(
         self, monkeypatch, tmp_path,
     ):

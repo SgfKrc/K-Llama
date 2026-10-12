@@ -8,6 +8,7 @@ import asyncio
 
 from fastapi import APIRouter, File
 from api._routing import configure_route_module
+from api_errors import error_code_from_exception
 
 router = APIRouter()
 _api_module: ModuleType | None = None
@@ -641,6 +642,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     if (
                         (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
                         and not _api_module._pipeline_model_is_prepared()
+                        and req.routing_preference != 'distributed_required'
                     ):
                         try:
                             await _run_with_request_id(loop, _api_module._auto_load_default_model)
@@ -895,7 +897,7 @@ async def chat_stream(req: ChatRequest, request: Request):
             except _api_module.HTTPException as e:
                 yield _error_event(
                     e.detail,
-                    reason_code=_api_module.error_code_from_exception(e),
+                    reason_code=error_code_from_exception(e),
                 )
             except Exception as e:
                 _api_module.logger.error(f"full 模式推理失败: {e}", exc_info=True)
@@ -1091,6 +1093,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         if (
             (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
             and not _api_module._pipeline_model_is_prepared()
+            and req.routing_preference != 'distributed_required'
         ):
             loop = _asyncio.get_running_loop()
             try:

@@ -216,6 +216,10 @@ class LlamaCppEngine:
         # 必须存活到 unload —— worker 一停，RPC device 上的计算即失败。
         self._rpc_session = None
 
+    @property
+    def engine_type(self) -> str:
+        return "llama_cpp"
+
     # ================================================================
     # RPC device 接入（llama.cpp RPC backend）
     # ================================================================
@@ -357,10 +361,16 @@ class LlamaCppEngine:
         if not path or not os.path.isfile(path):
             return {}
         try:
-            from relay_segment_info import read_artifact_manifest, read_gguf_layer_info
+            from relay_segment_info import (
+                read_artifact_manifest, read_gguf_layer_info,
+                read_gguf_tokenizer_sha256,
+            )
         except ImportError:  # 以包形式导入本模块时（src.llama_engine）
             try:
-                from .relay_segment_info import read_artifact_manifest, read_gguf_layer_info
+                from .relay_segment_info import (
+                    read_artifact_manifest, read_gguf_layer_info,
+                    read_gguf_tokenizer_sha256,
+                )
             except ImportError:
                 return {}
         info = read_gguf_layer_info(path)
@@ -452,7 +462,7 @@ class LlamaCppEngine:
             weight_bytes = 0
         model_sha256 = self._pipeline_file_sha256(path)
         artifact_manifest_info = None
-        tokenizer_sha256 = tokenizer_sha256_from_asset(Path(path).parent)
+        tokenizer_sha256 = read_gguf_tokenizer_sha256(path) or ""
         for manifest_path in (
             Path(path).with_suffix(".manifest.json"),
             Path(str(path) + ".manifest.json"),
@@ -460,11 +470,12 @@ class LlamaCppEngine:
             manifest_info = read_artifact_manifest(manifest_path)
             if manifest_info:
                 artifact_manifest_info = manifest_info
-                if not tokenizer_sha256:
-                    tokenizer_sha256 = str(
-                        manifest_info.get("tokenizer_sha256", "") or ""
-                    )
+                declared_tokenizer = str(manifest_info.get("tokenizer_sha256", "") or "")
+                if declared_tokenizer and declared_tokenizer != tokenizer_sha256:
+                    return {}
                 break
+        if not tokenizer_sha256:
+            tokenizer_sha256 = tokenizer_sha256_from_asset(Path(path).parent)
         if not tokenizer_sha256:
             try:
                 from model_config import get_builtin_model, resolve_model_path
@@ -489,6 +500,15 @@ class LlamaCppEngine:
             "model_id": (
                 str(getattr(self, "active_model_id", "") or "")
                 or os.path.splitext(os.path.basename(path))[0]
+            ),
+            # A precut artifact may be registered under a deployment alias
+            # (for example ``q35-artifacts``), while its manifest names the
+            # logical source model shared by every relay segment. Keep both
+            # identities: ``model_id`` selects the local registry entry;
+            # ``source_model_id`` is the cross-node preflight contract.
+            "source_model_id": str(
+                (artifact_manifest_info or {}).get("source_model_id", "")
+                or ""
             ),
             "model_path": path,
             "model_sha256": model_sha256,
@@ -626,7 +646,9 @@ class LlamaCppEngine:
             return ""
         descriptor = dict(getattr(self, "_pipeline_descriptor", None) or {})
         expected_source_sha256 = str(
-            descriptor.get("model_sha256", "") or ""
+            descriptor.get("source_model_sha256")
+            or descriptor.get("model_sha256")
+            or ""
         ).strip().lower()
         if not expected_source_sha256:
             source_path = str(
@@ -2164,7 +2186,10 @@ class LlamaCppEngine:
             return None
         cut_layer = int(rng[1]) - int(rng[0])
         key = (str(artifact), cut_layer)
-        if getattr(self, "_keep_head_key", None) == key:
+        if (
+            getattr(self, "_keep_head_key", None) == key
+            and getattr(getattr(self, "_keep_head", None), "is_available", True)
+        ):
             return getattr(self, "_keep_head", None)
 
         old = getattr(self, "_keep_head", None)

@@ -16,6 +16,7 @@ from pipeline_model_descriptor import (  # noqa: E402
     PipelineModelDescriptorError,
     canonical_pipeline_model_type,
     inspect_pipeline_model,
+    public_pipeline_descriptor,
 )
 
 
@@ -40,15 +41,81 @@ def _write_qwen2_fixture(root):
     save_file(tensors, str(root / "model.safetensors"))
     tokenizer_payload = b'{"version":1}'
     (root / "tokenizer.json").write_bytes(tokenizer_payload)
-    (root / "model.manifest.json").write_text(json.dumps({
+    entry = {
+        "path": "tokenizer.json",
+        "sha256": hashlib.sha256(tokenizer_payload).hexdigest(),
+        "size_bytes": len(tokenizer_payload),
+    }
+    manifest = {
+        "schema": 1,
+        "model_type": "safetensors",
+        "revision": "",
+        "source": "",
+        "files": [entry],
+    }
+    manifest["artifact_sha256"] = hashlib.sha256(
+        f"{entry['path']}\0{entry['size_bytes']}\0{entry['sha256']}".encode()
+    ).hexdigest()
+    manifest["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in manifest.items()
+             if key not in {"artifact_sha256", "manifest_sha256"}},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    (root / "model.manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+
+def _write_cross_format_provenance(
+    root: Path,
+    target: Path,
+    *,
+    target_tokenizer_sha256: str,
+    target_path: str | None = None,
+) -> dict:
+    manifest = json.loads((root / "model.manifest.json").read_text(encoding="utf-8"))
+    payload = {
         "schema_version": 1,
-        "artifact_sha256": "a" * 64,
-        "files": [{
-            "path": "tokenizer.json",
-            "sha256": hashlib.sha256(tokenizer_payload).hexdigest(),
-            "size_bytes": len(tokenizer_payload),
-        }],
-    }), encoding="utf-8")
+        "kind": "qlh.cross_format_pipeline_identity.v1",
+        "source": {
+            "artifact_sha256": manifest["artifact_sha256"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "tokenizer_sha256": next(
+                entry["sha256"] for entry in manifest["files"]
+                if entry["path"] == "tokenizer.json"
+            ),
+        },
+        "conversion": {
+            "output_type": "Q4_K_M",
+            "converter_revision": "a" * 40,
+            "converter_sha256": "b" * 64,
+            "quantizer_revision": "c" * 40,
+            "quantizer_sha256": "d" * 64,
+        },
+        "target": {
+            "path": target_path or (
+                Path("..") / target.parent.name / target.name
+            ).as_posix(),
+            "artifact_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "tokenizer_sha256": target_tokenizer_sha256,
+        },
+    }
+    payload["provenance_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    (root / "cross_format.provenance.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    return payload
 
 
 def _write_gemma4_fixture(root):
@@ -108,6 +175,90 @@ def test_descriptor_fails_closed_when_tokenizer_no_longer_matches_manifest(tmp_p
     descriptor = inspect_pipeline_model(tmp_path, model_id="fixture")
 
     assert descriptor["tokenizer_sha256"] == ""
+
+
+def test_cross_format_provenance_maps_safetensors_to_verified_gguf(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "models" / "source"
+    target = tmp_path / "models" / "gguf" / "converted.gguf"
+    source.mkdir(parents=True)
+    target.parent.mkdir()
+    _write_qwen2_fixture(source)
+    target.write_bytes(b"converted-gguf")
+    gguf_tokenizer_sha256 = "e" * 64
+    provenance = _write_cross_format_provenance(
+        source,
+        target,
+        target_tokenizer_sha256=gguf_tokenizer_sha256,
+    )
+    monkeypatch.setattr(
+        "relay_segment_info.read_gguf_tokenizer_sha256",
+        lambda path: gguf_tokenizer_sha256,
+    )
+
+    descriptor = inspect_pipeline_model(source, model_id="fixture")
+
+    assert descriptor["source_model_sha256"] == hashlib.sha256(
+        target.read_bytes()
+    ).hexdigest()
+    assert descriptor["tokenizer_sha256"] == gguf_tokenizer_sha256
+    assert descriptor["source_tokenizer_sha256"] == hashlib.sha256(
+        (source / "tokenizer.json").read_bytes()
+    ).hexdigest()
+    assert descriptor["cross_format_provenance_sha256"] == provenance[
+        "provenance_sha256"
+    ]
+    public = public_pipeline_descriptor(descriptor)
+    assert public["source_model_sha256"] == descriptor["source_model_sha256"]
+    assert public["source_tokenizer_sha256"] == descriptor[
+        "source_tokenizer_sha256"
+    ]
+    assert public["cross_format_provenance_sha256"] == provenance[
+        "provenance_sha256"
+    ]
+
+
+def test_cross_format_provenance_fails_closed_after_target_tamper(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "models" / "source"
+    target = tmp_path / "models" / "gguf" / "converted.gguf"
+    source.mkdir(parents=True)
+    target.parent.mkdir()
+    _write_qwen2_fixture(source)
+    target.write_bytes(b"converted-gguf")
+    _write_cross_format_provenance(
+        source,
+        target,
+        target_tokenizer_sha256="e" * 64,
+    )
+    target.write_bytes(b"tampered")
+    monkeypatch.setattr(
+        "relay_segment_info.read_gguf_tokenizer_sha256",
+        lambda path: "e" * 64,
+    )
+
+    with pytest.raises(PipelineModelDescriptorError, match="GGUF digest mismatch"):
+        inspect_pipeline_model(source, model_id="fixture")
+
+
+def test_cross_format_provenance_rejects_target_outside_models_root(tmp_path):
+    source = tmp_path / "models" / "source"
+    target = tmp_path / "outside" / "converted.gguf"
+    source.mkdir(parents=True)
+    target.parent.mkdir()
+    _write_qwen2_fixture(source)
+    target.write_bytes(b"converted-gguf")
+    _write_cross_format_provenance(
+        source,
+        target,
+        target_tokenizer_sha256="e" * 64,
+        target_path="../../outside/converted.gguf",
+    )
+
+    with pytest.raises(PipelineModelDescriptorError, match="escapes the models root"):
+        inspect_pipeline_model(source, model_id="fixture")
 
 
 def test_descriptor_rejects_missing_layer(tmp_path):

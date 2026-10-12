@@ -306,7 +306,9 @@ async def _prepare_pipeline_model_resolution(resolution):
                 on_commit=_after_commit,
             )
         )
-        if not capacity_plan.get("admitted"):
+        if not capacity_plan.get("admitted") or capacity_plan.get(
+            "transaction_phase"
+        ) in {"aborted", "invalidated", "rejected"}:
             _api_module.model_host.abort_pipeline_candidate(candidate_id)
             candidate_prepared = False
             raise _api_module.coded_http_error(

@@ -300,6 +300,26 @@ def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
 
     decode_message(hello)
 
+    with_bytes = copy.deepcopy(hello)
+    with_bytes["payload"]["capabilities"]["layer_artifacts"][0][
+        "layer_weight_bytes"
+    ] = [1, 2, 3, 4]
+    decode_message(with_bytes)
+
+    for invalid in ([1, 2, 3], [1, 0, 3, 4], [1, True, 3, 4]):
+        invalid_hello = copy.deepcopy(with_bytes)
+        invalid_hello["payload"]["capabilities"]["layer_artifacts"][0][
+            "layer_weight_bytes"
+        ] = invalid
+        with pytest.raises(WorkerProtocolError):
+            decode_message(invalid_hello)
+
+    wrong_level = copy.deepcopy(hello)
+    wrong_level["payload"]["capabilities"]["layer_weight_bytes"] = [1, 2, 3, 4]
+    with pytest.raises(WorkerProtocolError) as wrong_level_error:
+        decode_message(wrong_level)
+    assert wrong_level_error.value.code == "invalid_fields"
+
     bad_mode = copy.deepcopy(hello)
     bad_mode["payload"]["capabilities"]["layer_artifacts"][0][
         "segment_mode"

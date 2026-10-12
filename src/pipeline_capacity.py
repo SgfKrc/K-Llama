@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import re
 from functools import lru_cache
 from typing import Any
 
 
 CAPACITY_PLAN_SCHEMA_VERSION = 1
+logger = logging.getLogger("scheduler")
 
 
 class PipelineCapacityError(ValueError):
@@ -495,8 +498,8 @@ def _merge_source_layer_bytes(
     `layer_artifacts[].layer_weight_bytes` 里申报**本段局部**口径的逐层字节
     （下标 0 = 段内第一层），这里按 `layer_range` 平移到源模型坐标系后填入缺口。
 
-    只在「原表确有缺口、且缺的每一层都被补齐」时才返回补齐后的副本；否则原样返回 ——
-    保持 fail-closed：宁可拒绝，也不给求解器一份臆造的容量账。
+    补齐值仅用于形成求解器的候选层视图；实际计费必须来自最终选中的工件。
+    只接受已规范化的可用节点与同源工件，对重叠报价取上界；未补齐则保持拒绝。
     """
     if not isinstance(descriptor, dict):
         return descriptor
@@ -509,40 +512,40 @@ def _merge_source_layer_bytes(
         return descriptor
     if total <= 0 or len(raw) != total:
         return descriptor
-    try:
-        merged = [int(value) for value in raw]
-    except (TypeError, ValueError):
-        return descriptor
+    merged = [
+        _non_negative_int(value, f"layer_weight_bytes[{index}]")
+        for index, value in enumerate(raw)
+    ]
     if all(value > 0 for value in merged):
-        return descriptor  # 已是完整视图（例如主节点握着整模）
+        return descriptor
+    expected_source = str(descriptor.get("source_model_sha256", "") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_source) is None:
+        raise PipelineCapacityError(
+            "partial layer_weight_bytes requires source_model_sha256"
+        )
     filled = 0
+    advertised: list[tuple[str, tuple[int, int], int]] = []
     for node in nodes or []:
-        artifacts = node.get("layer_artifacts") if isinstance(node, dict) else None
-        if not isinstance(artifacts, list):
-            continue
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                continue
+        for artifact in node.get("layer_artifacts", ()):
             segment_bytes = artifact.get("layer_weight_bytes")
-            span = artifact.get("layer_range")
-            if not isinstance(segment_bytes, list) or not segment_bytes:
+            start, end = artifact["layer_range"]
+            node_id = node["node_id"]
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", node_id):
+                node_id = "unknown"
+            advertised.append((node_id, (start, end), len(segment_bytes or ())))
+            if artifact["source_model_sha256"] != expected_source or not segment_bytes:
                 continue
-            if not (isinstance(span, (list, tuple)) and len(span) == 2):
-                continue
-            start, end = int(span[0]), int(span[1])
-            if end - start != len(segment_bytes):
-                continue
-            for offset, value in enumerate(segment_bytes):
+            for offset, size in enumerate(segment_bytes):
                 index = start + offset
-                if not (0 <= index < total) or merged[index] > 0:
+                if int(raw[index]) > 0:
                     continue
-                try:
-                    size = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if size > 0:
-                    merged[index] = size
+                if merged[index] <= 0:
                     filled += 1
+                merged[index] = max(merged[index], size)
+    logger.info(
+        "event=pipeline_layer_bytes_merge total_layers=%s filled_layers=%s missing_layers=%s advertised=%s",
+        total, filled, sum(value <= 0 for value in merged), advertised,
+    )
     if filled <= 0 or any(value <= 0 for value in merged):
         return descriptor
     merged_descriptor = dict(descriptor)
@@ -580,16 +583,28 @@ def solve_pipeline_capacity(
     safety_margin = _positive_float(safety_margin, "safety_margin")
     if safety_margin < 1.0:
         raise PipelineCapacityError("safety_margin must be at least 1.0")
-    # ★ 2026-10-11（方案 A）：接力不加载整模 ⇒ 主节点的 descriptor 只含**本段**逐层字节，
-    #   而 `_descriptor_costs` 要求每层都有正字节数。这里先尝试用各 worker 在
-    #   `layer_artifacts[].layer_weight_bytes` 里申报的**本段**字节补齐整模视图。
-    #   放在这里（而非某个调用点）是因为它是**所有**调用者的公共入口：prepare 走
-    #   `start_pipeline_model_transaction`、规划走 scheduler，都会经过本函数。
-    descriptor = _merge_source_layer_bytes(descriptor, nodes)
+    original_layer_bytes = descriptor.get("layer_weight_bytes")
+    total_layers = _non_negative_int(descriptor.get("total_layers", 0), "total_layers")
+    usable, excluded = _normalize_nodes(nodes, total_layers=total_layers)
+    quoted_artifacts: dict[tuple[str, tuple[int, int]], tuple[str, tuple[int, ...]]] = {}
+    for node in usable:
+        for artifact in node.get("layer_artifacts", ()):
+            sizes = artifact.get("layer_weight_bytes")
+            if sizes is None:
+                continue
+            identity = (artifact["artifact_sha256"], artifact["layer_range"])
+            quote = (artifact["source_model_sha256"], tuple(sizes))
+            if identity in quoted_artifacts and quoted_artifacts[identity] != quote:
+                raise PipelineCapacityError("conflicting layer_weight_bytes for artifact_sha256")
+            quoted_artifacts[identity] = quote
+    descriptor = _merge_source_layer_bytes(descriptor, usable)
     layer_bytes, embedding_bytes, per_node_bytes, output_bytes = _descriptor_costs(
         descriptor
     )
-    usable, excluded = _normalize_nodes(nodes, total_layers=len(layer_bytes))
+    expected_source = str(descriptor.get("source_model_sha256", "") or "").strip().lower()
+    missing_prefix = [0]
+    for value in original_layer_bytes:
+        missing_prefix.append(missing_prefix[-1] + (int(value) == 0))
     # ★ A1 / X 档（Y 档第二条缺口 6）：relay 段节点**不占层、不计容量**，但**算参与节点**。
     #   `scheduler.py` 的 `_get_pipeline_capacity_nodes` 给它打 `capacity_source="relay_exempt"`
     #   （段工件在远端 relay_mid_service，本节点只转发 ⇒ 不需要本地容量预算）。
@@ -771,13 +786,34 @@ def solve_pipeline_capacity(
                 if matching_artifact is not None else ""
             )
             if (
+                matching_artifact is not None and expected_source
+                and artifact_source_sha256 != expected_source
+            ):
+                continue
+            if (
                 source_model_sha256
                 and artifact_source_sha256
                 and source_model_sha256 != artifact_source_sha256
             ):
                 continue
             next_source_sha256 = source_model_sha256 or artifact_source_sha256
-            raw_bytes = prefix[end] - prefix[cursor] + per_node_bytes
+            segment_bytes = (
+                matching_artifact.get("layer_weight_bytes")
+                if matching_artifact is not None else None
+            )
+            if (
+                matching_artifact is not None and segment_bytes is None
+                and matching_artifact["artifact_sha256"] != str(
+                    descriptor.get("model_sha256", "") or ""
+                ).strip().lower()
+            ):
+                continue
+            if segment_bytes is None and missing_prefix[end] != missing_prefix[cursor]:
+                continue
+            raw_bytes = (
+                sum(segment_bytes) if segment_bytes is not None
+                else prefix[end] - prefix[cursor]
+            ) + per_node_bytes
             has_embedding = not started
             has_lm_head = end == layer_budget
             if has_embedding:
@@ -800,6 +836,8 @@ def solve_pipeline_capacity(
                 required,
                 has_embedding,
                 has_lm_head,
+                node["layer_artifacts"].index(matching_artifact)
+                if matching_artifact is not None else None,
             )
             candidate = (item,) + tail
             if best is None:
@@ -977,8 +1015,15 @@ def solve_pipeline_capacity(
 
     assignments = []
     used_ids: set[str] = set()
-    for node_index, start, end, raw_bytes, required, has_embedding, has_lm_head in solved:
+    for (
+        node_index, start, end, raw_bytes, required,
+        has_embedding, has_lm_head, artifact_index,
+    ) in solved:
         node = usable[node_index]
+        artifact = (
+            node["layer_artifacts"][artifact_index]
+            if artifact_index is not None else None
+        )
         used_ids.add(node["node_id"])
         assignment = {
             "node_id": node["node_id"],
@@ -1003,17 +1048,23 @@ def solve_pipeline_capacity(
                 [range_start, range_end]
                 for range_start, range_end in node["layer_ranges"]
             ]
-        if "layer_artifacts" in node:
-            artifact = next((
-                item for item in node["layer_artifacts"]
-                if item["layer_range"] == (start, end)
-            ), None)
-            if artifact is not None:
-                assignment["layer_artifact"] = {
-                    **artifact,
-                    "layer_range": list(artifact["layer_range"]),
-                }
+        if artifact is not None:
+            assignment["layer_artifact"] = {
+                **artifact,
+                "layer_range": list(artifact["layer_range"]),
+            }
         assignments.append(assignment)
+
+    selected_layer_bytes = sum(
+        item[3] - per_node_bytes
+        - (embedding_bytes if item[5] else 0)
+        - (output_bytes if item[6] else 0)
+        for item in solved
+    )
+    base["raw_model_bytes"] = (
+        selected_layer_bytes + sum(layer_bytes[layer_budget:])
+        + embedding_bytes + per_node_bytes + output_bytes
+    )
 
     plan_identity = {
         "descriptor_sha256": str(descriptor.get("model_sha256", "") or ""),
@@ -1045,7 +1096,9 @@ def solve_pipeline_capacity(
             for start, end in allowed_ranges
         ):
             continue
-        required = _required_bytes(raw_model_bytes, node, safety_margin)
+        required = _required_bytes(
+            max(raw_model_bytes, base["raw_model_bytes"]), node, safety_margin
+        )
         if required <= node["capacity_bytes"]:
             full_model_fits.append(node["node_id"])
 

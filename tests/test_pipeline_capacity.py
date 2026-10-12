@@ -42,6 +42,222 @@ def node(node_id, capacity_mb, *, role="client", score=10):
     }
 
 
+def test_partial_master_merges_local_worker_bytes_without_full_model():
+    partial = descriptor(layer_sizes=(100, 0, 0, 0))
+    partial["source_model_sha256"] = "a" * 64
+    workers = [
+        {**node("master", 500, role="master"), "layer_ranges": [[0, 1]]},
+        {
+            **node("middle", 500),
+            "layer_ranges": [[1, 3]],
+            "layer_artifacts": [{
+                "layer_range": [1, 3], "segment_mode": "middle",
+                "model_id": "middle.gguf", "artifact_sha256": "b" * 64,
+                "source_model_sha256": "a" * 64,
+                "layer_weight_bytes": [100 * MIB, 100 * MIB],
+            }],
+        },
+        {
+            **node("tail", 500),
+            "layer_ranges": [[3, 4]],
+            "layer_artifacts": [{
+                "layer_range": [3, 4], "segment_mode": "tail",
+                "model_id": "tail.gguf", "artifact_sha256": "c" * 64,
+                "source_model_sha256": "a" * 64,
+                "layer_weight_bytes": [100 * MIB],
+            }],
+        },
+    ]
+    plan = solve_pipeline_capacity(
+        partial, workers, safety_margin=1.0,
+        require_distributed=True, prefer_all_workers=True,
+    )
+    assert plan["admitted"] is True
+    assert [(item["node_id"], item["start_layer"], item["end_layer"])
+            for item in plan["assignments"]] == [
+                ("master", 0, 1), ("middle", 1, 3), ("tail", 3, 4),
+            ]
+    assert partial["layer_weight_bytes"] == [100 * MIB, 0, 0, 0]
+
+    workers[2]["layer_artifacts"][0].pop("layer_weight_bytes")
+    with pytest.raises(PipelineCapacityError, match="every decoder layer"):
+        solve_pipeline_capacity(partial, workers, safety_margin=1.0)
+
+
+def test_partial_bytes_require_a_matching_source():
+    partial = descriptor(layer_sizes=(100, 0))
+    master = {**node("master", 200, role="master"), "layer_ranges": [[0, 1]]}
+    tail = {**node("tail", 500), "layer_ranges": [[1, 2]], "layer_artifacts": [{
+        "layer_range": [1, 2], "segment_mode": "tail", "model_id": "tail.gguf",
+        "artifact_sha256": "b" * 64, "source_model_sha256": "c" * 64,
+        "layer_weight_bytes": [1 * MIB],
+    }]}
+    with pytest.raises(PipelineCapacityError, match="source_model_sha256"):
+        solve_pipeline_capacity(partial, [master, tail], safety_margin=1.0)
+    partial["source_model_sha256"] = "a" * 64
+    with pytest.raises(PipelineCapacityError, match="every decoder layer"):
+        solve_pipeline_capacity(partial, [master, tail], safety_margin=1.0)
+
+    correct = {**node("correct", 400, score=50), "layer_ranges": [[1, 2]],
+               "layer_artifacts": [{**tail["layer_artifacts"][0],
+                                    "model_id": "correct.gguf",
+                                    "artifact_sha256": "d" * 64,
+                                    "source_model_sha256": "a" * 64,
+                                    "layer_weight_bytes": [200 * MIB]}]}
+    plan = solve_pipeline_capacity(partial, [master, tail, correct],
+                                   safety_margin=1.0, require_distributed=True)
+    assert plan["admitted"] is True
+    assert plan["assignments"][-1]["node_id"] == "correct"
+    assert plan["assignments"][-1]["raw_weight_bytes"] == 245 * MIB
+
+
+def test_overlap_charges_selected_artifact_instead_of_first_quote():
+    partial = descriptor(layer_sizes=(100, 0, 0, 0))
+    partial["source_model_sha256"] = "a" * 64
+    middle = {
+        "layer_range": [1, 3], "segment_mode": "middle",
+        "model_id": "middle.gguf", "artifact_sha256": "b" * 64,
+        "source_model_sha256": "a" * 64,
+    }
+    cheap = {
+        **node("cheap", 120, score=11), "layer_ranges": [[1, 3]],
+        "layer_artifacts": [{**middle, "layer_weight_bytes": [40 * MIB] * 2}],
+    }
+    expensive = {
+        **node("expensive", 400, score=50), "layer_ranges": [[1, 3]],
+        "layer_artifacts": [{
+            **middle, "model_id": "expensive.gguf", "artifact_sha256": "c" * 64,
+            "layer_weight_bytes": [150 * MIB] * 2,
+        }],
+    }
+    tail = {
+        **node("tail", 200), "layer_ranges": [[3, 4]],
+        "layer_artifacts": [{
+            "layer_range": [3, 4], "segment_mode": "tail",
+            "model_id": "tail.gguf", "artifact_sha256": "d" * 64,
+            "source_model_sha256": "a" * 64,
+            "layer_weight_bytes": [100 * MIB],
+        }],
+    }
+    master = {**node("master", 200, role="master"), "layer_ranges": [[0, 1]]}
+    for workers in ([cheap, expensive], [expensive, cheap]):
+        plan = solve_pipeline_capacity(
+            partial, [master, *workers, tail], safety_margin=1.0,
+            require_distributed=True,
+        )
+        assert plan["admitted"] is True
+        chosen = next(item for item in plan["assignments"] if item["node_id"] == "expensive")
+        assert chosen["raw_weight_bytes"] == 305 * MIB
+        assert chosen["required_bytes"] == 315 * MIB
+        assert plan["raw_model_bytes"] == 585 * MIB
+
+    expensive["capacity_bytes"] = 250 * MIB
+    cheaper_plan = solve_pipeline_capacity(
+        partial, [master, cheap, expensive, tail], safety_margin=1.0,
+        require_distributed=True,
+    )
+    assert cheaper_plan["admitted"] is True
+    cheap_assignment = next(item for item in cheaper_plan["assignments"]
+                            if item["node_id"] == "cheap")
+    assert cheap_assignment["raw_weight_bytes"] == 85 * MIB
+    assert cheaper_plan["raw_model_bytes"] == 365 * MIB
+
+    cheap["capacity_bytes"] = 50 * MIB
+    rejected = solve_pipeline_capacity(
+        partial, [master, cheap, expensive, tail], safety_margin=1.0,
+        require_distributed=True,
+    )
+    assert rejected["admitted"] is False
+
+
+def test_same_artifact_digest_with_conflicting_quotes_is_rejected():
+    partial = descriptor(layer_sizes=(100, 0))
+    partial["source_model_sha256"] = "a" * 64
+    artifact = {
+        "layer_range": [1, 2], "segment_mode": "tail",
+        "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+        "source_model_sha256": "a" * 64,
+    }
+    workers = [
+        {**node("first", 500), "layer_ranges": [[1, 2]],
+         "layer_artifacts": [{**artifact, "layer_weight_bytes": [100 * MIB]}]},
+        {**node("second", 500), "layer_ranges": [[1, 2]],
+         "layer_artifacts": [{**artifact, "layer_weight_bytes": [200 * MIB]}]},
+    ]
+    with pytest.raises(PipelineCapacityError, match="conflicting layer_weight_bytes"):
+        solve_pipeline_capacity(partial, workers, safety_margin=1.0)
+
+
+def test_partial_bytes_cannot_be_borrowed_by_an_unpriced_artifact():
+    partial = descriptor(layer_sizes=(100, 0))
+    partial["source_model_sha256"] = "a" * 64
+    artifact = {
+        "layer_range": [1, 2], "segment_mode": "tail",
+        "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+        "source_model_sha256": "a" * 64,
+        "layer_weight_bytes": [100 * MIB],
+    }
+    lender = {**node("lender", 50), "layer_ranges": [[1, 2]],
+              "layer_artifacts": [artifact]}
+    selected = {**node("selected", 300), "layer_ranges": [[1, 2]],
+                "layer_artifacts": [{key: value for key, value in artifact.items()
+                                     if key != "layer_weight_bytes"}]}
+    plan = solve_pipeline_capacity(
+        partial, [node("master", 200, role="master"), lender, selected],
+        safety_margin=1.0, require_distributed=True,
+    )
+    assert plan["admitted"] is False
+    lender["capacity_bytes"] = 5 * MIB
+    with pytest.raises(PipelineCapacityError, match="every decoder layer"):
+        solve_pipeline_capacity(
+            partial, [node("master", 200, role="master"), lender, selected],
+            safety_margin=1.0, require_distributed=True,
+        )
+
+
+def test_complete_descriptor_charges_selected_cross_format_artifact():
+    complete = descriptor(layer_sizes=(100, 100))
+    complete["source_model_sha256"] = "a" * 64
+    worker = {
+        **node("tail", 300), "layer_ranges": [[1, 2]],
+        "layer_artifacts": [{
+            "layer_range": [1, 2], "segment_mode": "tail",
+            "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+            "source_model_sha256": "a" * 64,
+            "layer_weight_bytes": [200 * MIB],
+        }],
+    }
+    master = {**node("master", 200, role="master"), "layer_ranges": [[0, 1]]}
+    plan = solve_pipeline_capacity(
+        complete, [master, worker], safety_margin=1.0,
+        require_distributed=True,
+    )
+    assert plan["admitted"] is True
+    assert plan["assignments"][-1]["required_bytes"] == 255 * MIB
+    assert plan["raw_model_bytes"] == 385 * MIB
+    worker["capacity_bytes"] = 200 * MIB
+    rejected = solve_pipeline_capacity(
+        complete, [master, worker], safety_margin=1.0,
+        require_distributed=True,
+    )
+    assert rejected["admitted"] is False
+
+    worker["capacity_bytes"] = 300 * MIB
+    worker["layer_artifacts"][0].pop("layer_weight_bytes")
+    unpriced = solve_pipeline_capacity(
+        complete, [master, worker], safety_margin=1.0,
+        require_distributed=True,
+    )
+    assert unpriced["admitted"] is False
+    worker["layer_artifacts"][0]["layer_weight_bytes"] = [100 * MIB]
+    worker["layer_artifacts"][0]["source_model_sha256"] = "c" * 64
+    foreign = solve_pipeline_capacity(
+        complete, [master, worker], safety_margin=1.0,
+        require_distributed=True,
+    )
+    assert foreign["admitted"] is False
+
+
 def test_declared_layer_budget_caps_that_node_layers():
     """设备自荐的层数上限必须被分配器尊重 —— 它是"本地裁层后能承载的上限"，
     不是"当前工件已就绪的区间"，所以分配器可以给它任意连续区间，但不能超过层数。"""
