@@ -349,6 +349,20 @@ SPEC_TOP_LOGPROBS = _env_int("QLH_SPEC_TOP_LOGPROBS", 20, min_val=1, max_val=100
 SPEC_STATEFUL_VERIFY = _env_bool("QLH_SPEC_STATEFUL_VERIFY", False)
 SPEC_LABEL = _env_first("QLH_SPEC_LABEL", default="投机解码外部辅助")  # 展示名
 
+# --- n-gram 自投机（绑定路径 / 无 CUDA 边缘）---
+# ★ 2026-10-13 实测（Qwen3.6-35B-A3B-UD-Q4_K_XL，`.venv-test` 绑定）：
+#   `draft_model=LlamaPromptLookupDecoding` 在**绑定路径**上有效 —— 重复文本
+#   1.30～1.40×，自由文本不劣化（不命中时也不掉速）。它与上面 `SPEC_*`
+#   「外部 verify 模型」那套是**两条不同的路**：这里不引入任何额外模型、
+#   不占额外带宽与显存，纯粹在 token 历史里做 n-gram 匹配。
+# ⚠️ 代价：绑定一旦收到 `draft_model`，`llama_cpp/llama.py` 会把 `logits_all`
+#   强制为 True（每个位置都算 logits，内存/显存开销上升）⇒ 因此**默认关闭**，
+#   按场景显式启用；只在文本重复场景（结构化输出 / 代码 / 长文回述）有收益。
+# 对应裁决：有 CUDA 走 server 的 `--spec-type`，无 CUDA 才走这里。
+NGRAM_SPEC_ENABLED = _env_bool("QLH_NGRAM_SPEC_ENABLED", False)
+NGRAM_SPEC_MAX_NGRAM = _env_int("QLH_NGRAM_SPEC_MAX_NGRAM", 2, min_val=1, max_val=16)
+NGRAM_SPEC_NUM_PRED = _env_int("QLH_NGRAM_SPEC_NUM_PRED", 10, min_val=1, max_val=64)
+
 # --- 多模型实验支持 (P3) ---
 # ★ 2026-09-19：`qwen-1_8b` 已退役并从内置列表移除 ⇒ 活跃模型 ID 同步为默认模型
 #   （须与 `model_config.DEFAULT_MODEL_ID` 保持一致）。

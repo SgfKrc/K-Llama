@@ -116,6 +116,42 @@ def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
     return merged
 
 
+def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
+    """按配置给绑定路径挂上 n-gram 自投机（就地修改 `load_kwargs`）。
+
+    为什么选 n-gram：它只在 token 历史里做匹配，**不需要 draft 模型**、不占额外
+    带宽与显存 —— 正合「边缘设备不与主模型争带宽」的约束。实测（2026-10-13，
+    Qwen3.6-35B-A3B-Q4，CPU 绑定）：重复文本 1.30～1.40×，自由文本不劣化。
+
+    契约：
+    * 未启用或调用方已显式给出 `draft_model` ⇒ 原样不动；
+    * 绑定缺 `LlamaPromptLookupDecoding`（旧版）⇒ 记 warning 后降级，不抛异常；
+    * ⚠️ 一旦注入，`llama_cpp/llama.py` 会把 `logits_all` 强制为 True（开销上升）。
+    """
+    import config as _cfg
+
+    if not _cfg.NGRAM_SPEC_ENABLED or "draft_model" in load_kwargs:
+        return
+    try:
+        from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
+    except Exception:  # pragma: no cover - 旧绑定没有该类
+        logger.warning(
+            "n-gram 自投机不可用：当前 llama-cpp-python 未提供 "
+            "LlamaPromptLookupDecoding；已按未启用处理",
+        )
+        return
+    load_kwargs["draft_model"] = LlamaPromptLookupDecoding(
+        max_ngram_size=int(_cfg.NGRAM_SPEC_MAX_NGRAM),
+        num_pred_tokens=int(_cfg.NGRAM_SPEC_NUM_PRED),
+    )
+    logger.info(
+        "n-gram 自投机已启用（max_ngram=%s, num_pred=%s）——"
+        "注意绑定会强制 logits_all=True，仅在文本重复场景有收益",
+        _cfg.NGRAM_SPEC_MAX_NGRAM,
+        _cfg.NGRAM_SPEC_NUM_PRED,
+    )
+
+
 def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
     """构造 `llama_cpp.Llama`，可选地把 context 的 `n_seq_max` 抬到指定值。
 
@@ -911,6 +947,9 @@ class LlamaCppEngine:
                 load_kwargs["chat_format"] = "chatml"
 
             load_kwargs.update(kwargs)
+            # n-gram 自投机（绑定路径 / 无 CUDA 边缘）：默认关闭；
+            # 调用方显式传了 draft_model 时不覆盖。
+            _apply_ngram_draft_model(load_kwargs)
 
             rpc_endpoints = self._normalize_rpc_servers(rpc_servers)
             if rpc_endpoints or rpc_worker_exe:
