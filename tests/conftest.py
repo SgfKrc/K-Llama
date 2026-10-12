@@ -1,6 +1,6 @@
 """tests/conftest.py — 测试会话级准备
 
-目前只做一件事：**尽早**安装 transformers 5.x 兼容 shim。
+Install the compatibility shim early and isolate process-wide mutable state.
 
 为什么需要在这里（而不是只靠 `src/model_module.py`）：
 `transformers_stream_generator`（Qwen-1.8B remote code 的 `chat_stream` 依赖）在
@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import random
 import sys
+from copy import deepcopy
 
 import pytest
 
@@ -88,79 +89,123 @@ def pytest_runtest_setup(item) -> None:  # noqa: ARG001 - 需要 item 签名
         pass
 
 
-#: 运行期会被生产代码/用例直接改写的全局 config 名（详见下方 fixture 说明）。
-_CONFIG_BASELINE_NAMES = ("INFERENCE_ENGINE", "QUANT_TYPE", "USE_COMPILE")
-#: 首次用例开始前记录的基线值（= 会话起点状态），每个用例前后恢复。
-_CONFIG_BASELINE: dict = {}
+def _is_config_setting(name: str) -> bool:
+    return name.isupper() and not name.startswith("_")
+
+
+def _restore_mutable_value(original, snapshot):
+    """Restore containers in place so aliases keep seeing the restored baseline."""
+    if isinstance(original, dict):
+        original.clear()
+        original.update(snapshot)
+    elif isinstance(original, (list, bytearray)):
+        original[:] = snapshot
+    elif isinstance(original, set):
+        original.clear()
+        original.update(snapshot)
+    else:
+        return snapshot
+    return original
+
+
+def _clear_chat_state(api_server) -> None:
+    if api_server is None:
+        return
+    service = getattr(api_server, "_chat_context", None)
+    if service is not None:
+        with service._lock:
+            service._committed_operations.clear()
+            service._revisions.clear()
+            service.histories.clear()
+            service._history_generations.clear()
+            service.active_session_id = None
+    ctx = getattr(api_server, "_request_id_ctx", None)
+    if ctx is not None:
+        ctx.set("")
 
 
 @pytest.fixture(autouse=True)
-def _reset_process_wide_chat_state():
-    """每个用例前后重置**进程级**聊天状态、request-id ContextVar 与被改写的全局 config。
+def _isolate_local_store(tmp_path):
+    """Keep lifecycle/identity state and legacy imports out of the user's store.
 
-    为什么必须在 conftest 兜底（而不是靠各用例自觉）：
-
-    1. **request-id 是 ContextVar** —— 有用例直接 `.set()` 一个固定 id
-       （如 `test_api_logging.py` 设 `"abc123def456"`）后**不会自动复原**
-       （monkeypatch 不管 ContextVar）。后续用例经
-       `api_server._commit_chat_context_turn` 会拿到同一个 operation_id。
-    2. **`api_server._chat_context` 是模块级单例** —— 其
-       `_committed_operations`（operation_id → turn 的幂等表）跨用例累积：
-       同一个 operation_id 第二次带**不同**内容就会抛
-       `ConversationContextConflict` → API 409
-       `operation_id has conflicting conversation turn`。
-    3. **生产代码会在运行时改写全局 `config`** —— 例如
-       `api_server._auto_load_default_model()` 直接写
-       `cfg.INFERENCE_ENGINE = resolution.engine` /
-       `cfg.QUANT_TYPE = resolution.quant_type`（票 2 引入）。它是进程级副作用、
-       不随用例复原，于是任何触发过自动加载的用例都会改变后续用例看到的
-       "当前引擎"，使 `ModelManager.select_engine()` 类断言随机失败
-       （实测：`test_model_module.py::TestSelectEngine::test_manual_llama_cpp_override`
-       全量红 / 单跑绿）。
-
-    实测症状：全量下上述两类假红合计 25 例，单跑全绿。
+    Use the real SQLite implementation with a separate path for every test and
+    worker. Test fixtures may still override the path or persistence functions
+    to exercise recovery; do not suppress lifecycle reads or model restoration.
     """
-    # 首次调用时记录全局 config 基线（= 会话起点状态），之后每用例恢复。
-    if not _CONFIG_BASELINE:
-        try:
-            import config as _cfg
-            for _name in _CONFIG_BASELINE_NAMES:
-                if hasattr(_cfg, _name):
-                    _CONFIG_BASELINE[_name] = getattr(_cfg, _name)
-        except Exception:  # noqa: BLE001
-            pass
+    with pytest.MonkeyPatch.context() as isolation:
+        isolation.setenv("QLH_SQLITE_PATH", str(tmp_path / "local-store.sqlite3"))
+        import local_store
 
-    def _reset() -> None:
-        try:
-            import api_server
-        except Exception:  # noqa: BLE001 - 环境缺依赖时不该让用例中断
-            pass
-        else:
-            try:
-                service = getattr(api_server, "_chat_context", None)
-                if service is not None:
-                    with service._lock:
-                        # 只清"幂等/跨请求累积"的部分，保留 service 的身份与配置。
-                        service._committed_operations.clear()
-                        service._revisions.clear()
-                        service.histories.clear()
-                        service._history_generations.clear()
-                        service.active_session_id = None
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                ctx = getattr(api_server, "_request_id_ctx", None)
-                if ctx is not None:
-                    ctx.set("")
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            import config as _cfg
-            for _name, _value in _CONFIG_BASELINE.items():
-                setattr(_cfg, _name, _value)
-        except Exception:  # noqa: BLE001
-            pass
+        isolation.setattr(local_store, "_legacy_store_dir", lambda: str(tmp_path / "legacy"))
+        isolation.setattr(local_store, "_initialized_paths", set())
+        yield
 
-    _reset()
-    yield
-    _reset()
+
+@pytest.fixture(autouse=True)
+def _reset_process_wide_chat_state(_isolate_local_store):
+    """Restore each test's Config and shared ModelHost after normal fixture teardown.
+
+    Auto-load and scheduler paths write host state directly; distributed tests
+    also replace the shared manager and can leave it as None.
+
+    Keep snapshots local to the test: a session baseline both loses scoped
+    fixture overrides and, when reused by reference, can itself be mutated.
+    Do not depend on monkeypatch or call undo(): its normal teardown must run
+    first, especially for attributes forwarded through the lazy manager.
+    Managers, callbacks and locks retain their identity; no engine is loaded,
+    copied or unloaded by isolation.
+    """
+    try:
+        import api_server
+    except Exception:  # noqa: BLE001 - optional runtime dependencies may be absent
+        api_server = None
+    try:
+        import config
+    except ImportError:
+        config = None
+
+    config_originals = (
+        {name: value for name, value in vars(config).items() if _is_config_setting(name)}
+        if config is not None else {}
+    )
+    config_snapshot = deepcopy(config_originals)
+
+    # Inspect the instance dictionary and lazy slot directly. getattr/hasattr on
+    # ModelHost or _LazyModelManager can otherwise construct a real ModelManager.
+    host_module = sys.modules.get("model_host")
+    host = vars(host_module).get("model_host") if host_module is not None else None
+    host_originals = dict(vars(host)) if host is not None else {}
+    generation = host_originals.get("generation_config")
+    generation_snapshot = deepcopy(generation)
+    manager = host_originals.get("_manager")
+    missing = object()
+    try:
+        lazy_instance = object.__getattribute__(manager, "_instance")
+    except AttributeError:
+        lazy_instance = missing
+
+    _clear_chat_state(api_server)
+    try:
+        yield
+    finally:
+        # This autouse fixture is set up before function fixtures, so their
+        # finalizers (including monkeypatch.undo) have already completed here.
+        try:
+            _clear_chat_state(api_server)
+        finally:
+            if host is not None:
+                if lazy_instance is not missing:
+                    object.__setattr__(manager, "_instance", lazy_instance)
+                if generation is not None:
+                    _restore_mutable_value(generation, deepcopy(generation_snapshot))
+                namespace = vars(host)
+                namespace.clear()
+                namespace.update(host_originals)
+            if config is not None:
+                namespace = vars(config)
+                for name in list(namespace):
+                    if _is_config_setting(name) and name not in config_originals:
+                        del namespace[name]
+                restored = deepcopy(config_snapshot)
+                for name, original in config_originals.items():
+                    namespace[name] = _restore_mutable_value(original, restored[name])

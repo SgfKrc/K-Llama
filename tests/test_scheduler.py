@@ -4965,6 +4965,8 @@ class TestPipelineFallback:
             self, sched, monkeypatch):
         from request_deadline import RequestDeadline
 
+        monkeypatch.setattr(sched, "_distributed_inference_enabled", False)
+
         entered = threading.Event()
         release_worker = threading.Event()
         worker_exited = threading.Event()
@@ -8478,8 +8480,10 @@ class TestPipelineOrchestrationIntegration:
     # ----------------------------------------------------------
 
     def test_fallback_calls_ensure_full_model(self, sched_master, monkeypatch):
-        """流水线裁剪后回退本地推理 → 必须确保模型为完整模型"""
+        """显式本地模式下推理 → 必须确保模型为完整模型。"""
         from model_host import model_host as _host
+
+        monkeypatch.setattr(sched_master, "_distributed_inference_enabled", False)
 
         ensure_calls = []
         chat_calls = []

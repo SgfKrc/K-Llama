@@ -95,6 +95,7 @@ def _scheduler(*, active_layer_config=None, layer_range=None,
                full_model_loaded=False, full_model_identity=None):
     """绕过 Scheduler.__init__ 构造最小能力快照目标。"""
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._distributed_inference_enabled = True
     scheduler._host = _FakeHost(
         layer_range=layer_range, full_model_loaded=full_model_loaded,
     )

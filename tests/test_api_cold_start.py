@@ -140,6 +140,9 @@ def test_frontend_bootstrap_endpoints_keep_model_manager_lazy(monkeypatch):
     class FakeScheduler:
         _max_nodes = 3
 
+        def get_distributed_inference_enabled(self):
+            return True
+
         def _effective_role(self):
             return "master"
 

@@ -291,6 +291,7 @@ def test_switch_model_accepts_external_model_path_not_in_builtin_registry(monkey
 
 
 def test_api_switch_model_resolves_db_registered_gguf(tmp_path, monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     gguf = tmp_path / "custom.Q4_K_M.gguf"
     gguf.write_text("x", encoding="utf-8")
     db_entry = {
@@ -592,6 +593,7 @@ def test_normalize_quant_marks_gguf_precision_as_artifact_owned():
 
 
 def test_load_model_auto_uses_real_gguf_model_resolution(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """engine=auto 解析到 llama.cpp 时，GGUF 量化占位值应合法。"""
     switch_calls = []
 
@@ -652,6 +654,7 @@ def test_load_model_auto_uses_real_gguf_model_resolution(monkeypatch, tmp_path):
 
 
 def test_api_auto_load_safetensors_only_uses_resolved_fp32(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     import config as runtime_config
 
     model_dir = tmp_path / "safetensors-only"
@@ -697,6 +700,7 @@ def test_api_auto_load_safetensors_only_uses_resolved_fp32(monkeypatch, tmp_path
 def test_api_auto_load_never_rebinds_active_id_to_global_artifact(
     monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     import config as runtime_config
 
     foreign = tmp_path / "foreign.gguf"
@@ -741,6 +745,7 @@ def test_load_model_rejects_nonexistent_model_id(monkeypatch):
 
 
 def test_load_model_uses_switch_model_internally(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """验证 /api/models/load 使用 switch_model（B2 修复）"""
     switch_calls = []
     load_mode_calls = []
@@ -990,6 +995,7 @@ def test_prepare_pipeline_model_rejects_synchronous_aborted_commit(
 
 
 def test_load_model_reports_effective_cpu_quant(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """CPU loader 归一为 FP32 后，API 状态不能继续上报请求的 FP16。"""
     class FakeManager:
         active_model_id = ""
@@ -1034,6 +1040,7 @@ def test_load_model_reports_effective_cpu_quant(monkeypatch):
 
 
 def test_load_model_rollback_on_failure(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """加载失败时 switch_model 应触发回滚，/api/models/load 应正确报告"""
     class FakeManager:
         active_model_id = "previous-model"
@@ -1245,8 +1252,9 @@ def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
         api_server._execute_chat_full(req)
 
     assert exc_info.value.status_code == 503
-    assert "整模回退已拒绝" in str(exc_info.value.detail)
-    assert calls == {"chat": 0, "ensure": 1}
+    assert exc_info.value.error_code == "DISTRIBUTED_FULL_MODEL_FORBIDDEN"
+    assert "route_a_mixed_legacy_execution_bridge_not_ready" in str(exc_info.value.detail)
+    assert calls == {"chat": 0, "ensure": 0}
 
 
 def test_pipeline_deadline_is_504_and_never_enters_local_fallback(monkeypatch):
@@ -1670,6 +1678,7 @@ def test_switch_model_rejects_invalid_engine(monkeypatch):
 
 
 def test_switch_model_calls_manager_switch(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """正常切换 → 调用 model_manager.switch_model 并更新全局状态"""
     switch_calls = []
 
@@ -1761,6 +1770,7 @@ def test_switch_model_rejects_gguf_quant_when_effective_engine_is_pytorch(monkey
 
 
 def test_switch_model_resets_runtime_conversation_state(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     switch_calls = []
     init_calls = []
     cleared = []
@@ -1845,6 +1855,7 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
 # ================================================================
 
 def test_register_model_passes_db_experimental_models_to_switch(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """注册的 DB 模型应可通过 switch_model 端点加载（B1 修复验证）"""
     gguf_file = tmp_path / "registered-model.Q4_K_M.gguf"
     gguf_file.write_text("x", encoding="utf-8")
