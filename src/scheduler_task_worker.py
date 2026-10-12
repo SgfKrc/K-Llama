@@ -719,7 +719,8 @@ class SchedulerTaskWorkerMixin:
     ) -> bool:
         """Send the TC-N2.0 hello after authenticated TCP registration."""
         if (
-            self._effective_role() != "client"
+            not self.get_distributed_inference_enabled()
+            or self._effective_role() != "client"
             or not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
         ):
             return False
@@ -764,7 +765,8 @@ class SchedulerTaskWorkerMixin:
         """Refresh hello asynchronously after a local full-model change."""
         client = getattr(self, "_tcp_client", None)
         if (
-            self._effective_role() != "client"
+            not self.get_distributed_inference_enabled()
+            or self._effective_role() != "client"
             or not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
             or not client
             or not getattr(client, "is_registered", False)
@@ -1248,7 +1250,9 @@ class SchedulerTaskWorkerMixin:
         active: Optional[_TaskWorkerActiveAttempt] = None
 
         coordinator = self._task_worker_control.coordinator_snapshot()
-        if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+        if not self.get_distributed_inference_enabled():
+            reject_reason = "local_inference_mode"
+        elif not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             reject_reason = "worker_experiment_disabled"
             reject_retryable = True
         else:
@@ -1288,6 +1292,9 @@ class SchedulerTaskWorkerMixin:
                 reject_retryable = True
 
         with self._task_worker_stage_lock:
+            if not self.get_distributed_inference_enabled():
+                reject_reason = "local_inference_mode"
+                reject_retryable = False
             if not reject_reason and (
                 attempt_id in self._task_worker_active_attempts
                 or self._task_worker_active_attempts
@@ -1401,6 +1408,8 @@ class SchedulerTaskWorkerMixin:
                 if stop_reason:
                     raise RuntimeError(stop_reason)
                 acquired_full_chat_lock = True
+                if not self.get_distributed_inference_enabled():
+                    raise RuntimeError("local_inference_mode")
 
                 stop_reason = self._acquire_task_worker_execution_lock(
                     self._inference_lock, active,

@@ -1080,6 +1080,8 @@ def _serialized_conversation_mutation(func):
 
 def _refresh_pipeline_layer_config() -> None:
     """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
+    if not scheduler.get_distributed_inference_enabled():
+        return
     try:
         if scheduler._effective_role() == "master":
             request_sync = getattr(
@@ -1362,6 +1364,10 @@ class PreparePipelineModelRequest(BaseModel):
         default="fp16",
         description="层段运行精度请求；第一期执行器仍以实际设备 dtype 为准",
     )
+
+
+class InferenceModeRequest(BaseModel):
+    mode: Literal["distributed", "local"]
 
 
 class ChatRequest(BaseModel):
@@ -1673,7 +1679,8 @@ def _build_chat_prompt(messages: list[dict], system_prompt: Optional[str] = None
 
 def _build_model_chat_prompt(tokenizer, messages: list[dict],
                              system_prompt: Optional[str] = None,
-                             assistant_prefill: Optional[str] = None) -> str:
+                             assistant_prefill: Optional[str] = None,
+                             enable_thinking: Optional[bool] = None) -> str:
     """Build a prompt with the active tokenizer's native chat template."""
     chat_messages = []
     if system_prompt:
@@ -1681,10 +1688,12 @@ def _build_model_chat_prompt(tokenizer, messages: list[dict],
     chat_messages.extend(messages)
 
     try:
+        template_options = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         prompt = tokenizer.apply_chat_template(
             chat_messages,
             tokenize=False,
             add_generation_prompt=True,
+            **template_options,
         )
         # DeepSeek-R1-Distill templates already end with "<think>\n" when
         # add_generation_prompt=True. Appending the legacy Chinese prefill here
@@ -2618,6 +2627,62 @@ def _unload_model_under_model_lock() -> dict:
 
 
 
+
+
+def _node_inference_mode() -> str:
+    return (
+        "distributed"
+        if RUN_MODE == "distributed" and scheduler.get_distributed_inference_enabled()
+        else "local"
+    )
+
+
+def _require_local_model_mode() -> None:
+    """Recheck intent after waiting for the model lock, before loading weights."""
+    if _node_inference_mode() != "local":
+        raise coded_http_error(
+            409, "INFERENCE_MODE_CHANGED",
+            "加载请求等待期间已加入集群；需要整模时请先手动切换到本地推理模式。",
+        )
+
+
+def _load_local_model_under_lock(**kwargs):
+    _require_local_model_mode()
+    return model_manager.load_model(**kwargs)
+
+
+def _sync_local_model_projection() -> None:
+    """Publish rollback state from the current runtime under its ownership lock."""
+    with model_host.full_chat_execution_lock:
+        loaded = bool(getattr(model_manager, "is_loaded", False)) and not _pipeline_model_is_prepared()
+        model_host.model_loaded = loaded
+        model_host.current_quant = getattr(model_manager, "quant_type", None) if loaded else None
+        if loaded:
+            _init_kv_cache()
+
+
+def _set_node_inference_mode(mode: str) -> dict:
+    if mode == "distributed" and RUN_MODE != "distributed":
+        raise coded_http_error(409, "DISTRIBUTED_RUNTIME_DISABLED", "Restart with QLH_RUN_MODE=distributed first.")
+    if not model_host.full_chat_execution_lock.acquire(blocking=False):
+        raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active inference before switching modes.")
+    try:
+        with scheduler._task_worker_stage_lock:
+            if scheduler._task_worker_active_attempts:
+                raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active worker task before switching modes.")
+            previous = _node_inference_mode()
+            if previous == mode:
+                return {"success": True, "mode": mode, "enabled": mode == "distributed", "changed": False}
+            scheduler._distributed_inference_enabled = False
+        scheduler.set_distributed_inference_enabled(False)
+        _unload_model_under_model_lock()
+        if mode == "distributed":
+            scheduler.set_distributed_inference_enabled(True)
+            scheduler.refresh_task_worker_capabilities()
+        logger.info("event=node_inference_mode_changed previous=%s mode=%s", previous, mode)
+        return {"success": True, "mode": mode, "enabled": mode == "distributed", "changed": True, "loaded": False}
+    finally:
+        model_host.full_chat_execution_lock.release()
 
 
 def _chat_origin(req: ChatRequest) -> str:
@@ -4381,6 +4446,14 @@ def _execute_chat_full(
             "请等待流水线就绪或显式加载完整模型。",
         )
 
+    if _node_inference_mode() == "distributed":
+        raise coded_http_error(
+            503 if pipeline_attempted else 409,
+            "DISTRIBUTED_FULL_MODEL_FORBIDDEN",
+            "分布式模式禁止执行或恢复整模；请先手动切换到本地推理模式。"
+            + (f" 流水线失败原因: {pipeline_failure_reason}" if pipeline_failure_reason else ""),
+        )
+
     # ---- 流水线失败 ⇒ 整模回退守卫（★ 2026-10-09：**引擎无关**）----
     #   ★ 原先只覆盖 llama.cpp / 孤岛（下面那个分支），PyTorch 路径漏了 ⇒ pipeline 尝试
     #   失败后会**静默坠入整模**：`ensure_full_model()` 对 distributed-only 模型抛
@@ -4564,6 +4637,7 @@ def _execute_chat_full(
             request_history,
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
+            enable_thinking=req.enable_thinking,
         )
         # ★ 数值对照诊断：与 `scheduler_pipeline._run_pipeline` 的同一行日志配对，
         #   用于确认两条路喂给模型的 prompt 是否逐字一致 —— 这是跨机 relay
@@ -4821,6 +4895,12 @@ def _auto_load_default_model():
     """自动加载默认模型（用于 thin client / Android 首次请求时服务端无模型的情况）。"""
     global kv_cache, conversation_stats
 
+    if RUN_MODE == "distributed" and scheduler.get_distributed_inference_enabled():
+        raise coded_http_error(
+            409, "DISTRIBUTED_MODEL_SELECTION_REQUIRED",
+            "请先选择并准备分布式模型；整模基线需要手动切换到本地推理模式。",
+        )
+
     import config as cfg
     import glob
 
@@ -4846,7 +4926,7 @@ def _auto_load_default_model():
         cfg.QUANT_TYPE = resolution.quant_type
         cfg.USE_COMPILE = False
         _run_exclusive_model_change(
-            lambda: model_manager.load_model(
+            lambda: _load_local_model_under_lock(
                 profile=device_profile,
                 engine=resolution.engine,
                 quant_type=resolution.quant_type,
@@ -4957,7 +5037,7 @@ def _auto_load_default_model():
     cfg.USE_COMPILE = False
 
     _run_exclusive_model_change(
-        lambda: model_manager.load_model(
+        lambda: _load_local_model_under_lock(
             model_path=model_path,
             quant_type=quant,
             profile=device_profile,
@@ -5643,65 +5723,10 @@ def _estimate_full_model_load_bytes(model_id: Optional[str], engine: str, quant:
 
 
 def _decide_pipeline_load_mode(model_id: Optional[str], engine: str, quant: str) -> tuple:
-    """★ 2026-10-09（自适应加载，用户裁定）决定分布式下的加载形态。
-
-    返回 `(mode, reason)`，`mode ∈ {"full", "pipeline"}`：
-    * `"full"` —— 可用显存/内存装得下**整模** ⇒ 直接整模加载（简单、启动快）；
-    * `"pipeline"` —— 装不下整模 ⇒ 走 `prepare_pipeline_model`，**各节点只在自己的分配段物化权重**
-      （这才是为边缘/小显存设计的路径；`#82` 的容量恒拒就发生在这里走错时）。
-
-    判据只做"整模装不装得下"这一层，**不替求解器决定怎么切分** ——
-    切分仍由 `pipeline_capacity` 按真实节点能力求解。
-    """
-    if RUN_MODE != "distributed":
-        return "full", "非分布式模式"
-    need = _estimate_full_model_load_bytes(model_id, engine, quant)
-    if need <= 0:
-        return "full", "无法估计整模需求（保持默认整模加载）"
-    profile = device_profile or {}
-    # ★ 2026-10-09：优先用**实时**探测，而不是注册时的画像快照 ——
-    #   `device_profile` 是启动时 `profiler.to_dict()` 的结果（且顶层未必有 `ram`），
-    #   实测在 CUDA 机器上拿不到可用值 ⇒ 决策退化成"未知 ⇒ 保持整模"。
-    #   这里直接问运行时：CUDA ⇒ `torch.cuda.mem_get_info`；CPU ⇒ `psutil.virtual_memory`。
-    available = 0.0
-    source = ""
-    try:
-        import torch_runtime as _tr
-
-        if _tr.cuda_available(load=False):
-            import torch as _torch
-
-            _free, _total = _torch.cuda.mem_get_info(0)
-            available = float(_free) / 1024 ** 3
-            source = "torch.cuda.mem_get_info"
-    except Exception:  # pragma: no cover - 探测失败则退化
-        available = 0.0
-    if available <= 0:
-        try:
-            import psutil as _psutil
-
-            available = float(_psutil.virtual_memory().available) / 1024 ** 3
-            source = "psutil.virtual_memory"
-        except Exception:  # pragma: no cover
-            available = 0.0
-    if available <= 0:
-        # 最后退化到注册时的画像（字段名兼容 PC 的 `ram.available_gb` 与 `gpu.vram_free_gb`）。
-        gpu_p = profile.get("gpu") or {}
-        ram_p = profile.get("ram") or {}
-        available = float(
-            (gpu_p.get("vram_free_gb") or ram_p.get("available_gb") or 0) or 0
-        )
-        source = "device_profile" if available > 0 else ""
-    if available <= 0:
-        return "full", "可用显存/内存未知（保持默认整模加载）"
-    # 留 15% 余量给 KV 缓存/激活/分配器开销。
-    fits = available * 1024 ** 3 * 0.85 >= need
-    if fits:
-        return "full", f"整模 {need / 1024**3:.2f}GB 可装入 {source}={available:.2f}GB"
-    return (
-        "pipeline",
-        f"整模 {need / 1024**3:.2f}GB 装不下 {source}={available:.2f}GB ⇒ 改为按段物化",
-    )
+    """Choose segment loading unless the user explicitly selects local inference."""
+    if RUN_MODE != "distributed" or not scheduler.get_distributed_inference_enabled():
+        return "full", "explicit_local_inference"
+    return "pipeline", "distributed_segment_loading_required"
 
 
 def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:

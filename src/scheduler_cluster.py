@@ -2258,6 +2258,8 @@ class SchedulerClusterMixin:
         master_host = canonical_host(master_host)
         master_port = int(master_port)
         with self._master_connect_lock:
+            if not self.get_distributed_inference_enabled():
+                return {"status": "denied", "reason": "local_inference_mode"}
             current = getattr(self, "_tcp_client", None)
             current_connected = bool(
                 current
@@ -3039,6 +3041,7 @@ class SchedulerClusterMixin:
         with self._nodes_lock:
             my_info = self.nodes.get(_effective_id)
         result = {
+            "inference_mode": "distributed" if self.get_distributed_inference_enabled() else "local",
             "node_role": effective_role,
             "node_id": _effective_id,
             "is_master": effective_role == "master",
@@ -3324,17 +3327,36 @@ class SchedulerClusterMixin:
 
 
     def set_distributed_inference_enabled(self, enabled: bool) -> dict:
-        """
-        设置分布式推理开关。
+        """Set participation and disconnect local workers when opting out."""
+        with self._host.full_chat_execution_lock:
+            return self._set_distributed_inference_enabled_locked(enabled)
 
-        - 关闭时不影响已连接节点（不会主动断开），仅阻止新的分布式推理请求
 
-        Returns:
-            {status, enabled, message}
-        """
+    def _set_distributed_inference_enabled_locked(self, enabled: bool) -> dict:
+        if enabled and not self.get_distributed_inference_enabled():
+            # The model API unloads under this same lock before rejoining.
+            # Other control surfaces must not advertise a resident local model.
+            with self._host.full_chat_execution_lock:
+                has_loaded = getattr(self._host, "has_loaded_model", None)
+                loaded = bool(self._host.model_loaded) or bool(
+                    callable(has_loaded) and has_loaded()
+                )
+                if loaded:
+                    return {
+                        "status": "error", "reason_code": "local_model_still_loaded",
+                        "reason": "请先通过模型模式接口卸载本地模型，再加入集群。",
+                    }
         self._distributed_inference_enabled = bool(enabled)
+        self._client_reconnect_enabled = bool(enabled)
+        if not enabled:
+            self.release_pipeline_worker_for_local_model()
+            client = getattr(self, "_tcp_client", None)
+            if client is not None:
+                client.disconnect()
         if enabled and self._effective_role() == "client":
             self._request_pipeline_worker_opt_in()
+            if self._running and not getattr(self._tcp_client, "is_registered", False):
+                threading.Thread(target=self._auto_connect_on_startup, name="explicit-cluster-rejoin", daemon=True).start()
         logger.info(f"分布式推理已{'启用' if enabled else '禁用'}")
         return {
             "status": "ok",
@@ -3345,6 +3367,8 @@ class SchedulerClusterMixin:
 
     def _request_pipeline_worker_opt_in(self) -> bool:
         """Ask the master to include this client in future layer assignments."""
+        if not self.get_distributed_inference_enabled():
+            return False
         with self._layer_config_lock:
             self._pipeline_worker_opted_out = False
         client = getattr(self, "_tcp_client", None)

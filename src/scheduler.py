@@ -2747,7 +2747,9 @@ class Scheduler(
         self, eligible_node_ids: Optional[set[str]] = None,
     ) -> list[dict]:
         """Project live layer-worker profiles into explicit free-memory budgets."""
+        from contextlib import nullcontext
         from config import PIPELINE_CAPACITY_RESERVE_MB
+        from koakuma_engine import canonical_backend
 
         # ★ 2026-10-07（DIST-NEXT-4b）：规划前先回收「心跳已过期且没有在跑 attempt」的
         #   reservation。TCP 半开/心跳线程失效的节点在巡检窗口（约 131s）里 TCP 仍算在线
@@ -2766,6 +2768,7 @@ class Scheduler(
         layer_ranges_by_node: dict[str, list[list[int]]] = {}
         layer_artifacts_by_node: dict[str, list[dict]] = {}
         models_by_node: dict[str, list[dict]] = {}
+        worker_engines: dict[str, str] = {}
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
         #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
         #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
@@ -2799,6 +2802,18 @@ class Scheduler(
                 models = capabilities.get("models")
                 if isinstance(models, list) and models:
                     models_by_node[node_id] = models
+                model_engines = {
+                    canonical_backend(item.get("engine"))
+                    for item in (models or []) if isinstance(item, dict)
+                } if isinstance(models, list) else set()
+                model_engines.discard("")
+                # Selected model identity takes precedence over installed engines.
+                if len(model_engines) == 1:
+                    worker_engines[node_id] = next(iter(model_engines))
+                else:
+                    engines = capabilities.get("engines")
+                    if isinstance(engines, list) and len(engines) == 1:
+                        worker_engines[node_id] = canonical_backend(engines[0])
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
@@ -2820,6 +2835,88 @@ class Scheduler(
 
         records = []
         effective_id = self.get_effective_node_id()
+        local_node_id = (
+            "master" if self._effective_role() == "master" else effective_id
+        )
+        local_engine = ""
+        local_device = ""
+        local_node = next((
+            node for node_id, node in snapshot if node_id == local_node_id
+        ), None)
+        if local_node is not None:
+            # Preparation keeps the active manager intact until commit. Read the
+            # actual candidate under its existing fence rather than the active
+            # host engine or a hardware-only CUDA guess. Never warm a lazy manager.
+            try:
+                candidate_lock = object.__getattribute__(
+                    self._host, "_pipeline_candidate_lock",
+                )
+            except AttributeError:
+                candidate_lock = nullcontext()
+            with candidate_lock:
+                try:
+                    candidate = object.__getattribute__(
+                        self._host, "_pipeline_candidate_transaction",
+                    )
+                except AttributeError:
+                    candidate = None
+                candidate_selected = candidate is not None and candidate.phase in {
+                    "prepared", "materialized", "committed",
+                }
+                runtime = candidate.manager if candidate_selected else None
+            # Runtime accessors may take the full-chat lock. Keep all calls out
+            # of the candidate fence so this reader adds no candidate -> full edge.
+            if not candidate_selected:
+                peek_manager = getattr(self._host, "peek_manager", None)
+                runtime = peek_manager() if callable(peek_manager) else self._host
+            local_engine = backend_id_for(runtime, default="")
+            if local_engine == "llama_cpp":
+                # ModelManager's legacy llama.cpp wrapper has a PyTorch-only
+                # get_device() that may still say CUDA; llama.cpp executes on CPU.
+                local_device = "cpu"
+            elif runtime is not None:
+                get_device = getattr(runtime, "get_device", None)
+                try:
+                    # Before materialization, ModelManager.get_device() falls
+                    # back to DEVICE. Share the filtered layer loader's selector.
+                    runtime_module = sys.modules.get("model_module")
+                    manager_type = getattr(runtime_module, "ModelManager", ())
+                    if (
+                        local_engine == "pytorch"
+                        and isinstance(runtime, manager_type)
+                        and runtime.is_pipeline_prepared
+                        and runtime.model is None
+                    ):
+                        device, _dtype = runtime_module._select_layer_runtime(
+                            runtime.quant_type,
+                        )
+                        local_device = str(device).split(":", 1)[0].lower()
+                    elif callable(get_device):
+                        local_device = str(get_device()).split(":", 1)[0].lower()
+                except Exception:
+                    local_device = "unknown"
+                    logger.warning(
+                        "runtime capacity device unavailable: engine=%s",
+                        local_engine, exc_info=True,
+                    )
+            if candidate_selected:
+                with candidate_lock:
+                    current = object.__getattribute__(
+                        self._host, "_pipeline_candidate_transaction",
+                    )
+                    if (
+                        current is not candidate or current.manager is not runtime
+                        or current.phase not in {
+                            "prepared", "materialized", "committed", "finalized",
+                        }
+                    ):
+                        # Abort/replacement during device lookup invalidates this
+                        # snapshot. Reject it instead of budgeting a stale engine.
+                        local_device = "unknown"
+            if runtime is None:
+                select_engine = getattr(self._host, "select_engine", None)
+                if callable(select_engine):
+                    local_engine = canonical_backend(select_engine(local_node.device_info))
         now = time.time()
         for node_id, node in snapshot:
             # ★ 逐条件诊断：把「为什么某个在线 PC 没进容量候选」直接打出来。
@@ -2900,19 +2997,29 @@ class Scheduler(
                 and gpu.get("cuda_available", False)
                 and not self._gpu_is_integrated(gpu)
             )
+            engine = worker_engines.get(node_id) or canonical_backend(
+                device_info.get("backend_id") or device_info.get("engine"),
+                default="pytorch",
+            )
+            if node_id == local_node_id:
+                engine = local_engine or engine
+            execution_device = (
+                "cuda" if engine == "pytorch" and cuda_discrete else "cpu"
+            )
+            if node_id == local_node_id and local_device:
+                execution_device = local_device
             capacity_gb = 0.0
             capacity_source = ""
             runtime_multiplier = 2.0
-            execution_device = "cpu"
-            if cuda_discrete:
-                try:
-                    capacity_gb = float(gpu.get("vram_free_gb", 0) or 0)
-                except (TypeError, ValueError):
-                    capacity_gb = 0.0
+            if execution_device == "cuda":
+                if cuda_discrete:
+                    try:
+                        capacity_gb = float(gpu.get("vram_free_gb", 0) or 0)
+                    except (TypeError, ValueError):
+                        capacity_gb = 0.0
                 capacity_source = "gpu.vram_free_gb" if capacity_gb > 0 else ""
                 runtime_multiplier = 1.0
-                execution_device = "cuda"
-            else:
+            elif execution_device == "cpu":
                 ram = device_info.get("ram", {})
                 if isinstance(ram, dict):
                     try:
@@ -2987,10 +3094,6 @@ class Scheduler(
             #   字面量 `"master"`，而 `get_effective_node_id()` 返回的是
             #   `_configured_node_id()`（可能是主机名）—— 两者**不等**，
             #   用后者会让本地节点永远匹配不上（实测投影里只有远端两个节点）。
-            local_node_id = (
-                "master" if self._effective_role() == "master"
-                else self.get_effective_node_id()
-            )
             if (
                 node_id == local_node_id
                 and "layer_ranges" not in record
@@ -3815,6 +3918,8 @@ class Scheduler(
 
     def push_layer_config_to_clients(self) -> None:
         with self._layer_config_push_lock:
+            if not self.get_distributed_inference_enabled():
+                return
             # Keep the transition check under the same lock used by the
             # publisher.  Otherwise a transition can begin after the check
             # but before the publish and still leak a transient release.

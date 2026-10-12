@@ -588,8 +588,12 @@ async def set_distributed_inference_config(req: DistributedInferenceRequest):
     - 主节点：控制是否接收从节点连接和协调分布式推理
     - 从节点：控制是否将推理请求转发给主节点
     """
-    result = _scheduler().set_distributed_inference_enabled(req.enabled)
+    result = await run_in_threadpool(
+        _scheduler().set_distributed_inference_enabled, req.enabled,
+    )
     if result.get("status") == "error":
+        if result.get("reason_code") == "local_model_still_loaded":
+            raise coded_http_error(409, "LOCAL_MODEL_STILL_LOADED", result["reason"])
         raise HTTPException(500, result.get("reason", "设置失败"))
     return result
 

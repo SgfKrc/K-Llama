@@ -10,6 +10,7 @@ from api._routing import configure_route_module
 router = APIRouter()
 _api_module: ModuleType | None = None
 _RESOLUTION_NAMES = (
+    "InferenceModeRequest",
     "CreateModelDownloadRequest",
     "LoadModelRequest",
     "PreparePipelineModelRequest",
@@ -33,6 +34,7 @@ async def get_current_model(request: Request = None):
             _api_module.model_manager.get_pipeline_descriptor()
         )
         return {
+            "inference_mode": _api_module._node_inference_mode(),
             "loaded": False,
             "pipeline_prepared": True,
             "segment_materialized": bool(
@@ -44,6 +46,7 @@ async def get_current_model(request: Request = None):
         }
     if not _api_module.model_host.model_loaded:
         return {
+            "inference_mode": _api_module._node_inference_mode(),
             "loaded": False,
             "pipeline_prepared": False,
             "quant_type": None,
@@ -89,6 +92,7 @@ async def get_current_model(request: Request = None):
             "model_sha256": descriptor.get("model_sha256") or identity.sha256,
         }
     return {
+        "inference_mode": _api_module._node_inference_mode(),
         "loaded": True,
         "model_id": _api_module.model_manager.active_model_id,
         "descriptor": descriptor,
@@ -104,6 +108,11 @@ async def get_current_model(request: Request = None):
         "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
         "gpu_reserved_gb": mem.get("gpu_reserved_gb", 0),
     }
+
+async def set_inference_mode(req: InferenceModeRequest, request: Request = None):
+    _api_module.require_model_api_source(request)
+    return await _api_module.run_in_threadpool(_api_module._set_node_inference_mode, req.mode)
+
 
 async def unload_model(request: Request = None):
     """Explicitly release the local LLM before loading another engine."""
@@ -128,7 +137,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
 
     operation = (
         _api_module.OP_DISTRIBUTED_LOAD
-        if _api_module.RUN_MODE == "distributed"
+        if _api_module._node_inference_mode() == "distributed"
         else _api_module.OP_FULL_MODEL
     )
     resolution = _api_module._resolve_model_load_plan(
@@ -152,11 +161,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         resolution.reason_code,
     )
 
-    # ★ 2026-10-09（自适应加载，用户裁定）：分布式下**先判断整模能否装下**。
-    #   装得下 ⇒ 整模加载（简单、启动快）；
-    #   装不下 ⇒ 改走「按段物化」（`prepare_pipeline_model`）—— 各节点只在自己的分配段物化权重。
-    #   此前只有"整模"一条路，于是小显存/边缘环境下加载成功、容量求解却必然失败
-    #   （`#82` 实测：fp32 整模 8GB 装不下 ⇒ `admitted=False` ⇒ 每个请求 503）。
+    # Distributed participation prepares segments; explicit local mode loads a whole model.
     load_mode, load_reason = _api_module._decide_pipeline_load_mode(
         resolution.model_id, effective_engine, quant
     )
@@ -172,6 +177,14 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         def _prepare_model_load() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _api_module._reset_runtime_conversation_state(clear_histories=True)
+            cfg.INFERENCE_ENGINE = effective_engine
+            cfg.QUANT_TYPE = quant
+            cfg.USE_COMPILE = req.use_compile
+            _api_module.model_host.model_loaded = True
+            _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
+            _api_module.model_host.generation_config["use_compile"] = req.use_compile
+            _api_module._init_kv_cache()
+            _api_module.scheduler.refresh_task_worker_capabilities()
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         _api_module.logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
@@ -179,18 +192,22 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         # ★ 2026-09-19：模型加载耗时 5-20 s，**必须**挪到线程池执行。
         #   否则会占住事件循环 ⇒ 期间 `/api/health` 等端点全部无响应
         #   （用户实测：「加载过程中健康不可达，加载完成后恢复」）。
+        def _change_model():
+            _api_module._require_local_model_mode()
+            return _api_module.model_manager.switch_model(
+                # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
+                model_id=resolution.model_id,
+                quant_type=quant,
+                profile=_api_module.device_profile,
+                engine=effective_engine if effective_engine != "auto" else None,
+                model_path=resolved_model_path,
+                db_experimental_models=_api_module._get_registered_experimental_models(),
+                resolution=resolution,
+            )
+
         def _do_switch():
             return _api_module._run_exclusive_model_change(
-                lambda: _api_module.model_manager.switch_model(
-                    # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
-                    model_id=resolution.model_id,
-                    quant_type=quant,
-                    profile=_api_module.device_profile,
-                    engine=effective_engine if effective_engine != "auto" else None,
-                    model_path=resolved_model_path,
-                    db_experimental_models=_api_module._get_registered_experimental_models(),
-                    resolution=resolution,
-                ),
+                _change_model,
                 prepare=_prepare_model_load,
                 release_worker_reservation=True,
             )
@@ -198,18 +215,11 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         result = await _api_module.run_in_threadpool(_do_switch)
 
         if result["success"]:
-            cfg.INFERENCE_ENGINE = effective_engine
-            cfg.QUANT_TYPE = quant
-            cfg.USE_COMPILE = req.use_compile
-            _api_module.model_host.model_loaded = True
-            _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
-            _api_module.model_host.generation_config["use_compile"] = req.use_compile
-
-            # 初始化 KV 缓存
-            _api_module._init_kv_cache()
-            _api_module.scheduler.refresh_task_worker_capabilities()
             elapsed = _api_module.time.time() - t0
             status = await _api_module.get_status()
+            status["loaded"] = True
+            status["pipeline_prepared"] = False
+            status["inference_mode"] = _api_module._node_inference_mode()
             status["load_time_seconds"] = round(elapsed, 1)
             status["model_name"] = result.get("model_name", "")
 
@@ -217,17 +227,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
             return status
         else:
             # 切换失败 — 检查是否回滚成功
-            if _api_module.model_manager.is_loaded:
-                _api_module.model_host.model_loaded = True
-                _api_module.model_host.current_quant = _api_module.model_manager.quant_type or (
-                    "gguf" if _api_module.backend_id_for(_api_module.model_manager) == "llama_cpp"
-                    else "island" if _api_module.backend_id_for(_api_module.model_manager) == "island"
-                    else _api_module.QUANT_TYPE
-                )
-                _api_module._init_kv_cache()
-            else:
-                _api_module.model_host.model_loaded = False
-                _api_module.model_host.current_quant = _api_module.QUANT_TYPE
+            _api_module._sync_local_model_projection()
             raise _api_module.coded_http_error(
                 500,
                 str(result.get("error_code") or "MODEL_LOAD_FAILED"),
@@ -237,15 +237,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     except _api_module.HTTPException:
         raise
     except Exception as e:
-        manager_loaded = bool(
-            getattr(_api_module.model_manager, "is_loaded", False)
-        )
-        _api_module.model_host.model_loaded = manager_loaded
-        if manager_loaded:
-            _api_module.model_host.current_quant = (
-                getattr(_api_module.model_manager, "quant_type", None)
-                or _api_module.model_host.current_quant
-            )
+        _api_module._sync_local_model_projection()
         _api_module.logger.error(f"模型加载失败: {e}", exc_info=True)
         raise _api_module.HTTPException(500, f"模型加载失败: {str(e)}")
 
@@ -325,6 +317,10 @@ async def _prepare_pipeline_model_resolution(resolution):
             "success": True,
             "loaded": False,
             "pipeline_prepared": True,
+            "inference_mode": _api_module._node_inference_mode(),
+            "model_id": resolution.model_id,
+            "engine": resolution.engine,
+            "quant_type": quant,
             "transaction_id": candidate_id,
             "transaction_phase": capacity_plan.get(
                 "transaction_phase", "preparing"
@@ -371,6 +367,8 @@ async def prepare_pipeline_model(req: PreparePipelineModelRequest):
     `_resolve_model_load_plan` 按落盘格式选引擎：目录模型走 pytorch 动态层段，
     GGUF 工件走 llama.cpp 只声明元数据。
     """
+    if _api_module._node_inference_mode() != "distributed":
+        raise _api_module.coded_http_error(409, "LOCAL_INFERENCE_MODE", "Switch to distributed inference before preparing a pipeline.")
     resolution = _api_module._resolve_model_load_plan(
         req.model_id,
         "auto",
@@ -579,7 +577,7 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
 
     operation = (
         _api_module.OP_DISTRIBUTED_LOAD
-        if _api_module.RUN_MODE == "distributed"
+        if _api_module._node_inference_mode() == "distributed"
         else _api_module.OP_FULL_MODEL
     )
     resolution = _api_module._resolve_model_load_plan(
@@ -603,8 +601,7 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
         resolution.reason_code,
     )
 
-    # ★ 2026-10-09（自适应加载，用户裁定）：与 `/api/models/load` 同一判据 ——
-    #   整模装不下时改走「按段物化」，而不是硬加载后让容量求解失败。
+    # Apply the same explicit mode contract as /api/models/load.
     load_mode, load_reason = _api_module._decide_pipeline_load_mode(
         resolution.model_id, effective_engine, quant
     )
@@ -618,22 +615,6 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
         def _prepare_model_switch() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _api_module._reset_runtime_conversation_state(clear_histories=True)
-
-        result = _api_module._run_exclusive_model_change(
-            lambda: _api_module.model_manager.switch_model(
-                model_id=resolution.model_id,
-                quant_type=quant,
-                profile=_api_module.device_profile,
-                engine=effective_engine if effective_engine != "auto" else None,
-                model_path=resolved_model_path,
-                db_experimental_models=_api_module._get_registered_experimental_models(),
-                resolution=resolution,
-            ),
-            prepare=_prepare_model_switch,
-            release_worker_reservation=True,
-        )
-
-        if result["success"]:
             if effective_engine != "auto":
                 cfg.INFERENCE_ENGINE = effective_engine
             cfg.QUANT_TYPE = quant
@@ -641,20 +622,33 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
             _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
             _api_module._init_kv_cache()
             _api_module.scheduler.refresh_task_worker_capabilities()
+
+        def _change_model():
+            _api_module._require_local_model_mode()
+            return _api_module.model_manager.switch_model(
+                model_id=resolution.model_id,
+                quant_type=quant,
+                profile=_api_module.device_profile,
+                engine=effective_engine if effective_engine != "auto" else None,
+                model_path=resolved_model_path,
+                db_experimental_models=_api_module._get_registered_experimental_models(),
+                resolution=resolution,
+            )
+
+        result = await _api_module.run_in_threadpool(
+            lambda: _api_module._run_exclusive_model_change(
+                _change_model,
+                prepare=_prepare_model_switch,
+                release_worker_reservation=True,
+            )
+        )
+
+        if result["success"]:
+            result.update(loaded=True, pipeline_prepared=False, inference_mode=_api_module._node_inference_mode())
             return result
         else:
             # 切换失败 — 检查是否回滚成功
-            if _api_module.model_manager.is_loaded:
-                _api_module.model_host.model_loaded = True
-                # P3修复: llama_cpp 引擎无 quant_type（GGUF 自带量化），回退到 "gguf"
-                _api_module.model_host.current_quant = _api_module.model_manager.quant_type or (
-                    "gguf" if _api_module.backend_id_for(_api_module.model_manager) == "llama_cpp"
-                    else "island" if _api_module.backend_id_for(_api_module.model_manager) == "island"
-                    else _api_module.QUANT_TYPE
-                )
-            else:
-                _api_module.model_host.model_loaded = False
-                _api_module.model_host.current_quant = _api_module.QUANT_TYPE
+            _api_module._sync_local_model_projection()
             raise _api_module.coded_http_error(
                 500,
                 str(result.get("error_code") or "MODEL_SWITCH_FAILED"),
@@ -1102,6 +1096,7 @@ async def download_model_file(filename: str, request: Request = None):
 
 
 def register_routes() -> None:
+    router.add_api_route('/api/models/inference-mode', set_inference_mode, methods=['PUT'])
     router.add_api_route('/api/models/current', get_current_model, methods=['GET'])
     router.add_api_route('/api/models/unload', unload_model, methods=['POST'])
     router.add_api_route('/api/models/load', load_model, methods=['POST'])

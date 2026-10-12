@@ -858,7 +858,10 @@ async def set_distributed_inference_config(req: DistributedInferenceRequest):
     - 主节点：控制是否接收从节点连接和协调分布式推理
     - 从节点：控制是否将推理请求转发给主节点
     """
-    result = _api_module.scheduler.set_distributed_inference_enabled(req.enabled)
+    result = await _api_module.run_in_threadpool(
+        _api_module._set_node_inference_mode,
+        "distributed" if req.enabled else "local",
+    )
     if result.get("status") == "error":
         raise _api_module.HTTPException(500, result.get("reason", "设置失败"))
     return result

@@ -741,7 +741,9 @@ class ModelHost:
         """Atomically publish the materialized manager, retaining rollback state."""
 
         lock = object.__getattribute__(self, "_pipeline_candidate_lock")
-        with lock:
+        # API unload/invalidation already owns full-chat before aborting a
+        # candidate. Direct commit/abort must follow the same lifecycle order.
+        with object.__getattribute__(self, "full_chat_execution_lock"), lock:
             transaction = self._require_pipeline_candidate(transaction_id)
             if transaction.phase in {"committed", "finalized"}:
                 return self.pipeline_candidate_status(transaction_id)
@@ -751,19 +753,18 @@ class ModelHost:
                     f"cannot commit from {transaction.phase!r}"
                 )
             candidate_host_state = self._pipeline_candidate_host_state(transaction)
-            with object.__getattribute__(self, "full_chat_execution_lock"):
-                transaction.previous_manager = object.__getattribute__(self, "_manager")
-                transaction.previous_host_state = self._snapshot_pipeline_host_state()
-                object.__setattr__(self, "_manager", transaction.manager)
-                self._apply_pipeline_candidate_host_state(candidate_host_state)
-                transaction.phase = "committed"
+            transaction.previous_manager = object.__getattribute__(self, "_manager")
+            transaction.previous_host_state = self._snapshot_pipeline_host_state()
+            object.__setattr__(self, "_manager", transaction.manager)
+            self._apply_pipeline_candidate_host_state(candidate_host_state)
+            transaction.phase = "committed"
             return self.pipeline_candidate_status(transaction_id)
 
     def abort_pipeline_candidate(self, transaction_id: str) -> dict:
         """Discard an uncommitted candidate or restore the exact prior runtime."""
 
         lock = object.__getattribute__(self, "_pipeline_candidate_lock")
-        with lock:
+        with object.__getattribute__(self, "full_chat_execution_lock"), lock:
             transaction = self._require_pipeline_candidate(transaction_id)
             if transaction.phase == "aborted":
                 return self.pipeline_candidate_status(transaction_id)
@@ -773,11 +774,10 @@ class ModelHost:
                 )
             manager = transaction.manager
             if transaction.phase == "committed":
-                with object.__getattribute__(self, "full_chat_execution_lock"):
-                    object.__setattr__(self, "_manager", transaction.previous_manager)
-                    self._restore_pipeline_host_state(
-                        transaction.previous_host_state or {},
-                    )
+                object.__setattr__(self, "_manager", transaction.previous_manager)
+                self._restore_pipeline_host_state(
+                    transaction.previous_host_state or {},
+                )
             self._close_pipeline_manager(manager)
             transaction.manager = None
             transaction.previous_manager = None

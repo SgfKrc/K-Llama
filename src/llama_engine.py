@@ -105,8 +105,12 @@ CHATML_STOP_SEQUENCES = [
 
 
 def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
+    if isinstance(stop, str):
+        stop = [stop]
     merged: List[str] = []
-    for value in (stop or []) + CHATML_STOP_SEQUENCES:
+    for value in list(stop or []) + CHATML_STOP_SEQUENCES:
+        if not isinstance(value, str):
+            raise ValueError("stop sequences must be strings")
         if value and value not in merged:
             merged.append(value)
     return merged
@@ -1039,8 +1043,21 @@ class LlamaCppEngine:
         return max(0, min(total_layers, budget // per_layer))
 
     def _install_chat_template_controls(self) -> None:
-        """Expose registered template kwargs through the llama.cpp handler."""
-        if self._chat_template != "qwen3_chat_v1":
+        """Expose thinking kwargs through the selected GGUF or registered handler."""
+        chat_format = getattr(self._model, "chat_format", None)
+        metadata = getattr(self._model, "metadata", None) or {}
+        template_key = (
+            "tokenizer.chat_template" if chat_format == "chat_template.default"
+            else f"tokenizer.{chat_format}" if str(chat_format).startswith("chat_template.")
+            else ""
+        )
+        native_template = metadata.get(template_key, "")
+        native_thinking = bool(
+            not getattr(self._model, "chat_handler", None)
+            and isinstance(native_template, str)
+            and re.search(r"\benable_thinking\b", native_template)
+        )
+        if self._chat_template != "qwen3_chat_v1" and not native_thinking:
             return
         try:
             from llama_cpp import llama_chat_format
@@ -1072,12 +1089,24 @@ class LlamaCppEngine:
                     return base_handler(*args, **handler_kwargs)
 
             self._model.chat_handler = chat_handler
+            if native_thinking:
+                # Registry aliases need no hard-coded model-family mapping: the
+                # selected GGUF Jinja template declares its own control variable.
+                self._chat_template = chat_format
+                self._thinking_mode = "declared"
             self._thinking_controlled = True
+            logger.info(
+                "llama.cpp thinking control installed: template=%s format=%s source=%s",
+                self._chat_template, chat_format,
+                template_key if native_thinking else "model_profile",
+            )
         except Exception:
             logger.debug("Qwen3 chat-template control unavailable", exc_info=True)
 
     def _set_thinking_mode(self, enabled: bool | None) -> None:
-        if self._chat_template != "qwen3_chat_v1" or enabled is None:
+        if (
+            self._chat_template != "qwen3_chat_v1" and not self._thinking_controlled
+        ) or enabled is None:
             return
         self._thinking_enabled = bool(enabled)
         self._chat_template_kwargs = {"enable_thinking": bool(enabled)}
@@ -1093,8 +1122,15 @@ class LlamaCppEngine:
         stream: bool,
         **kwargs,
     ):
-        self._set_thinking_mode(kwargs.pop("show_thinking", None))
-        self._set_thinking_mode(kwargs.pop("enable_thinking", None))
+        show_thinking = kwargs.pop("show_thinking", None)
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        # None means use the template default for this request, including after
+        # an earlier request explicitly disabled or enabled thinking.
+        self._thinking_enabled = None
+        self._chat_template_kwargs = {}
+        self._set_thinking_mode(
+            enable_thinking if enable_thinking is not None else show_thinking,
+        )
         return self._model.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
@@ -2487,11 +2523,52 @@ class LlamaCppEngine:
             raise RuntimeError("模型未加载")
         return self._model.tokenize(text.encode("utf-8"))
 
-    def detokenize(self, tokens: List[int]) -> str:
+    @staticmethod
+    def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
+        """Expose the same text stops to chat and the distributed decode loop."""
+        return _merge_stop_sequences(stop)
+
+    def _get_generation_eos_token_ids(self, stop_sequences: List[str]):
+        """Use valid EOS ids and exact single-token stops; keep multi-token stops as text."""
+        from numbers import Integral
+
+        ids: List[int] = []
+        eos_id = self.tokenizer.eos_token_id
+        if isinstance(eos_id, Integral) and not isinstance(eos_id, bool) and eos_id >= 0:
+            ids.append(int(eos_id))
+        for text in stop_sequences:
+            try:
+                encoded = self._model.tokenize(
+                    text.encode("utf-8"), add_bos=False, special=True,
+                )
+            except TypeError:
+                # Some keep-head tokenizer facades only expose tokenize(bytes).
+                encoded = self._model.tokenize(text.encode("utf-8"))
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            if len(encoded) != 1:
+                continue
+            token_id = encoded[0]
+            if (
+                isinstance(token_id, Integral)
+                and not isinstance(token_id, bool)
+                and token_id >= 0
+                and int(token_id) not in ids
+                and self.detokenize([int(token_id)], special=True) == text
+            ):
+                ids.append(int(token_id))
+        return ids if len(ids) > 1 else ids[0] if ids else None
+
+    def detokenize(self, tokens: List[int], *, special: bool = False) -> str:
         """将 token ID 列表转换为文本。"""
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
-        return self._model.detokenize(tokens).decode("utf-8", errors="replace")
+        try:
+            text = self._model.detokenize(tokens, special=special)
+        except TypeError:
+            # LL keep-head facades may return str and omit the special keyword.
+            text = self._model.detokenize(tokens)
+        return text if isinstance(text, str) else text.decode("utf-8", errors="replace")
 
     @property
     def tokenizer(self):
@@ -2560,7 +2637,7 @@ class _LlamaCppTokenizerAdapter:
                 flat.extend(int(value) for value in item)
             else:
                 flat.append(int(item))
-        return self._engine.detokenize(flat)
+        return self._engine.detokenize(flat, special=not skip_special_tokens)
 
 
 # ================================================================

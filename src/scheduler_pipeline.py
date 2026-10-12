@@ -85,6 +85,36 @@ logger = logging.getLogger("scheduler")
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
 
 
+def _route_a_text_stop_boundary(text: str, stop_sequences: list[str]) -> tuple[str, str]:
+    """Return text safe to publish, retaining split stop prefixes and UTF-8 tails."""
+    matches = [(text.find(stop), stop) for stop in stop_sequences if stop]
+    matches = [(index, stop) for index, stop in matches if index >= 0]
+    if matches:
+        index, stop = min(matches, key=lambda match: match[0])
+        return text[:index], stop
+    # A token can end in an incomplete UTF-8 character. Decode the complete
+    # generated sequence again next step instead of publishing replacement chars.
+    safe_text = text.rstrip("\ufffd")
+    withheld = 0
+    for stop in stop_sequences:
+        for size in range(min(len(stop) - 1, len(safe_text)), withheld, -1):
+            if safe_text.endswith(stop[:size]):
+                withheld = size
+                break
+    return safe_text[:-withheld] if withheld else safe_text, ""
+
+
+def _route_a_eos_ids(value) -> set[int]:
+    """Ignore missing, negative and non-integral EOS metadata."""
+    from numbers import Integral
+
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return {
+        int(token_id) for token_id in values
+        if isinstance(token_id, Integral) and not isinstance(token_id, bool) and token_id >= 0
+    }
+
+
 def _request_terminal_result(
     *,
     cancel_event: threading.Event | None,
@@ -1220,7 +1250,7 @@ class SchedulerPipelineMixin:
         加载完成或收到新的分布式请求时，通过这个一次性标记重新取得
         配置权威；普通拓扑刷新仍尊重从节点的临时退出状态。
         """
-        if self._effective_role() != "master":
+        if not self.get_distributed_inference_enabled() or self._effective_role() != "master":
             return False
         # Check the fence and publish under one lock order.  A check performed
         # before acquiring `_layer_config_push_lock` can race with begin/end
@@ -1473,6 +1503,11 @@ class SchedulerPipelineMixin:
         assignment 携带当前 PyTorch 模型身份和摘要。从节点缺少或模型不一致时
         先从主节点同步模型，校验成功并加载层范围后再返回 ready ACK。
         """
+        if not self.get_distributed_inference_enabled():
+            return {
+                "status": "rejected", "admitted": False,
+                "reason_code": "local_inference_mode", "assignments": [],
+            } if candidate is not None else None
         # `getattr` 而非直接取属性：`push_layer_config_to_clients()` 现在会在 task-worker
         # hello 之后被调用（legacy 重算），而测试/嵌入场景下的 `_tcp_server` 桩可能没有
         # `_running` ⇒ 直接取会 `AttributeError`（实测回归）。
@@ -2814,6 +2849,31 @@ class SchedulerPipelineMixin:
         cleanup_records = []
         try:
             with self._host.full_chat_execution_lock:
+                # Mode changes can invalidate this snapshot while we wait for
+                # full-chat. Fence publication before swapping any runtime or
+                # advancing the irreversible reshard epoch.
+                with self._layer_config_lock:
+                    transaction = self._pipeline_load_transaction
+                    if (
+                        not transaction
+                        or transaction.get("config_id") != config_id
+                        or transaction.get("phase") != "committing_global"
+                    ):
+                        return
+                if not self.get_distributed_inference_enabled():
+                    reason = "local mode selected before pipeline publication"
+                    if candidate_id:
+                        self._abort_pipeline_load_transaction(
+                            config_id, "distributed_inference_disabled", reason,
+                        )
+                    else:
+                        # A legacy transaction has no isolated runtime to abort;
+                        # never tear down the now-local model during rejection.
+                        self._invalidate_pipeline_load_transaction(
+                            reason_code="distributed_inference_disabled",
+                            reason=reason,
+                        )
+                    return
                 if candidate_id:
                     commit_candidate = getattr(
                         self._host, "commit_pipeline_candidate", None,
@@ -3720,10 +3780,17 @@ class SchedulerPipelineMixin:
         authoritative_sync = bool(
             isinstance(data, dict) and data.get("authoritative_sync")
         )
+        if not self.get_distributed_inference_enabled() and not data.get("release"):
+            self.release_pipeline_worker_for_local_model()
+            return
         resend_opt_out = False
         authoritative_opt_in = False
         with self._layer_config_lock:
-            if (
+            # The fast check above can precede an explicit local-mode switch.
+            # Recheck before authoritative sync can clear opt-out or enqueue work.
+            if not self.get_distributed_inference_enabled() and not data.get("release"):
+                resend_opt_out = True
+            elif (
                 authoritative_sync
                 and self._pipeline_worker_opted_out
                 and isinstance(data, dict)
@@ -3870,7 +3937,22 @@ class SchedulerPipelineMixin:
         receive_sequence: int = None,
         generation: int = None,
     ) -> None:
-        with self._layer_execution_lock:
+        # Match API model changes: full-chat must precede layer execution.
+        # The full-chat lock also excludes worker Stages; do not reacquire their
+        # non-reentrant inference lock here. Candidate commit/abort can reenter
+        # full-chat while these locks are held.
+        # Injected endpoint/control-only hosts may have no chat lifecycle;
+        # retain their existing layer-only serialization.
+        full_chat_lock = getattr(
+            self._host, "full_chat_execution_lock", self._layer_execution_lock,
+        )
+        with full_chat_lock, self._layer_execution_lock:
+            # Admission may have happened before an explicit opt-out. Check
+            # again under the model lifecycle lock before touching any runtime.
+            # Release/abort cleanup must remain available in local mode.
+            if not self.get_distributed_inference_enabled() and not data.get("release"):
+                self.release_pipeline_worker_for_local_model()
+                return
             if receive_sequence is not None:
                 with self._layer_config_lock:
                     if (receive_sequence
@@ -7136,6 +7218,8 @@ class SchedulerPipelineMixin:
         routing_preference: str,
         stage_nodes: list[dict],
         master_assignment: dict,
+        stop: list[str] | str | None = None,
+        enable_thinking: bool | None = None,
         _stream_callback=None,
         _cancel_event: threading.Event | None = None,
         _request_deadline: RequestDeadline | None = None,
@@ -7246,6 +7330,7 @@ class SchedulerPipelineMixin:
             chat_messages,
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
+            **({"enable_thinking": enable_thinking} if enable_thinking is not None else {}),
         )
         inputs = tokenizer(model_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]
@@ -7306,22 +7391,30 @@ class SchedulerPipelineMixin:
         generated_ids: list[int] = []
         full_input_ids = input_ids
         new_token_id: int | None = None
-        stop_sequences = []
-        merge_stops = getattr(mgr, "_merge_stop_sequences", None)
-        if callable(merge_stops):
-            stop_sequences = merge_stops(None)
-        get_eos = getattr(mgr, "_get_generation_eos_token_ids", None)
-        eos_token_ids = (
-            get_eos(stop_sequences)
-            if callable(get_eos)
-            else tokenizer.eos_token_id
-        )
-        if eos_token_ids is None:
-            eos_ids = {tokenizer.eos_token_id}
-        elif isinstance(eos_token_ids, int):
-            eos_ids = {eos_token_ids}
-        else:
-            eos_ids = set(eos_token_ids)
+        try:
+            from llama_engine import _merge_stop_sequences
+
+            merge_stops = getattr(mgr, "_merge_stop_sequences", _merge_stop_sequences)
+            stop_sequences = merge_stops([stop] if isinstance(stop, str) else stop)
+            get_eos = getattr(mgr, "_get_generation_eos_token_ids", None)
+            native_eos = getattr(tokenizer, "eos_token_id", None)
+            eos_ids = _route_a_eos_ids(native_eos)
+            if callable(get_eos):
+                eos_ids.update(_route_a_eos_ids(get_eos(stop_sequences)))
+        except Exception as exc:
+            return {"response": "", "error": f"route_a_stop_configuration_invalid: {exc}"}
+        if not eos_ids:
+            if not stop_sequences:
+                return {"response": "", "error": "route_a_stop_configuration_invalid:no_eos_or_text_stop"}
+            diagnostic = "route_a_eos_unavailable_text_stop"
+            logger.warning("%s eos=%r stops=%d", diagnostic, native_eos, len(stop_sequences))
+            pipeline_metrics["stop_diagnostic"] = diagnostic
+        pipeline_metrics["eos_token_ids"] = sorted(eos_ids)
+        raw_new_text = ""
+        published_text_len = 0
+        finish_reason = "length"
+        stop_reason = "max_new_tokens"
+        matched_stop = ""
         native_thinking_prompt = native_thinking_suppression_required(
             show_thinking, model_prompt,
         )
@@ -7503,10 +7596,17 @@ class SchedulerPipelineMixin:
                     tokenizer.decode([int(new_token_id)]),
                 )
                 if new_token_id in eos_ids:
+                    finish_reason = "stop"
+                    stop_reason = "eos_token"
                     break
                 generated_ids.append(new_token_id)
+                raw_new_text, matched_stop = _route_a_text_stop_boundary(
+                    tokenizer.decode(generated_ids, skip_special_tokens=False),
+                    stop_sequences,
+                )
                 if _stream_callback:
-                    token_text = tokenizer.decode([new_token_id])
+                    token_text = raw_new_text[published_text_len:]
+                    published_text_len = len(raw_new_text)
                     if suppress_native_thinking:
                         stream_buffer += token_text
                         marker = stream_buffer.lower().find("</think>")
@@ -7516,7 +7616,7 @@ class SchedulerPipelineMixin:
                             stream_buffer = ""
                             if visible:
                                 _stream_callback({"token": visible})
-                    else:
+                    elif token_text:
                         _stream_callback({"token": token_text})
                 # 载体随引擎不同：PyTorch 给张量，llama.cpp 给 numpy `[1, n_tokens]`。
                 # 必须跟 `full_input_ids` 同源拼接 —— 否则在去 torch 的节点上
@@ -7541,6 +7641,10 @@ class SchedulerPipelineMixin:
                     "time_ms": round(step_ms, 1),
                     "mode": "prefill" if is_prefill else "decode",
                 })
+                if matched_stop:
+                    finish_reason = "stop"
+                    stop_reason = "text_stop"
+                    break
         except Exception as exc:
             terminal = _request_terminal_result(
                 cancel_event=_cancel_event,
@@ -7578,32 +7682,16 @@ class SchedulerPipelineMixin:
         #   把缓冲内容交出去 —— 否则已生成的正文既不在 SSE 事件里、也不在 response 里
         #   （真机表现：流式 `tokens=0`、非流式「流水线返回空响应」）。放在组装 response
         #   之前，让两条出口看到同一份文本。
-        if _stream_callback and stream_buffer:
+        if _stream_callback and stream_buffer and not suppress_native_thinking:
             _stream_callback({"token": stream_buffer})
         stream_buffer = ""
         suppress_native_thinking = False
-        if generated_ids:
-            if hasattr(input_ids, "detach"):
-                full_ids = torch.cat([
-                    input_ids.squeeze(0),
-                    torch.tensor(generated_ids, dtype=torch.long),
-                ], dim=0)
-            else:
-                # 去 torch 节点：载体是 numpy，且 `tokenizer.decode` 也更适合收
-                # 普通序列 —— 这里不判载体同样会抛 `No module named 'torch'`。
-                import numpy as _np
-
-                full_ids = _np.concatenate([
-                    _np.asarray(input_ids).squeeze(0),
-                    _np.asarray(generated_ids, dtype=_np.int64),
-                ], axis=0).tolist()
-            response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
-            raw_new_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        else:
-            response_text = tokenizer.decode(
-                input_ids.squeeze(0), skip_special_tokens=True,
-            )
-            raw_new_text = ""
+        # Reuse the same stop-checked completion as the stream. Decoding the
+        # token list again here would restore the withheld stop and next turn.
+        response_text = (
+            tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+            + raw_new_text
+        )
         new_text, thinking_content = callbacks.format_model_response(
             raw_new_text,
             show_thinking,
@@ -7614,6 +7702,10 @@ class SchedulerPipelineMixin:
         )
         pipeline_metrics["tokens_generated"] = len(generated_ids)
         pipeline_metrics["generated_tokens"] = len(generated_ids)
+        pipeline_metrics["finish_reason"] = finish_reason
+        pipeline_metrics["stop_reason"] = stop_reason
+        if matched_stop:
+            pipeline_metrics["matched_stop"] = matched_stop
         pipeline_metrics["nodes_used"] = len(stage_nodes)
         pipeline_metrics["elapsed_seconds"] = round(
             pipeline_metrics["total_time_ms"] / 1000, 3,
@@ -7635,6 +7727,7 @@ class SchedulerPipelineMixin:
             "response": new_text,
             "full_text": response_text,
             "thinking": thinking_content,
+            "finish_reason": finish_reason,
             "metrics": pipeline_metrics,
         }
         if _stream_callback:
@@ -7911,7 +8004,8 @@ class SchedulerPipelineMixin:
                      _cancel_event: threading.Event = None,
                      _request_deadline: RequestDeadline = None,
                      _terminal_outcome: TerminalOutcomeLatch = None,
-                     _inference_lock_state: dict | None = None) -> dict:
+                     _inference_lock_state: dict | None = None,
+                     stop: list[str] | str | None = None) -> dict:
         """
         主节点：协调多节点流水线推理。
 
@@ -8027,11 +8121,13 @@ class SchedulerPipelineMixin:
                     temperature=temperature,
                     top_p=top_p,
                     session_id=session_id,
+                    enable_thinking=enable_thinking,
                     messages=messages,
                     show_thinking=show_thinking,
                     routing_preference=routing_preference,
                     stage_nodes=stage_offer_nodes,
                     master_assignment=master_assignment or {},
+                    stop=stop,
                     _stream_callback=_stream_callback,
                     _cancel_event=_cancel_event,
                     _request_deadline=_request_deadline,
@@ -8097,14 +8193,8 @@ class SchedulerPipelineMixin:
         ok, err_msg = self._verify_pipeline_readiness(pipeline_nodes)
         if not ok:
             logger.error(f"❌ 流水线就绪检查失败: {err_msg}")
-            # Phase 5 review C3: 恢复完整模型，避免残留裁剪状态导致后续推理失败
-            if master_participates:
-                try:
-                    ensure_full = getattr(mgr, 'ensure_full_model', None)
-                    if callable(ensure_full):
-                        ensure_full()
-                except Exception as restore_err:
-                    logger.warning(f"模型恢复失败（将继续）: {restore_err}")
+            # Keep the assigned segment. A readiness failure cannot authorize
+            # loading a whole model while this node participates in the cluster.
             return {"response": "", "error": err_msg}
 
         # Freeze the worker configuration generation for the complete task.
@@ -8179,6 +8269,7 @@ class SchedulerPipelineMixin:
             chat_messages,
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
+            **({"enable_thinking": enable_thinking} if enable_thinking is not None else {}),
         )
         inputs = tokenizer(model_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]  # (1, prompt_len)
@@ -9614,6 +9705,8 @@ class SchedulerPipelineMixin:
         "pipeline_full_model_fallback_forbidden": (
             "该模型只以分布式流水线模式准备，禁止退回整模推理（无可用原因信息）"
         ),
+        "distributed_full_model_forbidden": "分布式模式禁止整模回退；需要整模基线时请手动切换到本地推理",
+        "distributed_inference_disabled": "本节点已选择本地推理，分布式候选停止发布",
         "pipeline_layer_range_not_advertised": (
             "节点未声明层区间，无法判断它能承担哪一段"
         ),
@@ -9750,6 +9843,11 @@ class SchedulerPipelineMixin:
             }
         if not mgr or not mgr.is_loaded:
             return {"response": "", "error": "模型未加载"}
+        if self.get_distributed_inference_enabled():
+            return {
+                "response": "", "reason_code": "distributed_full_model_forbidden",
+                "error": "分布式模式禁止整模回退；请先手动切换到本地推理模式。",
+            }
 
         _stream_callback = kwargs.pop('_stream_callback', None)
         fallback_reason = kwargs.pop('_fallback_reason', '') or 'pipeline_fallback_full_model'
@@ -10045,6 +10143,12 @@ class SchedulerPipelineMixin:
             return
         if not mgr or not mgr.is_loaded:
             yield {"done": True, "error": "模型未加载"}
+            return
+        if self.get_distributed_inference_enabled():
+            yield {
+                "done": True, "reason_code": "distributed_full_model_forbidden",
+                "error": "分布式模式禁止整模回退；请先手动切换到本地推理模式。",
+            }
             return
 
         try:
