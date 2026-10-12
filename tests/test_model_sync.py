@@ -8,6 +8,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
@@ -144,6 +146,122 @@ def test_model_digest_changes_with_config_tokenizer_and_remote_code(tmp_path):
             path.write_text(content, encoding="utf-8")
         assert model_sync.compute_model_sha256(str(root), use_cache=False) != baseline
         path.write_bytes(original)
+
+
+def _expected_model_digest(artifacts):
+    digest = hashlib.sha256()
+    for name, content in sorted(artifacts.items()):
+        file_sha = hashlib.sha256(content).hexdigest()
+        digest.update(f"{name}\0{len(content)}\0{file_sha}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_model_digest_supply_marker_does_not_create_cache(tmp_path, use_cache):
+    import model_sync
+
+    root = tmp_path / "supplied"
+    root.mkdir()
+    artifacts = {
+        "config.json": b'{"model_type":"qwen2"}',
+        "model.safetensors": b"weights-v1",
+        "supply.manifest.json": b"not a trusted identity or even valid JSON",
+    }
+    for name, content in artifacts.items():
+        (root / name).write_bytes(content)
+    baseline = _expected_model_digest(artifacts)
+
+    for _ in range(3):
+        assert model_sync.compute_model_sha256(str(root), use_cache=use_cache) == baseline
+        assert {path.name: path.read_bytes() for path in root.iterdir()} == artifacts
+
+    weight = root / "model.safetensors"
+    previous_stat = weight.stat()
+    artifacts[weight.name] = b"weights-v2"
+    weight.write_bytes(artifacts[weight.name])
+    os.utime(weight, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns + 1_000_000_000))
+    expected = _expected_model_digest(artifacts)
+    assert expected != baseline
+    assert model_sync.compute_model_sha256(str(root), use_cache=use_cache) == expected
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == artifacts
+
+
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_model_digest_supply_marker_ignores_disk_cache(tmp_path, monkeypatch, use_cache):
+    import model_sync
+
+    root = tmp_path / "supplied"
+    root.mkdir()
+    forged_sha = "a" * 64
+    artifacts = {
+        "model.safetensors": b"actual weights",
+        "supply.manifest.json": json.dumps({"model_sha256": forged_sha, "files": []}).encode(),
+    }
+    for name, content in artifacts.items():
+        (root / name).write_bytes(content)
+    cache_path = root / "model.sha256"
+    metadata_path = root / "model.sha256.meta.json"
+    fingerprint = [
+        {"path": name, "size": (root / name).stat().st_size,
+         "mtime_ns": (root / name).stat().st_mtime_ns}
+        for name in sorted(artifacts)
+    ]
+    cache_path.write_text(f"{forged_sha}  forged\n", encoding="utf-8")
+    metadata_path.write_text(json.dumps(fingerprint), encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+    original_open = model_sync.Path.open
+
+    def guard_cache_access(path, *args, **kwargs):
+        if path in {cache_path, metadata_path}:
+            raise AssertionError("supply directory hash caches must not be read or written")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(model_sync.Path, "open", guard_cache_access)
+    expected = _expected_model_digest(artifacts)
+    assert expected != forged_sha
+    for _ in range(3):
+        assert model_sync.compute_model_sha256(str(root), use_cache=use_cache) == expected
+    monkeypatch.undo()
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+
+
+@pytest.mark.parametrize("use_cache", [True, False])
+def test_model_digest_normal_directory_preserves_cache_semantics(tmp_path, monkeypatch, use_cache):
+    import model_sync
+
+    root = tmp_path / "ordinary"
+    root.mkdir()
+    artifacts = {"model.safetensors": b"ordinary weights"}
+    for name, content in artifacts.items():
+        (root / name).write_bytes(content)
+    expected = _expected_model_digest(artifacts)
+    original_hash = model_sync.compute_file_sha256
+    hashed_paths = []
+
+    def record_hash(path):
+        hashed_paths.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(model_sync, "compute_file_sha256", record_hash)
+    for _ in range(2):
+        assert model_sync.compute_model_sha256(str(root), use_cache=use_cache) == expected
+    assert len(hashed_paths) == (1 if use_cache else 2)
+    cache_path = root / "model.sha256"
+    metadata_path = root / "model.sha256.meta.json"
+    assert cache_path.read_text(encoding="utf-8").split()[0] == expected
+    fingerprint = json.loads(metadata_path.read_text(encoding="utf-8"))
+    weight = root / "model.safetensors"
+    assert fingerprint == [{
+        "path": weight.name, "size": weight.stat().st_size,
+        "mtime_ns": weight.stat().st_mtime_ns,
+    }]
+
+    cache_path.write_text(f"{'a' * 64}  forged\n", encoding="utf-8")
+    before_count = len(hashed_paths)
+    assert model_sync.compute_model_sha256(str(root), use_cache=False) == expected
+    assert len(hashed_paths) == before_count + 1
+    assert cache_path.read_text(encoding="utf-8").split()[0] == expected
+    assert json.loads(metadata_path.read_text(encoding="utf-8")) == fingerprint
 
 
 def test_same_size_corrupt_weight_is_redownloaded(tmp_path, monkeypatch):

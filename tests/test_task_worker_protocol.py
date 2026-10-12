@@ -344,13 +344,18 @@ def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
         decode_message(incomplete)
     assert incomplete_error.value.code == "invalid_capabilities"
 
-    wrong_runtime = copy.deepcopy(hello)
-    wrong_runtime["payload"]["capabilities"]["engines"] = ["pytorch"]
-    wrong_runtime["payload"]["capabilities"]["models"][0]["engine"] = "pytorch"
-    wrong_runtime["payload"]["capabilities"]["models"][0]["format"] = "safetensors"
-    with pytest.raises(WorkerProtocolError) as runtime_error:
-        decode_message(wrong_runtime)
-    assert runtime_error.value.code == "invalid_capabilities"
+    pytorch_segment = copy.deepcopy(hello)
+    pytorch_segment["payload"]["capabilities"]["engines"] = ["pytorch"]
+    pytorch_segment["payload"]["capabilities"]["models"][0]["engine"] = "pytorch"
+    pytorch_segment["payload"]["capabilities"]["models"][0]["format"] = "safetensors"
+    decode_message(pytorch_segment)
+    for engine, format_name in (("pytorch", "gguf"), ("llama_cpp", "safetensors")):
+        wrong_runtime = copy.deepcopy(hello)
+        wrong_runtime["payload"]["capabilities"]["engines"] = [engine]
+        wrong_runtime["payload"]["capabilities"]["models"][0].update(engine=engine, format=format_name)
+        with pytest.raises(WorkerProtocolError) as runtime_error:
+            decode_message(wrong_runtime)
+        assert runtime_error.value.code == "invalid_capabilities"
 
 
 def test_hello_capabilities_reject_invalid_node_segment_mode(golden):
