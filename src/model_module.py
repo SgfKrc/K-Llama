@@ -2604,7 +2604,10 @@ class ModelManager:
 
             logger.info("推理路径裁决 -> llama-server 子进程（%s）", decision.reason)
             self._llama_engine = LlamaServerEngine(
-                cuda_available=bool(torch.cuda.is_available()),
+                # 必须与决策同源：用硬件级探测，而不是 torch.cuda.is_available()
+                # —— 本仓 .venv-test 是 CPU-only torch，后者会广告出"C 无 CUDA"
+                # 却实际走了 server 路径，自相矛盾。
+                cuda_available=decision.cuda_available,
             )
             self._llama_engine.load_model(model_path=gguf_path, n_ctx=n_ctx)
         else:
