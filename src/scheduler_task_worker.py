@@ -681,7 +681,18 @@ class SchedulerTaskWorkerMixin:
         if layer_worker and full_model_identity is None:
             stage_types = []
         if layer_worker and "layer_forward" not in stage_types:
-            stage_types.append("layer_forward")
+            # ★ 票 15a（能力广告半边）：**能起 server 不等于能参与层段接力**。
+            #   若当前 runtime 实际不支持 `FORWARD_LAYERS`（例：本机 llama-server
+            #   子进程路径），就不得广告 `layer_forward` —— 否则 master 会把层段
+            #   派给一台执行不了的 worker。判据走运行时能力探测而非 backend 名字：
+            #   server 引擎对外仍报 `engine_type="llama_cpp"`。
+            if self._advertises_layer_forward():
+                stage_types.append("layer_forward")
+            else:
+                logger.warning(
+                    "task worker 声明为层段 worker，但当前推理路径不支持层段前向 "
+                    "-> 不广告 layer_forward（票 15a INFER-PATH-SPLIT-01）"
+                )
         capabilities = {
             "stage_types": stage_types,
             "engines": engines,
@@ -743,6 +754,26 @@ class SchedulerTaskWorkerMixin:
             # A malformed or partial slim installation must remain visible as
             # unspecified; it must never claim a stronger release profile.
             return RUNTIME_PROFILE_UNSPECIFIED
+
+    def _advertises_layer_forward(self) -> bool:
+        """当前 runtime 能否**真的**执行层段前向（票 15a 的能力广告判据）。
+
+        保守语义：只有拿到**明确的否定结论**才不广告 —— 探测不出结论时（测试替身、
+        未加载模型、无可识别 backend）按"可以"处理，维持既有广告行为不变。
+        """
+        try:
+            from koakuma_engine import Capability, backend_id_for
+
+            host = self._host
+            probe = getattr(host, "supports", None)
+            if not callable(probe):
+                return True
+            if not backend_id_for(host):
+                # 没有可识别的 backend（未加载/替身）=> 不下否定结论
+                return True
+            return bool(probe(Capability.FORWARD_LAYERS))
+        except Exception:
+            return True
 
 
     def _send_task_worker_hello(
@@ -1269,6 +1300,27 @@ class SchedulerTaskWorkerMixin:
         self._send_task_worker_response(request_message_id, response)
 
 
+    def _cleanup_task_worker_prepare(self, reason_code, *, client=None, close=False):
+        if client is not None and getattr(self, "_tcp_client", None) is not client:
+            return
+        with self._task_worker_stage_lock:
+            for attempt in self._task_worker_active_attempts.values():
+                attempt.cancel_reason = reason_code
+                attempt.cancel_event.set()
+        controller = getattr(self, "_worker_prepare", None)
+        if controller is not None:
+            if close:
+                controller.close(wait=False)
+            else:
+                controller.invalidate(reason_code, client=client)
+
+    def _check_task_worker_prepare_stage(self, offer):
+        from worker_prepare_contract import WorkerPrepareError
+        controller = getattr(self, "_worker_prepare", None)
+        if controller is None:
+            raise WorkerPrepareError("worker_prepare_executor_unavailable")
+        controller.check_stage(offer)
+
     def _handle_task_worker_stage_offer(
         self, message: WorkerMessage,
     ) -> None:
@@ -1287,31 +1339,21 @@ class SchedulerTaskWorkerMixin:
             reject_reason = "worker_experiment_disabled"
             reject_retryable = True
         else:
-            # Layer workers are admitted through the v3 layer capability gate;
-            # full-model stages keep the legacy manual dispatch gate.  Older
-            # coordinators do not publish the layer flag, so retain the
-            # connected/manual fallback for wire compatibility.
-            # ★ 2026-10-03：层段的准入判据必须来自**本机自己的** capabilities。
-            #   两个坑：① 原来的 `coordinator["layer_stage_dispatch_enabled"]` 描述的是
-            #   "别的 worker 里有没有层段就绪的"（见 `get_task_worker_protocol_status` 里
-            #   `layer_stage_worker_ids` 的构造）⇒ 拿它判自己会把本机的合法 offer 拒成
-            #   `worker_not_admitted`；② 想把"自己的判据"塞进 `coordinator_snapshot()`
-            #   也走不通 —— 那返回的是**协调者**的快照，不是本机的状态。所以直接在本地算，
-            #   口径与 master 侧 `task_worker_adapter.py:359` 一致。
             if offer.get("stage_type") == "layer_forward":
-                capabilities = self._task_worker_capabilities()
-                dispatch_enabled = bool(
-                    capabilities.get("layer_ranges")
-                    and "layer_forward" in (capabilities.get("stage_types") or [])
-                )
+                try:
+                    self._check_task_worker_prepare_stage(offer)
+                    dispatch_enabled = True
+                except Exception as exc:
+                    reject_reason = getattr(exc, "reason_code", "worker_prepare_stage_rejected")
+                    dispatch_enabled = False
             else:
                 dispatch_enabled = coordinator.get("manual_stage_dispatch_enabled")
-            if not dispatch_enabled:
+            if not dispatch_enabled and not reject_reason:
                 reject_reason = "worker_not_admitted"
                 reject_retryable = True
         if not reject_reason and offer["provider_id"] != expected_provider:
             reject_reason = "provider_identity_mismatch"
-        elif not reject_reason:
+        elif not reject_reason and offer.get("stage_type") != "layer_forward":
             capabilities = self._task_worker_capabilities()
             if offer["stage_type"] not in capabilities["stage_types"]:
                 reject_reason = "unsupported_stage_type"
@@ -1425,7 +1467,7 @@ class SchedulerTaskWorkerMixin:
                     key: offer[key]
                     for key in (
                         "layer_range", "handoff_at", "hidden_sha256",
-                        "hidden_spec", "middle_channel", "seq_ids", "positions",
+                        "hidden_spec", "middle_channel", "seq_ids", "positions", "prepare_identity",
                     )
                     if key in offer
                 },
@@ -1449,6 +1491,8 @@ class SchedulerTaskWorkerMixin:
                     raise RuntimeError(stop_reason)
                 acquired_inference_lock = True
 
+                if offer.get("stage_type") == "layer_forward":
+                    self._check_task_worker_prepare_stage(offer)
                 output = self._require_callbacks().execute_task_worker_stage(
                     request, active.cancel_event,
                 )

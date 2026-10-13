@@ -2175,6 +2175,33 @@ class TestSelectEngine:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         assert ModelManager.select_engine() == "pytorch"
 
+    def test_supports_delegates_to_active_llama_server_engine(self):
+        """票 15a：`ModelManager.supports` 必须反映**活跃引擎**的真实能力。
+
+        llama-server 子进程对外仍报 `engine_type="llama_cpp"`（家族一致），但
+        `FORWARD_LAYERS` 必须是 False —— 否则 `runtime_supports` 放行，调度层会把
+        层段接力派给一台执行不了的 runtime。
+        """
+        from koakuma_engine import Capability
+        from llama_server_engine import LlamaServerEngine
+
+        mgr = ModelManager()
+        mgr._engine_type = "llama_cpp"
+        mgr._llama_engine = LlamaServerEngine()
+        assert mgr.supports(Capability.FORWARD_LAYERS) is False
+
+    def test_supports_falls_back_to_backend_when_engine_has_no_probe(self):
+        """没有自带能力探测的引擎（如绑定引擎）维持既有 backend 口径，行为不变。"""
+        from koakuma_engine import Capability
+
+        mgr = ModelManager()
+        mgr._engine_type = "llama_cpp"
+        mgr._llama_engine = object()  # 无 supports
+        # `capabilities` 是只读 property（按 backend 定），这里逐项对比证明走了回退
+        assert mgr.supports(Capability.FORWARD_LAYERS) == (
+            mgr.capabilities.supports(Capability.FORWARD_LAYERS)
+        )
+
     def test_laptop_tier_with_cuda_gpu_selects_pytorch(self, monkeypatch):
         """laptop 档位 + CUDA GPU → pytorch"""
         import model_module

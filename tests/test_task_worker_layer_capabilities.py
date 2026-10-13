@@ -81,23 +81,38 @@ def test_task_worker_capability_log_summary_is_bounded_and_exact():
 class _FakeHost:
     """最小 host 打桩：capabilities 只读这几个属性。"""
 
-    def __init__(self, *, layer_range=None, full_model_loaded=False):
+    def __init__(self, *, layer_range=None, full_model_loaded=False,
+                 forward_layers=None):
         self.layer_range = layer_range
         self.model_loaded = full_model_loaded
         self.is_loaded = full_model_loaded
         self.active_model_id = "fake-model"
+        # ★ 票 15a：`forward_layers=None` => 不提供能力探测（维持既有广告行为）；
+        #   给布尔值 => 模拟"引擎自带 supports"的 runtime（同时给出 backend 身份）。
+        self._forward_layers = forward_layers
+        if forward_layers is not None:
+            self.engine_type = "llama_cpp"
 
     def has_loaded_model(self):
         return self.model_loaded
 
+    def supports(self, capability):
+        from koakuma_engine import Capability
+
+        if capability == Capability.FORWARD_LAYERS:
+            return bool(self._forward_layers)
+        return True
+
 
 def _scheduler(*, active_layer_config=None, layer_range=None,
-               full_model_loaded=False, full_model_identity=None):
+               full_model_loaded=False, full_model_identity=None,
+               forward_layers=None):
     """绕过 Scheduler.__init__ 构造最小能力快照目标。"""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._distributed_inference_enabled = True
     scheduler._host = _FakeHost(
         layer_range=layer_range, full_model_loaded=full_model_loaded,
+        forward_layers=forward_layers,
     )
     scheduler._active_layer_config = active_layer_config
     if full_model_identity is not None:
@@ -108,13 +123,15 @@ def _scheduler(*, active_layer_config=None, layer_range=None,
 
 
 def _capabilities(*, active_layer_config=None, layer_range=None,
-                  full_model_loaded=False, full_model_identity=None):
+                  full_model_loaded=False, full_model_identity=None,
+                  forward_layers=None):
     """绕过 Scheduler.__init__ 直接调能力快照。"""
     return _scheduler(
         active_layer_config=active_layer_config,
         layer_range=layer_range,
         full_model_loaded=full_model_loaded,
         full_model_identity=full_model_identity,
+        forward_layers=forward_layers,
     )._task_worker_capabilities()
 
 
@@ -172,6 +189,28 @@ class TestLayerCapabilities:
             active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
         )
         assert caps["stage_chunked_input"] is True
+
+    def test_layer_worker_without_forward_layers_does_not_advertise_it(self):
+        """★ 票 15a：**能起 server 不等于能参与层段接力**。
+
+        server 引擎（llama-server 子进程）对外仍报 `engine_type="llama_cpp"`
+        （家族一致），但 `FORWARD_LAYERS` 为 False ⇒ 即使本进程被配置成层段 worker，
+        也不得广告 `layer_forward`，否则 master 会把层段派给一台执行不了的 worker。
+        """
+        caps = _capabilities(
+            active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
+            forward_layers=False,
+        )
+        assert caps["stage_types"] == []
+        assert "layer_forward" not in caps["stage_types"]
+
+    def test_layer_worker_with_forward_layers_keeps_advertising_it(self):
+        """绑定路径（真的支持层段前向）广告行为不变。"""
+        caps = _capabilities(
+            active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
+            forward_layers=True,
+        )
+        assert caps["stage_types"] == ["layer_forward"]
 
     def test_full_worker_does_not_declare_chunked_input(self):
         """非层段 worker 不做 hidden 交接 ⇒ 保守不声明（维持既有语义）。"""

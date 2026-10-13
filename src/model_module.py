@@ -4338,6 +4338,15 @@ class ModelManager:
         return backend_capabilities(self.engine_type)
 
     def supports(self, capability: str) -> bool:
+        # 票 15a：能力必须反映**真实执行能力**。llama-server 子进程虽然同属
+        # llama.cpp 家族（`engine_type == "llama_cpp"`，槽位也复用 `_llama_engine`），
+        # 但它**不承担层段接力** —— 直接沿用 `self.capabilities`（llama_cpp 白名单里
+        # `FORWARD_LAYERS` 为 True）会让调度层把层段派给一台执行不了的 worker。
+        # 活跃引擎自带能力探测时以它为准；否则维持既有 backend 口径（行为不变）。
+        if self._engine_type == "llama_cpp" and self._llama_engine is not None:
+            probe = getattr(self._llama_engine, "supports", None)
+            if callable(probe):
+                return bool(probe(capability))
         return self.capabilities.supports(capability)
 
     def get_device(self) -> torch.device:
