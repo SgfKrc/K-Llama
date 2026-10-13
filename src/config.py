@@ -363,6 +363,12 @@ NGRAM_SPEC_ENABLED = _env_bool("QLH_NGRAM_SPEC_ENABLED", False)
 NGRAM_SPEC_MAX_NGRAM = _env_int("QLH_NGRAM_SPEC_MAX_NGRAM", 2, min_val=1, max_val=16)
 NGRAM_SPEC_NUM_PRED = _env_int("QLH_NGRAM_SPEC_NUM_PRED", 10, min_val=1, max_val=64)
 
+# --- 本机 llama-server 子进程路径（票 15a/15b）---
+# 裁决（2026-10-12）：有 CUDA 走 server 子进程（拿得到 --spec-type 投机族、
+# `--cpu-moe`、`--cache-reuse`），无 CUDA 老实走绑定。留空时由
+# `llama_server_engine.default_server_exe()` 在 `runtime/llama-cpp/<build>/` 下自动挑选。
+LLAMA_SERVER_EXE = _env_first("QLH_LLAMA_SERVER_EXE", default="")
+
 # --- 多模型实验支持 (P3) ---
 # ★ 2026-09-19：`qwen-1_8b` 已退役并从内置列表移除 ⇒ 活跃模型 ID 同步为默认模型
 #   （须与 `model_config.DEFAULT_MODEL_ID` 保持一致）。
