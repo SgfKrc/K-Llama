@@ -92,5 +92,29 @@ def test_double_unload_is_safe():
     engine.unload()  # 不得抛异常
 
 
+def test_runtime_supports_forward_layers_is_false_for_server_engine():
+    """票 15a 的硬要求：**能起 server 不等于能参与层段接力**。
+
+    本引擎对外报 `engine_type="llama_cpp"`（家族一致），若不显式复写能力探测，
+    `runtime_supports(engine, FORWARD_LAYERS)` 会按 llama_cpp 白名单放行
+    （实测 `backend_capabilities(llama_cpp).supports(FORWARD_LAYERS) is True`），
+    于是调度层会把它当成可承接层段的 runtime —— 票 15a 明令禁止。
+    """
+    from koakuma_engine import Capability, runtime_supports
+
+    engine = _engine()  # 能力与进程是否启动无关，无需真起进程
+    assert runtime_supports(engine, Capability.FORWARD_LAYERS) is False
+
+
+def test_supports_delegates_other_capabilities_to_llama_cpp_family():
+    """除 FORWARD_LAYERS 外，其余能力仍按 llama.cpp 家族口径回答。"""
+    from koakuma_engine import Capability, backend_capabilities, backend_id_for
+
+    engine = _engine()
+    family = backend_capabilities(backend_id_for(engine))
+    for capability in (Capability.CHAT, Capability.CHAT_STREAM, Capability.UNLOAD_MODEL):
+        assert engine.supports(capability) == family.supports(capability)
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

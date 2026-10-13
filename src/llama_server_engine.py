@@ -206,6 +206,25 @@ class LlamaServerEngine:
         return self._client.detokenize(tokens)
 
     # ------------------------------------------------------------ capability
+    def supports(self, capability: str) -> bool:
+        """能力探测 —— `runtime_supports()` **优先**走这里，而不是 backend 白名单。
+
+        ⚠️ 本引擎对外报 `engine_type="llama_cpp"`（家族一致），但 **server 子进程
+        不承担层段接力**：层段/keep-head 前向依赖低层 C API 与本仓 llama.cpp 补丁。
+        若不做这个复写，`runtime_supports(engine, FORWARD_LAYERS)` 会按 llama_cpp
+        白名单放行（实测该家族 `FORWARD_LAYERS` 为 True），调度层于是把本引擎当成
+        可承接层段的 runtime —— 票 15a 明令禁止这种"能起 server 就算能接力"的推断。
+        """
+        from koakuma_engine import (
+            Capability,
+            backend_capabilities,
+            backend_id_for,
+        )
+
+        if capability == Capability.FORWARD_LAYERS:
+            return False
+        return backend_capabilities(backend_id_for(self)).supports(capability)
+
     def capability(self) -> dict:
         """能力声明，键与 `inference_path_selector.InferencePathDecision` 对齐。"""
         return {
