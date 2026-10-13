@@ -3098,3 +3098,39 @@ class TestEmptyCacheNormalization:
         assert getattr(cache.layers[0], "recurrent_state", None) is not None, (
             "状态本身存在于 cache 对象里 ⇒ 只要传 cache 对象就不会丢"
         )
+
+
+@pytest.mark.parametrize("release_method", ["close", "unload"])
+def test_llama_unload_failure_preserves_manager_projection(release_method):
+    manager = ModelManager()
+    should_fail = [True]
+
+    def release():
+        if should_fail[0]:
+            raise OSError("native owner still alive")
+
+    engine = types.SimpleNamespace(is_loaded=True, **{release_method: release})
+    manager._llama_engine = engine
+    manager._engine_type = "llama_cpp"
+    manager._active_model_id = "segment-model"
+    manager.quant_type = "Q4_K_M"
+    manager.layer_range = (0, 8)
+    manager._full_model_path = "head.gguf"
+    descriptor = {"assignment_layer_range": [0, 8]}
+    manager._pipeline_descriptor = descriptor
+    manager._pipeline_distributed_only = True
+    manager._load_fingerprint = {"model_path": "head.gguf"}
+    with pytest.raises(OSError, match="native owner still alive"):
+        manager.unload_model()
+    assert manager._llama_engine is engine and manager.is_loaded
+    assert manager._active_model_id == "segment-model" and manager._engine_type == "llama_cpp"
+    assert manager.quant_type == "Q4_K_M" and manager.layer_range == (0, 8)
+    assert manager._pipeline_descriptor is descriptor and manager._pipeline_distributed_only
+    assert manager._full_model_path == "head.gguf" and manager._load_fingerprint == {"model_path": "head.gguf"}
+    should_fail[0] = False
+    manager.unload_model()
+    assert manager._llama_engine is None and not manager.is_loaded
+    assert manager._active_model_id == "" and manager._engine_type == ""
+    assert manager.quant_type is None and manager.layer_range is None
+    assert manager._pipeline_descriptor is None and not manager._pipeline_distributed_only
+    assert manager._full_model_path is None and manager._load_fingerprint is None

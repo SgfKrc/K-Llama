@@ -5,6 +5,10 @@ import ctypes
 import types
 import hashlib
 import json
+import io
+import subprocess
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -118,7 +122,16 @@ def test_dead_keep_head_worker_is_recreated(monkeypatch, tmp_path):
     engine._keep_head_key = (str(artifact), 4)
     engine._keep_head = old
     monkeypatch.setattr("llama_engine.resolve_keep_head_shim", lambda: str(shim))
-    monkeypatch.setattr(KeepHeadUpstream, "__new__", lambda cls, *args, **kwargs: fresh)
+    # ⚠️ 千万不要 patch `KeepHeadUpstream.__new__` —— CPython 的 `tp_new` 槽一旦因子类
+    #   赋值而变成 `slot_tp_new`，**删掉类属性也不会复位**（实测：删后
+    #   `"__new__" in cls.__dict__` 为 False、`cls.__new__` 看着仍是继承来的
+    #   `object.__new__`，但 `cls(a, b)` 照样抛
+    #   `TypeError: object.__new__() takes exactly one argument`）。那会**永久污染
+    #   整个进程**里这个类，害得后续构造全崩（实测本文件
+    #   `test_keep_head_initialization_and_cleanup_failure_exposes_retryable_owner`
+    #   就是这么被弄红的）。改 patch **模块属性**：`_keep_head_upstream()` 里是
+    #   函数内 `from llama_keep_head import KeepHeadUpstream`，运行时取到的正是它。
+    monkeypatch.setattr("llama_keep_head.KeepHeadUpstream", lambda *args, **kwargs: fresh)
 
     assert engine._keep_head_upstream() is fresh
     assert closed == [True]
@@ -713,3 +726,204 @@ def test_load_gemma4_native_forwards_llama_kwargs(monkeypatch, tmp_path):
     assert captured.get("n_gpu_layers") == 4
     # 显式路径必须优先于缺省工件解析
     assert captured.get("model_path") == str(model)
+
+
+def test_unload_reaps_keep_head_child_without_close_response():
+    from llama_keep_head import KeepHeadUpstream
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys,time; sys.stdin.readline(); time.sleep(60)"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    upstream = KeepHeadUpstream.__new__(KeepHeadUpstream)
+    upstream._worker = process
+    engine = LlamaCppEngine()
+    engine._keep_head = upstream
+    engine._keep_head_key = ("head.gguf", 8)
+    engine._pipeline_distributed_only = True
+    engine._pipeline_descriptor = {"assignment_layer_range": [0, 8]}
+    try:
+        engine.unload()
+        assert process.poll() is not None
+        assert process.stdin.closed and process.stdout.closed
+        assert upstream._worker is None
+        assert engine._keep_head is None and engine._keep_head_key is None
+        assert not engine.is_loaded and not engine.is_pipeline_prepared
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+        for pipe in (process.stdin, process.stdout):
+            if not pipe.closed:
+                pipe.close()
+
+
+def test_keep_head_close_failure_retains_child_for_retry():
+    from llama_keep_head import KeepHeadUpstream
+
+    class Process:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO()
+            self.fail = True
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            if self.fail:
+                raise OSError("cannot confirm process exit")
+            self.returncode = 0
+            return 0
+
+    process = Process()
+    upstream = KeepHeadUpstream.__new__(KeepHeadUpstream)
+    upstream._worker = process
+    with pytest.raises(OSError, match="cannot confirm process exit"):
+        upstream.close()
+    assert upstream._worker is process and process.poll() is None
+    assert process.stdin.closed and not process.stdout.closed
+    process.fail = False
+    upstream.close()
+    assert upstream._worker is None and process.poll() == 0
+    assert process.stdin.closed and process.stdout.closed
+
+
+def test_unload_keep_head_failure_preserves_model_and_identity():
+    engine = LlamaCppEngine()
+    calls = []
+    should_fail = [True]
+
+    def close():
+        calls.append("head")
+        if should_fail[0]:
+            raise OSError("head still running")
+
+    upstream = types.SimpleNamespace(close=close)
+    model = types.SimpleNamespace(close=lambda: calls.append("binding"))
+    descriptor = {"assignment_layer_range": [0, 8]}
+    engine._keep_head = upstream
+    engine._keep_head_key = ("head.gguf", 8)
+    engine._model = model
+    engine._loaded = True
+    engine._model_path = "head.gguf"
+    engine._pipeline_descriptor = descriptor
+    with pytest.raises(OSError, match="head still running"):
+        engine.unload()
+    assert engine._keep_head is upstream and engine._keep_head_key == ("head.gguf", 8)
+    assert engine._model is model and engine.is_loaded
+    assert engine._pipeline_descriptor is descriptor and engine._model_path == "head.gguf"
+    assert calls == ["head"]
+    should_fail[0] = False
+    engine.unload()
+    assert calls == ["head", "head", "binding"]
+    assert engine._keep_head is None and engine._model is None and not engine.is_loaded
+
+
+def test_unload_binding_failure_retains_binding_for_retry():
+    engine = LlamaCppEngine()
+    should_fail = [True]
+
+    def close():
+        if should_fail[0]:
+            raise OSError("binding release failed")
+
+    model = types.SimpleNamespace(close=close)
+    descriptor = {"assignment_layer_range": [0, 8]}
+    engine._model = model
+    engine._loaded = True
+    engine._model_path = "head.gguf"
+    engine._pipeline_descriptor = descriptor
+    with pytest.raises(OSError, match="binding release failed"):
+        engine.unload()
+    assert engine._model is model and engine.is_loaded
+    assert engine._pipeline_descriptor is descriptor and engine._model_path == "head.gguf"
+    should_fail[0] = False
+    engine.unload()
+    assert engine._model is None and not engine.is_loaded
+    assert engine._model_path == "" and engine._pipeline_descriptor is None
+
+
+def test_keep_head_replacement_close_failure_preserves_old_owner(monkeypatch):
+    engine = LlamaCppEngine()
+    descriptor = {"loaded_artifact": "new.gguf", "assignment_layer_range": [0, 4]}
+    engine._pipeline_descriptor = descriptor
+
+    def fail_close():
+        raise OSError("old head still running")
+
+    old = types.SimpleNamespace(is_available=True, close=fail_close)
+    engine._keep_head = old
+    engine._keep_head_key = ("old.gguf", 8)
+    monkeypatch.setattr("llama_engine.resolve_keep_head_shim", lambda: pytest.fail("must retire old owner first"))
+    with pytest.raises(OSError, match="old head still running"):
+        engine._keep_head_upstream()
+    assert engine._keep_head is old and engine._keep_head_key == ("old.gguf", 8)
+    assert engine._pipeline_descriptor is descriptor
+
+
+def test_keep_head_initialization_and_cleanup_failure_exposes_retryable_owner(monkeypatch, tmp_path):
+    from llama_keep_head import KeepHeadCleanupError, KeepHeadUpstream
+
+    class Process:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO('{"ok":false,"error":"native init failed"}\n')
+            self.returncode = None
+            self.fail = True
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            if self.fail:
+                raise PermissionError("process exit could not be confirmed")
+            self.returncode = 0
+            return 0
+
+    process = Process()
+    shim = tmp_path / "shim.dll"
+    artifact = tmp_path / "head.gguf"
+    shim.write_bytes(b"shim")
+    artifact.write_bytes(b"segment")
+    monkeypatch.setattr("llama_keep_head._llama_cpp_loaded", lambda: True)
+    monkeypatch.setattr("llama_keep_head.subprocess.Popen", lambda *args, **kw: process)
+    monkeypatch.setenv("QLH_KEEP_HEAD_WORKER_LOG", str(tmp_path / "child.log"))
+    with pytest.raises(KeepHeadCleanupError) as failed:
+        KeepHeadUpstream(shim, artifact)
+    owner = failed.value.cleanup_owner
+    assert owner._worker is process and process.poll() is None
+    assert not owner.is_available
+    process.fail = False
+    owner.close()
+    assert owner._worker is None and process.poll() == 0
+    assert process.stdin.closed and process.stdout.closed
+
+
+def test_engine_retains_failed_initializer_before_propagating(monkeypatch, tmp_path):
+    from llama_keep_head import KeepHeadCleanupError
+
+    class Partial:
+        is_available = False
+        def close(self):
+            self.closed = True
+
+    owner = Partial()
+    def initialize(*args, **kwargs):
+        raise KeepHeadCleanupError(owner, RuntimeError("init failed"), OSError("close failed"))
+
+    artifact = tmp_path / "head.gguf"
+    shim = tmp_path / "shim.dll"
+    artifact.write_bytes(b"segment")
+    shim.write_bytes(b"shim")
+    monkeypatch.setattr("llama_keep_head.KeepHeadUpstream", initialize)
+    monkeypatch.setattr("llama_engine.resolve_keep_head_shim", lambda: str(shim))
+    engine = LlamaCppEngine()
+    engine._pipeline_descriptor = {"loaded_artifact": str(artifact), "assignment_layer_range": [0, 8]}
+    with pytest.raises(KeepHeadCleanupError):
+        engine._keep_head_upstream()
+    assert engine._keep_head is owner and engine._keep_head_key is None
+    engine.unload()
+    assert owner.closed and engine._keep_head is None

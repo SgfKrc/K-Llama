@@ -235,7 +235,8 @@ def test_progress_reports_transfer_and_reuse_separately(tmp_path):
     assert c.get(op_id)["nodes"]["worker"] == public
 
 
-def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("disk_free_bytes", [256 * 1024**2, 32 * 1024**2])
+def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, monkeypatch, disk_free_bytes):
     import model_supply as module
     import model_supply_assets as assets
     c, op_id, _ = coordinator(tmp_path)
@@ -248,7 +249,8 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
     c.scheduler._model_supply_worker.inventory = lambda **kw: {"engines": ["llama_cpp"], "distributed": True,
         "disk_free_bytes": 10**12, "memory_available_bytes": 10**12, "sources": []}
     c.scheduler._model_supply_worker.activate_local = lambda manifest, directory, **kw: {"status": "available", "model_path": str(directory)}
-    desc = {"layer_weight_bytes": [1]*6, "component_weight_bytes": {}}
+    desc = {"layer_weight_bytes": [1]*6, "component_weight_bytes": {"layers": 10**12}}
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda path: SimpleNamespace(free=disk_free_bytes))
     c._sources = lambda *args, **kw: {"descriptors": {"llama_cpp": desc}, "gguf": tmp_path / "source.gguf", "hf": None,
         "master_engine": "llama_cpp", "alignment": 1, "source_model_id": "fixture", "source_model_sha256": "a"*64,
         "tokenizer_sha256": "b"*64, "conversion_proof": None}
@@ -266,6 +268,7 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
         manifests[kw["node_id"]] = dict(manifest)
         return manifest
     monkeypatch.setattr(assets, "build_gguf_segment", build)
+    monkeypatch.setattr(assets, "gguf_segment_disk_weight_bytes", lambda source, start, end: end - start)
     def wait(operation_id, node_id, action, timeout):
         if action == "inventory_result":
             return c.scheduler._model_supply_worker.inventory()
@@ -273,6 +276,12 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
         assert ensured == ["worker", "tail"]
         return {**manifests[node_id], "status":"available", "actual_downloaded_bytes":7, "reused_bytes":0, "resumed_bytes":0}
     c._wait = wait
+    if disk_free_bytes < 64 * 1024**2:
+        with pytest.raises(ModelSupplyError) as exc:
+            c._execute(op_id)
+        assert exc.value.code == "SUPPLY_MASTER_DISK_INSUFFICIENT"
+        assert manifests == {}
+        return
     c._execute(op_id)
     result = c.get(op_id)
     assert result["status"] == "available" and result["loaded_ready"] is False
@@ -387,3 +396,21 @@ def test_invalid_range_preference_cannot_bypass_alignment_or_full_model_gate(pre
         plan_segment_supply({"llama_cpp":descriptor(layers=8)},[node("master",1000),node("tail",1000)],
                             master_engine="llama_cpp",alignment=2,preferred_ranges=preferences)
     assert error.value.code=="SUPPLY_PREFERRED_RANGE_INVALID"
+
+
+@pytest.mark.parametrize("engine,start,end,tied,expected", [
+    ("pytorch", 0, 2, False, 42),
+    ("pytorch", 2, 4, False, 22),
+    ("pytorch", 4, 6, False, 59),
+    ("pytorch", 4, 6, True, 79),
+])
+def test_segment_disk_budget_selects_source_tensors_without_counting_decoder_twice(engine, start, end, tied, expected):
+    from model_supply import _segment_disk_weight_bytes
+    source = descriptor(layers=6, layer_bytes=10)
+    source.update(tie_word_embeddings=tied, component_weight_bytes={
+        "layers": 10**12, "embedding": 20, "final_norm": 2, "lm_head": 30,
+        "other": 7, "visual": 100, "mtp": 40, "multimodal": 49,
+    })
+    before = copy.deepcopy(source)
+    assert _segment_disk_weight_bytes(source, {"engine": engine, "start_layer": start, "end_layer": end}) == expected
+    assert source == before

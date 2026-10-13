@@ -1357,3 +1357,17 @@ def test_native_role_and_filename_are_checked_on_pc_reuse(gguf_segment, field, v
     with pytest.raises(SupplyError) as error:
         assets._verify_segment(root, gguf_segment)
     assert error.value.code == "native_manifest_mismatch"
+
+
+@pytest.mark.parametrize("span", [(0, 2), (1, 3), (2, 4)])
+def test_gguf_disk_budget_matches_actual_cropped_tensor_inventory_and_excludes_mtp(tmp_path, span):
+    from model_supply import _segment_disk_weight_bytes
+    source = tmp_path / "disk-mtp.gguf"
+    _make_gguf(source, mtp=True)
+    estimate = _segment_disk_weight_bytes({"layer_weight_bytes": [32] * 4,
+        "component_weight_bytes": {"layers": 128, "embedding": 256, "final_norm": 32, "other": 32}},
+        {"engine": "llama_cpp", "start_layer": span[0], "end_layer": span[1]}, source)
+    manifest = build_gguf_segment(source, tmp_path / "disk-out", **_kwargs(source, *span))
+    _, actual = assets._gguf_table(Path(manifest["local_files"]["segment.gguf"]))
+    assert estimate == sum(entry[1] for entry in actual.values()) == 352
+    assert not any(name.startswith("blk.2.nextn") for name in actual)

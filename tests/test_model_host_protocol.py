@@ -737,3 +737,27 @@ class TestApiServerIntegration:
         import scheduler as sched_mod
         src = inspect.getsource(sched_mod)
         assert "import api_server" not in src
+
+
+def test_host_unload_failure_preserves_direct_engine_projection():
+    should_fail = [True]
+
+    class Engine:
+        def unload(self):
+            if should_fail[0]:
+                raise OSError("native owner still alive")
+
+    engine = Engine()
+    host = ModelHost(manager=engine)
+    for name, value in {"model_loaded": True, "_engine_type": "llama_cpp",
+                        "model_path": "head.gguf", "active_model_id": "segment-model"}.items():
+        object.__setattr__(host, name, value)
+    with pytest.raises(OSError, match="native owner still alive"):
+        host.unload_model()
+    assert host._manager is engine and host.model_loaded is True
+    assert host.__dict__["model_path"] == "head.gguf"
+    assert host.__dict__["active_model_id"] == "segment-model"
+    should_fail[0] = False
+    host.unload_model()
+    assert host.model_loaded is False
+    assert "model_path" not in host.__dict__ and "active_model_id" not in host.__dict__
