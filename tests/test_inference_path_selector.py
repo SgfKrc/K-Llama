@@ -71,6 +71,53 @@ def test_unknown_requested_path_is_rejected():
         select_inference_path(requested="quantum", cuda_available=True)
 
 
+def test_auto_with_cuda_but_no_server_binary_falls_back_observably():
+    """auto 允许降级，但必须在 reason 里写明（可观测），不能静默。"""
+    decision = select_inference_path(cuda_available=True, server_available=False)
+    assert decision.path == BINDING
+    assert decision.requested == "auto"
+    assert "找不到" in decision.reason or "退回绑定" in decision.reason
+
+
+def test_explicit_server_without_binary_is_rejected_even_with_cuda():
+    """显式请求 server 时 fail-closed：有 CUDA 但没有可执行文件也报错。"""
+    with pytest.raises(InferencePathError) as excinfo:
+        select_inference_path(
+            requested=SERVER, cuda_available=True, server_available=False,
+        )
+    assert "可执行文件" in str(excinfo.value)
+
+
+def test_auto_with_cuda_and_binary_selects_server():
+    decision = select_inference_path(cuda_available=True, server_available=True)
+    assert decision.path == SERVER
+    assert decision.requested == "auto"
+
+
+def test_detect_cuda_uses_hardware_probe_not_torch(monkeypatch):
+    """本仓 `.venv-test` 装的是 CPU-only torch（2.13.0+cpu）⇒ 探测必须走硬件级判据，
+    否则明明有 RTX 4060 也会判成无 CUDA，auto 永远选不到 server。"""
+    import inference_path_selector as selector
+
+    class _Completed:
+        returncode = 0
+        stdout = "NVIDIA GeForce RTX 4060 Laptop GPU\n"
+
+    monkeypatch.setattr(selector.subprocess, "run", lambda *args, **kwargs: _Completed())
+    assert selector.detect_cuda_available() is True
+
+
+def test_detect_cuda_falls_back_when_nvidia_smi_absent(monkeypatch):
+    import inference_path_selector as selector
+
+    def _boom(*args, **kwargs):
+        raise FileNotFoundError("nvidia-smi not found")
+
+    monkeypatch.setattr(selector.subprocess, "run", _boom)
+    # 退化路径也不得抛异常
+    assert selector.detect_cuda_available() in (True, False)
+
+
 def test_capability_advertisement_never_claims_layer_segments_for_server():
     caps = select_inference_path(cuda_available=True).to_capability()
     assert caps["inference_path"] == SERVER

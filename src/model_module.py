@@ -2581,24 +2581,36 @@ class ModelManager:
                 n_ctx = 2048
 
         # ★ 票 15a/15b 接线：整模 GGUF 走「绑定」还是「llama-server 子进程」，由
-        #   `select_inference_path` 决定（默认 binding ⇒ 既有行为不变）。
-        #   选择器内含两条硬规矩：层段接力强制绑定；显式请求 server 而无 CUDA 时
-        #   具名报错（绝不静默降级）。
+        #   `select_inference_path` 决定。默认 auto = llama.cpp 家族内挑传输：
+        #   有 CUDA 走 server（绑定是 CPU-only，拿不到 GPU），无 CUDA 走绑定。
+        #   两条硬规矩：层段接力强制绑定；**显式**请求 server 而无 CUDA / 无
+        #   可执行文件时具名报错（绝不静默降级）。auto 的降级会在 reason 写明。
         import config as _cfg
-        from inference_path_selector import BINDING, SERVER, select_inference_path
+        from inference_path_selector import (
+            AUTO,
+            BINDING,
+            SERVER,
+            select_inference_path,
+        )
+        from llama_server_engine import default_server_exe
 
+        server_available = bool(default_server_exe())
         decision = select_inference_path(
-            requested=str(getattr(_cfg, "INFER_PATH", BINDING) or BINDING),
+            requested=str(getattr(_cfg, "INFER_PATH", AUTO) or AUTO),
+            server_available=server_available,
         )
         if decision.path == SERVER:
             from llama_server_engine import LlamaServerEngine
 
-            logger.info("推理路径 ⇒ llama-server 子进程（%s）", decision.reason)
+            logger.info("推理路径裁决 -> llama-server 子进程（%s）", decision.reason)
             self._llama_engine = LlamaServerEngine(
                 cuda_available=bool(torch.cuda.is_available()),
             )
             self._llama_engine.load_model(model_path=gguf_path, n_ctx=n_ctx)
         else:
+            if decision.cuda_available and decision.requested == AUTO:
+                # auto 降级必须可观测（有 GPU 却回落到 CPU 绑定，用户会奇怪为什么慢）
+                logger.warning("推理路径 auto 降级到绑定：%s", decision.reason)
             self._llama_engine = LlamaCppEngine()
             self._llama_engine.load_model(
                 model_path=gguf_path,

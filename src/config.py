@@ -371,9 +371,14 @@ LLAMA_SERVER_EXE = _env_first("QLH_LLAMA_SERVER_EXE", default="")
 
 # --- 整模推理路径选择（票 15a/15b 接线）---
 # 取值 = `src/inference_path_selector.py` 的 AUTO / SERVER / BINDING。
-# **默认 binding，保持既有行为不变**：切到 server 是显式选择，不由 auto 悄悄改默认
-# （auto 在 select_backend 里代表的是 pytorch/llama_cpp 档位，不是本子域）。
-INFER_PATH = _env_first("QLH_INFER_PATH", default="llama_cpp_binding")
+# **默认 auto**，且它与 `select_backend` 的 auto 是**正交**的两层：
+#   * `select_backend` 的 auto 选的是**引擎档位**（pytorch / llama_cpp / island）；
+#   * 本项只在 **llama.cpp 家族内**挑传输 —— 有 CUDA 走 server 子进程（绑定是
+#     CPU-only，拿不到 GPU），无 CUDA 老实走绑定。
+# 因此 auto 不会顶掉 D 档：走 `_load_llama_cpp` 才轮到本项。server 可执行文件
+# 缺失时 auto **可观测地**退回绑定（reason 写明原因）；**显式**请求 server 则
+# 永远 fail-closed，不降级。
+INFER_PATH = _env_first("QLH_INFER_PATH", default="auto")
 
 # --- 多模型实验支持 (P3) ---
 # ★ 2026-09-19：`qwen-1_8b` 已退役并从内置列表移除 ⇒ 活跃模型 ID 同步为默认模型
