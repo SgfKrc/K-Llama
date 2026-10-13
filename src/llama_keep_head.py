@@ -143,6 +143,14 @@ def _shim_abi_collides_with_llama_cpp(shim_dir: Path) -> bool:
     return False
 
 
+class KeepHeadCleanupError(KeepHeadUnavailable):
+    """Initialization failed and its native owner still needs retirement."""
+
+    def __init__(self, owner, init_error, cleanup_error):
+        super().__init__(f"keep-head initialization failed: {init_error}; cleanup failed: {cleanup_error}")
+        self.cleanup_owner = owner
+
+
 class KeepHeadUpstream:
     """最小 keep-head 上游：吃 token → 吐「前 K 层输出」`[n_tokens, n_embd]` f32。
 
@@ -289,7 +297,7 @@ class KeepHeadUpstream:
         self.n_layer = int(n_layer_out.value)
         self.cut_layer = None if cut_layer is None else int(cut_layer)
         if self.n_embd <= 0:
-            self.close()
+            self._close_failed_initialization(KeepHeadUnavailable("invalid native embedding size"))
             raise KeepHeadUnavailable("shim 报告 n_embd <= 0")
 
     # ------------------------------------------------------------------ 前向
@@ -349,13 +357,20 @@ class KeepHeadUpstream:
                     f"（worker stderr: {log_path}）")
             self.n_embd = int(response["n_embd"])
             self.n_layer = int(response["n_layer"])
-        except Exception:
-            self.close()
+        except Exception as init_error:
+            self._close_failed_initialization(init_error)
             raise
         self._dll_dirs = []
         self._dll_dir_handles = []
         self._lib = None
         self._handle = None
+
+    def _close_failed_initialization(self, init_error) -> None:
+        self._initialization_failed = True
+        try:
+            self.close()
+        except Exception as cleanup_error:
+            raise KeepHeadCleanupError(self, init_error, cleanup_error) from cleanup_error
 
     def _read_worker_response(self) -> dict[str, object]:
         process = self._worker
@@ -374,6 +389,8 @@ class KeepHeadUpstream:
 
     @property
     def is_available(self) -> bool:
+        if getattr(self, "_initialization_failed", False):
+            return False
         if self._worker is not None:
             return self._worker.poll() is None
         return self._lib is not None and self._handle is not None
@@ -611,10 +628,11 @@ class KeepHeadUpstream:
         process = getattr(self, "_worker", None)
         if process is not None:
             try:
-                if process.poll() is None and process.stdin is not None:
+                if process.poll() is None and process.stdin is not None and not process.stdin.closed:
                     process.stdin.write('{"op":"close"}\n')
                     process.stdin.flush()
-                    self._read_worker_response()
+                # Retirement proves process exit; a missing protocol response
+                # must not block unload on an unbounded readline.
             except (OSError, BrokenPipeError, KeepHeadUnavailable):
                 pass
             finally:
@@ -632,6 +650,9 @@ class KeepHeadUpstream:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=5)
+                for pipe in (process.stdin, process.stdout):
+                    if pipe is not None:
+                        pipe.close()
                 self._worker = None
         handle = getattr(self, "_handle", None)
         if handle and getattr(self, "_lib", None) is not None:

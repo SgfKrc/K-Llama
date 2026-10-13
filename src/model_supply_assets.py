@@ -573,6 +573,26 @@ def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: i
         _fail(code, f"GGUF cutting failed (exit {result.returncode})")
 
 
+
+def _selected_gguf_weight_bytes(tensors: dict, start_layer: int, end_layer: int) -> int:
+    return sum(entry[1] for name, entry in tensors.items()
+               if not name.startswith("blk.")
+               or start_layer <= int(name.split(".")[1]) < end_layer)
+
+
+def gguf_segment_disk_weight_bytes(source: Path, start_layer: int, end_layer: int) -> int:
+    """Header-only weight budget using the builder's exact selection rule.
+
+    MTP blk entries outside the decoder range are excluded even when a runtime
+    descriptor groups their bytes into its 'other' component.
+    """
+    metadata, tensors = _gguf_table(Path(source))
+    _, total_layers, _ = _gguf_layers(metadata)
+    if not 0 <= start_layer < end_layer <= total_layers or end_layer - start_layer == total_layers:
+        _fail("invalid_range", "distributed disk budget requires proper decoder segments")
+    return _selected_gguf_weight_bytes(tensors, start_layer, end_layer)
+
+
 def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                        source_model_sha256, tokenizer_sha256, start_layer,
                        end_layer, total_layers, operation_id, node_id,
@@ -605,8 +625,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
     reused = _reuse(final, payload)
     if reused:
         return reused
-    selected_size = sum(entry[1] for name, entry in tensors.items()
-                        if not name.startswith("blk.") or start_layer <= int(name.split(".")[1]) < end_layer)
+    selected_size = _selected_gguf_weight_bytes(tensors, start_layer, end_layer)
     _ensure_space(root, selected_size + len(tensors) * 32 + _MAX_HEADER)
     stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
     try:

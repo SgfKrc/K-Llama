@@ -83,7 +83,7 @@ async def prepare_supply(operation_id: str, request: Request):
                 layer_range_mode="precut_artifact" if source["engine"] == "llama_cpp" else "dynamic",
                 reason_code="SUPPLY_ASSETS_AVAILABLE", reason="Use verified supplied segment")
             from api.routes_models import _prepare_pipeline_model_resolution
-            result = await _prepare_pipeline_model_resolution(resolution)
+            result = await _prepare_pipeline_model_resolution(resolution, operation_id=operation_id)
             result["supply_operation_id"] = operation_id
             return result
     except ModelSupplyError as exc:

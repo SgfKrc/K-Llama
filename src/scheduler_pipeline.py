@@ -511,7 +511,10 @@ def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
     return False
 
 
-class SchedulerPipelineMixin:
+from worker_prepare_coordinator import WorkerPrepareCoordinatorMixin
+
+
+class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
     def _selected_pipeline_safetensors(self) -> dict | None:
         from model_supply_worker import get_selected_model
 
@@ -525,7 +528,9 @@ class SchedulerPipelineMixin:
         """Return a bounded JSON-safe transaction record for restart recovery."""
         transaction = self._pipeline_load_transaction
         cleanup_ledger = getattr(self, "_pipeline_model_cleanup_ledger", {})
-        if not isinstance(transaction, dict) and not cleanup_ledger:
+        recovery = getattr(self, "_pipeline_recovery_state", None)
+        recovering = not isinstance(transaction, dict) and isinstance(recovery, dict)
+        if not isinstance(transaction, dict) and not cleanup_ledger and not recovering:
             return None
         transaction = transaction if isinstance(transaction, dict) else {}
         plan = transaction.get("plan") if isinstance(transaction.get("plan"), dict) else {}
@@ -538,6 +543,7 @@ class SchedulerPipelineMixin:
                 for key in (
                     "node_id", "start_layer", "end_layer", "layers_count",
                     "execution", "stage_type", "has_embedding", "has_lm_head",
+                    "worker_prepare_identity",
                 )
                 if key in item
             })
@@ -548,6 +554,7 @@ class SchedulerPipelineMixin:
             payload = record.get("payload")
             cleanup_records.append({
                 "cleanup_id": str(record.get("cleanup_id", "") or ""),
+                "legacy_identity": bool(record.get("legacy_identity", False)),
                 "node_id": str(record.get("node_id", "") or ""),
                 "candidate_config_id": str(
                     record.get("candidate_config_id", "") or ""
@@ -558,11 +565,22 @@ class SchedulerPipelineMixin:
                 "created_at": float(record.get("created_at", 0.0) or 0.0),
                 "payload": dict(payload) if isinstance(payload, dict) else {},
             })
+        if recovering:
+            # Cleanup replay runs before a fresh transaction exists. Preserve
+            # the persisted model and assignments through every ledger update;
+            # otherwise a second restart loses the authoritative recovery input.
+            return {
+                **recovery,
+                "schema_version": recovery.get("schema_version", _PIPELINE_LIFECYCLE_SCHEMA_VERSION),
+                "cleanup_ledger": cleanup_records,
+                "updated_at": time.time(),
+            }
         return {
             "schema_version": _PIPELINE_LIFECYCLE_SCHEMA_VERSION,
             "config_id": str(transaction.get("config_id", "") or ""),
             "generation": int(transaction.get("generation", 0) or 0),
             "phase": str(transaction.get("phase", "") or ""),
+            "published": bool(transaction.get("published") or transaction.get("phase") == "ready"),
             "model_id": str(plan.get("model_id", "") or ""),
             "model_type": str(plan.get("model_type", "") or ""),
             "model_sha256": str(plan.get("model_sha256", "") or ""),
@@ -626,7 +644,7 @@ class SchedulerPipelineMixin:
         assignment_id = str(assignment_id or "")
         if not node_id or not candidate_config_id:
             raise ValueError("pipeline cleanup requires node and candidate config")
-        if action not in {"abort", "finalize"}:
+        if action not in {"abort", "finalize", "release"}:
             raise ValueError(f"unsupported pipeline cleanup action: {action}")
         ledger = self._pipeline_model_cleanup_ledger
         for record in ledger.values():
@@ -710,7 +728,7 @@ class SchedulerPipelineMixin:
         if server is None or not getattr(server, "_running", False):
             return False
         try:
-            server.send_layer_config(node_id, dict(record.get("payload", {})))
+            self._send_pipeline_worker_config(node_id, dict(record.get("payload", {})))
         except Exception:
             logger.warning(
                 "发送候选终局清理失败: action=%s node=%s candidate=%s",
@@ -745,7 +763,7 @@ class SchedulerPipelineMixin:
         self._dispatch_pipeline_model_cleanup(records[0])
         return True
 
-    def _ack_pipeline_model_cleanup(self, client_id: str, data: dict) -> bool:
+    def _ack_pipeline_model_cleanup(self, client_id: str, data: dict, *, native_ack: dict | None = None) -> bool:
         cleanup_id = str(data.get("config_id", "") or "")
         action = str(data.get("cleanup_action", "") or "")
         assignment_id = str(data.get("assignment_id", "") or "")
@@ -760,6 +778,9 @@ class SchedulerPipelineMixin:
                 and finalized_config_id == candidate_config_id
                 and not aborted_config_id
             )
+        elif action == "release":
+            identity_valid = bool(status == "released" and data.get("release") is True
+                                  and candidate_config_id and not aborted_config_id and not finalized_config_id)
         elif action == "abort":
             identity_valid = bool(
                 status == "released"
@@ -784,6 +805,16 @@ class SchedulerPipelineMixin:
             record = self._pipeline_model_cleanup_ledger.get(cleanup_id)
             if not isinstance(record, dict):
                 return False
+            native_identity = record.get("payload", {}).get("worker_prepare_identity")
+            if isinstance(native_identity, dict):
+                from worker_prepare_contract import validate_ack, WorkerPrepareError
+                try:
+                    checked = validate_ack(native_ack)
+                except WorkerPrepareError:
+                    return False
+                if (checked["identity"] != native_identity or checked["phase"] != action
+                        or checked.get("cleanup_id") != cleanup_id or checked["status"] == "error"):
+                    return False
             if (
                 record.get("node_id") != client_id
                 or record.get("action") != action
@@ -886,7 +917,7 @@ class SchedulerPipelineMixin:
                 not cleanup_id
                 or not node_id
                 or not candidate_config_id
-                or action not in {"abort", "finalize"}
+                or action not in {"abort", "finalize", "release"}
                 or not isinstance(payload, dict)
             ):
                 invalid_cleanup = True
@@ -898,7 +929,13 @@ class SchedulerPipelineMixin:
                 invalid_cleanup = True
                 break
             canonical_payload = dict(payload)
-            legacy_identity = schema_version < 4
+            if "legacy_identity" in item and type(item["legacy_identity"]) is not bool:
+                invalid_cleanup = True
+                break
+            legacy_identity = schema_version < 4 or item.get("legacy_identity") is True
+            if legacy_identity and "worker_prepare_identity" in canonical_payload:
+                invalid_cleanup = True
+                break
             if legacy_identity:
                 canonical_payload.update({
                     "node_id": node_id,
@@ -935,7 +972,11 @@ class SchedulerPipelineMixin:
                     and str(canonical_payload.get("candidate_config_id", "") or "")
                     == candidate_config_id
                 )
-                if action == "finalize":
+                if action == "release":
+                    payload_identity_matches = (payload_identity_matches
+                                                and canonical_payload.get("release") is True
+                                                and isinstance(canonical_payload.get("worker_prepare_identity"), dict))
+                elif action == "finalize":
                     payload_identity_matches = (
                         payload_identity_matches
                         and str(canonical_payload.get("finalized_config_id", "") or "")
@@ -974,6 +1015,40 @@ class SchedulerPipelineMixin:
             return
         self._pipeline_model_cleanup_ledger.update(restored_cleanup)
         phase = str(raw.get("phase", "") or "")
+        if phase in _PIPELINE_RECOVERY_PHASES or raw.get("published"):
+            # A crashed master cannot reuse remote ready evidence. Retire the
+            # old native generation before publishing a fresh one, including
+            # candidates whose prepare completed before the crash.
+            action = "release" if phase == "ready" or raw.get("published") else "abort"
+            with self._layer_config_lock:
+                for assignment in raw.get("assignments", []):
+                    identity = assignment.get("worker_prepare_identity") if isinstance(assignment, dict) else None
+                    if not isinstance(identity, dict):
+                        continue
+                    from worker_prepare_contract import validate_identity, WorkerPrepareError
+                    try:
+                        identity = validate_identity(identity)
+                    except WorkerPrepareError:
+                        self._pipeline_lifecycle_persist_ok = False
+                        self._pipeline_recovery_pending = True
+                        self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
+                        return
+                    if (identity["config_id"] != raw.get("config_id") or identity["generation"] != raw.get("generation")
+                            or identity["node_id"] != assignment.get("node_id")):
+                        self._pipeline_lifecycle_persist_ok = False
+                        self._pipeline_recovery_pending = True
+                        self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
+                        return
+                    payload = {"worker_prepare_identity": identity, "release": True}
+                    if action == "abort":
+                        payload.update(abort=True, aborted_config_id=identity["config_id"])
+                    self._record_pipeline_model_cleanup_locked(
+                        node_id=identity["node_id"], candidate_config_id=identity["config_id"],
+                        generation=int(raw["generation"]), action=action,
+                        assignment_id=identity["assignment_id"], payload=payload,
+                    )
+                if self._pipeline_model_cleanup_ledger:
+                    self._persist_pipeline_lifecycle_locked()
         if phase in _PIPELINE_RECOVERY_PHASES:
             persisted_sha256 = str(raw.get("model_sha256", "") or "").lower()
             if (
@@ -1379,7 +1454,7 @@ class SchedulerPipelineMixin:
     def start_pipeline_model_transaction(
         self, *, candidate_id: str, descriptor: dict,
         model_path: str, quant_type: str = "",
-        require_distributed: bool = True, on_commit=None,
+        require_distributed: bool = True, on_commit=None, operation_id: str = "",
     ) -> dict:
         """Start one explicit model candidate without replacing active state."""
         candidate_id = str(candidate_id or "").strip()
@@ -1462,6 +1537,7 @@ class SchedulerPipelineMixin:
                         "model_path": str(model_path or ""),
                         "quant_type": str(quant_type or ""),
                         "on_commit": on_commit,
+                        "operation_id": operation_id,
                     },
                 )
             finally:
@@ -1617,6 +1693,33 @@ class SchedulerPipelineMixin:
                     "assignments": [],
                 }
             return None
+        if candidate is None:
+            with self._layer_config_lock:
+                current = self._pipeline_load_transaction
+                if isinstance(current, dict) and current.get("phase") in {
+                    "preparing", "committing_local", "committing", "committing_global",
+                }:
+                    # HELLO/inventory refresh must not replace a model operation
+                    # whose native load is still in flight.
+                    return {**dict(current.get("plan", {})), "transaction_phase": current["phase"]}
+                if self._pipeline_model_cleanup_ledger:
+                    return dict(self._active_pipeline_capacity_plan or {})
+                active = dict(self._active_pipeline_capacity_plan or {})
+            stage_items = [item for item in active.get("assignments", [])
+                           if item.get("execution") == "stage_offer_v3"]
+            if stage_items and all(self._stage_offer_assignment_ready(item["node_id"], item)[0]
+                                   for item in stage_items):
+                return active
+            supply = getattr(self, "_model_supply", None)
+            active_operation = getattr(supply, "_active", "")
+            if active_operation:
+                operation = supply.get(active_operation)
+                matching_operation = any(item.get("worker_prepare_identity", {}).get("operation_id") == active_operation
+                                         for item in stage_items)
+                if not matching_operation and operation.get("status") not in {"failed", "cancelled"}:
+                    # SUPPLY_ASSETS_AVAILABLE is a registration receipt. Explicit
+                    # prepare owns the transition to a loaded execution plan.
+                    return active
         get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
         connected_ids = (
             get_client_ids()
@@ -1862,6 +1965,13 @@ class SchedulerPipelineMixin:
             layer_info = self.get_layer_assignments()
         assignments = {}
         stage_assignments = {}
+        operation_id = str((candidate or {}).get("operation_id", ""))
+        if not operation_id and candidate is None:
+            from model_supply_worker import get_selected_model
+            supply_worker = getattr(self, "_model_supply_worker", None)
+            selected = get_selected_model(supply_worker.root) if supply_worker is not None else None
+            if selected is not None and selected["manifest"]["source_model_id"] == model_id:
+                operation_id = selected["manifest"]["operation_id"]
         from config import API_PORT
 
         for a in layer_info["assignments"]:
@@ -1895,9 +2005,16 @@ class SchedulerPipelineMixin:
                 # local model segment or publish LAYER_CONFIG to Android.
                 a["execution"] = "stage_offer_v3"
                 a["stage_type"] = "layer_forward"
-                stage_assignments[nid] = {
-                    **dict(a),
-                }
+                try:
+                    stage_assignments[nid] = self._build_worker_prepare_assignment(
+                        a, config_id=config_id, generation=generation,
+                        model_info=model_info,
+                        operation_id=operation_id,
+                    )
+                except ValueError as exc:
+                    return {"status": "rejected", "admitted": False,
+                            "reason_code": str(exc), "reason": str(exc),
+                            "assignments": [], "transaction_phase": "rejected"}
                 if candidate is None:
                     self._clear_layer_config_state(nid)
                 continue
@@ -1957,7 +2074,7 @@ class SchedulerPipelineMixin:
                     "release": True,
             }
             for node_id in (layer_releasable_worker_ids | full_worker_release_ids)
-            if node_id not in assignments
+            if node_id not in assignments and node_id not in stage_assignments
             # ★ relay 宿主**不**收本地层配置（它的层由远端 relay_mid_service 代跑），
             #   因此它永远不在 `assignments` 里 —— 但那不等于该释放它的预留：它要的
             #   恰恰是那份 legacy 层配置（`engine="relay_middle"`，由请求路径的
@@ -1968,9 +2085,9 @@ class SchedulerPipelineMixin:
             and not self._is_relay_host(node_id)
         }
         configs = (
-            dict(assignments)
+            {**assignments, **stage_assignments}
             if candidate is not None
-            else {**assignments, **releases}
+            else {**assignments, **stage_assignments, **releases}
         )
         if candidate is not None:
             # Candidate assignments exist beside the active registry until
@@ -1989,8 +2106,7 @@ class SchedulerPipelineMixin:
                     "transaction_phase": "rejected",
                 })
             elif stage_assignments:
-                # The solver's plan is retained, while only legacy workers
-                # participate in the prepare/commit ACK transaction.
+                # Every remote segment participates in the native-load barrier.
                 capacity_plan = dict(capacity_plan)
                 capacity_plan["assignments"] = [
                     (
@@ -2000,6 +2116,12 @@ class SchedulerPipelineMixin:
                     for item in capacity_plan.get("assignments", [])
                 ]
             with self._layer_config_lock:
+                # Cancellation can arrive while candidate metadata or capacity
+                # planning is being prepared. Check the supply guard under the
+                # same lock that installs the transaction, so cancellation either
+                # prevents its creation or finds it and aborts it.
+                if operation_id:
+                    self._model_supply.ensure_prepare_not_cancelled(operation_id)
                 previous_control_state = {
                     "retry_state": {
                         node_id: dict(value)
@@ -2016,7 +2138,11 @@ class SchedulerPipelineMixin:
                     "generation": generation,
                     "phase": "preparing" if assignments or stage_assignments else "rejected",
                     "plan": dict(capacity_plan),
-                    "worker_ids": set(assignments),
+                    "worker_ids": set(assignments) | set(stage_assignments),
+                    "connection_generations": {
+                        node: self._assignment_connection_generation(node)
+                        for node in stage_assignments
+                    },
                     "prepared_nodes": set(),
                     "candidate_id": (
                         str(candidate.get("candidate_id", "") or "")
@@ -2027,16 +2153,16 @@ class SchedulerPipelineMixin:
                     "previous_control_state": previous_control_state,
                     "expected": {
                         node_id: dict(value)
-                        for node_id, value in assignments.items()
-                    } if candidate is not None else {},
+                        for node_id, value in {**assignments, **stage_assignments}.items()
+                    },
                     "acks": {},
                     "retry_state": {
                         node_id: {
                             "attempts": 1,
                             "next_retry": time.monotonic() + 5.0,
                         }
-                        for node_id in assignments
-                    } if candidate is not None else {},
+                        for node_id in {**assignments, **stage_assignments}
+                    },
                     "on_commit": (
                         candidate.get("on_commit")
                         if isinstance(candidate, dict) else None
@@ -2058,11 +2184,6 @@ class SchedulerPipelineMixin:
             self._publish_pipeline_candidate_configs(configs)
         else:
             self._publish_layer_configs(configs)
-        if capacity_plan is not None and stage_assignments and not assignments:
-            # No legacy worker has an ACK to drive the transaction forward.
-            # Commit the master's local prefix explicitly, then expose the
-            # stage-only plan as active.
-            self._commit_pipeline_load_transaction(config_id)
         if assignments:
             logger.info(
                 f"分层配置已推送到 {len(assignments)} 个从节点，"
@@ -2099,6 +2220,9 @@ class SchedulerPipelineMixin:
         self, node_id: str, assignment: dict,
     ) -> tuple[bool, str]:
         """Check a Route-A worker without consulting legacy layer ACK state."""
+        loaded, reason = self._worker_prepare_assignment_loaded(node_id, assignment)
+        if not loaded:
+            return False, reason
         provider_factory = getattr(self, "_ensure_remote_task_worker_provider", None)
         if not callable(provider_factory):
             return False, "task_worker_provider_unavailable"
@@ -2371,6 +2495,12 @@ class SchedulerPipelineMixin:
             "hidden_spec": hidden_spec,
             "middle_channel": middle_channel,
         }
+        from worker_prepare_contract import stage_identity
+        identity = assignment.get("worker_prepare_identity")
+        ready, reason = self._worker_prepare_assignment_loaded(node_id, assignment)
+        if not ready:
+            raise RuntimeError(reason)
+        stage_fields["prepare_identity"] = stage_identity(identity)
         if seq_ids is not None:
             stage_fields["seq_ids"] = list(seq_ids)
         if positions is not None:
@@ -2500,7 +2630,7 @@ class SchedulerPipelineMixin:
         self._start_layer_config_retry_monitor()
         for node_id, config in configs.items():
             try:
-                self._tcp_server.send_layer_config(node_id, config)
+                self._send_pipeline_worker_config(node_id, config)
             except Exception:
                 logger.warning(
                     "分层配置首次发送失败，将由退避线程重试: node=%s",
@@ -2530,7 +2660,7 @@ class SchedulerPipelineMixin:
         self._start_layer_config_retry_monitor()
         for node_id, config in configs.items():
             try:
-                self._tcp_server.send_layer_config(node_id, config)
+                self._send_pipeline_worker_config(node_id, config)
             except Exception:
                 logger.warning(
                     "候选分层配置首次发送失败，将由退避线程重试: node=%s",
@@ -2580,6 +2710,8 @@ class SchedulerPipelineMixin:
                         if isinstance(candidate_expected, dict) else ""
                     ),
                     payload={
+                        **({"worker_prepare_identity": candidate_expected[node_id]["worker_prepare_identity"]}
+                           if candidate_expected.get(node_id, {}).get("worker_prepare_identity") else {}),
                         "release": True,
                         "abort": True,
                         "aborted_config_id": config_id,
@@ -2600,43 +2732,50 @@ class SchedulerPipelineMixin:
             transaction = self._pipeline_load_transaction
             if not transaction or transaction.get("config_id") != config_id:
                 return
-            worker_ids = set(transaction.get("worker_ids", set()))
-            candidate_id = str(transaction.get("candidate_id", "") or "")
-            self._layer_config_generation = max(
-                self._layer_config_generation + 1,
-                time.time_ns(),
-            )
-            generation = self._layer_config_generation
-            transaction["phase"] = "aborted"
-            transaction["reason_code"] = reason_code
-            transaction["reason"] = reason
-            model_id = str(transaction.get("plan", {}).get("model_id", "") or "")
-            previous = transaction.get("previous_control_state")
-            if isinstance(previous, dict) and not candidate_id:
-                self._layer_config_retry_state.clear()
-                self._layer_config_retry_state.update({
-                    node_id: dict(value)
-                    for node_id, value in previous.get("retry_state", {}).items()
-                    if isinstance(value, dict)
-                })
-                self._worker_assignments.restore(
-                    previous.get("assignments", {})
+            retire_published = bool(transaction.get("published") or transaction.get("phase") == "ready")
+            if transaction.get("phase") in {"aborted", "rejected", "invalidated"} and not retire_published:
+                return
+            if not retire_published:
+                worker_ids = set(transaction.get("worker_ids", set()))
+                candidate_id = str(transaction.get("candidate_id", "") or "")
+                self._layer_config_generation = max(
+                    self._layer_config_generation + 1,
+                    time.time_ns(),
                 )
-                active_plan = previous.get("active_plan")
-                self._active_pipeline_capacity_plan = (
-                    dict(active_plan) if isinstance(active_plan, dict) else None
-                )
-            elif not candidate_id:
-                self._active_pipeline_capacity_plan = None
-            if candidate_id:
-                cleanup_records.extend(
-                    self._record_pipeline_candidate_abort_cleanup_locked(
-                        transaction,
-                        generation=generation,
-                        reason_code=reason_code,
+                generation = self._layer_config_generation
+                transaction["phase"] = "aborted"
+                transaction["reason_code"] = reason_code
+                transaction["reason"] = reason
+                model_id = str(transaction.get("plan", {}).get("model_id", "") or "")
+                previous = transaction.get("previous_control_state")
+                if isinstance(previous, dict) and not candidate_id:
+                    self._layer_config_retry_state.clear()
+                    self._layer_config_retry_state.update({
+                        node_id: dict(value)
+                        for node_id, value in previous.get("retry_state", {}).items()
+                        if isinstance(value, dict)
+                    })
+                    self._worker_assignments.restore(
+                        previous.get("assignments", {})
                     )
-                )
-            self._persist_pipeline_lifecycle_locked()
+                    active_plan = previous.get("active_plan")
+                    self._active_pipeline_capacity_plan = (
+                        dict(active_plan) if isinstance(active_plan, dict) else None
+                    )
+                elif not candidate_id:
+                    self._active_pipeline_capacity_plan = None
+                if candidate_id:
+                    cleanup_records.extend(
+                        self._record_pipeline_candidate_abort_cleanup_locked(
+                            transaction,
+                            generation=generation,
+                            reason_code=reason_code,
+                        )
+                    )
+                self._persist_pipeline_lifecycle_locked()
+        if retire_published:
+            self._invalidate_pipeline_load_transaction(reason_code, reason, expected_config_id=config_id)
+            return
         if candidate_id:
             for record in cleanup_records:
                 self._dispatch_pipeline_model_cleanup(record)
@@ -2651,6 +2790,20 @@ class SchedulerPipelineMixin:
                 except Exception:
                     logger.warning("主节点回滚流水线层段失败", exc_info=True)
             abort_id = uuid.uuid4().hex
+            native_records = []
+            with self._layer_config_lock:
+                for node, expected in transaction.get("expected", {}).items():
+                    identity = expected.get("worker_prepare_identity")
+                    if isinstance(identity, dict):
+                        native_records.append(self._record_pipeline_model_cleanup_locked(
+                            node_id=node, candidate_config_id=config_id, generation=generation,
+                            action="abort", assignment_id=identity["assignment_id"],
+                            payload={"worker_prepare_identity": identity, "release": True, "abort": True,
+                                     "aborted_config_id": config_id},
+                        ))
+                self._persist_pipeline_lifecycle_locked()
+            for record in native_records:
+                self._dispatch_pipeline_model_cleanup(record)
             configs = {
                 node_id: {
                     "node_id": node_id,
@@ -2663,6 +2816,7 @@ class SchedulerPipelineMixin:
                     "reason_code": reason_code,
                 }
                 for node_id in worker_ids
+                if not transaction.get("expected", {}).get(node_id, {}).get("worker_prepare_identity")
             }
             for node_id, payload in configs.items():
                 try:
@@ -2679,16 +2833,18 @@ class SchedulerPipelineMixin:
 
 
     def _invalidate_pipeline_load_transaction(
-        self, reason_code: str = "pipeline_model_changed", reason: str = "",
+        self, reason_code: str = "pipeline_model_changed", reason: str = "", *, expected_config_id: str = "",
     ) -> None:
         """Fence a pipeline transaction before replacing the local model."""
         cleanup_records = []
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
-            if transaction and transaction.get("phase") not in {
+            if expected_config_id and (not transaction or transaction.get("config_id") != expected_config_id):
+                return
+            if transaction and (transaction.get("phase") not in {
                 "aborted", "rejected", "invalidated",
-            }:
-                published = transaction.get("phase") == "ready"
+            } or transaction.get("published")):
+                published = bool(transaction.get("published") or transaction.get("phase") == "ready")
                 transaction["phase"] = "invalidated"
                 transaction["reason_code"] = reason_code
                 transaction["reason"] = reason
@@ -2701,6 +2857,16 @@ class SchedulerPipelineMixin:
                 # assignment cannot roll it back or abort a finalized candidate.
                 # Keep existing finalize obligations fenced and retryable; the
                 # model-change owner releases the active runtime separately.
+                if published:
+                    for node, expected in transaction.get("expected", {}).items():
+                        identity = expected.get("worker_prepare_identity")
+                        if isinstance(identity, dict):
+                            cleanup_records.append(self._record_pipeline_model_cleanup_locked(
+                                node_id=node, candidate_config_id=identity["config_id"],
+                                generation=self._layer_config_generation, action="release",
+                                assignment_id=identity["assignment_id"],
+                                payload={"worker_prepare_identity": identity, "release": True},
+                            ))
                 if not published:
                     cleanup_records.extend(
                         self._record_pipeline_candidate_abort_cleanup_locked(
@@ -2711,6 +2877,10 @@ class SchedulerPipelineMixin:
                     )
                 self._persist_pipeline_lifecycle_locked()
             self._active_pipeline_capacity_plan = None
+            for node in self._worker_assignments.expected_configs():
+                # Revoke execution immediately. The separate native cleanup
+                # ledger keeps ownership until actual unload is acknowledged.
+                self._worker_assignments.release(node, reason_code=reason_code, aborted=True)
             self._prepared_layer_configs.clear()
             self._layer_config_inflight.clear()
         for record in cleanup_records:
@@ -2854,25 +3024,6 @@ class SchedulerPipelineMixin:
             item["phase"] = "commit"
             commit_configs[node_id] = item
         if not commit_configs:
-            stage_only = bool(
-                not worker_ids
-                and any(
-                    item.get("execution") == "stage_offer_v3"
-                    for item in plan.get("assignments", [])
-                )
-            )
-            if stage_only:
-                with self._layer_config_lock:
-                    transaction = self._pipeline_load_transaction
-                    if (
-                        transaction
-                        and transaction.get("config_id") == config_id
-                        and transaction.get("phase") == "committing_local"
-                    ):
-                        transaction["phase"] = "committing_global"
-                        self._persist_pipeline_lifecycle_locked()
-                self._complete_pipeline_load_transaction(config_id)
-                return
             self._abort_pipeline_load_transaction(
                 config_id, "pipeline_commit_workers_missing",
                 "prepared worker set disappeared before commit",
@@ -2880,13 +3031,16 @@ class SchedulerPipelineMixin:
             return
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
+            if (not transaction or transaction.get("config_id") != config_id
+                    or transaction.get("phase") != "committing_local"):
+                return
             if transaction and transaction.get("config_id") == config_id:
                 transaction["phase"] = "committing"
+                transaction["expected"] = {
+                    node_id: dict(value)
+                    for node_id, value in commit_configs.items()
+                }
                 if candidate_id:
-                    transaction["expected"] = {
-                        node_id: dict(value)
-                        for node_id, value in commit_configs.items()
-                    }
                     transaction["retry_state"] = {
                         node_id: {
                             "attempts": 1,
@@ -2984,14 +3138,31 @@ class SchedulerPipelineMixin:
                         )
                     commit_candidate(candidate_id)
 
-                # Candidate commit is reversible until finalize.  Cross the
-                # reshard CAS only after the local runtime can be restored on
-                # failure; the coordinator has no reverse-epoch operation.
-                reshard_result = self._commit_ready_pipeline_reshard(active_plan)
-                if reshard_result is False:
-                    raise RuntimeError("pipeline_reshard_commit_failed")
-
                 with self._layer_config_lock:
+                    transaction = self._pipeline_load_transaction
+                    if (not transaction or transaction.get("config_id") != config_id
+                            or transaction.get("phase") != "committing_global"
+                            or transaction.get("cancel_requested")):
+                        raise RuntimeError("pipeline transaction superseded before reshard commit")
+                    for node, item in expected.items():
+                        identity = item.get("worker_prepare_identity")
+                        if isinstance(identity, dict) and (
+                            node not in self._connected_client_ids()
+                            or node in self._pipeline_worker_opt_out
+                            or transaction.get("connection_generations", {}).get(node) != self._assignment_connection_generation(node)
+                            or transaction.get("acks", {}).get(node, {}).get("worker_prepare_identity") != identity
+                            or transaction.get("acks", {}).get(node, {}).get("loaded") is not True
+                            or transaction.get("acks", {}).get(node, {}).get("phase") != "commit"
+                        ):
+                            raise RuntimeError("worker_native_ready_revoked_before_publication")
+
+                    # Candidate commit is reversible until finalize.  Cross the
+                    # reshard CAS only after the local runtime can be restored on
+                    # failure; the coordinator has no reverse-epoch operation.
+                    reshard_result = self._commit_ready_pipeline_reshard(active_plan)
+                    if reshard_result is False:
+                        raise RuntimeError("pipeline_reshard_commit_failed")
+
                     transaction = self._pipeline_load_transaction
                     if (
                         not transaction
@@ -3001,6 +3172,26 @@ class SchedulerPipelineMixin:
                         raise RuntimeError(
                             "pipeline transaction superseded before publication"
                         )
+                    for node, item in expected.items():
+                        identity = item.get("worker_prepare_identity")
+                        if isinstance(identity, dict) and (
+                            node not in self._connected_client_ids()
+                            or node in self._pipeline_worker_opt_out
+                            or transaction.get("connection_generations", {}).get(node) != self._assignment_connection_generation(node)
+                            or transaction.get("acks", {}).get(node, {}).get("worker_prepare_identity") != identity
+                            or transaction.get("acks", {}).get(node, {}).get("loaded") is not True
+                            or transaction.get("acks", {}).get(node, {}).get("phase") != "commit"
+                        ):
+                            raise RuntimeError("worker_native_ready_revoked_before_publication")
+
+                    for retired_node, old in self._worker_assignments.expected_configs().items():
+                        identity = old.get("worker_prepare_identity")
+                        if retired_node not in worker_ids and isinstance(identity, dict):
+                            cleanup_records.append(self._record_pipeline_model_cleanup_locked(
+                                node_id=retired_node, candidate_config_id=identity["config_id"],
+                                generation=generation, action="release", assignment_id=identity["assignment_id"],
+                                payload={"worker_prepare_identity": identity, "release": True},
+                            ))
                     for node_id in worker_ids:
                         item = expected.get(node_id)
                         if not item:
@@ -3013,7 +3204,8 @@ class SchedulerPipelineMixin:
                             ),
                             config_id=config_id,
                             connection_generation=(
-                                self._assignment_connection_generation(node_id)
+                                transaction.get("connection_generations", {}).get(node_id,
+                                    self._assignment_connection_generation(node_id))
                             ),
                             expected_config=item,
                             acknowledgement=candidate_acks.get(node_id, {}),
@@ -3024,6 +3216,7 @@ class SchedulerPipelineMixin:
                             reason_code=REASON_CONFIG_ACKED,
                         )
                     transaction["phase"] = "ready"
+                    transaction["published"] = True
                     transaction["deadline"] = 0.0
                     self._active_pipeline_capacity_plan = dict(active_plan)
                     self._local_pipeline_steps.clear()
@@ -3049,6 +3242,8 @@ class SchedulerPipelineMixin:
                                 )
                             ),
                             payload={
+                                **({"worker_prepare_identity": expected[node_id]["worker_prepare_identity"]}
+                                   if expected.get(node_id, {}).get("worker_prepare_identity") else {}),
                                 "finalize": True,
                                 "finalized_config_id": config_id,
                             },
@@ -3147,7 +3342,7 @@ class SchedulerPipelineMixin:
 
         try:
             if self._tcp_server and self._tcp_server._running:
-                self._tcp_server.send_layer_config(node_id, assignment)
+                self._send_pipeline_worker_config(node_id, assignment)
                 logger.warning(
                     "worker 层配置已失效，立即重发: node=%s config=%s reason=%s",
                     node_id, config_id, reason,
@@ -3209,7 +3404,12 @@ class SchedulerPipelineMixin:
                 }
             ):
                 candidate_retry = transaction.setdefault("retry_state", {})
+                confirmed_nodes = transaction.get(
+                    "prepared_nodes" if transaction["phase"] == "preparing" else "ready_nodes", set(),
+                )
                 for node_id, expected in transaction.get("expected", {}).items():
+                    if node_id in confirmed_nodes:
+                        continue
                     state = candidate_retry.setdefault(
                         node_id, {"attempts": 0, "next_retry": now},
                     )
@@ -3274,7 +3474,7 @@ class SchedulerPipelineMixin:
             if node_id not in connected:
                 continue
             try:
-                self._tcp_server.send_layer_config(node_id, assignment)
+                self._send_pipeline_worker_config(node_id, assignment)
                 sent += 1
                 logger.info(
                     "重发分层配置: node=%s config=%s attempt=%d",
@@ -4100,6 +4300,15 @@ class SchedulerPipelineMixin:
                 )
                 return
 
+        cleanup_action = data.get("cleanup_action") if isinstance(data, dict) else None
+        if cleanup_action and (
+            (cleanup_action == "abort" and (data.get("abort") is not True or data.get("release") is not True or data.get("finalize")))
+            or (cleanup_action == "finalize" and (data.get("finalize") is not True or data.get("abort") or data.get("release")))
+            or cleanup_action not in {"abort", "finalize"}
+            or not data.get("candidate_config_id")
+        ):
+            logger.warning("event=pipeline_cleanup_shape_rejected action=%s", cleanup_action)
+            return
         node_id = self.get_effective_node_id()
         ack_generation = (
             data.get("generation", 0) if isinstance(data, dict) else 0
@@ -5076,6 +5285,9 @@ class SchedulerPipelineMixin:
                 if isinstance(candidate_expected, dict)
                 else self._worker_assignments.expected(client_id)
             )
+            if expected.get("worker_prepare_identity"):
+                logger.warning("event=legacy_ack_rejected_for_native_prepare node=%s", client_id)
+                return
             if not expected:
                 logger.warning("忽略未请求的层配置 ACK: node=%s", client_id)
                 return
@@ -5407,8 +5619,20 @@ class SchedulerPipelineMixin:
             )
             self.push_layer_config_to_clients()
             return
+        abort = None
+        retire = False
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.add(client_id)
+            transaction = self._pipeline_load_transaction
+            if transaction and client_id in set(transaction.get("worker_ids", set())):
+                if transaction.get("phase") in {"preparing", "committing_local", "committing", "committing_global"}:
+                    abort = (transaction["config_id"], "pipeline_worker_opted_out", "worker left distributed inference")
+                elif transaction.get("phase") == "ready":
+                    retire = True
+        if abort:
+            self._abort_pipeline_load_transaction(*abort)
+        elif retire:
+            self._invalidate_pipeline_load_transaction("pipeline_worker_opted_out")
         self._clear_layer_config_state(client_id)
         logger.info("从节点已退出 PyTorch 分层计算: node=%s", client_id)
         self.push_layer_config_to_clients()
@@ -9468,10 +9692,9 @@ class SchedulerPipelineMixin:
         ★ 立即执行路径与 is_busy 检查在同一锁内完成，消除 TOCTOU 竞态：
           多个调用方线程不可能同时看到 is_busy=False 并绕过队列。
         """
-        # ---- 引擎检查：流水线仅支持 PyTorch 引擎 ----
-        # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
-        # 已显式准备的 distributed-only 模型尚未物化任何权重，也允许进入；
-        # 主节点首段会在 worker 就绪后由 run_pipeline 按分配范围首次加载。
+        # 以运行时 FORWARD_LAYERS 能力准入 PyTorch 或 llama.cpp 层段接力。
+        # distributed-only 描述符允许进入同步检查；执行仍需已发布的
+        # 同代际 native-ready 计划，主节点本段已在准备事务中物化。
         queue_timeout = kwargs.pop('_queue_timeout', self._scheduler_facade_global('PIPELINE_TIMEOUT'))
         request_timeout = kwargs.pop(
             "_request_timeout_seconds", queue_timeout,

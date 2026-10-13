@@ -572,6 +572,13 @@ class EngineHost:
         # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
         #   由它自理；这里只负责按 env 配置创建一次并复用（重载 500MB GGUF 代价高）。
         self._layer_upstream: Any = None
+        self._worker_runtime_lock = threading.RLock()
+        self._worker_runtime_managed = False
+        self._worker_runtime_active = None
+        self._worker_runtime_candidate = None
+        self._worker_runtime_previous = None
+        self._worker_runtime_identity = None
+        self._worker_runtime_phase = "idle"
         # A filtered manager follows current.json; KV is per workflow/sequence.
         self._supplied_layer_manager: Any = None
         self._supplied_layer_key: Any = None
@@ -961,7 +968,7 @@ class EngineHost:
             import config as _cfg
 
             _cfg.USE_COMPILE = bool(use_compile)
-            self._unload_supplied_layer_manager()
+            self.release_worker_runtime()
             result = self._host.load_model(
                 engine=engine,
                 quant_type=quant_type,
@@ -984,7 +991,7 @@ class EngineHost:
 
     def unload_model(self) -> Dict[str, Any]:
         with self._model_lifecycle_lock():
-            self._unload_supplied_layer_manager()
+            self.release_worker_runtime()
             if self._llm_is_loaded():
                 self._host.unload_model()
             self._layers.clear()
@@ -1001,7 +1008,7 @@ class EngineHost:
         resolution: ModelLoadResolution | None = None,
     ) -> Dict[str, Any]:
         with self._model_lifecycle_lock():
-            self._unload_supplied_layer_manager()
+            self.release_worker_runtime()
             result = self._host.switch_model(
                 model_id=model_id,
                 engine=engine,
@@ -1024,7 +1031,7 @@ class EngineHost:
 
     def close(self) -> None:
         with self._model_lifecycle_lock():
-            self._unload_supplied_layer_manager()
+            self.release_worker_runtime()
         coordinator = self._task_graph_coordinator
         self._task_graph_coordinator = None
         if coordinator is not None:
@@ -2387,6 +2394,12 @@ class EngineHost:
         from task_graph import DEPENDENCY_FAILURES_KEY, TaskGraphError
         from task_provider import ProviderError, ProviderExecutionError
 
+        # Every public Route-A execution enters the committed prepare gate.
+        # The internal helper remains usable for legacy native unit fixtures.
+        if stage_request.stage_type == "layer_forward":
+            with self._worker_layer_lock():
+                self._check_worker_runtime_stage(stage_request, required=True)
+                return self._execute_layer_forward_stage_locked(stage_request, provider_cancel_event)
         root_input = stage_request.root_input
         options = root_input.get("task_options", {})
         if not isinstance(options, dict):
@@ -2530,6 +2543,350 @@ class EngineHost:
     # v3 层段 Stage（`layer_forward`）—— PC 侧执行
     # ------------------------------------------------------------------
 
+    def _worker_layer_lock(self):
+        lock = getattr(self, "_worker_runtime_lock", None)
+        if lock is None:
+            lock = self._worker_runtime_lock = threading.RLock()
+        return lock
+
+    def fence_worker_runtime(self):
+        # Admission/disconnect must fence immediately, without waiting for a
+        # native forward or unload that holds the runtime lock.
+        event = getattr(self, "_worker_runtime_fenced", None)
+        if event is None:
+            event = self._worker_runtime_fenced = threading.Event()
+        event.set()
+
+    def _resume_worker_runtime(self):
+        event = getattr(self, "_worker_runtime_fenced", None)
+        if event is not None:
+            event.clear()
+
+    def _capture_worker_runtime(self):
+        from worker_prepare import LayerRuntime
+        active = getattr(self, "_worker_runtime_active", None)
+        if active is None:
+            active = LayerRuntime(None)
+        # Preserve ownership on partial close failures and exact KV rollback.
+        active.upstream = getattr(self, "_layer_upstream", None)
+        active.manager = getattr(self, "_supplied_layer_manager", None)
+        active.workflow = getattr(self, "_supplied_layer_workflow", None)
+        active.caches = getattr(self, "_supplied_layer_caches", {})
+        return active
+
+    def _install_worker_runtime(self, runtime):
+        self._worker_runtime_active = runtime
+        self._layer_upstream = runtime.upstream if runtime is not None else None
+        self._layer_upstream_model_path = (
+            str(runtime.upstream.model_path) if runtime is not None and runtime.upstream is not None else ""
+        )
+        self._supplied_layer_manager = runtime.manager if runtime is not None else None
+        self._supplied_layer_key = (
+            self._supplied_layer_selection_key(runtime.selected)
+            if runtime is not None and runtime.manager is not None else None
+        )
+        self._supplied_layer_workflow = runtime.workflow if runtime is not None else None
+        self._supplied_layer_caches = runtime.caches if runtime is not None else {}
+
+    def _owned_worker_runtimes(self):
+        items = (self._capture_worker_runtime(), getattr(self, "_worker_runtime_candidate", None),
+                 getattr(self, "_worker_runtime_previous", None),
+                 *getattr(self, "_worker_runtime_orphans", []))
+        result = []
+        for runtime in items:
+            if runtime is not None and runtime.owned and all(runtime is not old for old in result):
+                result.append(runtime)
+        return result
+
+    def worker_runtime_owned_identities(self):
+        from copy import deepcopy
+        with self._worker_layer_lock():
+            return [deepcopy(runtime.identity) for runtime in self._owned_worker_runtimes()
+                    if runtime.identity is not None]
+
+    def _retain_failed_worker_runtime(self, runtime):
+        with self._worker_layer_lock():
+            orphans = getattr(self, "_worker_runtime_orphans", None)
+            if orphans is None:
+                orphans = self._worker_runtime_orphans = []
+            if all(runtime is not old for old in orphans):
+                orphans.append(runtime)
+
+    def _build_supplied_layer_manager(self, selected, provider_cancel_event, runtime_owner=None):
+        from worker_prepare_contract import WorkerPrepareError
+        import config
+        from model_module import ModelManager
+        manifest = selected["manifest"]
+        start, end = manifest["layer_range"]
+        model_id = "supply-" + manifest["artifact_sha256"][:24]
+        manager = ModelManager()
+        if runtime_owner is not None:
+            runtime_owner.manager = manager
+        try:
+            if provider_cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            manager.prepare_pipeline_model(
+                model_id=model_id, model_path=selected["directory"],
+                quant_type=config.QUANT_TYPE, layer_range=(start, end),
+                model_sha256=manifest["artifact_sha256"],
+            )
+            if provider_cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            manager.load_layer_range(
+                start_layer=start, end_layer=end,
+                has_embedding=manifest.get("has_embedding", start == 0),
+                has_lm_head=manifest.get("has_lm_head", end == manifest["total_layers"]),
+                model_path=selected["directory"], quant_type=config.QUANT_TYPE,
+                total_layers=manifest["total_layers"], model_id=model_id,
+            )
+            if provider_cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            if tuple(manager.layer_range or ()) != (start, end) or not manager.is_loaded:
+                raise WorkerPrepareError("worker_prepare_layer_range_mismatch")
+            return manager
+        except Exception:
+            if runtime_owner is None:
+                from worker_prepare import LayerRuntime, close_layer_runtime
+                partial = LayerRuntime(None, selected, manager=manager)
+                try:
+                    close_layer_runtime(partial)
+                except Exception:
+                    self._retain_failed_worker_runtime(partial)
+                    raise
+            raise
+
+    def _build_worker_runtime(self, command, selected, cancel_event):
+        from copy import deepcopy
+        from worker_prepare import LayerRuntime, close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError
+        identity = command["identity"]
+        runtime = LayerRuntime(deepcopy(identity), deepcopy(selected))
+        try:
+            if cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            if identity["stage_model_identity"]["format"] == "safetensors":
+                runtime.manager = self._build_supplied_layer_manager(selected, cancel_event, runtime)
+            else:
+                from keep_head_shim import resolve_keep_head_shim
+                from llama_keep_head import KeepHeadUpstream
+                import numpy as np
+                shim = resolve_keep_head_shim()
+                if not shim:
+                    raise WorkerPrepareError("worker_prepare_shim_unavailable")
+                runtime.upstream = KeepHeadUpstream(
+                    shim, selected["model_path"], mode="nextn",
+                    n_ctx=command["context_size"], n_batch=min(command["context_size"], 2048),
+                    n_threads=8, n_seq_max=1,
+                )
+                upstream = runtime.upstream
+                if (not upstream.is_available or upstream.n_embd != identity["hidden_size"]
+                        or upstream.n_layer != identity["layer_range"][1] - identity["layer_range"][0]):
+                    raise WorkerPrepareError("worker_prepare_layer_range_mismatch")
+                if cancel_event.is_set():
+                    raise WorkerPrepareError("worker_prepare_cancelled")
+                # Probe the optional tail entry point in the child, then clear probe KV.
+                hidden = np.zeros((1, identity["hidden_size"]), dtype=np.float32)
+                if identity["segment_mode"] == "tail":
+                    token = upstream.forward_hidden_to_token(hidden, n_past=0)
+                    if type(token) is not int or token < 0:
+                        raise WorkerPrepareError("worker_prepare_probe_failed")
+                else:
+                    output = upstream.forward_hidden_to_hidden(hidden, n_past=0)
+                    if output.shape != hidden.shape or not np.isfinite(output).all():
+                        raise WorkerPrepareError("worker_prepare_probe_failed")
+                upstream.reset()
+            if cancel_event.is_set() or not runtime.loaded:
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            return runtime
+        except Exception as exc:
+            if runtime.upstream is None:
+                runtime.upstream = getattr(exc, "cleanup_owner", None)
+            try:
+                close_layer_runtime(runtime)
+            except Exception:
+                self._retain_failed_worker_runtime(runtime)
+                raise
+            raise
+
+    def prepare_worker_runtime(self, command, selected, cancel_event):
+        from copy import deepcopy
+        from worker_prepare_contract import WorkerPrepareError, validate_command
+        command = validate_command(command)
+        if command["action"] != "prepare":
+            raise WorkerPrepareError("invalid_prepare_action")
+        identity = command["identity"]
+        self.fence_worker_runtime()
+        with self._worker_layer_lock():
+            self._worker_runtime_managed = True
+            if getattr(self, "_worker_runtime_phase", "idle") == "committed" or getattr(self, "_worker_runtime_candidate", None) is not None:
+                raise WorkerPrepareError("worker_prepare_cleanup_pending")
+            self._worker_runtime_identity = deepcopy(identity)
+            self._worker_runtime_phase = "preparing"
+        try:
+            runtime = self._build_worker_runtime(command, selected, cancel_event)
+        except Exception:
+            with self._worker_layer_lock():
+                self._worker_runtime_phase = "failed"
+            raise
+        with self._worker_layer_lock():
+            self._worker_runtime_candidate = runtime
+            if cancel_event.is_set():
+                from worker_prepare import close_layer_runtime
+                close_layer_runtime(runtime)
+                self._worker_runtime_candidate = None
+                self._worker_runtime_phase = "failed"
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            self._worker_runtime_candidate = runtime
+            self._worker_runtime_identity = deepcopy(identity)
+            self._worker_runtime_phase = "prepared"
+
+    def worker_runtime_loaded(self, identity=None):
+        with self._worker_layer_lock():
+            for runtime in (getattr(self, "_worker_runtime_candidate", None), getattr(self, "_worker_runtime_active", None)):
+                if runtime is not None and (identity is None or runtime.identity == identity) and runtime.loaded:
+                    return True
+            return False
+
+    def worker_runtime_ready(self, identity):
+        with self._worker_layer_lock():
+            fenced = getattr(self, "_worker_runtime_fenced", None)
+            active = getattr(self, "_worker_runtime_active", None)
+            return bool(active is not None and active.identity == identity and active.loaded
+                        and (fenced is None or not fenced.is_set())
+                        and getattr(self, "_worker_runtime_phase", "idle") in {"committed", "finalized", "aborted"})
+
+    def worker_runtime_present(self):
+        with self._worker_layer_lock():
+            return bool(self._owned_worker_runtimes()) or getattr(self, "_worker_runtime_phase", "idle") == "preparing"
+
+    def retire_previous_worker_runtime(self, identity):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError
+        with self._worker_layer_lock():
+            previous = getattr(self, "_worker_runtime_previous", None)
+            if previous is None or previous.identity != identity:
+                raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            close_layer_runtime(previous)
+            self._worker_runtime_previous = None
+
+    def commit_worker_runtime(self, identity):
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        identity = validate_identity(identity)
+        with self._worker_layer_lock():
+            if getattr(self, "_worker_runtime_identity", None) != identity:
+                raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            if self._worker_runtime_phase in {"committed", "finalized"}:
+                if not self.worker_runtime_loaded(identity):
+                    raise WorkerPrepareError("worker_prepare_runtime_unavailable")
+                return
+            runtime = getattr(self, "_worker_runtime_candidate", None)
+            if self._worker_runtime_phase != "prepared" or runtime is None or not runtime.loaded:
+                raise WorkerPrepareError("worker_prepare_not_prepared")
+            self._worker_runtime_previous = self._capture_worker_runtime()
+            self._install_worker_runtime(runtime)
+            self._worker_runtime_candidate = None
+            self._worker_runtime_phase = "committed"
+            self._resume_worker_runtime()
+
+    def abort_worker_runtime(self, identity, *, restore_previous=True):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        identity = validate_identity(identity)
+        with self._worker_layer_lock():
+            active = self._capture_worker_runtime()
+            candidate = getattr(self, "_worker_runtime_candidate", None)
+            phase = getattr(self, "_worker_runtime_phase", "idle")
+            matches = [runtime for runtime in self._owned_worker_runtimes() if runtime.identity == identity]
+            if getattr(self, "_worker_runtime_identity", None) != identity:
+                # Selection can fail before native preparation starts. Only
+                # that empty candidate may restore the still-owned old active.
+                if candidate is not None or matches or phase == "preparing":
+                    raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            elif phase == "finalized" and active.identity == identity:
+                raise WorkerPrepareError("worker_prepare_already_finalized")
+            self.fence_worker_runtime()
+            for runtime in matches:
+                close_layer_runtime(runtime)
+            if active.identity == identity:
+                previous = getattr(self, "_worker_runtime_previous", None)
+                if not restore_previous:
+                    close_layer_runtime(previous)
+                self._install_worker_runtime(previous if restore_previous else None)
+                self._worker_runtime_previous = None
+            if candidate is not None and candidate.identity == identity:
+                self._worker_runtime_candidate = None
+            self._worker_runtime_orphans = [runtime for runtime in getattr(self, "_worker_runtime_orphans", []) if runtime.owned]
+            self._worker_runtime_phase = "aborted"
+            if restore_previous and self._capture_worker_runtime().loaded:
+                self._resume_worker_runtime()
+
+    def finalize_worker_runtime(self, identity):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        identity = validate_identity(identity)
+        with self._worker_layer_lock():
+            if getattr(self, "_worker_runtime_identity", None) != identity or self._worker_runtime_phase not in {"committed", "finalized"}:
+                raise WorkerPrepareError("worker_prepare_not_committed")
+            if not self.worker_runtime_loaded(identity):
+                raise WorkerPrepareError("worker_prepare_runtime_unavailable")
+            close_layer_runtime(getattr(self, "_worker_runtime_previous", None))
+            self._worker_runtime_previous = None
+            self._worker_runtime_phase = "finalized"
+
+    def release_worker_runtime(self, identity=None):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        with self._worker_layer_lock():
+            active = self._capture_worker_runtime()
+            candidate = getattr(self, "_worker_runtime_candidate", None)
+            previous = getattr(self, "_worker_runtime_previous", None)
+            owned = self._owned_worker_runtimes()
+            if identity is not None:
+                identity = validate_identity(identity)
+                targets = [runtime for runtime in owned if runtime.identity == identity]
+                if not targets and owned:
+                    raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            else:
+                targets = owned
+            # Releasing the committed candidate retires its retained previous
+            # as well. A different prepared candidate/active remains untouched.
+            retire_previous = identity is None or (active.identity == identity and active.identity is not None)
+            if retire_previous and previous is not None and previous.owned and all(previous is not target for target in targets):
+                targets.append(previous)
+            # An old cleanup must never close a different new candidate/active.
+            if identity is None or active.identity == identity or (candidate is not None and candidate.identity == identity):
+                self.fence_worker_runtime()
+            for runtime in targets:
+                close_layer_runtime(runtime)
+            if identity is None or active.identity == identity:
+                self._install_worker_runtime(None)
+            if identity is None or (candidate is not None and candidate.identity == identity):
+                self._worker_runtime_candidate = None
+            if retire_previous or (previous is not None and previous.identity == identity):
+                self._worker_runtime_previous = None
+            self._worker_runtime_orphans = [runtime for runtime in getattr(self, "_worker_runtime_orphans", []) if runtime.owned]
+            if identity is None or getattr(self, "_worker_runtime_identity", None) == identity:
+                self._worker_runtime_phase = "released"
+
+    def _check_worker_runtime_stage(self, stage_request, *, required=False):
+        from worker_prepare_contract import WorkerPrepareError, stage_identity, validate_stage_identity
+        fields = stage_request.stage_fields or {}
+        if not required and not getattr(self, "_worker_runtime_managed", False) and "prepare_identity" not in fields:
+            return
+        actual = validate_stage_identity(fields.get("prepare_identity"))
+        fenced = getattr(self, "_worker_runtime_fenced", None)
+        if ((fenced is not None and fenced.is_set())
+                or getattr(self, "_worker_runtime_phase", "idle") not in {"committed", "finalized", "aborted"}):
+            raise WorkerPrepareError("worker_prepare_stage_fenced")
+        runtime = getattr(self, "_worker_runtime_active", None)
+        if runtime is None or runtime.identity is None or actual != stage_identity(runtime.identity) or not runtime.loaded:
+            raise WorkerPrepareError("worker_prepare_stage_identity_mismatch")
+        identity = stage_request.model_identity
+        if hasattr(identity, "snapshot"):
+            identity = identity.snapshot()
+        if identity != runtime.identity["stage_model_identity"] or fields.get("layer_range") != runtime.identity["layer_range"]:
+            raise WorkerPrepareError("worker_prepare_stage_contract_mismatch")
+
     def _layer_forward_upstream(self):
         """按 env 配置创建并复用 keep-head 上游（进程隔离由 `KeepHeadUpstream` 自理）。
 
@@ -2546,6 +2903,13 @@ class EngineHost:
         """
         import os
 
+        if getattr(self, "_worker_runtime_managed", False):
+            from worker_prepare_contract import WorkerPrepareError
+            active = getattr(self, "_worker_runtime_active", None)
+            if active is None or active.upstream is None or not active.loaded:
+                raise WorkerPrepareError("worker_prepare_runtime_unavailable")
+            return active.upstream
+
         # 本函数体要用 TaskGraphError，而该文件惯用函数内 import（同 :1802 / :2016 /
         # :2140），此前漏了这一处 ⇒ 层段 keep-head 上游缺 env 或绑定失败时抛的是
         # `NameError: name 'TaskGraphError' is not defined`，而不是真正的错误信息
@@ -2558,7 +2922,7 @@ class EngineHost:
         model_path = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
         if self._layer_upstream is not None:
             previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
-            if not previous_path or previous_path == model_path:
+            if (not previous_path or previous_path == model_path) and self._layer_upstream.is_available:
                 return self._layer_upstream
             self._layer_upstream.close()
             self._layer_upstream = None
@@ -2595,6 +2959,9 @@ class EngineHost:
                 n_seq_max=_env_int("QLH_LAYER_N_SEQ_MAX", 1),
             )
         except KeepHeadUnavailable as exc:
+            owner = getattr(exc, "cleanup_owner", None)
+            if owner is not None:
+                self._layer_upstream = owner
             raise TaskGraphError(f"层段 keep-head 上游不可用：{exc}") from exc
         return self._layer_upstream
 
@@ -2624,41 +2991,18 @@ class EngineHost:
         if getattr(self, "_supplied_layer_manager", None) is not None:
             return self._supplied_layer_manager
 
-        import config
-        from model_module import ModelManager
+        if getattr(self, "_worker_runtime_managed", False):
+            raise _StageError("worker_prepare_runtime_unavailable")
 
         upstream = getattr(self, "_layer_upstream", None)
         if upstream is not None:
             upstream.close()
             self._layer_upstream = None
-        manifest = selected["manifest"]
-        start, end = manifest["layer_range"]
-        model_id = "supply-" + manifest["artifact_sha256"][:24]
-        manager = ModelManager()
         try:
-            manager.prepare_pipeline_model(
-                model_id=model_id,
-                model_path=selected["directory"],
-                quant_type=config.QUANT_TYPE,
-                layer_range=(start, end),
-                model_sha256=manifest["artifact_sha256"],
-            )
-            if provider_cancel_event.is_set():
-                raise _StageError("supplied_stage_cancelled")
-            manager.load_layer_range(
-                start_layer=start,
-                end_layer=end,
-                has_embedding=manifest.get("has_embedding", start == 0),
-                has_lm_head=manifest.get("has_lm_head", end == manifest["total_layers"]),
-                model_path=selected["directory"],
-                quant_type=config.QUANT_TYPE,
-                total_layers=manifest["total_layers"],
-                model_id=model_id,
-            )
-            if provider_cancel_event.is_set():
-                raise _StageError("supplied_stage_cancelled")
-        except Exception:
-            manager.unload_model()
+            manager = self._build_supplied_layer_manager(selected, provider_cancel_event)
+        except Exception as exc:
+            if getattr(exc, "reason_code", "") == "worker_prepare_cancelled":
+                raise _StageError("supplied_stage_cancelled") from exc
             raise
         self._supplied_layer_manager = manager
         self._supplied_layer_key = key
@@ -2766,7 +3110,12 @@ class EngineHost:
         self._supplied_layer_caches = caches
         return output.numpy() if want_hidden else token
 
-    def _execute_layer_forward_stage(
+    def _execute_layer_forward_stage(self, stage_request, provider_cancel_event):
+        with self._worker_layer_lock():
+            self._check_worker_runtime_stage(stage_request)
+            return self._execute_layer_forward_stage_locked(stage_request, provider_cancel_event)
+
+    def _execute_layer_forward_stage_locked(
         self,
         stage_request,
         provider_cancel_event: threading.Event,
@@ -2820,7 +3169,10 @@ class EngineHost:
         hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
         from model_supply_worker import get_selected_model
 
-        selected = get_selected_model()
+        if getattr(self, "_worker_runtime_managed", False):
+            selected = self._worker_runtime_active.selected
+        else:
+            selected = get_selected_model()
         supplied = selected is not None and selected["manifest"]["format"] == "safetensors"
         if (not supplied or getattr(self, "_supplied_layer_key", None)
                 != self._supplied_layer_selection_key(selected)):
@@ -4106,7 +4458,7 @@ class EngineHost:
         ModelHost 执行锁，等价单机拓扑。）
         """
         with self._host.full_chat_execution_lock:
-            self._unload_supplied_layer_manager()
+            self.release_worker_runtime()
             sched = self._scheduler
             if sched is None:
                 result = change()

@@ -1111,9 +1111,11 @@ def _refresh_pipeline_layer_config() -> None:
 
 
 def _run_exclusive_model_change(
-    change, prepare=None, *, release_worker_reservation: bool = False,
+    change, prepare=None, *, release_worker_reservation: bool = False, retire_worker_runtime: bool = True,
 ):
     """Publish control-plane invalidation only after the model change succeeds."""
+    if release_worker_reservation and retire_worker_runtime:
+        _wait_for_worker_prepare_retirement("local_model_load")
     with model_host.full_chat_execution_lock:
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
@@ -2600,7 +2602,7 @@ class SelectGpuRequest(BaseModel):
 
 
 
-def _unload_model_under_model_lock() -> dict:
+def _unload_model_under_model_lock(*, retire_worker_runtime=True) -> dict:
     """Unload the local LLM without materializing the lazy manager when idle.
 
     Model and SD lifecycles share ``full_chat_execution_lock``. Keeping the
@@ -2623,6 +2625,7 @@ def _unload_model_under_model_lock() -> dict:
     unloaded = _run_exclusive_model_change(
         _change,
         release_worker_reservation=True,
+        retire_worker_runtime=retire_worker_runtime,
     )
     try:
         scheduler.refresh_task_worker_capabilities()
@@ -2674,28 +2677,56 @@ def _sync_local_model_projection() -> None:
             _init_kv_cache()
 
 
+_INFERENCE_MODE_CHANGE_LOCK = threading.Lock()
+
+
+def _wait_for_worker_prepare_retirement(reason_code):
+    """Join physical segment cleanup outside the full-model execution lock."""
+    controller = getattr(scheduler, "_worker_prepare", None)
+    if controller is None:
+        return
+    try:
+        controller.retire_and_join(reason_code, timeout=120)
+    except Exception as exc:
+        raise coded_http_error(409, getattr(exc, "reason_code", "WORKER_RUNTIME_RETIRE_FAILED"), str(exc)) from exc
+
+
 def _set_node_inference_mode(mode: str) -> dict:
     if mode == "distributed" and RUN_MODE != "distributed":
         raise coded_http_error(409, "DISTRIBUTED_RUNTIME_DISABLED", "Restart with QLH_RUN_MODE=distributed first.")
-    if not model_host.full_chat_execution_lock.acquire(blocking=False):
-        raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active inference before switching modes.")
+    if not _INFERENCE_MODE_CHANGE_LOCK.acquire(blocking=False):
+        raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Another mode transition is still retiring its runtime.")
     try:
-        with scheduler._task_worker_stage_lock:
-            if scheduler._task_worker_active_attempts:
-                raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active worker task before switching modes.")
-            previous = _node_inference_mode()
-            if previous == mode:
-                return {"success": True, "mode": mode, "enabled": mode == "distributed", "changed": False}
-            scheduler._distributed_inference_enabled = False
-        scheduler.set_distributed_inference_enabled(False)
-        _unload_model_under_model_lock()
+        if not model_host.full_chat_execution_lock.acquire(blocking=False):
+            raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active inference before switching modes.")
+        try:
+            with scheduler._task_worker_stage_lock:
+                if scheduler._task_worker_active_attempts:
+                    raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active worker task before switching modes.")
+                previous = _node_inference_mode()
+                changed = previous != mode
+                if not changed and mode == "distributed":
+                    return {"success": True, "mode": mode, "enabled": True, "changed": False}
+                scheduler._distributed_inference_enabled = False
+            scheduler.set_distributed_inference_enabled(False)
+            if changed:
+                _unload_model_under_model_lock(retire_worker_runtime=False)
+        finally:
+            model_host.full_chat_execution_lock.release()
+        # Native cleanup needs the same full-chat lock. Joining while holding it
+        # would deadlock; participation stays disabled throughout this wait.
+        _wait_for_worker_prepare_retirement("inference_mode_changed")
         if mode == "distributed":
-            scheduler.set_distributed_inference_enabled(True)
-            scheduler.refresh_task_worker_capabilities()
+            with model_host.full_chat_execution_lock:
+                scheduler.set_distributed_inference_enabled(True)
+                scheduler.refresh_task_worker_capabilities()
         logger.info("event=node_inference_mode_changed previous=%s mode=%s", previous, mode)
-        return {"success": True, "mode": mode, "enabled": mode == "distributed", "changed": True, "loaded": False}
+        result = {"success": True, "mode": mode, "enabled": mode == "distributed", "changed": changed}
+        if changed:
+            result["loaded"] = False
+        return result
     finally:
-        model_host.full_chat_execution_lock.release()
+        _INFERENCE_MODE_CHANGE_LOCK.release()
 
 
 def _chat_origin(req: ChatRequest) -> str:
@@ -3513,12 +3544,7 @@ def _execute_task_worker_stage(
         #   `TaskGraphError: 不支持的 Stage 类型: layer_forward`）。
         #   委托同一份实现；但本函数是**模块级**（没有 `self`），所以用一个模块级缓存实例
         #   承载 keep-head 上游（它本来就按 env 创建一次后复用，重载 500MB GGUF 代价高）。
-        global _LAYER_STAGE_HOST
-        if _LAYER_STAGE_HOST is None:
-            from inference_service.engine_host import EngineHost as _EngineHost
-
-            _LAYER_STAGE_HOST = _EngineHost()
-        return _LAYER_STAGE_HOST._execute_layer_forward_stage(
+        return _get_layer_stage_host()._execute_layer_forward_stage(
             stage_request, provider_cancel_event,
         )
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
@@ -3527,6 +3553,19 @@ def _execute_task_worker_stage(
 #: 模块级缓存：`_execute_task_worker_stage` 是模块级函数（无 `self`），层段 Stage 需要
 #: 一个持有 keep-head 上游的载体。上游按 env 创建一次后复用（重载 500MB GGUF 代价高）。
 _LAYER_STAGE_HOST = None
+_LAYER_STAGE_HOST_LOCK = threading.Lock()
+
+
+def _get_layer_stage_host():
+    global _LAYER_STAGE_HOST
+    with _LAYER_STAGE_HOST_LOCK:
+        if _LAYER_STAGE_HOST is None:
+            from inference_service.engine_host import EngineHost as _EngineHost
+            _LAYER_STAGE_HOST = _EngineHost()
+        return _LAYER_STAGE_HOST
+
+
+scheduler._worker_prepare.configure_runtime(_get_layer_stage_host)
 
 
 def _execute_task_graph_chat_with_slot(

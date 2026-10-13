@@ -241,9 +241,21 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         _api_module.logger.error(f"模型加载失败: {e}", exc_info=True)
         raise _api_module.HTTPException(500, f"模型加载失败: {str(e)}")
 
-async def _prepare_pipeline_model_resolution(resolution):
+async def _prepare_pipeline_model_resolution(resolution, *, operation_id=""):
     resolved_model_path = resolution.model_path
     quant = resolution.quant_type
+    if not operation_id:
+        # Direct prepare of a supplied path keeps the receipt's operation ID.
+        # This also prevents equal-SHA bytes from a previous operation granting
+        # a new generation without a matching selected manifest.
+        worker = getattr(_api_module.scheduler, "_model_supply_worker", None)
+        if worker is not None:
+            from pathlib import Path
+            from model_supply_worker import get_selected_model
+            selected = get_selected_model(worker.root)
+            selected_path = worker.selected_model_path()
+            if selected is not None and selected_path is not None and Path(resolved_model_path).resolve() == Path(selected_path).resolve():
+                operation_id = selected["manifest"]["operation_id"]
     candidate_id = f"modeltxn_{_api_module.uuid.uuid4().hex}"
     candidate_prepared = False
     transaction_started = False
@@ -296,6 +308,7 @@ async def _prepare_pipeline_model_resolution(resolution):
                 quant_type=quant,
                 require_distributed=True,
                 on_commit=_after_commit,
+                operation_id=operation_id,
             )
         )
         if not capacity_plan.get("admitted") or capacity_plan.get(
@@ -343,22 +356,25 @@ async def _prepare_pipeline_model_resolution(resolution):
                 )
         _api_module.logger.error("准备流水线模型失败: %s", exc, exc_info=True)
         error_code = (
-            "MODEL_TXN_CONFLICT"
+            "SUPPLY_PREPARE_CANCELLED"
+            if getattr(exc, "code", "") == "SUPPLY_PREPARE_CANCELLED"
+            else "MODEL_TXN_CONFLICT"
             if "MODEL_TXN_CONFLICT" in str(exc)
             else "MODEL_TXN_PREPARE_FAILED"
         )
-        status_code = 409 if error_code == "MODEL_TXN_CONFLICT" else 400
+        status_code = 409 if error_code in {"MODEL_TXN_CONFLICT", "SUPPLY_PREPARE_CANCELLED"} else 400
         raise _api_module.coded_http_error(
             status_code, error_code, f"准备流水线模型失败: {exc}"
         ) from exc
 
 
 async def prepare_pipeline_model(req: PreparePipelineModelRequest):
-    """Prepare a Qwen/Qwen2 artifact for distributed layer loading only.
+    """Prepare a model's proper segments before publishing pipeline execution.
 
-    This endpoint deliberately does not set ``model_loaded`` and does not
-    instantiate a Transformers model. The first local weight materialization
-    happens only when the scheduler's master assignment is executed.
+    This endpoint never sets ``model_loaded`` or constructs a complete model.
+    The transaction loads the assigned local and remote segments and requires
+    matching native receipts before publication. Chat executes committed
+    runtimes without filling a missing prepare through lazy loading.
 
     ★ 2026-10-11：引擎改为 **auto** —— 此前硬编码 pytorch，导致 GGUF 裁层工件
     （`llama_engine.LlamaCppEngine.prepare_pipeline_model`，契约同样是

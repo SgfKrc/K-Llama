@@ -313,29 +313,30 @@ class LlamaCppEngine:
     def _open_rpc_session(self, *, endpoints, worker_exe, worker_port, worker_threads, worker_log):
         """注册 RPC device（必要时先起本机 worker）；失败即抛，不降级为纯 CPU。"""
         try:
-            from llama_rpc_device import RpcSession
+            from llama_rpc_device import RpcCleanupError, RpcSession
         except ImportError:  # 以包形式导入本模块时（src.llama_engine）
-            from .llama_rpc_device import RpcSession
+            from .llama_rpc_device import RpcCleanupError, RpcSession
 
-        session = RpcSession.open(
-            endpoints=endpoints,
-            autostart_worker=worker_exe,
-            worker_port=worker_port,
-            worker_threads=worker_threads,
-            worker_log=worker_log,
-        )
+        try:
+            session = RpcSession.open(
+                endpoints=endpoints,
+                autostart_worker=worker_exe,
+                worker_port=worker_port,
+                worker_threads=worker_threads,
+                worker_log=worker_log,
+            )
+        except RpcCleanupError as exc:
+            self._rpc_session = exc.cleanup_owner
+            raise
         injected = [f"{dev.name}@{dev.endpoint}" for dev in session.injector.devices]
         logger.info(f"RPC device 已注入: {injected}")
         return session
 
     def _close_rpc_session(self) -> None:
         session = self._rpc_session
-        self._rpc_session = None
         if session is not None:
-            try:
-                session.close()
-            except Exception:
-                logger.debug("RPC session close failed", exc_info=True)
+            session.close()
+            self._rpc_session = None
 
     # ================================================================
     # 流水线模型描述器
@@ -621,7 +622,8 @@ class LlamaCppEngine:
                 raise ValueError(
                     "GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明"
                 )
-        if self.is_loaded or self._mtmd_context is not None:
+        if (self._model is not None or self._mtmd_context is not None
+                or self._rpc_session is not None or getattr(self, "_keep_head", None) is not None):
             self.unload()
         self._model_path = resolved_path
         self.active_model_id = str(model_id or "")
@@ -886,7 +888,8 @@ class LlamaCppEngine:
         elif embedding_dimension is not None or embedding_model_id is not None:
             raise ValueError("embedding identity requires embedding=True")
 
-        if self.is_loaded or self._mtmd_context is not None:
+        if (self._model is not None or self._mtmd_context is not None
+                or self._rpc_session is not None or getattr(self, "_keep_head", None) is not None):
             self.unload()
         self._pipeline_distributed_only = False
         self._model_path = model_path
@@ -1027,17 +1030,9 @@ class LlamaCppEngine:
             )
         except Exception as e:
             logger.error(f"GGUF 模型加载失败: {e}")
-            self._free_mtmd_context()
-            self._close_rpc_session()
-            model = self._model
-            self._model = None
-            close = getattr(model, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("GGUF model release after load failure failed", exc_info=True)
-            self._loaded = False
+            # Use the same ownership-preserving path as explicit unload:
+            # tensors must close before their RPC device/process retires.
+            self.unload()
             raise
 
     @staticmethod
@@ -1352,16 +1347,20 @@ class LlamaCppEngine:
 
     def unload(self) -> None:
         """卸载模型，释放内存。"""
+        upstream = getattr(self, "_keep_head", None)
+        if upstream is not None:
+            # Keep ownership until physical retirement succeeds. This runner
+            # holds segment weights independently of the in-process binding.
+            upstream.close()
+            self._keep_head = None
+        self._keep_head_key = None
         self._free_mtmd_context()
         # 顺序：先释放模型（其张量还在 RPC device 上），再撤 device/worker
         model = self._model
-        self._model = None
         close = getattr(model, "close", None)
         if callable(close):
-            try:
-                close()
-            except Exception:
-                logger.debug("GGUF model release failed", exc_info=True)
+            close()
+        self._model = None
         self._close_rpc_session()
         self._loaded = False
         self._embedding_enabled = False
@@ -2277,10 +2276,7 @@ class LlamaCppEngine:
 
         old = getattr(self, "_keep_head", None)
         if old is not None:
-            try:
-                old.close()
-            except Exception:  # noqa: BLE001 - 旧实例释放失败不影响新实例
-                logger.debug("keep-head 上游释放失败", exc_info=True)
+            old.close()
         self._keep_head = None
         self._keep_head_key = key
 
@@ -2310,7 +2306,7 @@ class LlamaCppEngine:
         #   ⇒ 判据已过时（会**误拒** qwen3.5 的 llama 上游），故移除。
         #   详见 `docs/已知问题记录.md` #54 与 `docs/真三机产品路径攻坚-2026-10-07.md` §4.2。
         try:
-            from llama_keep_head import KeepHeadUpstream
+            from llama_keep_head import KeepHeadCleanupError, KeepHeadUpstream
 
             # 不用 `layer_inp`：shim 把它限制为 `cut_layer < n_layer`
             # （scripts/model_tools/keep_head_shim/qlh_keep_head.c:111），取不到
@@ -2328,6 +2324,10 @@ class LlamaCppEngine:
                     512,
                     int(os.environ.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
                 ))
+        except KeepHeadCleanupError as exc:
+            self._keep_head = exc.cleanup_owner
+            self._keep_head_key = None
+            raise
         except Exception:  # noqa: BLE001 - 语义不兼容时由调用方 fail-closed
             logger.warning(
                 "keep-head 上游构造失败；层接力将 fail-closed，不交付 embeddings hidden "

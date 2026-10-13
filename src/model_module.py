@@ -1372,6 +1372,15 @@ class ModelManager:
         """
         logger.info(f"卸载模型: {self._active_model_id} (引擎={self._engine_type})")
 
+        # --- llama.cpp 引擎清理 ---
+        # Release native owners before clearing their state projection. A
+        # failed close must retain the engine and remain retryable by callers.
+        if self._llama_engine is not None:
+            close = getattr(self._llama_engine, "close", None) or getattr(self._llama_engine, "unload", None)
+            if callable(close):
+                close()
+            self._llama_engine = None
+
         # --- PyTorch 引擎清理 ---
         if self.model is not None:
             self.model = None
@@ -1393,17 +1402,6 @@ class ModelManager:
         self._full_model_quant_type = None
         self._load_fingerprint = None
         self._load_fingerprint_sha256 = ""
-
-        # --- llama.cpp 引擎清理 ---
-        if self._llama_engine is not None:
-            try:
-                if hasattr(self._llama_engine, 'close'):
-                    self._llama_engine.close()
-                elif hasattr(self._llama_engine, 'unload'):
-                    self._llama_engine.unload()
-            except Exception:
-                pass
-            self._llama_engine = None
 
         # --- 孤岛引擎清理（断开 HTTP 客户端）---
         if self._island_engine is not None:

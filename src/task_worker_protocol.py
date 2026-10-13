@@ -114,7 +114,7 @@ _LAYER_FORWARD_OFFER_FIELDS = {
 #: ⚠️ **不能**并入 `_LAYER_FORWARD_OFFER_FIELDS`：那里的字段集合是**精确**校验（缺失即
 #: `field_mismatch`）⇒ 会把可选字段变成必填、破坏既有对端（实测踩到）。可选字段在
 #: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
-_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
+_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions", "prepare_identity"}
 
 # Request deadlines are request-scoped and must not be encoded as worker
 # ownership leases. The field is optional so peers without an end-to-end
@@ -1138,6 +1138,12 @@ def _validate_payload(
                 )
             # ★ 2026-09-23：`middle_channel` 可选；一旦出现必须落在允许集合内（fail-closed）。
             #   字段不存在 = `extract_hidden`（旧行为），因此不破坏既有对端。
+            if "prepare_identity" in payload:
+                from worker_prepare_contract import validate_stage_identity, WorkerPrepareError
+                try:
+                    validate_stage_identity(payload["prepare_identity"])
+                except WorkerPrepareError as exc:
+                    raise _error(exc.reason_code, "payload.prepare_identity", str(exc)) from exc
             if "middle_channel" in payload:
                 channel = _require_string(
                     payload["middle_channel"], "payload.middle_channel",

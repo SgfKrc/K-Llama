@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import hashlib
 import hmac
 import json
+import logging
 import math
 import re
 import secrets
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Any
 
 from pipeline_capacity import solve_pipeline_capacity
+
+logger = logging.getLogger(__name__)
 
 
 class ModelSupplyError(ValueError):
@@ -34,11 +37,42 @@ def _digest(value: Any) -> str:
                                     separators=(",", ":")).encode()).hexdigest()
 
 
+
+def _segment_disk_weight_bytes(descriptor: dict, assignment: dict, source_path: Path | None = None) -> int:
+    """Charge source bytes selected by the format's segment builder exactly once.
+
+    ``components.layers`` is the complete decoder aggregate, already represented
+    by the per-layer slice. Safetensors excludes visual/MTP/multimodal weights
+    and selects boundaries with the same head/tail rules as _selected_keys.
+    GGUF uses the builder's header-only tensor selection, retaining non-block
+    tensors while excluding decoder-external MTP blocks. Builder checks still
+    account for support files and headers before writing.
+    """
+    start, end = assignment["start_layer"], assignment["end_layer"]
+    components = descriptor.get("component_weight_bytes") or {}
+    if assignment["engine"] == "llama_cpp":
+        from model_supply_assets import gguf_segment_disk_weight_bytes
+        if source_path is None:
+            raise ModelSupplyError("SUPPLY_SOURCE_MISSING", "GGUF disk budget requires its source header")
+        return gguf_segment_disk_weight_bytes(source_path, start, end)
+    else:
+        tail = end == descriptor["total_layers"]
+        keys = ["final_norm"]
+        if start == 0 or (tail and descriptor.get("tie_word_embeddings") is True):
+            keys.append("embedding")
+        if tail:
+            keys.extend(("lm_head", "other"))
+    return sum(descriptor["layer_weight_bytes"][start:end]) + sum(
+        int(components.get(key, 0)) for key in keys
+    )
+
+
 def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                         master_engine: str, alignment: int = 1,
                         safety_margin: float = 1.2,
                         runtime_descriptors: dict[str, dict] | None = None,
-                        preferred_ranges: dict[str, list[list[int]]] | None = None) -> dict:
+                        preferred_ranges: dict[str, list[list[int]]] | None = None,
+                        runtime_host_ranges: dict[str, list[list[int]]] | None = None) -> dict:
     """Reuse capacity admission while planning missing, not just existing, assets.
 
     GGUF segments retain non-block tensors. Charge those tensors on *each* GGUF
@@ -93,6 +127,19 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                            for span in wanted_ranges)):
                 raise ModelSupplyError("SUPPLY_PREFERRED_RANGE_INVALID", "Invalid reusable segment preference")
             node["layer_ranges"] = [[span[0] // alignment, span[1] // alignment] for span in wanted_ranges]
+        host_ranges = (runtime_host_ranges or {}).get(node_id)
+        if host_ranges is not None:
+            if (not isinstance(host_ranges, list)
+                    or any(not isinstance(span, list) or len(span) != 2
+                           or any(type(value) is not int for value in span)
+                           or not 0 <= span[0] < span[1] <= total
+                           or span[1] - span[0] == total
+                           or span[0] % alignment or span[1] % alignment for span in host_ranges)):
+                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_BUDGET_INVALID", "Invalid source staging ranges")
+            admitted_ranges = [[span[0] // alignment, span[1] // alignment] for span in host_ranges]
+            if "layer_ranges" in node:
+                admitted_ranges = [span for span in admitted_ranges if span in node["layer_ranges"]]
+            node["layer_ranges"] = admitted_ranges
         node["role"] = "master" if node_id == "master" else "client"
         node["reserve_bytes"] = int(node.get("reserve_bytes", 0)) + math.ceil(overhead * multiplier * safety_margin)
         node["runtime_multiplier"] = multiplier * max(a / b for a, b in zip(sizes, group_sizes))
@@ -144,6 +191,7 @@ class ModelSupplyCoordinator:
         self._connections: dict[tuple[str, str], object] = {}
         self._active = ""
         self._preparing = ""
+        self._prepare_cancelled = False
 
     @property
     def root(self) -> Path:
@@ -250,21 +298,31 @@ class ModelSupplyCoordinator:
             raise ModelSupplyError("SUPPLY_OPERATION_STALE", "Supply operation was superseded")
 
     def cancel(self, op_id):
+        # Verified assets stay available on disk. Cancellation still fences the
+        # pending prepare, including the interval before its transaction exists.
         with self._condition:
             op = self._operations.get(op_id)
             if not op:
                 raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
-            if op["status"] in self.TERMINAL:
-                return copy.deepcopy(op)
-            self._events[op_id].set()
-            op.update(status="cancelled", reason_code="SUPPLY_CANCELLED", updated_at=time.time())
-            self._persist(op)
-            for key in list(self._leases):
-                if key[0] == op_id:
-                    self._leases.pop(key, None)
-            self._condition.notify_all()
-        self._cancel_receivers(op_id, list(op["nodes"]))
-        return self.get(op_id)
+            if self._preparing == op_id:
+                self._prepare_cancelled = True
+            terminal = op["status"] in self.TERMINAL
+            if not terminal:
+                self._events[op_id].set()
+                op.update(status="cancelled", reason_code="SUPPLY_CANCELLED", updated_at=time.time())
+                self._persist(op)
+                for key in list(self._leases):
+                    if key[0] == op_id:
+                        self._leases.pop(key, None)
+                self._condition.notify_all()
+            result = copy.deepcopy(op)
+        # Do not hold the supply condition while acquiring the transaction lock.
+        cancel_prepare = getattr(self.scheduler, "cancel_worker_prepare_operation", None)
+        if callable(cancel_prepare):
+            cancel_prepare(op_id)
+        if not terminal:
+            self._cancel_receivers(op_id, list(result["nodes"]))
+        return result
 
     def _cancel_receivers(self, op_id, node_ids):
         self.scheduler._model_supply_worker.cancel(op_id)
@@ -537,14 +595,29 @@ class ModelSupplyCoordinator:
                 base.update(capacity_bytes=available, execution_device=device, runtime_multiplier=1.0,
                             capacity_source="supply.cuda.mem_get_info" if device == "cuda" else "supply.ram.available_bytes_live")
             base["engine"] = engine
+            logger.info("event=supply_runtime_budget operation=%s node=%s engine=%s device=%s capacity_bytes=%s reserve_bytes=%s multiplier=%s score=%s",
+                        op_id, node_id, engine, base.get("execution_device"), base.get("capacity_bytes"),
+                        base.get("reserve_bytes"), base.get("runtime_multiplier"), base.get("score"))
             records.append(base)
         from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
+        from model_supply_host_capacity import allowed_host_layer_ranges
+        runtime_host_ranges = {}
+        for node_id, projection in runtime_host_descriptors.items():
+            runtime_host_ranges[node_id] = allowed_host_layer_ranges(
+                projection, node_id=node_id,
+                available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+            )
+            if not runtime_host_ranges[node_id]:
+                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage a proper source segment in RAM")
         from model_supply_plan_reuse import plan_segment_supply_reuse
         def capacity_plan(*, preferred_ranges):
             return plan_segment_supply(sources["descriptors"], records,
                 master_engine=sources["master_engine"], alignment=sources["alignment"],
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
-                runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges)
+                runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
+                runtime_host_ranges=runtime_host_ranges)
         plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
             planner=capacity_plan, source_model_id=sources["source_model_id"],
             source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
@@ -582,8 +655,7 @@ class ModelSupplyCoordinator:
             # Disk budget covers the temporary segment + final publish. Source
             # is already on disk; a missing source is never assumed free.
             disk_descriptor = sources["descriptors"][assignment["engine"]]
-            estimated = sum(disk_descriptor["layer_weight_bytes"][assignment["start_layer"]:assignment["end_layer"]])
-            estimated += sum(int(value) for value in disk_descriptor.get("component_weight_bytes", {}).values())
+            estimated = _segment_disk_weight_bytes(disk_descriptor, assignment, src)
             free = shutil.disk_usage(directory).free
             if free < max(estimated * 2, 64 * 1024**2):
                 raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
@@ -659,6 +731,7 @@ class ModelSupplyCoordinator:
             if self._preparing:
                 raise ModelSupplyError("SUPPLY_PREPARE_BUSY", "Another supplied model preparation is entering its transaction")
             self._preparing = op_id
+            self._prepare_cancelled = False
         try:
             source = self.prepared_source(op_id)
             yield source
@@ -666,6 +739,12 @@ class ModelSupplyCoordinator:
             with self._condition:
                 if self._preparing == op_id:
                     self._preparing = ""
+                    self._prepare_cancelled = False
+
+    def ensure_prepare_not_cancelled(self, op_id):
+        with self._condition:
+            if self._preparing == op_id and self._prepare_cancelled:
+                raise ModelSupplyError("SUPPLY_PREPARE_CANCELLED", "Model preparation cancelled by user")
 
     def prepared_source(self, op_id) -> dict:
         self._check_master()

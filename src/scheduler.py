@@ -965,6 +965,11 @@ class Scheduler(
     - 流水线请求队列（PipelineQueue）
     """
 
+    def set_distributed_inference_enabled(self, enabled: bool) -> dict:
+        if not enabled:
+            self._cleanup_task_worker_prepare("local_inference_mode")
+        return super().set_distributed_inference_enabled(enabled)
+
     def _scheduler_facade_global(self, name: str):
         return globals()[name]
 
@@ -1012,6 +1017,8 @@ class Scheduler(
         from model_supply import ModelSupplyCoordinator
         from model_supply_worker import ModelSupplyWorker
         self._model_supply_worker = ModelSupplyWorker(self)
+        from worker_prepare import WorkerPrepareController
+        self._worker_prepare = WorkerPrepareController(self)
         self._model_supply = ModelSupplyCoordinator(self)
 
         # 从节点：等待主节点推理结果
@@ -1041,7 +1048,7 @@ class Scheduler(
         # ASSIGN-SOURCE-01: active wire contract, receipt and lifecycle live in
         # one registry. `_layer_config_pushed` remains a derived property.
         self._worker_assignments = WorkerAssignmentRegistry()
-        self._layer_config_lock = threading.Lock()
+        self._layer_config_lock = threading.RLock()
         self._layer_config_push_lock = threading.Lock()
         # Model transitions temporarily invalidate the local descriptor. Do
         # not publish a transient release from concurrent status callbacks.
@@ -1235,6 +1242,7 @@ class Scheduler(
                 return
             self._running = True
         try:
+            self._worker_prepare.reopen()
             self._start_impl(host=host, port=port)
         except Exception:
             try:
@@ -1528,6 +1536,7 @@ class Scheduler(
 
     def stop(self) -> None:
         """停止调度器"""
+        self._cleanup_task_worker_prepare("worker_prepare_stopped", close=True)
         self._startup_cancel_event.set()
         self._running = False
         runtime = getattr(self, "_auto_role_runtime", None)
@@ -4236,6 +4245,14 @@ class Scheduler(
                         client_id, exc,
                     )
 
+        elif msg_type == "model_prepare":
+            payload = msg.get("data")
+            if isinstance(payload, dict):
+                if self._effective_role() == "master":
+                    self._handle_worker_prepare_ack(client_id, payload)
+                elif client_id == "master":
+                    self._worker_prepare.handle(payload, self._tcp_client)
+
         elif msg_type == "model_supply":
             payload = msg.get("data")
             if isinstance(payload, dict):
@@ -4564,6 +4581,7 @@ class Scheduler(
         """TCP 断连回调（由 TCPServer 调用）"""
         abort_details = None
         qwen3_disconnect = None
+        retirement_records = []
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
             cleanup_changed = False
@@ -4619,6 +4637,17 @@ class Scheduler(
             ):
                 self._active_pipeline_capacity_plan = None
                 if transaction and abort_details is None:
+                    transaction["published"] = bool(transaction.get("published") or transaction.get("phase") == "ready")
+                    if transaction["published"]:
+                        for node, expected in transaction.get("expected", {}).items():
+                            identity = expected.get("worker_prepare_identity")
+                            if isinstance(identity, dict):
+                                retirement_records.append(self._record_pipeline_model_cleanup_locked(
+                                    node_id=node, candidate_config_id=identity["config_id"],
+                                    generation=self._layer_config_generation, action="release",
+                                    assignment_id=identity["assignment_id"],
+                                    payload={"worker_prepare_identity": identity, "release": True},
+                                ))
                     transaction["phase"] = "invalidated"
                     transaction["reason_code"] = "pipeline_worker_disconnected"
                     transaction["reason"] = (
@@ -4638,6 +4667,11 @@ class Scheduler(
                     )
         if abort_details is not None:
             self._abort_pipeline_load_transaction(*abort_details)
+        if retirement_records:
+            with self._layer_config_lock:
+                self._persist_pipeline_lifecycle_locked()
+            for record in retirement_records:
+                self._dispatch_pipeline_model_cleanup(record)
         # A disconnected socket can no longer satisfy the assignment that was
         # registered for it.  Drop that per-node expectation before the
         # reconnect callback publishes a fresh generation; otherwise an old
@@ -4718,6 +4752,7 @@ class Scheduler(
             logger.debug("忽略旧主节点连接的迟到断连回调")
             return
 
+        self._cleanup_task_worker_prepare("coordinator_disconnected", client=source_client)
         self._task_worker_control.disconnect_coordinator()
         with self._task_worker_stage_lock:
             for active in self._task_worker_active_attempts.values():
