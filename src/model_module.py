@@ -933,10 +933,16 @@ class ModelManager:
             else runtime_requested
         )
 
+        # ⚠️ 不要用 `torch.cuda.is_available()`：本仓 `.venv-test` 装的是 **CPU-only
+        #   torch（2.13.0+cpu）**，于是明明有 RTX 4060 也返回 False ⇒ `auto` 会错选
+        #   llama_cpp（本该按双档策略选 pytorch）。改用硬件级探测（nvidia-smi 优先），
+        #   与 `inference_path_selector.detect_cuda_available()` 同源。
+        from inference_path_selector import detect_cuda_available
+
         selected = select_backend(
             profile,
             requested=requested,
-            cuda_available=torch.cuda.is_available(),
+            cuda_available=detect_cuda_available(),
             island_enabled=bool(getattr(_cfg, "ISLAND_ENABLED", False)),
             island_base_url=str(getattr(_cfg, "ISLAND_BASE_URL", "") or ""),
         )

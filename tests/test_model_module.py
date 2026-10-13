@@ -2129,7 +2129,10 @@ class TestSelectEngine:
         """CUDA 可用 + auto 模式 → pytorch"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        # ⚠️ CUDA 判据已改为硬件级探测（nvidia-smi 优先）——本仓 .venv-test 是
+        # CPU-only torch，patch `torch.cuda.is_available` 已经不管用了（实测：
+        # 有 RTX 4060 也返回 False，auto 会错选 llama_cpp）。patch 点在这里：
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: True)
         result = ModelManager.select_engine()
         assert result == "pytorch"
 
@@ -2137,7 +2140,7 @@ class TestSelectEngine:
         """无 CUDA + auto 模式 → llama_cpp"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: False)
         result = ModelManager.select_engine()
         assert result == "llama_cpp"
 
@@ -2145,7 +2148,7 @@ class TestSelectEngine:
         """edge 档位 + 无 CUDA → llama_cpp"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: False)
         profile = {"tier": "edge", "gpus": []}
         result = ModelManager.select_engine(profile)
         assert result == "llama_cpp"
@@ -2154,10 +2157,23 @@ class TestSelectEngine:
         """mobile 档位 + 无 CUDA → llama_cpp"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: False)
         profile = {"tier": "mobile", "gpus": []}
         result = ModelManager.select_engine(profile)
         assert result == "llama_cpp"
+
+    def test_select_engine_uses_hardware_cuda_probe_not_torch(self, monkeypatch):
+        """防回归：CUDA 判据必须走硬件级探测，而不是 torch.cuda.is_available。
+
+        本仓 `.venv-test` 装的是 CPU-only torch（2.13.0+cpu），有 RTX 4060 也返回
+        False；若有人把判据改回去，`auto` 会在有 GPU 的机器上错选 llama_cpp。这里
+        故意把 torch 反着设成 False，逼 `select_engine` 只能靠硬件探测才能选对。
+        """
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert ModelManager.select_engine() == "pytorch"
 
     def test_laptop_tier_with_cuda_gpu_selects_pytorch(self, monkeypatch):
         """laptop 档位 + CUDA GPU → pytorch"""
