@@ -2580,11 +2580,30 @@ class ModelManager:
             elif tier == "ultrabook":
                 n_ctx = 2048
 
-        self._llama_engine = LlamaCppEngine()
-        self._llama_engine.load_model(
-            model_path=gguf_path,
-            n_ctx=n_ctx,
+        # ★ 票 15a/15b 接线：整模 GGUF 走「绑定」还是「llama-server 子进程」，由
+        #   `select_inference_path` 决定（默认 binding ⇒ 既有行为不变）。
+        #   选择器内含两条硬规矩：层段接力强制绑定；显式请求 server 而无 CUDA 时
+        #   具名报错（绝不静默降级）。
+        import config as _cfg
+        from inference_path_selector import BINDING, SERVER, select_inference_path
+
+        decision = select_inference_path(
+            requested=str(getattr(_cfg, "INFER_PATH", BINDING) or BINDING),
         )
+        if decision.path == SERVER:
+            from llama_server_engine import LlamaServerEngine
+
+            logger.info("推理路径 ⇒ llama-server 子进程（%s）", decision.reason)
+            self._llama_engine = LlamaServerEngine(
+                cuda_available=bool(torch.cuda.is_available()),
+            )
+            self._llama_engine.load_model(model_path=gguf_path, n_ctx=n_ctx)
+        else:
+            self._llama_engine = LlamaCppEngine()
+            self._llama_engine.load_model(
+                model_path=gguf_path,
+                n_ctx=n_ctx,
+            )
         self._model_path = gguf_path
 
         logger.info("✅ llama.cpp 引擎就绪 (CPU/集显 优化)")

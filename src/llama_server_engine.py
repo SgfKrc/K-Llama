@@ -166,6 +166,10 @@ class LlamaServerEngine:
         if server is not None:
             server.stop()
 
+    def close(self) -> None:
+        """与 `LlamaCppEngine.close()` 对齐的别名（ModelManager 会调用它）。"""
+        self.unload()
+
     # --------------------------------------------------------------- 委托面
     def chat(self, *args: Any, **kwargs: Any) -> dict:
         if self._client is None:

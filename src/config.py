@@ -369,6 +369,12 @@ NGRAM_SPEC_NUM_PRED = _env_int("QLH_NGRAM_SPEC_NUM_PRED", 10, min_val=1, max_val
 # `llama_server_engine.default_server_exe()` 在 `runtime/llama-cpp/<build>/` 下自动挑选。
 LLAMA_SERVER_EXE = _env_first("QLH_LLAMA_SERVER_EXE", default="")
 
+# --- 整模推理路径选择（票 15a/15b 接线）---
+# 取值 = `src/inference_path_selector.py` 的 AUTO / SERVER / BINDING。
+# **默认 binding，保持既有行为不变**：切到 server 是显式选择，不由 auto 悄悄改默认
+# （auto 在 select_backend 里代表的是 pytorch/llama_cpp 档位，不是本子域）。
+INFER_PATH = _env_first("QLH_INFER_PATH", default="llama_cpp_binding")
+
 # --- 多模型实验支持 (P3) ---
 # ★ 2026-09-19：`qwen-1_8b` 已退役并从内置列表移除 ⇒ 活跃模型 ID 同步为默认模型
 #   （须与 `model_config.DEFAULT_MODEL_ID` 保持一致）。
