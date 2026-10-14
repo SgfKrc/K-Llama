@@ -1,0 +1,78 @@
+# 核心测试门（CI 兜底）
+#
+# ## 为什么单独一个 workflow
+#
+# `checks.yml`（文档门）与 `relay-gates.yml`（合成 self-check）都是**秒级、零依赖**的静态兜底。
+# 核心 pytest 要安装 `requirements-test.txt`（torch / transformers / llama-cpp-python）并跑分钟级，
+# 混进文档门会把它从秒级拖成分钟级，失去"改一行文案也能立刻拿到反馈"的用途。
+# 因此这里单独一个 job：文档门保持秒级，测试门负责真实回归。
+#
+# ## 与 pre-push 的分工
+#
+# `.githooks/pre-push` 只跑 `scripts/run_doc_checks.py`（本地秒级拦截），完整 pytest 不在推送
+# 路径上阻塞，由本 workflow 兜底。
+#
+# ## 跑法直接复用 `scripts/run_test_channels.py`
+#
+# 通道划分与"重档/真机不进并行段"的判据由该脚本单点定义，本 workflow 不重复维护一份 `-m` 表达式：
+# `unit`（并行，排除 external / requires_db / real_model / slow / requires_gpu）
+# → `external`（串行 `-n 0`）。
+# `--allow-system-python` 是脚本为"一次性 CI 镜像"预留的开关，这里正是它的用途。
+#
+# ## 与票 13 三条要求的对应
+#
+# - 第一条（普通 CI 至少运行核心 pytest 和文档检查）：本 job 跑 `unit` + `external` 两个通道，
+#   覆盖除 `smoke` 外的全部用例，满足"至少核心"的下界（文档检查由 `checks.yml` 承担）。
+# - 第三条（物理设备 opt-in、skip 不计作 passed）：
+#   `smoke` 通道由 `QLH_RUN_REAL_MODEL_SMOKE` 显式开启，未开启时脚本把
+#   `smoke.ran=false` 与原因写进 `manifest.json` ⇒ "没跑"不会被误读成"通过"；
+#   摘要步骤从 JUnit XML 分别读出 passed / skipped / failed，**skipped 单列**，不计入 passed。
+name: core-tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 测试不需要 LFS 大文件；缺工件型用例自行 skip
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+
+      - name: Run test channels（unit -> external）
+        run: |
+          python scripts/run_test_channels.py \
+            --channel all \
+            --workers 4 \
+            --allow-system-python \
+            --artifacts-dir build/ci-test-artifacts
+
+      - name: Summarize channels（skip 不计作 passed）
+        if: always()
+        run: python scripts/summarize_test_channels.py --artifacts-dir build/ci-test-artifacts
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-test-artifacts
+          path: build/ci-test-artifacts
+          if-no-files-found: warn

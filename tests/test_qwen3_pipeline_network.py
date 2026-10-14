@@ -13,6 +13,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
+# ★ 本文件起真实 socket 与子进程（进程目标链 / 副作用释放），并行跑会与其它用例抢
+#   端口和进程资源：`-n 4` 全量下实测偶发失败，而单跑与 `-n 4` 单文件各 3 次均通过。
+#   按 `pytest.ini` 中 `external` 的既有语义（"run serially"），整文件交给
+#   `scripts/run_test_channels.py` 的串行 external 段，不进 unit 并行段。
+pytestmark = pytest.mark.external
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 

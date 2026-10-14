@@ -219,6 +219,7 @@ scripts/*
 !scripts/run_simulation.py
 !scripts/startup_matrix.py
 !scripts/test_classification_report.py
+!scripts/summarize_test_channels.py
 !scripts/edge_sim_setup.sh
 !scripts/cut_layers.py
 !scripts/quantize_model.py
