@@ -82,6 +82,7 @@ models/qwen-1_8b-chat/
 models/deepseek-*/
 models/sd15-*/
 models/qwen3-*/
+models/qwen36-*/
 models/gemma4-*/
 models/Qwen-*/
 .hf-cache/
