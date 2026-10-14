@@ -196,6 +196,7 @@ scripts/*
 !scripts/cut_layers_pipeline.py
 !scripts/model_tools.py
 !scripts/android_validation.py
+!scripts/edge_bench.py
 !scripts/edge_preflight.py
 !scripts/experiment_core/
 !scripts/experiment_gemma_judge_real.py
