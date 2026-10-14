@@ -99,11 +99,21 @@ def _bench_one(model_path: Path, *, n_ctx: int, n_threads: int, n_layers: int,
                gen: int, warmup: int, prompt_tokens: int) -> dict:
     from llama_cpp import Llama
 
-    base = "The quick brown fox jumps over the lazy dog. "
-    prompt = base * max(4, prompt_tokens // 10)
+    base = "The quick brown fox jumps over the lazy dog. "  # ≈10 token/句
+    # ★ 关键口径修正（2026-10-14）：
+    #   ① prompt 必须**真正**达到目标长度，否则「n_ctx 扫描」名不副实 —— 实测踩过：
+    #      prompt 只有 ~40 token 时，n_ctx=2048 反而比 512 快，因为被测的只是 KV 分配量；
+    #   ② prompt 长度必须**随该档 n_ctx 自适应**（否则 n_ctx=512 会报
+    #      `Requested tokens (1501) exceed context window of 512`）。
+    budget = max(64, int(n_ctx) - int(gen) - 16)
+    target = min(int(prompt_tokens), budget)
+    repeats = max(4, (target + 9) // 10)
+    prompt = base * repeats
 
     llm = Llama(model_path=str(model_path), n_ctx=n_ctx, n_batch=512,
                 n_threads=n_threads, seed=1234, verbose=False)
+    # 记录**实际** prompt token 数（口径透明，避免再次误读）
+    actual_prompt_tokens = len(llm.tokenize(prompt.encode("utf-8"), add_bos=True, special=True))
     for _ in range(max(0, warmup)):
         llm(prompt, max_tokens=2, temperature=0.0)
 
@@ -121,6 +131,7 @@ def _bench_one(model_path: Path, *, n_ctx: int, n_threads: int, n_layers: int,
     return {
         "n_ctx": n_ctx,
         "n_threads": n_threads,
+        "prompt_tokens_actual": actual_prompt_tokens,
         "decode_ms_per_token": round(ms_per_token, 3),
         "decode_tokens_per_s": round(1000.0 / ms_per_token, 3) if ms_per_token else None,
         "ms_per_layer": round(ms_per_token / n_layers, 3) if n_layers else None,
