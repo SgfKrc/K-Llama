@@ -89,7 +89,13 @@ def summarize(artifacts_dir: Path) -> tuple[int, dict[str, object]]:
     smoke = manifest.get("smoke") or {}
     print("[smoke] requested=%s ran=%s reason=%s"
           % (smoke.get("requested"), smoke.get("ran"), smoke.get("reason")))
-    print("[note] skipped 单列且不计作 passed；物理设备档为显式 opt-in（smoke.ran=false 不等于通过）")
+    physical = manifest.get("physical") or {}
+    print("[physical] opt_in_env=%s ran=%s reason=%s covers=%s"
+          % (physical.get("opt_in_env"), physical.get("ran"), physical.get("reason"),
+             physical.get("covers_markers")))
+    if physical:
+        print("[physical] external 段 -m = %s" % physical.get("external_marker_expression"))
+    print("[note] skipped 单列且不计作 passed；物理设备档为显式 opt-in（physical.ran=false 不等于通过）")
 
     result: dict[str, object] = {
         "artifacts_dir": str(artifacts_dir),
@@ -98,6 +104,7 @@ def summarize(artifacts_dir: Path) -> tuple[int, dict[str, object]]:
         "workers": manifest.get("workers"),
         "dist": manifest.get("dist"),
         "smoke": smoke,
+        "physical": physical,
         "runs": runs,
         "failed_channels": failed_channels,
     }

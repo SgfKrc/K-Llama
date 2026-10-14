@@ -24,9 +24,11 @@
 # - 第一条（普通 CI 至少运行核心 pytest 和文档检查）：本 job 跑 `unit` + `external` 两个通道，
 #   覆盖除 `smoke` 外的全部用例，满足"至少核心"的下界（文档检查由 `checks.yml` 承担）。
 # - 第三条（物理设备 opt-in、skip 不计作 passed）：
-#   `smoke` 通道由 `QLH_RUN_REAL_MODEL_SMOKE` 显式开启，未开启时脚本把
-#   `smoke.ran=false` 与原因写进 `manifest.json` ⇒ "没跑"不会被误读成"通过"；
-#   摘要步骤从 JUnit XML 分别读出 passed / skipped / failed，**skipped 单列**，不计入 passed。
+#   物理设备/重档用例（`real_model` / `requires_gpu` / `slow` / `requires_db`）由
+#   `QLH_RUN_PHYSICAL_TESTS` 显式开启才收集，本 job **不开启** ⇒ CI 不会以 skip 的形式
+#   把"没跑"混进结果；`manifest.json` 的 `physical` 字段记录 `ran=false` 与原因，
+#   `smoke` 字段同理。摘要步骤从 JUnit XML 分别读出 passed / skipped / failed，
+#   **skipped 单列**，不计入 passed。
 name: core-tests
 
 on:

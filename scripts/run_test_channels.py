@@ -1,10 +1,16 @@
 """Run the parallel, external-resource, and real-model test channels.
 
 通道：`unit`（并行，排除重资源标记）→ `external`（串行）→ `smoke`
-（`real_model`，串行加载真实权重，**opt-in**：需 `QLH_RUN_REAL_MODEL_SMOKE=1`）。
+（`real_model`，串行加载真实权重）。
+
+**物理设备 / 重档用例是显式 opt-in**（票 13 第三条）：`real_model`、`requires_gpu`、`slow`、
+`requires_db` 只有在 `QLH_RUN_PHYSICAL_TESTS=1` 时才被收集（`QLH_RUN_REAL_MODEL_SMOKE=1`
+保留为向后兼容的等价开关）。未开启时它们**不进入收集**，而不是"跑了再 skip" —— 后者在有
+GPU 的机器上会真的跑起来，等于隐式 opt-in。
 
 `--channel all` 会按上述顺序跑；smoke 未开启时**不影响退出码**，但跳过状态会写进
-`manifest.json` 的 `smoke` 字段 —— 避免"全绿"被误读成"real_model 也验过了"。
+`manifest.json` 的 `smoke` 字段、opt-in 状态写进 `physical` 字段 —— 避免"全绿"被误读成
+"real_model 也验过了"。
 """
 
 from __future__ import annotations
@@ -36,6 +42,39 @@ def _write_console(text: str) -> None:
     else:
         sys.stdout.write(encoded.decode(encoding, errors="replace"))
         sys.stdout.flush()
+
+
+#: 物理设备 / 重档用例的显式 opt-in 开关（票 13 第三条）。
+#:
+#: 未开启时这些用例**不被收集**，而不是"先尝试跑、依赖缺失再 skip" —— 后者在有 GPU 的
+#: 机器上会真的跑起来，等于隐式 opt-in。`QLH_RUN_REAL_MODEL_SMOKE` 保留为向后兼容的
+#: 等价开关（它此前只覆盖 `real_model`）。
+PHYSICAL_OPT_IN_ENV = "QLH_RUN_PHYSICAL_TESTS"
+LEGACY_SMOKE_ENV = "QLH_RUN_REAL_MODEL_SMOKE"
+#: 需要显式 opt-in 才收集的标记集合。
+PHYSICAL_MARKERS = ("real_model", "requires_gpu", "slow", "requires_db")
+
+
+def _physical_opt_in() -> bool:
+    """物理设备 / 重档用例是否已显式开启。"""
+    return (
+        os.environ.get(PHYSICAL_OPT_IN_ENV) == "1"
+        or os.environ.get(LEGACY_SMOKE_ENV) == "1"
+    )
+
+
+def _external_marker_expression(*, physical: bool) -> str:
+    """external 段的 `-m` 表达式。
+
+    external 段承载两类用例：**必须串行**的（`external`，如起真实 socket / 子进程）与
+    **物理设备/重档**的。后者的收集与否由显式 opt-in 决定；未开启时它们连收集都不进，
+    因此既不会占用串行段的时间，也不会以 skip 的形式混进结果。
+    """
+    if physical:
+        return 'not real_model and (external or requires_db or slow or requires_gpu)'
+    # `PHYSICAL_MARKERS` 已包含 `real_model`，这里不再重复写一遍。
+    excluded = ' and '.join(f'not {marker}' for marker in PHYSICAL_MARKERS)
+    return f'{excluded} and (external)'
 
 
 def _pytest_env() -> dict[str, str]:
@@ -248,11 +287,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f'[test-channels] order seed: {order_seed}', flush=True)
 
     env = _pytest_env()
+    physical = _physical_opt_in()
     external_args = [
         'tests',
         '-q',
         '-m',
-        'not real_model and (external or requires_db or slow or requires_gpu)',
+        _external_marker_expression(physical=physical),
     ]
     if importlib.util.find_spec('xdist') is not None:
         external_args.extend(['-n', '0'])
@@ -268,6 +308,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         'ran': False,
         'reason': 'QLH_RUN_REAL_MODEL_SMOKE is not set to 1',
     }
+    #: ★ 票 13 第三条：物理设备/重档的**显式 opt-in** 状态也写进 manifest。
+    #: 未开启时这些用例不被收集（不是"跑了再 skip"），因此"没跑"与"跑过"必须可区分。
+    physical_status: dict[str, object] = {
+        'opt_in_env': PHYSICAL_OPT_IN_ENV,
+        'legacy_env': LEGACY_SMOKE_ENV,
+        'requested': True,
+        'ran': physical,
+        'reason': '' if physical else f'{PHYSICAL_OPT_IN_ENV} is not set to 1',
+        'covers_markers': list(PHYSICAL_MARKERS),
+        'external_marker_expression': _external_marker_expression(physical=physical),
+    }
 
     def record_manifest() -> None:
         (artifact_dir / 'manifest.json').write_text(
@@ -279,6 +330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     'repeat': args.repeat,
                     'order_seed': order_seed,
                     'smoke': smoke_status,
+                    'physical': physical_status,
                     'runs': runs,
                 },
                 ensure_ascii=False,
@@ -328,10 +380,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failures.append(f'{name}#{repetition}')
 
     if args.channel in ('all', 'smoke'):
-        if os.environ.get('QLH_RUN_REAL_MODEL_SMOKE') != '1':
+        if not physical:
             print(
                 '\n[test-channels] smoke channel skipped: set '
-                'QLH_RUN_REAL_MODEL_SMOKE=1 to load real weights.',
+                f'{PHYSICAL_OPT_IN_ENV}=1 (physical/real-weight tests) '
+                f'or {LEGACY_SMOKE_ENV}=1 to load real weights.',
                 flush=True,
             )
         else:
