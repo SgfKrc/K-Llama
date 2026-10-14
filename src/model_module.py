@@ -76,6 +76,14 @@ COMPILE_MIN_PARAMS,
     TOTAL_MODEL_LAYERS, DEFAULT_LAYER_CONFIG,
 )
 from koakuma_engine import backend_capabilities, select_backend
+from model_load_resolver import (
+    ModelLoadFacts,
+    ModelLoadResolution,
+    OP_FULL_MODEL,
+    effective_pytorch_cuda_available,
+    preferred_engine_for_artifacts,
+    resolve_model_load,
+)
 
 import model_config as mc
 
@@ -417,9 +425,12 @@ def _apply_fused_rmsnorm(model: torch.nn.Module) -> int:
     return replaced
 
 
-def _select_layer_runtime() -> Tuple[str, torch.dtype]:
+def _select_layer_runtime(quant_type: str | None = None) -> Tuple[str, torch.dtype]:
     """Choose a stable dtype for selectively loaded pipeline layers."""
     if torch.cuda.is_available():
+        normalized = str(quant_type or "").strip().lower()
+        if normalized in {"fp32", "f32", "float32"}:
+            return "cuda:0", torch.float32
         return "cuda:0", torch.float16
     return "cpu", torch.float32
 
@@ -922,10 +933,16 @@ class ModelManager:
             else runtime_requested
         )
 
+        # ⚠️ 不要用 `torch.cuda.is_available()`：本仓 `.venv-test` 装的是 **CPU-only
+        #   torch（2.13.0+cpu）**，于是明明有 RTX 4060 也返回 False ⇒ `auto` 会错选
+        #   llama_cpp（本该按双档策略选 pytorch）。改用硬件级探测（nvidia-smi 优先），
+        #   与 `inference_path_selector.detect_cuda_available()` 同源。
+        from inference_path_selector import detect_cuda_available
+
         selected = select_backend(
             profile,
             requested=requested,
-            cuda_available=torch.cuda.is_available(),
+            cuda_available=detect_cuda_available(),
             island_enabled=bool(getattr(_cfg, "ISLAND_ENABLED", False)),
             island_base_url=str(getattr(_cfg, "ISLAND_BASE_URL", "") or ""),
         )
@@ -1109,53 +1126,103 @@ class ModelManager:
         engine: str | None,
         db_experimental_models: list[dict] | None,
         require_existing: bool,
+        resolution: ModelLoadResolution | None = None,
     ) -> Dict[str, Any]:
-        resolved_path = model_path
-        # ★ 2026-09-19：默认模型按设备画像选（`get_profile_default_model_id()` 内部已含兜底，
-        #   且不会因画像不可用而抛）。
-        _default_id = mc.get_profile_default_model_id()
-        resolved_id = model_id or _default_id
-        cfg = mc.get_model_config(resolved_id, db_experimental_models) if model_id else None
-        resolved_engine = engine if engine and engine != "auto" else self.select_engine(profile)
+        import config as runtime_config
 
-        if resolved_engine != "island":
-            if model_id and cfg is None and not resolved_path:
-                raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
-            if resolved_id != _default_id and cfg:
-                if cfg.model_type == "gguf" and resolved_engine == "pytorch":
-                    logger.warning(
-                        "模型 '%s' 仅有 GGUF 格式，引擎从 pytorch 切换为 llama_cpp",
-                        resolved_id,
-                    )
-                    resolved_engine = "llama_cpp"
-                elif cfg.model_type == "safetensors" and resolved_engine == "llama_cpp":
-                    logger.warning(
-                        "模型 '%s' 仅有 Safetensors 格式，引擎保持 pytorch（CPU 推理）",
-                        resolved_id,
-                    )
-                    resolved_engine = "pytorch"
+        resolved_id = (
+            resolution.model_id
+            if resolution is not None
+            else model_id or mc.get_profile_default_model_id()
+        )
+        cfg = mc.get_model_config(resolved_id, db_experimental_models)
+        if resolution is not None:
+            return {
+                "model_id": resolved_id,
+                "config": cfg,
+                "engine": resolution.engine,
+                "path": resolution.model_path or "",
+                "requested_quantization": resolution.requested_quant.casefold(),
+                "effective_quantization": resolution.quant_type,
+                "runtime": resolution.runtime,
+                "layer_range_mode": resolution.layer_range_mode,
+                "reason_code": resolution.reason_code,
+            }
+        requested_quant = str(quant_type or QUANT_TYPE)
+        cuda_ok = effective_pytorch_cuda_available(
+            system_cuda_available=bool(torch.cuda.is_available()),
+            profile=profile,
+        )
 
-            if not resolved_path and cfg:
-                candidate = (
-                    mc.resolve_model_path(cfg.gguf_path)
-                    if resolved_engine == "llama_cpp"
-                    else mc.resolve_model_path(cfg.model_path)
-                )
-                exists = os.path.isfile(candidate) if resolved_engine == "llama_cpp" else os.path.isdir(candidate)
-                if require_existing and not exists:
-                    label = "GGUF 文件" if resolved_engine == "llama_cpp" else "Safetensors 目录"
-                    configured = cfg.gguf_path if resolved_engine == "llama_cpp" else cfg.model_path
-                    raise FileNotFoundError(
-                        f"模型 '{resolved_id}' 的 {label}不存在: {configured or '(未配置)'}"
-                    )
-                resolved_path = candidate
+        if model_path:
+            explicit = os.path.abspath(model_path)
+            is_gguf = explicit.lower().endswith(".gguf") and (
+                os.path.isfile(explicit) or not require_existing
+            )
+            is_safetensors = not explicit.lower().endswith(".gguf") and (
+                os.path.isdir(explicit) or not require_existing
+            )
+            has_gguf = is_gguf
+            has_safetensors = is_safetensors
+            gguf_path = explicit if is_gguf else None
+            safetensors_path = explicit if is_safetensors else None
+            registered = bool(cfg is not None or model_path)
+        elif cfg is not None:
+            status = mc.get_model_file_status(cfg)
+            has_gguf = bool(status["has_gguf"] or (not require_existing and cfg.gguf_path))
+            has_safetensors = bool(
+                status["has_safetensors"] or (not require_existing and cfg.model_path)
+            )
+            gguf_path = mc.resolve_model_path(cfg.gguf_path) if has_gguf else None
+            safetensors_path = (
+                mc.resolve_model_path(cfg.model_path) if has_safetensors else None
+            )
+            registered = True
+        else:
+            has_gguf = False
+            has_safetensors = False
+            gguf_path = None
+            safetensors_path = None
+            registered = False
 
+        selected_preference = (
+            self.select_engine(profile)
+            if not engine or str(engine).strip().lower() == "auto"
+            else str(engine)
+        )
+        facts = ModelLoadFacts(
+            model_id=resolved_id,
+            model_name=getattr(cfg, "name", resolved_id),
+            registered=registered,
+            has_safetensors=has_safetensors,
+            has_gguf=has_gguf,
+            safetensors_path=safetensors_path,
+            gguf_path=gguf_path,
+            preferred_engine=selected_preference or preferred_engine_for_artifacts(
+                has_safetensors=has_safetensors,
+                has_gguf=has_gguf,
+                cuda_available=cuda_ok,
+            ),
+            cuda_available=cuda_ok,
+            island_enabled=bool(getattr(runtime_config, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(runtime_config, "ISLAND_BASE_URL", "") or ""),
+        )
+        resolution = resolve_model_load(
+            facts,
+            requested_engine=engine or "auto",
+            requested_quant=requested_quant,
+            operation=OP_FULL_MODEL,
+        )
         return {
-            "model_id": resolved_id,
+            "model_id": resolution.model_id,
             "config": cfg,
-            "engine": resolved_engine,
-            "path": resolved_path or "",
-            "requested_quantization": str(quant_type or QUANT_TYPE).casefold(),
+            "engine": resolution.engine,
+            "path": resolution.model_path or "",
+            "requested_quantization": resolution.requested_quant.casefold(),
+            "effective_quantization": resolution.quant_type,
+            "runtime": resolution.runtime,
+            "layer_range_mode": resolution.layer_range_mode,
+            "reason_code": resolution.reason_code,
         }
 
     def _build_load_fingerprint(
@@ -1171,6 +1238,7 @@ class ModelManager:
             "model_id": request["model_id"],
             "engine": request["engine"],
             "requested_quantization": request["requested_quantization"],
+            "effective_quantization": request.get("effective_quantization", ""),
             "artifact": self._artifact_load_identity(
                 request.get("path"),
                 model_id=request["model_id"],
@@ -1217,6 +1285,7 @@ class ModelManager:
         model_id: str = None,
         engine: str = None,
         db_experimental_models: list[dict] = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> None:
         """
         加载模型，自适应选择推理引擎。
@@ -1241,6 +1310,7 @@ class ModelManager:
             engine=engine,
             db_experimental_models=db_experimental_models,
             require_existing=True,
+            resolution=resolution,
         )
         resolved_path = request["path"] or None
         resolved_id = request["model_id"]
@@ -1272,7 +1342,11 @@ class ModelManager:
             else:
                 self._load_llama_cpp(resolved_path, profile)
         else:
-            self._load_pytorch(resolved_path, quant_type, profile)
+            self._load_pytorch(
+                resolved_path,
+                request["effective_quantization"],
+                profile,
+            )
 
         # 记录活跃模型 ID
         self._active_model_id = resolved_id
@@ -1298,6 +1372,15 @@ class ModelManager:
         """
         logger.info(f"卸载模型: {self._active_model_id} (引擎={self._engine_type})")
 
+        # --- llama.cpp 引擎清理 ---
+        # Release native owners before clearing their state projection. A
+        # failed close must retain the engine and remain retryable by callers.
+        if self._llama_engine is not None:
+            close = getattr(self._llama_engine, "close", None) or getattr(self._llama_engine, "unload", None)
+            if callable(close):
+                close()
+            self._llama_engine = None
+
         # --- PyTorch 引擎清理 ---
         if self.model is not None:
             self.model = None
@@ -1319,17 +1402,6 @@ class ModelManager:
         self._full_model_quant_type = None
         self._load_fingerprint = None
         self._load_fingerprint_sha256 = ""
-
-        # --- llama.cpp 引擎清理 ---
-        if self._llama_engine is not None:
-            try:
-                if hasattr(self._llama_engine, 'close'):
-                    self._llama_engine.close()
-                elif hasattr(self._llama_engine, 'unload'):
-                    self._llama_engine.unload()
-            except Exception:
-                pass
-            self._llama_engine = None
 
         # --- 孤岛引擎清理（断开 HTTP 客户端）---
         if self._island_engine is not None:
@@ -1492,6 +1564,7 @@ class ModelManager:
         engine: str = None,
         model_path: str = None,
         db_experimental_models: list[dict] = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> dict:
         """
         切换到另一个模型（P3 多模型支持）。
@@ -1551,6 +1624,7 @@ class ModelManager:
                     engine=engine,
                     db_experimental_models=db_experimental_models,
                     require_existing=False,
+                    resolution=resolution,
                 )
                 _, target_fingerprint = self._build_load_fingerprint(
                     target_request,
@@ -1617,7 +1691,8 @@ class ModelManager:
                 self.load_model(model_id=model_id, model_path=model_path,
                                 quant_type=quant_type, profile=profile,
                                 engine=engine,
-                                db_experimental_models=db_experimental_models)
+                                 db_experimental_models=db_experimental_models,
+                                 resolution=resolution)
                 return {
                     "success": True,
                     "model_id": self._active_model_id,
@@ -2026,7 +2101,7 @@ class ModelManager:
 
         model_prefixes = [model_key_of(prefix) for prefix in selected_prefixes]
 
-        target_device, target_dtype = _select_layer_runtime()
+        target_device, target_dtype = _select_layer_runtime(quant_type or QUANT_TYPE)
         load_tracker = _LayerRangeLoadTracker(
             architecture=architecture,
             start_layer=start_layer,
@@ -2193,7 +2268,7 @@ class ModelManager:
         if total_layers <= 0:
             raise RuntimeError("Qwen config 缺少 num_hidden_layers")
 
-        target_device, target_dtype = _select_layer_runtime()
+        target_device, target_dtype = _select_layer_runtime(quant_type or QUANT_TYPE)
         use_cuda = target_device.startswith("cuda")
         runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE
@@ -2509,11 +2584,45 @@ class ModelManager:
             elif tier == "ultrabook":
                 n_ctx = 2048
 
-        self._llama_engine = LlamaCppEngine()
-        self._llama_engine.load_model(
-            model_path=gguf_path,
-            n_ctx=n_ctx,
+        # ★ 票 15a/15b 接线：整模 GGUF 走「绑定」还是「llama-server 子进程」，由
+        #   `select_inference_path` 决定。默认 auto = llama.cpp 家族内挑传输：
+        #   有 CUDA 走 server（绑定是 CPU-only，拿不到 GPU），无 CUDA 走绑定。
+        #   两条硬规矩：层段接力强制绑定；**显式**请求 server 而无 CUDA / 无
+        #   可执行文件时具名报错（绝不静默降级）。auto 的降级会在 reason 写明。
+        import config as _cfg
+        from inference_path_selector import (
+            AUTO,
+            BINDING,
+            SERVER,
+            select_inference_path,
         )
+        from llama_server_engine import default_server_exe
+
+        server_available = bool(default_server_exe())
+        decision = select_inference_path(
+            requested=str(getattr(_cfg, "INFER_PATH", AUTO) or AUTO),
+            server_available=server_available,
+        )
+        if decision.path == SERVER:
+            from llama_server_engine import LlamaServerEngine
+
+            logger.info("推理路径裁决 -> llama-server 子进程（%s）", decision.reason)
+            self._llama_engine = LlamaServerEngine(
+                # 必须与决策同源：用硬件级探测，而不是 torch.cuda.is_available()
+                # —— 本仓 .venv-test 是 CPU-only torch，后者会广告出"C 无 CUDA"
+                # 却实际走了 server 路径，自相矛盾。
+                cuda_available=decision.cuda_available,
+            )
+            self._llama_engine.load_model(model_path=gguf_path, n_ctx=n_ctx)
+        else:
+            if decision.cuda_available and decision.requested == AUTO:
+                # auto 降级必须可观测（有 GPU 却回落到 CPU 绑定，用户会奇怪为什么慢）
+                logger.warning("推理路径 auto 降级到绑定：%s", decision.reason)
+            self._llama_engine = LlamaCppEngine()
+            self._llama_engine.load_model(
+                model_path=gguf_path,
+                n_ctx=n_ctx,
+            )
         self._model_path = gguf_path
 
         logger.info("✅ llama.cpp 引擎就绪 (CPU/集显 优化)")
@@ -2650,6 +2759,8 @@ class ModelManager:
         - int4: bitsandbytes 4-bit NF4 双重量化加载，显存 ~1.8 GB
         """
         path = model_path or MODEL_PATH
+        if str(path).strip().lower().endswith(".gguf"):
+            raise ValueError("PyTorch loader 拒绝 GGUF 路径；请先通过统一 resolver 选择引擎与工件")
         self._model_path = path
         self.quant_type = quant_type or QUANT_TYPE
 
@@ -2726,7 +2837,9 @@ class ModelManager:
                 load_kwargs["quantization_config"] = bnb_config
                 load_kwargs["torch_dtype"] = torch.float16
             else:
-                load_kwargs["torch_dtype"] = torch.float16
+                load_kwargs["torch_dtype"] = (
+                    torch.float32 if self.quant_type == "fp32" else torch.float16
+                )
 
         t0 = time.time()
 
@@ -4223,6 +4336,15 @@ class ModelManager:
         return backend_capabilities(self.engine_type)
 
     def supports(self, capability: str) -> bool:
+        # 票 15a：能力必须反映**真实执行能力**。llama-server 子进程虽然同属
+        # llama.cpp 家族（`engine_type == "llama_cpp"`，槽位也复用 `_llama_engine`），
+        # 但它**不承担层段接力** —— 直接沿用 `self.capabilities`（llama_cpp 白名单里
+        # `FORWARD_LAYERS` 为 True）会让调度层把层段派给一台执行不了的 worker。
+        # 活跃引擎自带能力探测时以它为准；否则维持既有 backend 口径（行为不变）。
+        if self._engine_type == "llama_cpp" and self._llama_engine is not None:
+            probe = getattr(self._llama_engine, "supports", None)
+            if callable(probe):
+                return bool(probe(capability))
         return self.capabilities.supports(capability)
 
     def get_device(self) -> torch.device:

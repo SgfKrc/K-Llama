@@ -1968,6 +1968,13 @@ class TestLayerRuntimeSelection:
 
         assert model_module._select_layer_runtime() == ("cuda:0", torch.float16)
 
+    def test_cuda_layers_preserve_explicit_fp32(self, monkeypatch):
+        import model_module
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        assert model_module._select_layer_runtime("fp32") == ("cuda:0", torch.float32)
+
     @pytest.mark.parametrize("requested_quant", ["fp16", "fp32", "int4", "int8"])
     def test_full_cpu_pytorch_load_uses_float32(
         self,
@@ -2005,6 +2012,101 @@ class TestLayerRuntimeSelection:
         assert mgr.quant_type == "fp32"
         assert next(mgr.model.parameters()).dtype == torch.float32
 
+    def test_full_cuda_pytorch_fp32_uses_float32(self, monkeypatch):
+        import model_module
+
+        captured = {}
+        fake_model = _make_tiny_model()
+
+        def fake_from_pretrained(*args, **kwargs):
+            captured.update(kwargs)
+            return fake_model
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(model_module, "USE_COMPILE", False)
+        monkeypatch.setattr(
+            model_module.AutoModelForCausalLM,
+            "from_pretrained",
+            fake_from_pretrained,
+        )
+        monkeypatch.setattr(
+            model_module.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: object(),
+        )
+
+        mgr = ModelManager()
+        mgr._load_pytorch("unused-model", quant_type="fp32")
+
+        assert captured["device_map"] == "auto"
+        assert captured["torch_dtype"] == torch.float32
+        assert mgr.quant_type == "fp32"
+
+    def test_pytorch_loader_rejects_gguf_path_before_runtime(self):
+        mgr = ModelManager()
+
+        with pytest.raises(ValueError, match="拒绝 GGUF"):
+            mgr._load_pytorch("model.gguf", quant_type="fp16")
+
+    def test_edge_profile_forces_fp32_during_resolution_even_when_host_has_cuda(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        request = ModelManager()._resolve_model_load_request(
+            model_path=str(tmp_path),
+            quant_type="int4",
+            profile={"tier": "edge", "gpu": {"cuda_available": False}},
+            model_id="edge-model",
+            engine="pytorch",
+            db_experimental_models=None,
+            require_existing=True,
+        )
+        assert request["runtime"] == "pytorch_cpu"
+        assert request["effective_quantization"] == "fp32"
+
+    def test_precomputed_resolution_is_consumed_without_second_resolver(
+        self, monkeypatch, tmp_path,
+    ):
+        import model_module
+        from model_load_resolver import ModelLoadResolution
+
+        resolution = ModelLoadResolution(
+            model_id="resolved-model",
+            requested_engine="pytorch",
+            engine="pytorch",
+            artifact_kind="safetensors",
+            model_path=str(tmp_path),
+            requested_quant="fp32",
+            quant_type="fp32",
+            runtime="pytorch_cpu",
+            runtime_quant="fp32",
+            layer_range_mode="dynamic",
+            reason_code="ENGINE_EXPLICIT",
+            reason="test",
+        )
+        monkeypatch.setattr(
+            model_module,
+            "resolve_model_load",
+            lambda *_args, **_kwargs: pytest.fail("resolver was called twice"),
+        )
+        calls = []
+        mgr = ModelManager()
+        monkeypatch.setattr(
+            mgr,
+            "_load_pytorch",
+            lambda path, quant, profile: calls.append((path, quant, profile)),
+        )
+
+        mgr.load_model(
+            model_id="resolved-model",
+            model_path=str(tmp_path),
+            engine="pytorch",
+            quant_type="fp32",
+            resolution=resolution,
+        )
+
+        assert calls == [(str(tmp_path), "fp32", None)]
+
 
 class TestSelectEngine:
     """测试 ModelManager.select_engine() 静态方法"""
@@ -2027,7 +2129,10 @@ class TestSelectEngine:
         """CUDA 可用 + auto 模式 → pytorch"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        # ⚠️ CUDA 判据已改为硬件级探测（nvidia-smi 优先）——本仓 .venv-test 是
+        # CPU-only torch，patch `torch.cuda.is_available` 已经不管用了（实测：
+        # 有 RTX 4060 也返回 False，auto 会错选 llama_cpp）。patch 点在这里：
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: True)
         result = ModelManager.select_engine()
         assert result == "pytorch"
 
@@ -2035,7 +2140,7 @@ class TestSelectEngine:
         """无 CUDA + auto 模式 → llama_cpp"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: False)
         result = ModelManager.select_engine()
         assert result == "llama_cpp"
 
@@ -2043,7 +2148,7 @@ class TestSelectEngine:
         """edge 档位 + 无 CUDA → llama_cpp"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: False)
         profile = {"tier": "edge", "gpus": []}
         result = ModelManager.select_engine(profile)
         assert result == "llama_cpp"
@@ -2052,10 +2157,50 @@ class TestSelectEngine:
         """mobile 档位 + 无 CUDA → llama_cpp"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: False)
         profile = {"tier": "mobile", "gpus": []}
         result = ModelManager.select_engine(profile)
         assert result == "llama_cpp"
+
+    def test_select_engine_uses_hardware_cuda_probe_not_torch(self, monkeypatch):
+        """防回归：CUDA 判据必须走硬件级探测，而不是 torch.cuda.is_available。
+
+        本仓 `.venv-test` 装的是 CPU-only torch（2.13.0+cpu），有 RTX 4060 也返回
+        False；若有人把判据改回去，`auto` 会在有 GPU 的机器上错选 llama_cpp。这里
+        故意把 torch 反着设成 False，逼 `select_engine` 只能靠硬件探测才能选对。
+        """
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr("inference_path_selector.detect_cuda_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert ModelManager.select_engine() == "pytorch"
+
+    def test_supports_delegates_to_active_llama_server_engine(self):
+        """票 15a：`ModelManager.supports` 必须反映**活跃引擎**的真实能力。
+
+        llama-server 子进程对外仍报 `engine_type="llama_cpp"`（家族一致），但
+        `FORWARD_LAYERS` 必须是 False —— 否则 `runtime_supports` 放行，调度层会把
+        层段接力派给一台执行不了的 runtime。
+        """
+        from koakuma_engine import Capability
+        from llama_server_engine import LlamaServerEngine
+
+        mgr = ModelManager()
+        mgr._engine_type = "llama_cpp"
+        mgr._llama_engine = LlamaServerEngine()
+        assert mgr.supports(Capability.FORWARD_LAYERS) is False
+
+    def test_supports_falls_back_to_backend_when_engine_has_no_probe(self):
+        """没有自带能力探测的引擎（如绑定引擎）维持既有 backend 口径，行为不变。"""
+        from koakuma_engine import Capability
+
+        mgr = ModelManager()
+        mgr._engine_type = "llama_cpp"
+        mgr._llama_engine = object()  # 无 supports
+        # `capabilities` 是只读 property（按 backend 定），这里逐项对比证明走了回退
+        assert mgr.supports(Capability.FORWARD_LAYERS) == (
+            mgr.capabilities.supports(Capability.FORWARD_LAYERS)
+        )
 
     def test_laptop_tier_with_cuda_gpu_selects_pytorch(self, monkeypatch):
         """laptop 档位 + CUDA GPU → pytorch"""
@@ -2099,7 +2244,7 @@ class TestLoadModelWithModelId:
         with pytest.raises(ValueError, match="未在注册表中找到"):
             mgr.load_model(model_id="nonexistent-model-xyz")
 
-    def test_load_model_accepts_model_id_with_explicit_path(self, monkeypatch):
+    def test_load_model_accepts_model_id_with_explicit_path(self, monkeypatch, tmp_path):
         """model_id 不存在但显式提供 model_path → 放行（由路径直接加载）"""
         import model_module
         monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "pytorch")
@@ -2109,9 +2254,14 @@ class TestLoadModelWithModelId:
         monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
 
         # 不应抛出异常
+        model_dir = tmp_path / "custom-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "model.safetensors").write_bytes(b"weights")
+
         mgr.load_model(
             model_id="custom-model",
-            model_path="/tmp/fake-model.safetensors",
+            model_path=str(model_dir),
             engine="pytorch",
         )
         assert mgr._active_model_id == "custom-model"
@@ -2220,15 +2370,16 @@ class TestLoadModelWithModelId:
         )
         assert mgr._active_model_id == "db-only-model"
 
-    def test_load_model_gguf_only_enforces_llama_cpp(self, monkeypatch):
-        """GGUF-only 模型 + pytorch 引擎 → 自动修正为 llama_cpp"""
+    def test_load_model_gguf_only_rejects_explicit_pytorch(self, monkeypatch):
+        """GGUF-only 模型不得静默进入或改写 PyTorch loader 请求。"""
         mgr = ModelManager()
-        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        llama_calls = []
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: llama_calls.append(True))
         monkeypatch.setattr(os.path, "isfile", lambda p: True)
 
-        mgr.load_model(model_id="qwen2.5-7b-gguf", engine="pytorch")
-        # 应被 model_type 约束修正
-        assert mgr._engine_type == "llama_cpp"
+        with pytest.raises(ValueError, match="Safetensors"):
+            mgr.load_model(model_id="qwen2.5-7b-gguf", engine="pytorch")
+        assert llama_calls == []
 
 
 class TestSwitchModel:
@@ -2422,7 +2573,7 @@ class TestP6SameModelSwitchShortCircuit:
         def fake_llama(*a, **kw):
             load_calls.append(("llama", kw))
             mgr._llama_engine = self._FakeLlamaEngine()
-            mgr._model_path = "G:/models/qwen2.5-7b-gguf"
+            mgr._model_path = "G:/models/qwen2.5-7b-gguf.gguf"
 
         monkeypatch.setattr(mgr, "_load_llama_cpp", fake_llama)
         monkeypatch.setattr(
@@ -2557,8 +2708,12 @@ class TestP6SameModelSwitchShortCircuit:
         assert result["load_fingerprint"] != before_fingerprint
 
     def test_engine_change_forces_reload(self, monkeypatch, tmp_path):
-        model_path = tmp_path / "artifact"
-        model_path.mkdir()
+        pytorch_path = tmp_path / "artifact"
+        pytorch_path.mkdir()
+        (pytorch_path / "config.json").write_text("{}", encoding="utf-8")
+        (pytorch_path / "model.safetensors").write_bytes(b"weights")
+        gguf_path = tmp_path / "artifact.gguf"
+        gguf_path.write_bytes(b"gguf")
         mgr = ModelManager()
         load_calls = []
 
@@ -2575,12 +2730,12 @@ class TestP6SameModelSwitchShortCircuit:
         monkeypatch.setattr(mgr, "_load_llama_cpp", fake_llama)
         monkeypatch.setattr(mgr, "_load_pytorch", fake_pytorch)
         first = mgr.switch_model(
-            "external-model", model_path=str(model_path), engine="llama_cpp",
+            "external-model", model_path=str(gguf_path), engine="llama_cpp",
         )
         assert first["success"] is True
 
         result = mgr.switch_model(
-            "external-model", model_path=str(model_path), engine="pytorch",
+            "external-model", model_path=str(pytorch_path), engine="pytorch",
         )
 
         assert result["success"] is True
@@ -2943,3 +3098,39 @@ class TestEmptyCacheNormalization:
         assert getattr(cache.layers[0], "recurrent_state", None) is not None, (
             "状态本身存在于 cache 对象里 ⇒ 只要传 cache 对象就不会丢"
         )
+
+
+@pytest.mark.parametrize("release_method", ["close", "unload"])
+def test_llama_unload_failure_preserves_manager_projection(release_method):
+    manager = ModelManager()
+    should_fail = [True]
+
+    def release():
+        if should_fail[0]:
+            raise OSError("native owner still alive")
+
+    engine = types.SimpleNamespace(is_loaded=True, **{release_method: release})
+    manager._llama_engine = engine
+    manager._engine_type = "llama_cpp"
+    manager._active_model_id = "segment-model"
+    manager.quant_type = "Q4_K_M"
+    manager.layer_range = (0, 8)
+    manager._full_model_path = "head.gguf"
+    descriptor = {"assignment_layer_range": [0, 8]}
+    manager._pipeline_descriptor = descriptor
+    manager._pipeline_distributed_only = True
+    manager._load_fingerprint = {"model_path": "head.gguf"}
+    with pytest.raises(OSError, match="native owner still alive"):
+        manager.unload_model()
+    assert manager._llama_engine is engine and manager.is_loaded
+    assert manager._active_model_id == "segment-model" and manager._engine_type == "llama_cpp"
+    assert manager.quant_type == "Q4_K_M" and manager.layer_range == (0, 8)
+    assert manager._pipeline_descriptor is descriptor and manager._pipeline_distributed_only
+    assert manager._full_model_path == "head.gguf" and manager._load_fingerprint == {"model_path": "head.gguf"}
+    should_fail[0] = False
+    manager.unload_model()
+    assert manager._llama_engine is None and not manager.is_loaded
+    assert manager._active_model_id == "" and manager._engine_type == ""
+    assert manager.quant_type is None and manager.layer_range is None
+    assert manager._pipeline_descriptor is None and not manager._pipeline_distributed_only
+    assert manager._full_model_path is None and manager._load_fingerprint is None

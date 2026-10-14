@@ -11,4 +11,13 @@ api_server.py / scheduler.py 保持原样作为可运行基线。
   tensor_transport.py loopback 张量序列化（复用 tcp_comm）
 """
 
-__version__ = "0.1.0"
+try:
+    from release_contract import (
+        INFERENCE_SERVICE_CONTRACT_VERSION as __contract_version__,
+        PRODUCT_VERSION as __version__,
+    )
+except ImportError:  # package import through ``src.inference_service``
+    from ..release_contract import (  # type: ignore[no-redef]
+        INFERENCE_SERVICE_CONTRACT_VERSION as __contract_version__,
+        PRODUCT_VERSION as __version__,
+    )

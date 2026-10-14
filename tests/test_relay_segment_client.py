@@ -14,6 +14,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,8 @@ from relay_segment_client import (  # noqa: E402
 from relay_transport import (  # noqa: E402
     RELAY_PROTOCOL_ERROR,
     RELAY_TRANSPORT_ERROR,
+    REQUEST_DEADLINE_EXCEEDED,
+    RelayProtocolError,
     expected_hidden_bytes,
     open_loopback_listener,
     serve_relay_connection,
@@ -288,6 +291,61 @@ def test_unreachable_segment_is_named_not_silent():
     assert outcome.error == RELAY_TRANSPORT_ERROR
     assert outcome.hidden == b""
     assert client.frames == 0
+
+
+def test_expired_absolute_deadline_prevents_connect(monkeypatch):
+    created: list[object] = []
+
+    class _UnexpectedTransport:
+        def __init__(self, *_args, **_kwargs):
+            created.append(self)
+
+    monkeypatch.setattr(segment_module, "RelayTcpClient", _UnexpectedTransport)
+    client = RelaySegmentClient(
+        "127.0.0.1",
+        50183,
+        n_embd=N_EMBD,
+        role="middle",
+        deadline_monotonic=time.monotonic() - 1.0,
+    )
+
+    outcome = client.forward_hidden(_hidden(), n_tokens=N_TOKENS)
+
+    assert outcome.ok is False
+    assert outcome.error == REQUEST_DEADLINE_EXCEEDED
+    assert created == []
+
+
+def test_failed_round_trip_discards_session_before_next_call(monkeypatch):
+    class _BrokenTransport:
+        instances: list["_BrokenTransport"] = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.aborted = False
+            type(self).instances.append(self)
+
+        def tighten_deadline(self, _deadline):
+            pass
+
+        def request_hidden(self, *_args, **_kwargs):
+            raise RelayProtocolError("connection_closed_mid_frame")
+
+        def abort(self):
+            self.aborted = True
+
+    monkeypatch.setattr(segment_module, "RelayTcpClient", _BrokenTransport)
+    client = RelaySegmentClient(
+        "127.0.0.1", 50183, n_embd=N_EMBD, role="middle"
+    )
+
+    first = client.forward_hidden(_hidden(), n_tokens=N_TOKENS)
+    second = client.forward_hidden(_hidden(), n_tokens=N_TOKENS)
+
+    assert first.error == "connection_closed_mid_frame"
+    assert second.error == "connection_closed_mid_frame"
+    assert len(_BrokenTransport.instances) == 2
+    assert all(instance.aborted for instance in _BrokenTransport.instances)
+    assert client._client is None
 
 
 def test_runner_exception_is_collapsed_without_leaking_text():

@@ -103,6 +103,12 @@ def test_request_code_roundtrip_and_durable_key_store(tmp_path):
     assert stored is not None
     assert stored[0] == request
     assert stored[1] == target
+    database_blob = (tmp_path / "join.sqlite3").read_bytes()
+    assert target.private_key.encode("ascii") not in database_blob
+    assert issuer.private_key.encode("ascii") not in database_blob
+    secret_blob = (tmp_path / "cluster_join_secrets.json").read_bytes()
+    assert target.private_key.encode("ascii") not in secret_blob
+    assert issuer.private_key.encode("ascii") not in secret_blob
 
 
 def test_nonce_replay_survives_ledger_restart(tmp_path):
@@ -271,3 +277,17 @@ def test_concurrent_nonce_consumption_has_one_winner(tmp_path):
         worker.join(timeout=5)
     assert not any(worker.is_alive() for worker in workers)
     assert sorted(outcomes) == ["consumed", "nonce_replayed"]
+
+
+def test_bootstrap_request_nonce_is_durable_and_one_time(tmp_path):
+    nonce = base64.urlsafe_b64encode(b"n" * 18).decode().rstrip("=")
+    digest = "a" * 64
+    path = tmp_path / "bootstrap-nonce.sqlite3"
+    JoinGrantLedger(path).consume_bootstrap_request(
+        nonce=nonce, request_digest=digest, consumed_at=10,
+    )
+    with pytest.raises(JoinContractError) as replay:
+        JoinGrantLedger(path).consume_bootstrap_request(
+            nonce=nonce, request_digest=digest, consumed_at=11,
+        )
+    assert replay.value.code == "nonce_replayed"

@@ -15,6 +15,15 @@ from typing import Any, Callable, Iterable, Optional, cast
 
 from task_journal import JournalEvent, TaskJournal, TaskJournalError
 from cluster_recovery import RecoveryError, decide_recovery
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    RequestDeadline,
+)
+from request_outcome import (
+    OUTCOME_COMPLETED,
+    REASON_GENERATION_CANCELLED,
+    TerminalOutcomeLatch,
+)
 from task_provider import (
     CallbackExecutionProvider,
     DEPENDENCY_FAILURES_KEY,
@@ -90,6 +99,15 @@ class WorkflowCancelled(TaskGraphError):
         )
 
 
+class WorkflowDeadlineExceeded(TaskGraphError):
+    def __init__(self, workflow_id: str):
+        self.workflow_id = workflow_id
+        super().__init__(
+            f"workflow {workflow_id} request deadline exceeded",
+            code=REQUEST_DEADLINE_EXCEEDED,
+        )
+
+
 class WorkflowExecutionError(TaskGraphError):
     def __init__(
         self,
@@ -156,6 +174,9 @@ class AttemptRecord:
     lease_id: str = ""
     lease_epoch: int = 0
     lease_expires_at: float = 0.0
+    lease_deadline_monotonic: float = field(
+        default=0.0, repr=False,
+    )
     state: str = "running"
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
@@ -304,6 +325,12 @@ class WorkflowRecord:
     session_id: str = ""
     model_identity: Optional[ModelIdentity] = None
     runtime_context: dict = field(default_factory=dict, repr=False)
+    request_deadline: Optional[RequestDeadline] = field(
+        default=None, repr=False,
+    )
+    terminal_outcome: TerminalOutcomeLatch = field(
+        default_factory=TerminalOutcomeLatch, repr=False,
+    )
     state: str = "created"
     last_sequence: int = 0
     created_at: float = field(default_factory=time.time)
@@ -342,6 +369,7 @@ class WorkflowRecord:
             rejections = sum(
                 int(stage["result_rejection_count"]) for stage in stages
             )
+            terminal_reason = self.terminal_outcome.snapshot()
             final_dependency_ids: set[str] = set()
             pending = [self.final_stage_id]
             while pending:
@@ -372,6 +400,11 @@ class WorkflowRecord:
                 "finished_at": self.finished_at,
                 "duration_seconds": round(duration, 6),
                 "error": self.error,
+                "request_deadline_epoch_ms": (
+                    self.request_deadline.expires_at_epoch_ms
+                    if self.request_deadline is not None else None
+                ),
+                "terminal_reason": terminal_reason,
                 "stage_count": len(stages),
                 "completed_stage_count": completed,
                 "failed_stage_count": failed,
@@ -387,6 +420,9 @@ class WorkflowRecord:
                 "result_rejection_count": rejections,
                 "cancel_requested": (
                     self.cancel_event.is_set() and self.state != "completed"
+                    and terminal_reason["reason_code"] in {
+                        "", REASON_GENERATION_CANCELLED,
+                    }
                 ),
                 "stages": stages,
             }
@@ -993,7 +1029,11 @@ class TaskGraphCoordinator:
         elif stage.state != "running":
             reason = "stage_not_running"
         elif (
-            attempt.lease_expires_at > 0
+            attempt.lease_deadline_monotonic > 0
+            and time.monotonic() > attempt.lease_deadline_monotonic
+        ) or (
+            attempt.lease_deadline_monotonic <= 0
+            and attempt.lease_expires_at > 0
             and submitted_at > attempt.lease_expires_at
         ):
             reason = "lease_expired"
@@ -1653,17 +1693,39 @@ class TaskGraphCoordinator:
         self,
         workflow: WorkflowRecord,
         reason: str = "cancelled",
+        *,
+        terminal_reason_code: str = REASON_GENERATION_CANCELLED,
+        terminal_source: str = "cancel_request",
     ) -> None:
         if workflow.state in TERMINAL_WORKFLOW_STATES:
             return
+        terminal_reason = self._observe_workflow_stop(workflow)
+        if terminal_reason:
+            workflow.terminal_outcome.decide(
+                terminal_reason_code,
+                source=terminal_source,
+            )
+        else:
+            terminal_reason = workflow.terminal_outcome.decide(
+                terminal_reason_code,
+                source=terminal_source,
+            )
         was_set = workflow.cancel_event.is_set()
         workflow.cancel_event.set()
         try:
             if workflow.state == "result_ready":
                 self._transition_workflow_locked(
                     workflow,
-                    "cancelled",
-                    error=reason,
+                    (
+                        "cancelled"
+                        if terminal_reason == REASON_GENERATION_CANCELLED
+                        else "failed"
+                    ),
+                    error=(
+                        reason
+                        if terminal_reason == REASON_GENERATION_CANCELLED
+                        else terminal_reason
+                    ),
                 )
                 workflow.cancel_recorded = True
             elif not workflow.cancel_recorded:
@@ -2128,6 +2190,7 @@ class TaskGraphCoordinator:
         runtime_context: Optional[dict] = None,
         workflow_id: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> tuple[dict, dict]:
         if template != "dual_candidate":
             raise TaskGraphError(f"unsupported task graph template: {template}")
@@ -2144,6 +2207,7 @@ class TaskGraphCoordinator:
             template=template,
             workflow_id=workflow_id,
             cancel_event=cancel_event,
+            request_deadline=request_deadline,
         )
 
     def run(
@@ -2159,6 +2223,7 @@ class TaskGraphCoordinator:
         template: str = "custom",
         workflow_id: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> tuple[dict, dict]:
         specs = self.validate(stages, final_stage_id)
         resolved_workflow_id = workflow_id or f"wf_{uuid.uuid4().hex}"
@@ -2176,6 +2241,12 @@ class TaskGraphCoordinator:
             model_identity, ModelIdentity,
         ):
             raise TaskGraphError("model_identity must be a ModelIdentity")
+        if request_deadline is not None and not isinstance(
+            request_deadline, RequestDeadline,
+        ):
+            raise TaskGraphError(
+                "request_deadline must be a RequestDeadline"
+            )
         workflow = WorkflowRecord(
             workflow_id=resolved_workflow_id,
             request_id=request_id,
@@ -2186,6 +2257,7 @@ class TaskGraphCoordinator:
             model_identity=model_identity,
             runtime_context=dict(runtime_context or {}),
             cancel_event=cancel_event or threading.Event(),
+            request_deadline=request_deadline,
         )
         with self._lock:
             if self._closing:
@@ -2339,8 +2411,11 @@ class TaskGraphCoordinator:
                 )
 
             with workflow.lock:
-                if workflow.cancel_event.is_set():
+                stop_reason = self._observe_workflow_stop(workflow)
+                if stop_reason == REASON_GENERATION_CANCELLED:
                     raise WorkflowCancelled(workflow.workflow_id)
+                if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                    raise WorkflowDeadlineExceeded(workflow.workflow_id)
                 final_stage = workflow.stages[final_stage_id]
                 if final_stage.state != "completed" or final_stage.output is None:
                     raise TaskGraphError("final stage did not complete")
@@ -2351,13 +2426,34 @@ class TaskGraphCoordinator:
         except WorkflowCancelled:
             self._mark_cancelled(workflow)
             raise
+        except WorkflowDeadlineExceeded as exc:
+            workflow.terminal_outcome.decide(
+                REQUEST_DEADLINE_EXCEEDED,
+                source="task_graph",
+            )
+            self._mark_failed(workflow, str(exc))
+            raise
         except WorkflowExecutionError as exc:
+            workflow.terminal_outcome.decide(
+                exc.code,
+                source="task_graph",
+            )
             self._mark_failed(workflow, str(exc))
             raise
         except Exception as exc:
-            if workflow.cancel_event.is_set():
+            stop_reason = self._observe_workflow_stop(workflow)
+            if stop_reason == REASON_GENERATION_CANCELLED:
                 self._mark_cancelled(workflow)
                 raise WorkflowCancelled(workflow.workflow_id) from exc
+            if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                self._mark_failed(workflow, str(exc))
+                raise WorkflowDeadlineExceeded(
+                    workflow.workflow_id,
+                ) from exc
+            workflow.terminal_outcome.decide(
+                getattr(exc, "code", "task_graph_execution_failed"),
+                source="task_graph",
+            )
             self._mark_failed(workflow, str(exc))
             raise WorkflowExecutionError(
                 resolved_workflow_id, "graph", str(exc),
@@ -2443,13 +2539,31 @@ class TaskGraphCoordinator:
             runtime_context=workflow.runtime_context,
             stage_fields=dict(stage.spec.stage_fields),
         )
+        accept_timeout = float(stage.spec.accept_timeout_seconds)
+        if workflow.request_deadline is not None:
+            try:
+                accept_timeout = min(
+                    accept_timeout,
+                    workflow.request_deadline.require_remaining(),
+                )
+            except Exception as exc:
+                raise WorkflowDeadlineExceeded(
+                    workflow.workflow_id,
+                ) from exc
         try:
             reservation = provider_registry.reserve(
                 provider_request,
-                timeout_seconds=stage.spec.accept_timeout_seconds,
+                timeout_seconds=accept_timeout,
                 cancel_event=workflow.cancel_event,
             )
         except ProviderError as exc:
+            if (
+                workflow.request_deadline is not None
+                and workflow.request_deadline.expired()
+            ):
+                raise WorkflowDeadlineExceeded(
+                    workflow.workflow_id,
+                ) from exc
             with workflow.lock:
                 if workflow.cancel_event.is_set():
                     raise WorkflowCancelled(workflow.workflow_id) from exc
@@ -2491,7 +2605,10 @@ class TaskGraphCoordinator:
         reservation: Reservation,
         lease_timeout_seconds: float,
     ) -> ProviderStageResult:
-        if attempt.lease_expires_at <= 0:
+        if (
+            attempt.lease_expires_at <= 0
+            and workflow.request_deadline is None
+        ):
             return provider_registry.execute(
                 provider_attempt, reservation, workflow.cancel_event,
             )
@@ -2533,15 +2650,30 @@ class TaskGraphCoordinator:
                         provider_id=attempt.provider,
                     )
                 return result
-            if workflow.cancel_event.is_set():
+            stop_reason = self._observe_workflow_stop(workflow)
+            if stop_reason == REASON_GENERATION_CANCELLED:
                 self._cancel_provider_attempt(
                     provider_registry, attempt.provider, attempt.attempt_id,
                 )
                 raise WorkflowCancelled(workflow.workflow_id)
+            if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                self._cancel_provider_attempt(
+                    provider_registry, attempt.provider, attempt.attempt_id,
+                )
+                raise ProviderExecutionError(
+                    "request deadline exceeded during provider execution",
+                    code=REQUEST_DEADLINE_EXCEEDED,
+                    provider_id=attempt.provider,
+                )
             with workflow.lock:
-                deadline = attempt.lease_expires_at
-            now = time.time()
-            remaining = deadline - now
+                deadline = attempt.lease_deadline_monotonic
+                lease_expires_at = attempt.lease_expires_at
+            now = time.monotonic()
+            remaining = (
+                deadline - now
+                if deadline > 0
+                else workflow.request_deadline.require_remaining()
+            )
             if remaining <= 0:
                 self._cancel_provider_attempt(
                     provider_registry, attempt.provider, attempt.attempt_id,
@@ -2552,8 +2684,15 @@ class TaskGraphCoordinator:
                     provider_id=attempt.provider,
                     retryable=True,
                 )
-            if renewal_supported and remaining <= renew_window:
+            if (
+                deadline > 0
+                and renewal_supported
+                and remaining <= renew_window
+            ):
                 renewed_deadline = time.time() + lease_duration
+                if renewed_deadline <= lease_expires_at + 0.001:
+                    renewal_supported = False
+                    continue
                 try:
                     renewal_supported = provider_registry.renew_lease(
                         attempt.provider,
@@ -2627,8 +2766,10 @@ class TaskGraphCoordinator:
                 if reservation.provider_kind not in {
                     "local_full_model", "callback_compatibility",
                 }:
-                    attempt.lease_expires_at = (
-                        time.time() + float(stage.spec.lease_timeout_seconds)
+                    lease_timeout = float(stage.spec.lease_timeout_seconds)
+                    attempt.lease_expires_at = time.time() + lease_timeout
+                    attempt.lease_deadline_monotonic = (
+                        time.monotonic() + lease_timeout
                     )
                 provider_attempt = ProviderStageAttempt(
                     attempt_id=attempt.attempt_id,
@@ -2638,6 +2779,7 @@ class TaskGraphCoordinator:
                     lease_epoch=attempt.lease_epoch,
                     lease_expires_at=attempt.lease_expires_at,
                     accept_timeout_seconds=stage.spec.accept_timeout_seconds,
+                    request_deadline=workflow.request_deadline,
                 )
             with self._provider_activity_lock:
                 self._active_provider_attempts[attempt.attempt_id] = (
@@ -2708,7 +2850,29 @@ class TaskGraphCoordinator:
         except WorkflowExecutionError:
             raise
         except Exception as exc:
-            if workflow.cancel_event.is_set():
+            stop_reason = self._observe_workflow_stop(workflow)
+            if (
+                stop_reason == REQUEST_DEADLINE_EXCEEDED
+                and not (
+                    isinstance(exc, ProviderError)
+                    and exc.code == REQUEST_DEADLINE_EXCEEDED
+                )
+            ):
+                exc = ProviderExecutionError(
+                    "request deadline exceeded during provider execution",
+                    code=REQUEST_DEADLINE_EXCEEDED,
+                    provider_id=(attempt.provider if attempt is not None else ""),
+                )
+            if (
+                isinstance(exc, ProviderError)
+                and exc.code == REQUEST_DEADLINE_EXCEEDED
+            ):
+                workflow.terminal_outcome.decide(
+                    REQUEST_DEADLINE_EXCEEDED,
+                    source="provider_execution",
+                )
+            stop_reason = self._observe_workflow_stop(workflow)
+            if stop_reason == REASON_GENERATION_CANCELLED:
                 if attempt_started and attempt is not None:
                     with workflow.lock:
                         if (
@@ -2774,7 +2938,12 @@ class TaskGraphCoordinator:
                     stage,
                     attempt,
                     attempt_state=(
-                        "expired" if retry_next_provider else "failed"
+                        "expired"
+                        if retry_next_provider
+                        or error_code in {
+                            "lease_expired", REQUEST_DEADLINE_EXCEEDED,
+                        }
+                        else "failed"
                     ),
                     retry=retry,
                     retry_same_provider=retry_same_provider,
@@ -2833,14 +3002,63 @@ class TaskGraphCoordinator:
                 raise cleanup_failure
 
     @staticmethod
+    def _observe_workflow_stop(workflow: WorkflowRecord) -> str:
+        """Return the canonical request terminal reason, if any.
+
+        The latch is authoritative once decided. Later cancel/deadline
+        observations are retained as secondary diagnostics and may wake active
+        work, but they cannot reverse the workflow's terminal class.
+        """
+
+        existing = workflow.terminal_outcome.snapshot()["reason_code"]
+        cancel_requested = workflow.cancel_event.is_set()
+        deadline_expired = bool(
+            workflow.request_deadline is not None
+            and workflow.request_deadline.expired()
+        )
+        if existing:
+            if cancel_requested:
+                workflow.terminal_outcome.decide(
+                    REASON_GENERATION_CANCELLED,
+                    source="cancel_event",
+                )
+            if deadline_expired:
+                workflow.terminal_outcome.decide(
+                    REQUEST_DEADLINE_EXCEEDED,
+                    source="request_deadline",
+                )
+            return str(existing)
+        if cancel_requested:
+            return workflow.terminal_outcome.decide(
+                REASON_GENERATION_CANCELLED,
+                source="cancel_event",
+            )
+        if deadline_expired:
+            return workflow.terminal_outcome.decide(
+                REQUEST_DEADLINE_EXCEEDED,
+                source="request_deadline",
+            )
+        return ""
+
+    @staticmethod
     def _raise_if_cancelled(workflow: WorkflowRecord) -> None:
-        if workflow.cancel_event.is_set():
+        stop_reason = TaskGraphCoordinator._observe_workflow_stop(workflow)
+        if stop_reason == REASON_GENERATION_CANCELLED:
             raise WorkflowCancelled(workflow.workflow_id)
+        if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+            raise WorkflowDeadlineExceeded(workflow.workflow_id)
 
     def _mark_cancelled(self, workflow: WorkflowRecord) -> None:
         now = time.time()
         with workflow.lock:
             if workflow.state in TERMINAL_WORKFLOW_STATES:
+                return
+            terminal_reason = workflow.terminal_outcome.decide(
+                REASON_GENERATION_CANCELLED,
+                source="workflow_cancelled",
+            )
+            if terminal_reason != REASON_GENERATION_CANCELLED:
+                self._mark_failed(workflow, terminal_reason)
                 return
             workflow.cancel_event.set()
             for stage in workflow.stages.values():
@@ -2868,6 +3086,11 @@ class TaskGraphCoordinator:
         with workflow.lock:
             if workflow.state in TERMINAL_WORKFLOW_STATES:
                 return
+            if not workflow.terminal_outcome.reason_code:
+                workflow.terminal_outcome.decide(
+                    "task_graph_execution_failed",
+                    source="workflow_failed",
+                )
             for stage in workflow.stages.values():
                 for attempt in stage.attempts:
                     if attempt.state not in TERMINAL_ATTEMPT_STATES:
@@ -2892,6 +3115,26 @@ class TaskGraphCoordinator:
                 workflow, "failed", error=error, now=now,
             )
 
+    @staticmethod
+    def _ensure_terminal_outcome_locked(workflow: WorkflowRecord) -> str:
+        """Make every terminal workflow occupy the first-terminal latch."""
+
+        existing = workflow.terminal_outcome.snapshot()["reason_code"]
+        if existing:
+            return str(existing)
+        if workflow.state == "completed":
+            reason_code = OUTCOME_COMPLETED
+            source = "result_commit"
+        elif workflow.state == "cancelled":
+            reason_code = REASON_GENERATION_CANCELLED
+            source = "workflow_cancelled"
+        else:
+            reason_code = "task_graph_execution_failed"
+            source = "workflow_failed"
+        return workflow.terminal_outcome.decide(
+            reason_code, source=source,
+        )
+
     def commit_result(self, workflow_id: str) -> dict:
         """Commit a result-ready workflow without allowing terminal reversal."""
         with self._lock:
@@ -2900,6 +3143,7 @@ class TaskGraphCoordinator:
                 raise WorkflowNotFound(workflow_id)
             with workflow.lock:
                 if workflow.state == "completed":
+                    self._ensure_terminal_outcome_locked(workflow)
                     return workflow.snapshot()
                 if workflow.state == "cancelled":
                     raise WorkflowCancelled(workflow_id)
@@ -2909,9 +3153,18 @@ class TaskGraphCoordinator:
                         f"{workflow.state}"
                     )
                 if workflow.cancel_event.is_set():
-                    self._mark_cancelled(workflow)
-                    raise WorkflowCancelled(workflow_id)
+                    stop_reason = self._observe_workflow_stop(workflow)
+                    if stop_reason == REASON_GENERATION_CANCELLED:
+                        self._mark_cancelled(workflow)
+                        raise WorkflowCancelled(workflow_id)
+                    self._mark_failed(workflow, stop_reason)
+                    raise WorkflowDeadlineExceeded(workflow_id)
+                stop_reason = self._observe_workflow_stop(workflow)
+                if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                    self._mark_failed(workflow, stop_reason)
+                    raise WorkflowDeadlineExceeded(workflow_id)
                 self._transition_workflow_locked(workflow, "completed")
+                self._ensure_terminal_outcome_locked(workflow)
                 return workflow.snapshot()
 
     def renew_stage_lease(
@@ -2972,6 +3225,11 @@ class TaskGraphCoordinator:
         now = time.time()
         deadline = float(lease_expires_at)
         if (
+            workflow.request_deadline is not None
+            and workflow.request_deadline.expired()
+        ):
+            raise WorkflowDeadlineExceeded(workflow.workflow_id)
+        if (
             not deadline > now
             or not deadline < float("inf")
             or deadline <= attempt.lease_expires_at
@@ -2982,7 +3240,11 @@ class TaskGraphCoordinator:
                 "within 3600 seconds"
             )
         previous_deadline = attempt.lease_expires_at
+        previous_monotonic_deadline = attempt.lease_deadline_monotonic
         attempt.lease_expires_at = deadline
+        attempt.lease_deadline_monotonic = time.monotonic() + max(
+            0.0, deadline - time.time(),
+        )
         try:
             self._record_event_locked(
                 workflow,
@@ -2999,6 +3261,7 @@ class TaskGraphCoordinator:
             )
         except Exception:
             attempt.lease_expires_at = previous_deadline
+            attempt.lease_deadline_monotonic = previous_monotonic_deadline
             raise
         return attempt.snapshot()
 
@@ -3038,6 +3301,8 @@ class TaskGraphCoordinator:
         self,
         workflow_id: str,
         reason: str = "cancelled before result commit",
+        *,
+        terminal_reason_code: str = REASON_GENERATION_CANCELLED,
     ) -> dict:
         """Discard an uncommitted final result while preserving terminal states."""
         with self._lock:
@@ -3052,7 +3317,12 @@ class TaskGraphCoordinator:
                         f"workflow {workflow_id} result cannot be discarded from "
                         f"state {workflow.state}"
                     )
-                self._request_cancel_locked(workflow, reason)
+                self._request_cancel_locked(
+                    workflow,
+                    reason,
+                    terminal_reason_code=terminal_reason_code,
+                    terminal_source="result_discard",
+                )
                 return workflow.snapshot()
 
     def get(self, workflow_id: str) -> dict:
@@ -3103,6 +3373,12 @@ class TaskGraphCoordinator:
                     self._request_cancel_locked(
                         workflow, "cancelled before result commit",
                     )
+                else:
+                    self._ensure_terminal_outcome_locked(workflow)
+                    workflow.terminal_outcome.decide(
+                        REASON_GENERATION_CANCELLED,
+                        source="cancel_request",
+                    )
             return workflow.snapshot()
 
     def request_cancel(self, workflow_id: str) -> Optional[dict]:
@@ -3134,6 +3410,12 @@ class TaskGraphCoordinator:
                 if workflow.state not in TERMINAL_WORKFLOW_STATES:
                     self._request_cancel_locked(
                         workflow, "cancelled before result commit",
+                    )
+                else:
+                    self._ensure_terminal_outcome_locked(workflow)
+                    workflow.terminal_outcome.decide(
+                        REASON_GENERATION_CANCELLED,
+                        source="cancel_request",
                     )
             return workflow.snapshot()
 

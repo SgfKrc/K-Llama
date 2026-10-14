@@ -20,6 +20,7 @@ import time
 
 from node_config import apply_node_config_to_env, resolve_initial_node_role
 from pathlib import Path
+from release_contract import PRODUCT_VERSION
 
 _LOG_FILE = Path(__file__).resolve().parent.parent / "logs" / "inference_svc_startup.log"
 
@@ -74,7 +75,7 @@ def build_app(node_role: str = "master", *, engine_host=None, kv_host=None):
         yield
         await asyncio.to_thread(host.close)
 
-    app = FastAPI(title="inference-svc", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="inference-svc", version=PRODUCT_VERSION, lifespan=lifespan)
     host.role = node_role
     app.state.engine_host = host
     app.state.kv_host = kv_host if kv_host is not None else KVHost()

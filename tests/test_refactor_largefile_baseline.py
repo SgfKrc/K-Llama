@@ -349,7 +349,9 @@ def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
     expected = {
         routes_health: 4,
         routes_device: 3,
-        routes_cluster: 67,
+        # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate
+        #   （OpenAPI 路径 126->127、operation 147->148，见 fixtures 快照）
+        routes_cluster: 68,
         routes_models: 23,
         routes_auth: 12,
         routes_sessions: 10,
@@ -397,7 +399,8 @@ def test_api_routers_cover_every_openapi_operation() -> None:
         for path, operations in api_server.app.openapi()["paths"].items()
         for method in operations
     )
-    assert sum(routed.values()) == 147
+    # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate ⇒ 147 -> 148
+    assert sum(routed.values()) == 148
     assert routed == openapi
 
 

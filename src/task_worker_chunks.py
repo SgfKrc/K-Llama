@@ -246,10 +246,16 @@ def build_stage_chunk(
     message_id: str,
     sent_at_ms: int,
     version: int = PROTOCOL_VERSION,
+    message_type: str = "stage_chunk",
 ) -> Any:
-    """构造一条 `stage_chunk`（摘要按**本条 payload** 计算）。"""
+    """构造一条分片消息（摘要按**本条 payload** 计算）。
+
+    `message_type` 默认 `stage_chunk`（coordinator → worker 的输入分片）。
+    ★ 2026-10-11（三机实测）：**回程**分片复用同一形状，调用方传
+    `stage_result_chunk` —— 因此两侧装配器与切分计划可以完全共享，不需要第二套实现。
+    """
     return build_message(
-        "stage_chunk",
+        str(message_type or "stage_chunk"),
         {
             "workflow_id": workflow_id,
             "stage_id": stage_id,

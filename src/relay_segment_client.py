@@ -32,6 +32,7 @@ from relay_transport import (  # noqa: PLC2701 - 白名单是**唯一定义**，
     RELAY_DEFAULT_MAX_TOKENS,
     RELAY_PROTOCOL_ERROR,
     RELAY_TRANSPORT_ERROR,
+    REQUEST_DEADLINE_EXCEEDED,
     RelayProtocolError,
     RelayTcpClient,
 )
@@ -128,6 +129,7 @@ class RelaySegmentClient:
         timeout: float = 60.0,
         max_tokens: int = RELAY_DEFAULT_MAX_TOKENS,
         quant: str = "none",
+        deadline_monotonic: float | None = None,
     ) -> None:
         if role not in SEGMENT_ROLES:
             raise ValueError(f"未知段角色 {role!r}；只允许 {SEGMENT_ROLES}")
@@ -146,6 +148,8 @@ class RelaySegmentClient:
         self.timeout = float(timeout)
         self.max_tokens = int(max_tokens)
         self.quant = str(quant)
+        self._deadline_monotonic: float | None = None
+        self.tighten_deadline(deadline_monotonic)
         self._client: RelayTcpClient | None = None
         self.frames = 0
         self.payload_bytes = 0
@@ -156,13 +160,40 @@ class RelaySegmentClient:
     def endpoint(self) -> str:
         return f"{self.host}:{self.port}"
 
-    def _ensure_client(self) -> RelayTcpClient:
+    @property
+    def deadline_monotonic(self) -> float | None:
+        return self._deadline_monotonic
+
+    def tighten_deadline(self, deadline_monotonic: float | None) -> None:
+        if deadline_monotonic is None:
+            return
+        candidate = float(deadline_monotonic)
+        if self._deadline_monotonic is None or candidate < self._deadline_monotonic:
+            self._deadline_monotonic = candidate
+        client = getattr(self, "_client", None)
+        if client is not None:
+            client.tighten_deadline(self._deadline_monotonic)
+
+    def _ensure_client(
+        self, deadline_monotonic: float | None = None
+    ) -> RelayTcpClient:
         """建立（或复用）连接；失败一律收敛成稳定码（**绝不上抛原始异常**）。"""
+        self.tighten_deadline(deadline_monotonic)
+        if (
+            self._deadline_monotonic is not None
+            and self._deadline_monotonic <= time.monotonic()
+        ):
+            raise RelaySegmentError(
+                REQUEST_DEADLINE_EXCEEDED,
+                role=self.role,
+                endpoint=self.endpoint,
+            )
         if self._client is None:
             try:
                 self._client = RelayTcpClient(
                     self.host, self.port, n_embd=self.n_embd,
                     timeout=self.timeout, max_tokens=self.max_tokens,
+                    deadline_monotonic=self._deadline_monotonic,
                 )
             except RelayProtocolError as exc:
                 raise RelaySegmentError(exc, role=self.role, endpoint=self.endpoint) from None
@@ -170,15 +201,26 @@ class RelaySegmentClient:
                 raise RelaySegmentError(
                     RELAY_TRANSPORT_ERROR, role=self.role, endpoint=self.endpoint
                 ) from exc
+        else:
+            self._client.tighten_deadline(self._deadline_monotonic)
         return self._client
 
-    def close(self) -> None:
+    def _discard_client(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
+            return
+        try:
+            client.abort()
+        except OSError:
+            pass
+
+    def close(self, *, grace_timeout: float | None = None) -> None:
         """幂等关闭；关闭失败只影响本对象后续可用性，不上抛。"""
         client, self._client = self._client, None
         if client is None:
             return
         try:
-            client.close()
+            client.close(grace_timeout=grace_timeout)
         except (RelayProtocolError, OSError):
             pass
 
@@ -190,8 +232,14 @@ class RelaySegmentClient:
 
     # ---- 三种段角色 -------------------------------------------------------
 
-    def forward_hidden(self, hidden: bytes, *, n_tokens: int,
-                       seq_meta: dict[str, object] | None = None) -> RelaySegmentOutcome:
+    def forward_hidden(
+        self,
+        hidden: bytes,
+        *,
+        n_tokens: int,
+        seq_meta: dict[str, object] | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> RelaySegmentOutcome:
         """中段往返：hidden → hidden。
 
         `seq_meta` 给了就按 **多序列**（`HIDDEN_SEQ`，逐 token 显式 `seq_ids`/`positions`）发送；
@@ -199,24 +247,47 @@ class RelaySegmentClient:
         """
         def _call(client: RelayTcpClient) -> bytes:
             if seq_meta is None:
-                return client.request_hidden(hidden, n_tokens=int(n_tokens), quant=self.quant)
+                return client.request_hidden(
+                    hidden,
+                    n_tokens=int(n_tokens),
+                    quant=self.quant,
+                    deadline_monotonic=deadline_monotonic,
+                )
             return client.request_hidden_seq(hidden, n_tokens=int(n_tokens), meta=seq_meta,
-                                             quant=self.quant)
+                                             quant=self.quant,
+                                             deadline_monotonic=deadline_monotonic)
 
-        return self._run(_call, n_tokens=int(n_tokens), want="hidden")
+        return self._run(
+            _call,
+            n_tokens=int(n_tokens),
+            want="hidden",
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def forward_hidden_to_token(
         self, hidden: bytes, *, n_tokens: int,
         seq_meta: dict[str, object] | None = None,
+        deadline_monotonic: float | None = None,
     ) -> RelaySegmentOutcome:
         """末段往返：hidden → token（远端自己跑完本段并回 argmax）。"""
         def _call(client: RelayTcpClient) -> int:
             return client.request_token(hidden, n_tokens=int(n_tokens), quant=self.quant,
-                                        seq_meta=seq_meta)
+                                        seq_meta=seq_meta,
+                                        deadline_monotonic=deadline_monotonic)
 
-        return self._run(_call, n_tokens=int(n_tokens), want="token")
+        return self._run(
+            _call,
+            n_tokens=int(n_tokens),
+            want="token",
+            deadline_monotonic=deadline_monotonic,
+        )
 
-    def forward_tokens(self, tokens: "list[int]") -> RelaySegmentOutcome:
+    def forward_tokens(
+        self,
+        tokens: "list[int]",
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> RelaySegmentOutcome:
         """上游段往返：token ids → hidden（远端跑它自己的 head 段）。
 
         ⚠️ 远端语义必须与本机 keep-head 一致（末层输出、`output_norm` **之前**）——
@@ -226,17 +297,31 @@ class RelaySegmentClient:
         values = [int(t) for t in tokens]
 
         def _call(client: RelayTcpClient) -> bytes:
-            return client.request_hidden_from_tokens(values)
+            return client.request_hidden_from_tokens(
+                values, deadline_monotonic=deadline_monotonic
+            )
 
-        return self._run(_call, n_tokens=len(values), want="hidden")
+        return self._run(
+            _call,
+            n_tokens=len(values),
+            want="hidden",
+            deadline_monotonic=deadline_monotonic,
+        )
 
     # ---- 统一执行 + 收敛 ------------------------------------------------
 
-    def _run(self, call, *, n_tokens: int, want: str) -> RelaySegmentOutcome:
+    def _run(
+        self,
+        call,
+        *,
+        n_tokens: int,
+        want: str,
+        deadline_monotonic: float | None = None,
+    ) -> RelaySegmentOutcome:
         """执行一次往返，把**所有**失败收敛成 `RelaySegmentOutcome.error`（稳定码）。"""
         started = time.perf_counter()
         try:
-            client = self._ensure_client()
+            client = self._ensure_client(deadline_monotonic)
             value = call(client)
         except RelaySegmentError as exc:
             return self._failure(exc.code, n_tokens=n_tokens, started=started)
@@ -269,6 +354,9 @@ class RelaySegmentClient:
         )
 
     def _failure(self, code: object, *, n_tokens: int, started: float) -> RelaySegmentOutcome:
+        # Any failed round-trip may have consumed or emitted a partial frame.
+        # Drop the connection immediately so no later step can reuse it.
+        self._discard_client()
         return RelaySegmentOutcome(
             n_tokens=int(n_tokens), role=self.role, endpoint=self.endpoint,
             elapsed_ms=(time.perf_counter() - started) * 1000,

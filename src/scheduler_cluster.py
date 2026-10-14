@@ -2258,6 +2258,8 @@ class SchedulerClusterMixin:
         master_host = canonical_host(master_host)
         master_port = int(master_port)
         with self._master_connect_lock:
+            if not self.get_distributed_inference_enabled():
+                return {"status": "denied", "reason": "local_inference_mode"}
             current = getattr(self, "_tcp_client", None)
             current_connected = bool(
                 current
@@ -2593,6 +2595,7 @@ class SchedulerClusterMixin:
                                      request_id: str = None,   # L5: 链路追踪
                                      routing_preference: str = "auto",
                                      _cancel_event: Optional[threading.Event] = None,
+                                     _request_deadline=None,
                                      timeout: float = 120.0) -> dict:
         """
         从节点将推理请求转发给主节点，并等待结果。
@@ -2644,6 +2647,10 @@ class SchedulerClusterMixin:
                 "routing_preference": routing_preference,
                 "forward_request_id": forward_request_id,
             }
+            if _request_deadline is not None:
+                infer_data["request_deadline_ms"] = (
+                    _request_deadline.expires_at_epoch_ms
+                )
             tcp_client.send_data(infer_data, MessageType.INFER_FORWARD)
             logger.info(
                 "event=infer_forward task_id=n/a request_id=%s forward_request_id=%s "
@@ -2652,6 +2659,11 @@ class SchedulerClusterMixin:
             )
 
             deadline = time.monotonic() + max(0.0, timeout)
+            if _request_deadline is not None:
+                deadline = min(
+                    deadline,
+                    _request_deadline.expires_at_monotonic,
+                )
             result_ready = False
             while True:
                 if _cancel_event is not None and _cancel_event.is_set():
@@ -2683,10 +2695,16 @@ class SchedulerClusterMixin:
                     len(result.get("content", "")),
                 )
                 if result.get("status") != "ok" or result.get("error"):
+                    metrics = result.get("metrics", {})
                     return {
                         "status": "error",
                         "error": result.get("error") or "主节点推理失败",
-                        "metrics": result.get("metrics", {}),
+                        "metrics": metrics,
+                        "reason_code": str(
+                            result.get("reason_code")
+                            or metrics.get("reason_code")
+                            or ""
+                        ),
                     }
                 return {
                     "status": "ok",
@@ -2697,6 +2715,10 @@ class SchedulerClusterMixin:
                 }
 
             # 超时
+            request_deadline_exceeded = bool(
+                _request_deadline is not None
+                and _request_deadline.expired()
+            )
             logger.warning(f"推理请求超时 ({timeout}s)")
             try:
                 tcp_client.send_data(
@@ -2705,7 +2727,18 @@ class SchedulerClusterMixin:
                 )
             except Exception:
                 logger.debug("发送转发推理取消失败", exc_info=True)
-            return {"status": "timeout", "error": f"等待主节点响应超时 ({timeout}s)"}
+            return {
+                "status": "timeout",
+                "error": (
+                    "request deadline exceeded"
+                    if request_deadline_exceeded
+                    else f"等待主节点响应超时 ({timeout}s)"
+                ),
+                "reason_code": (
+                    "request_deadline_exceeded"
+                    if request_deadline_exceeded else "forward_timeout"
+                ),
+            }
 
         except Exception as e:
             logger.error(f"转发推理请求失败: {e}")
@@ -3008,6 +3041,7 @@ class SchedulerClusterMixin:
         with self._nodes_lock:
             my_info = self.nodes.get(_effective_id)
         result = {
+            "inference_mode": "distributed" if self.get_distributed_inference_enabled() else "local",
             "node_role": effective_role,
             "node_id": _effective_id,
             "is_master": effective_role == "master",
@@ -3091,11 +3125,25 @@ class SchedulerClusterMixin:
                 del self.nodes[pid]
                 logger.info(f"  清理幽灵节点: {pid}")
         if phantoms:
+            invalidate_transaction = getattr(
+                self, "_invalidate_pipeline_load_transaction", None,
+            )
+            if callable(invalidate_transaction):
+                invalidate_transaction(
+                    reason_code="phantom_nodes_removed",
+                    reason=(
+                        "phantom nodes removed while updating cluster capacity: "
+                        + ", ".join(sorted(phantoms))
+                    ),
+                )
             with self._layer_config_lock:
-                # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
+                # Phantom cleanup is a global control-plane reset. Keep the
+                # assignment registry, retry state, transaction and active
+                # route in one state: empty and therefore not routable.
                 self._worker_assignments.clear()
-                self._layer_config_expected.clear()
-                self._layer_config_acks.clear()
+                self._layer_config_retry_state.clear()
+                self._pipeline_load_transaction = None
+                self._active_pipeline_capacity_plan = None
 
         logger.info(f"最大节点数已更新: {old_max} → {new_max}"
                     + (f" (清理幽灵: {phantoms})" if phantoms else ""))
@@ -3279,17 +3327,42 @@ class SchedulerClusterMixin:
 
 
     def set_distributed_inference_enabled(self, enabled: bool) -> dict:
-        """
-        设置分布式推理开关。
+        """Set participation and disconnect local workers when opting out."""
+        with self._host.full_chat_execution_lock:
+            return self._set_distributed_inference_enabled_locked(enabled)
 
-        - 关闭时不影响已连接节点（不会主动断开），仅阻止新的分布式推理请求
 
-        Returns:
-            {status, enabled, message}
-        """
+    def _set_distributed_inference_enabled_locked(self, enabled: bool) -> dict:
+        if enabled and not self.get_distributed_inference_enabled():
+            # The model API unloads under this same lock before rejoining.
+            # Other control surfaces must not advertise a resident local model.
+            with self._host.full_chat_execution_lock:
+                has_loaded = getattr(self._host, "has_loaded_model", None)
+                loaded = bool(self._host.model_loaded) or bool(
+                    callable(has_loaded) and has_loaded()
+                )
+                if loaded:
+                    return {
+                        "status": "error", "reason_code": "local_model_still_loaded",
+                        "reason": "请先通过模型模式接口卸载本地模型，再加入集群。",
+                    }
         self._distributed_inference_enabled = bool(enabled)
+        self._client_reconnect_enabled = bool(enabled)
+        if not enabled:
+            supply_worker = getattr(self, "_model_supply_worker", None)
+            if supply_worker is not None:
+                supply_worker.cancel()
+            supply = getattr(self, "_model_supply", None)
+            if supply is not None:
+                supply.cancel_active()
+            self.release_pipeline_worker_for_local_model()
+            client = getattr(self, "_tcp_client", None)
+            if client is not None:
+                client.disconnect()
         if enabled and self._effective_role() == "client":
             self._request_pipeline_worker_opt_in()
+            if self._running and not getattr(self._tcp_client, "is_registered", False):
+                threading.Thread(target=self._auto_connect_on_startup, name="explicit-cluster-rejoin", daemon=True).start()
         logger.info(f"分布式推理已{'启用' if enabled else '禁用'}")
         return {
             "status": "ok",
@@ -3300,6 +3373,8 @@ class SchedulerClusterMixin:
 
     def _request_pipeline_worker_opt_in(self) -> bool:
         """Ask the master to include this client in future layer assignments."""
+        if not self.get_distributed_inference_enabled():
+            return False
         with self._layer_config_lock:
             self._pipeline_worker_opted_out = False
         client = getattr(self, "_tcp_client", None)

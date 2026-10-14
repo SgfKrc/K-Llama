@@ -18,7 +18,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import tcp_comm as tcp_comm_mod  # noqa: E402
 from scheduler import Scheduler  # noqa: E402
+from tcp_comm import TCPClient  # noqa: E402
 from transport_port import MessageType  # noqa: E402
 
 
@@ -78,3 +80,125 @@ def test_heartbeat_ack_failure_does_not_break_handling():
     )
     # 没有异常抛出即通过；last_heartbeat 仍应被刷新（走的是同一条分支）。
     assert host.nodes["android-21af7c52"].last_heartbeat > 0
+
+
+def test_client_missing_heartbeat_acks_disconnects_once_and_fences_late_ack(
+    monkeypatch,
+):
+    """A half-open socket cannot stay registered merely because send succeeds."""
+    client = TCPClient(
+        server_host="127.0.0.1", server_port=1, client_id="worker-ack-watch",
+    )
+    original_sock = object()
+    replacement_sock = object()
+    client.sock = original_sock
+    client._running = True
+    client._registered = True
+    client._connection_generation = 1
+    client._heartbeat_quality.begin_generation(1)
+
+    sent = []
+    disconnects = []
+    reconnects = []
+    clock = [10.0]
+
+    def fake_time():
+        value = clock[0]
+        clock[0] += 1.0
+        return value
+
+    def send_data(data, message_type, connection_sock=None):
+        assert connection_sock is original_sock
+        sent.append((data, message_type))
+
+    def reconnect():
+        reconnects.append(client._connection_generation)
+        with client._disconnect_callback_lock:
+            client._connection_generation = 2
+            client.sock = replacement_sock
+            client._registered = True
+            client._disconnect_notified = False
+            client._last_heartbeat_send = 100.0
+            client._last_heartbeat_ack_send = 0.0
+            client._heartbeat_ack_missed = 1
+            client._heartbeat_quality.begin_generation(2)
+            client._heartbeat_quality.record_send(2, 100.0)
+
+    client.on_disconnect = lambda: disconnects.append("lost")
+    monkeypatch.setattr(client, "send_data", send_data)
+    monkeypatch.setattr(client, "_reconnect", reconnect)
+    monkeypatch.setattr(tcp_comm_mod.time, "time", fake_time)
+    monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _seconds: None)
+
+    client._heartbeat_loop(1, original_sock)
+
+    assert len(sent) == client.MAX_HEARTBEAT_ACK_MISSED
+    assert disconnects == ["lost"]
+    assert reconnects == [1]
+    assert client._connection_generation == 2
+    assert client.sock is replacement_sock
+    before = client.get_network_quality_snapshot()
+    assert before["generation"] == 2
+    assert before["pending_heartbeat"] is True
+    assert client._heartbeat_ack_missed == 1
+
+    # A delayed ACK from generation 1 is only a stale liveness observation;
+    # it cannot clear generation 2's pending heartbeat or revive old metrics.
+    clock[0] = 100.1
+    client._handle_heartbeat_ack(
+        {"data": {"t_send": 10.0}},
+        connection_generation=1,
+    )
+
+    after = client.get_network_quality_snapshot()
+    assert after["generation"] == 2
+    assert after["pending_heartbeat"] is True
+    assert after["sample_count"] == 0
+    assert client._heartbeat_ack_missed == 1
+    assert client.avg_rtt_ms == 0.0
+
+
+def test_stale_watchdog_does_not_reconnect_after_disconnect_callback_replaces_generation(
+    monkeypatch,
+):
+    client = TCPClient(
+        server_host="127.0.0.1", server_port=1, client_id="worker-stale-watch",
+    )
+    original_sock = object()
+    replacement_sock = object()
+    client.sock = original_sock
+    client._running = True
+    client._registered = True
+    client._connection_generation = 1
+    client._heartbeat_quality.begin_generation(1)
+    client._last_heartbeat_send = 10.0
+    client._last_heartbeat_ack_send = 0.0
+    client._heartbeat_ack_missed = client.MAX_HEARTBEAT_ACK_MISSED - 1
+    reconnects = []
+
+    def replace_generation():
+        with client._disconnect_callback_lock:
+            client._connection_generation = 2
+            client.sock = replacement_sock
+            client._registered = True
+            client._disconnect_notified = False
+            client._heartbeat_quality.begin_generation(2)
+
+    client.on_disconnect = replace_generation
+    monkeypatch.setattr(
+        client, "_reconnect", lambda: reconnects.append("unexpected"),
+    )
+    monkeypatch.setattr(
+        client,
+        "send_data",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("timed-out generation must not send another heartbeat")
+        ),
+    )
+
+    client._heartbeat_loop(1, original_sock)
+
+    assert reconnects == []
+    assert client._connection_generation == 2
+    assert client.sock is replacement_sock
+    assert client.is_registered is True

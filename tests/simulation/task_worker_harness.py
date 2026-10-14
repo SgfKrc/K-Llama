@@ -386,6 +386,7 @@ class TaskWorkerControlSimulationHarness:
             if not isinstance(outcome.get("error"), ProviderExecutionError):
                 raise RuntimeError("disconnect did not fail the pending attempt")
             late = {"content": "not-retained"}
+            late_code = ""
             try:
                 provider.handle_message(build_message(
                     "stage_result",
@@ -398,11 +399,18 @@ class TaskWorkerControlSimulationHarness:
                     message_id="msg_simv2disconnect_late", sent_at_ms=3_001, version=2,
                 ).snapshot())
             except WorkerProtocolError as exc:
-                late_code = exc.code
-            else:
-                raise RuntimeError("late result after disconnect was accepted")
+                late_code = exc.code          # 旧行为：同步拒绝
+            # ★ 票 7/票 8 起，断连终局之后迟到的 `stage_result` 不再抛
+            #   `WorkerProtocolError`，而是被**幂等吸收**
+            #   （实现侧 `_absorb_late_stage_response_locked`，记
+            #   `event=task_worker_late_stage_response_ignored terminal_kind=disconnect`）。
+            #   两种行为都算"未采纳"，故判据改为：迟到内容不得出现在 outcome
+            #   或 provider 状态里 —— 而不是要求它必须抛异常。
             provider.release(reservation.reservation_id)
             thread.join(_WAIT_SECONDS)
+            if ("not-retained" in repr(outcome)
+                    or "not-retained" in repr(self._provider_summary(provider))):
+                raise RuntimeError("late result after disconnect was retained")
             return {
                 "terminal_error_code": outcome["error"].code,
                 "rejected_codes": [late_code],

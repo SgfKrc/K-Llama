@@ -16,6 +16,7 @@ from task_graph import (
 )
 from task_provider import (
     LocalFullModelProvider,
+    ModelIdentity,
     ProviderBusy,
     ProviderNotFound,
     ProviderRegistrationError,
@@ -25,6 +26,49 @@ from task_provider import (
     StageAttempt,
     StageRequest,
 )
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("llama_cpp", "llama_cpp"),
+        ("llama.cpp", "llama_cpp"),
+        ("llama-cpp", "llama_cpp"),
+        ("llama", "llama_cpp"),
+        ("gguf", "llama_cpp"),
+        ("pytorch", "pytorch"),
+        ("torch", "pytorch"),
+    ],
+)
+def test_model_identity_normalizes_local_engine_aliases(alias, canonical):
+    identity = ModelIdentity(
+        model_id="model-a",
+        engine=alias,
+        format="gguf" if canonical == "llama_cpp" else "safetensors",
+        revision="rev-a",
+        sha256="a" * 64,
+    )
+
+    assert identity.engine == canonical
+    assert identity.snapshot()["engine"] == canonical
+
+
+@pytest.mark.parametrize("engine", ["island", "external_api", "speculative_assisted"])
+def test_model_identity_preserves_non_local_engine_identifiers(engine):
+    identity = ModelIdentity(
+        model_id="model-a", engine=engine, format="remote",
+        revision="rev-a", sha256="a" * 64,
+    )
+
+    assert identity.engine == engine
+
+
+def test_model_identity_rejects_unknown_engine_alias():
+    with pytest.raises(ValueError, match="engine is unsupported"):
+        ModelIdentity(
+            model_id="model-a", engine="llama_magic", format="gguf",
+            revision="rev-a", sha256="a" * 64,
+        )
 
 
 def _request(

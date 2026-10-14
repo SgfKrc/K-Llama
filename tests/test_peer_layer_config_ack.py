@@ -6,7 +6,7 @@
     if not expected.get("release") and "generation" in expected:
         … int(data["generation"]) == int(expected["generation"]) …
 
-而主节点写期望时 `self._layer_config_expected[node_id] = dict(config)`（`:390`）本就带
+而主节点 assignment registry 的 canonical expected contract 本就带
 `generation`。worker 的 `prepared` / `ready` ACK 若不带该字段 ⇒ 被
 `忽略缺少或无效 generation 的层配置 ACK` 整条丢弃 ⇒ 主节点每 60s
 `重发分层配置 attempt=N`（2026-09-30 三机验收实测刷到 attempt=8、9…），
@@ -39,6 +39,10 @@ def _peer(node_id: str = "client1"):
     peer._layer_config_lock = threading.RLock()
     peer._active_layer_config = None
     peer._local_pipeline_steps = {}
+    peer._latest_layer_config_generation = 0
+    peer._latest_layer_config_id = ""
+    peer._latest_layer_assignment_id = ""
+    peer._layer_assignment_identity_required = False
     sent: list = []
     peer._send_layer_config_ack = lambda payload: (sent.append(payload), True)[1]
     return peer, sent
@@ -69,6 +73,7 @@ def test_relay_prepared_ack_echoes_generation():
     peer._handle_layer_config({
         "start_layer": 8, "end_layer": 24,
         "node_id": "client1", "config_id": "cfg-1", "generation": 7,
+        "assignment_id": "asg-prepare",
         "engine": "relay_middle", "plan_id": "plan-1",
         "model_sha256": "deadbeef", "model_type": "qwen2",
         "phase": "prepare",
@@ -79,6 +84,7 @@ def test_relay_prepared_ack_echoes_generation():
     assert ack["status"] == "prepared"
     assert ack["phase"] == "prepare"
     assert ack["generation"] == 7, ack
+    assert ack["assignment_id"] == "asg-prepare"
     expected = {"config_id": "cfg-1", "generation": 7, "phase": "prepare"}
     assert _master_generation_gate(ack, expected) is True, ack
     # 反向：期望别的 generation 就该判失败 ⇒ 证明字段真的参与门闩。
@@ -113,6 +119,7 @@ def test_relay_commit_ack_is_ready_with_list_range():
     peer._handle_layer_config({
         "start_layer": 8, "end_layer": 24,
         "node_id": "client1", "config_id": "cfg-1", "generation": 7,
+        "assignment_id": "asg-commit",
         "engine": "relay_middle", "plan_id": "plan-1",
         "model_sha256": "deadbeef", "model_type": "qwen2",
         "phase": "commit",
@@ -123,6 +130,7 @@ def test_relay_commit_ack_is_ready_with_list_range():
     assert ack["status"] == "ready", ack
     assert ack["layer_range"] == [8, 24], ack          # 必须是 list，不是 "8-24"
     assert ack["generation"] == 7, ack
+    assert ack["assignment_id"] == "asg-commit"
     expected = {
         "config_id": "cfg-1", "generation": 7, "phase": "commit",
         "start_layer": 8, "end_layer": 24,
@@ -142,6 +150,76 @@ def test_prepare_stage_is_not_reported_as_ready():
         "phase": "prepare",
     })
     assert sent[0]["status"] == "prepared"
+    assert "assignment_id" not in sent[0]
+
+
+def test_prepare_commit_and_retry_reuse_the_same_assignment_id():
+    peer, sent = _peer()
+    payload = {
+        "start_layer": 8, "end_layer": 24,
+        "node_id": "client1", "config_id": "cfg-stable", "generation": 8,
+        "assignment_id": "asg-stable",
+        "engine": "relay_middle", "plan_id": "plan-stable",
+        "model_sha256": "deadbeef", "model_type": "qwen2",
+        "phase": "prepare",
+    }
+
+    peer._handle_layer_config(payload)
+    peer._handle_layer_config({**payload, "phase": "commit"})
+    peer._handle_layer_config({**payload, "phase": "commit"})
+
+    assert [ack["status"] for ack in sent] == ["prepared", "ready", "ready"]
+    assert {ack["assignment_id"] for ack in sent} == {"asg-stable"}
+    assert peer._latest_layer_assignment_id == "asg-stable"
+    assert peer._active_layer_config["assignment_id"] == "asg-stable"
+
+
+def test_same_generation_and_config_with_other_assignment_is_not_a_replay():
+    peer, sent = _peer()
+    current = {
+        "start_layer": 8, "end_layer": 24,
+        "node_id": "client1", "config_id": "cfg-current", "generation": 9,
+        "assignment_id": "asg-current",
+        "engine": "relay_middle", "model_sha256": "deadbeef",
+        "model_type": "qwen2", "phase": "commit",
+    }
+
+    peer._handle_layer_config(current)
+    peer._handle_layer_config({**current, "assignment_id": "asg-other"})
+
+    assert len(sent) == 1
+    assert sent[0]["assignment_id"] == "asg-current"
+    assert peer._latest_layer_assignment_id == "asg-current"
+    assert peer._active_layer_config["assignment_id"] == "asg-current"
+
+
+def test_identity_bearing_config_makes_missing_assignment_fail_closed():
+    peer, sent = _peer()
+    current = {
+        "start_layer": 8, "end_layer": 24,
+        "node_id": "client1", "config_id": "cfg-current", "generation": 10,
+        "assignment_id": "asg-current",
+        "engine": "relay_middle", "model_sha256": "deadbeef",
+        "model_type": "qwen2", "phase": "commit",
+    }
+
+    peer._handle_layer_config(current)
+    peer._handle_layer_config({
+        **current,
+        "config_id": "cfg-newer",
+        "generation": 11,
+        "assignment_id": None,
+    })
+    legacy_shaped = dict(current)
+    legacy_shaped.update(config_id="cfg-newer", generation=11)
+    legacy_shaped.pop("assignment_id")
+    peer._handle_layer_config(legacy_shaped)
+
+    assert len(sent) == 1
+    assert peer._latest_layer_config_generation == 10
+    assert peer._latest_layer_config_id == "cfg-current"
+    assert peer._latest_layer_assignment_id == "asg-current"
+    assert peer._active_layer_config["config_id"] == "cfg-current"
 
 
 class _HostInner:
@@ -160,6 +238,14 @@ class _HostInner:
 class _Host:
     def __init__(self) -> None:
         self._host = _HostInner()
+
+    def _ensure_device_profile(self):
+        """与 `inference_service/engine_host.py` 的同名方法对齐（惰性探测，未探测时为 None）。
+
+        `peer._handle_layer_config_locked`（peer.py:511）在解析层段模型加载时会取设备画像；
+        桩缺这个方法会让该分支直接 AttributeError，与实现脱节。
+        """
+        return None
 
 
 @pytest.fixture()
@@ -182,6 +268,7 @@ def test_layer_ready_ack_echoes_generation(_stub_model_sync):
     peer._handle_layer_config({
         "start_layer": 0, "end_layer": 8,
         "node_id": "client1", "config_id": "cfg-2", "generation": 11,
+        "assignment_id": "asg-ready",
         "model_id": "qwen2.5-0.5b-instruct", "model_sha256": "abc",
         "model_type": "qwen2", "total_layers": 24,
     })
@@ -191,6 +278,7 @@ def test_layer_ready_ack_echoes_generation(_stub_model_sync):
     assert ack["status"] == "ready"
     assert ack["layer_range"] == [0, 8], ack
     assert ack["generation"] == 11, ack
+    assert ack["assignment_id"] == "asg-ready"
     assert _master_generation_gate(ack, {"generation": 11}) is True, ack
     assert _master_generation_gate(ack, {"generation": 12}) is False
 
@@ -201,10 +289,12 @@ def test_layer_config_parse_error_ack_echoes_generation():
     peer._handle_layer_config({
         "start_layer": "not-an-int", "end_layer": 8,
         "node_id": "client1", "config_id": "cfg-parse", "generation": 13,
+        "assignment_id": "asg-parse",
     })
 
     assert sent[0]["status"] == "error"
     assert sent[0]["generation"] == 13
+    assert sent[0]["assignment_id"] == "asg-parse"
 
 
 def test_missing_assignment_error_ack_echoes_top_level_generation():
@@ -212,11 +302,13 @@ def test_missing_assignment_error_ack_echoes_top_level_generation():
 
     peer._handle_layer_config({
         "node_id": "client1", "config_id": "cfg-missing", "generation": 14,
+        "assignment_id": "asg-missing",
         "assignments": {},
     })
 
     assert sent[0]["status"] == "error"
     assert sent[0]["generation"] == 14
+    assert sent[0]["assignment_id"] == "asg-missing"
 
 
 def test_layer_load_error_ack_echoes_generation(_stub_model_sync):
@@ -226,16 +318,20 @@ def test_layer_load_error_ack_echoes_generation(_stub_model_sync):
     def fail_load(**_kwargs):
         raise RuntimeError("simulated load failure")
 
-    peer._host._host.load_model = fail_load
+    # ★ 桩要打在真实调用点上：peer 解析后调的是 `load_layer_range`（peer.py:531），
+    #   不是 `load_model` —— 打在旧名字上会让本测试静默变成"加载成功"。
+    peer._host._host.load_layer_range = fail_load
     peer._handle_layer_config({
         "start_layer": 0, "end_layer": 8,
         "node_id": "client1", "config_id": "cfg-load", "generation": 16,
+        "assignment_id": "asg-load-error",
         "model_id": "qwen2.5-0.5b-instruct", "model_sha256": "abc",
         "model_type": "qwen2", "total_layers": 24,
     })
 
     assert sent[0]["status"] == "error"
     assert sent[0]["generation"] == 16
+    assert sent[0]["assignment_id"] == "asg-load-error"
 
 
 def test_relay_unknown_phase_is_rejected_with_generation():
@@ -244,11 +340,13 @@ def test_relay_unknown_phase_is_rejected_with_generation():
     peer._handle_layer_config({
         "start_layer": 8, "end_layer": 24,
         "node_id": "client1", "config_id": "cfg-phase", "generation": 15,
+        "assignment_id": "asg-phase-error",
         "engine": "relay_middle", "phase": "commit-ish",
     })
 
     assert sent[0]["status"] == "error"
     assert sent[0]["generation"] == 15
+    assert sent[0]["assignment_id"] == "asg-phase-error"
     assert peer._active_layer_config is None
 
 

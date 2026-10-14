@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import base64
+from collections import OrderedDict
 import json
 import logging
 import socket
@@ -92,6 +94,21 @@ class _RegistrationRejected(Exception):
 # ================================================================
 HEADER_LEN = 4          # 长度头字节数（大端序 uint32）
 MAX_PACKET_SIZE = 256 * 1024 * 1024  # 最大包大小 256MB（特征张量可能较大）
+_CLIENT_SOCKET_TIMEOUT_SECONDS = HEARTBEAT_INTERVAL + 5
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def _protected_cluster_peer(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(host).split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(
+        address.is_loopback
+        or address in _TAILNET_V4
+        or address in _TAILNET_V6
+    )
 
 
 # ================================================================
@@ -106,7 +123,54 @@ def _get_cluster_secret() -> str:
         return os.environ.get("QLH_CLUSTER_SECRET", "")
 
 
-def build_auth_signature(node_id: str, timestamp: float = None) -> dict:
+def _get_cluster_secret_epoch() -> int:
+    try:
+        import config as cfg
+        value = getattr(
+            cfg,
+            "CLUSTER_SECRET_EPOCH",
+            os.environ.get("QLH_CLUSTER_SECRET_EPOCH", "1"),
+        )
+    except Exception:
+        value = os.environ.get("QLH_CLUSTER_SECRET_EPOCH", "1")
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+class RegistrationReplayGuard:
+    """Bounded nonce fence shared by every registration on one server."""
+
+    def __init__(self, *, max_entries: int = 4096) -> None:
+        self.max_entries = max(128, int(max_entries))
+        self._lock = threading.Lock()
+        self._seen: OrderedDict[tuple[int, str], float] = OrderedDict()
+
+    def consume(self, *, nonce: str, epoch: int, expires_at: float) -> bool:
+        now = time.time()
+        key = (int(epoch), str(nonce))
+        with self._lock:
+            while self._seen:
+                oldest, expiry = next(iter(self._seen.items()))
+                if expiry >= now and len(self._seen) < self.max_entries:
+                    break
+                self._seen.pop(oldest, None)
+            if key in self._seen:
+                return False
+            self._seen[key] = float(expires_at)
+            while len(self._seen) > self.max_entries:
+                self._seen.popitem(last=False)
+            return True
+
+
+def build_auth_signature(
+    node_id: str,
+    timestamp: float = None,
+    *,
+    nonce: str | None = None,
+    secret_epoch: int | None = None,
+) -> dict:
     """
     为注册消息构建 HMAC 认证签名。
 
@@ -116,15 +180,28 @@ def build_auth_signature(node_id: str, timestamp: float = None) -> dict:
     Returns:
         {"auth_timestamp": float, "auth_signature": str}
     """
-    ts = timestamp or time.time()
-    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    ts = time.time() if timestamp is None else float(timestamp)
+    auth_nonce = nonce or base64.urlsafe_b64encode(os.urandom(18)).decode("ascii").rstrip("=")
+    epoch = _get_cluster_secret_epoch() if secret_epoch is None else int(secret_epoch)
+    message = f"v2\n{node_id}\n{ts:.6f}\n{auth_nonce}\n{epoch}".encode("utf-8")
     sig = hmac.new(
         _get_cluster_secret().encode("utf-8"), message, hashlib.sha256
     ).hexdigest()
-    return {"auth_timestamp": ts, "auth_signature": sig}
+    return {
+        "auth_version": 2,
+        "auth_timestamp": ts,
+        "auth_nonce": auth_nonce,
+        "auth_secret_epoch": epoch,
+        "auth_signature": sig,
+    }
 
 
-def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
+def verify_auth_signature(
+    node_id: str,
+    auth_data: dict,
+    *,
+    replay_guard: RegistrationReplayGuard | None = None,
+) -> tuple:
     """
     验证 HMAC 认证签名。
 
@@ -142,13 +219,34 @@ def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
     if not auth_data:
         return False, "缺少认证签名（auth_timestamp/auth_signature）"
 
+    if not isinstance(auth_data, dict):
+        return False, "认证字段格式无效"
     ts = auth_data.get("auth_timestamp")
+    nonce = auth_data.get("auth_nonce", "")
+    epoch = auth_data.get("auth_secret_epoch")
     sig = auth_data.get("auth_signature", "")
 
     if ts is None:
         return False, "缺少时间戳（auth_timestamp）"
     if not sig:
         return False, "缺少签名（auth_signature）"
+    if auth_data.get("auth_version") != 2:
+        return False, "认证协议版本不受支持"
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(float(ts)):
+        return False, "认证时间戳必须是有限数值"
+    if not isinstance(nonce, str):
+        return False, "认证 nonce 无效"
+    try:
+        nonce_raw = base64.urlsafe_b64decode(nonce + ("=" * (-len(nonce) % 4)))
+    except (ValueError, TypeError):
+        return False, "认证 nonce 无效"
+    if len(nonce_raw) != 18:
+        return False, "认证 nonce 无效"
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        return False, "认证密钥代次无效"
+    current_epoch = _get_cluster_secret_epoch()
+    if epoch != current_epoch:
+        return False, "认证凭据已过期（cluster secret epoch mismatch）"
 
     secret = _get_cluster_secret()
     if not secret:
@@ -164,13 +262,20 @@ def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
         )
 
     # 2. HMAC 签名校验
-    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    message = f"v2\n{node_id}\n{float(ts):.6f}\n{nonce}\n{epoch}".encode("utf-8")
     expected = hmac.new(
         secret.encode("utf-8"), message, hashlib.sha256
     ).hexdigest()
 
     if not hmac.compare_digest(expected, sig):
         return False, "HMAC 签名不匹配 — 集群密钥不一致"
+
+    if replay_guard is not None and not replay_guard.consume(
+        nonce=nonce,
+        epoch=epoch,
+        expires_at=float(ts) + AUTH_TIMESTAMP_WINDOW,
+    ):
+        return False, "认证 nonce 已被消费（replay rejected）"
 
     return True, "ok"
 
@@ -196,6 +301,8 @@ class MessageType(str, Enum):
     INFER_RESULT = "infer_result"    # 主节点 → 从节点：推理结果回传
     INFER_CANCEL = "infer_cancel"    # 从节点 → 主节点：取消转发推理请求
     LAYER_CONFIG = "layer_config"    # 主节点 → 从节点：推送分层配置
+    MODEL_PREPARE = "model_prepare"  # native segment prepare / commit barrier
+    MODEL_SUPPLY = "model_supply"      # master-owned segment inventory / supply
     LAYER_CONFIG_ACK = "layer_config_ack"  # 从节点 → 主节点：模型层加载结果
     QWEN3_PIPELINE_DRY_RUN = "qwen3_pipeline_dry_run"
     QWEN3_PIPELINE_DRY_RUN_ACK = "qwen3_pipeline_dry_run_ack"
@@ -217,8 +324,8 @@ class MessageType(str, Enum):
     # 分布式流水线推理
     LAYER_FORWARD = "layer_forward"              # 主→从：执行层前向传播
     LAYER_RESULT = "layer_result"                # 从→主：层前向传播结果
-    CHAIN_FORWARD = "chain_forward"              # 从→从：链式直连层前向转发（P2 优化）
-    CHAIN_FORWARD_ACK = "chain_forward_ack"      # 从→主：链式转发每跳接收/错误确认
+    CHAIN_FORWARD = "chain_forward"              # 主→从：下一逻辑段层前向转发
+    CHAIN_FORWARD_ACK = "chain_forward_ack"      # 从→主：逻辑段接收/错误确认
     PIPELINE_DONE = "pipeline_done"              # 主→从：流水线任务完成（清理 KV 缓存）
     PIPELINE_ABORT = "pipeline_abort"            # 主→从：取消流水线任务
     PIPELINE_PAUSE = "pipeline_pause"            # 主→从：暂停流水线（二期协同抢占，协议预留）
@@ -236,6 +343,7 @@ class MessageType(str, Enum):
 FENCED_CONTROL_MESSAGE_TYPES = frozenset({
     MessageType.TASK_START.value, MessageType.TASK_STOP.value,
     MessageType.LAYER_CONFIG.value, MessageType.LAYER_CONFIG_ACK.value,
+    MessageType.MODEL_SUPPLY.value, MessageType.MODEL_PREPARE.value,
     MessageType.QWEN3_PIPELINE_DRY_RUN.value,
     MessageType.QWEN3_PIPELINE_DRY_RUN_ACK.value,
     MessageType.LAYER_WORKER_OPT_OUT.value, MessageType.LAYER_WORKER_OPT_IN.value,
@@ -1084,6 +1192,7 @@ class TCPServer:
         self._recv_threads: dict[str, threading.Thread] = {}
         self._registration_epochs: dict[str, int] = {}
         self._registration_context = threading.local()
+        self._auth_replay_guard = RegistrationReplayGuard()
         self.on_message: Optional[Callable] = None    # 消息回调
         self.on_disconnect: Optional[Callable] = None # 断连回调
         # Called only after a successful REGISTER ACK has been written to the
@@ -1286,6 +1395,51 @@ class TCPServer:
         except OSError:
             pass
 
+    def disconnect_all_clients(
+        self,
+        reason: str,
+        *,
+        before_disconnect: Callable[[], Any] | None = None,
+    ) -> tuple[Any, int]:
+        """Atomically fence credentials and detach every authenticated peer."""
+        with self._clients_lock:
+            action_result = before_disconnect() if before_disconnect is not None else None
+            client_items = list(self.clients.items())
+            pending_items = list(self._pending_registrations.items())
+            self.clients.clear()
+            self._pending_registrations.clear()
+
+        unique_connections: dict[int, ClientConn] = {}
+        for _client_id, client in client_items + pending_items:
+            unique_connections[id(client.sock)] = client
+        for client in unique_connections.values():
+            try:
+                client.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.sock.close()
+            except OSError:
+                pass
+
+        if self.on_disconnect:
+            for client_id, _client in client_items:
+                try:
+                    self.on_disconnect(client_id)
+                except Exception:
+                    logger.error(
+                        "disconnect callback failed during credential cutover: client=%s reason=%s",
+                        client_id,
+                        reason,
+                        exc_info=True,
+                    )
+        logger.warning(
+            "disconnected all cluster TCP clients: count=%s reason=%s",
+            len(unique_connections),
+            reason,
+        )
+        return action_result, len(unique_connections)
+
     # ---- Accept 循环 ----
 
     def _accept_loop(self) -> None:
@@ -1463,7 +1617,6 @@ class TCPServer:
                     registration_confirmed_now
                     and self.on_registration_confirmed is not None
                     and current is not None
-                    and current.node_type != "pipeline_peer"
                 ):
                     try:
                         self.on_registration_confirmed(client_id)
@@ -1508,8 +1661,7 @@ class TCPServer:
             if client_id in self._recv_threads:
                 del self._recv_threads[client_id]
             # 通知上层断连（仅对本线程实际移除的已注册连接通知一次）
-            if (self.on_disconnect and removed is not None
-                    and removed.node_type != "pipeline_peer"):
+            if self.on_disconnect and removed is not None:
                 try:
                     self.on_disconnect(client_id)
                 except Exception as e:
@@ -1551,9 +1703,23 @@ class TCPServer:
             advertised_port = SERVER_PORT
         advertised_address = format_host_port(advertised_host, advertised_port)
 
+        allow_unprotected = os.environ.get(
+            "QLH_ALLOW_UNPROTECTED_CLUSTER_TCP", ""
+        ).strip().lower() in {"1", "true", "yes"}
+        if not allow_unprotected and not _protected_cluster_peer(addr[0]):
+            reason = (
+                "生产集群 TCP 只允许 loopback/Tailnet 受保护路径；"
+                "直接 LAN 明文链路需显式不安全开关"
+            )
+            self._send_register_ack(conn, "rejected", reason=reason)
+            raise _RegistrationRejected(reason)
+
         # ★ 阶段 7：HMAC 集群认证
+        auth_data = data.get("auth", {})
         auth_ok, auth_reason = verify_auth_signature(
-            client_id, data.get("auth", {})
+            client_id,
+            auth_data,
+            replay_guard=self._auth_replay_guard,
         )
         if not auth_ok:
             logger.error(
@@ -1598,6 +1764,21 @@ class TCPServer:
             except OSError as e:
                 logger.debug(f"注册拒绝 ACK 发送失败: {e}", exc_info=True)
             raise _RegistrationRejected("从节点不能声明 role='master'")
+        if node_type == "pipeline_peer":
+            reason = "pipeline_peer 已禁用；worker 数据连接必须以 master 为中心"
+            logger.error(
+                "⛔ 拒绝注册: node_type='pipeline_peer' 已禁用，来源 %s:%s",
+                addr[0], addr[1],
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": reason,
+            })
+            try:
+                conn.sendall(ack)
+            except OSError as e:
+                logger.debug("pipeline_peer 拒绝 ACK 发送失败: %s", e, exc_info=True)
+            raise _RegistrationRejected(reason)
         # Android 节点只能作为 client
         if node_type == "android" and role == "master":
             logger.error(
@@ -1640,6 +1821,16 @@ class TCPServer:
         # but the old socket is closed only after leaving the lock.
         previous = None
         with self._clients_lock:
+            authenticated_epoch = int(auth_data.get("auth_secret_epoch", 0) or 0)
+            if authenticated_epoch != _get_cluster_secret_epoch():
+                reason = "cluster credential rotated during registration"
+                try:
+                    self._send_register_ack(
+                        conn, "rejected", client_id=client_id, reason=reason,
+                    )
+                except OSError:
+                    pass
+                raise _RegistrationRejected(reason)
             previous = self.clients.get(client_id)
             if previous is not None and not previous.registration_confirmed:
                 reason = "该节点已有注册正在确认"
@@ -1827,8 +2018,7 @@ class TCPServer:
                         pass
                     removed = self._pop_client_if_same(cid, conn)
                     # 通知上层（仅本线程实际移除连接时通知一次）
-                    if (removed is not None and self.on_disconnect
-                            and removed.node_type != "pipeline_peer"):
+                    if removed is not None and self.on_disconnect:
                         try:
                             self.on_disconnect(cid)
                         except Exception as e:
@@ -1898,6 +2088,14 @@ class TCPServer:
 class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
+    # A healthy peer must answer within at least one socket receive-timeout
+    # window.  Counting heartbeat periods keeps the watchdog deterministic
+    # when recv() repeatedly returns socket.timeout on a half-open connection.
+    MAX_HEARTBEAT_ACK_MISSED = max(
+        3,
+        math.ceil(_CLIENT_SOCKET_TIMEOUT_SECONDS / HEARTBEAT_INTERVAL),
+    )
+
     def __init__(self, server_host: str = None, server_port: int = None,
                  client_id: str = None, role: str = None,
                  node_type: str = "pc",
@@ -1931,6 +2129,8 @@ class TCPClient:
         self.last_register_error: str = ""
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
+        self._last_heartbeat_ack_send: float = 0.0
+        self._heartbeat_ack_missed: int = 0
         self._heartbeat_quality = HeartbeatQualityWindow()
         self._connect_lock = threading.Lock()   # Phase 5.4: 防止并发 connect()
         self._send_lock = threading.Lock()      # 心跳和推理消息共享同一 TCP 字节流
@@ -2057,7 +2257,7 @@ class TCPClient:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(family, socket.SOCK_STREAM)
-                sock.settimeout(HEARTBEAT_INTERVAL + 5)
+                sock.settimeout(_CLIENT_SOCKET_TIMEOUT_SECONDS)
                 sock.connect(sockaddr)
                 return sock
             except OSError as e:
@@ -2222,6 +2422,8 @@ class TCPClient:
                         connection_sock = self.sock
                         self._disconnect_notified = False
                         self._last_heartbeat_send = 0.0
+                        self._last_heartbeat_ack_send = 0.0
+                        self._heartbeat_ack_missed = 0
                         self._heartbeat_quality.begin_generation(connection_generation)
                         self._transport_runtime_call(
                             "connected", connection_generation,
@@ -2461,15 +2663,22 @@ class TCPClient:
             if connection_generation is None
             else connection_generation
         )
-        rtt_ms = self._heartbeat_quality.record_ack(generation, t_echo, t_now)
-        if rtt_ms is None:
-            return
+        with self._disconnect_callback_lock:
+            if generation != self._connection_generation:
+                return
+            rtt_ms = self._heartbeat_quality.record_ack(
+                generation, t_echo, t_now,
+            )
+            if rtt_ms is None:
+                return
+            self._last_heartbeat_ack_send = float(t_echo)
+            self._heartbeat_ack_missed = 0
 
-        # 指数加权滑动平均（α=0.1），平滑网络抖动
-        if self.avg_rtt_ms > 0:
-            self.avg_rtt_ms = 0.9 * self.avg_rtt_ms + 0.1 * rtt_ms
-        else:
-            self.avg_rtt_ms = rtt_ms
+            # 指数加权滑动平均（α=0.1），平滑网络抖动
+            if self.avg_rtt_ms > 0:
+                self.avg_rtt_ms = 0.9 * self.avg_rtt_ms + 0.1 * rtt_ms
+            else:
+                self.avg_rtt_ms = rtt_ms
 
     def _heartbeat_loop(
         self,
@@ -2486,17 +2695,50 @@ class TCPClient:
                     break
                 if self.sock is not connection_sock:
                     break
-            try:
-                self._last_heartbeat_send = time.time()
                 generation = (
                     self._connection_generation
                     if connection_generation is None
                     else connection_generation
                 )
-                self._heartbeat_quality.record_send(
-                    generation,
-                    self._last_heartbeat_send,
+                if (
+                    self._last_heartbeat_send > 0
+                    and self._last_heartbeat_ack_send
+                    != self._last_heartbeat_send
+                ):
+                    self._heartbeat_ack_missed += 1
+                else:
+                    self._heartbeat_ack_missed = 0
+                heartbeat_ack_timed_out = (
+                    self._heartbeat_ack_missed
+                    >= self.MAX_HEARTBEAT_ACK_MISSED
                 )
+                if not heartbeat_ack_timed_out:
+                    self._last_heartbeat_send = time.time()
+                    self._heartbeat_quality.record_send(
+                        generation,
+                        self._last_heartbeat_send,
+                    )
+
+            if heartbeat_ack_timed_out:
+                logger.warning(
+                    "heartbeat ACK timed out: client=%s generation=%s "
+                    "missed=%s; reconnecting",
+                    self.client_id, generation, self._heartbeat_ack_missed,
+                )
+                self._notify_disconnect(
+                    generation,
+                    connection_sock=connection_sock,
+                )
+                with self._disconnect_callback_lock:
+                    should_reconnect = bool(
+                        self._running
+                        and generation == self._connection_generation
+                        and self.sock is connection_sock
+                    )
+                if should_reconnect:
+                    self._reconnect()
+                break
+            try:
                 heartbeat_data = {"t_send": self._last_heartbeat_send}
                 if self.avg_rtt_ms > 0:
                     heartbeat_data["rtt_ms"] = round(self.avg_rtt_ms, 3)

@@ -9,6 +9,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+try:
+    from .task_provider import canonical_model_engine
+except ImportError:  # pragma: no cover - top-level import in worker bundles
+    from task_provider import canonical_model_engine
+
 
 PROTOCOL_NAME = "qlh.task_worker"
 PROTOCOL_VERSION = 3
@@ -60,6 +65,9 @@ MESSAGE_TYPES = frozenset({
     "stage_cancelled",
     #: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的有序分片（v3 起）。
     "stage_chunk",
+    #: ★ 2026-10-11（三机实测）：回程分片（worker → master）。见 `_PAYLOAD_FIELDS`
+    #: 里同名字段的说明；只对声明 `stage_chunked_output` 的对端使用。
+    "stage_result_chunk",
 })
 
 _MESSAGE_ID = re.compile(r"^msg_[A-Za-z0-9_-]{8,96}$")
@@ -106,7 +114,12 @@ _LAYER_FORWARD_OFFER_FIELDS = {
 #: ⚠️ **不能**并入 `_LAYER_FORWARD_OFFER_FIELDS`：那里的字段集合是**精确**校验（缺失即
 #: `field_mismatch`）⇒ 会把可选字段变成必填、破坏既有对端（实测踩到）。可选字段在
 #: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
-_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
+_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions", "prepare_identity"}
+
+# Request deadlines are request-scoped and must not be encoded as worker
+# ownership leases. The field is optional so peers without an end-to-end
+# deadline continue to emit the existing stage_offer shape.
+_STAGE_OFFER_OPTIONAL_FIELDS = {"request_deadline_ms"}
 
 #: `middle_channel` 的允许值（协议两侧必须同集合）。
 #: * `extract_hidden` —— `llama_get_embeddings_ith` 通道，返回 `output_norm(H)`（旧默认）；
@@ -121,6 +134,8 @@ _LAYER_ARTIFACT_DIAGNOSTIC_CODES = frozenset({
     "source_digest_mismatch",
     "artifact_missing",
     "artifact_digest_mismatch",
+    "fallback_storage_unavailable",
+    "artifact_ambiguous",
 })
 _LAYER_ARTIFACT_DIAGNOSTIC_MAX = 32
 
@@ -182,6 +197,15 @@ _PAYLOAD_FIELDS = {
     #: `payload_b64` 是**原始字节**的 base64；`payload_sha256` 是这些字节的摘要，
     #: 使接收端能在装配前逐片校验（装配完仍以 `stage_offer.hidden_sha256` 兜底）。
     "stage_chunk": _IDENTITY_FIELDS | {
+        "provider_id", "chunk_index", "chunk_count", "payload_b64",
+        "payload_sha256", "total_bytes",
+    },
+    #: ★ 2026-10-11（ROG+Y700+本机三机实测）：**回程**分片。
+    #: `stage_result.output.hidden_out_f32` 超过单帧预算时，worker 先发 N 条本类型，
+    #: 再发一条引用它们的 `stage_result`（`output.hidden_out_ref`）。字段与 `stage_chunk`
+    #: **同形**，以便复用两侧既有装配器；仅对在 HELLO 里声明 `stage_chunked_output`
+    #: 的对端使用，旧对端行为不变。
+    "stage_result_chunk": _IDENTITY_FIELDS | {
         "provider_id", "chunk_index", "chunk_count", "payload_b64",
         "payload_sha256", "total_bytes",
     },
@@ -407,15 +431,22 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
     # "island": TP 孤岛引擎（网关整请求转发，指纹为端点摘要）
     # "external_api": 外部推理服务（路线 B，指纹为外部端点摘要）
     # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify）
-    if model["engine"] not in _SUPPORTED_ENGINES:
+    engine = _require_string(
+        model["engine"], f"{field}.engine", max_length=64,
+    )
+    try:
+        engine = canonical_model_engine(engine)
+    except ValueError as exc:
         raise _error(
             "invalid_model_identity", f"{field}.engine",
             "model engine is unsupported",
-        )
+        ) from exc
     _require_string(model["format"], f"{field}.format", pattern=_SAFE_ID)
     _require_string(model["revision"], f"{field}.revision", pattern=_SAFE_ID)
     _require_string(model["sha256"], f"{field}.sha256", pattern=_SHA256)
-    return model
+    normalized = dict(model)
+    normalized["engine"] = engine
+    return normalized
 
 
 def _validate_layer_budget(value: Any) -> None:
@@ -688,8 +719,21 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             expected_artifact_fields = {
                 "layer_range", "segment_mode", "model_id", "artifact_sha256",
             }
+            if "layer_weight_bytes" in artifact:
+                expected_artifact_fields.add("layer_weight_bytes")
             if "source_model_sha256" in artifact:
                 expected_artifact_fields.add("source_model_sha256")
+            contract_fields = {
+                "source_model_id", "hidden_size", "tokenizer_sha256",
+            }
+            present_contract_fields = contract_fields.intersection(artifact)
+            if present_contract_fields and present_contract_fields != contract_fields:
+                raise _error(
+                    "invalid_capabilities", item_field,
+                    "source_model_id, hidden_size, and tokenizer_sha256 "
+                    "must be declared together",
+                )
+            expected_artifact_fields.update(present_contract_fields)
             _require_exact_fields(artifact, expected_artifact_fields, item_field)
             layer_range = artifact["layer_range"]
             if (
@@ -706,6 +750,17 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                     "invalid_capabilities", f"{item_field}.layer_range",
                     "layer_range must be a non-empty [start, end) integer range",
                 )
+            if "layer_weight_bytes" in artifact:
+                sizes = artifact["layer_weight_bytes"]
+                if not isinstance(sizes, list) or len(sizes) != layer_range[1] - layer_range[0]:
+                    raise _error(
+                        "invalid_capabilities", f"{item_field}.layer_weight_bytes",
+                        "layer_weight_bytes must match the segment span",
+                    )
+                for offset, size in enumerate(sizes):
+                    _require_int(
+                        size, f"{item_field}.layer_weight_bytes[{offset}]", minimum=1,
+                    )
             mode = _require_string(
                 artifact["segment_mode"], f"{item_field}.segment_mode",
             )
@@ -726,6 +781,22 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 _require_string(
                     artifact["source_model_sha256"],
                     f"{item_field}.source_model_sha256",
+                    pattern=_SHA256,
+                )
+            if present_contract_fields:
+                _require_string(
+                    artifact["source_model_id"],
+                    f"{item_field}.source_model_id",
+                    pattern=_SAFE_ID,
+                )
+                _require_int(
+                    artifact["hidden_size"],
+                    f"{item_field}.hidden_size",
+                    minimum=1,
+                )
+                _require_string(
+                    artifact["tokenizer_sha256"],
+                    f"{item_field}.tokenizer_sha256",
                     pattern=_SHA256,
                 )
             artifact_ranges.append((layer_range[0], layer_range[1]))
@@ -760,14 +831,27 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             "payload.capabilities.stage_chunked_input",
         )
     engines = capabilities["engines"]
-    if not isinstance(engines, list) or not engines or any(
-        value not in _SUPPORTED_ENGINES
-        for value in engines
-    ):
+    if not isinstance(engines, list) or not engines:
         raise _error(
             "invalid_capabilities", "payload.capabilities.engines",
             "engines must contain supported engine identifiers",
         )
+    canonical_engines = []
+    for index, value in enumerate(engines):
+        try:
+            engine = canonical_model_engine(_require_string(
+                value,
+                f"payload.capabilities.engines[{index}]",
+                max_length=64,
+            ))
+        except (ValueError, WorkerProtocolError) as exc:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.engines",
+                "engines must contain supported engine identifiers",
+            ) from exc
+        canonical_engines.append(engine)
+    engines = canonical_engines
+    capabilities["engines"] = engines
     if len(engines) != len(set(engines)):
         raise _error(
             "invalid_capabilities", "payload.capabilities.engines",
@@ -783,6 +867,7 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     for index, model in enumerate(models):
         field = f"payload.capabilities.models[{index}]"
         model = _validate_model_identity(model, field)
+        models[index] = model
         model_ids.append(model["model_id"])
         if model["engine"] not in engines:
             raise _error(
@@ -813,6 +898,14 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                     "invalid_capabilities",
                     f"payload.capabilities.layer_artifacts[{index}].artifact_sha256",
                     "layer artifact digest must match its advertised model identity",
+                )
+            if (advertised_model.get("engine"), advertised_model.get("format")) not in {
+                ("llama_cpp", "gguf"), ("pytorch", "safetensors"),
+            }:
+                raise _error(
+                    "invalid_capabilities",
+                    f"payload.capabilities.layer_artifacts[{index}].model_id",
+                    "layer artifact identity must reference a supported engine/format pair",
                 )
     max_concurrency = _require_int(
         capabilities["max_concurrency"],
@@ -906,6 +999,8 @@ def _validate_payload(
         else _PAYLOAD_FIELDS
     )
     required = fields[message_type]
+    if message_type == "stage_offer" and isinstance(payload, Mapping):
+        required = required | (_STAGE_OFFER_OPTIONAL_FIELDS & set(payload))
     # ★ 2026-09-20（v3）：层段字段**按 `stage_type` 动态并入**。
     #   只有声明 `layer_forward` 的 `stage_offer` 才要求 hidden 交接字段；
     #   非层段 stage 携带这些字段会被精确字段校验拒绝（既不漏也不多）。
@@ -985,6 +1080,11 @@ def _validate_payload(
             payload["lease_expires_at_ms"], "payload.lease_expires_at_ms",
             minimum=1,
         )
+        if "request_deadline_ms" in payload:
+            _require_int(
+                payload["request_deadline_ms"], "payload.request_deadline_ms",
+                minimum=1,
+            )
         root_input = _require_object(payload["root_input"], "payload.root_input")
         dependencies = _require_object(
             payload["dependencies"], "payload.dependencies"
@@ -1038,6 +1138,12 @@ def _validate_payload(
                 )
             # ★ 2026-09-23：`middle_channel` 可选；一旦出现必须落在允许集合内（fail-closed）。
             #   字段不存在 = `extract_hidden`（旧行为），因此不破坏既有对端。
+            if "prepare_identity" in payload:
+                from worker_prepare_contract import validate_stage_identity, WorkerPrepareError
+                try:
+                    validate_stage_identity(payload["prepare_identity"])
+                except WorkerPrepareError as exc:
+                    raise _error(exc.reason_code, "payload.prepare_identity", str(exc)) from exc
             if "middle_channel" in payload:
                 channel = _require_string(
                     payload["middle_channel"], "payload.middle_channel",
@@ -1076,7 +1182,7 @@ def _validate_payload(
                 "layer fields are only valid for layer_forward",
             )
         if version >= 2:
-            _validate_model_identity(
+            payload["model_identity"] = _validate_model_identity(
                 payload["model_identity"], "payload.model_identity",
             )
     elif message_type == "stage_accept":
@@ -1122,10 +1228,12 @@ def _validate_payload(
             max_length=64,
         )
         _require_bool(payload["retryable"], "payload.retryable")
-    elif message_type == "stage_chunk":
+    elif message_type in {"stage_chunk", "stage_result_chunk"}:
         # ★ 2026-10-07（DIST-NEXT-2b）：分片的形状与硬上限。顺序语义（不得乱序、
         #   不得重复、集齐才装配）由接收端状态机 `task_worker_chunks.StageChunkAssembler`
         #   保证 —— 协议层只拒绝「单条就不合法」的分片。
+        # ★ 2026-10-11：**回程**分片 `stage_result_chunk` 与输入分片**同形**，因此共用本
+        #   分支的全部约束（片数/单片/总字节上限、摘要格式、v3 起支持）。
         if version < 3:
             raise _error(
                 "unsupported_message_type", "message_type",

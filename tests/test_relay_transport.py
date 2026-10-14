@@ -5,13 +5,16 @@ from __future__ import annotations
 import socket
 import struct
 import threading
+import time
 
 import pytest
 
 from src.relay_transport import (
     RELAY_QUANT_CODES,
+    RELAY_TRANSPORT_ERROR,
     RELAY_WIRE_MAGIC,
     RELAY_WIRE_VERSION,
+    REQUEST_DEADLINE_EXCEEDED,
     RelayFrame,
     RelayFrameKind,
     RelayProtocolError,
@@ -59,6 +62,135 @@ def test_frame_round_trip_over_partial_socket_reads():
         right.close()
 
     assert received == frame
+
+
+@pytest.mark.parametrize(
+    ("request_deadline", "expected_error"),
+    [
+        (True, REQUEST_DEADLINE_EXCEEDED),
+        (False, RELAY_TRANSPORT_ERROR),
+    ],
+)
+def test_client_uses_one_absolute_deadline_across_partial_reads(
+    request_deadline: bool, expected_error: str
+):
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = int(listener.getsockname()[1])
+    server_errors: list[BaseException] = []
+
+    def serve_slow_response() -> None:
+        connection, _ = listener.accept()
+        try:
+            recv_frame(connection)
+            response = struct.pack(
+                "!4sBBHIIQ",
+                RELAY_WIRE_MAGIC,
+                RELAY_WIRE_VERSION,
+                int(RelayFrameKind.TOKEN),
+                0,
+                0,
+                1,
+                4,
+            ) + struct.pack("<i", 123)
+            for value in response:
+                connection.sendall(bytes([value]))
+                time.sleep(0.08)
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            server_errors.append(exc)
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=serve_slow_response, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 0.4
+    client = RelayTcpClient(
+        "127.0.0.1",
+        port,
+        n_embd=2,
+        timeout=1.0 if request_deadline else 0.4,
+        deadline_monotonic=deadline if request_deadline else None,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(RelayProtocolError, match=expected_error):
+            client.request_token(
+                b"\x00" * expected_hidden_bytes(1, 2),
+                n_tokens=1,
+            )
+    finally:
+        listener.close()
+        thread.join(timeout=2)
+
+    assert time.monotonic() - started < 0.8
+    assert client._closed is True
+    assert server_errors
+
+
+def test_protocol_failure_marks_transport_session_non_reusable():
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = int(listener.getsockname()[1])
+
+    def serve_bad_sequence() -> None:
+        connection, _ = listener.accept()
+        try:
+            recv_frame(connection)
+            send_frame(
+                connection,
+                RelayFrame(
+                    RelayFrameKind.TOKEN,
+                    99,
+                    n_tokens=1,
+                    payload=struct.pack("<i", 7),
+                ),
+            )
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=serve_bad_sequence, daemon=True)
+    thread.start()
+    client = RelayTcpClient("127.0.0.1", port, n_embd=2, timeout=1.0)
+    try:
+        with pytest.raises(RelayProtocolError, match="response_sequence_mismatch"):
+            client.request_token(
+                b"\x00" * expected_hidden_bytes(1, 2), n_tokens=1
+            )
+    finally:
+        listener.close()
+        thread.join(timeout=2)
+
+    assert client._closed is True
+    with pytest.raises(RelayProtocolError, match="client_closed"):
+        client.request_token(
+            b"\x00" * expected_hidden_bytes(1, 2), n_tokens=1
+        )
+
+
+def test_close_grace_is_an_absolute_short_budget():
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = int(listener.getsockname()[1])
+
+    def ignore_close_ack() -> None:
+        connection, _ = listener.accept()
+        try:
+            recv_frame(connection)
+            time.sleep(0.5)
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=ignore_close_ack, daemon=True)
+    thread.start()
+    client = RelayTcpClient("127.0.0.1", port, n_embd=2, timeout=5.0)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RelayProtocolError, match=RELAY_TRANSPORT_ERROR):
+            client.close(grace_timeout=0.1)
+        elapsed = time.monotonic() - started
+    finally:
+        listener.close()
+        thread.join(timeout=2)
+
+    assert elapsed < 0.4
+    assert client._closed is True
 
 
 @pytest.mark.parametrize(

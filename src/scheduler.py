@@ -527,9 +527,9 @@ class PipelineQueue:
         if event is None:
             return {"status": "unknown", "error": f"未知任务: {task_id}"}
 
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"status": "timeout", "error": f"任务 {task_id} 超时 ({timeout}s)"}
             if event.wait(timeout=min(0.1, remaining)):
@@ -965,6 +965,11 @@ class Scheduler(
     - 流水线请求队列（PipelineQueue）
     """
 
+    def set_distributed_inference_enabled(self, enabled: bool) -> dict:
+        if not enabled:
+            self._cleanup_task_worker_prepare("local_inference_mode")
+        return super().set_distributed_inference_enabled(enabled)
+
     def _scheduler_facade_global(self, name: str):
         return globals()[name]
 
@@ -1009,6 +1014,12 @@ class Scheduler(
         # 否则从未连接过主节点的实例在错误路径直接访问
         # self._tcp_client 会抛 AttributeError 而不是优雅返回 False
         self._tcp_client = None
+        from model_supply import ModelSupplyCoordinator
+        from model_supply_worker import ModelSupplyWorker
+        self._model_supply_worker = ModelSupplyWorker(self)
+        from worker_prepare import WorkerPrepareController
+        self._worker_prepare = WorkerPrepareController(self)
+        self._model_supply = ModelSupplyCoordinator(self)
 
         # 从节点：等待主节点推理结果
         self._client_pending_results: dict = {}
@@ -1033,19 +1044,11 @@ class Scheduler(
         self._nodes_lock = threading.RLock()    # Phase 2.1: 保护 self.nodes 并发读写（可重入）
         self._kv_cache_lock = threading.Lock()   # Phase 2.2: 保护 _kv_cache 并发读写
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
-        # 节点只有完成模型层加载并返回当前 config_id 的 ACK 后才进入该集合。
-        # 保留旧字段名，避免状态接口和测试夹具发生无关改动。
-        # ★ 2026-10-07（DIST-NEXT-3）：`_layer_config_pushed` 已**降级为派生视图**
-        #   （property，见 `scheduler_pipeline`）—— 事实源只有 `_worker_assignments`。
-        self._layer_config_expected: dict[str, dict] = {}
-        self._layer_config_acks: dict[str, dict] = {}
         self._layer_config_retry_state: dict[str, dict] = {}
-        # ★ 2026-10-07（DIST-NEXT-3）：assignment 的**权威视图**（`assignment_id` +
-        #   `config_id` + connection generation + lease + phase + 单一 reason code）。
-        #   本步**只写不读**（读路径后续切换）⇒ 零行为变化；它是「多集合交叉判定」
-        #   （pushed/expected/acks/transaction/recovery）的替代方向。
+        # ASSIGN-SOURCE-01: active wire contract, receipt and lifecycle live in
+        # one registry. `_layer_config_pushed` remains a derived property.
         self._worker_assignments = WorkerAssignmentRegistry()
-        self._layer_config_lock = threading.Lock()
+        self._layer_config_lock = threading.RLock()
         self._layer_config_push_lock = threading.Lock()
         # Model transitions temporarily invalidate the local descriptor. Do
         # not publish a transient release from concurrent status callbacks.
@@ -1063,10 +1066,16 @@ class Scheduler(
         self._layer_config_receive_sequence = 0
         self._latest_layer_config_receive_sequence = 0
         self._latest_layer_config_generation = 0
+        self._latest_layer_assignment_id = ""
         self._pipeline_worker_reserved = False
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
         self._pipeline_load_transaction: Optional[dict] = None
+        # Terminal model-runtime cleanup is independent from the one mutable
+        # load transaction.  A disconnected worker may keep an old candidate
+        # alive while later transactions continue on the remaining topology;
+        # retain that debt until the exact abort/finalize receipt arrives.
+        self._pipeline_model_cleanup_ledger: dict[str, dict] = {}
         # A persisted active transaction must be republished after a master
         # restart before distributed requests are admitted.
         self._pipeline_recovery_pending = False
@@ -1100,6 +1109,7 @@ class Scheduler(
         self._gemma4_sidecar_python_override: Optional[str] = None
         self._model_runtime_contract_lock = threading.RLock()
         self._active_pipeline_capacity_plan: Optional[dict] = None
+        self._pipeline_assignment_rollbacks: dict[str, dict] = {}
         # Recovery is control-plane state. A candidate is never published to
         # an executor before its capacity, artifact, and epoch gates pass.
         self._pipeline_reshard_coordinator: Optional[PipelineReshardCoordinator] = None
@@ -1111,8 +1121,6 @@ class Scheduler(
         self._local_pipeline_cancelled: set[str] = set()
         self._local_pipeline_cancelled_order: collections.deque = collections.deque()
         self._local_pipeline_steps: dict[str, int] = {}
-        self._chain_clients: dict[str, object] = {}
-        self._chain_clients_lock = threading.Lock()
         # Optional Transport v2 runtime factory.  It is unset by default so
         # all existing TCP clients keep the Legacy wire path unchanged.
         self._transport_runtime_factory: Optional[Callable[[str], object]] = None
@@ -1234,6 +1242,7 @@ class Scheduler(
                 return
             self._running = True
         try:
+            self._worker_prepare.reopen()
             self._start_impl(host=host, port=port)
         except Exception:
             try:
@@ -1310,6 +1319,8 @@ class Scheduler(
                 decision.get("accepted"), decision.get("state"),
                 decision.get("runtime_role"), decision.get("reason"),
             )
+            if runtime is not None:
+                runtime.start_lease_renewal(self._auto_role_controller)
 
         self.init_nodes()
         if self._effective_role() == "master":
@@ -1525,8 +1536,12 @@ class Scheduler(
 
     def stop(self) -> None:
         """停止调度器"""
+        self._cleanup_task_worker_prepare("worker_prepare_stopped", close=True)
         self._startup_cancel_event.set()
         self._running = False
+        runtime = getattr(self, "_auto_role_runtime", None)
+        if runtime is not None:
+            runtime.stop_lease_renewal()
         controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             try:
@@ -1541,14 +1556,6 @@ class Scheduler(
                 tcp_client.disconnect()
             except Exception:
                 logger.debug("停止主节点连接失败", exc_info=True)
-        with self._chain_clients_lock:
-            chain_clients = list(self._chain_clients.values())
-            self._chain_clients.clear()
-        for chain_client in chain_clients:
-            try:
-                chain_client.disconnect()
-            except Exception:
-                logger.debug("停止链式连接失败", exc_info=True)
         if self._tcp_server:
             self._tcp_server.stop()
         logger.info("调度器已停止")
@@ -1625,16 +1632,14 @@ class Scheduler(
         config.NODE_ROLE。
         """
         configured_role = NODE_ROLE
+        controller = getattr(self, "_auto_role_controller", None)
+        if configured_role == "auto":
+            return controller.runtime_role if controller is not None else "client"
         override = getattr(self, '_role_override', None)
         if override:
             return override
-        controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             return controller.runtime_role
-        if configured_role == "auto":
-            # Before the composition root has attached the controller, auto
-            # mode has no authority and must present as a read-only client.
-            return "client"
         return configured_role
 
     # ================================================================
@@ -1936,7 +1941,10 @@ class Scheduler(
                     logger.debug("读取当前模型层数失败: %s", config_path, exc_info=True)
         return TOTAL_MODEL_LAYERS
 
-    def _get_active_pipeline_model_info(self) -> dict:
+    def _get_active_pipeline_model_info(
+        self, *, descriptor: Optional[dict] = None,
+        model_path: str = "", quant_type: str = "",
+    ) -> dict:
         """Describe the master's pipeline artifact — PyTorch **or** llama.cpp.
 
         不需要完整加载模型：两条引擎路径各自给出描述器，本方法只做形状归一与
@@ -1944,20 +1952,24 @@ class Scheduler(
         `LlamaCppEngine.get_pipeline_descriptor()` 读文件头提供。
         """
         manager = self._host
-        if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
-            return {}
-        get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
-        if not callable(get_descriptor):
-            return {}
-        try:
-            descriptor = get_descriptor() or {}
-        except Exception:
-            logger.warning("读取主节点流水线模型描述器失败", exc_info=True)
-            return {}
+        if descriptor is None:
+            if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
+                return {}
+            get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
+            if not callable(get_descriptor):
+                return {}
+            try:
+                descriptor = get_descriptor() or {}
+            except Exception:
+                logger.warning("读取主节点流水线模型描述器失败", exc_info=True)
+                return {}
+        else:
+            descriptor = dict(descriptor)
         if not descriptor.get("pipeline_runtime_supported", False):
             return {}
         model_path = os.path.abspath(
-            getattr(manager, "_full_model_path", "")
+            model_path
+            or getattr(manager, "_full_model_path", "")
             or getattr(manager, "_model_path", "")
             or ""
         )
@@ -1980,7 +1992,7 @@ class Scheduler(
             or self._get_master_model_sha256(),
             "model_type": model_type,
             "total_layers": int(descriptor["total_layers"]),
-            "quant_type": getattr(manager, "quant_type", "") or "",
+            "quant_type": quant_type or getattr(manager, "quant_type", "") or "",
             "inspection_mode": descriptor.get("inspection_mode", ""),
             "weight_bytes": int(descriptor.get("weight_bytes", 0) or 0),
         }
@@ -2633,22 +2645,6 @@ class Scheduler(
                 dict(self._active_pipeline_capacity_plan)
                 if self._active_pipeline_capacity_plan else None
             )
-            if capacity_plan is None and self._pipeline_load_transaction:
-                transaction_phase = str(
-                    self._pipeline_load_transaction.get("phase", "") or ""
-                )
-                candidate = self._pipeline_load_transaction.get("plan")
-                if (
-                    transaction_phase in {
-                        "preparing", "committing_local", "committing", "ready",
-                    }
-                    and isinstance(candidate, dict)
-                    and candidate.get("admitted")
-                ):
-                    capacity_plan = dict(candidate)
-                    capacity_plan["transaction_phase"] = (
-                        transaction_phase
-                    )
 
         if capacity_plan and capacity_plan.get("admitted"):
             return {
@@ -2764,7 +2760,9 @@ class Scheduler(
         self, eligible_node_ids: Optional[set[str]] = None,
     ) -> list[dict]:
         """Project live layer-worker profiles into explicit free-memory budgets."""
+        from contextlib import nullcontext
         from config import PIPELINE_CAPACITY_RESERVE_MB
+        from koakuma_engine import canonical_backend
 
         # ★ 2026-10-07（DIST-NEXT-4b）：规划前先回收「心跳已过期且没有在跑 attempt」的
         #   reservation。TCP 半开/心跳线程失效的节点在巡检窗口（约 131s）里 TCP 仍算在线
@@ -2782,6 +2780,8 @@ class Scheduler(
         # solver so it cannot produce an assignment the worker must reject.
         layer_ranges_by_node: dict[str, list[list[int]]] = {}
         layer_artifacts_by_node: dict[str, list[dict]] = {}
+        models_by_node: dict[str, list[dict]] = {}
+        worker_engines: dict[str, str] = {}
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
         #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
         #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
@@ -2812,6 +2812,21 @@ class Scheduler(
                 artifacts = capabilities.get("layer_artifacts")
                 if isinstance(artifacts, list) and artifacts:
                     layer_artifacts_by_node[node_id] = artifacts
+                models = capabilities.get("models")
+                if isinstance(models, list) and models:
+                    models_by_node[node_id] = models
+                model_engines = {
+                    canonical_backend(item.get("engine"))
+                    for item in (models or []) if isinstance(item, dict)
+                } if isinstance(models, list) else set()
+                model_engines.discard("")
+                # Selected model identity takes precedence over installed engines.
+                if len(model_engines) == 1:
+                    worker_engines[node_id] = next(iter(model_engines))
+                else:
+                    engines = capabilities.get("engines")
+                    if isinstance(engines, list) and len(engines) == 1:
+                        worker_engines[node_id] = canonical_backend(engines[0])
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
@@ -2833,6 +2848,88 @@ class Scheduler(
 
         records = []
         effective_id = self.get_effective_node_id()
+        local_node_id = (
+            "master" if self._effective_role() == "master" else effective_id
+        )
+        local_engine = ""
+        local_device = ""
+        local_node = next((
+            node for node_id, node in snapshot if node_id == local_node_id
+        ), None)
+        if local_node is not None:
+            # Preparation keeps the active manager intact until commit. Read the
+            # actual candidate under its existing fence rather than the active
+            # host engine or a hardware-only CUDA guess. Never warm a lazy manager.
+            try:
+                candidate_lock = object.__getattribute__(
+                    self._host, "_pipeline_candidate_lock",
+                )
+            except AttributeError:
+                candidate_lock = nullcontext()
+            with candidate_lock:
+                try:
+                    candidate = object.__getattribute__(
+                        self._host, "_pipeline_candidate_transaction",
+                    )
+                except AttributeError:
+                    candidate = None
+                candidate_selected = candidate is not None and candidate.phase in {
+                    "prepared", "materialized", "committed",
+                }
+                runtime = candidate.manager if candidate_selected else None
+            # Runtime accessors may take the full-chat lock. Keep all calls out
+            # of the candidate fence so this reader adds no candidate -> full edge.
+            if not candidate_selected:
+                peek_manager = getattr(self._host, "peek_manager", None)
+                runtime = peek_manager() if callable(peek_manager) else self._host
+            local_engine = backend_id_for(runtime, default="")
+            if local_engine == "llama_cpp":
+                # ModelManager's legacy llama.cpp wrapper has a PyTorch-only
+                # get_device() that may still say CUDA; llama.cpp executes on CPU.
+                local_device = "cpu"
+            elif runtime is not None:
+                get_device = getattr(runtime, "get_device", None)
+                try:
+                    # Before materialization, ModelManager.get_device() falls
+                    # back to DEVICE. Share the filtered layer loader's selector.
+                    runtime_module = sys.modules.get("model_module")
+                    manager_type = getattr(runtime_module, "ModelManager", ())
+                    if (
+                        local_engine == "pytorch"
+                        and isinstance(runtime, manager_type)
+                        and runtime.is_pipeline_prepared
+                        and runtime.model is None
+                    ):
+                        device, _dtype = runtime_module._select_layer_runtime(
+                            runtime.quant_type,
+                        )
+                        local_device = str(device).split(":", 1)[0].lower()
+                    elif callable(get_device):
+                        local_device = str(get_device()).split(":", 1)[0].lower()
+                except Exception:
+                    local_device = "unknown"
+                    logger.warning(
+                        "runtime capacity device unavailable: engine=%s",
+                        local_engine, exc_info=True,
+                    )
+            if candidate_selected:
+                with candidate_lock:
+                    current = object.__getattribute__(
+                        self._host, "_pipeline_candidate_transaction",
+                    )
+                    if (
+                        current is not candidate or current.manager is not runtime
+                        or current.phase not in {
+                            "prepared", "materialized", "committed", "finalized",
+                        }
+                    ):
+                        # Abort/replacement during device lookup invalidates this
+                        # snapshot. Reject it instead of budgeting a stale engine.
+                        local_device = "unknown"
+            if runtime is None:
+                select_engine = getattr(self._host, "select_engine", None)
+                if callable(select_engine):
+                    local_engine = canonical_backend(select_engine(local_node.device_info))
         now = time.time()
         for node_id, node in snapshot:
             # ★ 逐条件诊断：把「为什么某个在线 PC 没进容量候选」直接打出来。
@@ -2913,19 +3010,29 @@ class Scheduler(
                 and gpu.get("cuda_available", False)
                 and not self._gpu_is_integrated(gpu)
             )
+            engine = worker_engines.get(node_id) or canonical_backend(
+                device_info.get("backend_id") or device_info.get("engine"),
+                default="pytorch",
+            )
+            if node_id == local_node_id:
+                engine = local_engine or engine
+            execution_device = (
+                "cuda" if engine == "pytorch" and cuda_discrete else "cpu"
+            )
+            if node_id == local_node_id and local_device:
+                execution_device = local_device
             capacity_gb = 0.0
             capacity_source = ""
             runtime_multiplier = 2.0
-            execution_device = "cpu"
-            if cuda_discrete:
-                try:
-                    capacity_gb = float(gpu.get("vram_free_gb", 0) or 0)
-                except (TypeError, ValueError):
-                    capacity_gb = 0.0
+            if execution_device == "cuda":
+                if cuda_discrete:
+                    try:
+                        capacity_gb = float(gpu.get("vram_free_gb", 0) or 0)
+                    except (TypeError, ValueError):
+                        capacity_gb = 0.0
                 capacity_source = "gpu.vram_free_gb" if capacity_gb > 0 else ""
                 runtime_multiplier = 1.0
-                execution_device = "cuda"
-            else:
+            elif execution_device == "cpu":
                 ram = device_info.get("ram", {})
                 if isinstance(ram, dict):
                     try:
@@ -2948,6 +3055,21 @@ class Scheduler(
                         if available_bytes > 0:
                             capacity_gb = available_bytes / (1024 ** 3)
                             capacity_source = "memory.available_bytes"
+                if (
+                    capacity_source == "ram.available_gb"
+                    and (node_id == effective_id or (
+                        node.role == NodeRole.MASTER
+                        and self._effective_role() == "master"
+                    ))
+                ):
+                    try:
+                        import psutil
+
+                        available_bytes = int(psutil.virtual_memory().available)
+                    except (ImportError, OSError, ValueError):
+                        available_bytes = 0
+                    capacity_gb = max(0, available_bytes) / (1024 ** 3)
+                    capacity_source = "ram.available_bytes_live" if available_bytes > 0 else ""
             record = {
                 "node_id": node_id,
                 "role": node.role,
@@ -2962,6 +3084,8 @@ class Scheduler(
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
             if node_id in layer_artifacts_by_node:
                 record["layer_artifacts"] = layer_artifacts_by_node[node_id]
+            if node_id in models_by_node:
+                record["models"] = models_by_node[node_id]
             if node_id in layer_budget_by_node:
                 record["layer_budget"] = layer_budget_by_node[node_id]
             # ★ 2026-10-05（DIST-3）：段类型透传给求解器，供其拒绝
@@ -2983,10 +3107,6 @@ class Scheduler(
             #   字面量 `"master"`，而 `get_effective_node_id()` 返回的是
             #   `_configured_node_id()`（可能是主机名）—— 两者**不等**，
             #   用后者会让本地节点永远匹配不上（实测投影里只有远端两个节点）。
-            local_node_id = (
-                "master" if self._effective_role() == "master"
-                else self.get_effective_node_id()
-            )
             if (
                 node_id == local_node_id
                 and "layer_ranges" not in record
@@ -3384,9 +3504,10 @@ class Scheduler(
                 local_layer_budget, relay_claims,
                 sorted(eligible_node_ids) if eligible_node_ids else None,
             )
+            capacity_nodes = self._get_pipeline_capacity_nodes(eligible_node_ids)
             result = solve_pipeline_capacity(
                 descriptor,
-                self._get_pipeline_capacity_nodes(eligible_node_ids),
+                capacity_nodes,
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                 require_distributed=require_distributed,
                 local_layer_budget=local_layer_budget,
@@ -3401,6 +3522,15 @@ class Scheduler(
                 "reason": str(exc),
                 "assignments": [],
             }
+        if result.get("admitted"):
+            from model_preflight import bind_model_preflight
+
+            result = bind_model_preflight(
+                result,
+                descriptor=descriptor,
+                nodes=capacity_nodes,
+                require_distributed=require_distributed,
+            )
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
@@ -3453,9 +3583,10 @@ class Scheduler(
 
         total_layers = len(layer_bytes)
         node_ids = {str(item.get("node_id", "")) for item in assignments}
+        capacity_records = self._get_pipeline_capacity_nodes(node_ids)
         records = {
             item["node_id"]: item
-            for item in self._get_pipeline_capacity_nodes(node_ids)
+            for item in capacity_records
         }
         planned = []
         artifact_source_sha256 = ""
@@ -3595,7 +3726,7 @@ class Scheduler(
                 for item in planned
             ],
         }
-        return self._attach_pipeline_node_contract({
+        plan = {
             "schema_version": 1,
             "status": "admitted",
             "admitted": True,
@@ -3620,7 +3751,16 @@ class Scheduler(
             "single_node_full_model_candidates": [],
             "aggregate_only": len(planned) > 1,
             "computed_at": time.time(),
-        })
+        }
+        from model_preflight import bind_model_preflight
+
+        plan = bind_model_preflight(
+            plan,
+            descriptor=descriptor,
+            nodes=capacity_records,
+            require_distributed=len(planned) > 1,
+        )
+        return self._attach_pipeline_node_contract(plan)
 
     def _normalize_manual_assignments(self, assignments: list) -> list:
         """补齐手动区间的运行字段，并按节点能力放置 Embedding/LM Head。"""
@@ -3791,6 +3931,8 @@ class Scheduler(
 
     def push_layer_config_to_clients(self) -> None:
         with self._layer_config_push_lock:
+            if not self.get_distributed_inference_enabled():
+                return
             # Keep the transition check under the same lock used by the
             # publisher.  Otherwise a transition can begin after the check
             # but before the publish and still leak a transient release.
@@ -3966,6 +4108,10 @@ class Scheduler(
                 qwen3_release, best_effort=True,
             )
 
+        cleanup_replayed = self._replay_pipeline_model_cleanup_for_node(
+            client_id,
+        )
+
         # REGISTER ACK precedes the client's task-worker hello. Fence this
         # connection from legacy layer assignment until that hello arrives.
         # The hello handler resolves the fence and triggers a fresh push.
@@ -3975,6 +4121,12 @@ class Scheduler(
         )
         if task_worker_handshake_pending:
             self._task_worker_control.mark_worker_connection_pending(client_id)
+        if cleanup_replayed:
+            logger.info(
+                "legacy_layer_config skipped reason=model_cleanup_pending node=%s",
+                client_id,
+            )
+        elif task_worker_handshake_pending:
             logger.info(
                 "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
                 client_id,
@@ -3997,9 +4149,13 @@ class Scheduler(
         if msg_type == "register":
             data = msg.get("data", {})
             if data.get("node_type") == "pipeline_peer":
+                reason = "worker peer 数据连接已禁用；层段数据必须经 master 转发"
                 if self._tcp_server:
-                    self._tcp_server.confirm_registration(client_id)
-                logger.debug("节点间流水线传输连接已认证: %s", client_id)
+                    self._tcp_server.reject_client(client_id, reason)
+                logger.warning(
+                    "拒绝 legacy pipeline_peer 注册: client=%s reason=%s",
+                    client_id, reason,
+                )
                 return
             # get_client_info 对未知 client_id 返回 None（如从节点收到主节点的
             # register 拒绝回执、或注册与断开竞态），必须兜底为空 dict，
@@ -4088,6 +4244,22 @@ class Scheduler(
                         "event=tcp_heartbeat_ack_failed client_id=%s error=%s",
                         client_id, exc,
                     )
+
+        elif msg_type == "model_prepare":
+            payload = msg.get("data")
+            if isinstance(payload, dict):
+                if self._effective_role() == "master":
+                    self._handle_worker_prepare_ack(client_id, payload)
+                elif client_id == "master":
+                    self._worker_prepare.handle(payload, self._tcp_client)
+
+        elif msg_type == "model_supply":
+            payload = msg.get("data")
+            if isinstance(payload, dict):
+                if self._effective_role() == "master":
+                    self._model_supply.handle(client_id, payload)
+                elif client_id == "master":
+                    self._model_supply_worker.handle(payload, self._tcp_client)
 
         elif msg_type == "task_worker":
             self._handle_task_worker_message(client_id, msg)
@@ -4247,7 +4419,7 @@ class Scheduler(
             self._handle_layer_result(client_id, msg)
 
         elif msg_type == "chain_forward":
-            # ---- 从节点：收到另一从节点的链式直连转发（P2 优化）----
+            # ---- 从节点：收到 master 转发的下一逻辑段 hidden ----
             threading.Thread(
                 target=self._handle_chain_forward,
                 args=(client_id, msg),
@@ -4409,12 +4581,28 @@ class Scheduler(
         """TCP 断连回调（由 TCPServer 调用）"""
         abort_details = None
         qwen3_disconnect = None
+        retirement_records = []
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
+            cleanup_changed = False
+            for record in self._pipeline_model_cleanup_ledger.values():
+                if record.get("node_id") == client_id:
+                    record["state"] = "await_reconnect"
+                    cleanup_changed = True
+            if cleanup_changed:
+                if isinstance(transaction, dict):
+                    pending = set(transaction.get("finalize_pending", set()))
+                    pending.discard(client_id)
+                    transaction["finalize_pending"] = pending
+                    transaction.get("finalize_retry_state", {}).pop(
+                        client_id, None,
+                    )
+                self._persist_pipeline_lifecycle_locked()
             if (
                 transaction
                 and transaction.get("phase") in {
                     "preparing", "committing_local", "committing",
+                    "committing_global",
                 }
                 and client_id in set(transaction.get("worker_ids", set()))
             ):
@@ -4449,6 +4637,17 @@ class Scheduler(
             ):
                 self._active_pipeline_capacity_plan = None
                 if transaction and abort_details is None:
+                    transaction["published"] = bool(transaction.get("published") or transaction.get("phase") == "ready")
+                    if transaction["published"]:
+                        for node, expected in transaction.get("expected", {}).items():
+                            identity = expected.get("worker_prepare_identity")
+                            if isinstance(identity, dict):
+                                retirement_records.append(self._record_pipeline_model_cleanup_locked(
+                                    node_id=node, candidate_config_id=identity["config_id"],
+                                    generation=self._layer_config_generation, action="release",
+                                    assignment_id=identity["assignment_id"],
+                                    payload={"worker_prepare_identity": identity, "release": True},
+                                ))
                     transaction["phase"] = "invalidated"
                     transaction["reason_code"] = "pipeline_worker_disconnected"
                     transaction["reason"] = (
@@ -4468,6 +4667,11 @@ class Scheduler(
                     )
         if abort_details is not None:
             self._abort_pipeline_load_transaction(*abort_details)
+        if retirement_records:
+            with self._layer_config_lock:
+                self._persist_pipeline_lifecycle_locked()
+            for record in retirement_records:
+                self._dispatch_pipeline_model_cleanup(record)
         # A disconnected socket can no longer satisfy the assignment that was
         # registered for it.  Drop that per-node expectation before the
         # reconnect callback publishes a fresh generation; otherwise an old
@@ -4548,6 +4752,7 @@ class Scheduler(
             logger.debug("忽略旧主节点连接的迟到断连回调")
             return
 
+        self._cleanup_task_worker_prepare("coordinator_disconnected", client=source_client)
         self._task_worker_control.disconnect_coordinator()
         with self._task_worker_stage_lock:
             for active in self._task_worker_active_attempts.values():
@@ -4564,14 +4769,6 @@ class Scheduler(
                     "error": "与主节点的连接已断开",
                 }
                 event.set()
-        with self._chain_clients_lock:
-            chain_clients = list(self._chain_clients.values())
-            self._chain_clients.clear()
-        for chain_client in chain_clients:
-            try:
-                chain_client.disconnect()
-            except Exception:
-                logger.debug("主节点断线时关闭链式连接失败", exc_info=True)
         with self._kv_cache_lock:
             active_tasks = list(self._kv_cache)
             self._kv_cache.clear()
@@ -4590,6 +4787,7 @@ class Scheduler(
                 self._layer_config_receive_sequence
             )
             self._latest_layer_config_generation = 0
+            self._latest_layer_assignment_id = ""
         for task_id in active_tasks:
             self._record_local_pipeline_participation(task_id, success=False)
         if active_tasks:

@@ -82,6 +82,7 @@ models/qwen-1_8b-chat/
 models/deepseek-*/
 models/sd15-*/
 models/qwen3-*/
+models/qwen36-*/
 models/gemma4-*/
 models/Qwen-*/
 .hf-cache/
@@ -185,6 +186,10 @@ docs/agent_tool/
 # 以及上手/流水线要用到的工具）。
 scripts/*
 !scripts/model_tools/
+!scripts/package_contract/
+!scripts/package_contract/linux_clean_gate.py
+!scripts/run_linux_package_gate.ps1
+!scripts/version_contract.py
 # 设备侧按需裁层的依赖（Termux 侧跑，见 scripts/model_tools/qlh_device_cut_range.sh）
 !scripts/cut_layers.py
 # 切层制作流水线（串起 源sha + 命令 + 产物sha + 校验，产 cut-report.json）
@@ -255,6 +260,15 @@ scripts/*
 !scripts/relay_health.py
 !scripts/run_doc_checks.py
 !scripts/tui_e2e_flow.py
+# PC 层段 worker 启动器（替代已过时的 build/perf/rog-start-worker.ps1：
+# 旧脚本硬编码过期密钥 + 走 PyTorch peer 路径 ⇒ 进不了 Route A 候选）
+!scripts/start_pc_layer_worker.ps1
+# #93 部署缺口：journal replica 接收端的正式启动器 + 换版同步检查单
+!scripts/start_journal_replica_receiver.py
+!scripts/start_journal_replica_receiver.ps1
+!scripts/verify_journal_replication_sync.ps1
+# 清单卫生：未闭环区不得滞留已修条目 / 票号不得重复
+!scripts/check_issue_registry_status.py
 
 # 根目录：过时日志 / 备份（2026-09-20 剔除）
 # `bjtu.bat` / `bjtu.sh` 保留：它们是活跃入口 —— `tests/test_qlh_cli.py` 与

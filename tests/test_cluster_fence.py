@@ -78,6 +78,36 @@ def test_fence_rejects_expired_certificate_and_header_roundtrip():
     assert certificate_from_headers({"X-QLH-Control-Certificate": encoded}) == certificate.to_dict()
 
 
+def test_request_permit_is_invalidated_by_local_lease_revocation():
+    fence, certificate = _fence()
+    try:
+        fence.admit_runtime(certificate, action="test.begin")
+        assert fence.require_current_permit(action="test.continue") is not None
+        assert fence.authority.revoke_certificate(certificate)
+        with pytest.raises(ControlFenceError) as rejected:
+            fence.require_current_permit(action="test.continue")
+        assert rejected.value.code == "control_certificate_not_current"
+    finally:
+        fence.clear_context()
+
+
+def test_auto_role_guard_rejects_a_valid_certificate_on_a_follower():
+    fence, certificate = _fence()
+    leader = {"active": True}
+    fence.set_role_guard(lambda: leader["active"])
+    try:
+        fence.admit_runtime(certificate, action="test.start")
+        leader["active"] = False
+        with pytest.raises(ControlFenceError) as blocked:
+            fence.admit(certificate, action="test.followup", source="http")
+        assert blocked.value.code == "control_certificate_not_current"
+        with pytest.raises(ControlFenceError) as in_flight:
+            fence.require_current_permit(action="test.followup")
+        assert in_flight.value.code == "control_certificate_not_current"
+    finally:
+        fence.clear_context()
+
+
 def test_install_invalid_certificate_uses_stable_fence_error():
     fence = ControlFence(required=True)
     with pytest.raises(ControlFenceError) as rejected:
@@ -104,3 +134,13 @@ def test_tcp_control_payload_is_decorated_and_requires_current_certificate():
 def test_disabled_fence_preserves_legacy_payloads():
     fence = ControlFence(required=False)
     assert _decorate_control_payload({"node_id": "worker"}, MessageType.LAYER_CONFIG, fence) == {"node_id": "worker"}
+
+
+def test_auto_role_without_voter_set_requires_an_unavailable_fence(monkeypatch):
+    monkeypatch.setenv("QLH_NODE_ROLE", "auto")
+    monkeypatch.delenv("QLH_CONTROL_VOTER_SET", raising=False)
+    fence = ControlFence.from_environment()
+    assert fence.required is True
+    with pytest.raises(ControlFenceError) as rejected:
+        fence.admit(None, action="test.auto")
+    assert rejected.value.code == "control_fence_unavailable"

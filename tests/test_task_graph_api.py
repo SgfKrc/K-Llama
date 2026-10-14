@@ -800,6 +800,49 @@ def test_task_graph_distributed_required_auto_assigns_remote_worker(
     assert len(manager.calls) == 2
 
 
+def test_release_profile_discards_task_graph_required_result_before_commit(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="f" * 64,
+    )
+    provider = _remote_worker_provider(identity, "worker_release")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(api_server.ChatRequest(
+            message="release route policy",
+            session_id="task-session",
+            execution_mode="task_graph",
+            routing_preference="distributed_required",
+            workflow_id="wf_releasetaskroute01",
+        )))
+
+    assert captured.value.status_code == 503
+    assert (
+        captured.value.error_code
+        == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
+    )
+    rejected = coordinator.get("wf_releasetaskroute01")
+    assert rejected["state"] == "failed"
+    assert rejected["cancel_requested"] is False
+    assert rejected["terminal_reason"]["reason_code"] == "request_refused"
+    assert len(manager.calls) == 2
+
+
 def test_task_graph_distributed_required_rejects_without_eligible_worker(
     task_graph_api, monkeypatch,
 ):
@@ -1565,6 +1608,22 @@ def test_workflow_api_fences_unknown_valid_id_and_rejects_invalid_id(task_graph_
     with pytest.raises(HTTPException) as cancel_error:
         asyncio.run(api_server.cancel_workflow("unsafe"))
     assert cancel_error.value.status_code == 400
+
+
+def test_auto_role_refuses_unreplicated_task_graph_writes(task_graph_api, monkeypatch):
+    monkeypatch.setattr(api_server, "NODE_ROLE", "auto")
+    listed = asyncio.run(api_server.list_workflows())
+    assert listed["local_available"] is False
+    request = api_server.ChatRequest(message="unreplicated", use_task_graph=True)
+    with pytest.raises(HTTPException) as rejected:
+        api_server._execute_task_graph_chat(request)
+    assert rejected.value.status_code == 503
+    with pytest.raises(HTTPException) as cancelled:
+        asyncio.run(api_server.cancel_workflow("wf_pending_auto"))
+    assert cancelled.value.status_code == 503
+    with pytest.raises(HTTPException) as cleaned:
+        asyncio.run(api_server.cleanup_task_journal())
+    assert cleaned.value.status_code == 503
 
 
 def test_chat_threadpool_allows_concurrent_workflow_cancellation(

@@ -105,11 +105,51 @@ CHATML_STOP_SEQUENCES = [
 
 
 def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
+    if isinstance(stop, str):
+        stop = [stop]
     merged: List[str] = []
-    for value in (stop or []) + CHATML_STOP_SEQUENCES:
+    for value in list(stop or []) + CHATML_STOP_SEQUENCES:
+        if not isinstance(value, str):
+            raise ValueError("stop sequences must be strings")
         if value and value not in merged:
             merged.append(value)
     return merged
+
+
+def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
+    """按配置给绑定路径挂上 n-gram 自投机（就地修改 `load_kwargs`）。
+
+    为什么选 n-gram：它只在 token 历史里做匹配，**不需要 draft 模型**、不占额外
+    带宽与显存 —— 正合「边缘设备不与主模型争带宽」的约束。实测（2026-10-13，
+    Qwen3.6-35B-A3B-Q4，CPU 绑定）：重复文本 1.30～1.40×，自由文本不劣化。
+
+    契约：
+    * 未启用或调用方已显式给出 `draft_model` ⇒ 原样不动；
+    * 绑定缺 `LlamaPromptLookupDecoding`（旧版）⇒ 记 warning 后降级，不抛异常；
+    * ⚠️ 一旦注入，`llama_cpp/llama.py` 会把 `logits_all` 强制为 True（开销上升）。
+    """
+    import config as _cfg
+
+    if not _cfg.NGRAM_SPEC_ENABLED or "draft_model" in load_kwargs:
+        return
+    try:
+        from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
+    except Exception:  # pragma: no cover - 旧绑定没有该类
+        logger.warning(
+            "n-gram 自投机不可用：当前 llama-cpp-python 未提供 "
+            "LlamaPromptLookupDecoding；已按未启用处理",
+        )
+        return
+    load_kwargs["draft_model"] = LlamaPromptLookupDecoding(
+        max_ngram_size=int(_cfg.NGRAM_SPEC_MAX_NGRAM),
+        num_pred_tokens=int(_cfg.NGRAM_SPEC_NUM_PRED),
+    )
+    logger.info(
+        "n-gram 自投机已启用（max_ngram=%s, num_pred=%s）——"
+        "注意绑定会强制 logits_all=True，仅在文本重复场景有收益",
+        _cfg.NGRAM_SPEC_MAX_NGRAM,
+        _cfg.NGRAM_SPEC_NUM_PRED,
+    )
 
 
 def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
@@ -216,6 +256,10 @@ class LlamaCppEngine:
         # 必须存活到 unload —— worker 一停，RPC device 上的计算即失败。
         self._rpc_session = None
 
+    @property
+    def engine_type(self) -> str:
+        return "llama_cpp"
+
     # ================================================================
     # RPC device 接入（llama.cpp RPC backend）
     # ================================================================
@@ -269,35 +313,36 @@ class LlamaCppEngine:
     def _open_rpc_session(self, *, endpoints, worker_exe, worker_port, worker_threads, worker_log):
         """注册 RPC device（必要时先起本机 worker）；失败即抛，不降级为纯 CPU。"""
         try:
-            from llama_rpc_device import RpcSession
+            from llama_rpc_device import RpcCleanupError, RpcSession
         except ImportError:  # 以包形式导入本模块时（src.llama_engine）
-            from .llama_rpc_device import RpcSession
+            from .llama_rpc_device import RpcCleanupError, RpcSession
 
-        session = RpcSession.open(
-            endpoints=endpoints,
-            autostart_worker=worker_exe,
-            worker_port=worker_port,
-            worker_threads=worker_threads,
-            worker_log=worker_log,
-        )
+        try:
+            session = RpcSession.open(
+                endpoints=endpoints,
+                autostart_worker=worker_exe,
+                worker_port=worker_port,
+                worker_threads=worker_threads,
+                worker_log=worker_log,
+            )
+        except RpcCleanupError as exc:
+            self._rpc_session = exc.cleanup_owner
+            raise
         injected = [f"{dev.name}@{dev.endpoint}" for dev in session.injector.devices]
         logger.info(f"RPC device 已注入: {injected}")
         return session
 
     def _close_rpc_session(self) -> None:
         session = self._rpc_session
-        self._rpc_session = None
         if session is not None:
-            try:
-                session.close()
-            except Exception:
-                logger.debug("RPC session close failed", exc_info=True)
+            session.close()
+            self._rpc_session = None
 
     # ================================================================
     # 流水线模型描述器
     # ================================================================
 
-    def _pipeline_file_sha256(self, path: str) -> str:
+    def _pipeline_file_sha256(self, path: str, *, use_cache: bool = True) -> str:
         """整文件 sha256，按 `(path, mtime, size)` 记忆 —— 大 GGUF 只读一次。
 
         与 PyTorch 侧 `model_sync.compute_model_sha256`（目录内 artifact 的稳定序
@@ -309,12 +354,16 @@ class LlamaCppEngine:
             stat = os.stat(path)
         except OSError:
             return ""
-        key = (path, int(stat.st_mtime), int(stat.st_size))
+        key = (
+            path,
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(stat.st_size),
+        )
         cache = getattr(self, "_pipeline_sha_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._pipeline_sha_cache = cache
-        if cache.get("key") == key:
+        if use_cache and cache.get("key") == key:
             return str(cache.get("value", ""))
         digest = hashlib.sha256()
         try:
@@ -353,10 +402,16 @@ class LlamaCppEngine:
         if not path or not os.path.isfile(path):
             return {}
         try:
-            from relay_segment_info import read_gguf_layer_info
+            from relay_segment_info import (
+                read_artifact_manifest, read_gguf_layer_info,
+                read_gguf_tokenizer_sha256,
+            )
         except ImportError:  # 以包形式导入本模块时（src.llama_engine）
             try:
-                from .relay_segment_info import read_gguf_layer_info
+                from .relay_segment_info import (
+                    read_artifact_manifest, read_gguf_layer_info,
+                    read_gguf_tokenizer_sha256,
+                )
             except ImportError:
                 return {}
         info = read_gguf_layer_info(path)
@@ -365,14 +420,45 @@ class LlamaCppEngine:
         from pipeline_model_descriptor import (
             PIPELINE_RUNTIME_MODEL_TYPES,
             canonical_pipeline_model_type,
+            tokenizer_sha256_from_asset,
         )
 
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
         if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
-        total_layers = int(info.get("n_layer", 0) or 0)
-        if total_layers <= 0:
+        local_total_layers = int(info.get("n_layer", 0) or 0)
+        if local_total_layers <= 0:
             return {}
+        # ★ 2026-10-11（三机实测 / total_layers 缺口，用户裁定「不能加载整模，这是接力的初衷」）：
+        #   裁层工件的 GGUF 头只含**本段**层（head=16），而容量求解器的区间判据要的是
+        #   **源模型**总层数（`pipeline_capacity.py:490` 取 `total_layers = len(layer_bytes)`，
+        #   `:74` 用它校验各节点 `layer_ranges` 上界）。此前 `total_layers` 直接取工件头部的
+        #   `n_layer` ⇒ 视图被钉成 16 ⇒ 远端 `[16,24)` / `[24,32)` 恒被拒
+        #   ⇒ 只能靠"加载整模"绕过，而那**违背接力初衷** ⇒ 这里按工件 manifest 的
+        #   `n_layer`/`source_layer_range` 把视图还原成源模型坐标系。
+        artifact_info = {}
+        for manifest_path in (
+            Path(path).with_suffix(".manifest.json"),
+            Path(str(path) + ".manifest.json"),
+        ):
+            manifest_info = read_artifact_manifest(manifest_path)
+            if manifest_info:
+                artifact_info = manifest_info
+                break
+        declared_range = artifact_info.get("source_layer_range")
+        segment_start = 0
+        if isinstance(declared_range, (list, tuple)) and len(declared_range) == 2:
+            try:
+                segment_start = int(declared_range[0])
+            except (TypeError, ValueError):
+                segment_start = 0
+        try:
+            declared_total = int(artifact_info.get("n_layer", 0) or 0)
+        except (TypeError, ValueError):
+            declared_total = 0
+        total_layers = declared_total if declared_total > 0 else local_total_layers
+        if total_layers < local_total_layers + segment_start:
+            total_layers = local_total_layers + segment_start
         # `pipeline_capacity` 的容量账要**逐层字节**与**分量字节**，两者都必须 exact
         # （它按此判定哪个 worker 装得下哪几层）。GGUF 里只有张量表，所以现场按
         # ggml 类型算一遍 —— 这也是「不用 offset 差值」的原因，差值含 32 字节对齐填充。
@@ -389,7 +475,9 @@ class LlamaCppEngine:
         for tensor_name, size in tensor_bytes.items():
             block = block_prefix.match(tensor_name)
             if block:
-                index = int(block.group(1))
+                # 工件内的 blk 索引是**本段局部**的（0..local_total_layers-1），
+                # 要按 manifest 的 source_layer_range 平移到源模型坐标系。
+                index = segment_start + int(block.group(1))
                 if index < total_layers:
                     layer_weight_bytes[index] += size
                     continue
@@ -401,21 +489,78 @@ class LlamaCppEngine:
                 component_weight_bytes["lm_head"] += size
             else:
                 component_weight_bytes["other"] += size
-        if any(size <= 0 for size in layer_weight_bytes):
+        # 只要求**本段**覆盖到字节：其它层属于别的段（远端执行），不是"缺失"。
+        segment_span = (segment_start, segment_start + local_total_layers)
+        if any(
+            size <= 0
+            for index, size in enumerate(layer_weight_bytes)
+            if segment_span[0] <= index < segment_span[1]
+        ):
             return {}
         try:
             weight_bytes = int(os.path.getsize(path))
         except OSError:
             weight_bytes = 0
+        model_sha256 = self._pipeline_file_sha256(path)
+        artifact_manifest_info = None
+        tokenizer_sha256 = read_gguf_tokenizer_sha256(path) or ""
+        for manifest_path in (
+            Path(path).with_suffix(".manifest.json"),
+            Path(str(path) + ".manifest.json"),
+        ):
+            manifest_info = read_artifact_manifest(manifest_path)
+            if manifest_info:
+                artifact_manifest_info = manifest_info
+                declared_tokenizer = str(manifest_info.get("tokenizer_sha256", "") or "")
+                if declared_tokenizer and declared_tokenizer != tokenizer_sha256:
+                    return {}
+                break
+        if not tokenizer_sha256:
+            tokenizer_sha256 = tokenizer_sha256_from_asset(Path(path).parent)
+        if not tokenizer_sha256:
+            try:
+                from model_config import get_builtin_model, resolve_model_path
+
+                registered = get_builtin_model(
+                    str(getattr(self, "active_model_id", "") or "")
+                )
+                registered_path = (
+                    resolve_model_path(str(getattr(registered, "model_path", "") or ""))
+                    if registered is not None else ""
+                )
+                if registered_path:
+                    tokenizer_sha256 = tokenizer_sha256_from_asset(
+                        Path(registered_path)
+                    )
+            except Exception:
+                logger.debug(
+                    "GGUF pipeline descriptor could not resolve tokenizer asset",
+                    exc_info=True,
+                )
         descriptor = {
             "model_id": (
                 str(getattr(self, "active_model_id", "") or "")
                 or os.path.splitext(os.path.basename(path))[0]
             ),
+            # A precut artifact may be registered under a deployment alias
+            # (for example ``q35-artifacts``), while its manifest names the
+            # logical source model shared by every relay segment. Keep both
+            # identities: ``model_id`` selects the local registry entry;
+            # ``source_model_id`` is the cross-node preflight contract.
+            "source_model_id": str(
+                (artifact_manifest_info or {}).get("source_model_id", "")
+                or ""
+            ),
             "model_path": path,
-            "model_sha256": self._pipeline_file_sha256(path),
+            "model_sha256": model_sha256,
+            "source_model_sha256": str(
+                (artifact_manifest_info or {}).get("source_model_sha256", "")
+                or model_sha256
+            ),
             "model_type": model_type,
             "total_layers": total_layers,
+            "hidden_size": int(info.get("n_embd", 0) or 0),
+            "tokenizer_sha256": tokenizer_sha256,
             "layer_weight_bytes": layer_weight_bytes,
             "component_weight_bytes": component_weight_bytes,
             "quant_type": str(getattr(self, "_quant_type", "") or ""),
@@ -439,8 +584,46 @@ class LlamaCppEngine:
         if not resolved_path or not os.path.isfile(resolved_path):
             raise FileNotFoundError(f"GGUF 模型文件未找到: {resolved_path or '(未提供路径)'}")
         if layer_range is not None:
-            raise ValueError("GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明")
-        if self.is_loaded or self._mtmd_context is not None:
+            # ★ 2026-10-11（ROG+Y700+本机三机验收实测）：llama.cpp 的段由**裁层工件**
+            #   表达（`model_load_resolver.ENGINE_CAPABILITIES[LLAMA_CPP].layer_range_mode
+            #   == "precut_artifact"`）。但 Route A 的本地 commit 仍会带上本机段区间 ⇒
+            #   此前一律拒绝，表现为 `pipeline_local_commit_failed`，GGUF 主节点**无法**
+            #   参与层流水线。现在只在**与所加载工件 manifest 声明的区间一致**时接受
+            #   （即"加载的正是这一段工件"），其余情况保持 fail-closed（整模仍拒绝）。
+            try:
+                from relay_segment_info import read_artifact_manifest
+            except ImportError:  # 以包形式导入本模块时（src.llama_engine）
+                from .relay_segment_info import read_artifact_manifest
+
+            # 区间声明来源优先级：**先 `QLH_LAYER_GGUF`**（主节点以"整模 + 本地裁层
+            # 工件"表达自己的段，从而对外仍提供**整模身份** `model_sha256`，
+            # Android 侧据此匹配工件的 `source_model_sha256`），再退回所加载文件自身
+            # 的 manifest（"直接加载该段工件"的用法）。
+            declared: list[int] | None = None
+            _bases = []
+            from model_supply_worker import selected_gguf_path
+            _env_gguf = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
+            if _env_gguf:
+                _bases.append(Path(_env_gguf))
+            _bases.append(Path(resolved_path))
+            for _base in _bases:
+                for manifest_path in (
+                    _base.with_suffix(".manifest.json"),
+                    Path(str(_base) + ".manifest.json"),
+                ):
+                    _info = read_artifact_manifest(manifest_path) or {}
+                    _span = _info.get("source_layer_range")
+                    if isinstance(_span, (list, tuple)) and len(_span) == 2:
+                        declared = [int(_span[0]), int(_span[1])]
+                        break
+                if declared is not None:
+                    break
+            if declared != [int(layer_range[0]), int(layer_range[1])]:
+                raise ValueError(
+                    "GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明"
+                )
+        if (self._model is not None or self._mtmd_context is not None
+                or self._rpc_session is not None or getattr(self, "_keep_head", None) is not None):
             self.unload()
         self._model_path = resolved_path
         self.active_model_id = str(model_id or "")
@@ -486,7 +669,8 @@ class LlamaCppEngine:
         """按 `[start, end)` 在工件目录里找裁层 GGUF —— **靠 manifest 自证，不猜文件名**。
 
         工件由 `scripts/cut_layers.py` 产出，旁边必有 `<artifact>.gguf.manifest.json`，
-        里面的 `source_layer_range` 正是「这一段来自源模型的哪几层」。命名并不统一
+        里面的 `source_layer_range`、`source_model_sha256`、`artifact_sha256`
+        共同证明区间、源整模和段工件身份。命名并不统一
         （`cut-16` / `cut-16-20` / `head8` / `mid8-16` / `cut-k16` …），按文件名猜会
         在下一个命名上翻车，所以只认 manifest。
 
@@ -503,17 +687,66 @@ class LlamaCppEngine:
         )
         if not directory.is_dir():
             return ""
+        descriptor = dict(getattr(self, "_pipeline_descriptor", None) or {})
+        expected_source_sha256 = str(
+            descriptor.get("source_model_sha256")
+            or descriptor.get("model_sha256")
+            or ""
+        ).strip().lower()
+        if not expected_source_sha256:
+            source_path = str(
+                descriptor.get("model_path", "")
+                or getattr(self, "_model_path", "")
+                or ""
+            )
+            expected_source_sha256 = self._pipeline_file_sha256(
+                source_path,
+                use_cache=False,
+            ).lower()
+        if not expected_source_sha256:
+            raise RuntimeError("无法确定预切 GGUF 的源整模摘要，拒绝按层区间猜测工件")
+
         wanted = [int(start), int(end)]
-        for manifest in sorted(directory.glob("*.manifest.json")):
+        from model_supply_worker import selected_gguf_path
+        supplied = selected_gguf_path()
+        candidates = sorted(directory.glob("*.manifest.json"))
+        if supplied:
+            supplied_path = _Path(supplied)
+            candidates = [supplied_path.with_suffix(".manifest.json")]
+            directory = supplied_path.parent
+        matches: list[str] = []
+        for manifest in candidates:
             info = read_artifact_manifest(manifest)
             if not info:
                 continue
             if list(info.get("source_layer_range") or []) != wanted:
                 continue
-            artifact = manifest.name[: -len(".manifest.json")] + ".gguf"
+            if str(info.get("source_model_sha256", "") or "").lower() != expected_source_sha256:
+                continue
+            expected_artifact_sha256 = str(
+                info.get("artifact_sha256", "") or ""
+            ).lower()
+            if not expected_artifact_sha256:
+                continue
+            artifact = manifest.name[: -len(".manifest.json")]
+            if not artifact.lower().endswith(".gguf"):
+                artifact += ".gguf"
             candidate = directory / artifact
-            if candidate.is_file():
-                return str(candidate)
+            if not candidate.is_file():
+                continue
+            if self._pipeline_file_sha256(
+                str(candidate),
+                use_cache=False,
+            ).lower() != expected_artifact_sha256:
+                continue
+            matches.append(str(candidate))
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"层区间[{int(start)},{int(end)})存在多个同源且摘要有效的裁层工件，"
+                "拒绝按文件名顺序静默选择"
+            )
+        if matches:
+            return matches[0]
         return ""
 
     def load_layer_range(
@@ -655,7 +888,8 @@ class LlamaCppEngine:
         elif embedding_dimension is not None or embedding_model_id is not None:
             raise ValueError("embedding identity requires embedding=True")
 
-        if self.is_loaded or self._mtmd_context is not None:
+        if (self._model is not None or self._mtmd_context is not None
+                or self._rpc_session is not None or getattr(self, "_keep_head", None) is not None):
             self.unload()
         self._pipeline_distributed_only = False
         self._model_path = model_path
@@ -716,6 +950,9 @@ class LlamaCppEngine:
                 load_kwargs["chat_format"] = "chatml"
 
             load_kwargs.update(kwargs)
+            # n-gram 自投机（绑定路径 / 无 CUDA 边缘）：默认关闭；
+            # 调用方显式传了 draft_model 时不覆盖。
+            _apply_ngram_draft_model(load_kwargs)
 
             rpc_endpoints = self._normalize_rpc_servers(rpc_servers)
             if rpc_endpoints or rpc_worker_exe:
@@ -793,17 +1030,9 @@ class LlamaCppEngine:
             )
         except Exception as e:
             logger.error(f"GGUF 模型加载失败: {e}")
-            self._free_mtmd_context()
-            self._close_rpc_session()
-            model = self._model
-            self._model = None
-            close = getattr(model, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("GGUF model release after load failure failed", exc_info=True)
-            self._loaded = False
+            # Use the same ownership-preserving path as explicit unload:
+            # tensors must close before their RPC device/process retires.
+            self.unload()
             raise
 
     @staticmethod
@@ -856,8 +1085,21 @@ class LlamaCppEngine:
         return max(0, min(total_layers, budget // per_layer))
 
     def _install_chat_template_controls(self) -> None:
-        """Expose registered template kwargs through the llama.cpp handler."""
-        if self._chat_template != "qwen3_chat_v1":
+        """Expose thinking kwargs through the selected GGUF or registered handler."""
+        chat_format = getattr(self._model, "chat_format", None)
+        metadata = getattr(self._model, "metadata", None) or {}
+        template_key = (
+            "tokenizer.chat_template" if chat_format == "chat_template.default"
+            else f"tokenizer.{chat_format}" if str(chat_format).startswith("chat_template.")
+            else ""
+        )
+        native_template = metadata.get(template_key, "")
+        native_thinking = bool(
+            not getattr(self._model, "chat_handler", None)
+            and isinstance(native_template, str)
+            and re.search(r"\benable_thinking\b", native_template)
+        )
+        if self._chat_template != "qwen3_chat_v1" and not native_thinking:
             return
         try:
             from llama_cpp import llama_chat_format
@@ -889,12 +1131,24 @@ class LlamaCppEngine:
                     return base_handler(*args, **handler_kwargs)
 
             self._model.chat_handler = chat_handler
+            if native_thinking:
+                # Registry aliases need no hard-coded model-family mapping: the
+                # selected GGUF Jinja template declares its own control variable.
+                self._chat_template = chat_format
+                self._thinking_mode = "declared"
             self._thinking_controlled = True
+            logger.info(
+                "llama.cpp thinking control installed: template=%s format=%s source=%s",
+                self._chat_template, chat_format,
+                template_key if native_thinking else "model_profile",
+            )
         except Exception:
             logger.debug("Qwen3 chat-template control unavailable", exc_info=True)
 
     def _set_thinking_mode(self, enabled: bool | None) -> None:
-        if self._chat_template != "qwen3_chat_v1" or enabled is None:
+        if (
+            self._chat_template != "qwen3_chat_v1" and not self._thinking_controlled
+        ) or enabled is None:
             return
         self._thinking_enabled = bool(enabled)
         self._chat_template_kwargs = {"enable_thinking": bool(enabled)}
@@ -910,8 +1164,15 @@ class LlamaCppEngine:
         stream: bool,
         **kwargs,
     ):
-        self._set_thinking_mode(kwargs.pop("show_thinking", None))
-        self._set_thinking_mode(kwargs.pop("enable_thinking", None))
+        show_thinking = kwargs.pop("show_thinking", None)
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        # None means use the template default for this request, including after
+        # an earlier request explicitly disabled or enabled thinking.
+        self._thinking_enabled = None
+        self._chat_template_kwargs = {}
+        self._set_thinking_mode(
+            enable_thinking if enable_thinking is not None else show_thinking,
+        )
         return self._model.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
@@ -1086,16 +1347,20 @@ class LlamaCppEngine:
 
     def unload(self) -> None:
         """卸载模型，释放内存。"""
+        upstream = getattr(self, "_keep_head", None)
+        if upstream is not None:
+            # Keep ownership until physical retirement succeeds. This runner
+            # holds segment weights independently of the in-process binding.
+            upstream.close()
+            self._keep_head = None
+        self._keep_head_key = None
         self._free_mtmd_context()
         # 顺序：先释放模型（其张量还在 RPC device 上），再撤 device/worker
         model = self._model
-        self._model = None
         close = getattr(model, "close", None)
         if callable(close):
-            try:
-                close()
-            except Exception:
-                logger.debug("GGUF model release failed", exc_info=True)
+            close()
+        self._model = None
         self._close_rpc_session()
         self._loaded = False
         self._embedding_enabled = False
@@ -2003,15 +2268,15 @@ class LlamaCppEngine:
             return None
         cut_layer = int(rng[1]) - int(rng[0])
         key = (str(artifact), cut_layer)
-        if getattr(self, "_keep_head_key", None) == key:
+        if (
+            getattr(self, "_keep_head_key", None) == key
+            and getattr(getattr(self, "_keep_head", None), "is_available", True)
+        ):
             return getattr(self, "_keep_head", None)
 
         old = getattr(self, "_keep_head", None)
         if old is not None:
-            try:
-                old.close()
-            except Exception:  # noqa: BLE001 - 旧实例释放失败不影响新实例
-                logger.debug("keep-head 上游释放失败", exc_info=True)
+            old.close()
         self._keep_head = None
         self._keep_head_key = key
 
@@ -2041,14 +2306,28 @@ class LlamaCppEngine:
         #   ⇒ 判据已过时（会**误拒** qwen3.5 的 llama 上游），故移除。
         #   详见 `docs/已知问题记录.md` #54 与 `docs/真三机产品路径攻坚-2026-10-07.md` §4.2。
         try:
-            from llama_keep_head import KeepHeadUpstream
+            from llama_keep_head import KeepHeadCleanupError, KeepHeadUpstream
 
             # 不用 `layer_inp`：shim 把它限制为 `cut_layer < n_layer`
             # （scripts/model_tools/keep_head_shim/qlh_keep_head.c:111），取不到
             # `lid == n_layer`（= 末层输出）这个恰好需要的挂点。
+            # ★ 2026-10-11（三机验收实测）：默认 `n_batch=512` 下，qwen3.5（M-RoPE）
+            #   的 embd 批次按 `4 × n_tokens` 读 pos ⇒ `n_tokens_all > n_batch` ⇒
+            #   llama.cpp 的 `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` 触发、worker
+            #   在 init 后立刻退出（master 只见 `keep-head worker exited before response`）。
+            #   这正是上游 #28963 家族（M-RoPE + embd）在本机的复现。这里把批次上限
+            #   放大到能容纳 4× 放大，并保留 `QLH_KEEP_HEAD_N_BATCH` 旋钮。
             self._keep_head = KeepHeadUpstream(
                 shim, str(artifact), mode="nextn",
-                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096))
+                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096),
+                n_batch=max(
+                    512,
+                    int(os.environ.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
+                ))
+        except KeepHeadCleanupError as exc:
+            self._keep_head = exc.cleanup_owner
+            self._keep_head_key = None
+            raise
         except Exception:  # noqa: BLE001 - 语义不兼容时由调用方 fail-closed
             logger.warning(
                 "keep-head 上游构造失败；层接力将 fail-closed，不交付 embeddings hidden "
@@ -2291,11 +2570,52 @@ class LlamaCppEngine:
             raise RuntimeError("模型未加载")
         return self._model.tokenize(text.encode("utf-8"))
 
-    def detokenize(self, tokens: List[int]) -> str:
+    @staticmethod
+    def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
+        """Expose the same text stops to chat and the distributed decode loop."""
+        return _merge_stop_sequences(stop)
+
+    def _get_generation_eos_token_ids(self, stop_sequences: List[str]):
+        """Use valid EOS ids and exact single-token stops; keep multi-token stops as text."""
+        from numbers import Integral
+
+        ids: List[int] = []
+        eos_id = self.tokenizer.eos_token_id
+        if isinstance(eos_id, Integral) and not isinstance(eos_id, bool) and eos_id >= 0:
+            ids.append(int(eos_id))
+        for text in stop_sequences:
+            try:
+                encoded = self._model.tokenize(
+                    text.encode("utf-8"), add_bos=False, special=True,
+                )
+            except TypeError:
+                # Some keep-head tokenizer facades only expose tokenize(bytes).
+                encoded = self._model.tokenize(text.encode("utf-8"))
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            if len(encoded) != 1:
+                continue
+            token_id = encoded[0]
+            if (
+                isinstance(token_id, Integral)
+                and not isinstance(token_id, bool)
+                and token_id >= 0
+                and int(token_id) not in ids
+                and self.detokenize([int(token_id)], special=True) == text
+            ):
+                ids.append(int(token_id))
+        return ids if len(ids) > 1 else ids[0] if ids else None
+
+    def detokenize(self, tokens: List[int], *, special: bool = False) -> str:
         """将 token ID 列表转换为文本。"""
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
-        return self._model.detokenize(tokens).decode("utf-8", errors="replace")
+        try:
+            text = self._model.detokenize(tokens, special=special)
+        except TypeError:
+            # LL keep-head facades may return str and omit the special keyword.
+            text = self._model.detokenize(tokens)
+        return text if isinstance(text, str) else text.decode("utf-8", errors="replace")
 
     @property
     def tokenizer(self):
@@ -2364,7 +2684,7 @@ class _LlamaCppTokenizerAdapter:
                 flat.extend(int(value) for value in item)
             else:
                 flat.append(int(item))
-        return self._engine.detokenize(flat)
+        return self._engine.detokenize(flat, special=not skip_special_tokens)
 
 
 # ================================================================

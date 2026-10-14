@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from api_errors import install_http_error_handler
-from inference_service.engine_host import EngineHost
+from inference_service.engine_host import ChatGenerationCancelled, EngineHost
 from inference_service.kv_host import KVHost
 from inference_service.protocol import ChatRequest, LoadModelRequest
 from inference_service.routes import router
@@ -80,6 +80,10 @@ class FakeModel:
 
     def __init__(self):
         self.calls = []
+        self.layer_load_calls = []
+        self.pipeline_prepare_calls = []
+        self.candidate_calls = []
+        self._candidate_prepared = {}
 
     def chat(self, messages, max_tokens=None, temperature=None, top_p=None,
              **_kw):
@@ -94,9 +98,50 @@ class FakeModel:
         }
 
     def load_layer_range(self, start_layer=0, end_layer=24,
-                         has_embedding=False, has_lm_head=False):
+                         has_embedding=False, has_lm_head=False,
+                          model_path=None, quant_type=None, model_id=None,
+                          profile=None, total_layers=None):
         """层段加载桩：1.2 复制完成后接入真实实现。"""
-        return None
+        self.layer_load_calls.append({
+            "start_layer": start_layer,
+            "end_layer": end_layer,
+            "model_path": model_path,
+            "quant_type": quant_type,
+            "model_id": model_id,
+            "profile": profile,
+            "total_layers": total_layers,
+        })
+        return {"success": True, "layer_range": f"{start_layer}-{end_layer}"}
+
+    def prepare_pipeline_model(self, **kwargs):
+        self.pipeline_prepare_calls.append(dict(kwargs))
+        return {"pipeline_runtime_supported": True, **kwargs}
+
+    def prepare_pipeline_candidate(self, transaction_id, **kwargs):
+        self.candidate_calls.append(("prepare", transaction_id, dict(kwargs)))
+        self.pipeline_prepare_calls.append(dict(kwargs))
+        self._candidate_prepared[transaction_id] = dict(kwargs)
+        return {"pipeline_runtime_supported": True, **kwargs}
+
+    def materialize_pipeline_candidate(self, transaction_id, **kwargs):
+        self.candidate_calls.append(
+            ("materialize", transaction_id, dict(kwargs))
+        )
+        prepared = self._candidate_prepared[transaction_id]
+        return self.load_layer_range(
+            model_path=prepared.get("model_path"),
+            quant_type=prepared.get("quant_type"),
+            **kwargs,
+        )
+
+    def commit_pipeline_candidate(self, transaction_id):
+        self.candidate_calls.append(("commit", transaction_id))
+
+    def finalize_pipeline_candidate(self, transaction_id):
+        self.candidate_calls.append(("finalize", transaction_id))
+
+    def abort_pipeline_candidate(self, transaction_id):
+        self.candidate_calls.append(("abort", transaction_id))
 
 
 class FakeEngineHost(EngineHost):
@@ -106,13 +151,22 @@ class FakeEngineHost(EngineHost):
         super().__init__()
         self._host = FakeModel()  # 替换真实 ModelHost
 
-    def load_model(self, engine=None, quant_type=None, use_compile=False, model_id=None):
+    def load_model(
+        self,
+        engine=None,
+        quant_type=None,
+        use_compile=False,
+        model_id=None,
+        model_path=None,
+        resolution=None,
+    ):
         return {"success": True, "engine": engine or "pytorch", "model_id": model_id}
 
     def unload_model(self):
         return {"success": True, "message": "模型已卸载"}
 
-    def switch_model(self, model_id, engine=None):
+    def switch_model(self, model_id, engine=None, quant_type=None, model_path=None,
+                     resolution=None):
         return {"success": True, "model_id": model_id, "engine": engine}
 
     def current_model(self):
@@ -356,6 +410,53 @@ def test_chat_stream_full_single_done(client):
     assert events[0]["response"] == "你好，我是 QLH。"
     assert events[0]["thinking_content"] is None
     assert events[0]["generation_id"].startswith("gen_")
+
+
+def test_chat_json_deadline_returns_504_with_stable_code():
+    from request_deadline import RequestDeadlineExceeded
+
+    class DeadlineHost(FakeEngineHost):
+        def chat_full_with_operation_id(
+                self, req, cancel_event, operation_id, request_deadline=None):
+            del req, cancel_event, operation_id, request_deadline
+            raise RequestDeadlineExceeded("request deadline exceeded")
+
+    with TestClient(make_app(engine_host=DeadlineHost())) as deadline_client:
+        resp = deadline_client.post("/v1/chat", json={"message": "deadline"})
+
+    assert resp.status_code == 504
+    assert resp.json()["error_code"] == "request_deadline_exceeded"
+    assert resp.headers["X-QLH-Error-Code"] == "request_deadline_exceeded"
+
+
+def test_chat_stream_deadline_sse_preserves_reason_code():
+    from request_deadline import RequestDeadlineExceeded
+
+    class DeadlineHost(FakeEngineHost):
+        def chat_stream_events_with_operation_id(
+                self, req, cancel_event, operation_id, request_deadline=None):
+            del req, cancel_event, operation_id, request_deadline
+            raise RequestDeadlineExceeded("request deadline exceeded")
+            yield  # pragma: no cover - keep this method a generator
+
+    with TestClient(make_app(engine_host=DeadlineHost())) as deadline_client:
+        resp = deadline_client.post(
+            "/v1/chat/stream",
+            json={"message": "deadline", "streaming_mode": "fast"},
+        )
+
+    events = [
+        json.loads(line[6:])
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert resp.status_code == 200
+    assert events == [{
+        "done": True,
+        "error": "request deadline exceeded",
+        "request_id": "-",
+        "reason_code": "request_deadline_exceeded",
+    }]
 
 
 def test_chat_cancel_semantics(client):
@@ -1079,15 +1180,90 @@ def test_engine_host_auto_load_selects_sorted_gguf_candidate(tmp_path, monkeypat
 
     host._auto_load_default_model()
 
-    assert recorder.calls == [{
+    assert len(recorder.calls) == 1
+    call = dict(recorder.calls[0])
+    resolution = call.pop("resolution")
+    assert call == {
         "model_path": str(selected),
-        "quant_type": "int4",
+        "quant_type": "gguf",
         "profile": {"tier": "edge", "gpu": {}},
+        "model_id": None,
         "engine": "llama_cpp",
-    }]
+    }
+    assert resolution.engine == "llama_cpp"
+    assert resolution.model_path == str(selected)
     assert host.current_model()["loaded"] is True
-    assert host.current_model()["quant_type"] == "int4"
+    assert recorder.current_quant == "gguf"
     assert host.kv_cache_status()["page_size"] == 64
+
+
+def test_engine_host_auto_load_safetensors_only_uses_pytorch_quant(tmp_path, monkeypatch):
+    import config as cfg
+
+    model_dir = tmp_path / "safetensors-model"
+    model_dir.mkdir()
+
+    class RecordingModelHost:
+        def __init__(self):
+            self.full_chat_execution_lock = threading.RLock()
+            self.model = None
+            self.model_loaded = False
+            self.quant_type = None
+            self.calls = []
+
+        @staticmethod
+        def get_device():
+            return torch.device("cpu")
+
+        def load_model(self, **kwargs):
+            self.calls.append(kwargs)
+            self.quant_type = kwargs["quant_type"]
+
+    host = FakeEngineHost()
+    recorder = RecordingModelHost()
+    host._host = recorder
+    host._device_profile = {"tier": "edge", "gpu": {"cuda_available": False}}
+    monkeypatch.setattr(host, "_ensure_device_profile", lambda: host._device_profile)
+    monkeypatch.setattr(cfg, "get_active_model_paths", lambda: {})
+    monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(tmp_path / "missing.gguf"))
+    monkeypatch.setattr(cfg, "MODEL_PATH", str(model_dir))
+    monkeypatch.setattr(cfg, "QUANT_TYPE", "int4")
+    monkeypatch.setattr(cfg, "PREFER_PYTORCH", False)
+
+    host._auto_load_default_model()
+
+    assert len(recorder.calls) == 1
+    call = recorder.calls[0]
+    assert call["engine"] == "pytorch"
+    assert call["model_path"] == str(model_dir)
+    assert call["quant_type"] == "fp32"
+    assert call["resolution"].runtime == "pytorch_cpu"
+
+
+def test_engine_host_auto_load_never_rebinds_active_id_to_global_artifact(
+    tmp_path, monkeypatch,
+):
+    import config as cfg
+
+    foreign = tmp_path / "foreign.gguf"
+    foreign.write_bytes(b"gguf")
+    host = FakeEngineHost()
+    host._device_profile = {"tier": "edge", "gpu": {"cuda_available": False}}
+    monkeypatch.setattr(host, "_ensure_device_profile", lambda: host._device_profile)
+    monkeypatch.setattr(
+        cfg,
+        "get_active_model_paths",
+        lambda: {
+            "model_id": "model-a",
+            "gguf_path": str(tmp_path / "missing-a.gguf"),
+            "model_path": str(tmp_path / "missing-a"),
+        },
+    )
+    monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(foreign))
+    monkeypatch.setattr(cfg, "MODEL_PATH", str(tmp_path / "foreign-safetensors"))
+
+    with pytest.raises(FileNotFoundError, match="未找到可自动加载的模型文件"):
+        host._auto_load_default_model()
 
 
 def test_engine_host_remote_worker_selection_enforces_feature_health_model_and_load(
@@ -1323,6 +1499,79 @@ def test_chat_full_llama_cpp_does_not_import_torch(monkeypatch):
     assert result["metrics"]["engine"] == "llama_cpp"
 
 
+@pytest.mark.parametrize("engine", ["pytorch", "llama_cpp"])
+def test_chat_full_partial_pipeline_local_only_fails_closed(engine):
+    host = make_full_host()
+    host._host._engine_type = engine
+    host._host.is_pipeline_prepared = True
+
+    with pytest.raises(HTTPException) as exc_info:
+        host.chat_full(ChatRequest(
+            message="hello",
+            routing_preference="local_only",
+        ))
+
+    assert exc_info.value.status_code == 409
+    assert "分布式流水线模式准备" in str(exc_info.value.detail)
+    assert host._host.calls == []
+
+
+def test_engine_host_pipeline_deadline_never_enters_local_fallback(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+    from request_deadline import RequestDeadline
+
+    calls = {"chat": 0, "ensure": 0}
+
+    class DeadlineModel(FakeModel):
+        _engine_type = "pytorch"
+
+        def ensure_full_model(self):
+            calls["ensure"] += 1
+            pytest.fail("deadline terminal must not restore a full model")
+
+        def chat(self, *_args, **_kwargs):
+            calls["chat"] += 1
+            pytest.fail("deadline terminal must not enter local chat")
+
+    host = make_full_host(DeadlineModel)
+    host._run_mode = "distributed"
+    host._scheduler = SimpleNamespace(
+        get_distributed_inference_enabled=lambda: True,
+        _effective_role=lambda: "master",
+        has_pipeline_worker_reservation=lambda: False,
+        run_pipeline_safe=lambda *_a, **_k: {
+            "response": "",
+            "error": "request deadline exceeded",
+            "reason_code": "request_deadline_exceeded",
+            "metrics": {"fallback": False},
+        },
+    )
+    monkeypatch.setattr(
+        engine_host_module,
+        "runtime_supports",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        host,
+        "_prepare_chat_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            session_id="default", history=[], revision=0,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        host.chat_full(
+            ChatRequest(message="deadline fence"),
+            request_deadline=RequestDeadline.start(1.0),
+        )
+
+    assert exc_info.value.status_code == 504
+    assert getattr(exc_info.value, "error_code", "") == (
+        "request_deadline_exceeded"
+    )
+    assert calls == {"chat": 0, "ensure": 0}
+
+
 # ----------------------------------------------------------------------
 # 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
 #      + _execute_task_graph_chat_with_slot + 5 个辅助函数）
@@ -1495,7 +1744,7 @@ def test_task_graph_with_slot_real_execution(monkeypatch):
                     "partial_result": False, "stage_count": 0,
                     "attempt_count": 0, "duration_seconds": 0.5}
 
-        def discard_result(self, workflow_id):
+        def discard_result(self, workflow_id, **_kwargs):
             return None
 
         def provider_status(self):
@@ -1522,6 +1771,93 @@ def test_task_graph_with_slot_real_execution(monkeypatch):
     assert [message["role"] for message in history] == ["user", "assistant"]
     # 本地 provider 注册成功（self._dispatch_local_task_provider 引用有效）
     assert "local_full_model" in fake_coord.providers
+
+
+def test_engine_host_release_profile_discards_task_graph_required_before_commit(
+    monkeypatch,
+):
+    """The inference service cannot revive task_graph as a release route."""
+    import config as _cfg
+    from task_provider import ModelIdentity
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
+    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+
+    host = make_full_host()
+    identity = ModelIdentity(
+        model_id="qwen-1.8b",
+        engine="llama_cpp",
+        format="gguf",
+        revision="release-test",
+        sha256="a" * 64,
+    )
+    monkeypatch.setattr(
+        host, "_active_task_graph_model_identity", lambda: identity,
+    )
+    monkeypatch.setattr(
+        host,
+        "_eligible_remote_task_worker_provider_ids",
+        lambda *_args, **_kwargs: ["remote_release_worker"],
+    )
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.providers = []
+            self.discarded = []
+
+        def has_provider(self, provider_id):
+            return provider_id in self.providers
+
+        def register_provider(self, provider):
+            self.providers.append(provider.provider_id)
+
+        def run(self, **_kwargs):
+            return (
+                {"content": "forbidden task graph result"},
+                {
+                    "workflow_id": "wf_releaseenginehost01",
+                    "state": "result_ready",
+                    "stages": [{
+                        "attempts": [{
+                            "state": "completed",
+                            "provider_kind": "remote_full_worker",
+                            "provider_node_id": "worker-release",
+                        }],
+                    }],
+                },
+            )
+
+        def discard_result(self, workflow_id, **kwargs):
+            self.discarded.append((workflow_id, kwargs))
+            return {"workflow_id": workflow_id, "state": "failed"}
+
+        def commit_result(self, _workflow_id):
+            pytest.fail("release route rejection must happen before commit")
+
+    coordinator = FakeCoordinator()
+    monkeypatch.setattr(
+        host, "_ensure_task_graph_coordinator", lambda: coordinator,
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        host.execute_task_graph_chat_with_slot(ChatRequest(
+            message="release route policy",
+            session_id="s1",
+            execution_mode="task_graph",
+            routing_preference="distributed_required",
+            workflow_id="wf_releaseenginehost01",
+        ))
+
+    assert captured.value.status_code == 503
+    assert (
+        captured.value.error_code
+        == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
+    )
+    assert coordinator.discarded == [(
+        "wf_releaseenginehost01",
+        {"terminal_reason_code": "request_refused"},
+    )]
 
 
 def test_task_graph_auto_remote_identity_path(monkeypatch):
@@ -1571,7 +1907,7 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
                     "partial_result": False, "stage_count": 0,
                     "attempt_count": 0, "duration_seconds": 0.3}
 
-        def discard_result(self, workflow_id):
+        def discard_result(self, workflow_id, **_kwargs):
             return None
 
         def provider_status(self):
@@ -1713,6 +2049,48 @@ def test_chat_full_session_switch(monkeypatch):
     assert result["content"] == "候选答案内容"
     # 新会话历史 = 本次对话
     assert host.session_history("s_new")[-1]["role"] == "assistant"
+
+
+def test_chat_full_same_session_reloads_after_runtime_reset(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+
+    rows = [
+        {"role": "user", "content": "persisted question"},
+        {"role": "assistant", "content": "persisted answer"},
+    ]
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "load_local_conversation",
+        lambda session_id: list(rows) if session_id == "s1" else [],
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "get_local_save_history",
+        lambda: False,
+    )
+
+    host = make_full_host()
+    host._active_session_id = "s1"
+    host._session_histories["s1"] = [{"role": "user", "content": "stale"}]
+    host._reset_runtime_conversation_state(clear_histories=True)
+
+    host.chat_full(ChatRequest(message="continue", session_id="s1"))
+
+    assert host.session_history("s1")[:2] == rows
+
+
+def test_engine_host_close_releases_task_graph_coordinator():
+    host = FakeEngineHost()
+    closed = []
+    host._task_graph_coordinator = SimpleNamespace(
+        close=lambda: closed.append(True),
+    )
+
+    host.close()
+    host.close()
+
+    assert closed == [True]
+    assert host._task_graph_coordinator is None
 
 
 def test_chat_full_first_message_auto_title(monkeypatch):
@@ -1860,8 +2238,160 @@ def test_engine_host_persists_locally_without_legacy_export(monkeypatch):
     monkeypatch.setattr(engine_host_module, "_local_store", fake_local_store)
 
     host = EngineHost()
-    assert host._persist_conversation_turn("s-local", "q", "a", {}) is True
+    result = host._persist_conversation_turn("s-local", "q", "a", {})
+    assert result.value == "committed"
     assert events == [("local", "s-local", "q", "a", {}, None)]
+
+
+def test_inference_http_request_id_replay_survives_host_restart(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+
+    durable: dict[str, list[dict]] = {"default": []}
+    receipts: dict[str, tuple[str, str, str]] = {}
+
+    def save_turn(
+        session_id, user, assistant, metrics=None, *, operation_id=None,
+    ):
+        turn = (session_id, user, assistant)
+        if operation_id in receipts:
+            if receipts[operation_id] != turn:
+                raise ValueError("operation_id has conflicting conversation turn")
+            return False
+        receipts[operation_id] = turn
+        durable.setdefault(session_id, []).extend([
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": assistant},
+        ])
+        return True
+
+    monkeypatch.setattr(
+        engine_host_module._local_store, "get_local_save_history", lambda: True,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store, "save_local_conversation_turn", save_turn,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "load_local_conversation",
+        lambda session_id: list(durable.get(session_id, [])),
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "update_local_session_title",
+        lambda *_args, **_kwargs: None,
+    )
+
+    headers = {"X-QLH-Request-ID": "req-restart-replay"}
+    first_host = make_full_host()
+    with TestClient(make_app(engine_host=first_host)) as first_client:
+        first = first_client.post(
+            "/v1/chat", json={"message": "same question"}, headers=headers,
+        )
+    assert first.status_code == 200
+    assert len(durable["default"]) == 2
+
+    restarted_host = make_full_host()
+    with TestClient(make_app(engine_host=restarted_host)) as second_client:
+        replay = second_client.post(
+            "/v1/chat", json={"message": "same question"}, headers=headers,
+        )
+
+    assert replay.status_code == 200
+    assert len(durable["default"]) == 2
+    assert restarted_host.session_history("default") == durable["default"]
+
+
+def test_inference_stream_producer_does_not_commit_before_terminal_consumption(
+    monkeypatch,
+):
+    import inference_service.engine_host as engine_host_module
+
+    writes = []
+    monkeypatch.setattr(
+        engine_host_module._local_store, "get_local_save_history", lambda: True,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "save_local_conversation_turn",
+        lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "load_local_conversation",
+        lambda _session_id: [],
+    )
+
+    class StreamingModel(FakeModel):
+        def chat_stream(self, messages, **_kwargs):
+            del messages
+            yield "first"
+            yield "second"
+
+    host = make_full_host(StreamingModel)
+    cancel_event = threading.Event()
+    events = host.chat_stream_events_with_operation_id(
+        ChatRequest(message="stream", session_id="stream-session"),
+        cancel_event,
+        "req-stream-consume",
+    )
+
+    assert next(events) == {"token": "first"}
+    cancel_event.set()
+    with pytest.raises(ChatGenerationCancelled):
+        next(events)
+
+    assert writes == []
+    assert host.session_history("stream-session") == []
+
+
+def test_inference_stream_blocked_backend_returns_deadline_but_retains_lock():
+    import time
+
+    from request_deadline import RequestDeadline
+
+    class BlockingStreamingModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.full_chat_execution_lock = threading.Lock()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def chat_stream(self, messages, **_kwargs):
+            del messages
+            self.started.set()
+            assert self.release.wait(5)
+            yield "late"
+
+    host = make_full_host(BlockingStreamingModel)
+    model = host._host
+    events = host.chat_stream_events_with_operation_id(
+        ChatRequest(message="blocked stream", session_id="blocked-session"),
+        threading.Event(),
+        "req-blocked-stream",
+        RequestDeadline.start(0.08),
+    )
+
+    started_at = time.monotonic()
+    terminal = next(events)
+    elapsed = time.monotonic() - started_at
+    events.close()
+
+    assert model.started.is_set()
+    assert elapsed < 0.5
+    assert terminal["done"] is True
+    assert terminal["reason_code"] == "request_deadline_exceeded"
+    assert model.full_chat_execution_lock.acquire(blocking=False) is False
+
+    model.release.set()
+    released = False
+    wait_until = time.monotonic() + 2.0
+    while time.monotonic() < wait_until:
+        if model.full_chat_execution_lock.acquire(blocking=False):
+            model.full_chat_execution_lock.release()
+            released = True
+            break
+        time.sleep(0.01)
+    assert released is True
 
 
 def test_build_app_master_role(monkeypatch, tmp_path):
@@ -1882,6 +2412,9 @@ def test_build_app_client_role_gates_chat():
 
     app = build_app("client")
     assert app.state.engine_host.role == "client"
+    fake_host = FakeEngineHost()
+    fake_host.role = "client"
+    app.state.engine_host = fake_host
     with TestClient(app) as c:
         # client 角色：chat 端点 404，层段/KV 端点仍可用
         assert c.post("/v1/chat", json={"message": "你好"}).status_code == 404
@@ -2081,6 +2614,10 @@ def make_peer():
 
     peer = PeerClient(master_host="127.0.0.1", master_port=8888,
                       node_id="test_client")
+    peer._host._ensure_device_profile = lambda: {
+        "tier": "edge",
+        "gpu": {"cuda_available": False},
+    }
     fake = FakeModel()
     fake.forward_layers_called = []
 
@@ -2099,7 +2636,8 @@ def make_peer():
         return out
 
     fake.forward_layers = _forward_layers
-    fake.load_model = lambda **kw: {"success": True}
+    fake.full_load_calls = []
+    fake.load_model = lambda **kw: fake.full_load_calls.append(dict(kw))
     fake.is_loaded = True
     fake._engine_type = "pytorch"
     fake.model = type("M", (), {"config": type("C", (), {"model_type": "qwen"})()})()
@@ -2120,11 +2658,14 @@ def test_peer_layer_config_new_format(monkeypatch):
         "has_embedding": True, "has_lm_head": False,
         "model_id": "qwen-1.8b", "model_sha256": "abc123",
         "model_type": "qwen", "total_layers": 24,
+        "master_quant_type": "fp32",
     })
     ack = [p for t, p in peer._client.sent if t.value == "layer_config_ack"]
     assert ack and ack[0]["status"] == "ready"
     assert ack[0]["config_id"] == "cfg-1"
     assert peer._active_layer_config["config_id"] == "cfg-1"
+    assert peer._host._host.full_load_calls == []
+    assert peer._host._host.layer_load_calls[0]["quant_type"] == "fp32"
 
 
 def test_peer_disconnect_marks_client_for_reregistration():
@@ -2588,13 +3129,13 @@ def test_v1_models_current_unloaded_shape_real_host():
 # 14.7 模型生命周期校验（contract_diff 2026-08-05 复测修复回归）
 #    - /v1/models/load：引擎白名单 400（此前 500）
 #    - /v1/models/switch：未注册模型 404 detail（此前 200 success:false）
-#    - 引擎大小写经 _check_load_engine 归一化后执行（校验与执行同值）
+#    - 引擎大小写经统一 resolver 归一化后执行（校验与执行同值）
 # ----------------------------------------------------------------------
 def test_models_load_invalid_engine_400(client):
     # ★ 2026-09-19：`qwen-1_8b` 已从内置列表移除 ⇒ 改用 `qwen3-0.6b`
     #   （本用例验的是「引擎白名单」，与具体模型无关）。
     resp = client.post("/v1/models/load", json={
-        "engine": "torch", "model_id": "qwen3-0.6b"})
+        "engine": "tensorrt", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
@@ -2605,6 +3146,98 @@ def test_models_load_engine_case_normalized(client):
     resp = client.post("/v1/models/load", json={
         "engine": "LLAMA_CPP", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 200
+
+
+def test_models_load_torch_alias_uses_pytorch(client):
+    resp = client.post("/v1/models/load", json={
+        "engine": "torch", "quant_type": "int4", "model_id": "qwen3-0.6b"})
+    assert resp.status_code == 200
+    assert resp.json()["engine"] == "pytorch"
+
+
+def test_models_load_layer_range_never_loads_full_model(monkeypatch):
+    from inference_service import routes as routes_module
+    from model_load_resolver import ModelLoadResolution
+
+    host = FakeEngineHost()
+    full_load_calls = []
+    host.load_model = lambda **kwargs: full_load_calls.append(dict(kwargs))
+    resolution = ModelLoadResolution(
+        model_id="qwen3-0.6b",
+        requested_engine="pytorch",
+        engine="pytorch",
+        artifact_kind="safetensors",
+        model_path="C:/models/qwen3-0.6b",
+        requested_quant="fp32",
+        quant_type="fp32",
+        runtime="pytorch_cpu",
+        runtime_quant="fp32",
+        layer_range_mode="dynamic",
+        reason_code="ENGINE_EXPLICIT",
+        reason="test",
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "_resolve_service_model_load",
+        lambda **_kwargs: resolution,
+    )
+
+    response = TestClient(make_app(engine_host=host)).post(
+        "/v1/models/load",
+        json={
+            "engine": "pytorch",
+            "quant_type": "fp32",
+            "model_id": "qwen3-0.6b",
+            "layer_range": "0-12",
+        },
+    )
+
+    assert response.status_code == 200
+    assert full_load_calls == []
+    assert host._host.layer_load_calls == [{
+        "start_layer": 0,
+        "end_layer": 12,
+        "model_path": "C:/models/qwen3-0.6b",
+        "quant_type": "fp32",
+        "model_id": "qwen3-0.6b",
+        "profile": None,
+        "total_layers": None,
+    }]
+
+
+def test_engine_host_precut_layer_range_prepares_descriptor_before_loading():
+    from model_load_resolver import ModelLoadResolution
+
+    host = FakeEngineHost()
+    resolution = ModelLoadResolution(
+        model_id="qwen3-0.6b",
+        requested_engine="llama_cpp",
+        engine="llama_cpp",
+        artifact_kind="gguf",
+        model_path="C:/models/qwen3-0.6b.gguf",
+        requested_quant="Q4_K_M",
+        quant_type="gguf",
+        runtime="llama_cpp_native",
+        runtime_quant="gguf",
+        layer_range_mode="precut_artifact",
+        reason_code="ENGINE_EXPLICIT",
+        reason="test",
+    )
+
+    host.load_layer_range(layer_range="12-24", resolution=resolution)
+
+    assert host._host.pipeline_prepare_calls == [{
+        "model_id": "qwen3-0.6b",
+        "model_path": "C:/models/qwen3-0.6b.gguf",
+        "quant_type": "gguf",
+        "layer_range": (12, 24),
+        "model_sha256": None,
+    }]
+    assert host._host.layer_load_calls[0]["start_layer"] == 12
+    assert host._host.layer_load_calls[0]["end_layer"] == 24
+    assert [call[0] for call in host._host.candidate_calls] == [
+        "prepare", "materialize", "commit", "finalize",
+    ]
 
 
 def test_models_switch_invalid_engine_400(client):
@@ -2639,13 +3272,14 @@ class _FakeLoadHost:
         self.switch_calls = []
 
     def load_model(self, engine=None, quant_type=None, use_compile=False,
-                   model_id=None):
+                   model_id=None, model_path=None, profile=None, resolution=None):
         self.load_calls.append((engine, quant_type, use_compile, model_id))
         # 模拟 manager 归一化：llama_cpp 引擎忽略请求量化（GGUF 自带）
         self.quant_type = "gguf" if engine == "llama_cpp" else (quant_type or "int4")
         return None
 
-    def switch_model(self, model_id=None, engine=None):
+    def switch_model(self, model_id=None, engine=None, quant_type=None,
+                     model_path=None, profile=None, resolution=None):
         self.switch_calls.append((model_id, engine))
         self.quant_type = "int8"
         return {"success": True, "model_id": model_id, "quant_type": "int8"}

@@ -127,6 +127,8 @@ class TestTotp:
         assert r.status_code == 200
         secret = r.json()["secret"]
         assert r.json()["otpauth_uri"].startswith("otpauth://totp/")
+        assert r.json()["reauth_required"] is True
+        assert client.get("/api/auth/me", headers=hdr).json()["username"] == "anonymous"
 
         # 绑定后：只给口令 ⇒ 401 且提示需要验证码
         r2 = client.post("/api/auth/login", json={"username": "root", "password": "password123"})
@@ -145,15 +147,39 @@ class TestTotp:
         hdr = self._login(client)
         secret = client.post("/api/auth/totp/provision", headers=hdr).json()["secret"]
         import auth_app
+        import auth_service
 
-        ok = client.post("/api/auth/totp/verify", json={"code": auth_app.totp(secret)},
-                         headers=hdr)
+        code = auth_app.totp(secret)
+        token = client.post(
+            "/api/auth/login",
+            json={"username": "root", "password": "password123", "totp_code": code},
+        ).json()["token"]
+        auth_service.get_totp_verifier().reset()
+        ok = client.post(
+            "/api/auth/totp/verify",
+            json={"code": code},
+            headers={"Authorization": f"Bearer {token}"},
+        )
         assert ok.status_code == 200 and ok.json()["verified"] is True
 
     def test_wrong_code_rejected(self, client):
         hdr = self._login(client)
-        client.post("/api/auth/totp/provision", headers=hdr)
-        r = client.post("/api/auth/totp/verify", json={"code": "000000"}, headers=hdr)
+        secret = client.post("/api/auth/totp/provision", headers=hdr).json()["secret"]
+        import auth_app
+
+        token = client.post(
+            "/api/auth/login",
+            json={
+                "username": "root",
+                "password": "password123",
+                "totp_code": auth_app.totp(secret),
+            },
+        ).json()["token"]
+        r = client.post(
+            "/api/auth/totp/verify",
+            json={"code": "000000"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
         assert r.status_code == 200 and r.json()["verified"] is False
 
 
@@ -228,3 +254,24 @@ class TestUserAdmin:
                          json={"username": "v1", "password": "password123"}).json()["token"]
         vh = {"Authorization": f"Bearer {vt}"}
         assert client.get("/api/users", headers=vh).status_code == 403
+
+    def test_optional_auth_mode_cannot_anonymously_take_over_accounts(self, client):
+        client.post(
+            "/api/users",
+            json={"username": "root", "password": "password123", "role": "admin"},
+        )
+
+        assert client.get("/api/users").status_code == 401
+        assert client.post(
+            "/api/users",
+            json={"username": "attacker", "password": "password123", "role": "admin"},
+        ).status_code == 401
+        assert client.patch(
+            "/api/users/root", json={"password": "attacker-password"},
+        ).status_code == 401
+        assert client.delete("/api/users/root").status_code == 401
+        assert client.post("/api/auth/totp/provision").status_code == 401
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "root", "password": "attacker-password"},
+        ).status_code == 401

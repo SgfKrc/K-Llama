@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from koakuma_engine import (
@@ -57,6 +59,17 @@ def test_backend_capabilities_are_public_and_backend_specific() -> None:
     assert torch.supports(Capability.FORWARD_LAYERS)
 
 
+def test_unknown_and_nonlocal_backends_have_no_local_capabilities() -> None:
+    for backend in ("external_api", "speculative_assisted", "relay_middle", "typo"):
+        assert canonical_backend(backend) == ""
+        assert not backend_capabilities(backend).supports(Capability.FORWARD_LAYERS)
+
+
+def test_select_backend_rejects_unknown_request() -> None:
+    with pytest.raises(ValueError, match="unsupported backend request"):
+        select_backend(requested="llama_magic", cuda_available=False)
+
+
 def test_backend_registry_is_the_api_allowlist_source() -> None:
     assert registered_backends() == (
         BackendId.LLAMA_CPP,
@@ -85,6 +98,12 @@ def test_runtime_supports_uses_capabilities_with_legacy_fallback() -> None:
     assert runtime_supports(LegacyLayerRuntime(), Capability.FORWARD_LAYERS)
     assert runtime_supports(ExplicitRuntime(), "custom")
     assert not runtime_supports(ExplicitRuntime(), Capability.FORWARD_LAYERS)
+
+    class UnknownRuntime:
+        _engine_type = "external_api"
+
+    assert backend_id_for(UnknownRuntime()) == ""
+    assert not runtime_supports(UnknownRuntime(), Capability.FORWARD_LAYERS)
 
 
 def test_model_host_engine_status_does_not_materialize_lazy_manager() -> None:

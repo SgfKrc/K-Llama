@@ -46,6 +46,24 @@ class TestBuildInteractiveRequest:
         assert body["routing_preference"] == "distributed_required"
         assert body["show_thinking"] is True
 
+    @pytest.mark.parametrize("mode, expected", [(None, "interactive"), ("interactive", "interactive"), ("full", "full")])
+    def test_explicit_streaming_mode_preserves_routing(self, mode, expected):
+        body = build_interactive_request("hi", streaming_mode=mode, routing_preference="distributed_required")
+        assert body["streaming_mode"] == expected
+        assert body["routing_preference"] == "distributed_required"
+
+    @pytest.mark.parametrize("mode", ["fast", "FULL", "", False])
+    def test_invalid_streaming_mode_is_rejected(self, mode):
+        with pytest.raises(ValueError, match="streaming_mode"):
+            build_interactive_request("hi", streaming_mode=mode)
+
+    def test_local_image_rejects_explicit_interactive(self):
+        with pytest.raises(ValueError, match="streaming_mode='full'"):
+            build_interactive_request(
+                "描述图片", routing_preference="local_only", streaming_mode="interactive",
+                image_data_urls=["data:image/png;base64,iVBORw0KGgo="],
+            )
+
     def test_invalid_routing_falls_back_to_auto(self):
         body = build_interactive_request("hi", routing_preference="bogus")
         assert body["routing_preference"] == "auto"
@@ -209,6 +227,49 @@ class TestFormatMetrics:
         assert "已请求分布式" not in text
         assert "本地执行" in text
 
+    def test_done_model_identity_preserves_two_remote_layer_evidence(self):
+        metrics = {
+            "engine": "distributed_pipeline", "execution_mode": "route_a_stage_offer_v3",
+            "distributed_used": True, "workers_used": ["worker-surface", "worker-android"],
+            "layer_segments": [[0, 15], [16, 31]], "generated_tokens": 42,
+            "tokens_per_second": 12.34, "config_id": "route_a:request_fixture",
+            "generation_id": "gen_request_fixture", "model_operation_id": "supply_response",
+            "model_config_id": "config_response", "model_generation": 7,
+        }
+        text = format_metrics(metrics, history_committed=False)
+        assert "分布式 ✓（2 段·层 0-31）" in text
+        assert "route_a_stage_offer_v3" in text
+        assert "42 tokens" in text and "12.3 tok/s" in text
+        assert "模型准备：supply_response" in text
+        assert "模型配置：config_response" in text
+        assert "模型代次：7" in text
+        assert "route_a:request_fixture" not in text
+        assert "gen_request_fixture" not in text
+        assert "历史未提交" in text
+
+    @pytest.mark.parametrize(("identity", "expected"), [
+        ({}, []),
+        ({"model_operation_id": "supply_response"}, ["模型准备：supply_response"]),
+        ({"model_config_id": "config_response"}, ["模型配置：config_response"]),
+        ({"model_generation": 0}, ["模型代次：0"]),
+        ({"model_operation_id": "", "model_config_id": None, "model_generation": None}, []),
+    ])
+    def test_only_returned_model_identity_fields_are_shown(self, identity, expected):
+        text = format_metrics({
+            "engine": "distributed_pipeline", "execution_mode": "route_a_stage_offer_v3",
+            "distributed_used": True, "workers_used": ["worker-surface", "worker-android"],
+            "config_id": "route_a:request_fixture", "generation_id": "gen_request_fixture",
+            **identity,
+        })
+        assert "分布式 ✓（2 个 worker）" in text
+        for value in expected:
+            assert value in text
+        for label in ("模型准备：", "模型配置：", "模型代次："):
+            if not any(value.startswith(label) for value in expected):
+                assert label not in text
+        assert "route_a:request_fixture" not in text
+        assert "gen_request_fixture" not in text
+
     def test_history_not_committed(self):
         text = format_metrics({}, history_committed=False)
         assert "历史未提交" in text
@@ -267,3 +328,60 @@ class TestApiPaths:
         assert API_PATHS["cluster_layers"] == "/cluster/layers"
         assert API_PATHS["cluster_pipeline_capacity"] == "/cluster/pipeline-capacity"
         assert API_PATHS["cluster_pipeline_reshard"] == "/cluster/pipeline-reshard"
+
+
+@pytest.mark.parametrize("identity", [
+    {"model_operation_id": "supply_response", "model_config_id": "config_response", "model_generation": 7},
+    {},
+])
+def test_textual_done_status_uses_response_metrics_identity(monkeypatch, identity):
+    """Exercise the real ChatPane SSE worker and rendered status with a response fixture."""
+    import asyncio
+
+    pytest.importorskip("textual")
+    from textual.app import App
+    from textual.widgets import Static
+    import tui_textual as tt
+
+    def stream(api, message, **kwargs):
+        yield {"token": "推理完成"}
+        yield {"done": True, "response": "推理完成", "metrics": {
+            "engine": "distributed_pipeline", "execution_mode": "route_a_stage_offer_v3",
+            "distributed_used": True, "workers_used": ["worker-surface", "worker-android"],
+            "layer_segments": [[0, 15], [16, 31]], **identity,
+        }}
+
+    monkeypatch.setattr(tt, "iter_chat_payloads", stream)
+
+    class ChatStatusApp(App):
+        api = object()
+        routing_preference = "distributed_required"
+        show_thinking = False
+        enable_thinking = False
+        model_intent = {"operation_id": "supply_ui_current", "config_id": "config_ui_current", "generation": 99}
+
+        def compose(self):
+            yield tt.ChatPane()
+
+    async def run():
+        app = ChatStatusApp()
+        async with app.run_test(size=(140, 25)) as pilot:
+            pane = app.query_one(tt.ChatPane)
+            await pane.stream_reply("检查本次推理身份").wait()
+            await pilot.pause()
+            text = str(pane.query_one("#chat-status", Static).content)
+            assert "推理完成" in str(pane.query_one("#chat-log", Static).content)
+            assert "分布式 ✓（2 段·层 0-31）" in text
+            assert "route_a_stage_offer_v3" in text
+            if identity:
+                assert "模型准备：supply_response" in text
+                assert "模型配置：config_response" in text
+                assert "模型代次：7" in text
+            else:
+                assert "模型准备：" not in text
+                assert "模型配置：" not in text
+                assert "模型代次：" not in text
+            assert "ui_current" not in text
+            assert "99" not in text
+
+    asyncio.run(run())

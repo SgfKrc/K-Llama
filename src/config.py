@@ -20,6 +20,12 @@ import sys
 import socket
 import hashlib
 
+from release_contract import apply_release_profile_to_env, release_profile_enforced
+
+# A packaged artifact owns its product-route switches. Apply those values
+# before .env and user node configuration are considered.
+apply_release_profile_to_env()
+
 # 加载 .env 文件中的环境变量（必须在读取任何环境变量之前）
 try:
     from dotenv import load_dotenv
@@ -40,6 +46,10 @@ try:
     from node_config import apply_node_config_to_env, resolve_initial_node_role
     _NODE_CONFIG = apply_node_config_to_env()
 except Exception:
+    # Credential-store corruption or migration failure must not fall back to
+    # a stale .env secret. Leave cluster authentication unavailable instead.
+    os.environ.pop("QLH_CLUSTER_SECRET", None)
+    os.environ.pop("QLH_CLUSTER_SECRET_EPOCH", None)
     _NODE_CONFIG = {}
     resolve_initial_node_role = None
 
@@ -339,6 +349,37 @@ SPEC_TOP_LOGPROBS = _env_int("QLH_SPEC_TOP_LOGPROBS", 20, min_val=1, max_val=100
 SPEC_STATEFUL_VERIFY = _env_bool("QLH_SPEC_STATEFUL_VERIFY", False)
 SPEC_LABEL = _env_first("QLH_SPEC_LABEL", default="投机解码外部辅助")  # 展示名
 
+# --- n-gram 自投机（绑定路径 / 无 CUDA 边缘）---
+# ★ 2026-10-13 实测（Qwen3.6-35B-A3B-UD-Q4_K_XL，`.venv-test` 绑定）：
+#   `draft_model=LlamaPromptLookupDecoding` 在**绑定路径**上有效 —— 重复文本
+#   1.30～1.40×，自由文本不劣化（不命中时也不掉速）。它与上面 `SPEC_*`
+#   「外部 verify 模型」那套是**两条不同的路**：这里不引入任何额外模型、
+#   不占额外带宽与显存，纯粹在 token 历史里做 n-gram 匹配。
+# ⚠️ 代价：绑定一旦收到 `draft_model`，`llama_cpp/llama.py` 会把 `logits_all`
+#   强制为 True（每个位置都算 logits，内存/显存开销上升）⇒ 因此**默认关闭**，
+#   按场景显式启用；只在文本重复场景（结构化输出 / 代码 / 长文回述）有收益。
+# 对应裁决：有 CUDA 走 server 的 `--spec-type`，无 CUDA 才走这里。
+NGRAM_SPEC_ENABLED = _env_bool("QLH_NGRAM_SPEC_ENABLED", False)
+NGRAM_SPEC_MAX_NGRAM = _env_int("QLH_NGRAM_SPEC_MAX_NGRAM", 2, min_val=1, max_val=16)
+NGRAM_SPEC_NUM_PRED = _env_int("QLH_NGRAM_SPEC_NUM_PRED", 10, min_val=1, max_val=64)
+
+# --- 本机 llama-server 子进程路径（票 15a/15b）---
+# 裁决（2026-10-12）：有 CUDA 走 server 子进程（拿得到 --spec-type 投机族、
+# `--cpu-moe`、`--cache-reuse`），无 CUDA 老实走绑定。留空时由
+# `llama_server_engine.default_server_exe()` 在 `runtime/llama-cpp/<build>/` 下自动挑选。
+LLAMA_SERVER_EXE = _env_first("QLH_LLAMA_SERVER_EXE", default="")
+
+# --- 整模推理路径选择（票 15a/15b 接线）---
+# 取值 = `src/inference_path_selector.py` 的 AUTO / SERVER / BINDING。
+# **默认 auto**，且它与 `select_backend` 的 auto 是**正交**的两层：
+#   * `select_backend` 的 auto 选的是**引擎档位**（pytorch / llama_cpp / island）；
+#   * 本项只在 **llama.cpp 家族内**挑传输 —— 有 CUDA 走 server 子进程（绑定是
+#     CPU-only，拿不到 GPU），无 CUDA 老实走绑定。
+# 因此 auto 不会顶掉 D 档：走 `_load_llama_cpp` 才轮到本项。server 可执行文件
+# 缺失时 auto **可观测地**退回绑定（reason 写明原因）；**显式**请求 server 则
+# 永远 fail-closed，不降级。
+INFER_PATH = _env_first("QLH_INFER_PATH", default="auto")
+
 # --- 多模型实验支持 (P3) ---
 # ★ 2026-09-19：`qwen-1_8b` 已退役并从内置列表移除 ⇒ 活跃模型 ID 同步为默认模型
 #   （须与 `model_config.DEFAULT_MODEL_ID` 保持一致）。
@@ -501,7 +542,11 @@ PREFER_PYTORCH = _env_bool("QLH_PREFER_PYTORCH", False)
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
 
 # 流水线推理超时与并发控制
-PIPELINE_TIMEOUT = 120                   # 流水线单步超时（秒），含网络传输 + 前向计算
+#: ★ 2026-10-11（ROG+Y700+本机三机实测）：此前是硬编码 `120`，而三机层接力每步约
+#:   0.2s ⇒ 长思考请求（`show_thinking=true` + 大 `max_new_tokens`）跑到 500+ 步就撞上，
+#:   表现为 `request_deadline_exceeded`，现场只能改源码。现在可用 `QLH_PIPELINE_TIMEOUT`
+#:   调整（默认仍是 120，既有行为不变）。
+PIPELINE_TIMEOUT = _env_int("QLH_PIPELINE_TIMEOUT", 120)   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
 PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
     "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK
@@ -595,11 +640,11 @@ REVIEW_REJECT_THRESHOLD = -2         # 阻止阈值: score <= -2
 # ============================================================
 # 6. 集群安全
 # ============================================================
-# 集群共享密钥 — 所有节点必须使用相同密钥才能加入集群
-# 通过环境变量 QLH_CLUSTER_SECRET 设置（必须设置，否则集群通信将拒绝认证）
-# 生产部署时务必使用随机字符串（建议 32+ 字符）
+# 集群共享密钥 — 所有节点必须使用相同密钥才能加入集群。
+# node_config 启动阶段会让加密存储中的 (secret, epoch) 覆盖旧环境投影；
+# QLH_CLUSTER_SECRET 只保留首次导入/开发兼容语义，不能回滚已轮换凭据。
 CLUSTER_SECRET = os.environ.get("QLH_CLUSTER_SECRET", "")
-if not CLUSTER_SECRET and NODE_ROLE == "master" and getattr(sys, "frozen", False):
+if not CLUSTER_SECRET and NODE_ROLE == "master" and release_profile_enforced():
     try:
         from node_config import ensure_local_cluster_secret
         CLUSTER_SECRET = ensure_local_cluster_secret()
@@ -613,6 +658,10 @@ if not CLUSTER_SECRET:
         RuntimeWarning,
         stacklevel=2,
     )
+try:
+    CLUSTER_SECRET_EPOCH = max(1, int(os.environ.get("QLH_CLUSTER_SECRET_EPOCH", "1") or 1))
+except ValueError:
+    CLUSTER_SECRET_EPOCH = 1
 # HMAC 签名时间窗口（秒）— 防重放攻击
 AUTH_TIMESTAMP_WINDOW = 300  # ±5 分钟
 

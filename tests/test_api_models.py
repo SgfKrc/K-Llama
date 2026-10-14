@@ -13,6 +13,7 @@ import api_server
 from model_host import model_host
 import model_config as mc
 from model_module import ModelManager
+from worker_assignment_state import WorkerAssignmentRegistry
 
 
 def test_pipeline_capacity_endpoint_returns_scheduler_plan(monkeypatch):
@@ -91,6 +92,30 @@ def _both_model(tmp_path, model_id="custom-both"):
     )
 
 
+def _resolved_load(
+    *,
+    model_id,
+    engine="pytorch",
+    model_path="models/test-hf",
+    quant_type="int4",
+    layer_range_mode="dynamic",
+):
+    return api_server.ModelLoadResolution(
+        model_id=model_id,
+        requested_engine=engine,
+        engine=engine,
+        artifact_kind="gguf" if engine == "llama_cpp" else "safetensors",
+        model_path=model_path,
+        requested_quant=quant_type,
+        quant_type=quant_type,
+        runtime="llama_cpp_native" if engine == "llama_cpp" else "pytorch_cuda",
+        runtime_quant=quant_type,
+        layer_range_mode=layer_range_mode,
+        reason_code="TEST_RESOLUTION",
+        reason="test fixture",
+    )
+
+
 class _TemplateTokenizer:
     def __init__(self, template_name):
         self.template_name = template_name
@@ -148,6 +173,7 @@ def test_unclosed_native_thinking_is_not_exposed_as_answer():
 
 def test_model_payload_prefers_pytorch_when_cuda_has_both_formats(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
+    monkeypatch.setattr(api_server, "cuda_available", lambda load=False: True)
     payload = api_server._model_api_payload(_both_model(tmp_path))
 
     assert payload["supported_engines"] == ["llama_cpp", "pytorch"]
@@ -155,13 +181,14 @@ def test_model_payload_prefers_pytorch_when_cuda_has_both_formats(tmp_path, monk
     assert payload["default_quant_type"] == "int4"
 
 
-def test_model_payload_prefers_pytorch_without_cuda_when_safetensors_exists(tmp_path, monkeypatch):
+def test_model_payload_prefers_llama_cpp_without_cuda_when_both_formats_exist(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
+    monkeypatch.setattr(api_server, "cuda_available", lambda load=False: False)
     payload = api_server._model_api_payload(_both_model(tmp_path))
 
     assert payload["supported_engines"] == ["llama_cpp", "pytorch"]
-    assert payload["preferred_engine"] == "pytorch"
-    assert payload["default_quant_type"] == "int4"
+    assert payload["preferred_engine"] == "llama_cpp"
+    assert payload["default_quant_type"] == "Q4_K_M"
 
 
 def test_available_models_scans_all_registered_model_formats(tmp_path, monkeypatch):
@@ -264,6 +291,7 @@ def test_switch_model_accepts_external_model_path_not_in_builtin_registry(monkey
 
 
 def test_api_switch_model_resolves_db_registered_gguf(tmp_path, monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     gguf = tmp_path / "custom.Q4_K_M.gguf"
     gguf.write_text("x", encoding="utf-8")
     db_entry = {
@@ -427,6 +455,22 @@ def test_register_model_rejects_empty_or_missing_assets(monkeypatch, tmp_path):
 
 def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
     calls = []
+    assignments = WorkerAssignmentRegistry()
+    assignments.begin(
+        "worker",
+        expected_config={"config_id": "cfg-old", "generation": 7},
+    )
+    retry_state = {"worker": {"attempts": 2, "next_retry": 10.0}}
+    transaction = {
+        "config_id": "cfg-old",
+        "phase": "ready",
+        "plan": {"admitted": True, "plan_id": "plan-old"},
+    }
+    active_plan = {"admitted": True, "plan_id": "plan-old"}
+    monkeypatch.setattr(api_server.scheduler, "_worker_assignments", assignments)
+    monkeypatch.setattr(api_server.scheduler, "_layer_config_retry_state", retry_state)
+    monkeypatch.setattr(api_server.scheduler, "_pipeline_load_transaction", transaction)
+    monkeypatch.setattr(api_server.scheduler, "_active_pipeline_capacity_plan", active_plan)
     monkeypatch.setattr(
         api_server.scheduler,
         "release_pipeline_worker_for_local_model",
@@ -441,6 +485,58 @@ def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
 
     assert result == {"success": True}
     assert calls == ["released"]
+    assert assignments.snapshot() == {}
+    assert retry_state == {}
+    assert api_server.scheduler._pipeline_load_transaction is None
+    assert api_server.scheduler._active_pipeline_capacity_plan is None
+
+
+def test_failed_exclusive_model_change_preserves_active_control_state(monkeypatch):
+    calls = []
+    assignments = WorkerAssignmentRegistry()
+    assignments.begin(
+        "worker",
+        expected_config={"config_id": "cfg-old", "generation": 7},
+    )
+    assignment_snapshot = assignments.snapshot()
+    retry_state = {"worker": {"attempts": 2, "next_retry": 10.0}}
+    transaction = {
+        "config_id": "cfg-old",
+        "phase": "ready",
+        "plan": {"admitted": True, "plan_id": "plan-old"},
+    }
+    active_plan = {"admitted": True, "plan_id": "plan-old"}
+    active_config = {"config_id": "cfg-old"}
+    monkeypatch.setattr(api_server.scheduler, "_worker_assignments", assignments)
+    monkeypatch.setattr(api_server.scheduler, "_layer_config_retry_state", retry_state)
+    monkeypatch.setattr(api_server.scheduler, "_pipeline_load_transaction", transaction)
+    monkeypatch.setattr(api_server.scheduler, "_active_pipeline_capacity_plan", active_plan)
+    monkeypatch.setattr(
+        api_server.scheduler, "_active_layer_config", dict(active_config),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "release_pipeline_worker_for_local_model",
+        lambda: calls.append("released") or True,
+    )
+    monkeypatch.setattr(
+        api_server, "_refresh_pipeline_layer_config",
+        lambda: calls.append("refreshed"),
+    )
+
+    result = api_server._run_exclusive_model_change(
+        lambda: {"success": False, "error": "load failed"},
+        prepare=lambda: calls.append("prepared"),
+        release_worker_reservation=True,
+    )
+
+    assert result["success"] is False
+    assert assignments.snapshot() == assignment_snapshot
+    assert retry_state == {"worker": {"attempts": 2, "next_retry": 10.0}}
+    assert api_server.scheduler._pipeline_load_transaction == transaction
+    assert api_server.scheduler._active_pipeline_capacity_plan == active_plan
+    assert api_server.scheduler._active_layer_config == active_config
+    assert calls == []
 
 
 def test_master_model_refresh_requests_authoritative_layer_sync(monkeypatch):
@@ -487,16 +583,17 @@ def test_load_model_rejects_invalid_quant_for_pytorch(monkeypatch):
     assert exc.value.status_code == 400
 
 
-def test_normalize_quant_keeps_gguf_quant_for_llama_cpp():
-    """llama_cpp 引擎放行任意 quant_type（GGUF 自带量化）"""
+def test_normalize_quant_marks_gguf_precision_as_artifact_owned():
+    """llama_cpp 的 effective quant 不得伪装成请求的 PyTorch dtype。"""
     api_server._validate_model_load_request(None, "llama_cpp")
-    assert api_server._normalize_quant_for_engine("Q4_K_M", "llama_cpp") == "Q4_K_M"
+    assert api_server._normalize_quant_for_engine("Q4_K_M", "llama_cpp") == "gguf"
     with pytest.raises(api_server.HTTPException) as exc:
         api_server._normalize_quant_for_engine("Q4_K_M", "pytorch")
     assert exc.value.status_code == 400
 
 
 def test_load_model_auto_uses_real_gguf_model_resolution(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """engine=auto 解析到 llama.cpp 时，GGUF 量化占位值应合法。"""
     switch_calls = []
 
@@ -551,8 +648,86 @@ def test_load_model_auto_uses_real_gguf_model_resolution(monkeypatch, tmp_path):
 
     assert result["status"] == "ok"
     assert switch_calls[0]["engine"] == "llama_cpp"
-    assert switch_calls[0]["quant_type"] == "Q4_K_M"
+    assert switch_calls[0]["quant_type"] == "gguf"
+    assert switch_calls[0]["resolution"].requested_quant == "Q4_K_M"
     assert switch_calls[0]["model_path"] == str(gguf_path)
+
+
+def test_api_auto_load_safetensors_only_uses_resolved_fp32(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
+    import config as runtime_config
+
+    model_dir = tmp_path / "safetensors-only"
+    model_dir.mkdir()
+    calls = []
+
+    class FakeManager:
+        quant_type = None
+
+        def load_model(self, **kwargs):
+            calls.append(dict(kwargs))
+            self.quant_type = kwargs["quant_type"]
+
+    manager = FakeManager()
+    monkeypatch.setattr(api_server, "model_manager", manager)
+    monkeypatch.setattr(api_server, "_resolution_cuda_available", lambda: False)
+    monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
+    monkeypatch.setattr(
+        api_server,
+        "_run_exclusive_model_change",
+        lambda operation, **_kwargs: operation(),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "refresh_task_worker_capabilities",
+        lambda: None,
+    )
+    monkeypatch.setattr(runtime_config, "get_active_model_paths", lambda: {})
+    monkeypatch.setattr(runtime_config, "GGUF_MODEL_PATH", str(tmp_path / "missing.gguf"))
+    monkeypatch.setattr(runtime_config, "MODEL_PATH", str(model_dir))
+    monkeypatch.setattr(runtime_config, "PREFER_PYTORCH", False)
+    monkeypatch.setattr(runtime_config, "QUANT_TYPE", "int4")
+
+    api_server._auto_load_default_model()
+
+    assert len(calls) == 1
+    assert calls[0]["engine"] == "pytorch"
+    assert calls[0]["model_path"] == str(model_dir)
+    assert calls[0]["quant_type"] == "fp32"
+    assert calls[0]["resolution"].runtime == "pytorch_cpu"
+
+
+def test_api_auto_load_never_rebinds_active_id_to_global_artifact(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
+    import config as runtime_config
+
+    foreign = tmp_path / "foreign.gguf"
+    foreign.write_bytes(b"gguf")
+    calls = []
+
+    class FakeManager:
+        def load_model(self, **kwargs):
+            calls.append(dict(kwargs))
+
+    monkeypatch.setattr(api_server, "model_manager", FakeManager())
+    monkeypatch.setattr(api_server, "_resolution_cuda_available", lambda: False)
+    monkeypatch.setattr(
+        runtime_config,
+        "get_active_model_paths",
+        lambda: {
+            "model_id": "model-a",
+            "gguf_path": str(tmp_path / "missing-a.gguf"),
+            "model_path": str(tmp_path / "missing-a"),
+        },
+    )
+    monkeypatch.setattr(runtime_config, "GGUF_MODEL_PATH", str(foreign))
+    monkeypatch.setattr(runtime_config, "MODEL_PATH", str(tmp_path / "foreign-safe"))
+
+    with pytest.raises(FileNotFoundError, match="未找到可自动加载的模型文件"):
+        api_server._auto_load_default_model()
+    assert calls == []
 
 
 def test_load_model_rejects_nonexistent_model_id(monkeypatch):
@@ -570,8 +745,10 @@ def test_load_model_rejects_nonexistent_model_id(monkeypatch):
 
 
 def test_load_model_uses_switch_model_internally(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """验证 /api/models/load 使用 switch_model（B2 修复）"""
     switch_calls = []
+    load_mode_calls = []
 
     class FakeManager:
         active_model_id = ""
@@ -597,6 +774,13 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
+    monkeypatch.setattr(
+        api_server,
+        "_decide_pipeline_load_mode",
+        lambda model_id, engine, quant: (
+            load_mode_calls.append((model_id, engine, quant)) or ("full", "test")
+        ),
+    )
 
     async def fake_get_status():
         return {"status": "ok"}
@@ -610,50 +794,64 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     result = asyncio.run(api_server.load_model(req))
     assert len(switch_calls) == 1, "应调用 switch_model 而非手动 unload/load"
     # ★ 2026-09-19：未指定 model_id 时按**设备画像**取默认（不再是固定常量）。
-    assert switch_calls[0]["model_id"] == api_server.mc.get_profile_default_model_id()
+    default_model_id = api_server.mc.get_profile_default_model_id()
+    assert switch_calls[0]["model_id"] == default_model_id
+    assert load_mode_calls[0][0] == default_model_id
     assert result["status"] == "ok"
 
 
 def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path):
     calls = []
+    transactions = []
+    import config as cfg
 
-    class FakeManager:
-        is_loaded = False
-        is_pipeline_prepared = False
+    monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "old-engine")
+    monkeypatch.setattr(cfg, "QUANT_TYPE", "old-quant")
 
-        def prepare_pipeline_model(self, **kwargs):
-            calls.append(kwargs)
-            self.is_pipeline_prepared = True
-            return {
-                "schema_version": 1,
-                "inspection_mode": "safetensors_headers_only",
-                "model_id": kwargs["model_id"],
-                "model_type": "qwen2",
-                "total_layers": 4,
-                "weight_bytes": 1024,
-                "pipeline_runtime_supported": True,
-                "model_sha256": "c" * 64,
-            }
+    def prepare_candidate(transaction_id, **kwargs):
+        calls.append((transaction_id, kwargs))
+        return {
+            "schema_version": 1,
+            "inspection_mode": "safetensors_headers_only",
+            "model_id": kwargs["model_id"],
+            "model_type": "qwen2",
+            "total_layers": 4,
+            "hidden_size": 128,
+            "tokenizer_sha256": "d" * 64,
+            "weight_bytes": 1024,
+            "pipeline_runtime_supported": True,
+            "model_sha256": "c" * 64,
+        }
 
-    manager = FakeManager()
-    monkeypatch.setattr(api_server, "model_manager", manager)
-    monkeypatch.setattr(model_host, "model_loaded", True)
-    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *args: None)
+    fake_host = types.SimpleNamespace(
+        model_loaded=True,
+        current_quant="old-quant",
+        prepare_pipeline_candidate=prepare_candidate,
+    )
+    monkeypatch.setattr(api_server, "model_host", fake_host)
     monkeypatch.setattr(
         api_server,
-        "_resolve_model_path_for_engine",
-        lambda model_id, engine: str(tmp_path),
-    )
-    monkeypatch.setattr(api_server, "_refresh_pipeline_layer_config", lambda: None)
-    monkeypatch.setattr(
-        api_server.scheduler,
-        "release_pipeline_worker_for_local_model",
-        lambda: True,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="tiny-qwen2",
+            model_path=str(tmp_path),
+            quant_type="fp16",
+        ),
     )
     monkeypatch.setattr(
         api_server.scheduler,
         "refresh_task_worker_capabilities",
         lambda: True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "start_pipeline_model_transaction",
+        lambda **kwargs: transactions.append(kwargs) or {
+            "admitted": True,
+            "plan_id": "plan-test",
+            "transaction_phase": "preparing",
+            "model_preflight": {"ok": True},
+        },
     )
 
     result = asyncio.run(api_server.prepare_pipeline_model(
@@ -667,15 +865,137 @@ def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp
     assert result["loaded"] is False
     assert result["pipeline_prepared"] is True
     assert result["descriptor"]["model_type"] == "qwen2"
-    assert model_host.model_loaded is False
-    assert calls == [{
+    assert result["model_preflight"] == {"ok": True}
+    assert fake_host.model_loaded is True
+    assert result["transaction_id"].startswith("modeltxn_")
+    assert calls == [(result["transaction_id"], {
         "model_id": "tiny-qwen2",
         "model_path": str(tmp_path),
         "quant_type": "fp16",
-    }]
+    })]
+    assert transactions[0]["candidate_id"] == result["transaction_id"]
+    assert transactions[0]["descriptor"]["model_type"] == "qwen2"
+    assert cfg.INFERENCE_ENGINE == "old-engine"
+    assert cfg.QUANT_TYPE == "old-quant"
+
+    # Scheduler invokes the callback only after ModelHost has published the
+    # candidate and mirrored its effective runtime quant.
+    fake_host.current_quant = "fp32"
+    transactions[0]["on_commit"]()
+
+    assert cfg.INFERENCE_ENGINE == "pytorch"
+    assert cfg.QUANT_TYPE == "fp32"
+
+
+def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
+    monkeypatch, tmp_path,
+):
+    aborted = []
+    fake_host = types.SimpleNamespace(
+        model_loaded=True,
+        current_quant="old-quant",
+        prepare_pipeline_candidate=lambda transaction_id, **kwargs: {
+            "schema_version": 1,
+            "inspection_mode": "safetensors_headers_only",
+            "model_id": kwargs["model_id"],
+            "model_type": "qwen2",
+            "total_layers": 24,
+            "hidden_size": 2048,
+            "tokenizer_sha256": "d" * 64,
+            "weight_bytes": 1024,
+            "pipeline_runtime_supported": True,
+            "model_sha256": "c" * 64,
+        },
+        abort_pipeline_candidate=(
+            lambda transaction_id: aborted.append(transaction_id)
+        ),
+    )
+    monkeypatch.setattr(api_server, "model_host", fake_host)
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="tiny-qwen2",
+            model_path=str(tmp_path),
+            quant_type="fp16",
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "start_pipeline_model_transaction",
+        lambda **kwargs: {
+            "admitted": False,
+            "reason_code": "model_preflight_hidden_size_mismatch",
+            "reason": (
+                "model preflight rejected model=tiny-qwen2 "
+                "nodes=edge-1 missing_ranges=[8,24)"
+            ),
+            "missing_layer_ranges": [[8, 24]],
+        },
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        asyncio.run(api_server.prepare_pipeline_model(
+            api_server.PreparePipelineModelRequest(
+                model_id="tiny-qwen2",
+                quant_type="fp16",
+            )
+        ))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.error_code == "model_preflight_hidden_size_mismatch"
+    assert "model=tiny-qwen2" in exc_info.value.detail
+    assert "nodes=edge-1" in exc_info.value.detail
+    assert "missing_ranges=[8,24)" in exc_info.value.detail
+    assert len(aborted) == 1
+
+
+def test_prepare_pipeline_model_rejects_synchronous_aborted_commit(
+    monkeypatch, tmp_path,
+):
+    aborted = []
+    monkeypatch.setattr(api_server, "model_host", types.SimpleNamespace(
+        prepare_pipeline_candidate=lambda transaction_id, **kwargs: {
+            "model_id": kwargs["model_id"],
+            "model_type": "qwen3_5",
+            "total_layers": 32,
+            "pipeline_runtime_supported": True,
+            "model_sha256": "a" * 64,
+        },
+        abort_pipeline_candidate=lambda transaction_id: aborted.append(transaction_id),
+    ))
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="q35-artifacts", engine="llama_cpp",
+            model_path=str(tmp_path / "head4.gguf"), quant_type="gguf",
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "start_pipeline_model_transaction",
+        lambda **kwargs: {
+            "admitted": True,
+            "transaction_phase": "aborted",
+            "reason_code": "pipeline_local_commit_failed",
+            "reason": "no matching local segment",
+        },
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        asyncio.run(api_server.prepare_pipeline_model(
+            api_server.PreparePipelineModelRequest(model_id="q35-artifacts")
+        ))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.error_code == "pipeline_local_commit_failed"
+    assert "no matching local segment" in exc_info.value.detail
+    assert len(aborted) == 1
 
 
 def test_load_model_reports_effective_cpu_quant(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """CPU loader 归一为 FP32 后，API 状态不能继续上报请求的 FP16。"""
     class FakeManager:
         active_model_id = ""
@@ -704,6 +1024,11 @@ def test_load_model_reports_effective_cpu_quant(monkeypatch):
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server, "get_status", fake_get_status)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
+    monkeypatch.setattr(
+        api_server,
+        "_decide_pipeline_load_mode",
+        lambda *_args: ("full", "量化上报测试固定整模路径"),
+    )
 
     result = asyncio.run(api_server.load_model(api_server.LoadModelRequest(
         engine="pytorch",
@@ -715,6 +1040,7 @@ def test_load_model_reports_effective_cpu_quant(monkeypatch):
 
 
 def test_load_model_rollback_on_failure(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """加载失败时 switch_model 应触发回滚，/api/models/load 应正确报告"""
     class FakeManager:
         active_model_id = "previous-model"
@@ -736,8 +1062,15 @@ def test_load_model_rollback_on_failure(monkeypatch):
     monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
-    # 绕过 _validate_model_load_request（model_id "new-model" 不在注册表中）
-    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="new-model",
+            engine="pytorch",
+            quant_type="int4",
+        ),
+    )
     # 绕过 _init_kv_cache（不需要真实模型）
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
 
@@ -919,8 +1252,170 @@ def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
         api_server._execute_chat_full(req)
 
     assert exc_info.value.status_code == 503
-    assert "整模回退已拒绝" in str(exc_info.value.detail)
-    assert calls == {"chat": 0, "ensure": 1}
+    assert exc_info.value.error_code == "DISTRIBUTED_FULL_MODEL_FORBIDDEN"
+    assert "route_a_mixed_legacy_execution_bridge_not_ready" in str(exc_info.value.detail)
+    assert calls == {"chat": 0, "ensure": 0}
+
+
+def test_pipeline_deadline_is_504_and_never_enters_local_fallback(monkeypatch):
+    from request_deadline import RequestDeadline
+
+    calls = {"chat": 0, "ensure": 0}
+
+    class DeadlineManager:
+        is_loaded = True
+        model_loaded = True
+        _engine_type = "pytorch"
+
+        def ensure_full_model(self):
+            calls["ensure"] += 1
+            pytest.fail("deadline terminal must not restore a full model")
+
+        def chat(self, **_kwargs):
+            calls["chat"] += 1
+            pytest.fail("deadline terminal must not enter local chat")
+
+    req = api_server.ChatRequest(message="deadline fence")
+    monkeypatch.setattr(api_server, "model_manager", DeadlineManager())
+    monkeypatch.setattr(api_server.model_host, "model_loaded", True)
+    monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
+    monkeypatch.setattr(api_server, "runtime_supports", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        api_server,
+        "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False, reason="disabled"),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_prepare_chat_context",
+        lambda *_a, **_k: types.SimpleNamespace(
+            session_id="default", history=[], revision=0,
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "get_distributed_inference_enabled", lambda: True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "_effective_role", lambda: "master",
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "has_pipeline_worker_reservation", lambda: False,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "run_pipeline_safe",
+        lambda *_a, **_k: {
+            "response": "",
+            "error": "request deadline exceeded",
+            "reason_code": "request_deadline_exceeded",
+            "metrics": {"fallback": False},
+        },
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._execute_chat_full(
+            req,
+            request_deadline=RequestDeadline.start(1.0),
+        )
+
+    assert exc_info.value.status_code == 504
+    assert getattr(exc_info.value, "error_code", "") == (
+        "request_deadline_exceeded"
+    )
+    assert calls == {"chat": 0, "ensure": 0}
+
+
+def test_prepared_gguf_pipeline_never_generates_local_followups(monkeypatch):
+    req = api_server.ChatRequest(
+        message="2+2?", routing_preference="distributed_required",
+    )
+    monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
+    monkeypatch.setattr(api_server, "_pipeline_model_is_prepared", lambda: True)
+    monkeypatch.setattr(api_server, "runtime_supports", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        api_server, "model_manager",
+        types.SimpleNamespace(engine_type="llama_cpp"),
+    )
+    monkeypatch.setattr(
+        api_server, "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False),
+    )
+    monkeypatch.setattr(
+        api_server, "_prepare_chat_context",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            session_id="test-prepared-gguf", revision=0,
+            history=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        ),
+    )
+    monkeypatch.setattr(api_server, "_commit_chat_context_turn", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        api_server, "_generate_followups_llama",
+        lambda *_a, **_kw: pytest.fail("partial model used for followups"),
+    )
+    monkeypatch.setattr(api_server, "_fallback_followups", lambda *_a, **_kw: ["next question?"])
+    monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: True)
+    monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
+    monkeypatch.setattr(api_server.scheduler, "has_pipeline_worker_reservation", lambda: False)
+    monkeypatch.setattr(api_server.scheduler, "run_pipeline_safe", lambda *_a, **_kw: {
+        "response": "4", "metrics": {
+            "distributed_used": True, "fallback": False,
+            "execution_mode": "route_a_stage_offer_v3",
+            "workers_used": ["surface", "y700"],
+        },
+    })
+
+    result = api_server._execute_chat_full(req)
+
+    assert result["content"] == "4"
+    assert result["followups"] == ["next question?"]
+
+
+@pytest.mark.parametrize("engine", ["pytorch", "llama_cpp"])
+def test_partial_pipeline_local_only_rejects_before_direct_chat(
+        monkeypatch, engine):
+    calls = []
+
+    class PartialManager:
+        _engine_type = engine
+        is_loaded = True
+        is_pipeline_prepared = True
+        tokenizer = object()
+
+        def chat(self, **kwargs):
+            calls.append(("chat", kwargs))
+            return {"content": "must not run", "usage": {}}
+
+        def chat_stream(self, **kwargs):
+            calls.append(("chat_stream", kwargs))
+            yield "must not run"
+
+    req = api_server.ChatRequest(
+        message="hello", routing_preference="local_only",
+    )
+    monkeypatch.setattr(api_server, "model_manager", PartialManager())
+    monkeypatch.setattr(api_server.model_host, "model_loaded", False)
+    monkeypatch.setattr(api_server, "RUN_MODE", "standalone")
+    monkeypatch.setattr(
+        api_server.scheduler, "get_distributed_inference_enabled", lambda: False,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "has_pipeline_worker_reservation", lambda: False,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False, reason="disabled"),
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._execute_chat_full(req)
+
+    assert exc_info.value.status_code == 409
+    assert "分布式流水线模式准备" in str(exc_info.value.detail)
+    assert calls == []
 
 
 def test_local_native_image_chat_uses_mtmd_and_removes_temp_file(monkeypatch):
@@ -1133,6 +1628,39 @@ def test_current_model_when_loaded(monkeypatch):
     assert result["model_name"] == "Qwen-1.8B-Chat"
 
 
+@pytest.mark.parametrize("host_loaded", [False, True])
+def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch, host_loaded):
+    class PartialManager:
+        active_model_id = "tiny-qwen2"
+        _engine_type = "pytorch"
+        is_loaded = True
+        is_pipeline_prepared = True
+
+        def get_pipeline_descriptor(self):
+            return {
+                "schema_version": 1,
+                "model_id": "tiny-qwen2",
+                "model_type": "qwen2",
+                "model_sha256": "a" * 64,
+                "total_layers": 4,
+                "hidden_size": 128,
+                "tokenizer_sha256": "b" * 64,
+                "pipeline_runtime_supported": True,
+            }
+
+    monkeypatch.setattr(api_server, "model_manager", PartialManager())
+    monkeypatch.setattr(model_host, "model_loaded", host_loaded)
+    monkeypatch.setattr(model_host, "current_quant", "fp32")
+
+    result = asyncio.run(api_server.get_current_model())
+
+    assert result["loaded"] is False
+    assert result["pipeline_prepared"] is True
+    assert result["segment_materialized"] is True
+    assert result["model_id"] == "tiny-qwen2"
+    assert result["quant_type"] == "fp32"
+
+
 # ================================================================
 # /api/models/switch 端点测试
 # ================================================================
@@ -1150,6 +1678,7 @@ def test_switch_model_rejects_invalid_engine(monkeypatch):
 
 
 def test_switch_model_calls_manager_switch(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """正常切换 → 调用 model_manager.switch_model 并更新全局状态"""
     switch_calls = []
 
@@ -1175,8 +1704,17 @@ def test_switch_model_calls_manager_switch(monkeypatch):
     monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
-    # 绕过 _validate_model_load_request（GGUF 文件实际不存在）
-    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="qwen2.5-7b-gguf",
+            engine="llama_cpp",
+            model_path="models/test.gguf",
+            quant_type="Q4_K_M",
+            layer_range_mode="precut_artifact",
+        ),
+    )
     monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [])
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
 
@@ -1192,7 +1730,7 @@ def test_switch_model_calls_manager_switch(monkeypatch):
     assert switch_calls[0]["engine"] == "llama_cpp"
 
 
-def test_switch_model_rejects_gguf_quant_when_effective_engine_is_pytorch(monkeypatch):
+def test_switch_model_rejects_gguf_quant_when_effective_engine_is_pytorch(monkeypatch, tmp_path):
     """engine=auto 解析到 PyTorch 时，不能把 Q4_K_M 传进 PyTorch 加载路径。"""
     switch_calls = []
 
@@ -1207,9 +1745,17 @@ def test_switch_model_rejects_gguf_quant_when_effective_engine_is_pytorch(monkey
             return {"success": True, "model_id": kwargs["model_id"], "model_name": "bad", "error": None}
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
-    monkeypatch.setattr(api_server, "_resolve_model_path_for_engine", lambda *a, **kw: "models/test-hf")
-    monkeypatch.setattr(api_server, "_effective_engine_for_model", lambda *a, **kw: "pytorch")
+    hf_dir = tmp_path / "hf-model"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text("{}", encoding="utf-8")
+    (hf_dir / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [{
+        "model_id": "hf-model",
+        "name": "HF Model",
+        "model_type": "safetensors",
+        "model_path": str(hf_dir),
+        "gguf_path": "",
+    }])
 
     req = api_server.SwitchModelRequest(
         model_id="hf-model",
@@ -1224,6 +1770,7 @@ def test_switch_model_rejects_gguf_quant_when_effective_engine_is_pytorch(monkey
 
 
 def test_switch_model_resets_runtime_conversation_state(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     switch_calls = []
     init_calls = []
     cleared = []
@@ -1268,9 +1815,17 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
         "session_histories",
         {"default": [{"role": "assistant", "content": "DeepSeek-R1 intro"}]},
     )
-    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
-    monkeypatch.setattr(api_server, "_resolve_model_path_for_engine", lambda *a, **kw: "models/test.gguf")
-    monkeypatch.setattr(api_server, "_effective_engine_for_model", lambda *a, **kw: "llama_cpp")
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="qwen2.5-7b-gguf",
+            engine="llama_cpp",
+            model_path="models/test.gguf",
+            quant_type="Q4_K_M",
+            layer_range_mode="precut_artifact",
+        ),
+    )
     monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [])
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: init_calls.append(True))
 
@@ -1300,6 +1855,7 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
 # ================================================================
 
 def test_register_model_passes_db_experimental_models_to_switch(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """注册的 DB 模型应可通过 switch_model 端点加载（B1 修复验证）"""
     gguf_file = tmp_path / "registered-model.Q4_K_M.gguf"
     gguf_file.write_text("x", encoding="utf-8")

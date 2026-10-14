@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from cluster_control_contract import (
+    CommitWatermark,
     ControlContractError,
     ControlPlaneAuthority,
     QuorumCertificate,
@@ -75,6 +76,8 @@ class AutoRoleController:
         authority: ControlPlaneAuthority | None = None,
         collector: QuorumCollector | None = None,
         fence: ControlFence | None = None,
+        commit_watermark_provider: Callable[[], Sequence[CommitWatermark]] | None = None,
+        committed_prefix_guard: Callable[[QuorumCertificate], None] | None = None,
     ) -> None:
         resolved_node_id = str(node_id or "").strip()
         if not resolved_node_id:
@@ -92,17 +95,26 @@ class AutoRoleController:
             authority = fence.authority
         if collector is not None and not isinstance(collector, QuorumCollector):
             raise AutoRoleError("collector_invalid", "collector must be a QuorumCollector")
+        if commit_watermark_provider is not None and not callable(commit_watermark_provider):
+            raise AutoRoleError("watermark_provider_invalid", "commit watermark provider must be callable")
+        if committed_prefix_guard is not None and not callable(committed_prefix_guard):
+            raise AutoRoleError("watermark_guard_invalid", "committed prefix guard must be callable")
         self.node_id = resolved_node_id
         self.mode = resolved_mode
         self.authority = authority
         self.collector = collector
         self.fence = fence
+        #: #93：leader 侧「我认为已提交到哪」的提议来源（None = 不声明，与旧行为一致）。
+        self.commit_watermark_provider = commit_watermark_provider
+        #: #93：接管侧校验钩子——用自己的复制副本确认已提交前缀（落后需追赶、多出需截断）。
+        self.committed_prefix_guard = committed_prefix_guard
         self._lock = threading.RLock()
         self._state = "starting"
         self._reason = "startup_pending"
         self._certificate: QuorumCertificate | None = None
         self._last_outcome: QuorumOutcome | None = None
         self._reconnect_requires_new_quorum = False
+        self._generation = 0
 
     @property
     def state(self) -> str:
@@ -111,6 +123,8 @@ class AutoRoleController:
 
     @property
     def runtime_role(self) -> str:
+        if self.mode == "auto" and self.state == "leader":
+            self.can_write()
         with self._lock:
             return "master" if self._state == "leader" else "client"
 
@@ -131,9 +145,26 @@ class AutoRoleController:
             return self._transition("leader", "static_master", accepted=True)
         if self.mode == "client":
             return self._transition("follower", "static_client", accepted=True)
+        if self.state == "stopped":
+            self._transition("starting", "startup_pending", accepted=False)
         if available_voter_ids is None:
             return self._transition("read_only", "quorum_unavailable", accepted=False)
         return self.attempt_takeover(available_voter_ids=available_voter_ids, now_ms=now_ms)
+
+    def _proposed_commit_watermark(self) -> tuple[CommitWatermark, ...]:
+        """#93：leader 自己声称的「已提交前缀」。没有来源 ⇒ 空元组（= 不声明）。
+
+        提议**失败**时同样返回空元组：宁可退化成"不承诺"，也不能把一次读取失败
+        变成"假装已提交"。真正的把关在 voter 侧（它们会拒签自己没耐久持有的前缀）。
+        """
+        provider = self.commit_watermark_provider
+        if provider is None:
+            return ()
+        try:
+            proposed = tuple(provider())
+        except Exception:  # noqa: BLE001 - 提议必须 fail-safe 成「不声明」
+            return ()
+        return tuple(item for item in proposed if isinstance(item, CommitWatermark))
 
     def attempt_takeover(
         self,
@@ -146,23 +177,89 @@ class AutoRoleController:
 
         if self.mode != "auto":
             return self._transition("read_only", "auto_mode_disabled", accepted=False)
+        if self.state == "stopped":
+            return self._transition("stopped", "stopped", accepted=False)
         collector = self.collector
         if collector is None:
             return self._transition("read_only", "quorum_unavailable", accepted=False)
+        with self._lock:
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
+            generation = self._generation
         try:
+            proposed = self._proposed_commit_watermark()
             outcome = collector.acquire(
                 self.node_id,
                 available_voter_ids=tuple(available_voter_ids),
                 now_ms=now_ms,
                 lease_id=lease_id,
+                commit_watermark=proposed,
             )
         except (ControlContractError, ValueError, RuntimeError) as exc:
-            return self._transition("read_only", "quorum_unavailable", accepted=False, outcome=None)
+            with self._lock:
+                if generation != self._generation:
+                    return self._transition(self._state, "role_changed", accepted=False)
+                return self._transition("read_only", "quorum_unavailable", accepted=False)
         with self._lock:
+            if generation != self._generation:
+                return self._transition(self._state, "role_changed", accepted=False)
             self._last_outcome = outcome
-        if not outcome.accepted or outcome.certificate is None:
-            return self._transition("read_only", outcome.reason, accepted=False, outcome=outcome)
-        return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+            if not outcome.accepted or outcome.certificate is None:
+                return self._transition("read_only", outcome.reason, accepted=False, outcome=outcome)
+            return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+
+    def renew_lease(
+        self,
+        *,
+        available_voter_ids: Sequence[str],
+        now_ms: int | None = None,
+    ) -> AutoRoleDecision:
+        """Renew only the currently installed lease, fencing on quorum loss."""
+        with self._lock:
+            certificate = self._certificate
+            generation = self._generation
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
+            if self._state != "leader" or certificate is None or self.collector is None:
+                return self._transition("read_only", "quorum_unavailable", accepted=False)
+        try:
+            # #93：续期时重新提议水位（提交点会前进）；提议失败 ⇒ 退回证书里的原承诺，
+            # 绝不因为"读不到新水位"就把已有承诺降级掉。
+            proposed = self._proposed_commit_watermark() or tuple(certificate.commit_watermark)
+            outcome = self.collector.renew(
+                certificate, available_voter_ids=tuple(available_voter_ids), now_ms=now_ms,
+                commit_watermark=proposed,
+            )
+        except (ControlContractError, ValueError, RuntimeError):
+            outcome = None
+        with self._lock:
+            if self._generation != generation or self._certificate is not certificate:
+                return self._transition(self._state, "role_changed", accepted=False)
+            if outcome is None or not outcome.accepted or outcome.certificate is None:
+                return self.on_quorum_loss(outcome.reason if outcome is not None else "quorum_unavailable")
+            return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+
+    def _enforce_committed_prefix(self, certificate: QuorumCertificate | Mapping[str, Any]) -> None:
+        """#93：接管前的「已提交前缀」核对（由部署注入的 ``committed_prefix_guard`` 执行）。
+
+        约定：guard 正常返回 = 本地前缀与证书承诺一致（必要时它已经完成截断/追赶）；
+        抛异常 = 不能接管。这里统一转成 `AutoRoleError`，让状态机走既有 fail-closed 路径
+        降到 read_only，而不是把底层异常码泄漏成「未知原因」。
+        """
+        guard = self.committed_prefix_guard
+        if guard is None:
+            return
+        if not isinstance(certificate, QuorumCertificate):
+            certificate = QuorumCertificate.from_dict(certificate)
+        try:
+            guard(certificate)
+        except AutoRoleError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 一律 fail-closed
+            raise AutoRoleError(
+                "committed_prefix_unverified",
+                str(exc) or "committed prefix could not be verified",
+            ) from exc
 
     def consume_certificate(
         self,
@@ -173,36 +270,39 @@ class AutoRoleController:
     ) -> AutoRoleDecision:
         """Install and consume a quorum certificate, demoting on any failure."""
 
-        try:
-            if self.fence is not None:
-                self.fence.install_certificate(certificate, now_ms=now_ms)
-                current = self.fence.authority.current_certificate() if self.fence.authority else None
-            elif self.authority is not None:
-                self.authority.install_certificate(certificate, now_ms=now_ms)
-                current = self.authority.current_certificate()
-            else:
-                raise AutoRoleError("authority_unavailable", "auto role has no control authority")
-            if current is None:
-                raise AutoRoleError("certificate_missing", "certificate was not installed")
-            if outcome is not None:
-                with self._lock:
-                    self._last_outcome = outcome
-        except (AutoRoleError, ControlContractError, TypeError, ValueError) as exc:
-            reason = getattr(exc, "code", "control_certificate_invalid")
-            with self._lock:
-                self._certificate = None
-            return self._transition("read_only", str(reason), accepted=False)
-
         with self._lock:
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
+            try:
+                # #93：安装证书**之前**，先用自己的复制副本核对「已提交前缀」：落后必须先
+                # 追赶、多出的未提交尾部必须先截断；核对不通过一律拒绝接管（fail-closed）。
+                self._enforce_committed_prefix(certificate)
+                if self.fence is not None:
+                    self.fence.install_certificate(certificate, now_ms=now_ms)
+                    current = self.fence.authority.current_certificate() if self.fence.authority else None
+                elif self.authority is not None:
+                    self.authority.install_certificate(certificate, now_ms=now_ms)
+                    current = self.authority.current_certificate()
+                else:
+                    raise AutoRoleError("authority_unavailable", "auto role has no control authority")
+                if current is None:
+                    raise AutoRoleError("certificate_missing", "certificate was not installed")
+            except (AutoRoleError, ControlContractError, TypeError, ValueError) as exc:
+                reason = getattr(exc, "code", "control_certificate_invalid")
+                return self._transition("read_only", str(reason), accepted=False)
+            if outcome is not None:
+                self._last_outcome = outcome
             self._certificate = current
             self._reconnect_requires_new_quorum = False
-        if current.leader_id == self.node_id:
-            return self._transition("leader", "quorum_certificate_accepted", accepted=True)
-        return self._transition("follower", "valid_certificate_other_leader", accepted=True)
+            if current.leader_id == self.node_id:
+                return self._transition("leader", "quorum_certificate_accepted", accepted=True)
+            return self._transition("follower", "valid_certificate_other_leader", accepted=True)
 
     def on_quorum_loss(self, reason: str = "quorum_unavailable") -> AutoRoleDecision:
         """Drop write authority immediately when voter reachability is lost."""
         with self._lock:
+            if self._state == "stopped":
+                return self._transition("stopped", "stopped", accepted=False)
             self._reconnect_requires_new_quorum = True
         return self._transition("read_only", str(reason or "quorum_unavailable"), accepted=False)
 
@@ -244,23 +344,24 @@ class AutoRoleController:
         with self._lock:
             state = self._state
             certificate = self._certificate
-        if self.mode == "master" and self.fence is None:
-            return state == "leader"
-        if state != "leader" or certificate is None:
-            return False
-        try:
-            if self.fence is not None:
-                self.fence.admit(certificate, action="auto_role.write", source="auto_role", now_ms=now_ms)
-            elif self.authority is not None:
-                self.authority.admit_control_write(certificate, now_ms=now_ms)
-            else:
+            if self.mode == "master" and self.fence is None:
+                return state == "leader"
+            if state != "leader" or certificate is None:
                 return False
-            return True
-        except (ControlContractError, ValueError, TypeError):
-            self.on_quorum_loss("control_certificate_not_current")
-            return False
+            try:
+                if self.fence is not None:
+                    self.fence.admit(certificate, action="auto_role.write", source="auto_role", now_ms=now_ms)
+                elif self.authority is not None:
+                    self.authority.admit_control_write(certificate, now_ms=now_ms)
+                else:
+                    return False
+                return True
+            except (ControlContractError, ValueError, TypeError):
+                self.on_quorum_loss("control_certificate_not_current")
+                return False
 
     def snapshot(self, *, now_ms: int | None = None) -> dict[str, Any]:
+        writable = self.can_write(now_ms=now_ms)
         with self._lock:
             certificate = self._certificate
             outcome = self._last_outcome
@@ -273,7 +374,7 @@ class AutoRoleController:
             "node_id": self.node_id,
             "state": state,
             "runtime_role": "master" if state == "leader" else "client",
-            "writable": self.can_write(now_ms=now_ms),
+            "writable": writable,
             "reason": reason,
             "certificate": certificate_view,
             "last_outcome": outcome.to_dict() if outcome is not None else None,
@@ -290,6 +391,14 @@ class AutoRoleController:
         if state not in AUTO_ROLE_STATES:
             raise AutoRoleError("state_invalid", "unsupported auto role state")
         with self._lock:
+            if (
+                state in {"read_only", "stopped"}
+                and self.mode == "auto"
+                and self.authority is not None
+                and self._certificate is not None
+            ):
+                self.authority.revoke_certificate(self._certificate)
+            self._generation += 1
             self._state = state
             self._reason = str(reason)
             if outcome is not None:

@@ -496,3 +496,147 @@ def test_real_rpc_device_injection_roundtrip(tmp_path):
     finally:
         session.close()
     assert proc.poll() is not None, "close() 必须回收本地 worker"
+
+
+def test_local_rpc_worker_stop_failure_preserves_process_for_retry():
+    worker = LocalRpcWorker()
+    fail = [True]
+
+    class Process:
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def terminate(self):
+            if fail[0]:
+                raise PermissionError("cannot terminate RPC child")
+        def wait(self, timeout):
+            self.returncode = 0
+            return 0
+
+    process = Process()
+    worker.proc = process
+    with pytest.raises(PermissionError, match="cannot terminate RPC child"):
+        worker.stop()
+    assert worker.proc is process and process.poll() is None
+    fail[0] = False
+    worker.stop()
+    assert worker.proc is None and process.poll() == 0
+
+
+def test_engine_rpc_close_failure_preserves_session_and_identity():
+    engine = LlamaCppEngine()
+    fail = [True]
+    def close():
+        if fail[0]:
+            raise OSError("RPC child still live")
+    session = types.SimpleNamespace(close=close)
+    engine._rpc_session = session
+    engine._pipeline_distributed_only = True
+    descriptor = {"assignment_layer_range": [0, 8]}
+    engine._pipeline_descriptor = descriptor
+    engine._model_path = "head.gguf"
+    with pytest.raises(OSError, match="RPC child still live"):
+        engine.unload()
+    assert engine._rpc_session is session and engine._pipeline_descriptor is descriptor
+    assert engine._model_path == "head.gguf" and engine.is_pipeline_prepared
+    fail[0] = False
+    engine.unload()
+    assert engine._rpc_session is None and not engine.is_pipeline_prepared
+
+
+@pytest.mark.parametrize("failure_phase", ["start", "attach"])
+def test_failed_rpc_open_exposes_owned_worker_when_cleanup_fails(monkeypatch, failure_phase):
+    from llama_rpc_device import RpcCleanupError
+    fail = [True]
+    made = []
+
+    class Worker:
+        endpoint = "127.0.0.1:18999"
+        def __init__(self, *args, **kwargs):
+            made.append(self)
+        def start(self):
+            if failure_phase == "start":
+                raise RuntimeError("startup failed")
+            return self
+        def stop(self):
+            if fail[0]:
+                raise PermissionError("child still alive")
+            self.closed = True
+
+    class Injector:
+        def __init__(self, **kwargs):
+            pass
+        def attach(self, endpoints):
+            raise RuntimeError("attach failed")
+        def close(self):
+            pass
+
+    monkeypatch.setattr("llama_rpc_device.LocalRpcWorker", Worker)
+    monkeypatch.setattr("llama_rpc_device.RpcBackendInjector", Injector)
+    with pytest.raises(RpcCleanupError) as failed:
+        RpcSession.open(autostart_worker="rpc.exe")
+    session = failed.value.cleanup_owner
+    assert session.worker is made[0]
+    fail[0] = False
+    session.close()
+    assert session.worker is None and made[0].closed
+
+
+def test_engine_preserves_rpc_session_from_failed_open(monkeypatch):
+    from llama_rpc_device import RpcCleanupError
+    session = types.SimpleNamespace(close=lambda: None)
+    def fail_open(**kwargs):
+        raise RpcCleanupError(session, RuntimeError("open failed"), OSError("close failed"))
+    monkeypatch.setattr(RpcSession, "open", staticmethod(fail_open))
+    engine = LlamaCppEngine()
+    with pytest.raises(RpcCleanupError):
+        engine._open_rpc_session(endpoints=[], worker_exe="rpc.exe", worker_port=18999,
+                                 worker_threads=1, worker_log=None)
+    assert engine._rpc_session is session
+    engine.unload()
+    assert engine._rpc_session is None
+
+
+@pytest.mark.parametrize("entry", ["load", "metadata_prepare"])
+@pytest.mark.parametrize("owner_kind", ["rpc", "keep_head", "partial_binding"])
+def test_reload_retires_all_native_owners_before_replacing_identity(
+        fake_llama_module, monkeypatch, tmp_path, entry, owner_kind):
+    engine = LlamaCppEngine()
+    old_descriptor = {"assignment_layer_range": [0, 8]}
+    engine._pipeline_descriptor = old_descriptor
+    engine._model_path = "old-segment.gguf"
+    fail = [True]
+    calls = []
+    def close():
+        calls.append("retire")
+        if fail[0]:
+            raise OSError("old native owner still alive")
+    owner = types.SimpleNamespace(close=close)
+    field = {"rpc": "_rpc_session", "keep_head": "_keep_head", "partial_binding": "_model"}[owner_kind]
+    setattr(engine, field, owner)
+    assert not engine.is_loaded
+    model = tmp_path / "new.gguf"
+    model.write_bytes(b"GGUF stub")
+    monkeypatch.setattr(engine, "get_pipeline_descriptor", lambda: {"pipeline_runtime_supported": True})
+    monkeypatch.setattr(engine, "_open_rpc_session", lambda **kwargs: pytest.fail("old owner must retire first"))
+    with pytest.raises(OSError, match="old native owner still alive"):
+        if entry == "load":
+            engine.load_model(model_path=str(model), rpc_servers="127.0.0.1:18998")
+        else:
+            engine.prepare_pipeline_model(model_id="new-model", model_path=str(model))
+    assert getattr(engine, field) is owner
+    assert engine._pipeline_descriptor is old_descriptor and engine._model_path == "old-segment.gguf"
+    assert calls == ["retire"] and _FakeLlama.instances == []
+    fail[0] = False
+    if entry == "load":
+        engine.load_model(model_path=str(model))
+        assert engine.is_loaded and len(_FakeLlama.instances) == 1
+        if field == "_model":
+            assert engine._model is not owner
+        else:
+            assert getattr(engine, field) is None
+    else:
+        engine.prepare_pipeline_model(model_id="new-model", model_path=str(model))
+        assert engine.is_pipeline_prepared and getattr(engine, field) is None
+    assert calls == ["retire", "retire"] and engine._model_path == str(model)
+    engine.unload()

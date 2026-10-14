@@ -48,12 +48,105 @@ def test_common_api_boundary_enforces_bearer_when_enabled(monkeypatch):
     assert response.json()["detail"]["code"] == "auth_required"
 
 
+@pytest.mark.parametrize("method,path,payload", [
+    ("post", "/api/cluster/nodes/worker-1/deregister", None),
+    ("delete", "/api/cluster/nodes/worker-1", None),
+    ("post", "/api/cluster/reset-identity", {"confirm": "reset"}),
+])
+def test_destructive_cluster_endpoints_require_named_admin_when_auth_is_optional(
+    method, path, payload, monkeypatch,
+):
+    monkeypatch.delenv("QLH_AUTH_REQUIRED", raising=False)
+    with TestClient(api_server.app, client=("127.0.0.1", 50000)) as client:
+        response = client.request(method.upper(), path, json=payload)
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "auth_required"
+
+
 def test_first_user_bootstrap_remains_open_when_auth_is_forced(monkeypatch):
     monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
     monkeypatch.setattr(api_server.auth_service, "is_bootstrap_open", lambda: True)
     principal = api_server.auth_service.require_session(authorization=None)
     assert principal.username == "anonymous"
     assert principal.is_admin is True
+
+
+def test_first_connect_returns_only_target_encrypted_cluster_credential(
+    monkeypatch, tmp_path,
+):
+    import bootstrap_credentials
+    import node_config
+    from cluster_join import JoinGrantLedger
+
+    class MasterScheduler:
+        _lan_ip = "100.64.0.1"
+        tcp_server = SimpleNamespace(port=18888)
+
+        @staticmethod
+        def _effective_role():
+            return "master"
+
+        @staticmethod
+        def manual_register_node(**kwargs):
+            return {"status": "registered", "node_id": kwargs["node_id"]}
+
+    monkeypatch.setattr(api_server, "scheduler", MasterScheduler())
+    monkeypatch.setattr(node_config, "ensure_local_cluster_secret", lambda: "s" * 32)
+    monkeypatch.setattr(node_config, "get_local_cluster_secret_epoch", lambda: 5)
+    monkeypatch.setattr(
+        api_server,
+        "_get_join_ledger",
+        lambda: JoinGrantLedger(tmp_path / "bootstrap.sqlite3"),
+    )
+    exchange = bootstrap_credentials.create_bootstrap_credential_request()
+    response = asyncio.run(api_server.first_connect_bootstrap(
+        api_server.FirstConnectBootstrapRequest(
+            node_id="client-secure",
+            node_type="pc",
+            credential_public_key=exchange.public_key,
+            credential_request_nonce=exchange.request_nonce,
+            credential_requested_at=exchange.requested_at,
+        ),
+        _request("100.64.0.20"),
+    ))
+
+    assert "cluster_secret" not in response["cluster"]
+    assert "s" * 32 not in str(response)
+    credential = bootstrap_credentials.open_bootstrap_credential(
+        response["credential_envelope"],
+        private_key=exchange.private_key,
+        expected_request_nonce=exchange.request_nonce,
+        expected_cluster_id=response["cluster"]["cluster_id"],
+        expected_node_id="client-secure",
+    )
+    assert credential == {
+        "cluster_secret": "s" * 32,
+        "cluster_secret_epoch": 5,
+        "issued_at": credential["issued_at"],
+        "expires_at": credential["expires_at"],
+    }
+
+
+def test_first_connect_rejects_custom_plain_lan_even_if_cidr_is_trusted(
+    monkeypatch,
+):
+    import bootstrap
+
+    monkeypatch.setattr(bootstrap, "is_trusted_bootstrap_source", lambda host: True)
+    monkeypatch.setattr(bootstrap, "is_secure_bootstrap_source", lambda host: False)
+    exchange = __import__("bootstrap_credentials").create_bootstrap_credential_request()
+    with pytest.raises(HTTPException) as rejected:
+        asyncio.run(api_server.first_connect_bootstrap(
+            api_server.FirstConnectBootstrapRequest(
+                node_id="client-lan",
+                credential_public_key=exchange.public_key,
+                credential_request_nonce=exchange.request_nonce,
+                credential_requested_at=exchange.requested_at,
+            ),
+            _request("192.168.1.20"),
+        ))
+    assert rejected.value.status_code == 403
+    assert rejected.value.detail["code"] == "protected_bootstrap_transport_required"
 
 
 def _request(host: str, *, headers: dict[str, str] | None = None) -> Request:

@@ -10,6 +10,7 @@ from api._routing import configure_route_module
 router = APIRouter()
 _api_module: ModuleType | None = None
 _RESOLUTION_NAMES = (
+    "InferenceModeRequest",
     "CreateModelDownloadRequest",
     "LoadModelRequest",
     "PreparePipelineModelRequest",
@@ -27,20 +28,25 @@ def exported_handlers() -> dict[str, object]:
 async def get_current_model(request: Request = None):
     """当前模型信息"""
     _api_module.require_model_api_source(request)
-    if not _api_module.model_host.model_loaded:
-        if _api_module._pipeline_model_is_prepared():
-            from pipeline_model_descriptor import public_pipeline_descriptor
-            descriptor = public_pipeline_descriptor(
-                _api_module.model_manager.get_pipeline_descriptor()
-            )
-            return {
-                "loaded": False,
-                "pipeline_prepared": True,
-                "quant_type": _api_module.model_host.current_quant,
-                "model_id": descriptor.get("model_id"),
-                "descriptor": descriptor,
-            }
+    if _api_module._pipeline_model_is_prepared():
+        from pipeline_model_descriptor import public_pipeline_descriptor
+        descriptor = public_pipeline_descriptor(
+            _api_module.model_manager.get_pipeline_descriptor()
+        )
         return {
+            "inference_mode": _api_module._node_inference_mode(),
+            "loaded": False,
+            "pipeline_prepared": True,
+            "segment_materialized": bool(
+                getattr(_api_module.model_manager, "is_loaded", False)
+            ),
+            "quant_type": _api_module.model_host.current_quant,
+            "model_id": descriptor.get("model_id"),
+            "descriptor": descriptor,
+        }
+    if not _api_module.model_host.model_loaded:
+        return {
+            "inference_mode": _api_module._node_inference_mode(),
             "loaded": False,
             "pipeline_prepared": False,
             "quant_type": None,
@@ -49,9 +55,47 @@ async def get_current_model(request: Request = None):
 
     info = _api_module.model_manager.get_model_info()
     mem = _api_module.model_manager.get_memory_usage()
+    # ★ 2026-10-11（ROG+Y700+本机三机实测）：整模加载态此前**不返回** `descriptor`，
+    #   只有 `pipeline_prepared` 态才返回。后果：Android worker 的
+    #   `MainViewModel` 要求 `descriptor.model_sha256` 为 64-hex 才认定
+    #   `hasCoordinatorIdentity` ⇒ 恒为 false ⇒ 不扫描/不广告层段工件 ⇒ 容量求解器
+    #   看不到该节点（实测 `candidate_node_count=1`）⇒ Route A 无法 prepare，
+    #   而 prepare 又正是 descriptor 出现的条件 ⇒ 死锁。
+    #   这里补**完整**身份：优先复用**公开流水线描述符**（`public_pipeline_descriptor`，
+    #   白名单含 `total_layers` / `hidden_size` / `tokenizer_sha256` / `model_sha256`）——
+    #   前三项正是 `model_preflight.descriptor_missing` 的判据，缺一即
+    #   `model_preflight_descriptor_incomplete`（实测三机接力就卡在这一层）。
+    #   拿不到描述符时退回 `_active_task_graph_model_identity()`（pytorch 整模走
+    #   `compute_model_sha256`，带 `model.sha256` + 指纹缓存）。投影失败只降级，
+    #   **不让端点 500**（替身 manager 缺属性时仍返回原结构）。
+    descriptor = {}
+    get_pipeline_descriptor = getattr(
+        _api_module.model_manager, "get_pipeline_descriptor", None
+    )
+    if callable(get_pipeline_descriptor):
+        try:
+            from pipeline_model_descriptor import public_pipeline_descriptor
+
+            descriptor = public_pipeline_descriptor(get_pipeline_descriptor() or {})
+        except Exception:
+            _api_module.logger.warning("整模流水线描述符投影失败", exc_info=True)
+            descriptor = {}
+    try:
+        identity = _api_module._active_task_graph_model_identity()
+    except Exception:
+        _api_module.logger.warning("整模身份投影失败", exc_info=True)
+        identity = None
+    if identity is not None:
+        descriptor = {
+            **descriptor,
+            "model_id": descriptor.get("model_id") or identity.model_id,
+            "model_sha256": descriptor.get("model_sha256") or identity.sha256,
+        }
     return {
+        "inference_mode": _api_module._node_inference_mode(),
         "loaded": True,
         "model_id": _api_module.model_manager.active_model_id,
+        "descriptor": descriptor,
         "quant_type": _api_module.model_host.current_quant,
         # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴，见
         #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。按活跃模型 id 兜底。
@@ -64,6 +108,11 @@ async def get_current_model(request: Request = None):
         "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
         "gpu_reserved_gb": mem.get("gpu_reserved_gb", 0),
     }
+
+async def set_inference_mode(req: InferenceModeRequest, request: Request = None):
+    _api_module.require_model_api_source(request)
+    return await _api_module.run_in_threadpool(_api_module._set_node_inference_mode, req.mode)
+
 
 async def unload_model(request: Request = None):
     """Explicitly release the local LLM before loading another engine."""
@@ -86,52 +135,56 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     _api_module.require_model_api_source(request)
     global kv_cache, conversation_stats
 
-    engine = req.engine.lower()
-    accepted_engines = _api_module.accepted_backend_requests()
-    if engine not in accepted_engines:
-        raise _api_module.coded_http_error(
-            400,
-            "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
-        )
+    operation = (
+        _api_module.OP_DISTRIBUTED_LOAD
+        if _api_module._node_inference_mode() == "distributed"
+        else _api_module.OP_FULL_MODEL
+    )
+    resolution = _api_module._resolve_model_load_plan(
+        req.model_id,
+        req.engine,
+        req.quant_type,
+        operation=operation,
+    )
+    effective_engine = resolution.engine
+    resolved_model_path = resolution.model_path
+    quant = resolution.quant_type
+    _api_module.logger.info(
+        "模型加载裁决: model=%s engine=%s path_kind=%s quant=%s runtime=%s "
+        "layer_range_mode=%s reason_code=%s",
+        resolution.model_id,
+        effective_engine,
+        resolution.artifact_kind,
+        quant,
+        resolution.runtime,
+        resolution.layer_range_mode,
+        resolution.reason_code,
+    )
 
-    _api_module._validate_model_load_request(req.model_id, engine)
-    # ★ 2026-10-09（稳定性 #73-④）：**先定引擎，再按引擎解析路径**。
-    #   此前顺序相反：路径按请求里的**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到 GGUF 文件，
-    #   而 `effective_engine` 已被纠正为 pytorch ⇒ **引擎与路径不匹配** ⇒ 加载直接 HTTP 500。
-    effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
-    quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
-
-    # ★ 2026-10-09（自适应加载，用户裁定）：分布式下**先判断整模能否装下**。
-    #   装得下 ⇒ 整模加载（简单、启动快）；
-    #   装不下 ⇒ 改走「按段物化」（`prepare_pipeline_model`）—— 各节点只在自己的分配段物化权重。
-    #   此前只有"整模"一条路，于是小显存/边缘环境下加载成功、容量求解却必然失败
-    #   （`#82` 实测：fp32 整模 8GB 装不下 ⇒ `admitted=False` ⇒ 每个请求 503）。
+    # Distributed participation prepares segments; explicit local mode loads a whole model.
     load_mode, load_reason = _api_module._decide_pipeline_load_mode(
-        req.model_id, effective_engine, quant
+        resolution.model_id, effective_engine, quant
     )
     _api_module.logger.info(f"加载模式决策: mode={load_mode}（{load_reason}）")
     if load_mode == "pipeline":
-        return await prepare_pipeline_model(
-            _api_module.PreparePipelineModelRequest(
-                model_id=req.model_id,
-                quant_type=req.quant_type,
-            )
-        )
+        return await _prepare_pipeline_model_resolution(resolution)
 
     try:
         t0 = _api_module.time.time()
 
-        # 临时修改 config（引擎 + 量化 + compile）
         import config as cfg
-        cfg.INFERENCE_ENGINE = effective_engine
-        cfg.QUANT_TYPE = quant
-        cfg.USE_COMPILE = req.use_compile
 
         def _prepare_model_load() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _api_module._reset_runtime_conversation_state(clear_histories=True)
+            cfg.INFERENCE_ENGINE = effective_engine
+            cfg.QUANT_TYPE = quant
+            cfg.USE_COMPILE = req.use_compile
+            _api_module.model_host.model_loaded = True
+            _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
+            _api_module.model_host.generation_config["use_compile"] = req.use_compile
+            _api_module._init_kv_cache()
+            _api_module.scheduler.refresh_task_worker_capabilities()
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         _api_module.logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
@@ -139,17 +192,22 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         # ★ 2026-09-19：模型加载耗时 5-20 s，**必须**挪到线程池执行。
         #   否则会占住事件循环 ⇒ 期间 `/api/health` 等端点全部无响应
         #   （用户实测：「加载过程中健康不可达，加载完成后恢复」）。
+        def _change_model():
+            _api_module._require_local_model_mode()
+            return _api_module.model_manager.switch_model(
+                # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
+                model_id=resolution.model_id,
+                quant_type=quant,
+                profile=_api_module.device_profile,
+                engine=effective_engine if effective_engine != "auto" else None,
+                model_path=resolved_model_path,
+                db_experimental_models=_api_module._get_registered_experimental_models(),
+                resolution=resolution,
+            )
+
         def _do_switch():
             return _api_module._run_exclusive_model_change(
-                lambda: _api_module.model_manager.switch_model(
-                    # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
-                    model_id=req.model_id or _api_module.mc.get_profile_default_model_id(),
-                    quant_type=quant,
-                    profile=_api_module.device_profile,
-                    engine=effective_engine if effective_engine != "auto" else None,
-                    model_path=resolved_model_path,
-                    db_experimental_models=_api_module._get_registered_experimental_models(),
-                ),
+                _change_model,
                 prepare=_prepare_model_load,
                 release_worker_reservation=True,
             )
@@ -157,15 +215,11 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         result = await _api_module.run_in_threadpool(_do_switch)
 
         if result["success"]:
-            _api_module.model_host.model_loaded = True
-            _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
-            _api_module.model_host.generation_config["use_compile"] = req.use_compile
-
-            # 初始化 KV 缓存
-            _api_module._init_kv_cache()
-            _api_module.scheduler.refresh_task_worker_capabilities()
             elapsed = _api_module.time.time() - t0
             status = await _api_module.get_status()
+            status["loaded"] = True
+            status["pipeline_prepared"] = False
+            status["inference_mode"] = _api_module._node_inference_mode()
             status["load_time_seconds"] = round(elapsed, 1)
             status["model_name"] = result.get("model_name", "")
 
@@ -173,17 +227,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
             return status
         else:
             # 切换失败 — 检查是否回滚成功
-            if _api_module.model_manager.is_loaded:
-                _api_module.model_host.model_loaded = True
-                _api_module.model_host.current_quant = _api_module.model_manager.quant_type or (
-                    "gguf" if _api_module.backend_id_for(_api_module.model_manager) == "llama_cpp"
-                    else "island" if _api_module.backend_id_for(_api_module.model_manager) == "island"
-                    else _api_module.QUANT_TYPE
-                )
-                _api_module._init_kv_cache()
-            else:
-                _api_module.model_host.model_loaded = False
-                _api_module.model_host.current_quant = _api_module.QUANT_TYPE
+            _api_module._sync_local_model_projection()
             raise _api_module.coded_http_error(
                 500,
                 str(result.get("error_code") or "MODEL_LOAD_FAILED"),
@@ -193,60 +237,161 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     except _api_module.HTTPException:
         raise
     except Exception as e:
-        _api_module.model_host.model_loaded = False
+        _api_module._sync_local_model_projection()
         _api_module.logger.error(f"模型加载失败: {e}", exc_info=True)
         raise _api_module.HTTPException(500, f"模型加载失败: {str(e)}")
 
-async def prepare_pipeline_model(req: PreparePipelineModelRequest):
-    """Prepare a Qwen/Qwen2 artifact for distributed layer loading only.
+async def _prepare_pipeline_model_resolution(resolution, *, operation_id=""):
+    resolved_model_path = resolution.model_path
+    quant = resolution.quant_type
+    if not operation_id:
+        # Direct prepare of a supplied path keeps the receipt's operation ID.
+        # This also prevents equal-SHA bytes from a previous operation granting
+        # a new generation without a matching selected manifest.
+        worker = getattr(_api_module.scheduler, "_model_supply_worker", None)
+        if worker is not None:
+            from pathlib import Path
+            from model_supply_worker import get_selected_model
+            selected = get_selected_model(worker.root)
+            selected_path = worker.selected_model_path()
+            if selected is not None and selected_path is not None and Path(resolved_model_path).resolve() == Path(selected_path).resolve():
+                operation_id = selected["manifest"]["operation_id"]
+    candidate_id = f"modeltxn_{_api_module.uuid.uuid4().hex}"
+    candidate_prepared = False
+    transaction_started = False
 
-    This endpoint deliberately does not set ``model_loaded`` and does not
-    instantiate a Transformers model. The first local weight materialization
-    happens only when the scheduler's master assignment is executed.
-    """
-    _api_module._validate_model_load_request(req.model_id, "pytorch")
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, "pytorch")
-    if not resolved_model_path:
-        raise _api_module.coded_http_error(
-            400,
-            "PIPELINE_MODEL_PATH_UNRESOLVED",
-            f"模型 '{req.model_id}' 的 Safetensors 路径不可用",
-        )
-    quant = _api_module._normalize_quant_for_engine(req.quant_type, "pytorch")
+    def _after_commit() -> None:
+        # The process-wide runtime selection is part of the published model
+        # identity.  Keep it behind the same commit fence as the manager and
+        # active capacity plan; prepare/commit failures must leave the previous
+        # selection untouched.
+        import config as cfg
 
-    def _prepare() -> dict:
-        _api_module._reset_runtime_conversation_state(clear_histories=True)
-        return _api_module.model_manager.prepare_pipeline_model(
-            model_id=req.model_id,
-            model_path=resolved_model_path,
-            quant_type=quant,
-        )
-
-    try:
-        result = await _api_module.run_in_threadpool(
-            lambda: _api_module._run_exclusive_model_change(
-                _prepare,
-                release_worker_reservation=True,
+        cfg.INFERENCE_ENGINE = (
+            _api_module.backend_id_for(
+                _api_module.model_host, default=resolution.engine,
             )
+            or resolution.engine
         )
-        _api_module.model_host.model_loaded = False
-        _api_module.model_host.current_quant = quant
+        cfg.QUANT_TYPE = _api_module.model_host.current_quant or quant
+        _api_module._reset_runtime_conversation_state(clear_histories=True)
+        try:
+            _api_module._init_kv_cache()
+        except Exception:
+            _api_module.logger.warning(
+                "流水线模型提交后初始化 KV 缓存失败",
+                exc_info=True,
+            )
         try:
             _api_module.scheduler.refresh_task_worker_capabilities()
         except Exception:
-            _api_module.logger.debug("准备流水线模型后刷新 Worker 能力失败", exc_info=True)
+            _api_module.logger.debug(
+                "流水线模型提交后刷新 Worker 能力失败",
+                exc_info=True,
+            )
+
+    try:
+        result = await _api_module.run_in_threadpool(
+            lambda: _api_module.model_host.prepare_pipeline_candidate(
+                candidate_id,
+                model_id=resolution.model_id,
+                model_path=resolved_model_path,
+                quant_type=quant,
+            )
+        )
+        candidate_prepared = True
+        capacity_plan = await _api_module.run_in_threadpool(
+            lambda: _api_module.scheduler.start_pipeline_model_transaction(
+                candidate_id=candidate_id,
+                descriptor=result,
+                model_path=resolved_model_path,
+                quant_type=quant,
+                require_distributed=True,
+                on_commit=_after_commit,
+                operation_id=operation_id,
+            )
+        )
+        if not capacity_plan.get("admitted") or capacity_plan.get(
+            "transaction_phase"
+        ) in {"aborted", "invalidated", "rejected"}:
+            _api_module.model_host.abort_pipeline_candidate(candidate_id)
+            candidate_prepared = False
+            raise _api_module.coded_http_error(
+                409,
+                str(
+                    capacity_plan.get("reason_code", "model_preflight_rejected")
+                    or "model_preflight_rejected"
+                ),
+                str(capacity_plan.get("reason", "") or "模型与 Worker 工件事前裁决未通过"),
+            )
+        transaction_started = True
         from pipeline_model_descriptor import public_pipeline_descriptor
         return {
             "success": True,
             "loaded": False,
             "pipeline_prepared": True,
+            "inference_mode": _api_module._node_inference_mode(),
+            "model_id": resolution.model_id,
+            "engine": resolution.engine,
+            "quant_type": quant,
+            "transaction_id": candidate_id,
+            "transaction_phase": capacity_plan.get(
+                "transaction_phase", "preparing"
+            ),
             "descriptor": public_pipeline_descriptor(result),
+            "model_preflight": capacity_plan.get("model_preflight", {}),
+            "capacity_plan_id": capacity_plan.get("plan_id", ""),
         }
     except _api_module.HTTPException:
         raise
     except Exception as exc:
+        if candidate_prepared and not transaction_started:
+            try:
+                _api_module.model_host.abort_pipeline_candidate(candidate_id)
+            except Exception:
+                _api_module.logger.warning(
+                    "流水线候选准备失败后的清理失败: candidate=%s",
+                    candidate_id,
+                    exc_info=True,
+                )
         _api_module.logger.error("准备流水线模型失败: %s", exc, exc_info=True)
-        raise _api_module.HTTPException(400, f"准备流水线模型失败: {exc}") from exc
+        error_code = (
+            "SUPPLY_PREPARE_CANCELLED"
+            if getattr(exc, "code", "") == "SUPPLY_PREPARE_CANCELLED"
+            else "MODEL_TXN_CONFLICT"
+            if "MODEL_TXN_CONFLICT" in str(exc)
+            else "MODEL_TXN_PREPARE_FAILED"
+        )
+        status_code = 409 if error_code in {"MODEL_TXN_CONFLICT", "SUPPLY_PREPARE_CANCELLED"} else 400
+        raise _api_module.coded_http_error(
+            status_code, error_code, f"准备流水线模型失败: {exc}"
+        ) from exc
+
+
+async def prepare_pipeline_model(req: PreparePipelineModelRequest):
+    """Prepare a model's proper segments before publishing pipeline execution.
+
+    This endpoint never sets ``model_loaded`` or constructs a complete model.
+    The transaction loads the assigned local and remote segments and requires
+    matching native receipts before publication. Chat executes committed
+    runtimes without filling a missing prepare through lazy loading.
+
+    ★ 2026-10-11：引擎改为 **auto** —— 此前硬编码 pytorch，导致 GGUF 裁层工件
+    （`llama_engine.LlamaCppEngine.prepare_pipeline_model`，契约同样是
+    "without constructing llama.cpp"）无法只声明层元数据 ⇒ GGUF 主节点的
+    `total_layers` 只能靠加载模型获得 ⇒ 与远端区间冲突。改由
+    `_resolve_model_load_plan` 按落盘格式选引擎：目录模型走 pytorch 动态层段，
+    GGUF 工件走 llama.cpp 只声明元数据。
+    """
+    if _api_module._node_inference_mode() != "distributed":
+        raise _api_module.coded_http_error(409, "LOCAL_INFERENCE_MODE", "Switch to distributed inference before preparing a pipeline.")
+    resolution = _api_module._resolve_model_load_plan(
+        req.model_id,
+        "auto",
+        req.quant_type,
+        operation=_api_module.OP_DYNAMIC_LAYER_RANGE,
+    )
+    return await _prepare_pipeline_model_resolution(resolution)
 
 async def list_available_models():
     """列出可选模型配置 + 可用引擎"""
@@ -446,79 +591,80 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
     _api_module.require_model_api_source(request)
     global kv_cache, conversation_stats
 
-    # 验证 engine 参数
-    engine = req.engine.lower()
-    accepted_engines = _api_module.accepted_backend_requests()
-    if engine not in accepted_engines:
-        raise _api_module.coded_http_error(
-            400,
-            "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
-        )
-    _api_module._validate_model_load_request(req.model_id, engine)
-    # ★ 2026-10-09（子 agent 复查 N1）：**先定引擎，再按引擎解析路径** —— 与 `/api/models/load`
-    #   保持同一顺序。此前这里是反的：路径按**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到
-    #   `.gguf`，而 `effective_engine` 已被纠正为 `pytorch` ⇒ 引擎与路径不匹配（同 `#73-④`）。
-    effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
-    quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
+    operation = (
+        _api_module.OP_DISTRIBUTED_LOAD
+        if _api_module._node_inference_mode() == "distributed"
+        else _api_module.OP_FULL_MODEL
+    )
+    resolution = _api_module._resolve_model_load_plan(
+        req.model_id,
+        req.engine,
+        req.quant_type,
+        operation=operation,
+    )
+    effective_engine = resolution.engine
+    resolved_model_path = resolution.model_path
+    quant = resolution.quant_type
+    _api_module.logger.info(
+        "模型切换裁决: model=%s engine=%s path_kind=%s quant=%s runtime=%s "
+        "layer_range_mode=%s reason_code=%s",
+        resolution.model_id,
+        effective_engine,
+        resolution.artifact_kind,
+        quant,
+        resolution.runtime,
+        resolution.layer_range_mode,
+        resolution.reason_code,
+    )
 
-    # ★ 2026-10-09（自适应加载，用户裁定）：与 `/api/models/load` 同一判据 ——
-    #   整模装不下时改走「按段物化」，而不是硬加载后让容量求解失败。
+    # Apply the same explicit mode contract as /api/models/load.
     load_mode, load_reason = _api_module._decide_pipeline_load_mode(
-        req.model_id, effective_engine, quant
+        resolution.model_id, effective_engine, quant
     )
     _api_module.logger.info(f"切换模式决策: mode={load_mode}（{load_reason}）")
     if load_mode == "pipeline":
-        return await prepare_pipeline_model(
-            _api_module.PreparePipelineModelRequest(
-                model_id=req.model_id,
-                quant_type=req.quant_type,
-            )
-        )
+        return await _prepare_pipeline_model_resolution(resolution)
 
     try:
-        # 更新全局引擎配置（P3修复: switch_model 也需要更新 config）
         import config as cfg
-        cfg.INFERENCE_ENGINE = effective_engine if effective_engine != "auto" else cfg.INFERENCE_ENGINE
-        cfg.QUANT_TYPE = quant
 
         def _prepare_model_switch() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _api_module._reset_runtime_conversation_state(clear_histories=True)
+            if effective_engine != "auto":
+                cfg.INFERENCE_ENGINE = effective_engine
+            cfg.QUANT_TYPE = quant
+            _api_module.model_host.model_loaded = True
+            _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
+            _api_module._init_kv_cache()
+            _api_module.scheduler.refresh_task_worker_capabilities()
 
-        result = _api_module._run_exclusive_model_change(
-            lambda: _api_module.model_manager.switch_model(
-                model_id=req.model_id,
+        def _change_model():
+            _api_module._require_local_model_mode()
+            return _api_module.model_manager.switch_model(
+                model_id=resolution.model_id,
                 quant_type=quant,
                 profile=_api_module.device_profile,
                 engine=effective_engine if effective_engine != "auto" else None,
                 model_path=resolved_model_path,
                 db_experimental_models=_api_module._get_registered_experimental_models(),
-            ),
-            prepare=_prepare_model_switch,
-            release_worker_reservation=True,
+                resolution=resolution,
+            )
+
+        result = await _api_module.run_in_threadpool(
+            lambda: _api_module._run_exclusive_model_change(
+                _change_model,
+                prepare=_prepare_model_switch,
+                release_worker_reservation=True,
+            )
         )
 
         if result["success"]:
-            _api_module.model_host.model_loaded = True
-            _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
-            _api_module._init_kv_cache()
-            _api_module.scheduler.refresh_task_worker_capabilities()
+            result.update(loaded=True, pipeline_prepared=False, inference_mode=_api_module._node_inference_mode())
             return result
         else:
             # 切换失败 — 检查是否回滚成功
-            if _api_module.model_manager.is_loaded:
-                _api_module.model_host.model_loaded = True
-                # P3修复: llama_cpp 引擎无 quant_type（GGUF 自带量化），回退到 "gguf"
-                _api_module.model_host.current_quant = _api_module.model_manager.quant_type or (
-                    "gguf" if _api_module.backend_id_for(_api_module.model_manager) == "llama_cpp"
-                    else "island" if _api_module.backend_id_for(_api_module.model_manager) == "island"
-                    else _api_module.QUANT_TYPE
-                )
-            else:
-                _api_module.model_host.model_loaded = False
-                _api_module.model_host.current_quant = _api_module.QUANT_TYPE
+            _api_module._sync_local_model_projection()
             raise _api_module.coded_http_error(
                 500,
                 str(result.get("error_code") or "MODEL_SWITCH_FAILED"),
@@ -884,7 +1030,8 @@ async def downloadable_pipeline_assignment(
         raise _api_module.HTTPException(409, "Qwen3 assignment manifest digest changed")
     return manifest
 
-async def list_gguf_models(request: Request = None):
+# Catalog hashing performs blocking disk I/O; FastAPI runs this handler in its worker pool.
+def list_gguf_models(request: Request = None):
     """
     列出可下载的 GGUF 模型文件及其 SHA256 校验值。
 
@@ -966,6 +1113,7 @@ async def download_model_file(filename: str, request: Request = None):
 
 
 def register_routes() -> None:
+    router.add_api_route('/api/models/inference-mode', set_inference_mode, methods=['PUT'])
     router.add_api_route('/api/models/current', get_current_model, methods=['GET'])
     router.add_api_route('/api/models/unload', unload_model, methods=['POST'])
     router.add_api_route('/api/models/load', load_model, methods=['POST'])

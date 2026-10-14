@@ -10,6 +10,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
 
+from koakuma_engine import normalize_backend_request
+from request_deadline import RequestDeadline
+
 
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 RESERVATION_ID_PATTERN = re.compile(r"^res_[A-Za-z0-9_-]{8,96}$")
@@ -17,14 +20,56 @@ MODEL_IDENTITY_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MODEL_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 DEPENDENCY_FAILURES_KEY = "__qlh_failed_dependencies__"
 
+_NON_LOCAL_MODEL_ENGINES = frozenset({
+    "island", "external_api", "speculative_assisted",
+})
+
+
+def canonical_model_engine(value: object) -> str:
+    """Return the canonical task/pipeline engine identity or fail closed.
+
+    Only local runtime aliases are folded.  Non-local execution identities are
+    already protocol-level identifiers and therefore pass through unchanged.
+    """
+
+    raw = str(value or "").strip()
+    folded = raw.casefold()
+    if folded in _NON_LOCAL_MODEL_ENGINES:
+        return folded
+    try:
+        return normalize_backend_request(raw, allow_auto=False)
+    except ValueError as exc:
+        raise ValueError("model identity engine is unsupported") from exc
+
 
 class _CombinedCancelEvent(threading.Event):
-    def __init__(self, workflow_event: threading.Event):
+    def __init__(
+        self,
+        workflow_event: threading.Event,
+        request_deadline: Optional[RequestDeadline] = None,
+    ):
         super().__init__()
         self._workflow_event = workflow_event
+        self._request_deadline = request_deadline
+
+    def set(self) -> None:
+        """Preserve the callback contract that setting this cancels workflow."""
+        self._workflow_event.set()
+        super().set()
+
+    def set_local(self) -> None:
+        """Stop only this Provider attempt without inventing a user cancel."""
+        super().set()
 
     def is_set(self) -> bool:
-        return super().is_set() or self._workflow_event.is_set()
+        return bool(
+            super().is_set()
+            or self._workflow_event.is_set()
+            or (
+                self._request_deadline is not None
+                and self._request_deadline.expired()
+            )
+        )
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -125,10 +170,7 @@ class ModelIdentity:
         # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify，
         # 见调研方案 §2.3），无单一本地 artifact，指纹 = draft 模型 + verify
         # 端点 + verify 模型名；输出分布等于 verify 模型。
-        if self.engine not in {
-            "pytorch", "llama_cpp", "island", "external_api", "speculative_assisted",
-        }:
-            raise ValueError("model identity engine is unsupported")
+        object.__setattr__(self, "engine", canonical_model_engine(self.engine))
         if any(
             MODEL_IDENTITY_VALUE_PATTERN.fullmatch(value) is None
             for value in (self.model_id, self.format, self.revision)
@@ -184,6 +226,9 @@ class StageAttempt:
     lease_epoch: int = 0
     lease_expires_at: float = 0.0
     accept_timeout_seconds: float = 10.0
+    request_deadline: Optional[RequestDeadline] = field(
+        default=None, compare=False, repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -359,10 +404,8 @@ class LocalFullModelProvider:
         reservation: Reservation,
         cancel_event: threading.Event,
     ) -> StageResult:
-        attempt_cancel_event = (
-            cancel_event
-            if self._provider_kind == "callback_compatibility"
-            else _CombinedCancelEvent(cancel_event)
+        attempt_cancel_event = _CombinedCancelEvent(
+            cancel_event, attempt.request_deadline,
         )
         with self._lock:
             owned = self._reservations.get(reservation.reservation_id)
@@ -422,7 +465,7 @@ class LocalFullModelProvider:
         with self._lock:
             event = self._active_attempts.get(attempt_id)
             if event is not None:
-                event.set()
+                event.set_local()
 
     def renew_lease(
         self,

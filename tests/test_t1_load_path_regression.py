@@ -26,7 +26,10 @@ class _FakeModel:
     model_loaded = False
     quant_type = "int4"
 
-    def load_model(self, engine=None, quant_type=None, model_id=None):
+    # ★ 与 engine_host.py:701 的真实调用对齐（票2 起会传 model_path/profile/resolution）：
+    #   签名缺参数会让 T1b/T1c 以 TypeError 假红，掩盖真实加载路径。
+    def load_model(self, engine=None, quant_type=None, model_id=None,
+                   model_path=None, profile=None, resolution=None):
         return {"success": True, "model_id": model_id or "qwen-1.8b"}
 
     def unload_model(self):

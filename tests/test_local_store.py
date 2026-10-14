@@ -274,7 +274,8 @@ class TestLocalMessages:
         monkeypatch.setattr(local_store, "_initialized_paths", set())
         initialize_local_store()
         assert save_local_conversation_turn(
-            "replay-turn", "question", "answer", {"engine": "test"},
+            "replay-turn", "question", "answer",
+            {"engine": "test", "generation_id": "new-retry-generation"},
             operation_id="req-replay-1",
         ) is False
         assert len(load_local_conversation("replay-turn")) == 2

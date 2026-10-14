@@ -13,6 +13,7 @@ SSE 事件格式对齐 api_server /api/chat/stream（2026-08-03 基线）：
 """
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import re
@@ -24,9 +25,25 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api_errors import coded_http_error
+import config as _cfg
 from model_api_access import require_model_api_source
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    RequestDeadline,
+    RequestDeadlineExceeded,
+)
+from model_load_resolver import (
+    ModelLoadFacts,
+    ModelLoadResolutionError,
+    OP_DISTRIBUTED_LOAD,
+    OP_FULL_MODEL,
+    OP_LAYER_RANGE,
+    effective_pytorch_cuda_available,
+    preferred_engine_for_artifacts,
+    resolve_model_load,
+)
 from inference_service.kv_host import KVCapacityError, KVCleanupError
-from . import __version__
+from . import __contract_version__, __version__
 from .protocol import (
     ChatCancelRequest,
     ChatRequest,
@@ -50,34 +67,83 @@ router = APIRouter(prefix="/v1")
 logger = logging.getLogger("inference_service.routes")
 
 
-async def _iterate_sync_generator(iterable):
+def _normalize_operation_id(value: Optional[str]) -> str:
+    """Normalize the HTTP request identity to the durable receipt contract."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9._:-]", "", str(value or "").strip())
+    return cleaned[:256] or "-"
+
+
+async def _iterate_sync_generator(
+    iterable,
+    cancel_event=None,
+    request_deadline: RequestDeadline | None = None,
+):
     """桥接阻塞式生成器而不阻塞 ASGI 事件循环（复制自
     api_server.py:4132 的等价实现；生成期间 /v1/chat/cancel、/v1/health
     仍可被处理——取消功能依赖此桥接）。"""
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     done = object()
+
+    def _put_from_thread(payload) -> bool:
+        future = asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+        while True:
+            try:
+                future.result(timeout=0.1)
+                return True
+            except concurrent.futures.TimeoutError:
+                if cancel_event is not None and cancel_event.is_set():
+                    future.cancel()
+                    return False
+            except Exception:
+                return False
 
     def _pump():
         try:
             for item in iterable:
-                loop.call_soon_threadsafe(queue.put_nowait, (item, None))
+                if not _put_from_thread((item, None)):
+                    return
         except Exception as exc:
-            loop.call_soon_threadsafe(queue.put_nowait, (None, exc))
+            _put_from_thread((None, exc))
         finally:
-            try:
-                loop.call_soon_threadsafe(queue.put_nowait, (done, None))
-            except RuntimeError:
-                pass
+            _put_from_thread((done, None))
 
     loop = asyncio.get_running_loop()
     threading.Thread(target=_pump, name="inference-svc-stream-bridge", daemon=True).start()
-    while True:
-        item, error = await queue.get()
-        if item is done:
-            break
-        if error is not None:
-            raise error
-        yield item
+    completed_normally = False
+    try:
+        while True:
+            wait_timeout = 0.1
+            if request_deadline is not None:
+                remaining = request_deadline.remaining()
+                if remaining <= 0:
+                    if cancel_event is not None:
+                        cancel_event.set()
+                    raise RequestDeadlineExceeded(
+                        "request deadline exceeded while streaming"
+                    )
+                wait_timeout = min(wait_timeout, remaining)
+            try:
+                item, error = await asyncio.wait_for(
+                    queue.get(), timeout=wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                continue
+            if item is done:
+                completed_normally = True
+                break
+            if error is not None:
+                raise error
+            yield item
+    finally:
+        if not completed_normally and cancel_event is not None:
+            cancel_event.set()
+        close = getattr(iterable, "close", None)
+        if callable(close):
+            try:
+                close()
+            except ValueError:
+                pass
 
 
 # ----------------------------------------------------------------------
@@ -112,10 +178,23 @@ def _sse_event(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _sse_error(message: Any, request_id: str = "-") -> str:
+def _sse_error(
+    message: Any,
+    request_id: str = "-",
+    reason_code: str = "",
+) -> str:
     if isinstance(message, dict):
+        reason_code = reason_code or str(
+            message.get("reason_code")
+            or message.get("error_code")
+            or message.get("code")
+            or ""
+        )
         message = message.get("message") or json.dumps(message, ensure_ascii=False)
-    return _sse_event({"done": True, "error": message, "request_id": request_id})
+    payload = {"done": True, "error": message, "request_id": request_id}
+    if reason_code:
+        payload["reason_code"] = reason_code
+    return _sse_event(payload)
 
 
 def _encode_tensor(tensor) -> str:
@@ -135,7 +214,12 @@ def _decode_tensor(tensor_ref: str):
 # ----------------------------------------------------------------------
 @router.get("/health", response_model=None)
 async def health():
-    return {"status": "ok", "service": "inference-svc", "version": __version__}
+    return {
+        "status": "ok",
+        "service": "inference-svc",
+        "version": __version__,
+        "contract_version": __contract_version__,
+    }
 
 
 @router.get("/ready")
@@ -155,57 +239,113 @@ async def status(request: Request):
 # ----------------------------------------------------------------------
 # 模型生命周期
 # ----------------------------------------------------------------------
-_VALID_ENGINES = ("auto", "llama_cpp", "pytorch", "island")
 _GENERATION_ID_PATTERN = re.compile(r"^gen_[A-Za-z0-9_-]{8,96}$")
 
 
-def _check_load_engine(engine: Optional[str]) -> str:
-    """对齐 api_server.py:2220-2222 的引擎白名单校验（400）。"""
-    e = (engine or "auto").lower()
-    if e not in _VALID_ENGINES:
-        raise coded_http_error(
-            400,
-            "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {e}，可选: auto, llama_cpp, pytorch, island",
-        )
-    return e
-
-
-def _check_model_registered(model_id: Optional[str], engine: str) -> None:
-    """对齐 api_server.py:5029-5051 _validate_model_load_request 的注册校验。
-
-    island 引擎无本地文件依赖；model_id 为空直接放行（对齐 api_server）。
-    inference-svc 模型域仅内置模型（DB 实验模型由 control-svc 承载），
-    故 get_model_config 的 db_models 参数恒传空 dict。
-    """
-    if engine == "island" or not model_id:
-        return
+def _resolve_service_model_load(
+    *,
+    host,
+    model_id: Optional[str],
+    engine: Optional[str],
+    quant_type: Optional[str],
+    operation: str,
+):
+    import config as cfg
     import model_config as mc
+    from torch_runtime import cuda_available
 
-    model = mc.get_model_config(model_id, {})
+    profile_loader = getattr(host, "_ensure_device_profile", None)
+    profile = profile_loader() if callable(profile_loader) else getattr(
+        host, "_device_profile", None
+    )
+    cuda_ok = effective_pytorch_cuda_available(
+        system_cuda_available=cuda_available(load=True),
+        profile=profile,
+    )
+
+    resolved_id = model_id or mc.get_profile_default_model_id()
+    model = mc.get_model_config(resolved_id, {})
     if model is None:
-        raise coded_http_error(
-            404,
-            "MODEL_NOT_REGISTERED",
-            f"模型 '{model_id}' 未在注册表中找到。",
+        facts = ModelLoadFacts(
+            model_id=resolved_id,
+            registered=False,
+            cuda_available=cuda_ok,
+            island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
         )
+    else:
+        status = mc.get_model_file_status(model)
+        facts = ModelLoadFacts(
+            model_id=resolved_id,
+            model_name=model.name,
+            registered=True,
+            has_safetensors=bool(status["has_safetensors"]),
+            has_gguf=bool(status["has_gguf"]),
+            safetensors_path=(
+                mc.resolve_model_path(model.model_path)
+                if status["has_safetensors"] else None
+            ),
+            gguf_path=(
+                mc.resolve_model_path(model.gguf_path)
+                if status["has_gguf"] else None
+            ),
+            preferred_engine=preferred_engine_for_artifacts(
+                has_safetensors=bool(status["has_safetensors"]),
+                has_gguf=bool(status["has_gguf"]),
+                cuda_available=cuda_ok,
+            ),
+            cuda_available=cuda_ok,
+            island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
+        )
+    try:
+        return resolve_model_load(
+            facts,
+            requested_engine=engine or "auto",
+            requested_quant=quant_type,
+            operation=operation,
+        )
+    except ModelLoadResolutionError as exc:
+        status_code = 404 if exc.code == "MODEL_NOT_REGISTERED" else 400
+        raise coded_http_error(status_code, exc.code, exc.message) from exc
 
 
 @router.post("/models/load")
 async def models_load(req: LoadModelRequest, request: Request):
     require_model_api_source(request)
-    engine = _check_load_engine(req.engine)
-    _check_model_registered(req.model_id, engine)
     host = _engine_host(request)
-    result = host.load_model(
-        engine=engine,
-        quant_type=req.quant_type,
-        use_compile=req.use_compile,
+    operation = (
+        OP_LAYER_RANGE
+        if req.layer_range
+        else OP_DISTRIBUTED_LOAD
+        if getattr(host, "_run_mode", "standalone") == "distributed"
+        else OP_FULL_MODEL
+    )
+    resolution = _resolve_service_model_load(
+        host=host,
         model_id=req.model_id,
+        engine=req.engine,
+        quant_type=req.quant_type,
+        operation=operation,
     )
     if req.layer_range:
-        host.load_layer_range(layer_range=req.layer_range)
-    return result
+        return host.load_layer_range(
+            layer_range=req.layer_range,
+            model_id=resolution.model_id,
+            model_path=resolution.model_path,
+            quant_type=resolution.quant_type,
+            engine=resolution.engine,
+            layer_range_mode=resolution.layer_range_mode,
+            resolution=resolution,
+        )
+    return host.load_model(
+        engine=resolution.engine,
+        quant_type=resolution.quant_type,
+        use_compile=req.use_compile,
+        model_id=resolution.model_id,
+        model_path=resolution.model_path,
+        resolution=resolution,
+    )
 
 
 @router.post("/models/unload")
@@ -217,9 +357,26 @@ async def models_unload(req: UnloadModelRequest, request: Request):
 @router.post("/models/switch")
 async def models_switch(req: SwitchModelRequest, request: Request):
     require_model_api_source(request)
-    engine = _check_load_engine(req.engine)
-    _check_model_registered(req.model_id, engine)
-    return _engine_host(request).switch_model(model_id=req.model_id, engine=engine)
+    host = _engine_host(request)
+    operation = (
+        OP_DISTRIBUTED_LOAD
+        if getattr(host, "_run_mode", "standalone") == "distributed"
+        else OP_FULL_MODEL
+    )
+    resolution = _resolve_service_model_load(
+        host=host,
+        model_id=req.model_id,
+        engine=req.engine,
+        quant_type=None,
+        operation=operation,
+    )
+    return host.switch_model(
+        model_id=resolution.model_id,
+        engine=resolution.engine,
+        quant_type=resolution.quant_type,
+        model_path=resolution.model_path,
+        resolution=resolution,
+    )
 
 
 @router.get("/models/current")
@@ -267,10 +424,19 @@ def chat(req: ChatRequest, request: Request):
     不阻塞事件循环（对齐 api_server run_in_threadpool 语义）。"""
     _require_master_role(request)
     host = _engine_host(request)
-    request_id = request.headers.get("X-QLH-Request-ID", "-")
+    request_id = _normalize_operation_id(
+        request.headers.get("X-QLH-Request-ID"),
+    )
+    request_deadline = RequestDeadline.start(_cfg.PIPELINE_TIMEOUT)
     generation_id, cancel_event = host.register_generation(req.generation_id)
     try:
-        result = host.chat_full(req, cancel_event)
+        result = host.chat_full_with_operation_id(
+            req, cancel_event, request_id, request_deadline,
+        )
+    except RequestDeadlineExceeded as exc:
+        raise coded_http_error(
+            504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+        ) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -287,7 +453,10 @@ async def chat_stream(req: ChatRequest, request: Request):
     """SSE 流式（事件格式与 api_server /api/chat/stream 一致）。"""
     _require_master_role(request)
     host = _engine_host(request)
-    request_id = request.headers.get("X-QLH-Request-ID", "-")
+    request_id = _normalize_operation_id(
+        request.headers.get("X-QLH-Request-ID"),
+    )
+    request_deadline = RequestDeadline.start(_cfg.PIPELINE_TIMEOUT)
     generation_id, cancel_event = host.register_generation(req.generation_id)
 
     # T9.5：distributed_required 无分布式路径时明确失败（所有模式）
@@ -303,7 +472,20 @@ async def chat_stream(req: ChatRequest, request: Request):
         # full：完整功能，推理完成后一次性返回单个 done 事件（SSE 格式）；
         # chat_full 阻塞调用放线程池（api_server run_in_threadpool 语义）
         try:
-            result = await run_in_threadpool(host.chat_full, req, cancel_event)
+            result = await run_in_threadpool(
+                host.chat_full_with_operation_id,
+                req,
+                cancel_event,
+                request_id,
+                request_deadline,
+            )
+        except RequestDeadlineExceeded as e:
+            return StreamingResponse(
+                iter([_sse_error(
+                    str(e), request_id, REQUEST_DEADLINE_EXCEEDED,
+                )]),
+                media_type="text/event-stream",
+            )
         except HTTPException as e:
             return StreamingResponse(
                 iter([_sse_error(e.detail, request_id)]),
@@ -329,8 +511,8 @@ async def chat_stream(req: ChatRequest, request: Request):
             iter([_sse_event(payload)]), media_type="text/event-stream"
         )
 
-    # interactive：start → token* → done | error | cancelled（T9 契约 §9.4.1；
-    # engine_host 薄实现不提交历史，history_committed 如实上报 false）
+    # interactive：start → token* → done | error | cancelled（T9 契约 §9.4.1）；
+    # EngineHost 与 full/fast 共用历史读取、裁剪和完成时提交。
     if req.streaming_mode == "interactive":
         async def _generate_interactive():
             yield _sse_event({
@@ -343,18 +525,37 @@ async def chat_stream(req: ChatRequest, request: Request):
             completed_normally = False
             try:
                 async for event in _iterate_sync_generator(
-                    host.chat_stream_events(req, cancel_event)
+                    host.chat_stream_events_with_operation_id(
+                        req, cancel_event, request_id, request_deadline,
+                    ),
+                    cancel_event,
+                    request_deadline,
                 ):
                     if event.get("done"):
                         event["request_id"] = request_id
                         event["generation_id"] = generation_id
-                        event["session_id"] = req.session_id
-                        event["history_committed"] = False
+                        event.setdefault("session_id", req.session_id)
                         metrics = event.setdefault("metrics", {})
                         metrics["routing_preference"] = req.routing_preference
-                        metrics["distributed_used"] = False
+                        metrics.setdefault("distributed_used", False)
+                        try:
+                            host._enforce_distributed_required(
+                                req,
+                                metrics,
+                                detail="interactive 终态未完成允许的分布式执行",
+                            )
+                        except HTTPException as exc:
+                            yield _sse_error(str(exc.detail), request_id)
+                            return
+                        event["history_committed"] = host.commit_stream_event(
+                            req, event, cancel_event, request_id,
+                        )
                     yield _sse_event(event)
                 completed_normally = True
+            except RequestDeadlineExceeded as e:
+                yield _sse_error(
+                    str(e), request_id, REQUEST_DEADLINE_EXCEEDED,
+                )
             except Exception as e:
                 yield _sse_error(str(e), request_id)
             finally:
@@ -371,14 +572,25 @@ async def chat_stream(req: ChatRequest, request: Request):
         completed_normally = False
         try:
             async for event in _iterate_sync_generator(
-                host.chat_stream_events(req, cancel_event)
+                host.chat_stream_events_with_operation_id(
+                    req, cancel_event, request_id, request_deadline,
+                ),
+                cancel_event,
+                request_deadline,
             ):
                 if event.get("done"):
                     # engine_host 薄实现的 done 事件带 "-" 占位，此处覆盖为真实值
                     event["request_id"] = request_id
                     event["generation_id"] = generation_id
+                    event["history_committed"] = host.commit_stream_event(
+                        req, event, cancel_event, request_id,
+                    )
                 yield _sse_event(event)
             completed_normally = True
+        except RequestDeadlineExceeded as e:
+            yield _sse_error(
+                str(e), request_id, REQUEST_DEADLINE_EXCEEDED,
+            )
         except Exception as e:
             yield _sse_error(str(e), request_id)
         finally:

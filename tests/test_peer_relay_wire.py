@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +48,9 @@ class _RelayClient:
     def __exit__(self, *_exc):
         return False
 
-    def forward_hidden(self, hidden: bytes, *, n_tokens: int):
+    def forward_hidden(
+        self, hidden: bytes, *, n_tokens: int, deadline_monotonic=None
+    ):
         assert n_tokens == 2
         type(self).received = hidden
         values = np.frombuffer(hidden, dtype=np.float32).copy() + 1.0
@@ -130,17 +133,30 @@ def test_peer_relay_rejects_raw_f32_without_shape(monkeypatch):
 class _SessionRelayClient:
     instances: list["_SessionRelayClient"] = []
 
-    def __init__(self, *_args, **_kwargs):
+    def __init__(self, *_args, **kwargs):
         self.calls = 0
         self.close_calls = 0
+        self.close_graces: list[float | None] = []
+        self.deadline_monotonic = kwargs.get("deadline_monotonic")
+        self.timeout = kwargs.get("timeout")
         type(self).instances.append(self)
 
-    def forward_hidden(self, hidden: bytes, *, n_tokens: int):
+    def tighten_deadline(self, deadline):
+        if deadline is None:
+            return
+        if self.deadline_monotonic is None or deadline < self.deadline_monotonic:
+            self.deadline_monotonic = deadline
+
+    def forward_hidden(
+        self, hidden: bytes, *, n_tokens: int, deadline_monotonic=None
+    ):
+        self.tighten_deadline(deadline_monotonic)
         self.calls += 1
         return _Outcome((np.frombuffer(hidden, dtype=np.float32) + self.calls).tobytes())
 
-    def close(self):
+    def close(self, *, grace_timeout=None):
         self.close_calls += 1
+        self.close_graces.append(grace_timeout)
 
 
 class _SeqRelayClient:
@@ -149,7 +165,10 @@ class _SeqRelayClient:
     def __init__(self, *_args, **_kwargs):
         pass
 
-    def forward_hidden(self, hidden: bytes, *, n_tokens: int, seq_meta=None):
+    def forward_hidden(
+        self, hidden: bytes, *, n_tokens: int, seq_meta=None,
+        deadline_monotonic=None,
+    ):
         type(self).seen = seq_meta
         return _Outcome(hidden)
 
@@ -187,6 +206,81 @@ def test_peer_relay_rejects_mismatched_positions_before_connect(monkeypatch):
     assert sent[0]["error"] == "relay seq_ids/positions must match hidden token count"
 
 
+def test_peer_relay_expired_wire_deadline_never_constructs_client(monkeypatch):
+    constructed: list[object] = []
+
+    class _UnexpectedRelayClient:
+        def __init__(self, *_args, **_kwargs):
+            constructed.append(self)
+
+    monkeypatch.setattr(
+        "relay_segment_client.RelaySegmentClient", _UnexpectedRelayClient
+    )
+    sent: list[dict] = []
+    peer = _peer(sent)
+    payload = _payload(np.zeros((1, 2, 3), dtype=np.float32), task_id="expired")
+    payload["request_deadline_ms"] = int(time.time() * 1000) - 1
+
+    peer._handle_layer_forward_via_relay(payload)
+
+    assert constructed == []
+    assert peer._relay_sessions == {}
+    assert sent == [{"error": "request_deadline_exceeded"}]
+
+
+def test_peer_relay_session_key_ignores_dynamic_timeout(monkeypatch):
+    _SessionRelayClient.instances.clear()
+    monkeypatch.setattr(
+        "relay_segment_client.RelaySegmentClient", _SessionRelayClient
+    )
+    sent: list[dict] = []
+    peer = _peer(sent)
+    deadline_ms = int((time.time() + 5.0) * 1000)
+    values = np.zeros((1, 2, 3), dtype=np.float32)
+
+    first = _payload(values, task_id="stable-session")
+    first["request_deadline_ms"] = deadline_ms
+    peer._handle_layer_forward_via_relay(first)
+    peer._active_layer_config["relay_segment"]["timeout"] = 0.25
+    second = _payload(values, task_id="stable-session")
+    second.update({"step": 1, "request_deadline_ms": deadline_ms})
+    peer._handle_layer_forward_via_relay(second)
+
+    assert len(_SessionRelayClient.instances) == 1
+    session = _SessionRelayClient.instances[0]
+    assert session.calls == 2
+    assert session.timeout == 2.0
+    assert session._relay_endpoint_key == ("127.0.0.1", 50283, 3, "middle")
+    assert session.deadline_monotonic is not None
+
+
+def test_peer_relay_failed_outcome_discards_session(monkeypatch):
+    class _FailedOutcome:
+        ok = False
+        error = "relay_transport_error"
+
+    class _FailingRelayClient(_SessionRelayClient):
+        def forward_hidden(self, *_args, **_kwargs):
+            self.calls += 1
+            return _FailedOutcome()
+
+    _FailingRelayClient.instances.clear()
+    monkeypatch.setattr(
+        "relay_segment_client.RelaySegmentClient", _FailingRelayClient
+    )
+    sent: list[dict] = []
+    peer = _peer(sent)
+
+    peer._handle_layer_forward_via_relay(
+        _payload(np.zeros((1, 2, 3), dtype=np.float32), task_id="failed")
+    )
+
+    session = _FailingRelayClient.instances[0]
+    assert session.close_graces == [0.0]
+    assert peer._relay_sessions == {}
+    assert sent == [{"error": "relay_segment_failed:relay_transport_error"}]
+
+
 @pytest.mark.parametrize("terminal_event", ["done", "abort"])
 def test_peer_relay_reuses_task_session_until_terminal_event(monkeypatch, terminal_event):
     """Decode steps share one relay connection; terminal cleanup sends one CLOSE."""
@@ -212,6 +306,7 @@ def test_peer_relay_reuses_task_session_until_terminal_event(monkeypatch, termin
     assert session.close_calls == 0
     getattr(peer, f"_handle_pipeline_{terminal_event}")({"task_id": "session-task"})
     assert session.close_calls == 1
+    assert session.close_graces == ([0.0] if terminal_event == "abort" else [None])
     assert "session-task" not in peer._relay_sessions
     assert "session-task" not in peer._active_pipeline_task_ids
 
@@ -232,6 +327,63 @@ def test_peer_relay_rejects_forward_after_abort_before_connect(monkeypatch):
 
     assert _SessionRelayClient.instances == []
     assert sent == []
+
+
+def test_peer_abort_breaks_blocking_relay_before_waiting_execution_lock(monkeypatch):
+    class _StoppedOutcome:
+        ok = False
+        error = "relay_transport_error"
+
+    class _BlockingRelayClient:
+        instances: list["_BlockingRelayClient"] = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.entered = threading.Event()
+            self.released = threading.Event()
+            self.close_graces: list[float | None] = []
+            type(self).instances.append(self)
+
+        def forward_hidden(self, *_args, **_kwargs):
+            self.entered.set()
+            assert self.released.wait(timeout=2)
+            return _StoppedOutcome()
+
+        def close(self, *, grace_timeout=None):
+            self.close_graces.append(grace_timeout)
+            self.released.set()
+
+    monkeypatch.setattr(
+        "relay_segment_client.RelaySegmentClient", _BlockingRelayClient
+    )
+    sent: list[dict] = []
+    peer = _peer(sent)
+    payload = _payload(
+        np.zeros((1, 2, 3), dtype=np.float32), task_id="blocking-abort"
+    )
+    payload.update({
+        "config_id": "cfg-relay",
+        "model_sha256": "relay-sha",
+        "model_type": "qwen2",
+        "use_kv_cache": False,
+    })
+    worker = threading.Thread(target=peer._handle_layer_forward, args=(payload,))
+    worker.start()
+    wait_until = time.monotonic() + 1.0
+    while not _BlockingRelayClient.instances and time.monotonic() < wait_until:
+        time.sleep(0.001)
+    assert _BlockingRelayClient.instances
+    session = _BlockingRelayClient.instances[0]
+    assert session.entered.wait(timeout=1)
+
+    started = time.monotonic()
+    peer._handle_pipeline_abort({"task_id": "blocking-abort"})
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 1.0
+    assert session.close_graces == [0.0]
+    assert peer._relay_sessions == {}
+    assert "blocking-abort" in peer._local_pipeline_cancelled
 
 
 def test_peer_relay_rejects_out_of_order_step_before_connect(monkeypatch):
@@ -324,11 +476,15 @@ class _TailRelayClient:
     def __exit__(self, *_exc):
         return False
 
-    def forward_hidden(self, hidden: bytes, *, n_tokens: int):  # pragma: no cover
+    def forward_hidden(
+        self, hidden: bytes, *, n_tokens: int, deadline_monotonic=None
+    ):  # pragma: no cover
         type(self).called = "forward_hidden"
         raise AssertionError("tail 段不应走 forward_hidden")
 
-    def forward_hidden_to_token(self, hidden: bytes, *, n_tokens: int):
+    def forward_hidden_to_token(
+        self, hidden: bytes, *, n_tokens: int, deadline_monotonic=None
+    ):
         type(self).called = "forward_hidden_to_token"
         assert n_tokens == 2
         type(self).received = hidden

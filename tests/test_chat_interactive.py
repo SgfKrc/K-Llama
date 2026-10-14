@@ -9,6 +9,7 @@ start → token* → done（含 generation_id/request_id/session_id/history_comm
 import json
 import os
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -92,9 +93,21 @@ def interactive_env(monkeypatch):
     monkeypatch.setattr(api_server, "model_manager", fake_model_manager)
     monkeypatch.setattr(
         api_server, "model_host",
-        SimpleNamespace(model_loaded=True),
+        SimpleNamespace(
+            model_loaded=True,
+            full_chat_execution_lock=threading.RLock(),
+        ),
     )
     monkeypatch.setattr(api_server, "RUN_MODE", "local")
+    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server, "session_histories", {})
+    monkeypatch.setattr(
+        api_server._chat_context,
+        "_load_history",
+        lambda _session_id: [],
+    )
+    api_server._chat_context.invalidate(clear_histories=True)
+    monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
 
     def fake_commit(session_id, user_message, response_text, metrics):
         calls["commits"].append(
@@ -102,7 +115,8 @@ def interactive_env(monkeypatch):
         )
         return True
 
-    monkeypatch.setattr(api_server, "_commit_interactive_history", fake_commit)
+    monkeypatch.setattr(api_server, "_persist_conversation_turn", fake_commit)
+    monkeypatch.setattr(api_server._chat_context, "_persist_turn", fake_commit)
     monkeypatch.setattr(api_server, "_external_route_decision",
                         lambda req: SimpleNamespace(use_external=False))
 
@@ -217,6 +231,35 @@ class TestInteractiveContract:
         assert user_message == "提交测试"
         assert response_text == "你好，世界！"
         assert metrics["engine"] == "llama_cpp"
+        assert api_server.session_histories["sess_commit"] == [
+            {"role": "user", "content": "提交测试"},
+            {"role": "assistant", "content": "你好，世界！"},
+        ]
+
+    def test_interactive_uses_and_extends_canonical_history(self, interactive_env):
+        client, calls = interactive_env
+        api_server.session_histories["sess_context"] = [
+            {"role": "user", "content": "记住颜色"},
+            {"role": "assistant", "content": "蓝色"},
+        ]
+
+        response = client.post("/api/chat/stream", json={
+            "message": "颜色是什么",
+            "streaming_mode": "interactive",
+            "session_id": "sess_context",
+        })
+
+        assert response.status_code == 200
+        _message, kwargs = calls["run_pipeline_safe"]
+        assert kwargs["messages"] == [
+            {"role": "user", "content": "记住颜色"},
+            {"role": "assistant", "content": "蓝色"},
+            {"role": "user", "content": "颜色是什么"},
+        ]
+        assert api_server.session_histories["sess_context"][-2:] == [
+            {"role": "user", "content": "颜色是什么"},
+            {"role": "assistant", "content": "你好，世界！"},
+        ]
 
     def test_distributed_required_marks_requested(self, interactive_env, monkeypatch):
         client, calls = interactive_env
@@ -276,6 +319,39 @@ class TestRoutingPreference:
         calls["role"] = "client"
         monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
         return client, calls
+
+    @pytest.mark.parametrize('streaming_mode', ['full', 'interactive', 'fast'])
+    def test_required_cold_start_never_auto_loads_full_model(
+        self, interactive_env, monkeypatch, streaming_mode,
+    ):
+        client, calls = interactive_env
+        calls['distributed_enabled'] = True
+        calls['role'] = 'master'
+        monkeypatch.setattr(api_server, 'RUN_MODE', 'distributed')
+        monkeypatch.setattr(api_server.model_host, 'model_loaded', False)
+        monkeypatch.setattr(
+            api_server, 'model_manager',
+            SimpleNamespace(is_loaded=False, is_pipeline_prepared=False),
+        )
+        monkeypatch.setattr(api_server, 'runtime_supports', lambda *_: False)
+        auto_load_calls = []
+        monkeypatch.setattr(
+            api_server, '_auto_load_default_model',
+            lambda: auto_load_calls.append(True),
+        )
+
+        response = client.post('/api/chat/stream', json={
+            'message': 'hi',
+            'streaming_mode': streaming_mode,
+            'routing_preference': 'distributed_required',
+        })
+
+        assert not auto_load_calls
+        assert response.status_code == 200
+        errors = [event for event in _sse_events(response) if event.get('error')]
+        assert errors
+        if streaming_mode == 'full':
+            assert errors[0]['outcome_reason'] == 'DISTRIBUTED_PIPELINE_NOT_READY'
 
     def test_client_without_local_only_guides_to_master(self, interactive_env, monkeypatch):
         client, calls = self._set_client_scene(interactive_env, monkeypatch)
@@ -409,6 +485,181 @@ class TestRoutingPreference:
         assert events[-1]["done"] is True
         assert calls["forward"] == 0
 
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    def test_required_worker_forward_allows_returning_stage_lock(
+        self, interactive_env, monkeypatch, endpoint,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        acquired = threading.Event()
+        stage_threads = []
+
+        def returning_stage():
+            lock = api_server.model_host.full_chat_execution_lock
+            if lock.acquire(timeout=1.0):
+                try:
+                    acquired.set()
+                finally:
+                    lock.release()
+
+        def forward(message, **kwargs):
+            assert kwargs["routing_preference"] == "distributed_required"
+            stage = threading.Thread(target=returning_stage)
+            stage_threads.append(stage)
+            stage.start()
+            stage.join(timeout=2.0)
+            assert acquired.is_set(), "worker held model lock while awaiting master"
+            return {
+                "status": "ok", "content": "2",
+                "metrics": {"distributed_used": True, "workers_used": ["worker"]},
+            }
+
+        monkeypatch.setattr(api_server.scheduler, "forward_inference_to_master", forward)
+        monkeypatch.setattr(
+            api_server, "_auto_load_default_model",
+            lambda: pytest.fail("required worker forwarding loaded a full model"),
+        )
+        response = client.post(endpoint, json={
+            "message": "one plus one", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        for stage in stage_threads:
+            stage.join(timeout=2.0)
+        assert response.status_code == 200
+        result = (_sse_events(response)[-1] if endpoint.endswith("/stream")
+                  else response.json())
+        assert (result.get("response") or result.get("content")) == "2"
+        assert result["metrics"]["distributed_used"] is True
+        assert result["metrics"]["fallback"] is False
+        assert calls.get("chat", 0) == 0
+        assert acquired.is_set()
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    @pytest.mark.parametrize("transition", ["master", "disabled"])
+    def test_unlocked_forward_role_change_never_enters_native_execution(
+        self, interactive_env, monkeypatch, endpoint, transition,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        execute = api_server._execute_requested_chat
+
+        def change_before_execution(req, cancel_event=None, request_deadline=None, **kwargs):
+            assert kwargs["forward_only"] is True
+            calls["role"] = "master" if transition == "master" else "client"
+            calls["distributed_enabled"] = transition != "disabled"
+            return execute(req, cancel_event, request_deadline, **kwargs)
+
+        monkeypatch.setattr(api_server, "_execute_requested_chat", change_before_execution)
+        monkeypatch.setattr(
+            api_server, "_auto_load_default_model",
+            lambda: pytest.fail("forward-only request auto-loaded a full model"),
+        )
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        if endpoint.endswith("/stream"):
+            assert response.status_code == 200
+            error = next(event for event in _sse_events(response) if event.get("error"))
+            assert error["outcome_reason"] == "DISTRIBUTED_FORWARD_CONTEXT_CHANGED"
+        else:
+            assert response.status_code == 409
+            assert response.json()["error_code"] == "DISTRIBUTED_FORWARD_CONTEXT_CHANGED"
+        assert calls.get("chat", 0) == 0
+        assert calls["forward"] == 0
+        assert calls["run_pipeline_safe"] is None
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    @pytest.mark.parametrize("transition", ["master", "disabled"])
+    def test_role_change_after_forward_guard_stays_forward_only(
+        self, interactive_env, monkeypatch, endpoint, transition,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        prepare = api_server._prepare_chat_context
+        forwarded = []
+
+        def change_during_context(*args, **kwargs):
+            context = prepare(*args, **kwargs)
+            calls["role"] = "master" if transition == "master" else "client"
+            calls["distributed_enabled"] = transition != "disabled"
+            return context
+
+        def denied_by_forward_owner(**kwargs):
+            assert not api_server._should_forward_chat_to_master()
+            forwarded.append(True)
+            return {"status": "disconnected", "error": "worker forwarding role changed"}
+
+        monkeypatch.setattr(api_server, "_prepare_chat_context", change_during_context)
+        monkeypatch.setattr(api_server.scheduler, "forward_inference_to_master", denied_by_forward_owner)
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        if endpoint.endswith("/stream"):
+            assert response.status_code == 200
+            assert any(event.get("error") for event in _sse_events(response))
+        else:
+            assert response.status_code == 503
+        assert forwarded == [True]
+        assert calls.get("chat", 0) == 0
+        assert calls["run_pipeline_safe"] is None
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    def test_required_worker_forward_failure_never_runs_local_model(
+        self, interactive_env, monkeypatch, endpoint,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        monkeypatch.setattr(
+            api_server.scheduler, "forward_inference_to_master",
+            lambda **kwargs: {"status": "disconnected", "error": "master unavailable"},
+        )
+        monkeypatch.setattr(
+            api_server, "_auto_load_default_model",
+            lambda: pytest.fail("required forwarding failure loaded a full model"),
+        )
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        if endpoint.endswith("/stream"):
+            assert response.status_code == 200
+            events = _sse_events(response)
+            assert any(event.get("error") for event in events)
+            assert not any(event.get("done") and not event.get("error") for event in events)
+        else:
+            assert response.status_code == 503
+        assert calls.get("chat", 0) == 0
+        assert calls["run_pipeline_safe"] is None
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    def test_local_full_chat_still_serializes_model_execution(
+        self, interactive_env, monkeypatch, endpoint,
+    ):
+        client, calls = interactive_env
+        acquired = []
+
+        def chat(messages, **kwargs):
+            def competing_stage():
+                lock = api_server.model_host.full_chat_execution_lock
+                owns = lock.acquire(timeout=0.1)
+                acquired.append(owns)
+                if owns:
+                    lock.release()
+            stage = threading.Thread(target=competing_stage)
+            stage.start()
+            stage.join(timeout=2.0)
+            assert acquired and not any(acquired)
+            return {"content": "local", "usage": {"completion_tokens": 1}}
+
+        monkeypatch.setattr(api_server.model_manager, "chat", chat)
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full", "routing_preference": "local_only",
+        })
+        assert response.status_code == 200
+        result = (_sse_events(response)[-1] if endpoint.endswith("/stream")
+                  else response.json())
+        assert (result.get("response") or result.get("content")) == "local"
+        assert acquired and not any(acquired)
+        assert calls["forward"] == 0
+
     def test_full_mode_distributed_required_rejected(self, interactive_env):
         client, _calls = interactive_env  # 分布式未启用
         response = client.post("/api/chat/stream", json={
@@ -422,6 +673,183 @@ class TestRoutingPreference:
         assert "distributed_required" in error[0]["error"]
 
 
+class TestFastContextContract:
+    def test_fast_uses_and_commits_canonical_history(self, interactive_env):
+        client, calls = interactive_env
+        api_server.session_histories["sess_fast"] = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]
+
+        response = client.post("/api/chat/stream", json={
+            "message": "third",
+            "streaming_mode": "fast",
+            "session_id": "sess_fast",
+        })
+
+        assert response.status_code == 200
+        _message, kwargs = calls["run_pipeline_safe"]
+        assert kwargs["messages"] == [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"},
+        ]
+        done = _sse_events(response)[-1]
+        assert done["done"] is True
+        assert done["history_committed"] is True
+        assert api_server.session_histories["sess_fast"][-2:] == [
+            {"role": "user", "content": "third"},
+            {"role": "assistant", "content": "你好，世界！"},
+        ]
+
+
+class TestContextReload:
+    def test_same_active_session_reloads_after_model_state_reset(
+        self, interactive_env, monkeypatch,
+    ):
+        client, calls = interactive_env
+        rows = [
+            {"role": "user", "content": "persisted question"},
+            {"role": "assistant", "content": "persisted answer"},
+        ]
+        monkeypatch.setattr(
+            api_server._chat_context,
+            "_load_history",
+            lambda session_id: list(rows) if session_id == "sess_reload" else [],
+        )
+        api_server.active_session_id = "sess_reload"
+        api_server.session_histories = {
+            "sess_reload": [{"role": "user", "content": "stale"}],
+        }
+
+        api_server._reset_runtime_conversation_state(clear_histories=True)
+        response = client.post("/api/chat/stream", json={
+            "message": "continue",
+            "streaming_mode": "interactive",
+            "session_id": "sess_reload",
+        })
+
+        assert response.status_code == 200
+        _message, kwargs = calls["run_pipeline_safe"]
+        assert kwargs["messages"] == [
+            *rows,
+            {"role": "user", "content": "continue"},
+        ]
+
+
+class TestSessionCrudContextContract:
+    def test_activate_same_stale_session_reloads_canonical_history(
+        self, interactive_env, monkeypatch,
+    ):
+        client, _calls = interactive_env
+        rows = [
+            {"role": "user", "content": "persisted question"},
+            {"role": "assistant", "content": "persisted answer"},
+        ]
+        api_server.active_session_id = "sess_activate"
+        api_server.session_histories = {
+            "sess_activate": [{"role": "user", "content": "stale"}],
+        }
+        api_server._sync_chat_context_facade()
+        api_server._chat_context.invalidate_session("sess_activate")
+        api_server._publish_chat_context_facade()
+        monkeypatch.setattr(
+            api_server._chat_context,
+            "_load_history",
+            lambda session_id: list(rows) if session_id == "sess_activate" else [],
+        )
+
+        response = client.post("/api/sessions/sess_activate/activate")
+
+        assert response.status_code == 200
+        assert response.json()["messages"] == rows
+        assert api_server.session_histories["sess_activate"] == rows
+
+    def test_delete_active_session_clears_kv_before_dropping_facade(
+        self, interactive_env, monkeypatch,
+    ):
+        client, _calls = interactive_env
+        cleared = []
+        initialized = []
+        api_server.active_session_id = "sess_delete"
+        api_server.session_histories = {
+            "sess_delete": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"},
+            ],
+        }
+        monkeypatch.setattr(
+            api_server,
+            "kv_cache",
+            SimpleNamespace(clear=lambda: cleared.append(True)),
+        )
+        monkeypatch.setattr(
+            api_server._local_store,
+            "delete_local_session",
+            lambda session_id: 2 if session_id == "sess_delete" else 0,
+        )
+        monkeypatch.setattr(
+            api_server, "_init_kv_cache", lambda: initialized.append(True),
+        )
+
+        response = client.delete("/api/sessions/sess_delete")
+
+        assert response.status_code == 200
+        assert api_server.active_session_id is None
+        assert "sess_delete" not in api_server.session_histories
+        assert cleared == [True]
+        assert initialized == [True]
+
+    def test_delete_old_persisted_turn_invalidates_window_instead_of_splicing_it(
+        self, interactive_env, monkeypatch,
+    ):
+        client, _calls = interactive_env
+        warm_window = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(20, 220)
+        ]
+        reloaded_window = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(18, 218)
+        ]
+        api_server.active_session_id = "sess_window"
+        api_server.session_histories = {"sess_window": warm_window}
+        monkeypatch.setattr(
+            api_server._local_store,
+            "get_local_conversation_count",
+            lambda session_id: 220 if session_id == "sess_window" else 0,
+        )
+        deleted = []
+        monkeypatch.setattr(
+            api_server._local_store,
+            "delete_local_message_range",
+            lambda session_id, turn_index: deleted.append(
+                (session_id, turn_index)
+            ) or 2,
+        )
+        monkeypatch.setattr(
+            api_server._chat_context,
+            "_load_history",
+            lambda session_id: (
+                list(reloaded_window) if session_id == "sess_window" else []
+            ),
+        )
+
+        response = client.delete("/api/sessions/sess_window/turns/0")
+
+        assert response.status_code == 200
+        assert response.json()["remaining_turns"] == 109
+        assert deleted == [("sess_window", 0)]
+        assert api_server.session_histories["sess_window"] == reloaded_window
+        assert api_server.session_histories["sess_window"][0]["content"] == "18"
+
+
 class TestCommitFunction:
     """真实 _commit_interactive_history 的本地存储分支。"""
 
@@ -430,6 +858,7 @@ class TestCommitFunction:
 
         fake_store = SimpleNamespace(
             get_local_save_history=lambda: True,
+            load_local_conversation=lambda _session_id: [],
             save_local_conversation_turn=(
                 lambda sid, user, assistant, metrics=None, **kwargs:
                 saved.append((sid, user, assistant, metrics)) or True
@@ -445,3 +874,87 @@ class TestCommitFunction:
         )
         assert committed is True
         assert saved == [("sess_l", "问", "答", {"engine": "llama_cpp"})]
+
+
+def test_full_stream_flushes_before_context_and_generation(interactive_env, monkeypatch):
+    """A proxy can flush SSE headers even while context/native work is blocked."""
+    import asyncio
+    from starlette.requests import Request
+
+    _client, calls = interactive_env
+    acquired = []
+    entered = threading.Event()
+    release = threading.Event()
+    acquire = api_server._chat_context.acquire_transaction
+
+    def capture_acquire(**kwargs):
+        acquired.append(True)
+        return acquire(**kwargs)
+
+    def blocked_execute(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0), "stream consumer never released execution"
+        return {"content": "2", "followups": [], "metrics": {"model_generation": 1791914962549556600}}
+
+    monkeypatch.setattr(api_server._chat_context, "acquire_transaction", capture_acquire)
+    monkeypatch.setattr(api_server, "_execute_requested_chat", blocked_execute)
+
+    async def consume():
+        api_server._request_id_ctx.set("full-flush-contract")
+        request = Request({"type": "http", "method": "POST", "path": "/api/chat/stream",
+                           "headers": [], "client": ("127.0.0.1", 1234), "scheme": "http"})
+        response = await api_server.chat_stream(
+            api_server.ChatRequest(message="one plus one", streaming_mode="full", routing_preference="local_only"),
+            request,
+        )
+        iterator = response.body_iterator
+        first = await asyncio.wait_for(anext(iterator), timeout=0.5)
+        assert first == ": processing\n\n"
+        assert not acquired and not entered.is_set()
+        pending = asyncio.create_task(anext(iterator))
+        try:
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            assert not pending.done(), "completion arrived while generation was blocked"
+            release.set()
+            final = await asyncio.wait_for(pending, timeout=2.0)
+            assert json.loads(final.removeprefix("data: ")) == {
+                "done": True, "response": "2", "thinking_content": None,
+                "followups": [], "metrics": {"model_generation": 1791914962549556600}, "request_id": "full-flush-contract",
+            }
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+        finally:
+            release.set()
+            if not pending.done():
+                await pending
+            await iterator.aclose()
+
+    asyncio.run(consume())
+    assert acquired == [True]
+    assert not calls["commits"]
+
+
+def test_full_stream_disconnect_after_first_comment_retires_generation(interactive_env, monkeypatch):
+    import asyncio
+    from starlette.requests import Request
+
+    _client, calls = interactive_env
+    monkeypatch.setattr(api_server._chat_context, "acquire_transaction",
+                        lambda **_kwargs: pytest.fail("disconnected stream acquired a context transaction"))
+    monkeypatch.setattr(api_server, "_execute_requested_chat",
+                        lambda *_args, **_kwargs: pytest.fail("disconnected stream started generation"))
+
+    async def disconnect():
+        request = Request({"type": "http", "method": "POST", "path": "/api/chat/stream",
+                           "headers": [], "client": ("127.0.0.1", 1234), "scheme": "http"})
+        response = await api_server.chat_stream(
+            api_server.ChatRequest(message="hi", streaming_mode="full", routing_preference="local_only"), request)
+        generation = response.headers["x-generation-id"]
+        cancel = api_server._generation_cancel_events[generation]
+        assert await anext(response.body_iterator) == ": processing\n\n"
+        await response.body_iterator.aclose()
+        assert cancel.is_set()
+        assert generation not in api_server._generation_cancel_events
+
+    asyncio.run(disconnect())
+    assert not calls["commits"]

@@ -57,7 +57,16 @@ class TaskJournal(Protocol):
 
 
 class SQLiteTaskJournal:
-    """SQLite event journal with an atomically updated snapshot projection."""
+    """SQLite event journal with an atomically updated snapshot projection.
+
+    锁所有权合约：实例化即获取跨进程独占锁（``_acquire_instance_lock``），直到
+    ``close()`` 才释放。因此只有**真正承担任务图写服务**的进程才允许在确定要
+    成为 writer 的时机实例化它（首个真实任务链执行、工作流查询、启动恢复，
+    或运行时切换启用时）；宿主模块的 **import 副作用**不得实例化——否则任何仅
+    import 宿主模块的探针 / pytest 冷启动子进程 / Windows ``multiprocessing``
+    spawn worker 都会与生产 writer 争锁，并被错误判定为
+    「任务图 journal 初始化失败，任务图已禁用」。
+    """
 
     def __init__(
         self,

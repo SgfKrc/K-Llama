@@ -35,6 +35,7 @@ from fastapi import FastAPI, HTTPException  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from edge_cluster import EdgeRpcWorker, EdgeRpcWorkerError  # noqa: E402
+from release_contract import PRODUCT_VERSION  # noqa: E402
 
 EDGE_BASELINE = {
     "edition": "edge",
@@ -44,7 +45,7 @@ EDGE_BASELINE = {
     "cold_start_budget_s": 15,
 }
 
-app = FastAPI(title="QLH Edge", version="0.1.0")
+app = FastAPI(title="QLH Edge", version=PRODUCT_VERSION)
 
 _state_lock = threading.RLock()
 _llm = None

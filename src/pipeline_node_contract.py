@@ -14,6 +14,11 @@ import math
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
+try:
+    from .task_provider import canonical_model_engine
+except ImportError:  # pragma: no cover - top-level import in runtime bundles
+    from task_provider import canonical_model_engine
+
 
 PIPELINE_NODE_SCHEMA_VERSION = 1
 RESOURCE_VIEW_SCHEMA_VERSION = 1
@@ -45,6 +50,13 @@ KNOWN_NODE_KINDS = frozenset({
 
 class PipelineNodeContractError(ValueError):
     """A node, artifact, or complete layer layout is not admissible."""
+
+
+def _canonical_engine(value: Any, field: str) -> str:
+    try:
+        return canonical_model_engine(value)
+    except ValueError as exc:
+        raise PipelineNodeContractError(f"{field} is unsupported") from exc
 
 
 def _non_negative_int(value: Any, field: str) -> int:
@@ -227,14 +239,12 @@ class PipelineNode:
     def __post_init__(self) -> None:
         node_id = str(self.node_id or "").strip()
         kind = str(self.kind or "").strip()
-        engine = str(self.engine or "").strip()
+        engine = _canonical_engine(self.engine, "node engine")
         location = str(self.location or "").strip()
         if not node_id:
             raise PipelineNodeContractError("node_id is required")
         if not kind:
             raise PipelineNodeContractError("node kind is required")
-        if not engine:
-            raise PipelineNodeContractError("node engine is required")
         if not location:
             raise PipelineNodeContractError("node location is required")
         handoff_at = (
@@ -541,14 +551,16 @@ def pipeline_layout_from_relay_handoff(
     total_layers = _non_negative_int(getattr(upstream, "n_layer", 0), "n_layer")
     cut = _non_negative_int(cut_layer, "cut_layer")
     default_capacity = PipelineNodeCapacity(capacity_bytes=0)
-    cross_engine = str(upstream.engine) != str(downstream.engine)
+    upstream_engine = _canonical_engine(upstream.engine, "upstream engine")
+    downstream_engine = _canonical_engine(downstream.engine, "downstream engine")
+    cross_engine = upstream_engine != downstream_engine
     downstream_federated = downstream_location != "local"
     nodes = [
         PipelineNode(
             node_id=upstream_node_id,
             kind="local" if upstream_location == "local" else "remote_rpc",
             layer_range=(0, cut),
-            engine=str(upstream.engine),
+            engine=upstream_engine,
             location=upstream_location,
             capacity=upstream_capacity or default_capacity,
             artifact=PipelineArtifactRef(
@@ -571,7 +583,7 @@ def pipeline_layout_from_relay_handoff(
                 else "local"
             ),
             layer_range=(cut, total_layers),
-            engine=str(downstream.engine),
+            engine=downstream_engine,
             location=downstream_location,
             capacity=downstream_capacity or default_capacity,
             artifact=PipelineArtifactRef(
@@ -662,7 +674,9 @@ def pipeline_node_from_rpc_lease(
         node_id=str(getattr(lease, "worker_id", "") or ""),
         kind="remote_rpc",
         layer_range=assigned_range,
-        engine=str(allocation.get("engine") or "llama.cpp"),
+        engine=_canonical_engine(
+            allocation.get("engine") or "llama.cpp", "allocation.engine",
+        ),
         location=location or str(allocation.get("location") or "remote"),
         capacity=capacity or PipelineNodeCapacity(capacity_bytes=0),
         artifact=artifact_value,

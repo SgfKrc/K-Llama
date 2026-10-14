@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from . import __contract_version__, __version__
+
 try:
     from multimodal import validate_image_data_urls
 except ImportError:  # package import: src.inference_service.protocol
@@ -22,7 +24,8 @@ class HealthResponse(BaseModel):
 
     status: str = "ok"
     service: str = "inference-svc"
-    version: str = "0.1.0"
+    version: str = __version__
+    contract_version: str = __contract_version__
 
 
 class ReadyResponse(BaseModel):
@@ -90,7 +93,7 @@ class ChatRequest(BaseModel):
     streaming_mode: str = Field(
         default="full",
         pattern="^(full|fast|interactive)$",
-        description="full=完整功能（历史/追问/持久化）| fast=真流式逐 token（跳过持久化）| interactive=真流式逐 token + 完成时事务提交（T9 契约）",
+        description="full=完整功能 | fast=真流式逐 token | interactive=真流式逐 token + T9 事件契约；三者共用历史、裁剪和完成时事务提交",
     )
     routing_preference: Literal[
         "auto", "local_only", "distributed_preferred", "distributed_required"

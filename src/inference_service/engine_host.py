@@ -16,6 +16,7 @@ scheduler 流水线段（_run_pipeline 等）复制为本宿主方法，源文�
   - 辅助纯函数：_format_model_response / _parse_thinking_response /
     _strip_native_thinking_tags（api_server.py:904-1088 复制，零改动）
 """
+import inspect
 import json
 import logging
 import re
@@ -25,13 +26,67 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import local_store as _local_store
+from api_errors import coded_http_error
+from chat_context import (
+    ConversationContextConflict,
+    ConversationContextService,
+    PreparedChatContext,
+    TurnPersistenceResult,
+)
 from koakuma_engine import (
     Capability,
     backend_id_for,
     registered_backends,
     runtime_supports,
 )
+from model_load_resolver import (
+    LAYER_RANGE_DYNAMIC,
+    LAYER_RANGE_PRECUT_ARTIFACT,
+    ModelLoadFacts,
+    ModelLoadResolution,
+    ModelLoadResolutionError,
+    effective_pytorch_cuda_available,
+    preferred_engine_for_artifacts,
+    resolve_model_load,
+)
 from multimodal import materialize_image_data_url
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    DeadlineCancelEvent,
+    RequestDeadline,
+    RequestDeadlineExceeded,
+    coerce_request_deadline,
+    hold_lock_until_deadline,
+    request_stop_reason,
+)
+from request_outcome import (
+    REASON_GENERATION_CANCELLED,
+    REASON_REQUEST_REFUSED,
+)
+
+
+def _call_with_optional_request_deadline(
+    callback,
+    *args,
+    request_deadline: Optional[RequestDeadline],
+):
+    """Call an override while keeping pre-deadline test/plugin signatures valid."""
+
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    deadline_parameter = parameters.get("request_deadline")
+    if deadline_parameter is not None:
+        if deadline_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return callback(*args, request_deadline)
+        return callback(*args, request_deadline=request_deadline)
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return callback(*args, request_deadline=request_deadline)
+    return callback(*args)
 
 
 # ---- 复制自 api_server.py:887-904（常量，保真不变） ----
@@ -508,6 +563,7 @@ class EngineHost:
 
     def __init__(self):
         # 延迟 import：保持模块顶层轻量（config 69ms 可接受，model_module 不在此触发）
+        import config as runtime_config
         from model_host import ModelHost
 
         self._host: ModelHost = ModelHost()
@@ -516,6 +572,18 @@ class EngineHost:
         # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
         #   由它自理；这里只负责按 env 配置创建一次并复用（重载 500MB GGUF 代价高）。
         self._layer_upstream: Any = None
+        self._worker_runtime_lock = threading.RLock()
+        self._worker_runtime_managed = False
+        self._worker_runtime_active = None
+        self._worker_runtime_candidate = None
+        self._worker_runtime_previous = None
+        self._worker_runtime_identity = None
+        self._worker_runtime_phase = "idle"
+        # A filtered manager follows current.json; KV is per workflow/sequence.
+        self._supplied_layer_manager: Any = None
+        self._supplied_layer_key: Any = None
+        self._supplied_layer_workflow: Any = None
+        self._supplied_layer_caches: dict = {}
         self._gen_lock = threading.RLock()
         self._generations: Dict[str, threading.Event] = {}
         # 1.2c 宿主适配状态（api_server 全局 → 实例属性）
@@ -531,14 +599,20 @@ class EngineHost:
         self._serving_node_id = ""
         self._distributed_enabled = False
         # 1.2c 会话管理状态（api_server 全局 → 实例属性）
+        self._chat_context = ConversationContextService(
+            load_history=self._load_conversation_history,
+            persist_turn=self._persist_conversation_turn,
+        )
         self._active_session_id: Optional[str] = None
-        self._session_histories: Dict[str, list] = {}
+        self._session_histories: Dict[str, list] = self._chat_context.histories
         self._kv_cache: Any = None  # PagedKVCache 单例（惰性，_init_kv_cache）
         self._device_profile: Optional[dict] = None  # 惰性探测（_ensure_device_profile）
         self._device_profile_started = False
         # 1.4 注入：scheduler-svc 客户端接口（None = 单机基线：分布式/流水线禁用）
         self._scheduler: Any = None
-        self._run_mode: str = "standalone"  # 对齐 api_server.RUN_MODE
+        self._run_mode: str = str(
+            getattr(runtime_config, "RUN_MODE", "standalone") or "standalone"
+        ).strip().lower()
         self._on_task_error = None  # 1.4 注入：任务失败回调
         self.role: str = "master"  # master / client（1.3 角色感知，1.5 peer 使用）
         # 1.2d task_graph 状态（api_server 全局 → 实例属性，惰性创建）
@@ -573,18 +647,307 @@ class EngineHost:
         user_message: str,
         assistant_message: str,
         metrics: Optional[dict] = None,
-    ) -> bool:
+    ) -> TurnPersistenceResult:
         try:
             if not _local_store.get_local_save_history():
-                return False
-            _local_store.save_local_conversation_turn(
-                session_id, user_message, assistant_message, metrics,
+                return TurnPersistenceResult.SKIPPED
+            operation_id = _request_id_ctx.get("")
+            committed = _local_store.save_local_conversation_turn(
+                session_id,
+                user_message,
+                assistant_message,
+                metrics,
+                operation_id=(
+                    operation_id
+                    if operation_id and operation_id != "-"
+                    else None
+                ),
             )
+        except ValueError:
+            raise
         except Exception as exc:
             logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
+            raise RuntimeError("SQLite 对话提交失败") from exc
+
+        return (
+            TurnPersistenceResult.COMMITTED
+            if committed
+            else TurnPersistenceResult.REPLAY
+        )
+
+    def _load_conversation_history(self, session_id: str) -> list[dict]:
+        try:
+            rows = _local_store.load_local_conversation(session_id)
+        except Exception:
+            logger.error(
+                "SQLite 会话历史加载失败: session=%s",
+                session_id,
+                exc_info=True,
+            )
+            raise
+        return [
+            {"role": row["role"], "content": row["content"]}
+            for row in rows
+        ]
+
+    def _sync_chat_context_facade(self) -> None:
+        self._chat_context.adopt_facade_state(
+            self._active_session_id, self._session_histories,
+        )
+
+    def _publish_chat_context_facade(self) -> None:
+        self._active_session_id = self._chat_context.active_session_id
+        self._session_histories = self._chat_context.histories
+
+    def _prepare_chat_context(
+        self,
+        requested_session_id: Optional[str],
+        first_message: Optional[str] = None,
+        *,
+        force_reload: bool = False,
+    ) -> PreparedChatContext:
+        self._sync_chat_context_facade()
+        prepared = self._chat_context.prepare(
+            requested_session_id, force_reload=force_reload,
+        )
+        self._publish_chat_context_facade()
+        if prepared.session_changed or prepared.reloaded:
+            if self._kv_cache:
+                self._kv_cache.clear()
+            if backend_id_for(self._host) == "pytorch":
+                self._init_kv_cache()
+            else:
+                self._kv_cache = None
+        if first_message and not prepared.history:
+            self._auto_title_session(prepared.session_id, first_message)
+        return prepared
+
+    def _commit_chat_context_turn(
+        self,
+        session_id: Optional[str],
+        user_message: str,
+        assistant_message: str,
+        metrics: Optional[dict] = None,
+        *,
+        expected_revision: Optional[int] = None,
+        operation_id: Optional[str] = None,
+    ) -> bool:
+        self._sync_chat_context_facade()
+        resolved_operation_id = operation_id or _request_id_ctx.get("")
+        request_token = None
+        if operation_id:
+            request_token = _request_id_ctx.set(operation_id)
+        try:
+            persisted = self._chat_context.commit_turn(
+                session_id,
+                user_message,
+                assistant_message,
+                metrics,
+                operation_id=(
+                    resolved_operation_id
+                    if resolved_operation_id and resolved_operation_id != "-"
+                    else None
+                ),
+                expected_revision=expected_revision,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ConversationContextConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        finally:
+            if request_token is not None:
+                _request_id_ctx.reset(request_token)
+        self._publish_chat_context_facade()
+        return persisted
+
+    def chat_full_with_operation_id(
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event],
+        operation_id: str,
+        request_deadline: Optional[RequestDeadline] = None,
+    ) -> Dict[str, Any]:
+        """Run one complete chat transaction with an explicit HTTP identity."""
+
+        with self._chat_context.transaction(deadline=request_deadline):
+            with hold_lock_until_deadline(
+                self._model_lifecycle_lock(),
+                request_deadline,
+                operation="full chat execution lock",
+            ):
+                token = _request_id_ctx.set(operation_id or "-")
+                try:
+                    return _call_with_optional_request_deadline(
+                        self.chat_full,
+                        req,
+                        cancel_event,
+                        request_deadline=request_deadline,
+                    )
+                finally:
+                    _request_id_ctx.reset(token)
+
+    def chat_stream_events_with_operation_id(
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event],
+        operation_id: str,
+        request_deadline: Optional[RequestDeadline] = None,
+    ):
+        """Bound stream consumption while the producer retains model ownership.
+
+        A backend iterator can block inside ``next()`` and ignore cooperative
+        cancellation.  The caller must still observe the request deadline, but
+        the conversation/model locks must not be released until that backend
+        actually exits.  A dedicated owner thread therefore holds both locks;
+        this generator only consumes its bounded queue.
+        """
+
+        import queue
+        import time as _time
+
+        stream_cancel_event = cancel_event
+        if not isinstance(stream_cancel_event, DeadlineCancelEvent):
+            stream_cancel_event = DeadlineCancelEvent(
+                stream_cancel_event, request_deadline,
+            )
+        events: queue.Queue = queue.Queue(maxsize=1)
+        consumer_done = threading.Event()
+        demand = threading.Semaphore(0)
+        producer_done = object()
+
+        def put_event(item) -> bool:
+            while not consumer_done.is_set():
+                try:
+                    events.put(item, timeout=0.05)
+                    return True
+                except queue.Full:
+                    pass
             return False
 
-        return True
+        def produce() -> None:
+            try:
+                with self._chat_context.transaction(deadline=request_deadline):
+                    with hold_lock_until_deadline(
+                        self._model_lifecycle_lock(),
+                        request_deadline,
+                        operation="full chat execution lock",
+                    ):
+                        token = _request_id_ctx.set(operation_id or "-")
+                        try:
+                            iterable = _call_with_optional_request_deadline(
+                                self.chat_stream_events,
+                                req,
+                                stream_cancel_event,
+                                request_deadline=request_deadline,
+                            )
+                            iterator = iter(iterable)
+                            while True:
+                                demand.acquire()
+                                if consumer_done.is_set():
+                                    return
+                                try:
+                                    event = next(iterator)
+                                except StopIteration:
+                                    break
+                                if not put_event((event, None)):
+                                    return
+                        finally:
+                            _request_id_ctx.reset(token)
+            except Exception as exc:
+                put_event((None, exc))
+            finally:
+                put_event((producer_done, None))
+
+        threading.Thread(
+            target=produce,
+            name="inference-svc-stream-owner",
+            daemon=True,
+        ).start()
+
+        completed_normally = False
+        cancel_grace_deadline = None
+        demand_outstanding = False
+        try:
+            while True:
+                stop_reason = request_stop_reason(
+                    stream_cancel_event, request_deadline,
+                )
+                if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                    yield {
+                        "done": True,
+                        "error": "request deadline exceeded",
+                        "reason_code": REQUEST_DEADLINE_EXCEEDED,
+                    }
+                    return
+                if stop_reason:
+                    if cancel_grace_deadline is None:
+                        cancel_grace_deadline = _time.monotonic() + 0.25
+                    elif _time.monotonic() >= cancel_grace_deadline:
+                        yield {
+                            "done": True,
+                            "error": "generation cancelled",
+                            "cancelled": True,
+                            "reason_code": REASON_GENERATION_CANCELLED,
+                        }
+                        return
+                wait_timeout = 0.1
+                if cancel_grace_deadline is not None:
+                    wait_timeout = min(
+                        wait_timeout,
+                        max(0.001, cancel_grace_deadline - _time.monotonic()),
+                    )
+                if not demand_outstanding:
+                    demand.release()
+                    demand_outstanding = True
+                if request_deadline is not None:
+                    remaining = request_deadline.remaining()
+                    if remaining <= 0:
+                        continue
+                    wait_timeout = min(wait_timeout, remaining)
+                try:
+                    event, error = events.get(timeout=wait_timeout)
+                except queue.Empty:
+                    continue
+                demand_outstanding = False
+                if event is producer_done:
+                    completed_normally = True
+                    return
+                if error is not None:
+                    raise error
+                yield event
+        finally:
+            consumer_done.set()
+            demand.release()
+            if not completed_normally:
+                stream_cancel_event.set()
+
+    def commit_stream_event(
+        self,
+        req: ChatRequest,
+        event: dict,
+        cancel_event: Optional[threading.Event],
+        operation_id: str,
+    ) -> bool:
+        """Commit only after the ASGI consumer accepts a terminal done event."""
+
+        context_session_id = event.pop("_context_session_id", None)
+        context_revision = event.pop("_context_revision", None)
+        if context_session_id is None or context_revision is None:
+            return bool(event.get("history_committed", False))
+        _raise_if_generation_cancelled(cancel_event, req.generation_id)
+        response_text = str(event.get("response") or "")
+        if not response_text:
+            return False
+        committed = self._commit_chat_context_turn(
+            context_session_id,
+            req.message,
+            response_text,
+            event.get("metrics") if isinstance(event.get("metrics"), dict) else {},
+            expected_revision=int(context_revision),
+            operation_id=operation_id,
+        )
+        self._conversation_stats["rounds"] += 1
+        return committed
 
     def select_engine(self, profile=None) -> str:
         return self._host.select_engine(profile)
@@ -595,6 +958,8 @@ class EngineHost:
         quant_type: Optional[str] = None,
         use_compile: bool = False,
         model_id: Optional[str] = None,
+        model_path: Optional[str] = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> Dict[str, Any]:
         # use_compile 走进程内 config 全局开关（对齐 api_server.py:2236
         # cfg.USE_COMPILE = req.use_compile）；ModelManager.load_model 签名
@@ -603,10 +968,14 @@ class EngineHost:
             import config as _cfg
 
             _cfg.USE_COMPILE = bool(use_compile)
+            self.release_worker_runtime()
             result = self._host.load_model(
                 engine=engine,
                 quant_type=quant_type,
                 model_id=model_id,
+                model_path=model_path,
+                profile=self._ensure_device_profile(),
+                resolution=resolution,
             )
             # 对齐 api_server.py:2264-2265：load 成功后显式置位运行时状态
             # （ModelHost.model_loaded 不自更新；2026-08-05 真实加载复测暴露
@@ -617,19 +986,37 @@ class EngineHost:
             self._host.current_quant = (
                 getattr(self._host, "quant_type", None) or quant_type or "int4"
             )
+            self._reset_runtime_conversation_state(clear_histories=True)
             return result if isinstance(result, dict) else {"success": True, "data": result}
 
     def unload_model(self) -> Dict[str, Any]:
         with self._model_lifecycle_lock():
+            self.release_worker_runtime()
             if self._llm_is_loaded():
                 self._host.unload_model()
             self._layers.clear()
             self._host.model_loaded = False
+            self._reset_runtime_conversation_state(clear_histories=True)
             return {"success": True, "message": "模型已卸载"}
 
-    def switch_model(self, model_id: str, engine: Optional[str] = None) -> Dict[str, Any]:
+    def switch_model(
+        self,
+        model_id: str,
+        engine: Optional[str] = None,
+        quant_type: Optional[str] = None,
+        model_path: Optional[str] = None,
+        resolution: ModelLoadResolution | None = None,
+    ) -> Dict[str, Any]:
         with self._model_lifecycle_lock():
-            result = self._host.switch_model(model_id=model_id, engine=engine)
+            self.release_worker_runtime()
+            result = self._host.switch_model(
+                model_id=model_id,
+                engine=engine,
+                quant_type=quant_type,
+                model_path=model_path,
+                profile=self._ensure_device_profile(),
+                resolution=resolution,
+            )
             # 对齐 api_server.py:5146-5147：切换成功置位运行时状态
             # （api_server 在 result['success'] 分支设置）
             if isinstance(result, dict) and result.get("success"):
@@ -639,10 +1026,16 @@ class EngineHost:
                     or result.get("quant_type")
                     or getattr(self._host, "current_quant", "int4")
                 )
+                self._reset_runtime_conversation_state(clear_histories=True)
             return result if isinstance(result, dict) else {"success": True, "data": result}
 
     def close(self) -> None:
-        return None
+        with self._model_lifecycle_lock():
+            self.release_worker_runtime()
+        coordinator = self._task_graph_coordinator
+        self._task_graph_coordinator = None
+        if coordinator is not None:
+            coordinator.close()
 
     def current_model(self) -> Dict[str, Any]:
         """当前模型信息（/v1/models/current，对齐 api_server.py:2188-2207 完整字段）。"""
@@ -881,12 +1274,16 @@ class EngineHost:
         unavailable_reason = file_status["unavailable_reason"]
         if file_status["is_available"] and not supported_engines:
             unavailable_reason = "模型文件已存在，但当前设备缺少可用推理后端。"
-        if "pytorch" in supported_engines:
-            preferred_engine = "pytorch"
-        elif "llama_cpp" in supported_engines:
-            preferred_engine = "llama_cpp"
-        else:
-            preferred_engine = "auto"
+        from torch_runtime import cuda_available
+
+        preferred_engine = preferred_engine_for_artifacts(
+            has_safetensors=bool(file_status["has_safetensors"]),
+            has_gguf=bool(file_status["has_gguf"]),
+            cuda_available=effective_pytorch_cuda_available(
+                system_cuda_available=cuda_available(load=True),
+                profile=self._ensure_device_profile(),
+            ),
+        )
         default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
         return {
             "model_id": model.model_id,
@@ -922,7 +1319,18 @@ class EngineHost:
     # 层段接口（client 角色；master 角色本地层段同用）
     # ------------------------------------------------------------------
     def load_layer_range(
-        self, layer_range: str, embed: bool = False, lm_head: bool = False
+        self,
+        layer_range: str,
+        embed: bool = False,
+        lm_head: bool = False,
+        *,
+        model_id: str | None = None,
+        model_path: str | None = None,
+        quant_type: str | None = None,
+        engine: str | None = None,
+        layer_range_mode: str | None = None,
+        model_sha256: str | None = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> Dict[str, Any]:
         """加载层段。layer_range 形如 "0-12"（[start, end)，对齐
         ModelManager.load_layer_range(start_layer, end_layer,
@@ -932,15 +1340,65 @@ class EngineHost:
             start_layer, end_layer = int(start_str), int(end_str)
         except (ValueError, AttributeError):
             raise ValueError(f"非法 layer_range: {layer_range!r}（期望如 '0-12'）")
-        result = self._host.load_layer_range(
-            start_layer=start_layer,
-            end_layer=end_layer,
-            has_embedding=embed,
-            has_lm_head=lm_head,
-        )
-        if layer_range not in self._layers:
-            self._layers.append(layer_range)
-        return result if isinstance(result, dict) else {"success": True, "layer_range": layer_range}
+        if resolution is not None:
+            model_id = resolution.model_id
+            model_path = resolution.model_path
+            quant_type = resolution.quant_type
+            engine = resolution.engine
+            layer_range_mode = resolution.layer_range_mode
+
+        with self._model_lifecycle_lock():
+            if layer_range_mode not in {
+                None, LAYER_RANGE_DYNAMIC, LAYER_RANGE_PRECUT_ARTIFACT,
+            }:
+                raise ValueError(
+                    f"引擎 {engine or 'unknown'} 不支持层段模式 {layer_range_mode!r}"
+                )
+            transaction_id = f"layer_{uuid4().hex}"
+            candidate_prepared = False
+            try:
+                self._host.prepare_pipeline_candidate(
+                    transaction_id,
+                    model_id=model_id or "",
+                    model_path=model_path or "",
+                    quant_type=quant_type,
+                    layer_range=(start_layer, end_layer),
+                    model_sha256=model_sha256,
+                )
+                candidate_prepared = True
+                result = self._host.materialize_pipeline_candidate(
+                    transaction_id,
+                    start_layer=start_layer,
+                    end_layer=end_layer,
+                    has_embedding=embed,
+                    has_lm_head=lm_head,
+                    model_id=model_id,
+                )
+                self._host.commit_pipeline_candidate(transaction_id)
+                self._host.finalize_pipeline_candidate(transaction_id)
+            except Exception:
+                if candidate_prepared:
+                    try:
+                        self._host.abort_pipeline_candidate(transaction_id)
+                    except Exception:
+                        logger.warning(
+                            "层段候选事务回滚失败: transaction=%s",
+                            transaction_id,
+                            exc_info=True,
+                        )
+                raise
+            self._host.model_loaded = False
+            if quant_type:
+                self._host.current_quant = quant_type
+            if layer_range not in self._layers:
+                self._layers.append(layer_range)
+            return result if isinstance(result, dict) else {
+                "success": True,
+                "engine": engine,
+                "model_id": model_id,
+                "quant_type": quant_type,
+                "layer_range": layer_range,
+            }
 
     def unload_layer_range(self, layer_range: str) -> Dict[str, Any]:
         if layer_range in self._layers:
@@ -1078,7 +1536,10 @@ class EngineHost:
     # RUN_MODE → self._run_mode）
     # ------------------------------------------------------------------
     def chat_full(
-        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """
         执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
@@ -1095,10 +1556,26 @@ class EngineHost:
         """
         import time as _time
         from fastapi import HTTPException
+        import config as _cfg
+
+        request_deadline = coerce_request_deadline(
+            request_deadline,
+            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
+        )
+        request_deadline.require_remaining()
 
         # ---- task_graph 分支（1.2d：对齐 api_server._execute_requested_chat）----
         if req.execution_mode == "task_graph":
-            return self.execute_task_graph_chat(req, cancel_event)
+            try:
+                return self.execute_task_graph_chat(
+                    req,
+                    cancel_event,
+                    request_deadline=request_deadline,
+                )
+            except TypeError as exc:
+                if "request_deadline" not in str(exc):
+                    raise
+                return self.execute_task_graph_chat(req, cancel_event)
 
         # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
         routing_gate = self._routing_gate_error(req)
@@ -1109,14 +1586,10 @@ class EngineHost:
         _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
         # ---- 多会话支持 ----
-        target_session_id = req.session_id or self._active_session_id
-        if target_session_id and target_session_id != self._active_session_id:
-            self._switch_session(target_session_id)
-
-        # ---- 首条消息自动生成标题 ----
-        history = self._get_active_history()
-        if target_session_id and len(history) == 0:
-            self._auto_title_session(target_session_id, req.message)
+        prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        request_deadline.require_remaining()
+        target_session_id = prepared_context.session_id
+        history = prepared_context.history
 
         # ---- 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）----
         external_fallback_reason = ""
@@ -1143,9 +1616,15 @@ class EngineHost:
         if _ext_decision.use_external:
             try:
                 return self.execute_external_chat(
-                    req, history, target_session_id, cancel_event,
+                    req,
+                    history,
+                    target_session_id,
+                    cancel_event,
+                    context_revision=prepared_context.revision,
                 )
             except ChatGenerationCancelled:
+                raise
+            except HTTPException:
                 raise
             except Exception as exc:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -1197,12 +1676,17 @@ class EngineHost:
                     messages=list(history) + [{"role": "user", "content": req.message}],
                     request_id=_request_id_ctx.get("-"),
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if result.get("reason_code") == REQUEST_DEADLINE_EXCEEDED:
+                    raise coded_http_error(
+                        504,
+                        REQUEST_DEADLINE_EXCEEDED,
+                        result.get("error") or "request deadline exceeded",
+                    )
                 if result.get("status") == "ok":
-                    history.append({"role": "user", "content": req.message})
                     response_text = result.get("content", "")
-                    history.append({"role": "assistant", "content": response_text})
                     forward_metrics = _augment_chat_metrics(
                         result.get("metrics", {}),
                         req,
@@ -1218,9 +1702,15 @@ class EngineHost:
                         forward_metrics["fallback"] = True
                         forward_metrics["fallback_reason"] = external_fallback_reason
 
-                    db_session_id = target_session_id or "default"
-                    self._persist_conversation_turn(
-                        db_session_id, req.message, response_text, forward_metrics,
+                    self._enforce_distributed_required(
+                        req,
+                        forward_metrics,
+                        detail="从节点转发结果未标记为分布式执行",
+                    )
+
+                    self._commit_chat_context_turn(
+                        target_session_id, req.message, response_text, forward_metrics,
+                        expected_revision=prepared_context.revision,
                     )
 
                     self._conversation_stats["rounds"] += 1
@@ -1251,9 +1741,12 @@ class EngineHost:
                     )
             except ChatGenerationCancelled:
                 raise
+            except HTTPException:
+                raise
             except Exception as e:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
+                self._enforce_distributed_required(req, detail=str(e))
 
             if self._pipeline_worker_is_reserved():
                 raise HTTPException(
@@ -1290,9 +1783,20 @@ class EngineHost:
                     _require_distributed=(req.routing_preference == "distributed_required"),
                     _force_distributed_assignment=True,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 if pipeline_result.get("error"):
+                    if (
+                        pipeline_result.get("reason_code")
+                        == REQUEST_DEADLINE_EXCEEDED
+                    ):
+                        raise coded_http_error(
+                            504,
+                            REQUEST_DEADLINE_EXCEEDED,
+                            pipeline_result.get("error")
+                            or "request deadline exceeded",
+                        )
                     pipeline_failure_reason = str(pipeline_result["error"])
                     logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
                     self._enforce_distributed_required(
@@ -1302,11 +1806,10 @@ class EngineHost:
                     response_text = pipeline_result.get("response", "")
                     if not response_text:
                         logger.warning("流水线返回空响应，回退到本地推理")
+                        self._enforce_distributed_required(
+                            req, detail="流水线返回空响应",
+                        )
                     else:
-                        history.append({"role": "user", "content": req.message})
-                        history.append({"role": "assistant", "content": response_text})
-
-                        db_session_id = target_session_id or "default"
                         pipeline_metrics = _augment_chat_metrics(
                             pipeline_result.get("metrics", {}),
                             req,
@@ -1328,8 +1831,9 @@ class EngineHost:
                             pipeline_metrics,
                             detail="流水线结果未标记为分布式执行",
                         )
-                        self._persist_conversation_turn(
-                            db_session_id, req.message, response_text, pipeline_metrics,
+                        self._commit_chat_context_turn(
+                            target_session_id, req.message, response_text, pipeline_metrics,
+                            expected_revision=prepared_context.revision,
                         )
 
                         self._conversation_stats["rounds"] += 1
@@ -1351,11 +1855,26 @@ class EngineHost:
                         }
             except ChatGenerationCancelled:
                 raise
+            except HTTPException:
+                raise
             except Exception as e:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 pipeline_failure_reason = str(e)
                 logger.warning(f"流水线推理异常: {e}，回退到本地推理")
                 self._enforce_distributed_required(req, detail=str(e))
+
+        if req.routing_preference == "distributed_required":
+            raise HTTPException(
+                503,
+                "distributed_required 执行失败：当前引擎未完成分布式流水线",
+            )
+
+        if self._pipeline_model_is_prepared() and not pipeline_attempted:
+            raise HTTPException(
+                409 if req.routing_preference == "local_only" else 503,
+                "当前模型仅以分布式流水线模式准备，禁止作为本地完整模型执行；"
+                "请等待流水线就绪或显式加载完整模型。",
+            )
 
         model_manager = self._host
         # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
@@ -1445,20 +1964,16 @@ class EngineHost:
                     distributed_enabled=distributed_enabled,
                 )
 
-                db_session_id = target_session_id or "default"
                 followups = self.generate_followups_llama(
                     completed_history, cancel_event,
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
-                history.extend([
-                    {"role": "user", "content": req.message},
-                    {"role": "assistant", "content": response_text},
-                ])
 
                 save_metrics = dict(metrics)
                 save_metrics["followups"] = followups
-                self._persist_conversation_turn(
-                    db_session_id, req.message, response_text, save_metrics,
+                self._commit_chat_context_turn(
+                    target_session_id, req.message, response_text, save_metrics,
+                    expected_revision=prepared_context.revision,
                 )
 
                 self._conversation_stats["total_generated_tokens"] += completion_tokens
@@ -1472,6 +1987,8 @@ class EngineHost:
                     "followups": followups,
                 }
             except ChatGenerationCancelled:
+                raise
+            except HTTPException:
                 raise
             except Exception as e:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -1605,8 +2122,6 @@ class EngineHost:
                 ),
             )
 
-            db_session_id = target_session_id or "default"
-
             followups = self._generate_followups(
                 completed_history,
                 tokenizer,
@@ -1615,15 +2130,12 @@ class EngineHost:
                 cancel_event,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            history.extend([
-                {"role": "user", "content": req.message},
-                {"role": "assistant", "content": response_text},
-            ])
 
             save_metrics = dict(metrics)
             save_metrics["followups"] = followups
-            self._persist_conversation_turn(
-                db_session_id, req.message, response_text, save_metrics,
+            self._commit_chat_context_turn(
+                target_session_id, req.message, response_text, save_metrics,
+                expected_revision=prepared_context.revision,
             )
 
             self._conversation_stats["total_prompt_tokens"] += prompt_len
@@ -1644,6 +2156,12 @@ class EngineHost:
             }
 
         except ChatGenerationCancelled:
+            raise
+        except RequestDeadlineExceeded as exc:
+            raise coded_http_error(
+                504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+            ) from exc
+        except HTTPException:
             raise
         except _torch.cuda.OutOfMemoryError:
             self._record_task_error()
@@ -1673,26 +2191,100 @@ class EngineHost:
             except Exception:
                 pass
 
-    def chat_stream_events(self, req: ChatRequest, cancel_event: Optional[threading.Event]):
+    def chat_stream_events(
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event],
+        request_deadline: Optional[RequestDeadline] = None,
+    ):
         """SSE 事件序列（1.1 薄实现；1.2 替换为 fast 模式副本）。
 
         Yields:
             dict 事件：{"token": ...} 或 {"done": True, "response": ..., "metrics": ...}
         """
+        import config as _cfg
+
+        request_deadline = coerce_request_deadline(
+            request_deadline,
+            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
+        )
+        if not isinstance(cancel_event, DeadlineCancelEvent):
+            cancel_event = DeadlineCancelEvent(
+                cancel_event, request_deadline,
+            )
+        request_deadline.require_remaining()
+        self._enforce_distributed_required(
+            req, detail="inference-service interactive 仅实现本地流式执行",
+        )
         if getattr(req, "image_data_urls", []):
             raise RuntimeError("图像请求仅支持 full 响应模式，禁止忽略图片后执行文本流式推理")
-        messages = [{"role": "user", "content": req.message}]
-        chunks = self._host.chat_stream(
-            messages=messages,
-            max_tokens=req.max_new_tokens,
-            temperature=req.temperature,
-            top_p=req.top_p,
-        )
+        prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        request_deadline.require_remaining()
+        messages = [
+            *prepared_context.history,
+            {"role": "user", "content": req.message},
+        ]
+        response_parts: list[str] = []
+        try:
+            chunks = self._host.chat_stream(
+                messages=messages,
+                max_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                _cancel_event=cancel_event,
+            )
+        except TypeError as exc:
+            if "_cancel_event" not in str(exc):
+                raise
+            chunks = self._host.chat_stream(
+                messages=messages,
+                max_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+            )
         for chunk in chunks:
-            if cancel_event is not None and cancel_event.is_set():
-                break
+            stop_reason = request_stop_reason(
+                cancel_event, request_deadline,
+            )
+            if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                yield {
+                    "done": True,
+                    "error": "request deadline exceeded",
+                    "reason_code": REQUEST_DEADLINE_EXCEEDED,
+                }
+                return
+            if stop_reason:
+                raise ChatGenerationCancelled(req.generation_id or "gen_unknown")
+            response_parts.append(str(chunk))
             yield {"token": chunk}
-        yield {"done": True, "response": "", "followups": [], "metrics": {}, "request_id": "-"}
+        if request_deadline.expired():
+            yield {
+                "done": True,
+                "error": "request deadline exceeded",
+                "reason_code": REQUEST_DEADLINE_EXCEEDED,
+            }
+            return
+        _raise_if_generation_cancelled(cancel_event, req.generation_id)
+        response_text = "".join(response_parts)
+        metrics = {
+            "engine": backend_id_for(self._host) or "unknown",
+            "execution_mode": "streaming",
+            "request_id": _request_id_ctx.get("-"),
+        }
+        yield {
+            "done": True,
+            "response": response_text,
+            "followups": [],
+            "metrics": metrics,
+            "request_id": "-",
+            "session_id": prepared_context.session_id,
+            "history_committed": False,
+            # Private handoff consumed by routes.py before SSE serialization.
+            # The producer thread must never commit before the client-side
+            # consumer accepts this terminal event.
+            "_context_session_id": prepared_context.session_id,
+            "_context_revision": prepared_context.revision,
+        }
 
     def speculative_run(self, req) -> Dict[str, Any]:
         """投机解码实验端点（1.2b 复制自 api_server._run_speculative_experiment
@@ -1802,6 +2394,12 @@ class EngineHost:
         from task_graph import DEPENDENCY_FAILURES_KEY, TaskGraphError
         from task_provider import ProviderError, ProviderExecutionError
 
+        # Every public Route-A execution enters the committed prepare gate.
+        # The internal helper remains usable for legacy native unit fixtures.
+        if stage_request.stage_type == "layer_forward":
+            with self._worker_layer_lock():
+                self._check_worker_runtime_stage(stage_request, required=True)
+                return self._execute_layer_forward_stage_locked(stage_request, provider_cancel_event)
         root_input = stage_request.root_input
         options = root_input.get("task_options", {})
         if not isinstance(options, dict):
@@ -1945,6 +2543,350 @@ class EngineHost:
     # v3 层段 Stage（`layer_forward`）—— PC 侧执行
     # ------------------------------------------------------------------
 
+    def _worker_layer_lock(self):
+        lock = getattr(self, "_worker_runtime_lock", None)
+        if lock is None:
+            lock = self._worker_runtime_lock = threading.RLock()
+        return lock
+
+    def fence_worker_runtime(self):
+        # Admission/disconnect must fence immediately, without waiting for a
+        # native forward or unload that holds the runtime lock.
+        event = getattr(self, "_worker_runtime_fenced", None)
+        if event is None:
+            event = self._worker_runtime_fenced = threading.Event()
+        event.set()
+
+    def _resume_worker_runtime(self):
+        event = getattr(self, "_worker_runtime_fenced", None)
+        if event is not None:
+            event.clear()
+
+    def _capture_worker_runtime(self):
+        from worker_prepare import LayerRuntime
+        active = getattr(self, "_worker_runtime_active", None)
+        if active is None:
+            active = LayerRuntime(None)
+        # Preserve ownership on partial close failures and exact KV rollback.
+        active.upstream = getattr(self, "_layer_upstream", None)
+        active.manager = getattr(self, "_supplied_layer_manager", None)
+        active.workflow = getattr(self, "_supplied_layer_workflow", None)
+        active.caches = getattr(self, "_supplied_layer_caches", {})
+        return active
+
+    def _install_worker_runtime(self, runtime):
+        self._worker_runtime_active = runtime
+        self._layer_upstream = runtime.upstream if runtime is not None else None
+        self._layer_upstream_model_path = (
+            str(runtime.upstream.model_path) if runtime is not None and runtime.upstream is not None else ""
+        )
+        self._supplied_layer_manager = runtime.manager if runtime is not None else None
+        self._supplied_layer_key = (
+            self._supplied_layer_selection_key(runtime.selected)
+            if runtime is not None and runtime.manager is not None else None
+        )
+        self._supplied_layer_workflow = runtime.workflow if runtime is not None else None
+        self._supplied_layer_caches = runtime.caches if runtime is not None else {}
+
+    def _owned_worker_runtimes(self):
+        items = (self._capture_worker_runtime(), getattr(self, "_worker_runtime_candidate", None),
+                 getattr(self, "_worker_runtime_previous", None),
+                 *getattr(self, "_worker_runtime_orphans", []))
+        result = []
+        for runtime in items:
+            if runtime is not None and runtime.owned and all(runtime is not old for old in result):
+                result.append(runtime)
+        return result
+
+    def worker_runtime_owned_identities(self):
+        from copy import deepcopy
+        with self._worker_layer_lock():
+            return [deepcopy(runtime.identity) for runtime in self._owned_worker_runtimes()
+                    if runtime.identity is not None]
+
+    def _retain_failed_worker_runtime(self, runtime):
+        with self._worker_layer_lock():
+            orphans = getattr(self, "_worker_runtime_orphans", None)
+            if orphans is None:
+                orphans = self._worker_runtime_orphans = []
+            if all(runtime is not old for old in orphans):
+                orphans.append(runtime)
+
+    def _build_supplied_layer_manager(self, selected, provider_cancel_event, runtime_owner=None):
+        from worker_prepare_contract import WorkerPrepareError
+        import config
+        from model_module import ModelManager
+        manifest = selected["manifest"]
+        start, end = manifest["layer_range"]
+        model_id = "supply-" + manifest["artifact_sha256"][:24]
+        manager = ModelManager()
+        if runtime_owner is not None:
+            runtime_owner.manager = manager
+        try:
+            if provider_cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            manager.prepare_pipeline_model(
+                model_id=model_id, model_path=selected["directory"],
+                quant_type=config.QUANT_TYPE, layer_range=(start, end),
+                model_sha256=manifest["artifact_sha256"],
+            )
+            if provider_cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            manager.load_layer_range(
+                start_layer=start, end_layer=end,
+                has_embedding=manifest.get("has_embedding", start == 0),
+                has_lm_head=manifest.get("has_lm_head", end == manifest["total_layers"]),
+                model_path=selected["directory"], quant_type=config.QUANT_TYPE,
+                total_layers=manifest["total_layers"], model_id=model_id,
+            )
+            if provider_cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            if tuple(manager.layer_range or ()) != (start, end) or not manager.is_loaded:
+                raise WorkerPrepareError("worker_prepare_layer_range_mismatch")
+            return manager
+        except Exception:
+            if runtime_owner is None:
+                from worker_prepare import LayerRuntime, close_layer_runtime
+                partial = LayerRuntime(None, selected, manager=manager)
+                try:
+                    close_layer_runtime(partial)
+                except Exception:
+                    self._retain_failed_worker_runtime(partial)
+                    raise
+            raise
+
+    def _build_worker_runtime(self, command, selected, cancel_event):
+        from copy import deepcopy
+        from worker_prepare import LayerRuntime, close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError
+        identity = command["identity"]
+        runtime = LayerRuntime(deepcopy(identity), deepcopy(selected))
+        try:
+            if cancel_event.is_set():
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            if identity["stage_model_identity"]["format"] == "safetensors":
+                runtime.manager = self._build_supplied_layer_manager(selected, cancel_event, runtime)
+            else:
+                from keep_head_shim import resolve_keep_head_shim
+                from llama_keep_head import KeepHeadUpstream
+                import numpy as np
+                shim = resolve_keep_head_shim()
+                if not shim:
+                    raise WorkerPrepareError("worker_prepare_shim_unavailable")
+                runtime.upstream = KeepHeadUpstream(
+                    shim, selected["model_path"], mode="nextn",
+                    n_ctx=command["context_size"], n_batch=min(command["context_size"], 2048),
+                    n_threads=8, n_seq_max=1,
+                )
+                upstream = runtime.upstream
+                if (not upstream.is_available or upstream.n_embd != identity["hidden_size"]
+                        or upstream.n_layer != identity["layer_range"][1] - identity["layer_range"][0]):
+                    raise WorkerPrepareError("worker_prepare_layer_range_mismatch")
+                if cancel_event.is_set():
+                    raise WorkerPrepareError("worker_prepare_cancelled")
+                # Probe the optional tail entry point in the child, then clear probe KV.
+                hidden = np.zeros((1, identity["hidden_size"]), dtype=np.float32)
+                if identity["segment_mode"] == "tail":
+                    token = upstream.forward_hidden_to_token(hidden, n_past=0)
+                    if type(token) is not int or token < 0:
+                        raise WorkerPrepareError("worker_prepare_probe_failed")
+                else:
+                    output = upstream.forward_hidden_to_hidden(hidden, n_past=0)
+                    if output.shape != hidden.shape or not np.isfinite(output).all():
+                        raise WorkerPrepareError("worker_prepare_probe_failed")
+                upstream.reset()
+            if cancel_event.is_set() or not runtime.loaded:
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            return runtime
+        except Exception as exc:
+            if runtime.upstream is None:
+                runtime.upstream = getattr(exc, "cleanup_owner", None)
+            try:
+                close_layer_runtime(runtime)
+            except Exception:
+                self._retain_failed_worker_runtime(runtime)
+                raise
+            raise
+
+    def prepare_worker_runtime(self, command, selected, cancel_event):
+        from copy import deepcopy
+        from worker_prepare_contract import WorkerPrepareError, validate_command
+        command = validate_command(command)
+        if command["action"] != "prepare":
+            raise WorkerPrepareError("invalid_prepare_action")
+        identity = command["identity"]
+        self.fence_worker_runtime()
+        with self._worker_layer_lock():
+            self._worker_runtime_managed = True
+            if getattr(self, "_worker_runtime_phase", "idle") == "committed" or getattr(self, "_worker_runtime_candidate", None) is not None:
+                raise WorkerPrepareError("worker_prepare_cleanup_pending")
+            self._worker_runtime_identity = deepcopy(identity)
+            self._worker_runtime_phase = "preparing"
+        try:
+            runtime = self._build_worker_runtime(command, selected, cancel_event)
+        except Exception:
+            with self._worker_layer_lock():
+                self._worker_runtime_phase = "failed"
+            raise
+        with self._worker_layer_lock():
+            self._worker_runtime_candidate = runtime
+            if cancel_event.is_set():
+                from worker_prepare import close_layer_runtime
+                close_layer_runtime(runtime)
+                self._worker_runtime_candidate = None
+                self._worker_runtime_phase = "failed"
+                raise WorkerPrepareError("worker_prepare_cancelled")
+            self._worker_runtime_candidate = runtime
+            self._worker_runtime_identity = deepcopy(identity)
+            self._worker_runtime_phase = "prepared"
+
+    def worker_runtime_loaded(self, identity=None):
+        with self._worker_layer_lock():
+            for runtime in (getattr(self, "_worker_runtime_candidate", None), getattr(self, "_worker_runtime_active", None)):
+                if runtime is not None and (identity is None or runtime.identity == identity) and runtime.loaded:
+                    return True
+            return False
+
+    def worker_runtime_ready(self, identity):
+        with self._worker_layer_lock():
+            fenced = getattr(self, "_worker_runtime_fenced", None)
+            active = getattr(self, "_worker_runtime_active", None)
+            return bool(active is not None and active.identity == identity and active.loaded
+                        and (fenced is None or not fenced.is_set())
+                        and getattr(self, "_worker_runtime_phase", "idle") in {"committed", "finalized", "aborted"})
+
+    def worker_runtime_present(self):
+        with self._worker_layer_lock():
+            return bool(self._owned_worker_runtimes()) or getattr(self, "_worker_runtime_phase", "idle") == "preparing"
+
+    def retire_previous_worker_runtime(self, identity):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError
+        with self._worker_layer_lock():
+            previous = getattr(self, "_worker_runtime_previous", None)
+            if previous is None or previous.identity != identity:
+                raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            close_layer_runtime(previous)
+            self._worker_runtime_previous = None
+
+    def commit_worker_runtime(self, identity):
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        identity = validate_identity(identity)
+        with self._worker_layer_lock():
+            if getattr(self, "_worker_runtime_identity", None) != identity:
+                raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            if self._worker_runtime_phase in {"committed", "finalized"}:
+                if not self.worker_runtime_loaded(identity):
+                    raise WorkerPrepareError("worker_prepare_runtime_unavailable")
+                return
+            runtime = getattr(self, "_worker_runtime_candidate", None)
+            if self._worker_runtime_phase != "prepared" or runtime is None or not runtime.loaded:
+                raise WorkerPrepareError("worker_prepare_not_prepared")
+            self._worker_runtime_previous = self._capture_worker_runtime()
+            self._install_worker_runtime(runtime)
+            self._worker_runtime_candidate = None
+            self._worker_runtime_phase = "committed"
+            self._resume_worker_runtime()
+
+    def abort_worker_runtime(self, identity, *, restore_previous=True):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        identity = validate_identity(identity)
+        with self._worker_layer_lock():
+            active = self._capture_worker_runtime()
+            candidate = getattr(self, "_worker_runtime_candidate", None)
+            phase = getattr(self, "_worker_runtime_phase", "idle")
+            matches = [runtime for runtime in self._owned_worker_runtimes() if runtime.identity == identity]
+            if getattr(self, "_worker_runtime_identity", None) != identity:
+                # Selection can fail before native preparation starts. Only
+                # that empty candidate may restore the still-owned old active.
+                if candidate is not None or matches or phase == "preparing":
+                    raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            elif phase == "finalized" and active.identity == identity:
+                raise WorkerPrepareError("worker_prepare_already_finalized")
+            self.fence_worker_runtime()
+            for runtime in matches:
+                close_layer_runtime(runtime)
+            if active.identity == identity:
+                previous = getattr(self, "_worker_runtime_previous", None)
+                if not restore_previous:
+                    close_layer_runtime(previous)
+                self._install_worker_runtime(previous if restore_previous else None)
+                self._worker_runtime_previous = None
+            if candidate is not None and candidate.identity == identity:
+                self._worker_runtime_candidate = None
+            self._worker_runtime_orphans = [runtime for runtime in getattr(self, "_worker_runtime_orphans", []) if runtime.owned]
+            self._worker_runtime_phase = "aborted"
+            if restore_previous and self._capture_worker_runtime().loaded:
+                self._resume_worker_runtime()
+
+    def finalize_worker_runtime(self, identity):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        identity = validate_identity(identity)
+        with self._worker_layer_lock():
+            if getattr(self, "_worker_runtime_identity", None) != identity or self._worker_runtime_phase not in {"committed", "finalized"}:
+                raise WorkerPrepareError("worker_prepare_not_committed")
+            if not self.worker_runtime_loaded(identity):
+                raise WorkerPrepareError("worker_prepare_runtime_unavailable")
+            close_layer_runtime(getattr(self, "_worker_runtime_previous", None))
+            self._worker_runtime_previous = None
+            self._worker_runtime_phase = "finalized"
+
+    def release_worker_runtime(self, identity=None):
+        from worker_prepare import close_layer_runtime
+        from worker_prepare_contract import WorkerPrepareError, validate_identity
+        with self._worker_layer_lock():
+            active = self._capture_worker_runtime()
+            candidate = getattr(self, "_worker_runtime_candidate", None)
+            previous = getattr(self, "_worker_runtime_previous", None)
+            owned = self._owned_worker_runtimes()
+            if identity is not None:
+                identity = validate_identity(identity)
+                targets = [runtime for runtime in owned if runtime.identity == identity]
+                if not targets and owned:
+                    raise WorkerPrepareError("worker_prepare_identity_mismatch")
+            else:
+                targets = owned
+            # Releasing the committed candidate retires its retained previous
+            # as well. A different prepared candidate/active remains untouched.
+            retire_previous = identity is None or (active.identity == identity and active.identity is not None)
+            if retire_previous and previous is not None and previous.owned and all(previous is not target for target in targets):
+                targets.append(previous)
+            # An old cleanup must never close a different new candidate/active.
+            if identity is None or active.identity == identity or (candidate is not None and candidate.identity == identity):
+                self.fence_worker_runtime()
+            for runtime in targets:
+                close_layer_runtime(runtime)
+            if identity is None or active.identity == identity:
+                self._install_worker_runtime(None)
+            if identity is None or (candidate is not None and candidate.identity == identity):
+                self._worker_runtime_candidate = None
+            if retire_previous or (previous is not None and previous.identity == identity):
+                self._worker_runtime_previous = None
+            self._worker_runtime_orphans = [runtime for runtime in getattr(self, "_worker_runtime_orphans", []) if runtime.owned]
+            if identity is None or getattr(self, "_worker_runtime_identity", None) == identity:
+                self._worker_runtime_phase = "released"
+
+    def _check_worker_runtime_stage(self, stage_request, *, required=False):
+        from worker_prepare_contract import WorkerPrepareError, stage_identity, validate_stage_identity
+        fields = stage_request.stage_fields or {}
+        if not required and not getattr(self, "_worker_runtime_managed", False) and "prepare_identity" not in fields:
+            return
+        actual = validate_stage_identity(fields.get("prepare_identity"))
+        fenced = getattr(self, "_worker_runtime_fenced", None)
+        if ((fenced is not None and fenced.is_set())
+                or getattr(self, "_worker_runtime_phase", "idle") not in {"committed", "finalized", "aborted"}):
+            raise WorkerPrepareError("worker_prepare_stage_fenced")
+        runtime = getattr(self, "_worker_runtime_active", None)
+        if runtime is None or runtime.identity is None or actual != stage_identity(runtime.identity) or not runtime.loaded:
+            raise WorkerPrepareError("worker_prepare_stage_identity_mismatch")
+        identity = stage_request.model_identity
+        if hasattr(identity, "snapshot"):
+            identity = identity.snapshot()
+        if identity != runtime.identity["stage_model_identity"] or fields.get("layer_range") != runtime.identity["layer_range"]:
+            raise WorkerPrepareError("worker_prepare_stage_contract_mismatch")
+
     def _layer_forward_upstream(self):
         """按 env 配置创建并复用 keep-head 上游（进程隔离由 `KeepHeadUpstream` 自理）。
 
@@ -1961,6 +2903,13 @@ class EngineHost:
         """
         import os
 
+        if getattr(self, "_worker_runtime_managed", False):
+            from worker_prepare_contract import WorkerPrepareError
+            active = getattr(self, "_worker_runtime_active", None)
+            if active is None or active.upstream is None or not active.loaded:
+                raise WorkerPrepareError("worker_prepare_runtime_unavailable")
+            return active.upstream
+
         # 本函数体要用 TaskGraphError，而该文件惯用函数内 import（同 :1802 / :2016 /
         # :2140），此前漏了这一处 ⇒ 层段 keep-head 上游缺 env 或绑定失败时抛的是
         # `NameError: name 'TaskGraphError' is not defined`，而不是真正的错误信息
@@ -1969,9 +2918,14 @@ class EngineHost:
         # ★ 2026-10-08（#53）：与 master 侧共用 shim 定位（含"仓库默认构建产物"一档）。
         from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 
+        from model_supply_worker import selected_gguf_path
+        model_path = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
         if self._layer_upstream is not None:
-            return self._layer_upstream
-        model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
+            previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
+            if (not previous_path or previous_path == model_path) and self._layer_upstream.is_available:
+                return self._layer_upstream
+            self._layer_upstream.close()
+            self._layer_upstream = None
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
@@ -1994,6 +2948,7 @@ class EngineHost:
                 return default
 
         try:
+            self._layer_upstream_model_path = model_path
             self._layer_upstream = KeepHeadUpstream(
                 shim_path,
                 model_path,
@@ -2004,10 +2959,163 @@ class EngineHost:
                 n_seq_max=_env_int("QLH_LAYER_N_SEQ_MAX", 1),
             )
         except KeepHeadUnavailable as exc:
+            owner = getattr(exc, "cleanup_owner", None)
+            if owner is not None:
+                self._layer_upstream = owner
             raise TaskGraphError(f"层段 keep-head 上游不可用：{exc}") from exc
         return self._layer_upstream
 
-    def _execute_layer_forward_stage(
+    def _unload_supplied_layer_manager(self) -> None:
+        """Release segment weights and every KV reference before replacing them."""
+        manager = getattr(self, "_supplied_layer_manager", None)
+        self._supplied_layer_manager = None
+        self._supplied_layer_key = None
+        self._supplied_layer_workflow = None
+        self._supplied_layer_caches = {}
+        if manager is not None:
+            manager.unload_model()
+
+    @staticmethod
+    def _supplied_layer_selection_key(selected: dict) -> tuple:
+        from pathlib import Path
+
+        return (selected["manifest_sha256"], str(Path(selected["directory"]).resolve()))
+
+    def _supplied_layer_manager_for(self, selected: dict, provider_cancel_event):
+        """Materialize only the registered range, never a complete-model load."""
+        from task_graph import TaskGraphError as _StageError
+
+        if provider_cancel_event.is_set():
+            raise _StageError("supplied_stage_cancelled")
+        key = self._supplied_layer_selection_key(selected)
+        if getattr(self, "_supplied_layer_manager", None) is not None:
+            return self._supplied_layer_manager
+
+        if getattr(self, "_worker_runtime_managed", False):
+            raise _StageError("worker_prepare_runtime_unavailable")
+
+        upstream = getattr(self, "_layer_upstream", None)
+        if upstream is not None:
+            upstream.close()
+            self._layer_upstream = None
+        try:
+            manager = self._build_supplied_layer_manager(selected, provider_cancel_event)
+        except Exception as exc:
+            if getattr(exc, "reason_code", "") == "worker_prepare_cancelled":
+                raise _StageError("supplied_stage_cancelled") from exc
+            raise
+        self._supplied_layer_manager = manager
+        self._supplied_layer_key = key
+        return manager
+
+    def _execute_supplied_layer_forward(
+        self, selected, stage_request, hidden, *, want_hidden, n_past,
+        positions, seq_ids, provider_cancel_event,
+    ):
+        """Adapt v3 hidden/KV to ModelManager's existing batched forward API."""
+        import torch
+        from task_graph import TaskGraphError as _StageError
+
+        manifest = selected["manifest"]
+        fields = stage_request.stage_fields or {}
+        if fields.get("layer_range") != manifest["layer_range"]:
+            raise _StageError("supplied_layer_range_mismatch")
+        if hidden.shape[1] != manifest["hidden_size"]:
+            raise _StageError("supplied_hidden_size_mismatch")
+        identity = getattr(stage_request, "model_identity", None)
+        if identity is not None:
+            identity = identity.snapshot() if hasattr(identity, "snapshot") else identity
+            if identity != {
+                "model_id": "supply-" + manifest["artifact_sha256"][:24],
+                "engine": "pytorch", "format": "safetensors", "revision": "1",
+                "sha256": manifest["artifact_sha256"],
+            }:
+                raise _StageError("supplied_model_identity_mismatch")
+        if not want_hidden and not manifest.get(
+            "has_lm_head", manifest["layer_range"][1] == manifest["total_layers"],
+        ):
+            raise _StageError("supplied_segment_has_no_lm_head")
+
+        n_tokens = hidden.shape[0]
+        seq_ids = [0] * n_tokens if seq_ids is None else seq_ids
+        if (not isinstance(seq_ids, (list, tuple)) or len(seq_ids) != n_tokens
+                or any(type(value) is not int or value < 0 for value in seq_ids)):
+            raise _StageError("supplied_seq_ids_invalid")
+        if positions is None:
+            counters = {}
+            positions = []
+            for seq in seq_ids:
+                position = counters.get(seq, n_past)
+                positions.append(position)
+                counters[seq] = position + 1
+        if (not isinstance(positions, (list, tuple)) or len(positions) != n_tokens
+                or any(type(value) is not int or value < 0 for value in positions)):
+            raise _StageError("supplied_positions_invalid")
+        groups = {}
+        for index, seq in enumerate(seq_ids):
+            groups.setdefault(seq, []).append(index)
+        workflow = stage_request.workflow_id
+        if getattr(self, "_supplied_layer_workflow", None) != workflow:
+            self._supplied_layer_caches = {}
+            self._supplied_layer_workflow = workflow
+        # Validate a working mapping first: one sequence's reset must not
+        # erase committed KV when a later sequence fails input validation.
+        caches = dict(getattr(self, "_supplied_layer_caches", {}))
+        for seq, indices in groups.items():
+            seq_positions = [positions[index] for index in indices]
+            if seq_positions != list(range(seq_positions[0], seq_positions[0] + len(indices))):
+                raise _StageError("supplied_positions_must_be_contiguous")
+            if seq_positions[0] == 0:
+                caches.pop(seq, None)
+            elif seq not in caches or caches[seq][1] != seq_positions[0]:
+                raise _StageError("supplied_decode_requires_matching_prefill")
+
+        try:
+            manager = self._supplied_layer_manager_for(selected, provider_cancel_event)
+            states = torch.from_numpy(hidden.copy()).unsqueeze(0)
+            output = torch.empty((n_tokens, hidden.shape[1]), dtype=torch.float32) if want_hidden else None
+            token = None
+            for seq, indices in groups.items():
+                if provider_cancel_event.is_set():
+                    raise _StageError("supplied_stage_cancelled")
+                index_tensor = torch.tensor(indices, dtype=torch.long)
+                result = manager.forward_layers(
+                    hidden_states=states.index_select(1, index_tensor),
+                    position_ids=torch.tensor([[positions[index] for index in indices]], dtype=torch.long),
+                    past_key_values=caches[seq][0] if seq in caches else None,
+                    use_cache=True,
+                    apply_lm_head=False,
+                )
+                if provider_cancel_event.is_set():
+                    raise _StageError("supplied_stage_cancelled")
+                # Preserve hybrid recurrent state: the tuple is a lossy fallback.
+                cache = result.get("cache")
+                if cache is None:
+                    cache = result.get("past_key_values")
+                if cache is None:
+                    raise _StageError("supplied_forward_missing_kv_cache")
+                caches[seq] = (cache, positions[indices[-1]] + 1)
+                out = result["hidden_states"]
+                if want_hidden:
+                    output.index_copy_(0, index_tensor, out[0].detach().to(device="cpu", dtype=torch.float32))
+                elif seq == seq_ids[-1]:
+                    logits = manager.forward_lm_head(out[:, -1:, :])
+                    token = int(logits[0, -1].argmax().item())
+            if provider_cancel_event.is_set():
+                raise _StageError("supplied_stage_cancelled")
+        except Exception:
+            # Cache objects mutate during forward; partial failures cannot resume.
+            self._supplied_layer_caches = {}
+            raise
+        self._supplied_layer_caches = caches
+        return output.numpy() if want_hidden else token
+
+    def _execute_layer_forward_stage(self, stage_request, provider_cancel_event):
+        with self._worker_layer_lock():
+            self._check_worker_runtime_stage(stage_request)
+            return self._execute_layer_forward_stage_locked(stage_request, provider_cancel_event)
+
+    def _execute_layer_forward_stage_locked(
         self,
         stage_request,
         provider_cancel_event: threading.Event,
@@ -2059,6 +3167,37 @@ class EngineHost:
         n_past = int(root_input.get("pos_base", 0) or 0)
 
         hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
+        from model_supply_worker import get_selected_model
+
+        if getattr(self, "_worker_runtime_managed", False):
+            selected = self._worker_runtime_active.selected
+        else:
+            selected = get_selected_model()
+        supplied = selected is not None and selected["manifest"]["format"] == "safetensors"
+        if (not supplied or getattr(self, "_supplied_layer_key", None)
+                != self._supplied_layer_selection_key(selected)):
+            self._unload_supplied_layer_manager()
+        identity = getattr(stage_request, "model_identity", None)
+        if hasattr(identity, "snapshot"):
+            identity = identity.snapshot()
+        if (not supplied and isinstance(identity, dict)
+                and identity.get("engine") == "pytorch"
+                and identity.get("format") == "safetensors"):
+            raise _StageError("supplied_registration_unavailable")
+        if supplied:
+            out = self._execute_supplied_layer_forward(
+                selected, stage_request, hidden, want_hidden=want_hidden,
+                n_past=n_past, positions=positions, seq_ids=seq_ids,
+                provider_cancel_event=provider_cancel_event,
+            )
+            if not want_hidden:
+                return {"token_argmax": int(out)}
+            out_raw = np.ascontiguousarray(out, dtype=np.float32).tobytes()
+            return {
+                "hidden_out_f32": base64.b64encode(out_raw).decode("ascii"),
+                "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
+                "token_argmax": None,
+            }
         upstream = self._layer_forward_upstream()
 
         # ★ 2026-10-03：批次**从位置 0 开始**就说明这是新 prompt 的 prefill ⇒ 必须先清
@@ -2342,7 +3481,10 @@ class EngineHost:
 
 
     def execute_task_graph_chat(
-        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """Run the fixed local task graph without claiming multi-device execution.
         1.2d 复制自 api_server._execute_task_graph_chat（api_server.py:2571-2614）；
@@ -2373,15 +3515,24 @@ class EngineHost:
         if not self._task_graph_execution_slot.acquire(blocking=False):
             raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
         try:
-            with self._host.full_chat_execution_lock:
-                return self.execute_task_graph_chat_with_slot(req, cancel_event)
+            with hold_lock_until_deadline(
+                self._model_lifecycle_lock(),
+                request_deadline,
+                operation="full chat execution lock",
+            ):
+                return self.execute_task_graph_chat_with_slot(
+                    req, cancel_event, request_deadline,
+                )
         finally:
             self._task_graph_execution_slot.release()
 
 
 
     def execute_task_graph_chat_with_slot(
-        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """Execute one workflow while the process-wide task-graph slot is held.
         1.2d 复制自 api_server._execute_task_graph_chat_with_slot
@@ -2392,17 +3543,28 @@ class EngineHost:
         record_task_complete → self._record_task_complete()。"""
         import config as _cfg
         import local_store as _local_store
+        from api_errors import coded_http_error
         from dataclasses import replace
+        from distributed_completion import (
+            DistributedCompletionError,
+            validate_distributed_completion,
+        )
         from fastapi import HTTPException
         from task_graph import (
             StageSpec,
             TaskGraphError,
             TaskGraphUnavailable,
             WorkflowCancelled,
+            WorkflowDeadlineExceeded,
             WorkflowExecutionError,
             dual_candidate_template,
         )
         from task_provider import ProviderError
+        request_deadline = coerce_request_deadline(
+            request_deadline,
+            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
+        )
+        request_deadline.require_remaining()
 
         remote_stage_id = str(req.task_graph_remote_stage or "")
         remote_provider_id = str(req.task_graph_remote_provider_id or "")
@@ -2445,12 +3607,10 @@ class EngineHost:
                     "distributed_required 需要已启用的 PC Full Worker 实验调度。",
                 )
 
-        target_session_id = req.session_id or self._active_session_id
-        if target_session_id and target_session_id != self._active_session_id:
-            self._switch_session(target_session_id)
-        history = self._get_active_history()
-        if target_session_id and len(history) == 0:
-            self._auto_title_session(target_session_id, req.message)
+        prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        target_session_id = prepared_context.session_id
+        history = prepared_context.history
+        request_deadline.require_remaining()
 
         base_messages = list(history) + [{"role": "user", "content": req.message}]
         root_input = {
@@ -2621,6 +3781,7 @@ class EngineHost:
                     runtime_context=runtime_context,
                     workflow_id=req.workflow_id,
                     cancel_event=cancel_event,
+                    request_deadline=request_deadline,
                 )
             else:
                 final_output, workflow = self._ensure_task_graph_coordinator().run(
@@ -2634,6 +3795,7 @@ class EngineHost:
                     runtime_context=runtime_context,
                     workflow_id=req.workflow_id,
                     cancel_event=cancel_event,
+                    request_deadline=request_deadline,
                 )
         except WorkflowCancelled as exc:
             raise HTTPException(
@@ -2641,13 +3803,23 @@ class EngineHost:
                 {"message": "任务链已取消", "workflow_id": exc.workflow_id},
             ) from exc
         except WorkflowExecutionError as exc:
+            status_code = 504 if exc.code == "request_deadline_exceeded" else 500
             raise coded_http_error(
-                500,
+                status_code,
                 exc.code,
                 {
                     "message": str(exc),
                     "workflow_id": exc.workflow_id,
                     "stage_id": exc.stage_id,
+                },
+            ) from exc
+        except WorkflowDeadlineExceeded as exc:
+            raise coded_http_error(
+                504,
+                exc.code,
+                {
+                    "message": str(exc),
+                    "workflow_id": exc.workflow_id,
                 },
             ) from exc
         except TaskGraphUnavailable as exc:
@@ -2666,28 +3838,92 @@ class EngineHost:
         if not response_text:
             raise HTTPException(500, "任务链最终聚合结果为空。")
 
-        history_start = len(history)
+        if distributed_task_required:
+            precommit_attempts = [
+                attempt
+                for stage in workflow.get("stages", [])
+                for attempt in stage.get("attempts", [])
+                if attempt.get("state") == "completed"
+            ]
+            precommit_remote_attempts = [
+                attempt
+                for attempt in precommit_attempts
+                if attempt.get("provider_kind") == "remote_full_worker"
+            ]
+            if not precommit_remote_attempts:
+                try:
+                    self._ensure_task_graph_coordinator().discard_result(
+                        workflow["workflow_id"],
+                        terminal_reason_code=REASON_REQUEST_REFUSED,
+                    )
+                except TaskGraphUnavailable as exc:
+                    raise HTTPException(
+                        503,
+                        {
+                            "message": "distributed_required 校验失败且结果无法丢弃。",
+                            "reason": str(exc),
+                        },
+                    ) from exc
+                raise coded_http_error(
+                    503,
+                    "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
+                    "distributed_required 未执行任何远端 Full Worker Stage。",
+                )
+            try:
+                validate_distributed_completion(
+                    req.routing_preference,
+                    {
+                        "distributed_used": True,
+                        "execution_mode": "task_graph",
+                        "workers_used": [
+                            str(attempt.get("provider_node_id", "") or "")
+                            for attempt in precommit_remote_attempts
+                            if attempt.get("provider_node_id")
+                        ],
+                    },
+                )
+            except DistributedCompletionError as exc:
+                try:
+                    self._ensure_task_graph_coordinator().discard_result(
+                        workflow["workflow_id"],
+                        terminal_reason_code=REASON_REQUEST_REFUSED,
+                    )
+                except TaskGraphUnavailable as discard_exc:
+                    raise HTTPException(
+                        503,
+                        {
+                            "message": "发行 profile 拒绝任务图结果且结果无法丢弃。",
+                            "reason": str(discard_exc),
+                        },
+                    ) from discard_exc
+                raise coded_http_error(
+                    503,
+                    "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN",
+                    f"distributed_required 发行路线校验失败：{exc}",
+                ) from exc
+
         try:
-            with self._gen_lock:
+            with hold_lock_until_deadline(
+                self._gen_lock,
+                request_deadline,
+                operation="generation commit lock",
+            ):
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
-                history.extend([
-                    {"role": "user", "content": req.message},
-                    {"role": "assistant", "content": response_text},
-                ])
                 if cancel_event is not None and cancel_event.is_set():
-                    del history[history_start:]
                     _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 try:
                     workflow = self._ensure_task_graph_coordinator().commit_result(
                         workflow["workflow_id"],
                     )
                 except WorkflowCancelled as exc:
-                    del history[history_start:]
                     raise ChatGenerationCancelled(
                         req.generation_id or "gen_unknown",
                     ) from exc
+                except WorkflowDeadlineExceeded as exc:
+                    raise coded_http_error(
+                        504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+                    ) from exc
                 except TaskGraphUnavailable:
-                    del history[history_start:]
                     raise
         except ChatGenerationCancelled:
             try:
@@ -2849,13 +4085,17 @@ class EngineHost:
                 else f"{_chat_origin(req)}_to_local_task_graph"
             ),
         )
-        followups = _fallback_followups(history, [])
+        completed_history = [
+            *history,
+            {"role": "user", "content": req.message},
+            {"role": "assistant", "content": response_text},
+        ]
+        followups = _fallback_followups(completed_history, [])
         save_metrics = dict(metrics)
         save_metrics["followups"] = followups
-
-        db_session_id = target_session_id or "default"
-        self._persist_conversation_turn(
-            db_session_id, req.message, response_text, save_metrics,
+        self._commit_chat_context_turn(
+            target_session_id, req.message, response_text, save_metrics,
+            expected_revision=prepared_context.revision,
         )
 
         self._conversation_stats["total_prompt_tokens"] += prompt_tokens
@@ -2886,11 +4126,10 @@ class EngineHost:
         如果没有活跃会话，返回空列表（不自动创建会话）。
         返回的列表对象可被原地修改（append、clear 等）。
         """
-        if self._active_session_id is None:
-            return []
-        if self._active_session_id not in self._session_histories:
-            self._session_histories[self._active_session_id] = []
-        return self._session_histories[self._active_session_id]
+        self._sync_chat_context_facade()
+        history = self._chat_context.active_history()
+        self._publish_chat_context_facade()
+        return history
 
     def _ensure_device_profile(self) -> Optional[dict]:
         """惰性设备画像探测（api_server 启动事件等价物，同步版）。"""
@@ -2950,33 +4189,27 @@ class EngineHost:
             )
         return self._kv_cache
 
-    def _switch_session(self, target_id: str) -> None:
+    def _switch_session(self, target_id: str, *, force_reload: bool = False) -> None:
         """
         切换到目标会话：暂存当前历史 → 加载目标历史 → 清 KV Cache。
         """
-        if self._active_session_id == target_id:
-            return
-        self._active_session_id = target_id
-        if target_id not in self._session_histories:
-            messages = []
-            try:
-                local_rows = _local_store.load_local_conversation(target_id)
-                messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-            except Exception as exc:
-                logger.error("SQLite 切换会话加载失败: session=%s: %s", target_id, exc)
-            self._session_histories[target_id] = messages
-        if self._kv_cache:
-            self._kv_cache.clear()
-        self._init_kv_cache()
-        logger.info(f"已切换到会话: {target_id}")
+        prepared = self._prepare_chat_context(
+            target_id, force_reload=force_reload,
+        )
+        logger.info(
+            "已切换到会话: %s (reloaded=%s)",
+            prepared.session_id,
+            prepared.reloaded,
+        )
 
     def _reset_runtime_conversation_state(self, clear_histories: bool = True) -> None:
         """Clear in-memory conversation/KV state after a model change."""
         if self._kv_cache:
             self._kv_cache.clear()
         self._kv_cache = None
-        if clear_histories:
-            self._session_histories = {}
+        self._sync_chat_context_facade()
+        self._chat_context.invalidate(clear_histories=clear_histories)
+        self._publish_chat_context_facade()
         self._conversation_stats = {
             "total_prompt_tokens": 0,
             "total_generated_tokens": 0,
@@ -3152,20 +4385,30 @@ class EngineHost:
         detail: str = "分布式执行未完成",
     ) -> None:
         """Reject the EngineHost's local fallback for an explicit route."""
-        if req.routing_preference != "distributed_required":
-            return
-        if isinstance(metrics, dict) and metrics.get("distributed_used"):
-            return
+        from distributed_completion import (
+            DistributedCompletionError,
+            validate_distributed_completion,
+        )
         from fastapi import HTTPException
-        raise HTTPException(503, f"distributed_required 执行失败：{detail}")
+        try:
+            validate_distributed_completion(
+                req.routing_preference, metrics, detail=detail,
+            )
+        except DistributedCompletionError as exc:
+            raise HTTPException(
+                503, f"distributed_required 执行失败：{exc}",
+            ) from exc
 
     def _external_route_decision(self, req: "ChatRequest"):
         """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
-        if req.routing_preference == "local_only":
+        if req.routing_preference in {"local_only", "distributed_required"}:
             # T9.5：local_only 覆盖一切外部路由意图，数据不出集群
             from types import SimpleNamespace as _SN
-            return _SN(use_external=False, eligible=False,
-                       reason="local_only_override")
+            return _SN(
+                use_external=False,
+                eligible=False,
+                reason=f"{req.routing_preference}_override",
+            )
         import config as _cfg
         from external_provider import decide_external_route
 
@@ -3203,41 +4446,60 @@ class EngineHost:
         check = getattr(sched, "has_pipeline_worker_reservation", None) if sched else None
         return bool(callable(check) and check())
 
+    def _pipeline_model_is_prepared(self) -> bool:
+        return bool(getattr(self._host, "is_pipeline_prepared", False))
+
     def _run_exclusive_model_change(
         self, change, prepare=None, *, release_worker_reservation: bool = False,
     ):
-        """Block inference, invalidate old worker ACKs, then refresh the new model.
+        """Invalidate distributed state only after the model change succeeds.
 
         （api_server 版嵌套 scheduler 锁；本进程无 scheduler 时仅持
         ModelHost 执行锁，等价单机拓扑。）
         """
         with self._host.full_chat_execution_lock:
-            if prepare is not None:
-                prepare()
+            self.release_worker_runtime()
             sched = self._scheduler
-            transition_started = False
-            if sched is not None:
-                begin_transition = getattr(
-                    sched, "_begin_layer_config_model_change", None,
-                )
-                if callable(begin_transition):
-                    begin_transition()
-                    transition_started = True
-                invalidate_transaction = getattr(
-                    sched, "_invalidate_pipeline_load_transaction", None,
-                )
-                if callable(invalidate_transaction):
-                    invalidate_transaction(
-                        reason_code="pipeline_model_changed",
-                        reason="local model replacement started",
+            if sched is None:
+                result = change()
+                if not (
+                    isinstance(result, dict)
+                    and result.get("success") is False
+                ) and prepare is not None:
+                    prepare()
+                return result
+
+            with sched._inference_lock:
+                with sched._layer_execution_lock:
+                    result = change()
+                    if (
+                        isinstance(result, dict)
+                        and result.get("success") is False
+                    ):
+                        return result
+
+                    begin_transition = getattr(
+                        sched, "_begin_layer_config_model_change", None,
                     )
-                with sched._inference_lock:
-                    with sched._layer_execution_lock:
+                    transition_started = callable(begin_transition)
+                    if transition_started:
+                        begin_transition()
+                    try:
+                        if prepare is not None:
+                            prepare()
+                        invalidate_transaction = getattr(
+                            sched, "_invalidate_pipeline_load_transaction", None,
+                        )
+                        if callable(invalidate_transaction):
+                            invalidate_transaction(
+                                reason_code="pipeline_model_changed",
+                                reason="local model replacement committed",
+                            )
                         with sched._layer_config_lock:
-                            # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图。
                             sched._worker_assignments.clear()
-                            sched._layer_config_expected.clear()
-                            sched._layer_config_acks.clear()
+                            sched._layer_config_retry_state.clear()
+                            sched._pipeline_load_transaction = None
+                            sched._active_pipeline_capacity_plan = None
                             sched._active_layer_config = None
                             sched._last_layer_config_ack_payload = None
                             sched._local_pipeline_steps.clear()
@@ -3251,17 +4513,15 @@ class EngineHost:
                                 release()
                             else:
                                 sched._pipeline_worker_reserved = False
-            try:
-                return change()
-            finally:
-                if sched is not None:
-                    self._refresh_pipeline_layer_config(sched)
-                    if transition_started:
-                        end_transition = getattr(
-                            sched, "_end_layer_config_model_change", None,
-                        )
-                        if callable(end_transition):
-                            end_transition()
+                        self._refresh_pipeline_layer_config(sched)
+                    finally:
+                        if transition_started:
+                            end_transition = getattr(
+                                sched, "_end_layer_config_model_change", None,
+                            )
+                            if callable(end_transition):
+                                end_transition()
+                    return result
 
     def _refresh_pipeline_layer_config(self, sched) -> None:
         """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
@@ -3288,17 +4548,29 @@ class EngineHost:
         if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
             from island_engine import mask_island_url
 
+            resolution = resolve_model_load(
+                ModelLoadFacts(
+                    model_id=None,
+                    island_enabled=True,
+                    island_base_url=str(cfg.ISLAND_BASE_URL),
+                ),
+                requested_engine="island",
+                requested_quant="island",
+            )
+
             logger.info(
                 f"自动加载孤岛引擎: endpoint={mask_island_url(cfg.ISLAND_BASE_URL)}"
             )
             t0 = _time.time()
-            cfg.INFERENCE_ENGINE = "island"
-            cfg.QUANT_TYPE = "island"
+            cfg.INFERENCE_ENGINE = resolution.engine
+            cfg.QUANT_TYPE = resolution.quant_type
             cfg.USE_COMPILE = False
             self._run_exclusive_model_change(
                 lambda: self._host.load_model(
                     profile=self._ensure_device_profile(),
-                    engine="island",
+                    engine=resolution.engine,
+                    quant_type=resolution.quant_type,
+                    resolution=resolution,
                 )
             )
             self._reset_runtime_conversation_state(clear_histories=False)
@@ -3310,7 +4582,7 @@ class EngineHost:
                 "rounds": 0,
             }
             self._host.model_loaded = True
-            self._host.current_quant = "island"
+            self._host.current_quant = resolution.quant_type
             if self._scheduler is not None:
                 try:
                     self._scheduler.refresh_task_worker_capabilities()
@@ -3329,11 +4601,11 @@ class EngineHost:
 
         # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
         gguf_candidates = []
-        gguf_configured = _active_gguf if _active_gguf and _os.path.isfile(_active_gguf) else cfg.GGUF_MODEL_PATH
+        gguf_configured = _active_gguf if _active_id else cfg.GGUF_MODEL_PATH
         if _os.path.isfile(gguf_configured):
             gguf_candidates.append(gguf_configured)
         models_dir = _os.path.dirname(gguf_configured)
-        if _os.path.isdir(models_dir):
+        if not _active_id and _os.path.isdir(models_dir):
             for f in sorted(glob.glob(_os.path.join(models_dir, "*.gguf"))):
                 if f not in gguf_candidates:
                     gguf_candidates.append(f)
@@ -3341,30 +4613,55 @@ class EngineHost:
         if _active_id:
             logger.info(f"默认模型按设备画像选择: {_active_id}")
 
-        if gguf_candidates:
-            gguf_path = gguf_candidates[0]
-            engine = "llama_cpp"
-            model_path = gguf_path
-            quant = "int4"
-            if len(gguf_candidates) > 1:
-                logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {_os.path.basename(gguf_path)}")
-        elif _active_safetensors and _os.path.isdir(_active_safetensors):
-            # 2a. 画像模型的 Safetensors 目录（PyTorch 后端）
-            engine = "pytorch"
-            model_path = _active_safetensors
-            quant = cfg.QUANT_TYPE
-        elif _os.path.isdir(cfg.MODEL_PATH):
-            # 2b. 回退：Safetensors 目录必须使用 PyTorch 后端
-            engine = "pytorch"
-            model_path = cfg.MODEL_PATH
-            quant = cfg.QUANT_TYPE
-        else:
+        safetensors_path = (
+            _active_safetensors
+            if _active_safetensors and _os.path.isdir(_active_safetensors)
+            else "" if _active_id
+            else cfg.MODEL_PATH if _os.path.isdir(cfg.MODEL_PATH) else ""
+        )
+        gguf_path = gguf_candidates[0] if gguf_candidates else ""
+        prefer_pytorch = bool(
+            getattr(cfg, "PREFER_PYTORCH", False) and safetensors_path
+        )
+        try:
+            from torch_runtime import cuda_available
+
+            profile = self._ensure_device_profile()
+            cuda_ok = effective_pytorch_cuda_available(
+                system_cuda_available=cuda_available(load=True),
+                profile=profile,
+            )
+
+            resolution = resolve_model_load(
+                ModelLoadFacts(
+                    model_id=_active_id or None,
+                    model_name=_active_id or "默认模型",
+                    registered=True,
+                    has_safetensors=bool(safetensors_path),
+                    has_gguf=bool(gguf_path),
+                    safetensors_path=safetensors_path or None,
+                    gguf_path=gguf_path or None,
+                    preferred_engine="pytorch" if prefer_pytorch else preferred_engine_for_artifacts(
+                        has_safetensors=bool(safetensors_path),
+                        has_gguf=bool(gguf_path),
+                        cuda_available=cuda_ok,
+                    ),
+                    cuda_available=cuda_ok,
+                ),
+                requested_engine="pytorch" if prefer_pytorch else "auto",
+                requested_quant=getattr(cfg, "QUANT_TYPE", "int4"),
+            )
+        except ModelLoadResolutionError as exc:
             raise FileNotFoundError(
-                f"未找到可自动加载的模型文件。已检查:\n"
+                f"未找到可自动加载的模型文件（{exc.code}: {exc.message}）。已检查:\n"
                 f"  GGUF 配置路径: {gguf_configured}\n"
                 f"  Safetensors 路径: {cfg.MODEL_PATH}\n"
                 f"  models 目录: {models_dir}"
-            )
+            ) from exc
+
+        engine = resolution.engine
+        model_path = resolution.model_path
+        quant = resolution.quant_type
 
         logger.info(f"自动加载默认模型: path={model_path}, engine={engine}")
 
@@ -3378,7 +4675,9 @@ class EngineHost:
                 model_path=model_path,
                 quant_type=quant,
                 profile=self._ensure_device_profile(),
+                model_id=resolution.model_id,
                 engine=engine,
+                resolution=resolution,
             )
         )
 
@@ -3415,6 +4714,15 @@ class EngineHost:
                 503,
                 "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
             )
+        if self._pipeline_model_is_prepared():
+            if req is not None and req.routing_preference == "local_only":
+                from fastapi import HTTPException
+                raise HTTPException(
+                    409,
+                    "当前模型仅以分布式流水线模式准备；"
+                    "local_only 请求需要先显式加载完整模型。",
+                )
+            return
         if self._host.model_loaded and getattr(self._host, "is_loaded", False):
             return
         self._auto_load_default_model()
@@ -3430,6 +4738,8 @@ class EngineHost:
         history: list,
         target_session_id: Optional[str],
         cancel_event: Optional[threading.Event] = None,
+        *,
+        context_revision: Optional[int] = None,
     ) -> Dict[str, Any]:
         """整请求路由到外部推理服务（与 llama.cpp/孤岛整请求路径同构）。"""
         import config as _cfg
@@ -3491,17 +4801,13 @@ class EngineHost:
             distributed_enabled=self._distributed_enabled,
         )
 
-        db_session_id = target_session_id or "default"
         followups = _fallback_followups(completed_history, [])
-        history.extend([
-            {"role": "user", "content": req.message},
-            {"role": "assistant", "content": response_text},
-        ])
 
         save_metrics = dict(metrics)
         save_metrics["followups"] = followups
-        self._persist_conversation_turn(
-            db_session_id, req.message, response_text, save_metrics,
+        self._commit_chat_context_turn(
+            target_session_id, req.message, response_text, save_metrics,
+            expected_revision=context_revision,
         )
 
         self._conversation_stats["total_generated_tokens"] += completion_tokens

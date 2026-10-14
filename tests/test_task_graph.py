@@ -608,11 +608,18 @@ def test_completed_workflow_is_idempotent_and_cannot_be_discarded():
     second = coordinator.commit_result("wf_terminal1")
 
     assert first["state"] == "completed"
+    assert first["terminal_reason"]["reason_code"] == "completed"
     assert second["state"] == "completed"
     assert second["finished_at"] == first["finished_at"]
     with pytest.raises(TaskGraphError, match="cannot be discarded"):
         coordinator.discard_result("wf_terminal1")
-    assert coordinator.cancel("wf_terminal1")["cancel_requested"] is False
+    late_cancel = coordinator.cancel("wf_terminal1")
+    assert late_cancel["cancel_requested"] is False
+    assert late_cancel["terminal_reason"]["reason_code"] == "completed"
+    assert [
+        item["reason_code"]
+        for item in late_cancel["terminal_reason"]["secondary_observations"]
+    ] == ["generation_cancelled"]
     cancel_event.set()
     assert coordinator.get("wf_terminal1")["cancel_requested"] is False
     assert coordinator.get("wf_terminal1")["state"] == "completed"
@@ -637,3 +644,27 @@ def test_cancel_result_ready_is_terminal_and_prevents_commit():
     assert coordinator.discard_result("wf_terminal2")["state"] == "cancelled"
     with pytest.raises(WorkflowCancelled):
         coordinator.commit_result("wf_terminal2")
+
+
+def test_refused_result_ready_is_failed_without_claiming_user_cancel():
+    coordinator = TaskGraphCoordinator()
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        return {"content": stage.stage_id}
+
+    coordinator.run_template(
+        "dual_candidate",
+        {"message": "question"},
+        execute,
+        workflow_id="wf_refused01",
+    )
+    refused = coordinator.discard_result(
+        "wf_refused01",
+        reason="distributed route refused",
+        terminal_reason_code="request_refused",
+    )
+
+    assert refused["state"] == "failed"
+    assert refused["error"] == "request_refused"
+    assert refused["cancel_requested"] is False
+    assert refused["terminal_reason"]["reason_code"] == "request_refused"

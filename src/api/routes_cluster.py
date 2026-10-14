@@ -16,6 +16,7 @@ _RESOLUTION_NAMES = (
     "ClusterJoinConsume",
     "ClusterJoinGrantIssue",
     "ClusterJoinRequestCreate",
+    "ClusterSecretRotateRequest",
     "ClusterStatus",
     "ConnectToMasterRequest",
     "ControlCertificateRequest",
@@ -45,7 +46,7 @@ def configure_api_module(module: ModuleType) -> None:
     configure_route_module(globals(), module, _RESOLUTION_NAMES)
 
 def exported_handlers() -> dict[str, object]:
-    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'quorum_voter_rpc', 'get_queue_detail', 'set_queue_strategy', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_task_graph_config', 'set_task_graph_config', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
+    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'rotate_cluster_secret', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'quorum_voter_rpc', 'get_queue_detail', 'set_queue_strategy', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_task_graph_config', 'set_task_graph_config', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
 
 async def get_cluster_status():
     """
@@ -76,7 +77,10 @@ async def get_cluster_resources():
     """Return the read-only aggregate CPU, RAM, and GPU resource view."""
     return await _api_module.run_in_threadpool(_api_module.scheduler.get_aggregate_resource_view)
 
-async def deregister_node(node_id: str):
+async def deregister_node(
+    node_id: str,
+    _principal=Depends(auth_service.require_authenticated_role("admin")),
+):
     """
     强制注销一个从节点。
 
@@ -95,7 +99,10 @@ async def deregister_node(node_id: str):
         "node_id": node_id,
     }
 
-async def delete_cluster_node(node_id: str):
+async def delete_cluster_node(
+    node_id: str,
+    _principal=Depends(auth_service.require_authenticated_role("admin")),
+):
     """
     删除离线节点记录（区别于 deregister：deregister 仅标记离线）。
 
@@ -246,6 +253,63 @@ async def issue_cluster_join_grant(
         _api_module.logger.error("cluster join grant issuance failed: %s", exc, exc_info=True)
         raise _api_module.HTTPException(503, "本地主节点入群密钥不可用") from exc
 
+async def rotate_cluster_secret(
+    req: ClusterSecretRotateRequest,
+    request: Request,
+    principal=Depends(auth_service.require_role("admin")),
+):
+    """Rotate the cluster root after Tailnet revocation and drop live peers."""
+    if _api_module.scheduler._effective_role() != "master":
+        raise _api_module.HTTPException(403, "only master can rotate cluster credentials")
+    if not req.tailnet_revocation_completed:
+        raise _api_module.HTTPException(
+            409,
+            {
+                "code": "tailnet_revocation_required",
+                "message": "remove the revoked node from the Tailnet before rotation",
+            },
+        )
+    _api_module.auth_service.verify_totp_confirmation(
+        principal,
+        req.otp_code,
+        source=_api_module.auth_service.request_source(request),
+    )
+
+    from node_config import rotate_local_cluster_secret
+
+    try:
+        tcp_server = getattr(_api_module.scheduler, "_tcp_server", None)
+        if tcp_server is not None:
+            rotation, disconnected = await _api_module.run_in_threadpool(
+                tcp_server.disconnect_all_clients,
+                "cluster credential rotation",
+                before_disconnect=rotate_local_cluster_secret,
+            )
+        else:
+            rotation = await _api_module.run_in_threadpool(
+                rotate_local_cluster_secret,
+            )
+            disconnected = 0
+        _secret, epoch = rotation
+        return {
+            "status": "rotated",
+            "cluster_secret_epoch": epoch,
+            "disconnected_clients": disconnected,
+            "rebootstrap_required": True,
+        }
+    except Exception as exc:
+        _api_module.logger.error(
+            "cluster credential rotation failed: %s", exc, exc_info=True,
+        )
+        raise _api_module.HTTPException(
+            503,
+            {
+                "code": "cluster_credential_rotation_failed",
+                "message": "cluster credential rotation failed",
+            },
+        ) from exc
+
+
 async def consume_cluster_join_grant(req: ClusterJoinConsume):
     """Verify a one-time grant, switch this node to client, and connect."""
     try:
@@ -260,11 +324,16 @@ async def consume_cluster_join_grant(req: ClusterJoinConsume):
             raise _api_module.JoinContractError("授权目标节点与本节点不匹配", code="request_mismatch")
         issuer_public_key = str(payload.get("issuer_public_key") or "")
         ledger = _api_module._get_join_ledger()
-        _api_module.verify_join_grant(
+        # The one-time authorization must be consumed before role, config or
+        # network side effects. A failed connection requires a fresh grant;
+        # replay can never enter the switch/connect path.
+        verified = _api_module.verify_and_consume_join_grant(
             req.grant_code,
             issuer_public_key=issuer_public_key,
             expected_request=expected_request,
+            ledger=ledger,
         )
+        ledger.delete_pending_request(str(expected_request["request_digest"]))
         master_host, master_port = _api_module._join_endpoint_parts(str(payload["master_endpoint"]))
         if _api_module.scheduler._effective_role() == "master":
             if not _api_module.scheduler.can_join_existing_master():
@@ -285,13 +354,6 @@ async def consume_cluster_join_grant(req: ClusterJoinConsume):
             raise _api_module.JoinContractError(
                 connection_result.get("reason", "连接主节点失败"), code="connect_failed"
             )
-        verified = _api_module.verify_and_consume_join_grant(
-            req.grant_code,
-            issuer_public_key=issuer_public_key,
-            expected_request=expected_request,
-            ledger=ledger,
-        )
-        ledger.delete_pending_request(str(expected_request["request_digest"]))
         return {
             "status": "connected",
             "role": "client",
@@ -317,12 +379,25 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         raise _api_module.HTTPException(403, "bootstrap disabled")
 
     peer_host = request.client.host if request.client else ""
-    from bootstrap import is_trusted_bootstrap_source, normalize_node_id, normalize_node_type
+    from bootstrap import (
+        is_secure_bootstrap_source,
+        is_trusted_bootstrap_source,
+        normalize_node_id,
+        normalize_node_type,
+    )
 
     require_trusted = _api_module.os.environ.get("QLH_BOOTSTRAP_REQUIRE_TAILSCALE", "true").strip().lower()
     if require_trusted not in {"0", "false", "no"}:
         if not is_trusted_bootstrap_source(peer_host):
             raise _api_module.HTTPException(403, "source network is not trusted")
+    if not is_secure_bootstrap_source(peer_host):
+        raise _api_module.HTTPException(
+            403,
+            {
+                "code": "protected_bootstrap_transport_required",
+                "message": "credential bootstrap requires loopback or Tailnet overlay",
+            },
+        )
 
     if _api_module.scheduler._effective_role() != "master":
         raise _api_module.HTTPException(403, "only master can serve bootstrap")
@@ -332,8 +407,10 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
     if node_id == "master":
         raise _api_module.HTTPException(400, "reserved node_id")
 
-    from node_config import ensure_local_cluster_secret
+    from bootstrap_credentials import BootstrapCredentialError, seal_bootstrap_credential
+    from node_config import ensure_local_cluster_secret, get_local_cluster_secret_epoch
     cluster_secret = ensure_local_cluster_secret()
+    cluster_secret_epoch = get_local_cluster_secret_epoch()
     try:
         import config as cfg
         cfg.CLUSTER_SECRET = cluster_secret
@@ -349,6 +426,46 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
     master_api_host = api_host or master_tcp_host
     master_api_port = request.url.port or _api_module.API_PORT
     master_tcp_port = _api_module.scheduler.tcp_server.port if _api_module.scheduler.tcp_server else _api_module.SERVER_PORT
+
+    cluster_id = _api_module.os.environ.get("QLH_CLUSTER_ID", "qlh-default")
+    try:
+        credential_envelope = seal_bootstrap_credential(
+            public_key=req.credential_public_key,
+            request_nonce=req.credential_request_nonce,
+            requested_at=req.credential_requested_at,
+            cluster_id=cluster_id,
+            node_id=node_id,
+            cluster_secret=cluster_secret,
+            secret_epoch=cluster_secret_epoch,
+        )
+        import hashlib
+        import json
+
+        request_digest = hashlib.sha256(json.dumps(
+            {
+                "credential_public_key": req.credential_public_key,
+                "credential_request_nonce": req.credential_request_nonce,
+                "credential_requested_at": req.credential_requested_at,
+                "node_id": node_id,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+        _api_module._get_join_ledger().consume_bootstrap_request(
+            nonce=req.credential_request_nonce,
+            request_digest=request_digest,
+        )
+    except BootstrapCredentialError as exc:
+        status = 409 if exc.code in {"request_expired"} else 400
+        raise _api_module.HTTPException(
+            status, {"code": exc.code, "message": str(exc)}
+        ) from exc
+    except _api_module.JoinContractError as exc:
+        status = 409 if exc.code == "nonce_replayed" else 400
+        raise _api_module.HTTPException(
+            status, {"code": exc.code, "message": str(exc)}
+        ) from exc
 
     hostname = req.hostname or node_id
     address = f"{peer_host}" if peer_host else ""
@@ -371,12 +488,12 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
     response = {
         "status": "ok",
         "cluster": {
-            "cluster_id": _api_module.os.environ.get("QLH_CLUSTER_ID", "qlh-default"),
+            "cluster_id": cluster_id,
             "master_api_host": master_api_host,
             "master_api_port": master_api_port,
             "master_tcp_host": master_tcp_host,
             "master_tcp_port": master_tcp_port,
-            "cluster_secret": cluster_secret,
+            "cluster_secret_epoch": cluster_secret_epoch,
         },
         "node": {
             "node_id": node_id,
@@ -392,6 +509,7 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
                 "http", master_api_host, master_api_port, "/api/models/downloadable"
             ),
         },
+        "credential_envelope": credential_envelope,
     }
     _api_module.logger.info(
         "首次连接部署: node_id=%s type=%s peer=%s host=%s api=%s:%s tcp=%s:%s",
@@ -559,7 +677,10 @@ async def discover_master():
     """
     return _api_module.scheduler.discover_master()
 
-async def reset_master_identity(req: ResetIdentityRequest):
+async def reset_master_identity(
+    req: ResetIdentityRequest,
+    _principal=Depends(auth_service.require_authenticated_role("admin")),
+):
     """
     重置主节点身份标识（仅主节点可调用）。
 
@@ -714,6 +835,8 @@ async def set_task_graph_config(req: TaskGraphConfigRequest):
             task_graph_enabled=req.enabled,
             task_worker_experimental_enabled=req.worker_experimental_enabled,
         )
+    except _api_module.HTTPException:
+        raise
     except Exception as exc:
         _api_module.logger.error("任务链运行时开关更新失败", exc_info=True)
         raise _api_module.HTTPException(500, f"任务链实验开关更新失败: {exc}") from exc
@@ -735,7 +858,10 @@ async def set_distributed_inference_config(req: DistributedInferenceRequest):
     - 主节点：控制是否接收从节点连接和协调分布式推理
     - 从节点：控制是否将推理请求转发给主节点
     """
-    result = _api_module.scheduler.set_distributed_inference_enabled(req.enabled)
+    result = await _api_module.run_in_threadpool(
+        _api_module._set_node_inference_mode,
+        "distributed" if req.enabled else "local",
+    )
     if result.get("status") == "error":
         raise _api_module.HTTPException(500, result.get("reason", "设置失败"))
     return result
@@ -1191,6 +1317,7 @@ def register_routes() -> None:
     router.add_api_route('/api/cluster/invite', get_invite_info, methods=['GET'])
     router.add_api_route('/api/cluster/join/request', create_cluster_join_request, methods=['POST'])
     router.add_api_route('/api/cluster/join/grant', issue_cluster_join_grant, methods=['POST'])
+    router.add_api_route('/api/cluster/credentials/rotate', rotate_cluster_secret, methods=['POST'])
     router.add_api_route('/api/cluster/join/consume', consume_cluster_join_grant, methods=['POST'])
     router.add_api_route('/api/bootstrap/first-connect', first_connect_bootstrap, methods=['POST'])
     router.add_api_route('/api/bootstrap/info', bootstrap_info, methods=['GET'])

@@ -161,6 +161,29 @@ class JournalReplicationTcpServer:
             except OSError:
                 pass
 
+    def _dispatch(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """按 `operation` 分派（#93 起两条：推入 ``apply_checkpoint`` / 拉取 ``get_checkpoint``）。"""
+
+        operation = request.get("operation")
+        if operation == "apply_checkpoint":
+            raw_checkpoint = request.get("checkpoint")
+            if not isinstance(raw_checkpoint, Mapping):
+                raise JournalReplicationTransportError("checkpoint_required")
+            checkpoint = JournalCheckpoint.from_dict(raw_checkpoint)
+            if request.get("source_node_id") != checkpoint.source_node_id:
+                raise JournalReplicationTransportError("source_identity_mismatch")
+            return self.replica.apply_checkpoint(checkpoint)
+        if operation == "get_checkpoint":
+            # #93：跨机追赶的**拉取**方向。只把已自洽的前缀交出去 ——
+            # `export_checkpoint` 自身会在不自洽时拒绝，这里不做任何降级。
+            workflow_id = request.get("workflow_id")
+            if not isinstance(workflow_id, str) or not workflow_id:
+                raise JournalReplicationTransportError("workflow_id_required")
+            if request.get("source_node_id") != self.replica.source_node_id:
+                raise JournalReplicationTransportError("source_identity_mismatch")
+            return {"checkpoint": self.replica.export_checkpoint(workflow_id).to_dict()}
+        raise JournalReplicationTransportError("unsupported_operation")
+
     def _handle(self, connection: socket.socket) -> None:
         try:
             request = _read_frame(connection, self.max_frame_bytes)
@@ -171,15 +194,7 @@ class JournalReplicationTcpServer:
                 raise JournalReplicationTransportError("authentication_failed")
             if request.get("transport_schema") != TRANSPORT_SCHEMA_VERSION:
                 raise JournalReplicationTransportError("unsupported_transport_schema")
-            if request.get("operation") != "apply_checkpoint":
-                raise JournalReplicationTransportError("unsupported_operation")
-            raw_checkpoint = request.get("checkpoint")
-            if not isinstance(raw_checkpoint, Mapping):
-                raise JournalReplicationTransportError("checkpoint_required")
-            checkpoint = JournalCheckpoint.from_dict(raw_checkpoint)
-            if request.get("source_node_id") != checkpoint.source_node_id:
-                raise JournalReplicationTransportError("source_identity_mismatch")
-            result = self.replica.apply_checkpoint(checkpoint)
+            result = self._dispatch(request)
             response: dict[str, Any] = {
                 "transport_schema": TRANSPORT_SCHEMA_VERSION,
                 "ok": True,
@@ -269,10 +284,69 @@ def send_checkpoint(
     return result
 
 
+def request_checkpoint(
+    host: str,
+    port: int,
+    *,
+    source_node_id: str,
+    stream_id: str,
+    workflow_id: str,
+    secret: bytes,
+    timeout: float = 5.0,
+    max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+) -> JournalCheckpoint:
+    """#93：从对端**拉**一个已自洽的 checkpoint（落后副本的追赶方向）。
+
+    与 `send_checkpoint` 严格对偶：同样带 MAC、同样校验身份。对端只会在**自洽**时
+    交出前缀（见 `DurableJournalReplica.export_checkpoint`），因此这里拿到的必然是
+    「可以当成已提交前缀」的那一点。
+    """
+
+    if len(secret) < 32:
+        raise JournalReplicationTransportError("replication secret must be at least 32 bytes")
+    if not workflow_id or not source_node_id or not stream_id:
+        raise JournalReplicationTransportError("checkpoint identity is required")
+    request: dict[str, Any] = {
+        "transport_schema": TRANSPORT_SCHEMA_VERSION,
+        "operation": "get_checkpoint",
+        "source_node_id": source_node_id,
+        "workflow_id": workflow_id,
+    }
+    request["mac"] = _mac(secret, request)
+    try:
+        with socket.create_connection((host, int(port)), timeout=max(0.1, timeout)) as connection:
+            connection.settimeout(max(0.1, timeout))
+            _write_frame(connection, request, max_frame_bytes)
+            response = _read_frame(connection, max_frame_bytes)
+    except (OSError, JournalReplicationTransportError) as exc:
+        raise JournalReplicationTransportError("journal replication exchange failed") from exc
+    supplied_mac = response.get("mac")
+    if not isinstance(supplied_mac, str) or not hmac.compare_digest(
+        supplied_mac, _mac(secret, response)
+    ):
+        raise JournalReplicationTransportError("replication acknowledgement authentication failed")
+    if response.get("transport_schema") != TRANSPORT_SCHEMA_VERSION:
+        raise JournalReplicationTransportError("unsupported acknowledgement schema")
+    if response.get("ok") is not True or not isinstance(response.get("result"), dict):
+        raise JournalReplicationTransportError("remote replica rejected the request")
+    raw = response["result"].get("checkpoint")
+    if not isinstance(raw, Mapping):
+        raise JournalReplicationTransportError("remote replica did not return a checkpoint")
+    checkpoint = JournalCheckpoint.from_dict(raw)
+    if (
+        checkpoint.source_node_id != source_node_id
+        or checkpoint.stream_id != stream_id
+        or checkpoint.workflow_id != workflow_id
+    ):
+        raise JournalReplicationTransportError("returned checkpoint identity mismatch")
+    return checkpoint
+
+
 __all__ = [
     "DEFAULT_MAX_FRAME_BYTES",
     "JournalReplicationTcpServer",
     "JournalReplicationTransportError",
     "TRANSPORT_SCHEMA_VERSION",
+    "request_checkpoint",
     "send_checkpoint",
 ]

@@ -21,8 +21,10 @@ from koakuma_engine import (
     BackendCapabilities,
     backend_capabilities,
     backend_id_for,
+    normalize_backend_request,
     select_backend,
 )
+from model_load_resolver import ModelLoadResolution
 
 
 class InferenceHost(Protocol):
@@ -45,6 +47,22 @@ class InferenceHost(Protocol):
     def load_model(self, engine, quant_type, use_compile, model_id): ...
 
     def unload_model(self): ...
+
+    def prepare_pipeline_candidate(
+        self, transaction_id, model_id, model_path, quant_type=None,
+        layer_range=None, model_sha256=None,
+    ): ...
+
+    def materialize_pipeline_candidate(
+        self, transaction_id, start_layer, end_layer, has_embedding,
+        has_lm_head, total_layers=None, model_id=None,
+    ): ...
+
+    def commit_pipeline_candidate(self, transaction_id): ...
+
+    def abort_pipeline_candidate(self, transaction_id): ...
+
+    def finalize_pipeline_candidate(self, transaction_id): ...
 
     def load_layer_range(self, layer_range, embed, lm_head): ...
 
@@ -145,10 +163,39 @@ class _LazyModelManager:
         return repr(instance)
 
 
+@dataclass
+class _PipelineCandidateTransaction:
+    transaction_id: str
+    model_id: str
+    model_path: str
+    quant_type: Optional[str]
+    layer_range: Optional[tuple[int, int]]
+    model_sha256: Optional[str]
+    manager: Any
+    descriptor: dict
+    phase: str = "preparing"
+    materialization_key: Optional[tuple[Any, ...]] = None
+    materialization_result: Any = None
+    previous_manager: Any = None
+    previous_host_state: Optional[dict] = None
+    error: Optional[str] = None
+
+
+_PIPELINE_HOST_MIRROR_ATTRS = (
+    "_engine_type",
+    "quant_type",
+    "model_path",
+    "active_model_id",
+    "_active_model_id",
+)
+_PIPELINE_CANDIDATE_TERMINAL_PHASES = frozenset({"aborted", "finalized"})
+
+
 # ModelHost owns these runtime attributes rather than proxying them to a manager.
 _OWN_ATTRS = {
     "_manager", "model_loaded", "generation_config", "current_quant",
     "full_chat_execution_lock", "scheduler_callbacks",
+    "_pipeline_candidate_lock", "_pipeline_candidate_transaction",
 }
 
 
@@ -176,6 +223,8 @@ class ModelHost:
         })
         object.__setattr__(self, "full_chat_execution_lock", threading.RLock())
         object.__setattr__(self, "scheduler_callbacks", None)
+        object.__setattr__(self, "_pipeline_candidate_lock", threading.RLock())
+        object.__setattr__(self, "_pipeline_candidate_transaction", None)
 
     @property
     def engine_type(self) -> str:
@@ -321,11 +370,440 @@ class ModelHost:
     def runtime_status(self) -> dict:
         """Return the public, lazy-safe runtime state for diagnostics and tests."""
 
+        manager = self.peek_manager()
         return {
-            "manager_loaded": self.peek_manager() is not None,
-            "model_loaded": self.has_loaded_model(),
+            "manager_loaded": manager is not None,
+            # Keep whole-request readiness separate from the broader question
+            # of whether this process owns any materialized runtime.  A
+            # distributed-only layer segment is materialized and prepared, but
+            # must never be advertised as a complete local chat model.
+            "model_loaded": bool(
+                object.__getattribute__(self, "model_loaded")
+            ),
+            "runtime_materialized": bool(
+                manager is not None and getattr(manager, "is_loaded", False)
+            ),
+            "pipeline_prepared": bool(
+                manager is not None
+                and getattr(manager, "is_pipeline_prepared", False)
+            ),
             "current_quant": object.__getattribute__(self, "current_quant"),
         }
+
+    @staticmethod
+    def _close_pipeline_manager(manager: Any) -> None:
+        if type(manager).__name__ == "_LazyModelManager":
+            manager = object.__getattribute__(manager, "_instance")
+        if manager is None:
+            return
+        close = (
+            getattr(manager, "unload_model", None)
+            or getattr(manager, "unload", None)
+            or getattr(manager, "close", None)
+        )
+        if callable(close):
+            close()
+
+    def _abort_failed_pipeline_candidate(
+        self,
+        transaction: _PipelineCandidateTransaction,
+        manager: Any,
+        error: Exception,
+    ) -> Optional[Exception]:
+        transaction.error = str(error)
+        try:
+            self._close_pipeline_manager(manager)
+        except Exception as cleanup_error:
+            transaction.manager = manager
+            transaction.phase = "cleanup_pending"
+            transaction.error = f"{error}; cleanup failed: {cleanup_error}"
+            return cleanup_error
+        transaction.manager = None
+        transaction.phase = "aborted"
+        return None
+
+    @staticmethod
+    def _pipeline_candidate_conflict(
+        transaction_id: str,
+        active_transaction_id: str,
+    ) -> RuntimeError:
+        return RuntimeError(
+            "MODEL_TXN_CONFLICT: "
+            f"transaction {transaction_id!r} conflicts with active transaction "
+            f"{active_transaction_id!r}"
+        )
+
+    def _require_pipeline_candidate(
+        self,
+        transaction_id: str,
+    ) -> _PipelineCandidateTransaction:
+        transaction = object.__getattribute__(
+            self, "_pipeline_candidate_transaction",
+        )
+        if transaction is None:
+            raise RuntimeError(
+                f"MODEL_TXN_NOT_FOUND: transaction {transaction_id!r} has no candidate"
+            )
+        if transaction.transaction_id != transaction_id:
+            raise self._pipeline_candidate_conflict(
+                transaction_id, transaction.transaction_id,
+            )
+        return transaction
+
+    def _snapshot_pipeline_host_state(self) -> dict:
+        instance_state = object.__getattribute__(self, "__dict__")
+        return {
+            "model_loaded": object.__getattribute__(self, "model_loaded"),
+            "current_quant": object.__getattribute__(self, "current_quant"),
+            "mirrors": {
+                name: (name in instance_state, instance_state.get(name))
+                for name in _PIPELINE_HOST_MIRROR_ATTRS
+            },
+        }
+
+    def _restore_pipeline_host_state(self, snapshot: dict) -> None:
+        object.__setattr__(self, "model_loaded", snapshot["model_loaded"])
+        object.__setattr__(self, "current_quant", snapshot["current_quant"])
+        instance_state = object.__getattribute__(self, "__dict__")
+        for name, (was_present, value) in snapshot["mirrors"].items():
+            if was_present:
+                object.__setattr__(self, name, value)
+            else:
+                instance_state.pop(name, None)
+
+    def _pipeline_candidate_host_state(
+        self,
+        transaction: _PipelineCandidateTransaction,
+    ) -> dict:
+        manager = transaction.manager
+        backend_id = backend_id_for(manager, default="")
+        quant_type = (
+            getattr(manager, "quant_type", None)
+            or getattr(manager, "_quant_type", None)
+            or transaction.quant_type
+        )
+        if not quant_type and backend_id == "llama_cpp":
+            quant_type = "gguf"
+        loaded = getattr(manager, "is_loaded", None)
+        pipeline_prepared = bool(
+            getattr(manager, "is_pipeline_prepared", False)
+        )
+        return {
+            # `model_loaded` means a whole-request local runtime.  A materialized
+            # pipeline segment is loaded for layer forwarding but must never be
+            # advertised as a complete model.
+            "model_loaded": (
+                False
+                if pipeline_prepared
+                else (True if loaded is None else bool(loaded))
+            ),
+            "current_quant": str(quant_type) if quant_type else None,
+            "mirrors": {
+                "_engine_type": backend_id or None,
+                "quant_type": quant_type,
+                "model_path": transaction.model_path,
+                "active_model_id": transaction.model_id,
+                "_active_model_id": transaction.model_id,
+            },
+        }
+
+    def _apply_pipeline_candidate_host_state(self, state: dict) -> None:
+        object.__setattr__(self, "model_loaded", state["model_loaded"])
+        if state["current_quant"]:
+            object.__setattr__(self, "current_quant", state["current_quant"])
+
+        instance_state = object.__getattribute__(self, "__dict__")
+        for name in _PIPELINE_HOST_MIRROR_ATTRS:
+            instance_state.pop(name, None)
+        for name, value in state["mirrors"].items():
+            if value is not None:
+                object.__setattr__(self, name, value)
+
+    def pipeline_candidate_status(self, transaction_id: str | None = None) -> dict:
+        """Return candidate transaction state without exposing runtime objects."""
+
+        with object.__getattribute__(self, "_pipeline_candidate_lock"):
+            transaction = object.__getattribute__(
+                self, "_pipeline_candidate_transaction",
+            )
+            if transaction is None:
+                return {"active": False, "phase": "idle"}
+            return {
+                "active": transaction.phase not in _PIPELINE_CANDIDATE_TERMINAL_PHASES,
+                "matches": (
+                    transaction_id is None
+                    or transaction.transaction_id == transaction_id
+                ),
+                "transaction_id": transaction.transaction_id,
+                "phase": transaction.phase,
+                "model_id": transaction.model_id,
+                "model_path": transaction.model_path,
+                "quant_type": transaction.quant_type,
+                "descriptor": dict(transaction.descriptor),
+                "error": transaction.error,
+            }
+
+    def prepare_pipeline_candidate(
+        self,
+        transaction_id: str,
+        model_id: str,
+        model_path: str,
+        quant_type: str = None,
+        layer_range: tuple[int, int] | None = None,
+        model_sha256: str | None = None,
+    ) -> dict:
+        """Prepare one isolated pipeline runtime without touching the active one."""
+
+        import os
+
+        transaction_id = str(transaction_id or "").strip()
+        if not transaction_id:
+            raise ValueError("transaction_id is required")
+        resolved_path = os.path.abspath(model_path or "")
+        normalized_range = tuple(layer_range) if layer_range is not None else None
+        prepare_key = (
+            str(model_id or ""),
+            resolved_path,
+            quant_type,
+            normalized_range,
+            model_sha256,
+        )
+        lock = object.__getattribute__(self, "_pipeline_candidate_lock")
+        with lock:
+            current = object.__getattribute__(
+                self, "_pipeline_candidate_transaction",
+            )
+            if current is not None and current.transaction_id == transaction_id:
+                current_key = (
+                    current.model_id,
+                    current.model_path,
+                    current.quant_type,
+                    current.layer_range,
+                    current.model_sha256,
+                )
+                if current_key != prepare_key:
+                    raise self._pipeline_candidate_conflict(
+                        transaction_id, current.transaction_id,
+                    )
+                if current.phase in {"aborted", "cleanup_pending"}:
+                    raise RuntimeError(
+                        f"MODEL_TXN_STATE: transaction {transaction_id!r} "
+                        f"is {current.phase!r}"
+                    )
+                return dict(current.descriptor)
+            if (
+                current is not None
+                and current.phase not in _PIPELINE_CANDIDATE_TERMINAL_PHASES
+            ):
+                raise self._pipeline_candidate_conflict(
+                    transaction_id, current.transaction_id,
+                )
+
+            if os.path.isfile(resolved_path):
+                from llama_engine import LlamaCppEngine
+
+                manager = LlamaCppEngine()
+            else:
+                lazy_manager = _LazyModelManager()
+                if type(lazy_manager).__name__ == "_LazyModelManager":
+                    try:
+                        manager = lazy_manager._get_instance()
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "当前发行版没有 PyTorch，无法准备目录模型候选运行时"
+                        ) from exc
+                else:
+                    manager = lazy_manager
+
+            transaction = _PipelineCandidateTransaction(
+                transaction_id=transaction_id,
+                model_id=str(model_id or ""),
+                model_path=resolved_path,
+                quant_type=quant_type,
+                layer_range=normalized_range,
+                model_sha256=model_sha256,
+                manager=manager,
+                descriptor={},
+            )
+            object.__setattr__(self, "_pipeline_candidate_transaction", transaction)
+            try:
+                descriptor = manager.prepare_pipeline_model(
+                    model_id=model_id,
+                    model_path=resolved_path,
+                    quant_type=quant_type,
+                    layer_range=normalized_range,
+                    model_sha256=model_sha256,
+                )
+            except Exception as exc:
+                cleanup_error = self._abort_failed_pipeline_candidate(
+                    transaction, manager, exc,
+                )
+                if cleanup_error is not None:
+                    raise RuntimeError(
+                        "MODEL_TXN_CLEANUP_FAILED: candidate cleanup failed"
+                    ) from cleanup_error
+                raise
+            transaction.descriptor = dict(descriptor or {})
+            transaction.phase = "prepared"
+            return dict(transaction.descriptor)
+
+    def materialize_pipeline_candidate(
+        self,
+        transaction_id: str,
+        start_layer: int | None,
+        end_layer: int | None,
+        has_embedding: bool,
+        has_lm_head: bool,
+        total_layers: int = None,
+        model_id: str = None,
+    ) -> Any:
+        """Materialize the candidate's assigned range while active stays live."""
+
+        lock = object.__getattribute__(self, "_pipeline_candidate_lock")
+        with lock:
+            transaction = self._require_pipeline_candidate(transaction_id)
+            if transaction.phase == "aborted":
+                raise RuntimeError(
+                    f"MODEL_TXN_ABORTED: transaction {transaction_id!r} was aborted"
+                )
+            if (start_layer is None) != (end_layer is None):
+                raise ValueError(
+                    "start_layer and end_layer must both be set or both be None"
+                )
+            normalized_start = (
+                None if start_layer is None else int(start_layer)
+            )
+            normalized_end = None if end_layer is None else int(end_layer)
+            materialization_key = (
+                normalized_start,
+                normalized_end,
+                bool(has_embedding),
+                bool(has_lm_head),
+                total_layers,
+                model_id or transaction.model_id,
+            )
+            if transaction.materialization_key is not None:
+                if transaction.materialization_key != materialization_key:
+                    raise self._pipeline_candidate_conflict(
+                        transaction_id, transaction.transaction_id,
+                    )
+                return transaction.materialization_result
+            if transaction.phase != "prepared" or transaction.manager is None:
+                raise RuntimeError(
+                    f"MODEL_TXN_STATE: transaction {transaction_id!r} "
+                    f"cannot materialize from {transaction.phase!r}"
+                )
+            try:
+                if normalized_start is None:
+                    prepare_tokenizer = getattr(
+                        transaction.manager,
+                        "prepare_pipeline_tokenizer",
+                        None,
+                    )
+                    result = (
+                        prepare_tokenizer()
+                        if callable(prepare_tokenizer) else None
+                    )
+                else:
+                    result = transaction.manager.load_layer_range(
+                        start_layer=normalized_start,
+                        end_layer=normalized_end,
+                        has_embedding=bool(has_embedding),
+                        has_lm_head=bool(has_lm_head),
+                        model_path=transaction.model_path,
+                        quant_type=transaction.quant_type,
+                        total_layers=total_layers,
+                        model_id=model_id or transaction.model_id,
+                    )
+            except Exception as exc:
+                manager = transaction.manager
+                cleanup_error = self._abort_failed_pipeline_candidate(
+                    transaction, manager, exc,
+                )
+                if cleanup_error is not None:
+                    raise RuntimeError(
+                        "MODEL_TXN_CLEANUP_FAILED: candidate cleanup failed"
+                    ) from cleanup_error
+                raise
+            if result is None:
+                result = {
+                    "success": True,
+                    "layer_start": normalized_start,
+                    "layer_end": normalized_end,
+                    "tokenizer_only": normalized_start is None,
+                }
+            transaction.materialization_key = materialization_key
+            transaction.materialization_result = result
+            transaction.phase = "materialized"
+            return result
+
+    def commit_pipeline_candidate(self, transaction_id: str) -> dict:
+        """Atomically publish the materialized manager, retaining rollback state."""
+
+        lock = object.__getattribute__(self, "_pipeline_candidate_lock")
+        # API unload/invalidation already owns full-chat before aborting a
+        # candidate. Direct commit/abort must follow the same lifecycle order.
+        with object.__getattribute__(self, "full_chat_execution_lock"), lock:
+            transaction = self._require_pipeline_candidate(transaction_id)
+            if transaction.phase in {"committed", "finalized"}:
+                return self.pipeline_candidate_status(transaction_id)
+            if transaction.phase != "materialized" or transaction.manager is None:
+                raise RuntimeError(
+                    f"MODEL_TXN_STATE: transaction {transaction_id!r} "
+                    f"cannot commit from {transaction.phase!r}"
+                )
+            candidate_host_state = self._pipeline_candidate_host_state(transaction)
+            transaction.previous_manager = object.__getattribute__(self, "_manager")
+            transaction.previous_host_state = self._snapshot_pipeline_host_state()
+            object.__setattr__(self, "_manager", transaction.manager)
+            self._apply_pipeline_candidate_host_state(candidate_host_state)
+            transaction.phase = "committed"
+            return self.pipeline_candidate_status(transaction_id)
+
+    def abort_pipeline_candidate(self, transaction_id: str) -> dict:
+        """Discard an uncommitted candidate or restore the exact prior runtime."""
+
+        lock = object.__getattribute__(self, "_pipeline_candidate_lock")
+        with object.__getattribute__(self, "full_chat_execution_lock"), lock:
+            transaction = self._require_pipeline_candidate(transaction_id)
+            if transaction.phase == "aborted":
+                return self.pipeline_candidate_status(transaction_id)
+            if transaction.phase == "finalized":
+                raise RuntimeError(
+                    f"MODEL_TXN_STATE: transaction {transaction_id!r} is finalized"
+                )
+            manager = transaction.manager
+            if transaction.phase == "committed":
+                object.__setattr__(self, "_manager", transaction.previous_manager)
+                self._restore_pipeline_host_state(
+                    transaction.previous_host_state or {},
+                )
+            self._close_pipeline_manager(manager)
+            transaction.manager = None
+            transaction.previous_manager = None
+            transaction.previous_host_state = None
+            transaction.phase = "aborted"
+            return self.pipeline_candidate_status(transaction_id)
+
+    def finalize_pipeline_candidate(self, transaction_id: str) -> dict:
+        """Make a committed candidate permanent and release the prior runtime."""
+
+        lock = object.__getattribute__(self, "_pipeline_candidate_lock")
+        with lock:
+            transaction = self._require_pipeline_candidate(transaction_id)
+            if transaction.phase == "finalized":
+                return self.pipeline_candidate_status(transaction_id)
+            if transaction.phase != "committed":
+                raise RuntimeError(
+                    f"MODEL_TXN_STATE: transaction {transaction_id!r} "
+                    f"cannot finalize from {transaction.phase!r}"
+                )
+            previous_manager = transaction.previous_manager
+            self._close_pipeline_manager(previous_manager)
+            transaction.previous_manager = None
+            transaction.previous_host_state = None
+            transaction.phase = "finalized"
+            return self.pipeline_candidate_status(transaction_id)
 
     # ------------------------------------------------------------ engine dispatch
     def load_model(
@@ -336,6 +814,7 @@ class ModelHost:
         model_id: str = None,
         engine: str = None,
         db_experimental_models: list = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> None:
         """Load a model, routing the GGUF engine *around* the torch-backed manager.
 
@@ -349,12 +828,14 @@ class ModelHost:
         positional and keyword callers keep working.
         """
 
-        requested_engine = str(engine or "").strip().lower()
-        if requested_engine in ("", "auto"):
-            requested_engine = str(self.select_engine(profile) or "").strip().lower()
-        if requested_engine in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf"):
+        requested_engine = normalize_backend_request(engine or "auto")
+        if requested_engine == "auto":
+            requested_engine = normalize_backend_request(self.select_engine(profile))
+        if requested_engine == "llama_cpp":
             self._load_gguf_model(model_path=model_path, model_id=model_id, profile=profile)
             return
+        if requested_engine == "pytorch" and str(model_path or "").lower().endswith(".gguf"):
+            raise ValueError("PyTorch loader 拒绝 GGUF 路径")
         manager = self._materialize_manager()
         manager.load_model(
             model_path=model_path,
@@ -363,6 +844,7 @@ class ModelHost:
             model_id=model_id,
             engine=engine,
             db_experimental_models=db_experimental_models,
+            resolution=resolution,
         )
 
     def prepare_pipeline_model(
@@ -456,7 +938,9 @@ class ModelHost:
         except Exception:  # pragma: no cover - config defines it in practice
             GGUF_MODEL_PATH = ""
 
-        if model_path and str(model_path).endswith(".gguf"):
+        if model_path:
+            if not str(model_path).lower().endswith(".gguf"):
+                raise ValueError("llama.cpp loader 只接受显式 GGUF 文件路径")
             gguf_path = model_path
         elif GGUF_MODEL_PATH and os.path.isfile(GGUF_MODEL_PATH):
             gguf_path = GGUF_MODEL_PATH
@@ -511,11 +995,7 @@ class ModelHost:
         object.__setattr__(self, "_engine_type", "llama_cpp")
         object.__setattr__(self, "quant_type", "gguf")
         object.__setattr__(self, "model_path", gguf_path)
-        try:
-            import config as _cfg
-            object.__setattr__(self, "current_quant", str(getattr(_cfg, "QUANT_TYPE", "int4")))
-        except Exception:  # pragma: no cover
-            pass
+        object.__setattr__(self, "current_quant", "gguf")
 
     def _gguf_available(self) -> bool:
         """Whether a GGUF file can be resolved *without* importing torch."""
@@ -539,6 +1019,7 @@ class ModelHost:
         engine: str = None,
         model_path: str = None,
         db_experimental_models: list = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> dict:
         """Switch models, keeping the GGUF engine on the torch-free path.
 
@@ -551,9 +1032,9 @@ class ModelHost:
 
         import importlib.util
 
-        requested = str(engine or "").strip().lower()
-        wants_gguf = requested in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf")
-        if not wants_gguf and requested in ("", "auto"):
+        requested = normalize_backend_request(engine or "auto")
+        wants_gguf = requested == "llama_cpp"
+        if not wants_gguf and requested == "auto":
             torch_absent = importlib.util.find_spec("torch") is None
             wants_gguf = torch_absent and self._gguf_available()
         if wants_gguf:
@@ -565,6 +1046,8 @@ class ModelHost:
                 "model_name": model_id,
                 "error": None,
             }
+        if requested == "pytorch" and str(model_path or "").lower().endswith(".gguf"):
+            raise ValueError("PyTorch loader 拒绝 GGUF 路径")
         # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
         #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
         #   转发会抛 AttributeError。
@@ -589,6 +1072,7 @@ class ModelHost:
             engine=engine,
             model_path=model_path,
             db_experimental_models=db_experimental_models,
+            resolution=resolution,
         )
 
     def unload_model(self) -> None:

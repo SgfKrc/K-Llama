@@ -1,30 +1,17 @@
-"""★ 2026-10-07（DIST-NEXT-3）：`WorkerAssignmentState` —— 单个 worker 的 assignment 权威视图。
+"""Authoritative per-worker assignment identity, contract, receipt and phase.
 
-背景（`docs/DIST后续核心链路缺陷审计-2026-10-07.md` P1-1 / P0-3）
-----------------------------------------------------------------
-主仓为「节点是否已拿到层配置」同时维护 `_layer_config_pushed` / `_layer_config_expected` /
-`_layer_config_acks` / `_pipeline_load_transaction` / `_active_pipeline_capacity_plan` /
-`_pipeline_recovery_state` 等集合，并且**没有 `assignment_id` 维度** —— 同一节点重连或重配时
-只能靠 config/generation 的组合间接隔离，于是出现「某处判 ready、另一处仍 not_configured」
-与 release/re-ACK 竞态。
-
-本模块给出**单一事实源**的形状与状态机：
-
-* 身份：`assignment_id`（每次下发新配置都换）+ `config_id` + `connection_generation` + lease；
-* 相位：`staged → pushing → acked → ready`，终止态 `released` / `aborted`；
-* **单一 reason code**：每次进入终止态只记录一个原因（复用 `task_worker_adapter` 的
-  `RELEASE_REASON_*` 闭集，不另造第三套命名）。
-
-**接线纪律（本步只写不读）**：registry 先在现有写入点同步维护（`_publish_layer_configs` /
-`_clear_layer_config_state` / ACK / abort），**读路径暂不切换** ⇒ 零行为变化；后续轮次再把
-容量、readiness、dispatch、release 的判据逐条切到本视图。
+``WorkerAssignmentRegistry`` is the single source of truth for an active
+legacy layer assignment.  Callers derive compatibility views such as
+``_layer_config_pushed`` from registry phase instead of maintaining parallel
+expected/ACK collections.
 """
 
 from __future__ import annotations
 
+import copy
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Optional
 
 #: 相位：非终止态按序前进；终止态只能从非终止态进入。
@@ -72,6 +59,8 @@ class WorkerAssignmentState:
     phase: str = PHASE_STAGED
     reason_code: str = ""
     updated_at: float = 0.0
+    expected_config: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    acknowledgement: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     @property
     def terminal(self) -> bool:
@@ -88,6 +77,8 @@ class WorkerAssignmentState:
             "phase": self.phase,
             "reason_code": self.reason_code,
             "updated_at": float(self.updated_at),
+            "expected_config": copy.deepcopy(dict(self.expected_config)),
+            "acknowledgement": copy.deepcopy(dict(self.acknowledgement)),
         }
 
 
@@ -116,6 +107,9 @@ class WorkerAssignmentRegistry:
         *,
         config_id: str = "",
         connection_generation: int = 0,
+        assignment_id: str = "",
+        expected_config: Optional[Mapping[str, Any]] = None,
+        acknowledgement: Optional[Mapping[str, Any]] = None,
         reason_code: str = REASON_CONFIG_PUBLISHED,
     ) -> WorkerAssignmentState:
         """开始（或换代）一个节点的 assignment —— **每次都换 `assignment_id`**。
@@ -129,19 +123,92 @@ class WorkerAssignmentRegistry:
             reason = REASON_RECONFIGURED
         else:
             reason = reason_code
+        expected = copy.deepcopy(dict(expected_config or {}))
+        identity = str(
+            assignment_id or expected.get("assignment_id", "") or self._id_factory()
+        )
+        expected["assignment_id"] = identity
+        effective_config_id = str(
+            config_id or expected.get("config_id", "") or ""
+        )
+        receipt = copy.deepcopy(dict(acknowledgement or {}))
+        if receipt:
+            receipt["assignment_id"] = identity
         state = WorkerAssignmentState(
             node_id=key,
-            assignment_id=self._id_factory(),
-            config_id=str(config_id or ""),
+            assignment_id=identity,
+            config_id=effective_config_id,
             connection_generation=int(connection_generation),
             lease_id="",
             lease_epoch=0,
             phase=PHASE_PUSHING,
             reason_code=reason,
             updated_at=self._clock(),
+            expected_config=expected,
+            acknowledgement=receipt,
         )
         self._states[key] = state
         return state
+
+    def update_expected(
+        self,
+        node_id: str,
+        expected_config: Mapping[str, Any],
+        *,
+        reason_code: str = REASON_CONFIG_PUBLISHED,
+        reset_phase: bool = True,
+    ) -> Optional[WorkerAssignmentState]:
+        """Replace the current wire contract without changing its identity.
+
+        Pipeline prepare → commit and retransmission are phases of one
+        assignment. They retain one ``assignment_id`` while the expected
+        payload advances atomically.
+        """
+        key = str(node_id or "")
+        state = self._states.get(key)
+        if state is None or state.terminal:
+            return None
+        expected = copy.deepcopy(dict(expected_config or {}))
+        expected["assignment_id"] = state.assignment_id
+        updated = replace(
+            state,
+            config_id=str(expected.get("config_id", state.config_id) or ""),
+            phase=PHASE_PUSHING if reset_phase else state.phase,
+            reason_code=str(reason_code or ""),
+            expected_config=expected,
+            acknowledgement={},
+            updated_at=self._clock(),
+        )
+        self._states[key] = updated
+        return updated
+
+    def record_ack(
+        self,
+        node_id: str,
+        acknowledgement: Mapping[str, Any],
+    ) -> Optional[WorkerAssignmentState]:
+        """Record a receipt only when it belongs to the current assignment."""
+        key = str(node_id or "")
+        state = self._states.get(key)
+        if state is None:
+            return None
+        receipt = copy.deepcopy(dict(acknowledgement or {}))
+        if not self.identity_matches(
+            key,
+            assignment_id=receipt.get("assignment_id"),
+            config_id=receipt.get("config_id"),
+            generation=receipt.get("generation"),
+        ):
+            return None
+        if dict(state.acknowledgement) == receipt:
+            return state
+        updated = replace(
+            state,
+            acknowledgement=receipt,
+            updated_at=self._clock(),
+        )
+        self._states[key] = updated
+        return updated
 
     def attach_lease(
         self, node_id: str, *, lease_id: str, lease_epoch: int,
@@ -176,6 +243,8 @@ class WorkerAssignmentRegistry:
         target = _PHASE_ORDER.get(phase, -1)
         if target < 0 or target < current:
             return None
+        if target == current and str(reason_code or "") == state.reason_code:
+            return state
         updated = replace(
             state,
             phase=phase,
@@ -223,11 +292,99 @@ class WorkerAssignmentRegistry:
         state = self.state(node_id)
         return state is not None and state.phase == PHASE_READY
 
+    def identity_matches(
+        self,
+        node_id: str,
+        *,
+        assignment_id: object,
+        config_id: object,
+        generation: object,
+    ) -> bool:
+        """Compare one wire receipt with the complete current identity."""
+        state = self.state(node_id)
+        if state is None:
+            return False
+        if str(assignment_id or "") != state.assignment_id:
+            return False
+        if str(config_id or "") != state.config_id:
+            return False
+        expected = state.expected_config
+        if "generation" not in expected:
+            return generation in (None, "", 0, "0")
+        try:
+            return int(generation) == int(expected.get("generation"))
+        except (TypeError, ValueError):
+            return False
+
+    def expected(self, node_id: str) -> dict[str, Any]:
+        state = self.state(node_id)
+        if state is None or state.terminal:
+            return {}
+        return copy.deepcopy(dict(state.expected_config))
+
+    def acknowledgement(self, node_id: str) -> dict[str, Any]:
+        state = self.state(node_id)
+        if state is None or state.terminal:
+            return {}
+        return copy.deepcopy(dict(state.acknowledgement))
+
+    def expected_configs(self) -> dict[str, dict[str, Any]]:
+        return {
+            node_id: copy.deepcopy(dict(state.expected_config))
+            for node_id, state in self._states.items()
+            if not state.terminal and state.expected_config
+        }
+
+    def acknowledgements(self) -> dict[str, dict[str, Any]]:
+        return {
+            node_id: copy.deepcopy(dict(state.acknowledgement))
+            for node_id, state in self._states.items()
+            if not state.terminal and state.acknowledgement
+        }
+
     def snapshot(self) -> dict[str, dict[str, Any]]:
         return {
             node_id: state.snapshot()
             for node_id, state in sorted(self._states.items())
         }
+
+    def restore(self, snapshot: Mapping[str, Mapping[str, Any]]) -> None:
+        """Replace the registry with one previously emitted snapshot."""
+        restored: dict[str, WorkerAssignmentState] = {}
+        for raw_node_id, raw in (snapshot or {}).items():
+            if not isinstance(raw, Mapping):
+                continue
+            node_id = str(raw.get("node_id", raw_node_id) or raw_node_id)
+            assignment_id = str(raw.get("assignment_id", "") or "")
+            phase = str(raw.get("phase", "") or "")
+            if not node_id or not assignment_id or phase not in {
+                *ACTIVE_PHASES, *TERMINAL_PHASES,
+            }:
+                continue
+            restored[node_id] = WorkerAssignmentState(
+                node_id=node_id,
+                assignment_id=assignment_id,
+                config_id=str(raw.get("config_id", "") or ""),
+                connection_generation=int(
+                    raw.get("connection_generation", 0) or 0
+                ),
+                lease_id=str(raw.get("lease_id", "") or ""),
+                lease_epoch=int(raw.get("lease_epoch", 0) or 0),
+                phase=phase,
+                reason_code=str(raw.get("reason_code", "") or ""),
+                updated_at=float(raw.get("updated_at", self._clock()) or 0.0),
+                expected_config=copy.deepcopy(dict(
+                    raw.get("expected_config", {})
+                    if isinstance(raw.get("expected_config", {}), Mapping)
+                    else {}
+                )),
+                acknowledgement=copy.deepcopy(dict(
+                    raw.get("acknowledgement", {})
+                    if isinstance(raw.get("acknowledgement", {}), Mapping)
+                    else {}
+                )),
+            )
+        self._states = restored
 
     def drop(self, node_id: str) -> None:
         """移除记录（测试与节点彻底退场时使用）。"""
@@ -271,95 +428,3 @@ def assignment_state_summary(
         )
         counts[phase] = counts.get(phase, 0) + 1
     return counts
-
-
-#: 一致性分歧的具名原因（`event=worker_assignment_state_divergence`）。
-DIVERGENCE_STATE_MISSING = "state_missing_but_legacy_expected"
-DIVERGENCE_TERMINAL_BUT_PUSHED = "terminal_state_but_legacy_pushed"
-DIVERGENCE_READY_BUT_NOT_PUSHED = "state_ready_but_legacy_not_pushed"
-#: 权威视图说「已 ACK」而旧集合说「未 pushed」——「放宽」方向的分歧（当前**不**随它放宽）。
-DIVERGENCE_PUSHED_BUT_LEGACY_NOT = "state_pushed_but_legacy_not_pushed"
-
-#: 旧集合 `_layer_config_pushed` 的等价相位：节点已确认收到本代际配置。
-PUSHED_PHASES = (PHASE_ACKED, PHASE_READY)
-
-
-def pushed_from_state(state: Optional[WorkerAssignmentState]) -> Optional[bool]:
-    """用权威视图推导「`_layer_config_pushed` 的等价值」。
-
-    返回 `None` = **无从推导**，调用方应沿用旧集合。三档语义：
-
-    * `ACKED` / `READY` ⇒ `True`；
-    * `RELEASED` / `ABORTED` ⇒ `False`（明确否定：这才是"陈旧 pushed"要收紧的情形）；
-    * `STAGED` / `PUSHING` ⇒ `None` —— 尚无 ACK 证据**不等于**否定：旧集合可能由不经过
-      本视图的路径维护（历史 ready ACK 路径、测试夹具），把它当 `False` 会误伤仍在
-      就绪的节点（实测：`test_push_waits_for_worker_load_ack`）。
-    """
-    if state is None:
-        return None
-    if state.phase in PUSHED_PHASES:
-        return True
-    if state.phase in TERMINAL_PHASES:
-        return False
-    return None
-
-
-@dataclass(frozen=True)
-class AssignmentConsistency:
-    """权威视图与旧集合判据的比对结果（仅用于**观测**，不改变任何判据）。"""
-
-    consistent: bool
-    reason_code: str = ""
-    state_phase: str = ""
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "consistent": self.consistent,
-            "reason_code": self.reason_code,
-            "state_phase": self.state_phase,
-        }
-
-
-def evaluate_assignment_consistency(
-    state: Optional[WorkerAssignmentState],
-    *,
-    legacy_pushed: bool,
-    has_expected: bool,
-    has_ack: bool = False,
-) -> AssignmentConsistency:
-    """把「权威视图」与 `_layer_config_expected` / `_layer_config_pushed` / `_layer_config_acks` 对照。
-
-    刻意**只判等价关系**，不决定任何行为：读路径切换前，先让真实分歧在日志里可见
-    （`event=worker_assignment_state_divergence`），而不是继续靠多集合各自推断。
-
-    ★ 2026-10-08（DIST-1 推进）：把 **`_layer_config_acks`** 也纳入观测 —— 它是第三个
-    「谁已确认收到本代际配置」的旧集合，此前**未参与**一致性比对。`has_ack=True` 而
-    权威视图无状态，与 `has_expected=True` 是同一类分歧（"旧集合说有、权威视图没有"），
-    故复用 `DIVERGENCE_STATE_MISSING`；这不改变任何判据，只是让该分歧也可见。
-    """
-    if state is None:
-        if has_expected or has_ack:
-            return AssignmentConsistency(
-                consistent=False, reason_code=DIVERGENCE_STATE_MISSING,
-            )
-        return AssignmentConsistency(consistent=True)
-    if state.terminal and legacy_pushed:
-        return AssignmentConsistency(
-            consistent=False,
-            reason_code=DIVERGENCE_TERMINAL_BUT_PUSHED,
-            state_phase=state.phase,
-        )
-    if state.phase == PHASE_ACKED and not legacy_pushed:
-        # 「放宽」方向的分歧：权威视图已 ACK，但旧集合尚未标记 pushed。
-        return AssignmentConsistency(
-            consistent=False,
-            reason_code=DIVERGENCE_PUSHED_BUT_LEGACY_NOT,
-            state_phase=state.phase,
-        )
-    if state.phase == PHASE_READY and not legacy_pushed:
-        return AssignmentConsistency(
-            consistent=False,
-            reason_code=DIVERGENCE_READY_BUT_NOT_PUSHED,
-            state_phase=state.phase,
-        )
-    return AssignmentConsistency(consistent=True, state_phase=state.phase)

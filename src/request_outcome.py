@@ -22,6 +22,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 OUTCOME_COMPLETED = "completed"
@@ -57,6 +60,72 @@ REASON_GENERATION_CANCELLED = "generation_cancelled"
 REASON_REQUEST_FAILED = "request_failed"
 #: 具名拒绝的 reason code（路由门等：不可恢复、dispatch 前结束）。
 REASON_REQUEST_REFUSED = "request_refused"
+#: End-to-end request budget exhausted; distinct from worker lease expiry.
+REASON_REQUEST_DEADLINE_EXCEEDED = "request_deadline_exceeded"
+
+MAX_SECONDARY_OBSERVATIONS = 32
+
+
+@dataclass
+class TerminalOutcomeLatch:
+    """Thread-safe first-writer-wins terminal reason.
+
+    Later heartbeat, disconnect, lease, timeout or cancel observations are
+    retained for diagnostics but cannot overwrite the request's terminal
+    reason. This is intentionally a small value object rather than another
+    scheduler state machine.
+    """
+
+    reason_code: str = ""
+    source: str = ""
+    observed_at: float = 0.0
+    secondary_observations: list[dict[str, Any]] = field(default_factory=list)
+    secondary_observations_dropped: int = 0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
+
+    def decide(self, reason_code: str, *, source: str = "") -> str:
+        code = str(reason_code or "").strip()
+        normalized_source = str(source or "")
+        if not code:
+            raise ValueError("terminal reason_code must not be empty")
+        with self._lock:
+            if not self.reason_code:
+                self.reason_code = code
+                self.source = normalized_source
+                self.observed_at = time.time()
+            elif code != self.reason_code or normalized_source != self.source:
+                duplicate = any(
+                    item.get("reason_code") == code
+                    and item.get("source") == normalized_source
+                    for item in self.secondary_observations
+                )
+                if duplicate:
+                    return self.reason_code
+                if len(self.secondary_observations) >= MAX_SECONDARY_OBSERVATIONS:
+                    self.secondary_observations_dropped += 1
+                    return self.reason_code
+                self.secondary_observations.append({
+                    "reason_code": code,
+                    "source": normalized_source,
+                    "observed_at": time.time(),
+                })
+            return self.reason_code
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "reason_code": self.reason_code,
+                "source": self.source,
+                "observed_at": self.observed_at,
+                "secondary_observations": [
+                    dict(item) for item in self.secondary_observations
+                ],
+                "secondary_observations_dropped": (
+                    self.secondary_observations_dropped
+                ),
+            }
 
 
 def derive_outcome(

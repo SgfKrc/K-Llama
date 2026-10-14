@@ -10,6 +10,9 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -88,6 +91,158 @@ class TestNotLoaded:
         descriptor = eng.get_pipeline_descriptor()
         assert descriptor["partial_assignment"] is True
         assert descriptor["assignment_layer_range"] == [0, 8]
+
+    def test_layer_artifact_selection_requires_same_source_and_valid_digest(
+        self, monkeypatch, tmp_path,
+    ):
+        from llama_engine import LlamaCppEngine
+
+        source = tmp_path / "whole.gguf"
+        source.write_bytes(b"source-model-a")
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+
+        wrong = tmp_path / "a-wrong.gguf"
+        wrong.write_bytes(b"segment-from-model-b")
+        (tmp_path / "a-wrong.manifest.json").write_text(json.dumps({
+            "source_layer_range": [0, 8],
+            "source_model_sha256": "b" * 64,
+            "artifact_sha256": hashlib.sha256(wrong.read_bytes()).hexdigest(),
+        }), encoding="utf-8")
+
+        right = tmp_path / "z-right.gguf"
+        right.write_bytes(b"segment-from-model-a")
+        (tmp_path / "z-right.gguf.manifest.json").write_text(json.dumps({
+            "source_layer_range": [0, 8],
+            "source_model_sha256": source_sha,
+            "artifact_sha256": hashlib.sha256(right.read_bytes()).hexdigest(),
+        }), encoding="utf-8")
+
+        eng = LlamaCppEngine()
+        eng._pipeline_descriptor = {
+            "model_path": str(source),
+            "model_sha256": source_sha,
+        }
+        monkeypatch.setenv("QLH_LAYER_ARTIFACT_DIR", str(tmp_path))
+
+        assert eng._find_layer_artifact(0, 8) == str(right)
+
+    def test_precut_head_uses_source_digest_not_head_digest(
+        self, monkeypatch, tmp_path,
+    ):
+        from llama_engine import LlamaCppEngine
+
+        source_sha = hashlib.sha256(b"unloaded-whole-model").hexdigest()
+        head = tmp_path / "head4.gguf"
+        head.write_bytes(b"verified-head-segment")
+        head_sha = hashlib.sha256(head.read_bytes()).hexdigest()
+        manifest = tmp_path / "head4.manifest.json"
+        manifest.write_text(json.dumps({
+            "source_layer_range": [0, 4],
+            "source_model_sha256": source_sha,
+            "artifact_sha256": head_sha,
+        }), encoding="utf-8")
+
+        engine = LlamaCppEngine()
+        engine._model_path = str(head)
+        engine._pipeline_descriptor = {
+            "model_path": str(head),
+            "model_sha256": head_sha,
+            "source_model_sha256": source_sha,
+        }
+        monkeypatch.delenv("QLH_LAYER_ARTIFACT_DIR", raising=False)
+
+        assert engine._find_layer_artifact(0, 4) == str(head)
+        manifest.write_text(json.dumps({
+            "source_layer_range": [0, 4],
+            "source_model_sha256": head_sha,
+            "artifact_sha256": head_sha,
+        }), encoding="utf-8")
+        assert engine._find_layer_artifact(0, 4) == ""
+
+    def test_layer_artifact_selection_rejects_digest_mismatch(
+        self, monkeypatch, tmp_path,
+    ):
+        from llama_engine import LlamaCppEngine
+
+        source = tmp_path / "whole.gguf"
+        source.write_bytes(b"source-model")
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        artifact = tmp_path / "head8.gguf"
+        artifact.write_bytes(b"tampered-segment")
+        (tmp_path / "head8.manifest.json").write_text(json.dumps({
+            "source_layer_range": [0, 8],
+            "source_model_sha256": source_sha,
+            "artifact_sha256": "c" * 64,
+        }), encoding="utf-8")
+
+        eng = LlamaCppEngine()
+        eng._pipeline_descriptor = {
+            "model_path": str(source),
+            "model_sha256": source_sha,
+        }
+        monkeypatch.setenv("QLH_LAYER_ARTIFACT_DIR", str(tmp_path))
+
+        assert eng._find_layer_artifact(0, 8) == ""
+
+    def test_layer_artifact_selection_rehashes_same_size_replacement(
+        self, monkeypatch, tmp_path,
+    ):
+        from llama_engine import LlamaCppEngine
+
+        source = tmp_path / "whole.gguf"
+        source.write_bytes(b"source-model")
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        artifact = tmp_path / "head8.gguf"
+        artifact.write_bytes(b"segment-good")
+        original_stat = artifact.stat()
+        (tmp_path / "head8.manifest.json").write_text(json.dumps({
+            "source_layer_range": [0, 8],
+            "source_model_sha256": source_sha,
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        }), encoding="utf-8")
+
+        eng = LlamaCppEngine()
+        eng._pipeline_descriptor = {
+            "model_path": str(source),
+            "model_sha256": source_sha,
+        }
+        monkeypatch.setenv("QLH_LAYER_ARTIFACT_DIR", str(tmp_path))
+
+        assert eng._find_layer_artifact(0, 8) == str(artifact)
+        artifact.write_bytes(b"segment-evil")
+        os.utime(
+            artifact,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+        assert eng._find_layer_artifact(0, 8) == ""
+
+    def test_layer_artifact_selection_rejects_multiple_valid_matches(
+        self, monkeypatch, tmp_path,
+    ):
+        from llama_engine import LlamaCppEngine
+
+        source = tmp_path / "whole.gguf"
+        source.write_bytes(b"source-model")
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        for stem in ("head8-a", "head8-b"):
+            artifact = tmp_path / f"{stem}.gguf"
+            artifact.write_bytes(stem.encode("ascii"))
+            (tmp_path / f"{stem}.manifest.json").write_text(json.dumps({
+                "source_layer_range": [0, 8],
+                "source_model_sha256": source_sha,
+                "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }), encoding="utf-8")
+
+        eng = LlamaCppEngine()
+        eng._pipeline_descriptor = {
+            "model_path": str(source),
+            "model_sha256": source_sha,
+        }
+        monkeypatch.setenv("QLH_LAYER_ARTIFACT_DIR", str(tmp_path))
+
+        with pytest.raises(RuntimeError, match="多个同源"):
+            eng._find_layer_artifact(0, 8)
 
 
 class TestWithRealModel:

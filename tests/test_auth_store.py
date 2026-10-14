@@ -191,6 +191,55 @@ class TestTotp:
         assert store.clear_totp("o") is True
         assert store.get_totp_secret("o") is None
 
+    def test_binding_totp_revokes_all_existing_sessions(self, store):
+        store.create_user("totp-session", "password123")
+        tokens = [store.issue_session("totp-session")[0] for _ in range(2)]
+
+        store.bind_totp("totp-session", "JBSWY3DPEHPK3PXP")
+
+        assert all(store.resolve_session(token) is None for token in tokens)
+
+    def test_totp_seed_is_not_stored_in_plaintext_sqlite(self, store, tmp_path):
+        secret = "JBSWY3DPEHPK3PXP"
+        store.create_user("secure-totp", "password123")
+        store.bind_totp("secure-totp", secret)
+
+        conn = sqlite3.connect(str(tmp_path / "auth.sqlite"))
+        try:
+            stored = conn.execute(
+                "SELECT secret FROM auth_totp WHERE username = ?", ("secure-totp",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert stored == "local-secret-store:v1"
+        assert secret.encode() not in (tmp_path / "auth.sqlite").read_bytes()
+        assert secret not in (tmp_path / "auth_secrets.json").read_text(encoding="utf-8")
+        assert store.get_totp_secret("secure-totp") == secret
+
+    def test_legacy_plaintext_totp_seed_migrates_on_read(self, store, tmp_path):
+        secret = "MFRGGZDFMZTWQ2LK"
+        store.create_user("legacy-totp", "password123")
+        conn = sqlite3.connect(str(tmp_path / "auth.sqlite"))
+        try:
+            conn.execute(
+                "INSERT INTO auth_totp (username, secret, confirmed_at) VALUES (?,?,?)",
+                ("legacy-totp", secret, 1.0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert store.get_totp_secret("legacy-totp") == secret
+        conn = sqlite3.connect(str(tmp_path / "auth.sqlite"))
+        try:
+            stored = conn.execute(
+                "SELECT secret FROM auth_totp WHERE username = ?", ("legacy-totp",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert stored == "local-secret-store:v1"
+
 
 class TestSchemaIdempotent:
     def test_reopen_keeps_schema_and_data(self, tmp_path):

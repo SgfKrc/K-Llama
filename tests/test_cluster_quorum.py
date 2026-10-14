@@ -190,6 +190,23 @@ def test_renew_keeps_term_and_lease_id_but_extends_expiry(tmp_path):
     assert renewed.certificate.expires_at_ms == 1_150
 
 
+def test_renew_can_use_recovered_voter_outside_original_majority(tmp_path):
+    voter_set, voters = _fixture(tmp_path)
+    collector = QuorumCollector(
+        voter_set=voter_set, voters=voters, policy=QuorumPolicy(lease_duration_ms=100)
+    )
+    first = collector.acquire(
+        "voter-0", available_voter_ids=("voter-0", "voter-1"), now_ms=1_000
+    )
+    assert first.accepted
+    renewed = collector.renew(
+        first.certificate, available_voter_ids=("voter-0", "voter-2"), now_ms=1_050
+    )
+    assert renewed.accepted
+    assert renewed.signed_voters == ("voter-0", "voter-2")
+    assert voters["voter-2"].snapshot().active_certificate_digest == renewed.certificate.digest()
+
+
 def test_ledger_reopen_preserves_term_and_active_certificate(tmp_path):
     voter_set, voters = _fixture(tmp_path)
     result = QuorumCollector(voter_set=voter_set, voters=voters).acquire(

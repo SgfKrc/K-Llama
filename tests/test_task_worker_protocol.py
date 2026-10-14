@@ -36,9 +36,12 @@ def test_v1_golden_messages_round_trip_canonically(golden):
     assert golden["protocol"] == PROTOCOL_NAME
     decoded = [decode_message(message) for message in golden["messages"]]
 
-    # v1 golden 覆盖 v1 时代的全部类型；`stage_chunk` 是 v3 引入的大 payload 分片
-    # （DIST-NEXT-2b），不在 v1 fixture 范围内（其往返由 test_task_worker_chunks 覆盖）。
-    assert {message.message_type for message in decoded} == MESSAGE_TYPES - {"stage_chunk"}
+    # v1 golden 覆盖 v1 时代的全部类型；`stage_chunk`（DIST-NEXT-2b）与
+    # `stage_result_chunk`（2026-10-11 回程分片）都是 v3 引入的大 payload 分片，
+    # 不在 v1 fixture 范围内（其往返由 test_task_worker_chunks 覆盖）。
+    assert {message.message_type for message in decoded} == (
+        MESSAGE_TYPES - {"stage_chunk", "stage_result_chunk"}
+    )
     assert [message.snapshot() for message in decoded] == golden["messages"]
     for message in decoded:
         assert decode_message(canonical_message_bytes(message)) == message
@@ -148,6 +151,70 @@ def test_worker_capability_lists_and_concurrency_are_bounded(golden):
     assert concurrency_error.value.code == "invalid_capabilities"
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("llama.cpp", "llama_cpp"),
+        ("llama-cpp", "llama_cpp"),
+        ("gguf", "llama_cpp"),
+        ("llama", "llama_cpp"),
+        ("torch", "pytorch"),
+    ],
+)
+def test_wire_capabilities_normalize_local_engine_aliases(golden, alias, canonical):
+    hello = copy.deepcopy(golden["messages"][0])
+    capabilities = hello["payload"]["capabilities"]
+    capabilities["engines"] = [alias]
+    capabilities["models"][0]["engine"] = alias
+
+    decoded = decode_message(hello)
+
+    assert decoded.payload["capabilities"]["engines"] == [canonical]
+    assert decoded.payload["capabilities"]["models"][0]["engine"] == canonical
+
+
+def test_wire_model_identity_normalizes_alias_and_preserves_non_local_engine(golden):
+    offer = copy.deepcopy(golden["messages"][2])
+    offer["version"] = 2
+    offer["payload"]["model_identity"] = {
+        "model_id": "model-a",
+        "engine": "llama.cpp",
+        "format": "gguf",
+        "revision": "rev-a",
+        "sha256": "a" * 64,
+    }
+    assert decode_message(offer).payload["model_identity"]["engine"] == "llama_cpp"
+
+    offer["payload"]["model_identity"]["engine"] = "external_api"
+    assert decode_message(offer).payload["model_identity"]["engine"] == "external_api"
+
+    hello = copy.deepcopy(golden["messages"][0])
+    capabilities = hello["payload"]["capabilities"]
+    capabilities["engines"] = ["speculative_assisted"]
+    capabilities["models"][0]["engine"] = "speculative_assisted"
+    decoded = decode_message(hello)
+    assert decoded.payload["capabilities"]["engines"] == ["speculative_assisted"]
+    assert decoded.payload["capabilities"]["models"][0]["engine"] == (
+        "speculative_assisted"
+    )
+
+
+def test_wire_engine_aliases_fail_closed_and_canonical_duplicates_are_rejected(golden):
+    unknown = copy.deepcopy(golden["messages"][0])
+    unknown["payload"]["capabilities"]["engines"] = ["llama_magic"]
+    unknown["payload"]["capabilities"]["models"][0]["engine"] = "llama_magic"
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(unknown)
+    assert captured.value.code == "invalid_capabilities"
+
+    duplicate = copy.deepcopy(golden["messages"][0])
+    duplicate["payload"]["capabilities"]["engines"] = ["llama.cpp", "gguf"]
+    duplicate["payload"]["capabilities"]["models"][0]["engine"] = "llama_cpp"
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(duplicate)
+    assert captured.value.code == "invalid_capabilities"
+
+
 def test_layer_forward_result_metadata_is_accepted():
     """层段结果回记的对账字段必须被接受。
 
@@ -226,9 +293,32 @@ def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
         "model_id": "tail20.gguf",
         "artifact_sha256": "a" * 64,
         "source_model_sha256": "b" * 64,
+        "source_model_id": "qwen3-5-2b",
+        "hidden_size": 2048,
+        "tokenizer_sha256": "d" * 64,
     }]
 
     decode_message(hello)
+
+    with_bytes = copy.deepcopy(hello)
+    with_bytes["payload"]["capabilities"]["layer_artifacts"][0][
+        "layer_weight_bytes"
+    ] = [1, 2, 3, 4]
+    decode_message(with_bytes)
+
+    for invalid in ([1, 2, 3], [1, 0, 3, 4], [1, True, 3, 4]):
+        invalid_hello = copy.deepcopy(with_bytes)
+        invalid_hello["payload"]["capabilities"]["layer_artifacts"][0][
+            "layer_weight_bytes"
+        ] = invalid
+        with pytest.raises(WorkerProtocolError):
+            decode_message(invalid_hello)
+
+    wrong_level = copy.deepcopy(hello)
+    wrong_level["payload"]["capabilities"]["layer_weight_bytes"] = [1, 2, 3, 4]
+    with pytest.raises(WorkerProtocolError) as wrong_level_error:
+        decode_message(wrong_level)
+    assert wrong_level_error.value.code == "invalid_fields"
 
     bad_mode = copy.deepcopy(hello)
     bad_mode["payload"]["capabilities"]["layer_artifacts"][0][
@@ -245,6 +335,27 @@ def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
     with pytest.raises(WorkerProtocolError) as identity_error:
         decode_message(mismatched_identity)
     assert identity_error.value.code == "invalid_capabilities"
+
+    incomplete = copy.deepcopy(hello)
+    incomplete["payload"]["capabilities"]["layer_artifacts"][0].pop(
+        "tokenizer_sha256"
+    )
+    with pytest.raises(WorkerProtocolError) as incomplete_error:
+        decode_message(incomplete)
+    assert incomplete_error.value.code == "invalid_capabilities"
+
+    pytorch_segment = copy.deepcopy(hello)
+    pytorch_segment["payload"]["capabilities"]["engines"] = ["pytorch"]
+    pytorch_segment["payload"]["capabilities"]["models"][0]["engine"] = "pytorch"
+    pytorch_segment["payload"]["capabilities"]["models"][0]["format"] = "safetensors"
+    decode_message(pytorch_segment)
+    for engine, format_name in (("pytorch", "gguf"), ("llama_cpp", "safetensors")):
+        wrong_runtime = copy.deepcopy(hello)
+        wrong_runtime["payload"]["capabilities"]["engines"] = [engine]
+        wrong_runtime["payload"]["capabilities"]["models"][0].update(engine=engine, format=format_name)
+        with pytest.raises(WorkerProtocolError) as runtime_error:
+            decode_message(wrong_runtime)
+        assert runtime_error.value.code == "invalid_capabilities"
 
 
 def test_hello_capabilities_reject_invalid_node_segment_mode(golden):
@@ -446,6 +557,23 @@ def test_hello_capabilities_may_advertise_unusable_artifact_reasons():
     assert hello([unreadable]).payload["capabilities"][
         "layer_artifact_diagnostics"
     ] == [unreadable]
+
+    unavailable = {
+        **identity_fields,
+        "error_code": "fallback_storage_unavailable",
+        "manifest": "default-storage",
+        "architecture": "",
+        "mode": "",
+        "layer_range": None,
+    }
+    assert hello([unavailable]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [unavailable]
+
+    ambiguous = {**identity_fields, "error_code": "artifact_ambiguous"}
+    assert hello([ambiguous]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [ambiguous]
 
     # 空列表没有信息量：要么不给该键，要么给非空列表
     with pytest.raises(WorkerProtocolError) as empty:

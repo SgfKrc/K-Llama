@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -42,6 +43,28 @@ if hasattr(sys.stdout, "reconfigure"):
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _validate_model_preflight_metadata(
+    source_model_id: str | None,
+    tokenizer_sha256: str | None,
+) -> tuple[str, str, list[str]]:
+    problems: list[str] = []
+    if (source_model_id is None) != (tokenizer_sha256 is None):
+        problems.append("--source-model-id 与 --tokenizer-sha256 必须成对提供")
+        return source_model_id or "", tokenizer_sha256 or "", problems
+    if source_model_id is None:
+        return "", "", problems
+    if not _MODEL_ID_PATTERN.fullmatch(source_model_id):
+        problems.append(
+            "--source-model-id 必须匹配 ^[A-Za-z0-9_.:-]{1,128}$"
+        )
+    if not _SHA256_PATTERN.fullmatch(tokenizer_sha256):
+        problems.append("--tokenizer-sha256 必须是 64 位十六进制 SHA256")
+    return source_model_id, tokenizer_sha256.lower(), problems
 
 
 def _sha256(path: Path, chunk: int = 1 << 20) -> str:
@@ -278,7 +301,8 @@ def _validate_required_tensors(reader, identity: dict, *, k: int | None = None,
 
 def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int, *,
               end: int | None = None, keep_head: int | None = None,
-              kept_names: list[str] | None = None) -> dict:
+              kept_names: list[str] | None = None,
+              source_model_id: str = "", tokenizer_sha256: str = "") -> dict:
     """产出一份可复算的 manifest（三种模式都覆盖）。
 
     `mode=head` / `mode=middle` 时 `contract` 段**标记为不适用** —— `relay_contract.RelayTrimPlan`
@@ -324,6 +348,7 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
         "block_count": identity["block_count"],
         "n_layer": identity["n_layer"],
         "nextn_predict_layers": identity["nextn_predict_layers"],
+        "hidden_size": int(identity["n_embd"]),
         # ★ 2026-09-23：段在**源模型**里的层区间（half-open）与本地映射起点。
         "source_layer_range": source_layer_range,
         "trim_layers": trim,
@@ -333,6 +358,11 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
         "first_local_layer_maps_to": first_local,
         "artifact_sha256": _sha256(dst) if dst.exists() else "",
     }
+    if source_model_id and tokenizer_sha256:
+        result.update({
+            "source_model_id": source_model_id,
+            "tokenizer_sha256": tokenizer_sha256,
+        })
     # ★ `#67`-⑥：显式声明归属（下游不必靠"段类型 + 区间"反推）。
     if kept_names is not None:
         names = set(kept_names)
@@ -498,6 +528,10 @@ def main() -> int:
                     help="★ 保留**前 N 层**（blk.0..N-1，**不重命名**）⇒ 供「llama 当上游」"
                          "（上游段工件）。与 --k 互斥")
     ap.add_argument("--manifest", help="输出 manifest JSON 的路径")
+    ap.add_argument("--source-model-id", default=None,
+                    help="源模型稳定标识；必须与 --tokenizer-sha256 成对提供")
+    ap.add_argument("--tokenizer-sha256", default=None,
+                    help="tokenizer 内容 SHA256；必须与 --source-model-id 成对提供")
     ap.add_argument("--verify-manifest", help="校验模式：对照该 manifest 检查 --src 工件")
     ap.add_argument("--dry-run", action="store_true", help="只列出影响，不写文件")
     ap.add_argument("--hf-config", default=None,
@@ -505,6 +539,17 @@ def main() -> int:
                          "源的 layer_types 必须与 llama.cpp 按 full_attention_interval 重推的"
                          "序列一致，否则加载必报 missing tensor（fail-closed，拒绝产出坏工件）")
     args = ap.parse_args()
+
+    source_model_id, tokenizer_sha256, preflight_problems = (
+        _validate_model_preflight_metadata(
+            args.source_model_id,
+            args.tokenizer_sha256,
+        )
+    )
+    if preflight_problems:
+        for problem in preflight_problems:
+            print(f"FAIL: {problem}")
+        return 2
 
     src = Path(args.src)
     if not src.exists():
@@ -639,7 +684,9 @@ def main() -> int:
 
     manifest = _manifest(identity, args.k, dst, len(keep), len(drop),
                          end=args.end, keep_head=args.keep_head,
-                         kept_names=[new_name for _, new_name in keep])
+                         kept_names=[new_name for _, new_name in keep],
+                         source_model_id=source_model_id,
+                         tokenizer_sha256=tokenizer_sha256)
     if args.manifest:
         Path(args.manifest).write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                        encoding="utf-8")

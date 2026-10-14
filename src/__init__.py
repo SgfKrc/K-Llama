@@ -11,4 +11,4 @@
 - api_server: FastAPI 后端 + React 前端一体化服务
 """
 
-__version__ = "0.1.8.1"
+from .release_contract import PRODUCT_VERSION as __version__

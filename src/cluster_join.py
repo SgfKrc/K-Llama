@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from local_secret_store import LocalSecretStore, LocalSecretStoreError
+
 try:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import serialization
@@ -396,6 +398,10 @@ class JoinGrantLedger:
         self.path = str(path)
         self._lock = threading.RLock()
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        database_path = Path(self.path)
+        self._private_store = LocalSecretStore(
+            database_path.with_name("cluster_join_secrets.json")
+        )
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
@@ -404,6 +410,15 @@ class JoinGrantLedger:
                 CREATE TABLE IF NOT EXISTS cluster_join_grant_nonces (
                   nonce TEXT PRIMARY KEY,
                   grant_digest TEXT NOT NULL,
+                  consumed_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cluster_bootstrap_request_nonces (
+                  nonce TEXT PRIMARY KEY,
+                  request_digest TEXT NOT NULL,
                   consumed_at INTEGER NOT NULL
                 )
                 """
@@ -438,6 +453,30 @@ class JoinGrantLedger:
         connection.execute("PRAGMA synchronous=FULL")
         return connection
 
+    @staticmethod
+    def _secret_ref(name: str) -> str:
+        return f"local-secret-store:{name}"
+
+    def _store_private_key(self, name: str, private_key: str) -> str:
+        _unb64(private_key, field="private_key", expected_length=32)
+        self._private_store.set(name, private_key)
+        return self._secret_ref(name)
+
+    def _resolve_private_key(self, stored: str, *, name: str) -> tuple[str, bool]:
+        prefix = "local-secret-store:"
+        if stored.startswith(prefix):
+            reference = stored[len(prefix):]
+            if reference != name:
+                raise JoinContractError("private key reference mismatch", code="invalid_key")
+            try:
+                value = self._private_store.get(reference)
+            except LocalSecretStoreError as exc:
+                raise JoinContractError("private key store is unavailable", code="invalid_key") from exc
+            _unb64(value, field="private_key", expected_length=32)
+            return value, False
+        # One-time migration for pre-SEC-BOUNDARY ledgers.
+        return stored, True
+
     def consume(self, *, nonce: str, grant_digest: str, consumed_at: int | float | None = None) -> None:
         _unb64(nonce, field="nonce", expected_length=18)
         if not re.fullmatch(r"[0-9a-f]{64}", grant_digest):
@@ -456,6 +495,33 @@ class JoinGrantLedger:
                 (nonce, grant_digest, timestamp),
             )
 
+    def consume_bootstrap_request(
+        self,
+        *,
+        nonce: str,
+        request_digest: str,
+        consumed_at: int | float | None = None,
+    ) -> None:
+        """Atomically fence one encrypted bootstrap credential request."""
+        _unb64(nonce, field="credential_request_nonce", expected_length=18)
+        if not re.fullmatch(r"[0-9a-f]{64}", str(request_digest)):
+            raise JoinContractError("bootstrap request digest is invalid", code="invalid_request")
+        timestamp = _now_seconds(consumed_at)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT request_digest FROM cluster_bootstrap_request_nonces WHERE nonce = ?",
+                (nonce,),
+            ).fetchone()
+            if existing is not None:
+                raise JoinContractError(
+                    "bootstrap request nonce was already consumed", code="nonce_replayed"
+                )
+            connection.execute(
+                "INSERT INTO cluster_bootstrap_request_nonces(nonce, request_digest, consumed_at) VALUES (?, ?, ?)",
+                (nonce, request_digest, timestamp),
+            )
+
     def get_or_create_issuer_keypair(self, key_id: str = "main") -> tuple[str, JoinKeyPair]:
         """Return the durable main-node signing key owned by this SQLite store."""
         _safe_id(key_id, field="key_id", pattern=_SAFE_KEY_ID)
@@ -464,13 +530,27 @@ class JoinGrantLedger:
                 "SELECT key_id, private_key, public_key FROM cluster_join_keys WHERE key_scope = 'issuer'"
             ).fetchone()
             if row is not None:
+                key_id_value = str(row["key_id"])
+                secret_name = f"join_issuer:{key_id_value}"
+                private_key, migrate = self._resolve_private_key(
+                    str(row["private_key"]), name=secret_name,
+                )
+                if migrate:
+                    reference = self._store_private_key(secret_name, private_key)
+                    connection.execute(
+                        "UPDATE cluster_join_keys SET private_key = ?, updated_at = ? WHERE key_scope = 'issuer'",
+                        (reference, _now_seconds(None)),
+                    )
                 return str(row["key_id"]), JoinKeyPair(
-                    private_key=str(row["private_key"]), public_key=str(row["public_key"])
+                    private_key=private_key, public_key=str(row["public_key"])
                 )
             pair = generate_join_keypair()
+            private_ref = self._store_private_key(
+                f"join_issuer:{key_id}", pair.private_key,
+            )
             connection.execute(
                 "INSERT INTO cluster_join_keys(key_scope, key_id, private_key, public_key, updated_at) VALUES ('issuer', ?, ?, ?, ?)",
-                (key_id, pair.private_key, pair.public_key, _now_seconds(None)),
+                (key_id, private_ref, pair.public_key, _now_seconds(None)),
             )
             return key_id, pair
 
@@ -480,6 +560,8 @@ class JoinGrantLedger:
             raise JoinContractError("pending key does not match request target", code="request_mismatch")
         _unb64(keypair.private_key, field="private_key", expected_length=32)
         _unb64(keypair.public_key, field="public_key", expected_length=32)
+        secret_name = f"join_pending:{request['request_digest']}"
+        private_ref = self._store_private_key(secret_name, keypair.private_key)
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -492,7 +574,7 @@ class JoinGrantLedger:
                 (
                     str(request["request_digest"]),
                     json.dumps(dict(request), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                    keypair.private_key,
+                    private_ref,
                     keypair.public_key,
                     _now_seconds(None),
                 ),
@@ -511,9 +593,21 @@ class JoinGrantLedger:
         try:
             request = json.loads(str(row["request_json"]))
             encode_join_request(request)
-        except (JoinContractError, json.JSONDecodeError, TypeError):
+            private_key, migrate = self._resolve_private_key(
+                str(row["private_key"]), name=f"join_pending:{request_digest}",
+            )
+            if migrate:
+                reference = self._store_private_key(
+                    f"join_pending:{request_digest}", private_key,
+                )
+                with self._lock, self._connect() as connection:
+                    connection.execute(
+                        "UPDATE cluster_join_pending_requests SET private_key = ? WHERE request_digest = ?",
+                        (reference, request_digest),
+                    )
+        except (JoinContractError, LocalSecretStoreError, json.JSONDecodeError, TypeError):
             return None
-        return request, JoinKeyPair(private_key=str(row["private_key"]), public_key=str(row["public_key"]))
+        return request, JoinKeyPair(private_key=private_key, public_key=str(row["public_key"]))
 
     def delete_pending_request(self, request_digest: str) -> None:
         with self._lock, self._connect() as connection:
@@ -521,6 +615,7 @@ class JoinGrantLedger:
                 "DELETE FROM cluster_join_pending_requests WHERE request_digest = ?",
                 (request_digest,),
             )
+        self._private_store.delete(f"join_pending:{request_digest}")
 
 
 def verify_and_consume_join_grant(

@@ -149,59 +149,113 @@ def test_snapshot_and_summary_are_serializable():
     }) == {PHASE_RELEASED: 1}
 
 
-def test_consistency_check_flags_the_three_divergences():
-    """权威视图 vs 旧集合判据：三种分歧各有具名原因，且只观测、不决定行为。"""
-    from worker_assignment_state import (
-        DIVERGENCE_READY_BUT_NOT_PUSHED,
-        DIVERGENCE_STATE_MISSING,
-        DIVERGENCE_TERMINAL_BUT_PUSHED,
-        evaluate_assignment_consistency,
-    )
-
-    # 一致：既无权威状态、也无旧期望
-    assert evaluate_assignment_consistency(
-        None, legacy_pushed=False, has_expected=False,
-    ).consistent
-
-    # 分歧①：旧期望在、权威视图没有
-    verdict = evaluate_assignment_consistency(
-        None, legacy_pushed=False, has_expected=True,
-    )
-    assert not verdict.consistent
-    assert verdict.reason_code == DIVERGENCE_STATE_MISSING
-
-    # 分歧②：终止态 vs 旧 pushed
+def test_registry_owns_expected_contract_and_receipt_by_assignment_identity():
     registry, _ = _registry()
-    registry.begin("w", config_id="c")
-    registry.release("w", reason_code="config_cleared")
-    verdict = evaluate_assignment_consistency(
-        registry.state("w"), legacy_pushed=True, has_expected=True,
+    source = {
+        "config_id": "cfg-1",
+        "generation": 7,
+        "layer_range": [8, 24],
+    }
+
+    state = registry.begin(
+        "worker_01",
+        config_id="cfg-1",
+        connection_generation=3,
+        expected_config=source,
     )
-    assert verdict.reason_code == DIVERGENCE_TERMINAL_BUT_PUSHED
+    source["layer_range"][0] = 99
 
-    # 分歧③：ready 相位 vs 旧未 pushed
-    ready_registry, _ = _registry()
-    ready_registry.begin("w", config_id="c")
-    ready_registry.transition("w", phase=PHASE_READY)
-    verdict = evaluate_assignment_consistency(
-        ready_registry.state("w"), legacy_pushed=False, has_expected=True,
+    expected = registry.expected("worker_01")
+    assert expected["assignment_id"] == state.assignment_id
+    assert expected["layer_range"] == [8, 24]
+    assert registry.identity_matches(
+        "worker_01",
+        assignment_id=state.assignment_id,
+        config_id="cfg-1",
+        generation=7,
     )
-    assert verdict.reason_code == DIVERGENCE_READY_BUT_NOT_PUSHED
+    assert not registry.identity_matches(
+        "worker_01",
+        assignment_id="asg_stale",
+        config_id="cfg-1",
+        generation=7,
+    )
 
-    # 一致：pushing 相位 + 旧未 pushed（ACK 还没到，两边都"未就绪"）
-    assert evaluate_assignment_consistency(
-        ready_registry.state("w") if False else None,
-        legacy_pushed=False,
-        has_expected=False,
-    ).consistent
+    assert registry.record_ack("worker_01", {
+        "assignment_id": "asg_stale",
+        "config_id": "cfg-1",
+        "generation": 7,
+        "status": "ready",
+    }) is None
+    assert registry.acknowledgement("worker_01") == {}
+
+    receipt = {
+        "assignment_id": state.assignment_id,
+        "config_id": "cfg-1",
+        "generation": 7,
+        "status": "ready",
+    }
+    assert registry.record_ack("worker_01", receipt) is not None
+    receipt["status"] = "error"
+    assert registry.acknowledgement("worker_01")["status"] == "ready"
 
 
-def test_legacy_ready_ack_advances_the_authority_view():
-    """legacy ready ACK 也要推进权威视图 —— 这是"降级为派生视图"的前置不变量。
+def test_prepare_to_commit_updates_contract_without_changing_assignment_id():
+    registry, _ = _registry()
+    prepared = registry.begin(
+        "worker_01",
+        expected_config={
+            "config_id": "cfg-1",
+            "generation": 7,
+            "phase": "prepare",
+        },
+    )
 
-    此前只有 release 类配置的分支推进相位，registry 长期停在 `pushing`，派生集合会漏掉
-    这类节点（回归实测：`test_push_waits_for_worker_load_ack` 一收紧就变红）。
-    """
+    committed = registry.update_expected("worker_01", {
+        "config_id": "cfg-1",
+        "generation": 7,
+        "phase": "commit",
+    })
+
+    assert committed is not None
+    assert committed.assignment_id == prepared.assignment_id
+    assert registry.expected("worker_01")["assignment_id"] == prepared.assignment_id
+    assert registry.expected("worker_01")["phase"] == "commit"
+    assert registry.acknowledgement("worker_01") == {}
+
+
+def test_snapshot_restore_preserves_contract_receipt_and_assignment_identity():
+    registry, _ = _registry()
+    state = registry.begin(
+        "worker_01",
+        connection_generation=4,
+        expected_config={"config_id": "cfg-1", "generation": 9},
+    )
+    registry.record_ack("worker_01", {
+        "assignment_id": state.assignment_id,
+        "config_id": "cfg-1",
+        "generation": 9,
+        "status": "ready",
+    })
+    registry.transition("worker_01", phase=PHASE_READY)
+    snapshot = registry.snapshot()
+
+    registry.begin(
+        "worker_01",
+        expected_config={"config_id": "cfg-2", "generation": 10},
+    )
+    registry.restore(snapshot)
+
+    restored = registry.state("worker_01")
+    assert restored is not None
+    assert restored.assignment_id == state.assignment_id
+    assert restored.connection_generation == 4
+    assert restored.phase == PHASE_READY
+    assert registry.expected("worker_01")["config_id"] == "cfg-1"
+    assert registry.acknowledgement("worker_01")["status"] == "ready"
+
+
+def test_versioned_ready_ack_advances_the_authority_view():
     sched = Scheduler()
     config = {
         "config_id": "cfg-1", "generation": 11, "nodes": [],
@@ -210,9 +264,12 @@ def test_legacy_ready_ack_advances_the_authority_view():
         "model_sha256": "a" * 64, "model_type": "qwen2", "engine": "pytorch",
     }
     sched._publish_layer_configs({"worker_01": config})
+    expected = sched._worker_assignments.expected("worker_01")
 
     sched._handle_layer_config_ack("worker_01", {"data": {
-        "node_id": "worker_01", "config_id": "cfg-1", "generation": 11,
+        "node_id": "worker_01",
+        "assignment_id": expected["assignment_id"],
+        "config_id": "cfg-1", "generation": 11,
         "status": "ready", "phase": "commit", "plan_id": "plan-1",
         "layer_range": [8, 24], "model_sha256": "a" * 64, "model_type": "qwen2",
         "engine": "pytorch",
@@ -227,8 +284,7 @@ def test_legacy_ready_ack_advances_the_authority_view():
     assert derived == set(sched._layer_config_pushed)
 
 
-def test_retry_scan_is_not_blocked_by_a_stale_pushed_entry():
-    """陈旧 pushed（权威视图已终止）不再阻止重发 —— 否则该节点永远等不到配置。"""
+def test_retry_scan_ignores_terminal_assignments():
     sched = Scheduler()
     registry = sched._worker_assignments
     sent = []
@@ -244,14 +300,15 @@ def test_retry_scan_is_not_blocked_by_a_stale_pushed_entry():
 
     sched._tcp_server = _Server()
     with sched._layer_config_lock:
-        sched._layer_config_expected["stale"] = {"config_id": "c", "generation": 1}
         sched._layer_config_retry_state["stale"] = {"attempts": 0, "next_retry": 0.0}
-        # 陈旧证据：旧集合曾有该节点，但权威视图已终止（派生视图不再包含）
-        registry.begin("stale", config_id="c")
+        registry.begin(
+            "stale",
+            expected_config={"config_id": "c", "generation": 1},
+        )
         registry.release("stale", reason_code=REASON_CONFIG_CLEARED)
 
-    assert sched._retry_pending_layer_configs(now=1_000_000.0) == 1
-    assert sent and sent[0][0] == "stale"
+    assert sched._retry_pending_layer_configs(now=1_000_000.0) == 0
+    assert sent == []
 
 
 def test_retry_scan_still_skips_genuinely_pushed_nodes():
@@ -271,138 +328,29 @@ def test_retry_scan_still_skips_genuinely_pushed_nodes():
 
     sched._tcp_server = _Server()
     with sched._layer_config_lock:
-        sched._layer_config_expected["fresh"] = {"config_id": "c", "generation": 1}
         sched._layer_config_retry_state["fresh"] = {"attempts": 0, "next_retry": 0.0}
-        registry.begin("fresh", config_id="c")
+        registry.begin(
+            "fresh",
+            expected_config={"config_id": "c", "generation": 1},
+        )
         registry.transition("fresh", phase=PHASE_ACKED)
 
     assert sched._retry_pending_layer_configs(now=1_000_000.0) == 0
     assert sent == []
 
 
-def test_recovery_fence_observes_divergence_without_changing_the_verdict(caplog):
-    """观测点：分歧进日志，判据不变（这是"先让分歧可见、再切读路径"的落点）。"""
+def test_pushed_view_and_ready_nodes_are_derived_only_from_registry():
     sched = Scheduler()
-    registry = sched._worker_assignments
-    registry.begin("worker_01", config_id="cfg-1")
-    registry.release("worker_01", reason_code=REASON_CONFIG_CLEARED)
-
-    with caplog.at_level("WARNING", logger="scheduler"):
-        sched._observe_assignment_state_consistency(
-            "worker_01", legacy_pushed=True, expected={"config_id": "cfg-1"},
-        )
-
-    assert "event=worker_assignment_state_divergence" in caplog.text
-    assert "terminal_state_but_legacy_pushed" in caplog.text
-
-    caplog.clear()
-    with caplog.at_level("WARNING", logger="scheduler"):
-        sched._observe_assignment_state_consistency(
-            "worker_01", legacy_pushed=False, expected={},
-        )
-    assert "worker_assignment_state_divergence" not in caplog.text
-
-
-def test_ack_record_also_observed_without_changing_verdict(caplog):
-    """★ 2026-10-08（DIST-1 推进）：第三个旧集合 `_layer_config_acks` 也纳入一致性观测。
-
-    判据：有 ACK 记录而权威视图**无状态** ⇒ 记 `state_missing_but_legacy_expected`
-    （与 `has_expected` 同类："旧集合说有、权威视图没有"）；并且**不改判据** ——
-    只增一条可见事件，`_layer_config_expected` 等集合不被本观测改动。
-    """
-    sched = Scheduler()
-    sched._layer_config_acks["worker_01"] = {"config_id": "cfg-1"}
-    before_expected = dict(sched._layer_config_expected)
-
-    with caplog.at_level("WARNING", logger="scheduler"):
-        sched._observe_assignment_state_consistency(
-            "worker_01", legacy_pushed=False, expected={},
-        )
-
-    assert "event=worker_assignment_state_divergence" in caplog.text
-    assert "state_missing_but_legacy_expected" in caplog.text
-    # 只观测：不得改动任何旧集合
-    assert dict(sched._layer_config_expected) == before_expected
-    assert sched._layer_config_acks["worker_01"] == {"config_id": "cfg-1"}
-
-    # 没有 ack 记录时不得凭空产生分歧（回归"不谎报"）
-    caplog.clear()
-    with caplog.at_level("WARNING", logger="scheduler"):
-        sched._observe_assignment_state_consistency(
-            "worker_09", legacy_pushed=False, expected={},
-        )
-    assert "worker_assignment_state_divergence" not in caplog.text
-
-
-def test_pushed_equivalence_mapping_and_effective_verdict(caplog):
-    """`_layer_config_pushed` 的等价映射，以及"读路径切换"的保守规则。"""
-    from worker_assignment_state import pushed_from_state
-
-    registry, _ = _registry()
-    # 无记录 ⇒ 无从推导
-    assert pushed_from_state(None) is None
-    # 未 ACK 的相位 ⇒ **未知**（不等于否定：旧集合可能由其它路径维护）
-    registry.begin("w_pushing", config_id="c")
-    assert pushed_from_state(registry.state("w_pushing")) is None
-    # ACK 之后 ⇒ True（与 `_layer_config_pushed.add` 的语义等价）
-    registry.transition("w_pushing", phase=PHASE_ACKED)
-    assert pushed_from_state(registry.state("w_pushing")) is True
-    registry.transition("w_pushing", phase=PHASE_READY)
-    assert pushed_from_state(registry.state("w_pushing")) is True
-    # 终止态 ⇒ False
-    registry.release("w_pushing", reason_code=REASON_CONFIG_CLEARED)
-    assert pushed_from_state(registry.state("w_pushing")) is False
-
-    sched = Scheduler()
-    # ① 无记录 ⇒ 沿用旧集合
-    assert sched._effective_layer_config_pushed("unknown_node", True) is True
-    assert sched._effective_layer_config_pushed("unknown_node", False) is False
-
-    # ② 等价场景 ⇒ 读权威视图（结果与旧集合一致）
+    assert sched._effective_layer_config_pushed("unknown_node", True) is False
     sched._worker_assignments.begin("w_acked", config_id="c")
     sched._worker_assignments.transition("w_acked", phase=PHASE_ACKED)
     assert sched._effective_layer_config_pushed("w_acked", True) is True
-    assert sched._effective_layer_config_pushed("w_acked", False) is False
-
-    # ③ 收紧了场景 ⇒ 权威视图判否 ⇒ 不再算 pushed（排除陈旧项），且观测点已留证据
     sched._worker_assignments.begin("w_released", config_id="c")
     sched._worker_assignments.release("w_released", reason_code=REASON_CONFIG_CLEARED)
-    with caplog.at_level("WARNING", logger="scheduler"):
-        sched._observe_assignment_state_consistency(
-            "w_released", legacy_pushed=True, expected={"config_id": "c"},
-        )
-        verdict = sched._effective_layer_config_pushed("w_released", True)
-    assert verdict is False                      # 陈旧项被排除（收紧）
-    assert "terminal_state_but_legacy_pushed" in caplog.text
-
-    # ④ **不放宽**：权威视图判真、旧集合判假 ⇒ 保持旧值（放宽集合会改 readiness 结论）
-    sched._worker_assignments.begin("w_acked2", config_id="c")
-    sched._worker_assignments.transition("w_acked2", phase=PHASE_ACKED)
-    assert sched._effective_layer_config_pushed("w_acked2", False) is False
-
-
-def test_ready_node_set_excludes_stale_entries_and_never_widens(caplog):
-    """readiness 的 ready 集合：陈旧 pushed 被排除、无记录项保留、权威独有项不加入。"""
-    sched = Scheduler()
-    registry = sched._worker_assignments
-    registry.begin("stale", config_id="c")
-    registry.release("stale", reason_code=REASON_CONFIG_CLEARED)
-    registry.begin("fresh", config_id="c")
-    registry.transition("fresh", phase=PHASE_ACKED)
-    registry.begin("authority_only", config_id="c")
-    registry.transition("authority_only", phase=PHASE_ACKED)
-
-    with caplog.at_level("WARNING", logger="scheduler"):
-        ready = sched._effective_layer_config_pushed_nodes(
-            {"stale", "fresh", "legacy_only"},
-            {"fresh": {"config_id": "c"}, "authority_only": {"config_id": "c"}},
-        )
-
-    # stale：旧集合有、权威视图已 released ⇒ 排除
-    # legacy_only：无 assignment 记录 ⇒ 沿用旧集合（不当作未就绪）
-    # authority_only：权威说 pushed 但旧集合没有 ⇒ 不放宽（只记事件）
-    assert ready == {"fresh", "legacy_only"}
-    assert "worker_assignment_state_divergence" in caplog.text
+    assert sched._effective_layer_config_pushed("w_released", True) is False
+    assert sched._effective_layer_config_pushed_nodes(
+        {"legacy_only"}, {"legacy_only": {"config_id": "legacy"}},
+    ) == {"w_acked"}
 
 
 def test_scheduler_write_paths_feed_the_authority_view():
@@ -423,6 +371,7 @@ def test_scheduler_write_paths_feed_the_authority_view():
     assert state.phase == PHASE_PUSHING
     assert state.config_id == "cfg-1"
     assert state.assignment_id.startswith("asg_")
+    assert registry.expected("worker_01")["assignment_id"] == state.assignment_id
 
     # 清配置 ⇒ 终止态 + 单一 reason
     sched._clear_layer_config_state("worker_01")
@@ -450,6 +399,99 @@ def test_reconfiguration_replaces_the_previous_assignment():
     assert registry.state("worker_01").reason_code == REASON_RECONFIGURED
 
 
+def test_stale_same_config_generation_ack_cannot_advance_new_assignment():
+    sched = Scheduler()
+    config = {
+        "config_id": "cfg-1", "generation": 11, "phase": "commit",
+        "plan_id": "plan-1", "start_layer": 8, "end_layer": 24,
+        "model_sha256": "a" * 64, "model_type": "qwen2", "engine": "pytorch",
+    }
+    sched._publish_layer_configs({"worker_01": dict(config)})
+    old_id = sched._worker_assignments.assignment_id("worker_01")
+    sched._publish_layer_configs({"worker_01": dict(config)})
+    current = sched._worker_assignments.state("worker_01")
+    assert current.assignment_id != old_id
+
+    sched._handle_layer_config_ack("worker_01", {"data": {
+        "node_id": "worker_01", "assignment_id": old_id,
+        "config_id": "cfg-1", "generation": 11,
+        "status": "ready", "phase": "commit", "plan_id": "plan-1",
+        "layer_range": [8, 24], "model_sha256": "a" * 64,
+        "model_type": "qwen2", "engine": "pytorch",
+    }})
+
+    assert sched._worker_assignments.phase("worker_01") == PHASE_PUSHING
+    assert sched._worker_assignments.acknowledgement("worker_01") == {}
+    assert "worker_01" in sched._layer_config_retry_state
+
+
+def test_versioned_ack_without_assignment_id_fails_closed():
+    sched = Scheduler()
+    sched._publish_layer_configs({"worker_01": {
+        "config_id": "cfg-1", "generation": 11, "phase": "commit",
+        "start_layer": 0, "end_layer": 1,
+        "model_sha256": "a" * 64, "model_type": "qwen2", "engine": "pytorch",
+    }})
+
+    sched._handle_layer_config_ack("worker_01", {"data": {
+        "node_id": "worker_01", "config_id": "cfg-1", "generation": 11,
+        "status": "ready", "phase": "commit", "layer_range": [0, 1],
+        "model_sha256": "a" * 64, "model_type": "qwen2", "engine": "pytorch",
+    }})
+
+    assert sched._worker_assignments.phase("worker_01") == PHASE_PUSHING
+    assert sched._worker_assignments.acknowledgement("worker_01") == {}
+
+
+def test_retry_reuses_the_same_assignment_identity():
+    sched = Scheduler()
+    sent = []
+
+    class _Server:
+        _running = True
+
+        def get_client_ids(self):
+            return ["worker_01"]
+
+        def send_layer_config(self, node_id, payload):
+            sent.append((node_id, dict(payload)))
+
+    sched._tcp_server = _Server()
+    sched._publish_layer_configs({"worker_01": {
+        "config_id": "cfg-1", "generation": 11, "release": True,
+    }})
+    assignment_id = sched._worker_assignments.assignment_id("worker_01")
+    sched._layer_config_retry_state["worker_01"]["next_retry"] = 0.0
+
+    assert sched._retry_pending_layer_configs(now=1_000_000.0) == 1
+    assert len(sent) == 2
+    assert {payload["assignment_id"] for _, payload in sent} == {assignment_id}
+
+
+def test_late_release_ack_cannot_clear_replacement_assignment():
+    sched = Scheduler()
+    sched._publish_layer_configs({"worker_01": {
+        "config_id": "cfg-release", "generation": 11, "release": True,
+    }})
+    old = sched._worker_assignments.expected("worker_01")
+    sched._publish_layer_configs({"worker_01": {
+        "config_id": "cfg-new", "generation": 12,
+        "phase": "commit", "start_layer": 0, "end_layer": 1,
+        "model_sha256": "a" * 64, "model_type": "qwen2", "engine": "pytorch",
+    }})
+
+    sched._handle_layer_config_ack("worker_01", {"data": {
+        "node_id": "worker_01", "assignment_id": old["assignment_id"],
+        "config_id": "cfg-release", "generation": 11,
+        "status": "released", "release": True,
+    }})
+
+    current = sched._worker_assignments.state("worker_01")
+    assert current.config_id == "cfg-new"
+    assert current.phase == PHASE_PUSHING
+    assert "worker_01" in sched._layer_config_retry_state
+
+
 def test_ack_path_reaches_acked_and_released_states():
     """ACK 路径：非 released ⇒ acked；released ⇒ 终止态（reason=worker_released）。"""
     sched = Scheduler()
@@ -462,8 +504,10 @@ def test_ack_path_reaches_acked_and_released_states():
     })
 
     def ack(**extra):
+        assignment_id = registry.assignment_id("worker_01")
         return {"data": {
             "node_id": "worker_01",
+            "assignment_id": assignment_id,
             "config_id": "cfg-1",
             "generation": 11,
             **extra,

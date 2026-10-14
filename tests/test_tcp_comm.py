@@ -123,6 +123,46 @@ class TestRegistrationAuthentication:
         auth = tcp_comm_mod.build_auth_signature("client-auth", timestamp=999.0)
         assert tcp_comm_mod.verify_auth_signature("client-auth", auth) == (True, "ok")
 
+    def test_registration_nonce_is_consumed_once_across_connections(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret_epoch", lambda: 7)
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 1000.0)
+        guard = tcp_comm_mod.RegistrationReplayGuard()
+        auth = tcp_comm_mod.build_auth_signature(
+            "client-auth", timestamp=999.0, secret_epoch=7,
+        )
+
+        assert tcp_comm_mod.verify_auth_signature(
+            "client-auth", auth, replay_guard=guard,
+        ) == (True, "ok")
+        replay_ok, replay_reason = tcp_comm_mod.verify_auth_signature(
+            "client-auth", auth, replay_guard=guard,
+        )
+        assert replay_ok is False
+        assert "replay" in replay_reason
+
+    @pytest.mark.parametrize("timestamp", [True, "1000", float("nan"), float("inf")])
+    def test_registration_rejects_non_finite_or_non_numeric_timestamp(
+        self, monkeypatch, timestamp,
+    ):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        auth = tcp_comm_mod.build_auth_signature("client-auth", timestamp=1000.0)
+        auth["auth_timestamp"] = timestamp
+        ok, reason = tcp_comm_mod.verify_auth_signature("client-auth", auth)
+        assert ok is False
+        assert "时间戳" in reason
+
+    def test_registration_rejects_old_secret_epoch(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret_epoch", lambda: 3)
+        auth = tcp_comm_mod.build_auth_signature(
+            "client-auth", timestamp=1000.0, secret_epoch=2,
+        )
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 1000.0)
+        ok, reason = tcp_comm_mod.verify_auth_signature("client-auth", auth)
+        assert ok is False
+        assert "epoch" in reason
+
 
 # ================================================================
 # pack_data / unpack_header 测试
@@ -248,7 +288,7 @@ class TestMessageType:
         assert actual == expected
 
     def test_chain_forward_type(self):
-        """链式直连转发类型（P2 优化）"""
+        """master 向下一逻辑段转发的消息类型保持 wire 兼容。"""
         assert MessageType.CHAIN_FORWARD.value == "chain_forward"
 
     def test_chain_forward_ack_type(self):
@@ -805,8 +845,9 @@ class TestTCPServerConnectionManagement:
             thread.join(timeout=2)
             server.stop()
 
-    def test_registration_uses_advertised_endpoint_not_peer_port(self):
+    def test_registration_uses_advertised_endpoint_not_peer_port(self, monkeypatch):
         """节点服务地址应使用 advertised_address，peer_addr 保留临时源端口。"""
+        monkeypatch.setenv("QLH_ALLOW_UNPROTECTED_CLUSTER_TCP", "1")
         server = TCPServer(host="127.0.0.1", port=0)
         srv_sock, cli_sock = socket.socketpair()
         try:
@@ -835,8 +876,9 @@ class TestTCPServerConnectionManagement:
             srv_sock.close()
             cli_sock.close()
 
-    def test_legacy_registration_falls_back_to_server_port(self):
+    def test_legacy_registration_falls_back_to_server_port(self, monkeypatch):
         """旧客户端未上报 advertised_port 时应使用 peer_ip:SERVER_PORT，而不是临时端口。"""
+        monkeypatch.setenv("QLH_ALLOW_UNPROTECTED_CLUSTER_TCP", "1")
         server = TCPServer(host="127.0.0.1", port=0)
         srv_sock, cli_sock = socket.socketpair()
         try:
@@ -940,6 +982,36 @@ class TestTCPServerConnectionManagement:
             payload = recv_exact(cli_sock, unpack_header(header))
             ack = parse_message(payload)
             assert ack["data"]["status"] == "rejected"
+            assert server.get_client_ids() == []
+        finally:
+            srv_sock.close()
+            cli_sock.close()
+
+    def test_registration_rejects_legacy_pipeline_peer(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            client_id = "client-peer"
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": client_id,
+                    "role": "client",
+                    "node_type": "pipeline_peer",
+                    "auth": tcp_comm_mod.build_auth_signature(client_id),
+                },
+            }
+            with pytest.raises(tcp_comm_mod._RegistrationRejected):
+                server._handle_registration(
+                    srv_sock, ("127.0.0.1", 54321), "pending_54321", msg,
+                )
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["data"]["status"] == "rejected"
+            assert "pipeline_peer" in ack["data"]["reason"]
             assert server.get_client_ids() == []
         finally:
             srv_sock.close()
@@ -1094,6 +1166,111 @@ class TestTCPServerConnectionManagement:
             assert server.get_client_ids() == []
         finally:
             cli_sock.close()
+
+    def test_disconnect_all_clients_fences_then_closes_and_notifies(self):
+        class FakeSock:
+            def __init__(self):
+                self.shutdown_called = False
+                self.closed = False
+
+            def shutdown(self, _how):
+                self.shutdown_called = True
+
+            def close(self):
+                self.closed = True
+
+        server = TCPServer(host="127.0.0.1", port=0)
+        first_sock = FakeSock()
+        second_sock = FakeSock()
+        first = ClientConn("client-a", first_sock, ("127.0.0.1", 1))
+        second = ClientConn("client-b", second_sock, ("127.0.0.1", 2))
+        first.registration_confirmed = True
+        events = []
+        server.clients = {"client-a": first, "client-b": second}
+        server._pending_registrations = {"client-b": second}
+        server.on_disconnect = lambda client_id: events.append(("disconnect", client_id))
+
+        def rotate():
+            events.append(("rotate", None))
+            return "new-secret", 2
+
+        rotation, count = server.disconnect_all_clients(
+            "credential rotation", before_disconnect=rotate,
+        )
+
+        assert rotation == ("new-secret", 2)
+        assert count == 2
+        assert events[0] == ("rotate", None)
+        assert set(events[1:]) == {
+            ("disconnect", "client-a"),
+            ("disconnect", "client-b"),
+        }
+        assert server.clients == {}
+        assert server._pending_registrations == {}
+        assert first_sock.shutdown_called and first_sock.closed
+        assert second_sock.shutdown_called and second_sock.closed
+
+    def test_registration_verified_before_rotation_cannot_publish_after_cutover(
+        self, monkeypatch,
+    ):
+        class FakeSock:
+            def __init__(self):
+                self.packets = []
+
+            def sendall(self, packet):
+                self.packets.append(packet)
+
+        server = TCPServer(host="127.0.0.1", port=0)
+        epoch = {"value": 1}
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+        monkeypatch.setattr(
+            tcp_comm_mod, "_get_cluster_secret_epoch", lambda: epoch["value"],
+        )
+
+        def delayed_verify(*_args, **_kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return True, "ok"
+
+        monkeypatch.setattr(tcp_comm_mod, "verify_auth_signature", delayed_verify)
+        sock = FakeSock()
+
+        def register():
+            try:
+                server._handle_registration(
+                    sock,
+                    ("127.0.0.1", 10001),
+                    "pending_10001",
+                    {"data": {
+                        "client_id": "client-race",
+                        "role": "client",
+                        "node_type": "pc",
+                        "auth": {"auth_secret_epoch": 1},
+                    }},
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=register, daemon=True)
+        thread.start()
+        assert entered.wait(timeout=5)
+
+        def rotate():
+            epoch["value"] = 2
+            return "new-secret", 2
+
+        server.disconnect_all_clients(
+            "credential rotation", before_disconnect=rotate,
+        )
+        release.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], tcp_comm_mod._RegistrationRejected)
+        assert server.get_client_ids() == []
 
     def test_scheduler_confirmed_registration_returns_registered(self):
         """REGISTER 只有在上层调度器确认后才返回 registered。"""

@@ -247,12 +247,38 @@ class TestLazyModelManager:
         fake_module.get_gguf_model_path = lambda: str(model_path)
         monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
 
+        monkeypatch.setattr(
+            ModelHost,
+            "select_engine",
+            lambda self, profile=None: "llama_cpp",
+        )
         host = ModelHost()
-        monkeypatch.setattr(host, "select_engine", lambda profile=None: "llama_cpp")
         host.load_model(model_path=str(model_path), engine=None)
 
         assert host.is_loaded is True
         assert host.engine_type == "llama_cpp"
+        assert host.current_quant == "gguf"
+
+    def test_explicit_llama_path_cannot_fall_back_to_global_gguf(
+            self, monkeypatch, tmp_path):
+        foreign = tmp_path / "foreign.gguf"
+        foreign.write_bytes(b"foreign")
+
+        class FakeGguf:
+            def load_model(self, **_kwargs):
+                raise AssertionError("非 GGUF 显式路径不得回退并加载全局工件")
+
+        fake_module = types.ModuleType("llama_engine")
+        fake_module.LlamaCppEngine = FakeGguf
+        fake_module.get_gguf_model_path = lambda: str(foreign)
+        monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
+
+        host = ModelHost()
+        with pytest.raises(ValueError, match="只接受显式 GGUF"):
+            host.load_model(
+                model_path=str(tmp_path / "safetensors-model"),
+                engine="llama_cpp",
+            )
 
     def test_prepare_gguf_pipeline_does_not_materialize_torch_manager(
             self, monkeypatch, tmp_path):
@@ -376,6 +402,320 @@ class TestLazyModelManager:
         assert host.ensure_full_model() is None
 
 
+class TestPipelineCandidateTransaction:
+    class _Manager:
+        engine_type = "pytorch"
+
+        def __init__(self, name, *, loaded=False):
+            self.name = name
+            self.is_loaded = loaded
+            self.prepare_calls = []
+            self.materialize_calls = []
+            self.tokenizer_calls = 0
+            self.closed = 0
+
+        def prepare_pipeline_model(self, **kwargs):
+            self.prepare_calls.append(kwargs)
+            self.quant_type = kwargs.get("quant_type") or "int4"
+            self.is_pipeline_prepared = True
+            return {
+                "model_id": kwargs["model_id"],
+                "model_sha256": kwargs.get("model_sha256") or "a" * 64,
+            }
+
+        def load_layer_range(self, **kwargs):
+            self.materialize_calls.append(kwargs)
+            self.is_loaded = True
+            return {
+                "success": True,
+                "layer_start": kwargs["start_layer"],
+                "layer_end": kwargs["end_layer"],
+            }
+
+        def prepare_pipeline_tokenizer(self):
+            self.tokenizer_calls += 1
+            return {"success": True, "tokenizer": True}
+
+        def unload_model(self):
+            self.closed += 1
+            self.is_loaded = False
+
+    @staticmethod
+    def _set_active_mirrors(host):
+        object.__setattr__(host, "model_loaded", True)
+        object.__setattr__(host, "current_quant", "old-quant")
+        object.__setattr__(host, "_engine_type", "old-engine")
+        object.__setattr__(host, "quant_type", "old-quant")
+        object.__setattr__(host, "model_path", "old-path")
+        object.__setattr__(host, "active_model_id", "old-model")
+        object.__setattr__(host, "_active_model_id", "old-model")
+
+    def _prepare_and_materialize(self, host, model_dir, transaction_id="txn-1"):
+        descriptor = host.prepare_pipeline_candidate(
+            transaction_id,
+            "new-model",
+            str(model_dir),
+            quant_type="int8",
+            model_sha256="b" * 64,
+        )
+        materialized = host.materialize_pipeline_candidate(
+            transaction_id,
+            0,
+            8,
+            True,
+            False,
+            total_layers=24,
+        )
+        return descriptor, materialized
+
+    def test_prepare_and_materialize_do_not_pollute_active_runtime(
+        self, monkeypatch, tmp_path,
+    ):
+        import model_host as model_host_module
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        active = self._Manager("active", loaded=True)
+        candidate = self._Manager("candidate")
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda _self: candidate,
+        )
+        host = ModelHost(manager=active)
+        self._set_active_mirrors(host)
+
+        descriptor, materialized = self._prepare_and_materialize(host, model_dir)
+        repeated = host.materialize_pipeline_candidate(
+            "txn-1", 0, 8, True, False, total_layers=24,
+        )
+
+        assert descriptor["model_id"] == "new-model"
+        assert materialized["success"] is True
+        assert repeated == materialized
+        assert host.peek_manager() is active
+        assert host.model_loaded is True
+        assert host.current_quant == "old-quant"
+        assert host.engine_type == "old-engine"
+        assert host.active_model_id == "old-model"
+        assert active.closed == 0
+        assert candidate.prepare_calls[0]["model_path"] == str(model_dir.resolve())
+        assert candidate.materialize_calls[0]["total_layers"] == 24
+        assert len(candidate.materialize_calls) == 1
+
+    def test_commit_then_abort_restores_exact_active_runtime(
+        self, monkeypatch, tmp_path,
+    ):
+        import model_host as model_host_module
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        active = self._Manager("active", loaded=True)
+        candidate = self._Manager("candidate")
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda _self: candidate,
+        )
+        host = ModelHost(manager=active)
+        self._set_active_mirrors(host)
+        self._prepare_and_materialize(host, model_dir)
+
+        committed = host.commit_pipeline_candidate("txn-1")
+        repeated_commit = host.commit_pipeline_candidate("txn-1")
+
+        assert committed["phase"] == "committed"
+        assert repeated_commit["phase"] == "committed"
+        assert host.peek_manager() is candidate
+        assert host.active_model_id == "new-model"
+        assert host.current_quant == "int8"
+        assert host.model_loaded is False
+        assert host.is_loaded is True
+        assert host.is_pipeline_prepared is True
+        assert host.runtime_status() == {
+            "manager_loaded": True,
+            "model_loaded": False,
+            "runtime_materialized": True,
+            "pipeline_prepared": True,
+            "current_quant": "int8",
+        }
+        assert active.closed == 0
+
+        aborted = host.abort_pipeline_candidate("txn-1")
+        repeated_abort = host.abort_pipeline_candidate("txn-1")
+
+        assert aborted["phase"] == "aborted"
+        assert repeated_abort["phase"] == "aborted"
+        assert host.peek_manager() is active
+        assert host.model_loaded is True
+        assert host.current_quant == "old-quant"
+        assert host.engine_type == "old-engine"
+        assert host.quant_type == "old-quant"
+        assert host.model_path == "old-path"
+        assert host.active_model_id == "old-model"
+        assert candidate.closed == 1
+        assert active.closed == 0
+
+    def test_abort_before_commit_closes_only_candidate(self, monkeypatch, tmp_path):
+        import model_host as model_host_module
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        active = self._Manager("active", loaded=True)
+        candidate = self._Manager("candidate")
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda _self: candidate,
+        )
+        host = ModelHost(manager=active)
+        self._prepare_and_materialize(host, model_dir)
+
+        aborted = host.abort_pipeline_candidate("txn-1")
+
+        assert aborted["phase"] == "aborted"
+        assert host.peek_manager() is active
+        assert active.closed == 0
+        assert candidate.closed == 1
+
+    def test_finalize_closes_old_manager_once(self, monkeypatch, tmp_path):
+        import model_host as model_host_module
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        active = self._Manager("active", loaded=True)
+        candidate = self._Manager("candidate")
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda _self: candidate,
+        )
+        host = ModelHost(manager=active)
+        self._prepare_and_materialize(host, model_dir)
+        host.commit_pipeline_candidate("txn-1")
+
+        finalized = host.finalize_pipeline_candidate("txn-1")
+        repeated = host.finalize_pipeline_candidate("txn-1")
+
+        assert finalized["phase"] == "finalized"
+        assert repeated["phase"] == "finalized"
+        assert host.peek_manager() is candidate
+        assert active.closed == 1
+        assert candidate.closed == 0
+
+    def test_conflicting_transaction_is_rejected_and_same_id_is_idempotent(
+        self, monkeypatch, tmp_path,
+    ):
+        import model_host as model_host_module
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        candidate = self._Manager("candidate")
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda _self: candidate,
+        )
+        host = ModelHost(manager=self._Manager("active", loaded=True))
+
+        first = host.prepare_pipeline_candidate("txn-1", "model", str(model_dir))
+        repeated = host.prepare_pipeline_candidate("txn-1", "model", str(model_dir))
+
+        assert repeated == first
+        assert len(candidate.prepare_calls) == 1
+        with pytest.raises(RuntimeError, match="MODEL_TXN_CONFLICT"):
+            host.prepare_pipeline_candidate("txn-2", "other", str(model_dir))
+        with pytest.raises(RuntimeError, match="MODEL_TXN_CONFLICT"):
+            host.materialize_pipeline_candidate("txn-2", 0, 8, True, False)
+
+    def test_gguf_candidate_uses_independent_engine(self, monkeypatch, tmp_path):
+        model_path = tmp_path / "candidate.gguf"
+        model_path.write_bytes(b"candidate")
+        engines = []
+
+        class FakeGguf(self._Manager):
+            engine_type = "llama_cpp"
+
+            def __init__(self):
+                super().__init__("gguf-candidate")
+                engines.append(self)
+
+        fake_module = types.ModuleType("llama_engine")
+        fake_module.LlamaCppEngine = FakeGguf
+        monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
+        active = self._Manager("active", loaded=True)
+        host = ModelHost(manager=active)
+
+        host.prepare_pipeline_candidate("txn-gguf", "gguf", str(model_path))
+
+        assert len(engines) == 1
+        assert host.peek_manager() is active
+        assert active.closed == 0
+
+    def test_gguf_candidate_commit_retains_layer_forward_capability(
+        self, monkeypatch, tmp_path,
+    ):
+        from koakuma_engine import Capability, runtime_supports
+        from llama_engine import LlamaCppEngine
+
+        model_path = tmp_path / "head.gguf"
+        model_path.write_bytes(b"header-only-fixture")
+
+        def prepare(engine, **kwargs):
+            engine._model_path = kwargs["model_path"]
+            engine._pipeline_distributed_only = True
+            engine._pipeline_descriptor = {
+                "model_id": kwargs["model_id"],
+                "model_sha256": "a" * 64,
+                "pipeline_runtime_supported": True,
+            }
+            return dict(engine._pipeline_descriptor)
+
+        def materialize(engine, **kwargs):
+            engine._loaded = True
+            return {"success": True}
+
+        monkeypatch.setattr(LlamaCppEngine, "prepare_pipeline_model", prepare)
+        monkeypatch.setattr(LlamaCppEngine, "load_layer_range", materialize)
+        host = ModelHost()
+        host.prepare_pipeline_candidate("txn-head", "model", str(model_path))
+        host.materialize_pipeline_candidate("txn-head", 0, 4, True, False)
+        host.commit_pipeline_candidate("txn-head")
+
+        assert host.engine_type == "llama_cpp"
+        assert runtime_supports(host, Capability.FORWARD_LAYERS) is True
+        assert host.model_loaded is False
+
+    def test_tokenizer_only_candidate_can_commit_without_local_layers(
+        self, monkeypatch, tmp_path,
+    ):
+        import model_host as model_host_module
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        active = self._Manager("active", loaded=True)
+        candidate = self._Manager("candidate")
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda _self: candidate,
+        )
+        host = ModelHost(manager=active)
+
+        host.prepare_pipeline_candidate(
+            "txn-tokenizer", "model", str(model_dir),
+        )
+        result = host.materialize_pipeline_candidate(
+            "txn-tokenizer", None, None, False, False,
+        )
+        host.commit_pipeline_candidate("txn-tokenizer")
+
+        assert result == {"success": True, "tokenizer": True}
+        assert candidate.tokenizer_calls == 1
+        assert host.peek_manager() is candidate
+        assert active.closed == 0
+
+
 class TestApiServerIntegration:
     """api_server 经改造后的宿主接线（不加载模型）。"""
 
@@ -397,3 +737,27 @@ class TestApiServerIntegration:
         import scheduler as sched_mod
         src = inspect.getsource(sched_mod)
         assert "import api_server" not in src
+
+
+def test_host_unload_failure_preserves_direct_engine_projection():
+    should_fail = [True]
+
+    class Engine:
+        def unload(self):
+            if should_fail[0]:
+                raise OSError("native owner still alive")
+
+    engine = Engine()
+    host = ModelHost(manager=engine)
+    for name, value in {"model_loaded": True, "_engine_type": "llama_cpp",
+                        "model_path": "head.gguf", "active_model_id": "segment-model"}.items():
+        object.__setattr__(host, name, value)
+    with pytest.raises(OSError, match="native owner still alive"):
+        host.unload_model()
+    assert host._manager is engine and host.model_loaded is True
+    assert host.__dict__["model_path"] == "head.gguf"
+    assert host.__dict__["active_model_id"] == "segment-model"
+    should_fail[0] = False
+    host.unload_model()
+    assert host.model_loaded is False
+    assert "model_path" not in host.__dict__ and "active_model_id" not in host.__dict__

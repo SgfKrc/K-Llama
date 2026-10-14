@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CUT_SCRIPT = REPO_ROOT / "scripts" / "cut_layers.py"
 REPORT_SCHEMA = "qlh.cut_layers.report.v1"
+_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 #: ★ `#67`-⑨：llama.cpp 判定"加载失败"的标志 —— **取自源码真实的抛出点**
 #: （`llama-model-loader.cpp:560` `failed to load model from`、`:1098` `missing tensor`、
@@ -44,6 +47,25 @@ LLAMA_LOAD_FAILURE_MARKERS = (
     "error loading model",
     "failed to open gguf file",
 )
+
+
+def _validate_model_preflight_metadata(
+    source_model_id: str | None,
+    tokenizer_sha256: str | None,
+) -> tuple[str, str, list[str]]:
+    problems: list[str] = []
+    if (source_model_id is None) != (tokenizer_sha256 is None):
+        problems.append("--source-model-id 与 --tokenizer-sha256 必须成对提供")
+        return source_model_id or "", tokenizer_sha256 or "", problems
+    if source_model_id is None:
+        return "", "", problems
+    if not _MODEL_ID_PATTERN.fullmatch(source_model_id):
+        problems.append(
+            "--source-model-id 必须匹配 ^[A-Za-z0-9_.:-]{1,128}$"
+        )
+    if not _SHA256_PATTERN.fullmatch(tokenizer_sha256):
+        problems.append("--tokenizer-sha256 必须是 64 位十六进制 SHA256")
+    return source_model_id, tokenizer_sha256.lower(), problems
 
 
 def verify_artifact_loads(artifact: Path, llama_bin, *, timeout_s: int = 300,
@@ -151,10 +173,25 @@ def main(argv: list[str] | None = None) -> int:
                     help="产物基名（默认 `<arch>-cut-<lo>-<hi>`）；用于保持既有引用不失效")
     ap.add_argument("--hf-config", default=None,
                     help="HF config.json（可选）：额外做 #67-③ 层类型逐位校验")
+    ap.add_argument("--source-model-id", default=None,
+                    help="源模型稳定标识；必须与 --tokenizer-sha256 成对提供")
+    ap.add_argument("--tokenizer-sha256", default=None,
+                    help="tokenizer 内容 SHA256；必须与 --source-model-id 成对提供")
     ap.add_argument("--llama-bin", default=None,
                     help="★ llama.cpp 可执行文件（如 llama-debug.exe）：做 #67-⑨ **加载自证** "
                          "（真的加载一次工件，抓 missing tensor）；不给则跳过该项")
     args = ap.parse_args(argv)
+
+    source_model_id, tokenizer_sha256, preflight_problems = (
+        _validate_model_preflight_metadata(
+            args.source_model_id,
+            args.tokenizer_sha256,
+        )
+    )
+    if preflight_problems:
+        for problem in preflight_problems:
+            print(f"FAIL: {problem}")
+        return 2
 
     src = Path(args.src)
     if not src.is_file():
@@ -200,6 +237,11 @@ def main(argv: list[str] | None = None) -> int:
             cmd += ["--end", str(args.end)]
     if args.hf_config:
         cmd += ["--hf-config", str(args.hf_config)]
+    if source_model_id and tokenizer_sha256:
+        cmd += [
+            "--source-model-id", source_model_id,
+            "--tokenizer-sha256", tokenizer_sha256,
+        ]
 
     print(f"[pipeline] 执行: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True,

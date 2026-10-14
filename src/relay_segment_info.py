@@ -30,6 +30,7 @@ __all__ = [
     "load_ready_build",
     "read_artifact_manifest",
     "read_gguf_layer_info",
+    "read_gguf_tokenizer_sha256",
     "unknown_remote_build",
 ]
 
@@ -135,8 +136,10 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
                 if key == "general.architecture" and value_type == _GGUF_TYPE_STRING:
                     arch = _gguf_read_string(handle)
                     continue
-                # 只留**整数**标量：真正的层数 KV 都是整数，浮点/字符串没有用还占地方。
-                if (key.endswith(".block_count") or key.endswith(".nextn_predict_layers")):
+                # 只留流水线合同需要的整数标量；浮点/字符串没有用还占地方。
+                if key.endswith((
+                    ".block_count", ".nextn_predict_layers", ".embedding_length",
+                )):
                     value = _gguf_read_scalar(handle, value_type)
                     if isinstance(value, int):
                         scalars[key] = value
@@ -151,12 +154,62 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     if not isinstance(block_count, int) or block_count <= 0:
         return None
     nextn = scalars.get(f"{arch}.nextn_predict_layers") or 0
+    n_embd = scalars.get(f"{arch}.embedding_length") or 0
     return {
         "architecture": arch,
         "block_count": block_count,
         "nextn_predict_layers": int(nextn),
         "n_layer": max(0, block_count - int(nextn)),
+        "n_embd": max(0, int(n_embd)),
     }
+
+
+def read_gguf_tokenizer_sha256(path: str | Path) -> str | None:
+    """Fingerprint serialized tokenizer GGUF metadata without reading tensor payloads."""
+    target = Path(path)
+    try:
+        file_size = target.stat().st_size
+        with target.open("rb") as handle:
+            if handle.read(4) != _GGUF_MAGIC:
+                return None
+            (version,) = struct.unpack("<I", handle.read(4))
+            if version < 2:
+                return None
+            handle.read(8)
+            (metadata_count,) = struct.unpack("<Q", handle.read(8))
+            if metadata_count > 100_000:
+                return None
+            values: dict[str, bytes] = {}
+            for _ in range(metadata_count):
+                key = _gguf_read_string(handle)
+                (value_type,) = struct.unpack("<I", handle.read(4))
+                start = handle.tell()
+                _gguf_skip_value(handle, value_type)
+                end = handle.tell()
+                if end > file_size:
+                    return None
+                if not key.startswith("tokenizer."):
+                    continue
+                if key in values or end - start > 128 * 1024 * 1024:
+                    return None
+                field_digest = hashlib.sha256(struct.pack("<I", value_type))
+                handle.seek(start)
+                remaining = end - start
+                while remaining:
+                    chunk = handle.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        return None
+                    field_digest.update(chunk)
+                    remaining -= len(chunk)
+                values[key] = field_digest.digest()
+            if not {"tokenizer.ggml.model", "tokenizer.ggml.tokens"}.issubset(values):
+                return None
+            digest = hashlib.sha256()
+            for key in sorted(values):
+                digest.update(key.encode("utf-8") + b"\0" + values[key])
+            return digest.hexdigest()
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        return None
 
 
 #: GGML 张量类型 → `(每个 block 的元素数, 每个 block 的字节数)`。
@@ -225,9 +278,8 @@ def read_gguf_tensor_bytes(path: str | Path) -> dict[str, int] | None:
 def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
     """读**段工件旁的 manifest**（`<artifact>.gguf.manifest.json` 或显式路径）里的层范围。
 
-    返回 `{"source_layer_range": [start, end], "n_layer": N}`（能读到哪个给哪个）；
-    读不到 ⇒ `None`。用于回答「这一段**来自源模型的哪几层**」—— 工件头部**没有**这个信息
-    （裁层生成器只改 `block_count`、不记录来源层号），只能靠 manifest 自证（#30）。
+    返回经过基本格式校验的层范围、源整模摘要和段工件摘要（能读到哪个给哪个）；
+    读不到 ⇒ `None`。工件选择方必须同时校验这些字段，不能只按层区间猜测同源性。
     """
     target = Path(path)
     if not target.is_file():
@@ -250,6 +302,24 @@ def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
     total = payload.get("n_layer")
     if isinstance(total, int) and total > 0:
         info["n_layer"] = total
+    for field in (
+        "source_model_sha256", "artifact_sha256", "tokenizer_sha256",
+    ):
+        digest = str(payload.get(field, "") or "").strip().lower()
+        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+            info[field] = digest
+    source_model_id = str(payload.get("source_model_id", "") or "").strip()
+    if (
+        1 <= len(source_model_id) <= 128
+        and all(
+            char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-"
+            for char in source_model_id
+        )
+    ):
+        info["source_model_id"] = source_model_id
+    hidden_size = payload.get("hidden_size")
+    if isinstance(hidden_size, int) and not isinstance(hidden_size, bool) and hidden_size > 0:
+        info["hidden_size"] = hidden_size
     return info or None
 
 

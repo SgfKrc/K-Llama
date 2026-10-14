@@ -29,6 +29,10 @@ def _peer(node_id: str = "client1"):
     peer._layer_config_lock = threading.RLock()
     peer._active_layer_config = {"stale": True}
     peer._local_pipeline_steps = {"t1": 0}
+    peer._latest_layer_config_generation = 0
+    peer._latest_layer_config_id = ""
+    peer._latest_layer_assignment_id = ""
+    peer._layer_assignment_identity_required = False
     sent: list = []
     peer._send_layer_config_ack = lambda payload: (sent.append(payload), True)[1]
     return peer, sent
@@ -82,6 +86,95 @@ def test_release_generation_must_echo_the_request():
     assert _master_released_predicate(sent[0], {"generation": 42}) is True
     # 主节点若期望别的 generation 就该判失败 ⇒ 证明这个字段**真的**参与判据，不是摆设。
     assert _master_released_predicate(sent[0], {"generation": 41}) is False
+
+
+def test_matching_assignment_release_echoes_identity_and_clears_state():
+    peer, sent = _peer()
+    peer._handle_layer_config({
+        "start_layer": 8,
+        "end_layer": 24,
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 12,
+        "assignment_id": "asg-current",
+        "engine": "relay_middle",
+        "model_sha256": "deadbeef",
+        "model_type": "qwen2",
+        "phase": "commit",
+    })
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 12,
+        "assignment_id": "asg-current",
+    })
+
+    assert [ack["status"] for ack in sent] == ["ready", "released"]
+    assert sent[-1]["assignment_id"] == "asg-current"
+    assert peer._active_layer_config is None
+    assert peer._local_pipeline_steps == {}
+
+
+def test_other_assignment_release_cannot_clear_current_config():
+    peer, sent = _peer()
+    current = {
+        "start_layer": 8,
+        "end_layer": 24,
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 13,
+        "assignment_id": "asg-current",
+        "engine": "relay_middle",
+        "model_sha256": "deadbeef",
+        "model_type": "qwen2",
+        "phase": "commit",
+    }
+    peer._handle_layer_config(current)
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 13,
+        "assignment_id": "asg-old",
+    })
+
+    assert len(sent) == 1
+    assert peer._active_layer_config["assignment_id"] == "asg-current"
+    assert peer._local_pipeline_steps == {"task-current": 0}
+
+
+def test_identity_less_release_is_rejected_after_assignment_fencing():
+    peer, sent = _peer()
+    current = {
+        "start_layer": 8,
+        "end_layer": 24,
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 14,
+        "assignment_id": "asg-current",
+        "engine": "relay_middle",
+        "model_sha256": "deadbeef",
+        "model_type": "qwen2",
+        "phase": "commit",
+    }
+    peer._handle_layer_config(current)
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 14,
+    })
+
+    assert len(sent) == 1
+    assert peer._active_layer_config["assignment_id"] == "asg-current"
+    assert peer._local_pipeline_steps == {"task-current": 0}
 
 
 def test_release_for_another_node_is_ignored():

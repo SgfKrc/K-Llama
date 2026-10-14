@@ -229,6 +229,17 @@ def test_shim_symbol_contract_is_declared():
     assert set(MODE_CODES) == {"nextn", "layer_inp"}
 
 
+def test_oversized_prompt_rejected_before_native_worker():
+    upstream = object.__new__(KeepHeadUpstream)
+    upstream.n_batch = 512
+    upstream.ctx_per_seq = 4096
+
+    with pytest.raises(KeepHeadUnavailable, match="batch exceeds n_batch"):
+        upstream.forward_tokens_to_hidden(range(513))
+    with pytest.raises(KeepHeadUnavailable, match="context exceeds per-sequence limit"):
+        upstream.forward_tokens_to_hidden([1] * 10, n_past=4090)
+
+
 # ------------------------------------------------------------------ 真模型（缺工件跳过）
 def test_nextn_upstream_returns_hidden_with_expected_shape():
     import numpy as np

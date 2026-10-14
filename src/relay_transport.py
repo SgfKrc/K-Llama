@@ -14,6 +14,7 @@ import logging
 import socket
 import struct
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from typing import BinaryIO, Sequence
@@ -67,6 +68,7 @@ RELAY_PROTOCOL_ERROR = "relay_protocol_error"
 RELAY_TRANSPORT_ERROR = "relay_transport_error"
 RELAY_INTERNAL_ERROR = "relay_internal_error"
 RELAY_RUNNER_ERROR = "runner_failed"
+REQUEST_DEADLINE_EXCEEDED = 'request_deadline_exceeded'
 _RELAY_ERROR_CODES = frozenset({
     "client_closed",
     "connection_closed_mid_frame",
@@ -112,6 +114,7 @@ _RELAY_ERROR_CODES = frozenset({
     RELAY_PROTOCOL_ERROR,
     RELAY_REMOTE_ERROR,
     RELAY_TRANSPORT_ERROR,
+    REQUEST_DEADLINE_EXCEEDED,
 })
 
 
@@ -307,11 +310,56 @@ def decode_hidden_seq(payload: bytes, *, n_embd: int,
     return hidden, int(n_tokens), meta
 
 
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
+def _io_timeout(
+    sock: socket.socket,
+    *,
+    deadline_monotonic: float | None,
+    timeout: float | None,
+    deadline_error: str,
+) -> bool:
+    """Apply the earliest I/O boundary and report whether deadline was limiting."""
+    deadline_limited = False
+    budget = None if timeout is None else max(0.0, float(timeout))
+    if deadline_monotonic is not None:
+        remaining = float(deadline_monotonic) - time.monotonic()
+        if remaining <= 0:
+            raise RelayProtocolError(deadline_error)
+        if budget is None or remaining <= budget:
+            budget = remaining
+            deadline_limited = True
+    if budget is not None:
+        if budget <= 0:
+            raise RelayProtocolError(deadline_error)
+        sock.settimeout(max(1e-6, budget))
+    return deadline_limited
+
+
+def _recv_exact(
+    sock: socket.socket,
+    size: int,
+    *,
+    deadline_monotonic: float | None = None,
+    timeout: float | None = None,
+    deadline_error: str = REQUEST_DEADLINE_EXCEEDED,
+) -> bytes:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
-        chunk = sock.recv(remaining)
+        deadline_limited = _io_timeout(
+            sock,
+            deadline_monotonic=deadline_monotonic,
+            timeout=timeout,
+            deadline_error=deadline_error,
+        )
+        try:
+            chunk = sock.recv(remaining)
+        except socket.timeout as exc:
+            if deadline_limited or (
+                deadline_monotonic is not None
+                and time.monotonic() >= float(deadline_monotonic)
+            ):
+                raise RelayProtocolError(deadline_error) from exc
+            raise
         if not chunk:
             raise RelayProtocolError("connection_closed_mid_frame")
         chunks.append(chunk)
@@ -319,7 +367,14 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def send_frame(sock: socket.socket, frame: RelayFrame) -> None:
+def send_frame(
+    sock: socket.socket,
+    frame: RelayFrame,
+    *,
+    deadline_monotonic: float | None = None,
+    timeout: float | None = None,
+    deadline_error: str = REQUEST_DEADLINE_EXCEEDED,
+) -> None:
     payload = bytes(frame.payload)
     quant = getattr(frame, "quant", "none") or "none"
     code = RELAY_QUANT_CODES.get(quant)
@@ -337,13 +392,38 @@ def send_frame(sock: socket.socket, frame: RelayFrame) -> None:
         )
     except (OverflowError, struct.error, ValueError) as exc:
         raise RelayProtocolError("invalid_frame_header") from exc
-    sock.sendall(header + payload)
+    deadline_limited = _io_timeout(
+        sock,
+        deadline_monotonic=deadline_monotonic,
+        timeout=timeout,
+        deadline_error=deadline_error,
+    )
+    try:
+        sock.sendall(header + payload)
+    except socket.timeout as exc:
+        if deadline_limited or (
+            deadline_monotonic is not None
+            and time.monotonic() >= float(deadline_monotonic)
+        ):
+            raise RelayProtocolError(deadline_error) from exc
+        raise
 
 
 def recv_frame(
-    sock: socket.socket, *, max_payload_bytes: int = RELAY_DEFAULT_MAX_PAYLOAD
+    sock: socket.socket,
+    *,
+    max_payload_bytes: int = RELAY_DEFAULT_MAX_PAYLOAD,
+    deadline_monotonic: float | None = None,
+    timeout: float | None = None,
+    deadline_error: str = REQUEST_DEADLINE_EXCEEDED,
 ) -> RelayFrame:
-    raw = _recv_exact(sock, _HEADER.size)
+    raw = _recv_exact(
+        sock,
+        _HEADER.size,
+        deadline_monotonic=deadline_monotonic,
+        timeout=timeout,
+        deadline_error=deadline_error,
+    )
     magic, version, kind_value, flags, sequence, n_tokens, payload_size = _HEADER.unpack(raw)
     if magic != RELAY_WIRE_MAGIC:
         raise RelayProtocolError("invalid_magic")
@@ -362,7 +442,17 @@ def recv_frame(
         raise RelayProtocolError("unknown_frame_kind") from exc
     if payload_size > int(max_payload_bytes):
         raise RelayProtocolError("payload_too_large")
-    payload = _recv_exact(sock, payload_size) if payload_size else b""
+    payload = (
+        _recv_exact(
+            sock,
+            payload_size,
+            deadline_monotonic=deadline_monotonic,
+            timeout=timeout,
+            deadline_error=deadline_error,
+        )
+        if payload_size
+        else b""
+    )
     return RelayFrame(kind=kind, sequence=sequence, n_tokens=n_tokens, payload=payload,
                       quant=quant)
 
@@ -428,6 +518,7 @@ class RelayTcpClient:
         n_embd: int,
         timeout: float = 60.0,
         max_tokens: int = RELAY_DEFAULT_MAX_TOKENS,
+        deadline_monotonic: float | None = None,
     ) -> None:
         if not is_loopback_host(host):
             raise RelayProtocolError("non_loopback_endpoint_rejected")
@@ -437,15 +528,125 @@ class RelayTcpClient:
         self.port = int(port)
         self.n_embd = int(n_embd)
         self.max_tokens = int(max_tokens)
+        self.timeout = float(timeout)
+        self._deadline_monotonic: float | None = None
+        self.tighten_deadline(deadline_monotonic)
         self.max_payload_bytes = (expected_hidden_bytes(self.max_tokens, self.n_embd)
                                  + RELAY_SEQ_META_LIMIT + _SEQ_HEADER.size)
-        self._sock = socket.create_connection((self.host, self.port), timeout=float(timeout))
-        self._sock.settimeout(float(timeout))
+        connect_timeout = self.timeout
+        deadline_limited = False
+        if self._deadline_monotonic is not None:
+            remaining = self._deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise RelayProtocolError(REQUEST_DEADLINE_EXCEEDED)
+            if remaining <= connect_timeout:
+                connect_timeout = remaining
+                deadline_limited = True
+        try:
+            self._sock = socket.create_connection(
+                (self.host, self.port), timeout=max(1e-6, connect_timeout)
+            )
+        except socket.timeout as exc:
+            if deadline_limited or (
+                self._deadline_monotonic is not None
+                and time.monotonic() >= self._deadline_monotonic
+            ):
+                raise RelayProtocolError(REQUEST_DEADLINE_EXCEEDED) from exc
+            raise
+        self._sock.settimeout(self.timeout)
         self._sequence = 0
         self._closed = False
 
-    def request_token(self, hidden: bytes, *, n_tokens: int, quant: str = "none",
-                      seq_meta: dict[str, object] | None = None) -> int:
+    @property
+    def deadline_monotonic(self) -> float | None:
+        return self._deadline_monotonic
+
+    def tighten_deadline(self, deadline_monotonic: float | None) -> None:
+        if deadline_monotonic is None:
+            return
+        candidate = float(deadline_monotonic)
+        if self._deadline_monotonic is None or candidate < self._deadline_monotonic:
+            self._deadline_monotonic = candidate
+
+    def _exchange(
+        self,
+        frame: RelayFrame,
+        *,
+        max_payload_bytes: int,
+        deadline_monotonic: float | None = None,
+    ) -> RelayFrame:
+        if self._closed:
+            raise RelayProtocolError("client_closed")
+        self.tighten_deadline(deadline_monotonic)
+        operation_deadline = time.monotonic() + self.timeout
+        deadline_error = RELAY_TRANSPORT_ERROR
+        if (
+            self._deadline_monotonic is not None
+            and self._deadline_monotonic <= operation_deadline
+        ):
+            operation_deadline = self._deadline_monotonic
+            deadline_error = REQUEST_DEADLINE_EXCEEDED
+        try:
+            send_frame(
+                self._sock,
+                frame,
+                deadline_monotonic=operation_deadline,
+                deadline_error=deadline_error,
+            )
+            return recv_frame(
+                self._sock,
+                max_payload_bytes=max_payload_bytes,
+                deadline_monotonic=operation_deadline,
+                deadline_error=deadline_error,
+            )
+        except (OSError, RelayProtocolError):
+            # A timeout, partial frame, or protocol failure leaves stream
+            # alignment unknown. Such a connection is never reusable.
+            self.abort()
+            raise
+
+    def _decode_token_response(self, response: RelayFrame, sequence: int) -> int:
+        try:
+            token = _decode_token(response, sequence)
+            if token < 0:
+                raise RelayProtocolError("runner_failed")
+            return token
+        except RelayProtocolError:
+            self.abort()
+            raise
+
+    def _decode_hidden_response(
+        self, response: RelayFrame, sequence: int, count: int
+    ) -> bytes:
+        try:
+            if response.kind == RelayFrameKind.ERROR:
+                raise RelayProtocolError(
+                    _error_code_from_frame(response, sequence)
+                )
+            if response.sequence != sequence:
+                raise RelayProtocolError("response_sequence_mismatch")
+            if response.kind != RelayFrameKind.HIDDEN:
+                raise RelayProtocolError("hidden_response_required")
+            if response.n_tokens != count:
+                raise RelayProtocolError("hidden_token_count_mismatch")
+            if len(response.payload) != expected_hidden_bytes(
+                count, self.n_embd, response.quant
+            ):
+                raise RelayProtocolError("hidden_payload_size_mismatch")
+            return frame_hidden_bytes(response, n_embd=self.n_embd)
+        except RelayProtocolError:
+            self.abort()
+            raise
+
+    def request_token(
+        self,
+        hidden: bytes,
+        *,
+        n_tokens: int,
+        quant: str = "none",
+        seq_meta: dict[str, object] | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> int:
         """Send hidden to a tail and receive its argmax token.
 
         ``seq_meta`` carries explicit per-token sequence/position bindings for
@@ -466,19 +667,27 @@ class RelayTcpClient:
             payload = encode_hidden_seq(hidden, n_tokens=count, meta=seq_meta,
                                         quant=quant, n_embd=self.n_embd)
         sequence = self._sequence
-        send_frame(
-            self._sock,
-            RelayFrame(kind, sequence, n_tokens=count, payload=payload,
-                       quant=quant or "none"),
+        response = self._exchange(
+            RelayFrame(
+                kind,
+                sequence,
+                n_tokens=count,
+                payload=payload,
+                quant=quant or "none",
+            ),
+            max_payload_bytes=self.max_payload_bytes,
+            deadline_monotonic=deadline_monotonic,
         )
-        response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
-        token = _decode_token(response, sequence)
-        if token < 0:
-            raise RelayProtocolError("runner_failed")
+        token = self._decode_token_response(response, sequence)
         self._sequence += 1
         return token
 
-    def request_hidden_from_tokens(self, tokens: "Sequence[int]") -> bytes:
+    def request_hidden_from_tokens(
+        self,
+        tokens: "Sequence[int]",
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> bytes:
         """★ P4.5 **上游段往返**：送 token id 列表，远端跑它自己的 head 段并回 `HIDDEN`。
 
         与 `request_hidden`（吃 hidden 吐 hidden）、`request_token`（吃 hidden 吐 token）
@@ -494,28 +703,25 @@ class RelayTcpClient:
         if count < 1 or count > self.max_tokens:
             raise RelayProtocolError("token_count_exceeds_limit")
         sequence = self._sequence
-        send_frame(
-            self._sock,
+        response = self._exchange(
             RelayFrame(RelayFrameKind.TOKENS, sequence, n_tokens=count,
                        payload=encode_tokens(values)),
+            max_payload_bytes=self.max_payload_bytes,
+            deadline_monotonic=deadline_monotonic,
         )
-        response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
-        if response.kind == RelayFrameKind.ERROR:
-            # ★ 2026-09-24：ERROR 帧必须解出服务端的**稳定码**，不能笼统当成"非 HIDDEN"。
-            raise RelayProtocolError(_error_code_from_frame(response, sequence))
-        if response.sequence != sequence:
-            raise RelayProtocolError("response_sequence_mismatch")
-        if response.kind != RelayFrameKind.HIDDEN:
-            raise RelayProtocolError("hidden_response_required")
-        if response.n_tokens != count:
-            raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
-            raise RelayProtocolError("hidden_payload_size_mismatch")
+        hidden = self._decode_hidden_response(response, sequence, count)
         self._sequence += 1
         # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
-        return frame_hidden_bytes(response, n_embd=self.n_embd)
+        return hidden
 
-    def request_hidden(self, hidden: bytes, *, n_tokens: int, quant: str = "none") -> bytes:
+    def request_hidden(
+        self,
+        hidden: bytes,
+        *,
+        n_tokens: int,
+        quant: str = "none",
+        deadline_monotonic: float | None = None,
+    ) -> bytes:
         """★ 中间段往返：发 HIDDEN，收 HIDDEN（远端段交出它自己的 hidden）。
 
         与 `request_token`（末段，收 token）配对 —— 这正是「1 个 torch 上游 + n 个
@@ -535,28 +741,26 @@ class RelayTcpClient:
             raise RelayProtocolError("hidden_payload_size_mismatch")
         payload = quantize_upload(hidden, count, self.n_embd, quant)
         sequence = self._sequence
-        send_frame(
-            self._sock,
+        response = self._exchange(
             RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=payload,
                        quant=quant or "none"),
+            max_payload_bytes=self.max_payload_bytes,
+            deadline_monotonic=deadline_monotonic,
         )
-        response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
-        if response.kind == RelayFrameKind.ERROR:
-            raise RelayProtocolError(_error_code_from_frame(response, sequence))
-        if response.sequence != sequence:
-            raise RelayProtocolError("response_sequence_mismatch")
-        if response.kind != RelayFrameKind.HIDDEN:
-            raise RelayProtocolError("hidden_response_required")
-        if response.n_tokens != count:
-            raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
-            raise RelayProtocolError("hidden_payload_size_mismatch")
+        output = self._decode_hidden_response(response, sequence, count)
         self._sequence += 1
         # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
-        return frame_hidden_bytes(response, n_embd=self.n_embd)
+        return output
 
-    def request_hidden_seq(self, hidden: bytes, *, n_tokens: int,
-                           meta: dict[str, object], quant: str = "none") -> bytes:
+    def request_hidden_seq(
+        self,
+        hidden: bytes,
+        *,
+        n_tokens: int,
+        meta: dict[str, object],
+        quant: str = "none",
+        deadline_monotonic: float | None = None,
+    ) -> bytes:
         """★ P3：**多序列**中间段往返 —— 请求帧带 `seq_ids` / `positions`（`HIDDEN_SEQ`）。
 
         响应仍是纯 `HIDDEN`（远端已按显式 seq/pos 算完）。元数据只允许
@@ -572,33 +776,63 @@ class RelayTcpClient:
         payload = encode_hidden_seq(hidden, n_tokens=count, meta=meta, quant=quant,
                                     n_embd=self.n_embd)
         sequence = self._sequence
-        send_frame(
-            self._sock,
+        response = self._exchange(
             RelayFrame(RelayFrameKind.HIDDEN_SEQ, sequence, n_tokens=count, payload=payload,
                        quant=quant or "none"),
+            max_payload_bytes=self.max_payload_bytes,
+            deadline_monotonic=deadline_monotonic,
         )
-        response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
-        if response.kind == RelayFrameKind.ERROR:
-            raise RelayProtocolError(_error_code_from_frame(response, sequence))
-        if response.sequence != sequence:
-            raise RelayProtocolError("response_sequence_mismatch")
-        if response.kind != RelayFrameKind.HIDDEN:
-            raise RelayProtocolError("hidden_response_required")
-        if response.n_tokens != count:
-            raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
-            raise RelayProtocolError("hidden_payload_size_mismatch")
+        output = self._decode_hidden_response(response, sequence, count)
         self._sequence += 1
         # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
-        return frame_hidden_bytes(response, n_embd=self.n_embd)
+        return output
 
-    def close(self) -> None:
+    def abort(self) -> None:
+        """Close immediately without sending CLOSE on a non-reusable stream."""
         if self._closed:
             return
         self._closed = True
         try:
-            send_frame(self._sock, RelayFrame(RelayFrameKind.CLOSE, self._sequence))
-            response = recv_frame(self._sock, max_payload_bytes=1024)
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+
+    def close(self, *, grace_timeout: float | None = None) -> None:
+        if self._closed:
+            return
+        if grace_timeout is not None and float(grace_timeout) <= 0:
+            self.abort()
+            return
+        close_timeout = self.timeout
+        if grace_timeout is not None:
+            close_timeout = min(close_timeout, float(grace_timeout))
+        now = time.monotonic()
+        close_deadline = now + close_timeout
+        deadline_error = RELAY_TRANSPORT_ERROR
+        if (
+            self._deadline_monotonic is not None
+            and self._deadline_monotonic <= close_deadline
+        ):
+            close_deadline = self._deadline_monotonic
+            deadline_error = REQUEST_DEADLINE_EXCEEDED
+        if close_deadline <= now:
+            self.abort()
+            return
+        self._closed = True
+        try:
+            send_frame(
+                self._sock,
+                RelayFrame(RelayFrameKind.CLOSE, self._sequence),
+                deadline_monotonic=close_deadline,
+                deadline_error=deadline_error,
+            )
+            response = recv_frame(
+                self._sock,
+                max_payload_bytes=1024,
+                deadline_monotonic=close_deadline,
+                deadline_error=deadline_error,
+            )
             token = _decode_token(response, self._sequence)
             if token != -1:
                 raise RelayProtocolError("invalid_close_ack")
@@ -612,8 +846,7 @@ class RelayTcpClient:
         if exc_type is None:
             self.close()
         else:
-            self._closed = True
-            self._sock.close()
+            self.abort()
 
 
 class StdioRelayRunner:

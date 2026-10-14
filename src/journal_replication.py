@@ -538,6 +538,138 @@ class DurableJournalReplica:
             finally:
                 connection.close()
 
+    def truncate_to(
+        self,
+        workflow_id: str,
+        *,
+        last_sequence: int,
+        event_chain_head: str | None = None,
+        received_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Drop the **uncommitted tail**, leaving the durable prefix ending at the committed point.
+
+        为什么需要它（#93）：旧主可能在「还没有拿到多数耐久确认」时就把事件写到本地
+        （= 未提交尾部）。新主一旦接管，若照原样继续服务，就会把**从未提交**的事件
+        当成既成事实 ⇒ 违反一致性承诺。
+
+        安全约束（不满足即拒绝，绝不"尽力而为"）：
+        - ``last_sequence == 0`` 合法（截成空链）；
+        - 否则本地链上**必须存在**该 sequence（哈希链保证该点唯一）⇒ 不允许凭空造点；
+          ``event_chain_head`` 若传入则必须与该点摘要一致（口径 = 事件链摘要）。
+        - 只删 ``sequence > last_sequence`` 的事件。快照行**不删**：它的内容对应更高的点、
+          已不可再当可信前缀，因此记入 ``truncated:<workflow_id>`` 元数据留作取证。
+        """
+        sequence = int(last_sequence)
+        if sequence < 0:
+            raise JournalReplicationError("last_sequence must be >= 0")
+        arrival = time.time() if received_at is None else float(received_at)
+        if not math.isfinite(arrival):
+            raise JournalReplicationError("received_at must be finite")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if sequence > 0:
+                    row = connection.execute(
+                        "SELECT event_digest FROM replicated_events "
+                        "WHERE workflow_id = ? AND sequence = ?",
+                        (workflow_id, sequence),
+                    ).fetchone()
+                    if row is None:
+                        raise JournalReplicationGap(
+                            "cannot truncate to a point the replica does not durably hold"
+                        )
+                    if event_chain_head is not None and str(row["event_digest"]) != str(event_chain_head):
+                        raise JournalReplicationConflict(
+                            "truncate target digest does not match the durable event chain"
+                        )
+                removed = connection.execute(
+                    "DELETE FROM replicated_events WHERE workflow_id = ? AND sequence > ?",
+                    (workflow_id, sequence),
+                ).rowcount
+                snapshot = connection.execute(
+                    "SELECT last_sequence FROM replicated_snapshots WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                # 快照仍指向被截断掉的更高点 ⇒ 它是一个**过期的**前缀，必须留痕。
+                stale = snapshot is not None and int(snapshot["last_sequence"]) > sequence
+                if stale:
+                    connection.execute(
+                        "INSERT INTO replication_metadata(key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (f"truncated:{workflow_id}", f"{sequence}@{int(arrival)}"),
+                    )
+                connection.execute("COMMIT")
+                return {
+                    "accepted": True,
+                    "workflow_id": workflow_id,
+                    "durable_sequence": sequence,
+                    "removed_events": max(0, int(removed or 0)),
+                    "snapshot_stale": stale,
+                    "source_node_id": self.source_node_id,
+                    "stream_id": self.stream_id,
+                }
+            except (JournalReplicationError, sqlite3.IntegrityError):
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            except sqlite3.Error as exc:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise JournalReplicationError(f"failed to truncate journal replica: {exc}") from exc
+            finally:
+                connection.close()
+
+    def durable_prefix(self, workflow_id: str) -> dict[str, Any]:
+        """只读诊断：本地**事件链**现状（**不**做快照一致性校验）。
+
+        截断后副本必然处于「链不完整」状态（`recovery_status.verified` 为 False），
+        此时仍要能看到自己手里到底有什么，才能决定追赶起点。
+        """
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS n, MIN(sequence) AS first_sequence,
+                           MAX(sequence) AS last_sequence
+                    FROM replicated_events WHERE workflow_id = ?
+                    """,
+                    (workflow_id,),
+                ).fetchone()
+                head = connection.execute(
+                    "SELECT event_digest FROM replicated_events "
+                    "WHERE workflow_id = ? ORDER BY sequence DESC LIMIT 1",
+                    (workflow_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+        count = int(row["n"] or 0) if row is not None else 0
+        return {
+            "workflow_id": workflow_id,
+            "event_count": count,
+            "first_sequence": None if count == 0 else int(row["first_sequence"]),
+            "last_sequence": 0 if count == 0 else int(row["last_sequence"]),
+            "event_chain_head": "" if head is None else str(head["event_digest"]),
+        }
+
+    def truncated_watermark(self, workflow_id: str) -> str:
+        """Return the recorded truncation marker for a workflow, if any (diagnostics)."""
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT value FROM replication_metadata WHERE key = ?",
+                    (f"truncated:{workflow_id}",),
+                ).fetchone()
+            finally:
+                connection.close()
+        return "" if row is None else str(row["value"])
+
     def recovery_status(self, workflow_id: str) -> dict[str, Any]:
         with self._lock:
             connection = self._connect()
@@ -647,6 +779,67 @@ class DurableJournalReplica:
             "checkpoint_digest": snapshot["checkpoint_digest"],
             "reason": "verified" if verified else "replica_chain_verification_failed",
         }
+
+    def export_checkpoint(
+        self, workflow_id: str, *, created_at: float | None = None,
+    ) -> JournalCheckpoint:
+        """把一个**已自洽**的 workflow 导出成 checkpoint（供落后的对端追赶）。
+
+        与 `recovery_status().verified` 同一判据：不自洽（例如刚截断过尾部、快照与事件链
+        对不上）就**拒绝导出** —— 否则等于把一段没人担保的前缀当成「已提交」发出去。
+        """
+        status = self.recovery_status(workflow_id)
+        if not status.get("verified"):
+            raise JournalReplicationError(
+                f"workflow is not durably replicated: {status.get('reason', 'unverified')}"
+            )
+        with self._lock:
+            connection = self._connect()
+            try:
+                snapshot_row = connection.execute(
+                    "SELECT last_sequence, event_chain_head, checkpoint_digest, snapshot_json "
+                    "FROM replicated_snapshots WHERE workflow_id = ?",
+                    (workflow_id,),
+                ).fetchone()
+                event_rows = connection.execute(
+                    "SELECT sequence, event_json, event_digest, previous_digest "
+                    "FROM replicated_events WHERE workflow_id = ? ORDER BY sequence",
+                    (workflow_id,),
+                ).fetchall()
+            finally:
+                connection.close()
+        if snapshot_row is None:
+            raise JournalReplicationError(f"workflow snapshot not found: {workflow_id}")
+        records: list[dict[str, Any]] = []
+        for row in event_rows:
+            try:
+                event = json.loads(row["event_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise JournalReplicationError("replicated event is not valid JSON") from exc
+            records.append({
+                "event": event,
+                "event_digest": str(row["event_digest"]),
+                "previous_digest": str(row["previous_digest"]),
+            })
+        try:
+            snapshot = json.loads(snapshot_row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise JournalReplicationError("replicated snapshot is not valid JSON") from exc
+        # `JournalCheckpoint` 的构造会**重新校验**整条摘要链与 checkpoint_digest：
+        # 万一库被改坏，这里就会抛，而不是把坏前缀发出去。
+        return JournalCheckpoint(
+            source_node_id=self.source_node_id,
+            stream_id=self.stream_id,
+            workflow_id=workflow_id,
+            created_at=time.time() if created_at is None else float(created_at),
+            snapshot=snapshot,
+            # ⚠️ 必须是 **tuple**：`JournalCheckpoint.__post_init__` 拿
+            #    `_validate_event_sequence()`（返回 tuple）与传入值做**结构比较**，
+            #    传 list 会永远不相等，报「checkpoint event digest chain is invalid」（踩过）。
+            records=tuple(records),
+            event_chain_head=str(snapshot_row["event_chain_head"]),
+            checkpoint_digest=str(snapshot_row["checkpoint_digest"]),
+        )
 
     def recovery_projection(self, workflow_id: str) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         status = self.recovery_status(workflow_id)

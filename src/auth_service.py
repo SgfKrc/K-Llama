@@ -52,6 +52,7 @@ __all__ = [
     "resolve_bearer",
     "require_session",
     "require_role",
+    "require_authenticated_role",
     "AuthPrincipal",
 ]
 
@@ -284,6 +285,27 @@ def require_role(*roles: str):
             if not _auth_required():
                 return AuthPrincipal("anonymous", ROLE_ADMIN)
             raise HTTPException(401, {"code": "auth_required", "message": "需要登录（Bearer token）"})
+        if principal.role not in allowed:
+            raise HTTPException(403, {
+                "code": "insufficient_role",
+                "message": f"需要角色之一: {sorted(allowed)}",
+            })
+        return principal
+
+    return _dep
+
+
+def require_authenticated_role(*roles: str):
+    """Require a named session even when global compatibility auth is off."""
+    allowed = frozenset(roles)
+
+    def _dep(authorization: Optional[str] = Header(default=None)) -> AuthPrincipal:
+        principal = resolve_bearer(authorization)
+        if principal is None:
+            raise HTTPException(401, {
+                "code": "auth_required",
+                "message": "该高风险操作需要实名登录（Bearer token）",
+            })
         if principal.role not in allowed:
             raise HTTPException(403, {
                 "code": "insufficient_role",

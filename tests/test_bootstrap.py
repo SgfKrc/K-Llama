@@ -4,8 +4,13 @@
 纯逻辑测试，不启动后端、不访问网络。
 """
 
+import json
 import os
 import sys
+
+import pytest
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -116,10 +121,14 @@ def test_tailnet_ipv6_discovery_uses_brackets_only_in_url(monkeypatch):
 def test_first_connect_builds_valid_ipv6_url(monkeypatch):
     import json
     import bootstrap
+    from bootstrap_credentials import seal_bootstrap_credential
 
     seen = []
 
     class Response:
+        def __init__(self, body):
+            self.body = body
+
         def __enter__(self):
             return self
 
@@ -127,18 +136,32 @@ def test_first_connect_builds_valid_ipv6_url(monkeypatch):
             return False
 
         def read(self):
-            return json.dumps({
-                "status": "ok",
-                "cluster": {
-                    "master_tcp_host": "fd7a:115c:a1e0::10",
-                    "master_tcp_port": 8888,
-                },
-                "node": {"node_id": "client-v6", "role": "client"},
-            }).encode("utf-8")
+            return json.dumps(self.body).encode("utf-8")
 
     def fake_urlopen(request, timeout):
         seen.append(request.full_url)
-        return Response()
+        payload = json.loads(request.data.decode("utf-8"))
+        envelope = seal_bootstrap_credential(
+            public_key=payload["credential_public_key"],
+            request_nonce=payload["credential_request_nonce"],
+            requested_at=payload["credential_requested_at"],
+            cluster_id="cluster-v6",
+            node_id="client-v6",
+            cluster_secret="secret-v6-credential-value",
+            secret_epoch=2,
+            now=payload["credential_requested_at"],
+        )
+        return Response({
+            "status": "ok",
+            "cluster": {
+                "cluster_id": "cluster-v6",
+                "master_tcp_host": "fd7a:115c:a1e0::10",
+                "master_tcp_port": 8888,
+                "cluster_secret_epoch": 2,
+            },
+            "node": {"node_id": "client-v6", "role": "client"},
+            "credential_envelope": envelope,
+        })
 
     monkeypatch.setattr(bootstrap.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(bootstrap, "persist_bootstrap_response", lambda data: None)
@@ -168,6 +191,7 @@ def test_persist_bootstrap_response_writes_node_config(tmp_path, monkeypatch):
             "master_tcp_host": "100.64.0.10",
             "master_tcp_port": 8888,
             "cluster_secret": "secret-123",
+            "cluster_secret_epoch": 3,
         },
         "node": {
             "node_id": "client-test",
@@ -181,10 +205,14 @@ def test_persist_bootstrap_response_writes_node_config(tmp_path, monkeypatch):
     assert path.is_file()
     data = load_node_config()
     assert data["bootstrapped"] is True
-    assert data["cluster"]["cluster_secret"] == "secret-123"
+    assert "cluster_secret" not in data["cluster"]
+    assert data["cluster"]["cluster_secret_ref"] == "local-secret-store:v1"
+    assert data["cluster"]["cluster_secret_epoch"] == 3
+    assert "secret-123" not in path.read_text(encoding="utf-8")
     assert data["cluster"]["master_tcp_host"] == "100.64.0.10"
     assert data["node"]["node_id"] == "client-test"
     assert os.environ["QLH_CLUSTER_SECRET"] == "secret-123"
+    assert os.environ["QLH_CLUSTER_SECRET_EPOCH"] == "3"
     assert os.environ["QLH_MASTER_HOST"] == "100.64.0.10"
     assert os.environ["QLH_MASTER_PORT"] == "8888"
     assert os.environ["QLH_MASTER_API_PORT"] == "8000"
@@ -244,25 +272,30 @@ def test_source_checkout_requires_explicit_master_role(tmp_path, monkeypatch):
     assert node_config.resolve_initial_node_role() == "master"
 
 
-def test_source_checkout_rejects_unknown_role_as_client(tmp_path, monkeypatch):
+def test_source_checkout_rejects_unknown_role_explicitly(tmp_path, monkeypatch):
     import node_config
 
     monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
     monkeypatch.setenv("QLH_NODE_ROLE", "typo-role")
     monkeypatch.setattr(sys, "frozen", False, raising=False)
 
-    assert node_config.resolve_initial_node_role() == "client"
+    with pytest.raises(ValueError, match="invalid node role"):
+        node_config.resolve_initial_node_role()
 
 
 def test_frozen_config_migrates_legacy_exe_directory_file(tmp_path, monkeypatch):
-    from node_config import get_node_config_path, load_node_config
+    from node_config import get_local_cluster_secret, get_node_config_path, load_node_config
 
     install_dir = tmp_path / "Program Files" / "QLH-Edge-Inference"
     install_dir.mkdir(parents=True)
     executable = install_dir / "QLH-Edge-Inference.exe"
     legacy_path = install_dir / "node_config.json"
     legacy_path.write_text(
-        '{"bootstrapped": true, "node": {"role": "client"}}',
+        json.dumps({
+            "bootstrapped": True,
+            "cluster": {"cluster_secret": "legacy-install-secret"},
+            "node": {"role": "client"},
+        }),
         encoding="utf-8",
     )
     local_app_data = tmp_path / "LocalAppData"
@@ -271,11 +304,216 @@ def test_frozen_config_migrates_legacy_exe_directory_file(tmp_path, monkeypatch)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.delenv("QLH_CLUSTER_SECRET", raising=False)
 
     data = load_node_config()
 
     assert data["node"]["role"] == "client"
     assert get_node_config_path().is_file()
+    assert not legacy_path.exists()
+    assert get_local_cluster_secret() == "legacy-install-secret"
+    assert "legacy-install-secret" not in get_node_config_path().read_text(encoding="utf-8")
+
+
+def test_frozen_legacy_config_is_scrubbed_when_delete_is_denied(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    install_dir = tmp_path / "Program Files" / "QLH-Edge-Inference"
+    install_dir.mkdir(parents=True)
+    executable = install_dir / "QLH-Edge-Inference.exe"
+    legacy_path = install_dir / "node_config.json"
+    legacy_path.write_text(json.dumps({
+        "cluster": {"cluster_secret": "legacy-locked-secret"},
+        "node": {"role": "client", "role_confirmed": True},
+    }), encoding="utf-8")
+    monkeypatch.delenv("QLH_NODE_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("QLH_CLUSTER_SECRET", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "executable", str(executable))
+    original_unlink = node_config.Path.unlink
+
+    def deny_legacy_unlink(path, *args, **kwargs):
+        if path == legacy_path:
+            raise PermissionError("legacy config is locked")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(node_config.Path, "unlink", deny_legacy_unlink)
+
+    data = node_config.load_node_config()
+
+    assert data["node"]["role"] == "client"
+    assert legacy_path.is_file()
+    assert "legacy-locked-secret" not in legacy_path.read_text(encoding="utf-8")
+    assert node_config.get_local_cluster_secret() == "legacy-locked-secret"
+
+
+def test_legacy_plaintext_cluster_secret_migrates_out_of_node_config(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    config_path = tmp_path / "node_config.json"
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(tmp_path / "node_secrets.json"))
+    monkeypatch.delenv("QLH_CLUSTER_SECRET", raising=False)
+    config_path.write_text(json.dumps({
+        "cluster": {"cluster_id": "legacy", "cluster_secret": "legacy-secret-value"},
+        "node": {"role": "client", "role_confirmed": True},
+    }), encoding="utf-8")
+
+    data = node_config.load_node_config()
+
+    assert "cluster_secret" not in data["cluster"]
+    assert data["cluster"]["cluster_secret_ref"] == "local-secret-store:v1"
+    assert node_config.get_local_cluster_secret() == "legacy-secret-value"
+    assert "legacy-secret-value" not in config_path.read_text(encoding="utf-8")
+    assert "legacy-secret-value" not in (
+        tmp_path / "node_secrets.json"
+    ).read_text(encoding="utf-8")
+
+
+def test_stale_legacy_plaintext_cannot_roll_back_rotated_credential(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    install_dir = tmp_path / "Program Files" / "QLH-Edge-Inference"
+    install_dir.mkdir(parents=True)
+    executable = install_dir / "QLH-Edge-Inference.exe"
+    legacy_path = install_dir / "node_config.json"
+    local_app_data = tmp_path / "LocalAppData"
+    monkeypatch.delenv("QLH_NODE_CONFIG_PATH", raising=False)
+    monkeypatch.setenv(
+        "QLH_NODE_SECRET_STORE_PATH", str(local_app_data / "node_secrets.json"),
+    )
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setenv("QLH_CLUSTER_SECRET", "initial-secret")
+    monkeypatch.setenv("QLH_CLUSTER_SECRET_EPOCH", "1")
+    node_config.ensure_local_cluster_secret()
+    rotated_secret, rotated_epoch = node_config.rotate_local_cluster_secret()
+    node_config.get_node_config_path().unlink()
+    legacy_path.write_text(json.dumps({
+        "cluster": {
+            "cluster_secret": "stale-install-secret",
+            "cluster_secret_epoch": 1,
+        },
+        "node": {"role": "client", "role_confirmed": True},
+    }), encoding="utf-8")
+
+    node_config.load_node_config()
+
+    assert node_config.get_local_cluster_secret() == rotated_secret
+    assert node_config.get_local_cluster_secret_epoch() == rotated_epoch
+
+
+def test_primary_config_migration_failure_does_not_fallback_to_legacy(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    primary = tmp_path / "user" / "node_config.json"
+    primary.parent.mkdir(parents=True)
+    primary.write_text(json.dumps({
+        "cluster": {"cluster_secret": "primary-secret"},
+        "node": {"role": "master", "role_confirmed": True},
+    }), encoding="utf-8")
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    executable = install_dir / "qlh.exe"
+    (install_dir / "node_config.json").write_text(json.dumps({
+        "cluster": {"cluster_secret": "legacy-secret"},
+        "node": {"role": "client", "role_confirmed": True},
+    }), encoding="utf-8")
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(primary))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(tmp_path / "secrets.json"))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setattr(
+        node_config,
+        "write_node_config",
+        lambda _data: (_ for _ in ()).throw(OSError("migration denied")),
+    )
+
+    with pytest.raises(OSError, match="migration denied"):
+        node_config.load_node_config()
+
+
+def test_cluster_secret_rotation_advances_epoch_and_invalidates_old_root(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(tmp_path / "node_secrets.json"))
+    monkeypatch.delenv("QLH_CLUSTER_SECRET", raising=False)
+    monkeypatch.delenv("QLH_CLUSTER_SECRET_EPOCH", raising=False)
+    old = node_config.ensure_local_cluster_secret()
+    old_epoch = node_config.get_local_cluster_secret_epoch()
+
+    new, new_epoch = node_config.rotate_local_cluster_secret()
+
+    assert new != old
+    assert new_epoch == old_epoch + 1
+    assert node_config.get_local_cluster_secret() == new
+    assert node_config.get_local_cluster_secret_epoch() == new_epoch
+
+
+def test_cluster_secret_rotation_overrides_stale_environment_on_restart(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(tmp_path / "node_secrets.json"))
+    monkeypatch.setenv("QLH_CLUSTER_SECRET", "legacy-dotenv-secret")
+    monkeypatch.setenv("QLH_CLUSTER_SECRET_EPOCH", "1")
+    old_secret = node_config.ensure_local_cluster_secret()
+
+    new_secret, new_epoch = node_config.rotate_local_cluster_secret()
+    assert new_secret != old_secret
+
+    # Simulate python-dotenv restoring the old deployment values before the
+    # normal startup call to apply_node_config_to_env().
+    monkeypatch.setenv("QLH_CLUSTER_SECRET", "legacy-dotenv-secret")
+    monkeypatch.setenv("QLH_CLUSTER_SECRET_EPOCH", "1")
+    node_config.apply_node_config_to_env()
+
+    assert os.environ["QLH_CLUSTER_SECRET"] == new_secret
+    assert os.environ["QLH_CLUSTER_SECRET_EPOCH"] == str(new_epoch)
+    assert node_config.get_local_cluster_secret() == new_secret
+    assert node_config.get_local_cluster_secret_epoch() == new_epoch
+
+
+def test_cluster_secret_rotation_restores_old_secret_when_config_write_fails(
+    tmp_path, monkeypatch,
+):
+    import node_config
+
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(tmp_path / "node_secrets.json"))
+    monkeypatch.delenv("QLH_CLUSTER_SECRET", raising=False)
+    monkeypatch.delenv("QLH_CLUSTER_SECRET_EPOCH", raising=False)
+    old_secret = node_config.ensure_local_cluster_secret()
+    old_epoch = node_config.get_local_cluster_secret_epoch()
+    monkeypatch.setattr(
+        node_config,
+        "write_node_config",
+        lambda _data: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        node_config.rotate_local_cluster_secret()
+
+    monkeypatch.delenv("QLH_CLUSTER_SECRET", raising=False)
+    assert node_config.get_local_cluster_secret() == old_secret
+    assert node_config.get_local_cluster_secret_epoch() == old_epoch
 
 
 def test_bootstrap_api_port_ignores_local_api_port(monkeypatch):
@@ -294,7 +532,7 @@ def test_bootstrap_api_port_ignores_local_api_port(monkeypatch):
     assert _bootstrap_api_port() == 18001
 
 
-def test_apply_runtime_config_syncs_loaded_scheduler(monkeypatch):
+def test_apply_runtime_config_syncs_loaded_scheduler(monkeypatch, tmp_path):
     import config as cfg
     import scheduler as scheduler_mod
     from node_config import apply_runtime_config
@@ -303,6 +541,8 @@ def test_apply_runtime_config_syncs_loaded_scheduler(monkeypatch):
     monkeypatch.setattr(cfg, "NODE_ROLE", "master", raising=False)
     monkeypatch.setattr(scheduler_mod, "NODE_ID", "stale-client", raising=False)
     monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "master", raising=False)
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(tmp_path / "node_secrets.json"))
     monkeypatch.setenv("QLH_CLUSTER_SECRET", "stale-runtime-secret")
     monkeypatch.setenv("QLH_NODE_ROLE", "master")
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -167,6 +169,74 @@ def test_join_grant_rejects_legacy_boolean_field(join_api):
     assert response.status_code == 422
 
 
+def test_cluster_secret_rotation_requires_master_and_tailnet_revocation(join_api):
+    import auth_app
+
+    client, role, secret = join_api
+    code = auth_app.totp(secret)
+    denied_role = client.post(
+        "/api/cluster/credentials/rotate",
+        json={"otp_code": code, "tailnet_revocation_completed": True},
+    )
+    assert denied_role.status_code == 403
+
+    role["value"] = "master"
+    missing_revocation = client.post(
+        "/api/cluster/credentials/rotate",
+        json={"otp_code": code, "tailnet_revocation_completed": False},
+    )
+    assert missing_revocation.status_code == 409
+    assert missing_revocation.json()["detail"]["code"] == "tailnet_revocation_required"
+
+
+def test_cluster_secret_rotation_never_returns_secret_and_disconnects_peers(
+    monkeypatch,
+):
+    import api_server
+    import node_config
+    from types import SimpleNamespace
+
+    calls = []
+
+    class FakeTCPServer:
+        def disconnect_all_clients(self, reason, *, before_disconnect):
+            calls.append(reason)
+            return before_disconnect(), 3
+
+    monkeypatch.setattr(api_server, "scheduler", SimpleNamespace(
+        _effective_role=lambda: "master",
+        _tcp_server=FakeTCPServer(),
+    ))
+    monkeypatch.setattr(
+        api_server.auth_service,
+        "verify_totp_confirmation",
+        lambda principal, code, source: None,
+    )
+    monkeypatch.setattr(
+        node_config,
+        "rotate_local_cluster_secret",
+        lambda: ("new-secret-must-not-leak", 7),
+    )
+
+    response = __import__("asyncio").run(api_server.rotate_cluster_secret(
+        api_server.ClusterSecretRotateRequest(
+            otp_code="123456",
+            tailnet_revocation_completed=True,
+        ),
+        SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")),
+        principal=SimpleNamespace(username="root"),
+    ))
+
+    assert response == {
+        "status": "rotated",
+        "cluster_secret_epoch": 7,
+        "disconnected_clients": 3,
+        "rebootstrap_required": True,
+    }
+    assert "new-secret-must-not-leak" not in str(response)
+    assert calls == ["cluster credential rotation"]
+
+
 def test_totp_failures_for_one_account_do_not_lock_another(join_api):
     import auth_app
     import auth_service
@@ -212,3 +282,51 @@ def test_provisional_master_request_uses_future_client_id(join_api, monkeypatch)
     )
     assert response.status_code == 200, response.text
     assert response.json()["target_node_id"] == "client_provisional-box"
+
+
+def test_join_grant_replay_is_rejected_before_connection_side_effect(join_api, monkeypatch):
+    import auth_app
+    import api_server
+
+    client, role, secret = join_api
+    created = client.post(
+        "/api/cluster/join/request",
+        json={"master_endpoint": "100.64.0.10:8888", "target_node_id": "client-test"},
+    )
+    role["value"] = "master"
+    issued = client.post(
+        "/api/cluster/join/grant",
+        json={
+            "request_code": created.json()["request_code"],
+            "otp_code": auth_app.totp(secret),
+        },
+    )
+    role["value"] = "client"
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_connect(host, port, **kwargs):
+        calls.append((host, port))
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"status": "connected", "master_host": host, "master_port": port}
+
+    monkeypatch.setattr(api_server.scheduler, "connect_to_master", blocking_connect)
+    grant_code = issued.json()["grant_code"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            client.post, "/api/cluster/join/consume", json={"grant_code": grant_code},
+        )
+        assert entered.wait(timeout=5)
+        replay = pool.submit(
+            client.post, "/api/cluster/join/consume", json={"grant_code": grant_code},
+        ).result(timeout=5)
+        release.set()
+        accepted = first.result(timeout=5)
+
+    assert accepted.status_code == 200
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["code"] in {"nonce_replayed", "request_not_found"}
+    assert calls == [("100.64.0.10", 8888)]

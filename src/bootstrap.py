@@ -15,6 +15,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from bootstrap_credentials import (
+    BootstrapCredentialError,
+    create_bootstrap_credential_request,
+    open_bootstrap_credential,
+)
 from node_config import apply_runtime_config, persist_bootstrap_response
 from network_address import build_url, canonical_host, is_tailscale_ip
 
@@ -47,6 +52,15 @@ def is_trusted_bootstrap_source(host: str, cidrs: str | None = None) -> bool:
     except ValueError:
         return False
     return any(ip in network for network in _cidr_list(cidrs))
+
+
+def is_secure_bootstrap_source(host: str) -> bool:
+    """Allow credential delivery only over loopback or Tailnet overlay."""
+    try:
+        address = ipaddress.ip_address((host or "").split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(address.is_loopback or is_tailscale_ip(str(address)))
 
 
 def normalize_node_type(node_type: str | None) -> str:
@@ -183,13 +197,16 @@ def first_connect(
     timeout: float = 8.0,
 ) -> dict[str, Any]:
     node_type = normalize_node_type(node_type)
+    normalized_node_id = normalize_node_id(node_id, node_type)
+    credential_request = create_bootstrap_credential_request()
     payload = {
-        "node_id": normalize_node_id(node_id, node_type),
+        "node_id": normalized_node_id,
         "node_type": node_type,
         "hostname": socket.gethostname(),
         "platform": platform.system().lower(),
         "app_variant": app_variant,
         "capabilities": capabilities or {},
+        **credential_request.fields(),
     }
     url = build_url(
         "http",
@@ -207,14 +224,30 @@ def first_connect(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"bootstrap HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"bootstrap HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"bootstrap request failed: {exc.reason}") from exc
 
     data = json.loads(body or "{}")
     if data.get("status") not in {"ok", "registered", "updated"}:
-        raise RuntimeError(f"bootstrap rejected: {data}")
+        raise RuntimeError("bootstrap rejected")
+
+    cluster = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
+    response_node = data.get("node") if isinstance(data.get("node"), dict) else {}
+    try:
+        credential = open_bootstrap_credential(
+            data.get("credential_envelope"),
+            private_key=credential_request.private_key,
+            expected_request_nonce=credential_request.request_nonce,
+            expected_cluster_id=str(cluster.get("cluster_id") or ""),
+            expected_node_id=str(response_node.get("node_id") or normalized_node_id),
+        )
+    except BootstrapCredentialError as exc:
+        raise RuntimeError(f"bootstrap credential rejected: {exc.code}") from exc
+    cluster["cluster_secret"] = credential["cluster_secret"]
+    cluster["cluster_secret_epoch"] = credential["cluster_secret_epoch"]
+    data["cluster"] = cluster
+    data.pop("credential_envelope", None)
 
     persist_bootstrap_response(data)
     apply_runtime_config(data)

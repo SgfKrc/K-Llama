@@ -14,7 +14,7 @@ _send_layer_config_ack / _send_layer_result / pipeline_done|abort），
   get_effective_node_id() → self._node_id
 
 未复制（开发期从节点不承担，归 scheduler-svc 控制面）：
-  链式直连 chain_forward（结果经主节点中转回退，主节点侧兼容）、
+  legacy 多段 CHAIN_FORWARD（由 master 向下一逻辑段转发，worker 不互连）、
   bootstrap 首次连接部署、备用主节点/角色转让、DB 主节点发现。
 """
 import base64
@@ -27,6 +27,13 @@ from typing import Any, Dict, Optional
 
 # ★ #31 M2：层流水线支持的架构走**单一事实来源**（此前硬编码 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+from model_load_resolver import (
+    ModelLoadFacts,
+    OP_DYNAMIC_LAYER_RANGE,
+    effective_pytorch_cuda_available,
+    resolve_model_load,
+)
+from torch_runtime import cuda_available
 
 logger = logging.getLogger("inference_service.peer")
 
@@ -38,6 +45,14 @@ def _generation_ack_fields(config: object, fallback: object = None) -> dict[str,
     for source in (config, fallback):
         if isinstance(source, dict) and "generation" in source:
             return {"generation": source["generation"]}
+    return {}
+
+
+def _assignment_ack_fields(config: object, fallback: object = None) -> dict[str, Any]:
+    """Echo assignment identity without normalizing its wire representation."""
+    for source in (config, fallback):
+        if isinstance(source, dict) and "assignment_id" in source:
+            return {"assignment_id": source["assignment_id"]}
     return {}
 
 
@@ -94,6 +109,11 @@ class PeerClient:
         # assignment after a master restart.
         self._latest_layer_config_generation = 0
         self._latest_layer_config_id = ""
+        self._latest_layer_assignment_id = ""
+        # Capability is sticky for the process lifetime. Once the coordinator
+        # has used assignment identity, accepting an identity-less retry would
+        # reopen the stale-message hole that the assignment fence closes.
+        self._layer_assignment_identity_required = False
         self._running = False
         self._client: Optional[Any] = None  # tcp_comm.TCPClient
         self._reconnect_delay = 5.0
@@ -258,6 +278,13 @@ class PeerClient:
             str(candidate.get("config_id", "") or "")
             if isinstance(candidate, dict) else ""
         )
+        incoming_assignment_present = (
+            isinstance(candidate, dict) and "assignment_id" in candidate
+        )
+        incoming_assignment_id = (
+            str(candidate.get("assignment_id", "") or "")
+            if incoming_assignment_present else ""
+        )
         with self._layer_config_lock:
             latest_generation = int(
                 getattr(self, "_latest_layer_config_generation", 0) or 0
@@ -265,6 +292,36 @@ class PeerClient:
             latest_config_id = str(
                 getattr(self, "_latest_layer_config_id", "") or ""
             )
+            latest_assignment_id = str(
+                getattr(self, "_latest_layer_assignment_id", "") or ""
+            )
+            assignment_identity_required = bool(
+                getattr(self, "_layer_assignment_identity_required", False)
+                or latest_assignment_id
+            )
+            # An explicitly present but empty identity is malformed, not a
+            # legacy message. Only true field absence may use the old path.
+            if incoming_assignment_present and not incoming_assignment_id:
+                logger.warning(
+                    "ignore layer config with empty assignment_id "
+                    "node=%s config=%s generation=%s",
+                    node_id,
+                    incoming_config_id or "legacy",
+                    incoming_generation,
+                )
+                return
+            if assignment_identity_required and not incoming_assignment_id:
+                logger.info(
+                    "ignore identity-less layer config after assignment fencing "
+                    "node=%s config=%s generation=%s latest=%s/%s/%s",
+                    node_id,
+                    incoming_config_id or "legacy",
+                    incoming_generation,
+                    latest_generation,
+                    latest_config_id or "legacy",
+                    latest_assignment_id,
+                )
+                return
             # Once a versioned assignment has been accepted, an unversioned
             # legacy message is necessarily older than the active lifecycle.
             # Accepting it would let a delayed release clear a newer relay
@@ -300,15 +357,24 @@ class PeerClient:
                         and latest_config_id
                         and incoming_config_id != latest_config_id
                     )
+                    or (
+                        incoming_generation == latest_generation
+                        and latest_config_id == incoming_config_id
+                        and latest_assignment_id
+                        and incoming_assignment_id != latest_assignment_id
+                    )
                 )
                 if stale:
                     logger.info(
-                        "ignore stale layer config node=%s config=%s generation=%s latest=%s/%s",
+                        "ignore stale layer config node=%s config=%s generation=%s "
+                        "assignment=%s latest=%s/%s/%s",
                         node_id,
                         incoming_config_id or "legacy",
                         incoming_generation,
+                        incoming_assignment_id or "legacy",
                         latest_generation,
                         latest_config_id or "legacy",
+                        latest_assignment_id or "legacy",
                     )
                     return
                 if (
@@ -320,6 +386,9 @@ class PeerClient:
                 ):
                     self._latest_layer_config_generation = incoming_generation
                     self._latest_layer_config_id = incoming_config_id
+            if incoming_assignment_id:
+                self._latest_layer_assignment_id = incoming_assignment_id
+                self._layer_assignment_identity_required = True
 
         # 兼容两种格式：新版直接是 assignment；旧版 {node_id: assignment}
         if isinstance(data, dict) and data.get("release"):
@@ -350,6 +419,7 @@ class PeerClient:
                 "status": "released",
                 "release": True,
                 "generation": int(data.get("generation", 0) or 0),
+                **_assignment_ack_fields(data),
             })
             logger.info("分层配置已释放: config_id=%s", data.get("config_id", ""))
             return
@@ -367,6 +437,7 @@ class PeerClient:
                 "status": "error",
                 "error": error,
                 **_generation_ack_fields(data),
+                **_assignment_ack_fields(data),
             })
             return
 
@@ -390,6 +461,7 @@ class PeerClient:
                 "node_id": node_id, "config_id": config_id,
                 "status": "error", "error": error,
                 **_generation_ack_fields(cfg, data),
+                **_assignment_ack_fields(cfg, data),
             })
             return
 
@@ -415,6 +487,7 @@ class PeerClient:
                     "status": "error",
                     "error": error,
                     **_generation_ack_fields(cfg, data),
+                    **_assignment_ack_fields(cfg, data),
                 })
                 return
             with self._layer_config_lock:
@@ -443,9 +516,10 @@ class PeerClient:
                 # ★ 2026-09-30：ACK **必须**回显 `generation` —— 主节点
                 #   `scheduler_pipeline.py:1926` 对**非 release** 的期望同样做 generation 门闩
                 #   （`if not expected.get("release") and "generation" in expected`），
-                #   而主节点写入的 `_layer_config_expected[node_id] = dict(config)`（`:390`）
-                #   本就带 generation。缺它 ⇒ 被 `忽略缺少或无效 generation 的层配置 ACK`。
+                #   而 assignment registry 的 canonical expected contract
+                #   本就带 generation。缺它 ⇒ 被 generation 门闩拒绝。
                 "generation": cfg.get("generation", data.get("generation", 0)),
+                **_assignment_ack_fields(cfg, data),
             }
             if phase == "commit":
                 self._send_layer_config_ack({**common, "status": "ready"})
@@ -498,15 +572,37 @@ class PeerClient:
             if not local_model_path:
                 raise RuntimeError(f"模型同步后仍无本地路径: {model_id}")
 
-            self._host._host.load_model(
-                model_path=local_model_path,
-                quant_type="int4",
-                profile=None,
-                engine="pytorch",
+            requested_quant = str(
+                cfg.get("master_quant_type") or cfg.get("quant_type") or "int4"
             )
+            profile = self._host._ensure_device_profile()
+
+            resolution = resolve_model_load(
+                ModelLoadFacts(
+                    model_id=model_id,
+                    model_name=model_id,
+                    registered=True,
+                    has_safetensors=True,
+                    safetensors_path=local_model_path,
+                    preferred_engine="pytorch",
+                    cuda_available=effective_pytorch_cuda_available(
+                        system_cuda_available=cuda_available(load=True),
+                        profile=profile,
+                    ),
+                ),
+                requested_engine="pytorch",
+                requested_quant=requested_quant,
+                operation=OP_DYNAMIC_LAYER_RANGE,
+            )
+
             self._host._host.load_layer_range(
                 start_layer=start, end_layer=end,
                 has_embedding=has_embed, has_lm_head=has_lm,
+                model_path=resolution.model_path,
+                quant_type=resolution.quant_type,
+                profile=profile,
+                total_layers=total_layers,
+                model_id=resolution.model_id,
             )
 
             with self._layer_config_lock:
@@ -523,6 +619,7 @@ class PeerClient:
                 # ★ 2026-09-30：同 relay 分支 —— 非 release 的层配置 ACK 也要回显
                 #   `generation`，否则主节点的 generation 门闩会把它整条忽略（见上）。
                 "generation": int(cfg.get("generation", 0) or 0),
+                **_assignment_ack_fields(cfg, data),
             })
             logger.info(
                 f"✅ 层段加载完成: Layer {start}-{end}, config_id={config_id}"
@@ -534,6 +631,7 @@ class PeerClient:
                 "node_id": node_id, "config_id": config_id,
                 "status": "error", "error": error,
                 **_generation_ack_fields(cfg, data),
+                **_assignment_ack_fields(cfg, data),
             })
 
     def _send_layer_config_ack(self, payload: dict) -> bool:
@@ -578,13 +676,44 @@ class PeerClient:
         # tensor-fast decoder below remains for mixed-version non-relay frames.
         from tcp_comm import deserialize_tensor_fast
 
-        from relay_segment_client import RelaySegmentClient
+        from relay_segment_client import (
+            REQUEST_DEADLINE_EXCEEDED,
+            RelaySegmentClient,
+        )
 
         task_id = str(data.get("task_id", "unknown") or "unknown")
         try:
             step = int(data.get("step", 0))
         except (TypeError, ValueError):
             step = -1
+
+        request_deadline_ms = int(data.get("request_deadline_ms", 0) or 0)
+        deadline_monotonic = None
+        if request_deadline_ms:
+            remaining = request_deadline_ms / 1000.0 - time.time()
+            if remaining <= 0:
+                self._close_relay_session(task_id, abort=True)
+                self._send_layer_result(
+                    task_id, {}, error=REQUEST_DEADLINE_EXCEEDED
+                )
+                return False
+            deadline_monotonic = time.monotonic() + remaining
+            with self._layer_config_lock:
+                existing = getattr(self, "_relay_sessions", {}).get(task_id)
+                existing_deadline = getattr(
+                    existing, "deadline_monotonic", None
+                )
+            if (
+                existing_deadline is not None
+                and existing_deadline < deadline_monotonic
+            ):
+                deadline_monotonic = existing_deadline
+            if deadline_monotonic <= time.monotonic():
+                self._close_relay_session(task_id, abort=True)
+                self._send_layer_result(
+                    task_id, {}, error=REQUEST_DEADLINE_EXCEEDED
+                )
+                return False
 
         cfg = dict(self._active_layer_config or {})
         spec = cfg.get("relay_segment") or {}
@@ -695,38 +824,75 @@ class PeerClient:
         try:
             endpoint_key = (
                 str(spec.get("host", "")), int(spec.get("port", 0)), width, role,
-                float(spec.get("timeout", 60.0) or 60.0),
             )
-            sessions = getattr(self, "_relay_sessions", None)
-            if sessions is None:
-                sessions = self._relay_sessions = {}
-            client = sessions.get(task_id)
+            configured_timeout = float(spec.get("timeout", 60.0) or 60.0)
+            with self._layer_config_lock:
+                sessions = getattr(self, "_relay_sessions", None)
+                if sessions is None:
+                    sessions = self._relay_sessions = {}
+                client = sessions.get(task_id)
             if client is not None and getattr(client, "_relay_endpoint_key", None) != endpoint_key:
-                self._close_relay_session(task_id)
+                self._close_relay_session(task_id, abort=True)
                 client = None
             if client is None:
                 client = RelaySegmentClient(
                     endpoint_key[0], endpoint_key[1], n_embd=width,
-                    role=role, timeout=endpoint_key[4],
+                    role=role, timeout=configured_timeout,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 client._relay_endpoint_key = endpoint_key
-                sessions[task_id] = client
+                with self._layer_config_lock:
+                    if task_id in self._local_pipeline_cancelled:
+                        client.close(grace_timeout=0.0)
+                        return False
+                    sessions[task_id] = client
+            elif deadline_monotonic is not None:
+                tighten_deadline = getattr(client, "tighten_deadline", None)
+                if callable(tighten_deadline):
+                    tighten_deadline(deadline_monotonic)
+            deadline_kwargs = (
+                {"deadline_monotonic": deadline_monotonic}
+                if deadline_monotonic is not None
+                else {}
+            )
             if role == "tail":
                 if seq_meta is None:
-                    outcome = client.forward_hidden_to_token(hidden_bytes, n_tokens=n_tokens)
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes,
+                        n_tokens=n_tokens,
+                        **deadline_kwargs,
+                    )
                 else:
                     outcome = client.forward_hidden_to_token(
-                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+                        hidden_bytes,
+                        n_tokens=n_tokens,
+                        seq_meta=seq_meta,
+                        **deadline_kwargs,
+                    )
             else:
                 if seq_meta is None:
-                    outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+                    outcome = client.forward_hidden(
+                        hidden_bytes,
+                        n_tokens=n_tokens,
+                        **deadline_kwargs,
+                    )
                 else:
                     outcome = client.forward_hidden(
-                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+                        hidden_bytes,
+                        n_tokens=n_tokens,
+                        seq_meta=seq_meta,
+                        **deadline_kwargs,
+                    )
         except Exception as exc:
             logger.error("relay 段委托失败: %s", exc, exc_info=True)
-            self._close_relay_session(task_id)
-            self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{exc}")
+            self._close_relay_session(task_id, abort=True)
+            code = getattr(exc, "code", "") or str(exc)
+            error = (
+                REQUEST_DEADLINE_EXCEEDED
+                if code == REQUEST_DEADLINE_EXCEEDED
+                else f"relay_segment_failed:{code}"
+            )
+            self._send_layer_result(task_id, {}, error=error)
             return False
         elapsed_ms = (time.time() - started) * 1000
 
@@ -735,8 +901,28 @@ class PeerClient:
             logger.warning(
                 "relay 段委托未成功: task=%s step=%s code=%s", task_id, step, code
             )
-            self._close_relay_session(task_id)
-            self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{code}")
+            self._close_relay_session(task_id, abort=True)
+            error = (
+                REQUEST_DEADLINE_EXCEEDED
+                if code == REQUEST_DEADLINE_EXCEEDED
+                else f"relay_segment_failed:{code}"
+            )
+            self._send_layer_result(task_id, {}, error=error)
+            return False
+
+        if (
+            deadline_monotonic is not None
+            and deadline_monotonic <= time.monotonic()
+        ):
+            self._close_relay_session(task_id, abort=True)
+            self._send_layer_result(
+                task_id, {}, error=REQUEST_DEADLINE_EXCEEDED
+            )
+            return False
+        with self._layer_config_lock:
+            cancelled = task_id in self._local_pipeline_cancelled
+        if cancelled:
+            self._close_relay_session(task_id, abort=True)
             return False
 
         common_response = {
@@ -761,7 +947,7 @@ class PeerClient:
             token = getattr(outcome, "token", None)
             if token is None:
                 self._send_layer_result(task_id, {}, error="relay tail 段未返回 token")
-                self._close_relay_session(task_id)
+                self._close_relay_session(task_id, abort=True)
                 return False
             response = {**common_response, "token": int(token)}
         else:
@@ -778,7 +964,7 @@ class PeerClient:
             except Exception as exc:
                 logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
                 self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
-                self._close_relay_session(task_id)
+                self._close_relay_session(task_id, abort=True)
                 return False
             # Keep the relay contract symmetric with scheduler_pipeline:
             # raw f32 in both directions, with an explicit discriminator.
@@ -795,24 +981,28 @@ class PeerClient:
         )
         return self._send_layer_result(task_id, response)
 
-    def _close_relay_session(self, task_id: str) -> None:
+    def _close_relay_session(self, task_id: str, *, abort: bool = False) -> None:
         """Close one task-scoped relay connection and forget it."""
-        sessions = getattr(self, "_relay_sessions", None)
-        if not sessions:
-            return
-        client = sessions.pop(str(task_id), None)
+        with self._layer_config_lock:
+            sessions = getattr(self, "_relay_sessions", None)
+            client = sessions.pop(str(task_id), None) if sessions else None
         if client is None:
             return
         try:
-            client.close()
+            if abort:
+                try:
+                    client.close(grace_timeout=0.0)
+                except TypeError:
+                    client.close()
+            else:
+                client.close()
         except Exception:  # noqa: BLE001 - cleanup must not mask pipeline state
             logger.warning("relay session close failed: task=%s", task_id, exc_info=True)
 
     def _close_all_relay_sessions(self) -> None:
-        sessions = getattr(self, "_relay_sessions", None)
-        if not sessions:
-            return
-        for task_id in list(sessions):
+        with self._layer_config_lock:
+            task_ids = list(getattr(self, "_relay_sessions", {}) or {})
+        for task_id in task_ids:
             self._close_relay_session(task_id)
 
     def _handle_layer_forward_locked(self, data: dict) -> None:
@@ -1039,12 +1229,15 @@ class PeerClient:
     def _handle_pipeline_abort(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         if task_id:
+            # Publish cancellation and break a blocking relay I/O before
+            # waiting for the serialized layer execution section.
+            with self._layer_config_lock:
+                self._local_pipeline_cancelled.add(task_id)
+            self._close_relay_session(task_id, abort=True)
             with self._layer_execution_lock:
-                self._close_relay_session(task_id)
                 with self._layer_config_lock:
                     self._local_pipeline_steps.pop(task_id, None)
                     self._active_pipeline_task_ids.discard(task_id)
-                    self._local_pipeline_cancelled.add(task_id)
                 with self._kv_cache_lock:
                     self._kv_cache.pop(task_id, None)
                 logger.info(f"流水线任务取消: {task_id}")

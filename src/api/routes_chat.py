@@ -8,6 +8,7 @@ import asyncio
 
 from fastapi import APIRouter, File
 from api._routing import configure_route_module
+from api_errors import error_code_from_exception
 
 router = APIRouter()
 _api_module: ModuleType | None = None
@@ -237,6 +238,11 @@ async def _watch_client_disconnect(request: Request, cancel_event,
     except Exception:                       # 断开检测本身失败不得影响请求
         _api_module.logger.warning("客户端断开检测失败", exc_info=True)
 
+def _check_registered_chat_source(request):
+    if _api_module.is_registered_chat_request(request):
+        _api_module.require_model_intent_source(request, _api_module.scheduler)
+
+
 async def chat(req: ChatRequest, request: Request = None):
     """
     发送消息并获取模型回复（多轮对话）。
@@ -248,8 +254,12 @@ async def chat(req: ChatRequest, request: Request = None):
     （`tests/test_task_graph_api.py` 多处 `api_server.chat(req)`）；
     经 FastAPI 路由进入时总会被注入真实 `Request`，断开检测才会生效。
     """
+    _check_registered_chat_source(request)
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
+    request_deadline = _api_module.RequestDeadline.start(
+        _api_module.PIPELINE_TIMEOUT,
+    )
     # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
     _api_module._maybe_log_external_scope_denial(req, _api_module._external_route_decision(req))
 
@@ -275,18 +285,40 @@ async def chat(req: ChatRequest, request: Request = None):
             "task_graph_remote_provider_id）以便推断执行模式。",
         )
 
-    def _run_chat_request():
+    def _run_chat_request_unlocked():
+        _check_registered_chat_source(request)
         if req.execution_mode == "task_graph":
             if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
                 raise _api_module.HTTPException(
                     409,
                     "任务链实验要求先加载本地完整模型。",
                 )
-            return _api_module._execute_requested_chat(req, cancel_event)
-        with _api_module.model_host.full_chat_execution_lock:
-            if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
+            return _api_module._execute_requested_chat(
+                req, cancel_event, request_deadline,
+            )
+        # A required worker request waits on the master, which can dispatch a
+        # layer stage back to this same worker. Holding its model lock across
+        # that wait would prevent the stage from executing. Required routing
+        # already fails closed instead of running a local fallback.
+        if (req.routing_preference == "distributed_required"
+                and _api_module._should_forward_chat_to_master()):
+            return _api_module._execute_requested_chat(
+                req, cancel_event, request_deadline, forward_only=True,
+            )
+        with _api_module.hold_lock_until_deadline(
+            _api_module.model_host.full_chat_execution_lock,
+            request_deadline,
+            operation="full chat execution lock",
+        ):
+            if (
+                not _api_module.model_host.model_loaded
+                or not _api_module.model_manager.is_loaded
+                or _api_module._pipeline_model_is_prepared()
+            ):
                 try:
                     _api_module._ensure_chat_model_or_forwarding(req)
+                except _api_module.HTTPException:
+                    raise
                 except FileNotFoundError:
                     raise _api_module.HTTPException(
                         400,
@@ -298,7 +330,21 @@ async def chat(req: ChatRequest, request: Request = None):
                         500,
                         f"自动加载模型失败: {exc}。请手动在控制面板中加载模型。",
                     ) from exc
-            return _api_module._execute_requested_chat(req, cancel_event)
+            return _api_module._execute_requested_chat(
+                req, cancel_event, request_deadline,
+            )
+
+    def _run_chat_request():
+        with _api_module._chat_context.transaction(
+            deadline=request_deadline,
+        ):
+            token = _api_module._request_id_ctx.set(
+                _api_module._request_id_ctx.get("-"),
+            )
+            try:
+                return _run_chat_request_unlocked()
+            finally:
+                _api_module._request_id_ctx.reset(token)
 
     watcher = None
     if request is None:
@@ -309,6 +355,12 @@ async def chat(req: ChatRequest, request: Request = None):
             _watch_client_disconnect(request, cancel_event, generation_id))
     try:
         result = await _api_module.run_in_threadpool(_run_chat_request)
+    except _api_module.RequestDeadlineExceeded as exc:
+        raise _api_module.coded_http_error(
+            504,
+            _api_module.REQUEST_DEADLINE_EXCEEDED,
+            str(exc),
+        ) from exc
     except _api_module.ChatGenerationCancelled as exc:
         # ★ 2026-10-07（DIST-NEXT-8）：非流式取消同样带独立终态与稳定 reason code，
         #   与其它 409/拒绝响应的风格一致（此前只有一个中文 message）。
@@ -341,11 +393,11 @@ async def chat_stream(req: ChatRequest, request: Request):
 
     支持两种模式（通过 streaming_mode 参数切换）:
 
-    fast（默认）— 真流式，逐 token 推送:
+    fast — 真流式，逐 token 推送:
       - 路径1: 分布式流水线 → 逐 token SSE
       - 路径2: 单机 PyTorch → 逐 token SSE（TextIteratorStreamer）
       - 路径3: llama.cpp / 其他 → 假流式回退（单次 done 事件）
-      - 注意: fast 模式跳过了历史/追问/DB持久化，专注低延迟
+      - 与 full/interactive 共用会话历史、上下文窗口和完成时提交
 
     full — 假流式，完整功能:
       - 走 /api/chat 全流程：会话管理、对话历史、追问生成、DB 持久化
@@ -359,21 +411,58 @@ async def chat_stream(req: ChatRequest, request: Request):
     import asyncio as _asyncio
     import json as _json
     request_id = _api_module._request_id_ctx.get("-")
+    _check_registered_chat_source(request)
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
+    request_deadline = _api_module.RequestDeadline.start(
+        _api_module.PIPELINE_TIMEOUT,
+    )
 
     async def _generate():
         previous_request_id = _api_module._request_id_ctx.get("-")
         _api_module._request_id_ctx.set(request_id)
         completed_normally = False
+        transaction_acquired = False
         try:
+            if req.streaming_mode == "full" or req.execution_mode == "task_graph":
+                # Flush headers through proxies before context/model locks or
+                # generation can consume the client's connection timeout.
+                # SSE comments carry no token or completion semantics.
+                yield ": processing\n\n"
+            loop = _asyncio.get_running_loop()
+            acquire_future = loop.run_in_executor(
+                None,
+                lambda: _api_module._chat_context.acquire_transaction(
+                    deadline=request_deadline,
+                ),
+            )
+            try:
+                await _asyncio.shield(acquire_future)
+                transaction_acquired = True
+            except _asyncio.CancelledError:
+                async def _release_abandoned_acquire():
+                    try:
+                        await acquire_future
+                    finally:
+                        _api_module._chat_context.release_transaction()
+
+                _asyncio.create_task(_release_abandoned_acquire())
+                raise
             async for chunk in _generate_events():
                 yield chunk
+            completed_normally = True
+        except _api_module.RequestDeadlineExceeded as exc:
+            yield _error_event(
+                str(exc),
+                reason_code=_api_module.REQUEST_DEADLINE_EXCEEDED,
+            )
             completed_normally = True
         finally:
             if not completed_normally:
                 cancel_event.set()
             _api_module._unregister_generation(generation_id, cancel_event)
+            if transaction_acquired:
+                _api_module._chat_context.release_transaction()
             # StreamingResponse may close an async generator from a different
             # task context. ContextVar tokens cannot be reset across contexts.
             _api_module._request_id_ctx.set(previous_request_id)
@@ -395,6 +484,12 @@ async def chat_stream(req: ChatRequest, request: Request):
         其余为链路/执行失败。两者以前只有一段 `error` 文本，聚合时分不开。
         """
         if isinstance(message, dict):
+            reason_code = reason_code or str(
+                message.get("reason_code")
+                or message.get("error_code")
+                or message.get("code")
+                or ""
+            )
             message = message.get("message") or _api_module.json.dumps(
                 message, ensure_ascii=False,
             )
@@ -411,20 +506,33 @@ async def chat_stream(req: ChatRequest, request: Request):
 
     async def _iterate_sync_generator(iterable):
         """Bridge a blocking generator without blocking the ASGI event loop."""
-        queue = _asyncio.Queue()
+        import concurrent.futures as _concurrent_futures
+
+        queue = _asyncio.Queue(maxsize=1)
         done = object()
+
+        def _put_from_thread(payload) -> bool:
+            future = _asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+            while True:
+                try:
+                    future.result(timeout=0.1)
+                    return True
+                except _concurrent_futures.TimeoutError:
+                    if cancel_event.is_set():
+                        future.cancel()
+                        return False
+                except Exception:
+                    return False
 
         def _pump():
             try:
                 for item in iterable:
-                    loop.call_soon_threadsafe(queue.put_nowait, (item, None))
+                    if not _put_from_thread((item, None)):
+                        return
             except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, (None, exc))
+                _put_from_thread((None, exc))
             finally:
-                try:
-                    loop.call_soon_threadsafe(queue.put_nowait, (done, None))
-                except RuntimeError:
-                    pass
+                _put_from_thread((done, None))
 
         loop = _asyncio.get_running_loop()
         _api_module.threading.Thread(
@@ -432,16 +540,25 @@ async def chat_stream(req: ChatRequest, request: Request):
             name=f"chat-stream-bridge-{generation_id[-8:]}",
             daemon=True,
         ).start()
+        completed_normally = False
         try:
             while True:
                 item, error = await queue.get()
                 if item is done:
+                    completed_normally = True
                     break
                 if error is not None:
                     raise error
                 yield item
         finally:
-            cancel_event.set()
+            if not completed_normally:
+                cancel_event.set()
+            close = getattr(iterable, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except ValueError:
+                    pass
 
     async def _generate_events():
         # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
@@ -456,18 +573,19 @@ async def chat_stream(req: ChatRequest, request: Request):
         #    完成时会话事务提交（user + assistant 一次写入）
         # ================================================================
         if req.streaming_mode == "interactive":
-            target_session_id = req.session_id or _api_module.active_session_id
-            if target_session_id and target_session_id != _api_module.active_session_id:
-                try:
-                    _api_module._switch_session(target_session_id)
-                except Exception:
-                    pass
-            history = _api_module._get_active_history()
-            if target_session_id and len(history) == 0:
-                try:
-                    _api_module._auto_title_session(target_session_id, req.message)
-                except Exception:
-                    pass
+            try:
+                prepared_context = _api_module._prepare_chat_context(
+                    req.session_id, req.message,
+                )
+            except Exception as exc:
+                yield _error_event(f"会话上下文加载失败: {exc}")
+                return
+            target_session_id = prepared_context.session_id
+            history = prepared_context.history
+            request_messages = [
+                *history,
+                {"role": "user", "content": req.message},
+            ]
 
             yield f"data: {_json.dumps({'start': True, 'generation_id': generation_id, 'request_id': request_id, 'session_id': target_session_id, 'routing_preference': req.routing_preference}, ensure_ascii=False)}\n\n"
 
@@ -475,11 +593,12 @@ async def chat_stream(req: ChatRequest, request: Request):
             thinking_parts: list[str] = []
             metrics: dict = {}
             error: _api_module.Optional[str] = None
+            terminal_reason_code = ""
             cancelled = False
             distributed_used = False
 
             def _append_event(event: dict) -> None:
-                nonlocal metrics, error
+                nonlocal metrics, error, terminal_reason_code
                 if event.get("token"):
                     response_parts.append(str(event["token"]))
                 if event.get("thinking"):
@@ -488,6 +607,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                     metrics.update(event["metrics"])
                 if event.get("error"):
                     error = str(event["error"])
+                    terminal_reason_code = str(
+                        event.get("reason_code") or terminal_reason_code
+                    )
 
             loop = _asyncio.get_running_loop()
 
@@ -502,7 +624,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 _ext_decision = _api_module._external_route_decision(req)
                 if _ext_decision.use_external:
                     async for event in _iterate_sync_generator(
-                        _api_module._external_stream_events(req, cancel_event),
+                        _api_module._external_stream_events(
+                            req, cancel_event, history=history,
+                        ),
                     ):
                         _append_event(event)
                         frame = _token_frame(event)
@@ -530,8 +654,17 @@ async def chat_stream(req: ChatRequest, request: Request):
                     )
                 else:
                     if (
+                        req.routing_preference == "local_only"
+                        and _api_module._pipeline_model_is_prepared()
+                    ):
+                        error = (
+                            "当前模型仅以分布式流水线模式准备；"
+                            "local_only 请求需要先显式加载完整模型。"
+                        )
+                    if (
                         (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
                         and not _api_module._pipeline_model_is_prepared()
+                        and req.routing_preference != 'distributed_required'
                     ):
                         try:
                             await _run_with_request_id(loop, _api_module._auto_load_default_model)
@@ -553,12 +686,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 max_new_tokens=req.max_new_tokens,
                                 temperature=req.temperature,
                                 top_p=req.top_p,
-                                session_id=req.session_id,
-                                messages=[{"role": "user", "content": req.message}],
+                                session_id=target_session_id,
+                                messages=request_messages,
                                 show_thinking=req.show_thinking,
+                                enable_thinking=req.enable_thinking,
                                 _require_distributed=(req.routing_preference == "distributed_required"),
                                 _force_distributed_assignment=True,
                                 _cancel_event=cancel_event,
+                                _request_deadline=request_deadline,
                             )):
                                 _append_event(event)
                                 frame = _token_frame(event)
@@ -577,9 +712,11 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     max_new_tokens=req.max_new_tokens,
                                     temperature=req.temperature,
                                     top_p=req.top_p,
-                                    messages=[{"role": "user", "content": req.message}],
+                                    messages=request_messages,
                                     show_thinking=req.show_thinking,
+                                    enable_thinking=req.enable_thinking,
                                     _cancel_event=cancel_event,
+                                    _request_deadline=request_deadline,
                                 ),
                             ):
                                 _append_event(event)
@@ -593,10 +730,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 max_new_tokens=req.max_new_tokens,
                                 temperature=req.temperature,
                                 top_p=req.top_p,
-                                session_id=req.session_id,
-                                messages=[{"role": "user", "content": req.message}],
+                                session_id=target_session_id,
+                                messages=request_messages,
                                 show_thinking=req.show_thinking,
+                                enable_thinking=req.enable_thinking,
                                 _cancel_event=cancel_event,
+                                _request_deadline=request_deadline,
                             )):
                                 _append_event(event)
                                 frame = _token_frame(event)
@@ -611,10 +750,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     max_new_tokens=req.max_new_tokens,
                                     temperature=req.temperature,
                                     top_p=req.top_p,
-                                    session_id=req.session_id,
+                                    session_id=target_session_id,
+                                    messages=request_messages,
                                     _require_distributed=(req.routing_preference == "distributed_required"),
                                     _force_distributed_assignment=(req.routing_preference != "local_only"),
                                     _cancel_event=cancel_event,
+                                    _request_deadline=request_deadline,
                                 ),
                             )
                             if isinstance(result.get("metrics"), dict):
@@ -653,7 +794,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
                 return
             if error:
-                yield _error_event(error)
+                yield _error_event(
+                    error, reason_code=terminal_reason_code,
+                )
                 return
 
             response_text = "".join(response_parts)
@@ -685,6 +828,15 @@ async def chat_stream(req: ChatRequest, request: Request):
                     "fallback_reason",
                     "distributed_unavailable_fallback_to_local",
                 )
+            try:
+                _api_module._enforce_distributed_required(
+                    req,
+                    metrics,
+                    detail="interactive 终态未完成允许的分布式执行",
+                )
+            except _api_module.HTTPException as exc:
+                yield _error_event(exc.detail)
+                return
             # ★ 2026-10-07（DIST-NEXT-8）：统一相位 + 互斥终态。
             #   `admitted` = 本次请求真的拿到了分布式 assignment（config_id /
             #   workers_used / layer_assignments 任一存在）；`fallback=True` 只描述
@@ -700,8 +852,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 completed=True,
                 fallback=bool(metrics.get("fallback")),
             )
-            committed = _api_module._commit_interactive_history(
+            committed = _api_module._commit_chat_context_turn(
                 target_session_id, req.message, response_text, metrics,
+                expected_revision=prepared_context.revision,
             )
             done_payload = {
                 "done": True,
@@ -724,22 +877,42 @@ async def chat_stream(req: ChatRequest, request: Request):
             loop = _asyncio.get_running_loop()
 
             def _execute_full_stream_request():
+                _check_registered_chat_source(request)
                 if req.execution_mode == "task_graph":
                     if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
                         raise _api_module.HTTPException(
                             409,
                             "任务链实验要求先加载本地完整模型。",
                         )
-                    return _api_module._execute_requested_chat(req, cancel_event)
-                with _api_module.model_host.full_chat_execution_lock:
-                    if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
+                    return _api_module._execute_requested_chat(
+                        req, cancel_event, request_deadline,
+                    )
+                # Keep this worker available for the master's returning stage.
+                if (req.routing_preference == "distributed_required"
+                        and _api_module._should_forward_chat_to_master()):
+                    return _api_module._execute_requested_chat(
+                        req, cancel_event, request_deadline, forward_only=True,
+                    )
+                with _api_module.hold_lock_until_deadline(
+                    _api_module.model_host.full_chat_execution_lock,
+                    request_deadline,
+                    operation="full chat execution lock",
+                ):
+                    if (
+                        not _api_module.model_host.model_loaded
+                        or not _api_module.model_manager.is_loaded
+                        or _api_module._pipeline_model_is_prepared()
+                    ):
                         _api_module._ensure_chat_model_or_forwarding(req)
-                    return _api_module._execute_requested_chat(req, cancel_event)
+                    return _api_module._execute_requested_chat(
+                        req, cancel_event, request_deadline,
+                    )
 
             try:
                 result = await _run_with_request_id(
                     loop, _execute_full_stream_request,
                 )
+                _check_registered_chat_source(request)
                 _done_payload = _json.dumps({
                     'done': True,
                     'response': result['content'],
@@ -749,16 +922,88 @@ async def chat_stream(req: ChatRequest, request: Request):
                     'request_id': request_id,
                 }, ensure_ascii=False)
                 yield f"data: {_done_payload}\n\n"
+            except _api_module.RequestDeadlineExceeded as e:
+                yield _error_event(
+                    str(e),
+                    reason_code=_api_module.REQUEST_DEADLINE_EXCEEDED,
+                )
             except _api_module.HTTPException as e:
-                yield _error_event(e.detail)
+                yield _error_event(
+                    e.detail,
+                    reason_code=error_code_from_exception(e),
+                )
             except Exception as e:
                 _api_module.logger.error(f"full 模式推理失败: {e}", exc_info=True)
                 yield _error_event(str(e))
             return
 
         # ================================================================
-        # fast 模式：真流式，跳过历史/追问/DB 持久化（低延迟）
+        # fast 模式：真流式；上下文与完成时提交和其他模式完全一致。
         # ================================================================
+        try:
+            prepared_context = _api_module._prepare_chat_context(
+                req.session_id, req.message,
+            )
+        except Exception as exc:
+            yield _error_event(f"会话上下文加载失败: {exc}")
+            return
+        target_session_id = prepared_context.session_id
+        history = prepared_context.history
+        request_messages = [
+            *history,
+            {"role": "user", "content": req.message},
+        ]
+        fast_response_parts: list[str] = []
+        fast_metrics: dict = {}
+        fast_committed = False
+
+        def _capture_fast_event(event: dict) -> dict:
+            nonlocal fast_committed
+            if event.get("token") is not None:
+                fast_response_parts.append(str(event["token"]))
+            if isinstance(event.get("metrics"), dict):
+                fast_metrics.update(event["metrics"])
+            if not event.get("done") or fast_committed:
+                return event
+            if (
+                event.get("error")
+                or event.get("cancelled")
+                or cancel_event.is_set()
+                or fast_metrics.get("cancelled")
+            ):
+                return event
+            response_text = str(
+                event.get("response") or "".join(fast_response_parts)
+            )
+            if not response_text:
+                return event
+            event_metrics = dict(fast_metrics)
+            event_metrics.setdefault("request_id", request_id)
+            try:
+                _api_module._enforce_distributed_required(
+                    req,
+                    event_metrics,
+                    detail="fast 终态未完成允许的分布式执行",
+                )
+            except _api_module.HTTPException as exc:
+                return {
+                    "done": True,
+                    "error": str(exc.detail),
+                    "metrics": event_metrics,
+                    "request_id": request_id,
+                    "session_id": target_session_id,
+                    "history_committed": False,
+                }
+            event["metrics"] = event_metrics
+            event["response"] = response_text
+            event["session_id"] = target_session_id
+            event["history_committed"] = _api_module._commit_chat_context_turn(
+                target_session_id, req.message, response_text, event_metrics,
+                expected_revision=prepared_context.revision,
+            )
+            fast_committed = True
+            return event
+
         # ---- 路线 B: 外部推理服务真流式（数据作用域门控，默认不出集群）----
         external_fallback_reason = ""
         _ext_decision = _api_module._external_route_decision(req)
@@ -770,7 +1015,9 @@ async def chat_stream(req: ChatRequest, request: Request):
             return
         if _ext_decision.use_external:
             loop = _asyncio.get_running_loop()
-            ext_events = _api_module._external_stream_events(req, cancel_event)
+            ext_events = _api_module._external_stream_events(
+                req, cancel_event, history=history,
+            )
             first_event = None
             external_error = None
             try:
@@ -783,10 +1030,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                 external_error = exc
             if external_error is None:
                 if first_event is not None:
+                    first_event = _capture_fast_event(first_event)
                     yield f"data: {_json.dumps(first_event, ensure_ascii=False)}\n\n"
                     if not first_event.get("done"):
                         try:
                             async for event in _iterate_sync_generator(ext_events):
+                                # Once any external SSE event has been emitted,
+                                # a stream failure is terminal and must cancel.
+                                event = _capture_fast_event(event)
                                 yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
                         except Exception as e:
                             _api_module.logger.error(f"外部推理服务流式失败: {e}")
@@ -828,9 +1079,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     show_thinking=req.show_thinking,
+                    enable_thinking=req.enable_thinking,
                     routing_preference=req.routing_preference,
-                    session_id=req.session_id,
-                    messages=[{"role": "user", "content": req.message}],
+                    session_id=target_session_id,
+                    messages=request_messages,
                     request_id=request_id,
                     _cancel_event=cancel_event,
                 ),
@@ -838,13 +1090,14 @@ async def chat_stream(req: ChatRequest, request: Request):
             if result.get("status") == "ok":
                 metrics = result.get("metrics", {}) or {}
                 metrics.setdefault("request_id", request_id)
-                _done_payload = _json.dumps({
+                done_event = _capture_fast_event({
                     'done': True,
                     'response': result.get('content', ''),
                     'thinking_content': result.get('thinking_content'),
                     'metrics': metrics,
                     'request_id': request_id,
-                }, ensure_ascii=False)
+                })
+                _done_payload = _json.dumps(done_event, ensure_ascii=False)
                 yield f"data: {_done_payload}\n\n"
                 return
             if _api_module._pipeline_worker_is_reserved():
@@ -862,8 +1115,19 @@ async def chat_stream(req: ChatRequest, request: Request):
             return
 
         if (
+            req.routing_preference == "local_only"
+            and _api_module._pipeline_model_is_prepared()
+        ):
+            yield _error_event(
+                "当前模型仅以分布式流水线模式准备；"
+                "local_only 请求需要先显式加载完整模型。"
+            )
+            return
+
+        if (
             (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
             and not _api_module._pipeline_model_is_prepared()
+            and req.routing_preference != 'distributed_required'
         ):
             loop = _asyncio.get_running_loop()
             try:
@@ -884,13 +1148,16 @@ async def chat_stream(req: ChatRequest, request: Request):
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.temperature,
                     top_p=req.top_p,
-                    session_id=req.session_id,
-                    messages=[{"role": "user", "content": req.message}],
+                    session_id=target_session_id,
+                    messages=request_messages,
                     show_thinking=req.show_thinking,
+                    enable_thinking=req.enable_thinking,
                     _require_distributed=(req.routing_preference == "distributed_required"),
                     _force_distributed_assignment=True,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )):
+                    event = _capture_fast_event(event)
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 _api_module.logger.error(f"流式推理失败: {e}", exc_info=True)
@@ -910,11 +1177,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                         max_new_tokens=req.max_new_tokens,
                         temperature=req.temperature,
                         top_p=req.top_p,
-                        messages=[{"role": "user", "content": req.message}],
+                        messages=request_messages,
                         show_thinking=req.show_thinking,
+                        enable_thinking=req.enable_thinking,
                         _cancel_event=cancel_event,
+                        _request_deadline=request_deadline,
                     ),
                 ):
+                    event = _capture_fast_event(event)
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 _api_module.logger.error(f"llama.cpp 流式推理失败: {e}", exc_info=True)
@@ -928,11 +1198,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.temperature,
                     top_p=req.top_p,
-                    session_id=req.session_id,
-                    messages=[{"role": "user", "content": req.message}],
+                    session_id=target_session_id,
+                    messages=request_messages,
                     show_thinking=req.show_thinking,
+                    enable_thinking=req.enable_thinking,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )):
+                    event = _capture_fast_event(event)
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 _api_module.logger.error(f"单机流式推理失败: {e}", exc_info=True)
@@ -948,10 +1221,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.temperature,
                     top_p=req.top_p,
-                    session_id=req.session_id,
+                    session_id=target_session_id,
+                    messages=request_messages,
                     _require_distributed=(req.routing_preference == "distributed_required"),
                     _force_distributed_assignment=(req.routing_preference != "local_only"),
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )
             )
             # 一次性返回完整结果（SSE 格式，单事件）
@@ -960,7 +1235,15 @@ async def chat_stream(req: ChatRequest, request: Request):
             if external_fallback_reason and not metrics.get("fallback_reason"):
                 metrics["fallback"] = True
                 metrics["fallback_reason"] = external_fallback_reason
-            yield f"data: {_json.dumps({'done': True, 'response': result.get('response', ''), 'error': result.get('error'), 'metrics': metrics, 'request_id': request_id}, ensure_ascii=False)}\n\n"
+            done_event = _capture_fast_event({
+                'done': True,
+                'response': result.get('response', ''),
+                'error': result.get('error'),
+                'reason_code': result.get('reason_code'),
+                'metrics': metrics,
+                'request_id': request_id,
+            })
+            yield f"data: {_json.dumps(done_event, ensure_ascii=False)}\n\n"
 
     return _api_module.StreamingResponse(
         _generate(),

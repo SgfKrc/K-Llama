@@ -437,6 +437,45 @@ class TestMasterNodeManagement:
         assert "client3" not in scheduler.nodes, "幽灵节点应被清理"
         assert "client4" not in scheduler.nodes, "幽灵节点应被清理"
 
+    def test_phantom_cleanup_resets_the_entire_assignment_control_plane(
+            self, scheduler, monkeypatch):
+        scheduler.nodes["phantom"] = NodeInfo(
+            node_id="phantom", role="client", state=NodeState.OFFLINE,
+        )
+        scheduler._worker_assignments.begin(
+            "worker",
+            expected_config={"config_id": "cfg-old", "generation": 7},
+        )
+        scheduler._layer_config_retry_state["worker"] = {
+            "attempts": 2, "next_retry": 10.0,
+        }
+        scheduler._pipeline_load_transaction = {
+            "config_id": "cfg-old",
+            "phase": "ready",
+            "plan": {
+                "admitted": True,
+                "plan_id": "plan-old",
+                "assignments": [{"node_id": "worker"}],
+            },
+        }
+        scheduler._active_pipeline_capacity_plan = {
+            "admitted": True,
+            "plan_id": "plan-old",
+            "assignments": [{"node_id": "worker"}],
+        }
+        monkeypatch.setattr(scheduler, "_get_total_model_layers", lambda: 24)
+        monkeypatch.setattr(scheduler, "compute_layer_assignment", lambda: [])
+
+        scheduler.update_max_nodes(scheduler._max_nodes + 1)
+
+        assert scheduler._worker_assignments.snapshot() == {}
+        assert scheduler._layer_config_retry_state == {}
+        assert scheduler._pipeline_load_transaction is None
+        assert scheduler._active_pipeline_capacity_plan is None
+        assignments = scheduler.get_layer_assignments()
+        assert assignments["strategy"] != "capacity"
+        assert assignments.get("plan_id") != "plan-old"
+
     def test_update_max_nodes_preserves_real_nodes(self, scheduler):
         """幽灵清理不应删除有连接记录的真实节点。"""
         # 真实 TCP 注册节点（有 address）

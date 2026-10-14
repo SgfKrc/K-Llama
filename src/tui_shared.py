@@ -39,6 +39,11 @@ API_PATHS = {
     "sessions_activate": "/sessions/{session_id}/activate",
     "conversations": "/conversations",
     "models_current": "/models/current",
+    "models_intent": "/models/intent",
+    "models_intent_catalog": "/models/intent/catalog",
+    "models_intent_current": "/models/intent/current",
+    "models_intent_operation": "/models/intent/{operation_id}",
+    "models_intent_connect": "/models/intent/connect",
     "distributed_config": "/cluster/config/distributed-inference",
     "cluster_resources": "/cluster/resources",
     "cluster_control_plane": "/cluster/control-plane",
@@ -111,6 +116,52 @@ API_PATHS = {
 # 路由偏好
 # ============================================================
 
+MODEL_INTENT_STATUSES = (
+    "queued", "waiting_nodes", "inspecting", "inventory", "planning", "building",
+    "supplying", "preparing", "ready", "failed", "cancelled", "superseded",
+)
+MODEL_INTENT_TERMINAL = frozenset({"ready", "failed", "cancelled", "superseded"})
+MODEL_INTENT_LABELS = dict(zip(MODEL_INTENT_STATUSES, (
+    "排队中", "等待节点", "检查模型", "盘点资产", "规划层段", "构建层段",
+    "供给中", "准备中", "就绪", "失败", "已取消", "已被替代",
+)))
+
+
+def model_intent_ready(operation: Dict[str, Any]) -> bool:
+    return operation.get("status") == "ready" and operation.get("loaded_ready") is True
+
+
+def format_model_intent(operation: Dict[str, Any]) -> str:
+    """Display only the intent owner's facts, including node receipts and reasons."""
+    if not operation:
+        return "尚未选择分布式模型"
+    status = str(operation.get("status") or "unknown")
+    intent = operation.get("intent") or {}
+    model_id = intent.get("model_id", "") if isinstance(intent, dict) else ""
+    label = MODEL_INTENT_LABELS.get(status, status)
+    if status == "ready" and not model_intent_ready(operation):
+        label = "等待加载确认"
+    lines = [f"{model_id} · {label} ({status})",
+             f"operation_id: {operation.get('operation_id') or '—'}",
+             f"config_id: {operation.get('config_id') or '—'} · generation: {operation.get('generation', 0)}"
+             f" · loaded_ready: {str(operation.get('loaded_ready') is True).lower()}"]
+    if operation.get("reason_code") or operation.get("reason"):
+        lines.append(f"{operation.get('reason_code') or ''}: {operation.get('reason') or ''}")
+    nodes = operation.get("nodes") or {}
+    if isinstance(nodes, dict):
+        for node_id, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            line = (f"{node_id}: {node.get('status') or '—'} · "
+                    f"{node.get('bytes_received', 0)}/{node.get('total_bytes', 0)} bytes")
+            if node.get("layer_range") is not None:
+                line += f" · layer_range: {node['layer_range']}"
+            if node.get("reason_code") or node.get("reason"):
+                line += f" · {node.get('reason_code') or ''}: {node.get('reason') or ''}"
+            lines.append(line)
+    return "\n".join(lines)
+
+
 ROUTING_PREFERENCES = (
     "auto",
     "local_only",
@@ -165,8 +216,11 @@ def build_interactive_request(
     temperature: float = 0.7,
     top_p: float = 0.9,
     image_data_urls: Optional[List[str]] = None,
+    streaming_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """构造 /api/chat/stream 的 interactive 请求体（T9 契约 §9.4.1）。"""
+    """构造聊天流请求；绑定从节点可显式使用 full，默认保留 T9 interactive 契约。"""
+    if streaming_mode not in (None, "interactive", "full"):
+        raise ValueError("streaming_mode must be 'interactive' or 'full'")
     if routing_preference not in ROUTING_PREFERENCES:
         routing_preference = "auto"
     if execution_mode not in EXECUTION_MODES:
@@ -175,9 +229,11 @@ def build_interactive_request(
     local_image = bool(images and routing_preference == "local_only")
     if local_image and len(images) != 1:
         raise ValueError("本地 MTMD 图像请求仅支持一张图片")
+    if local_image and streaming_mode == "interactive":
+        raise ValueError("本地 MTMD 图像请求要求 streaming_mode='full'")
     body = {
         "message": message,
-        "streaming_mode": "full" if local_image else "interactive",
+        "streaming_mode": "full" if local_image else streaming_mode or "interactive",
         "generation_id": generation_id,
         "session_id": session_id,
         "routing_preference": routing_preference,
@@ -325,6 +381,14 @@ def format_metrics(
         parts.append("⚠️ 已请求分布式，实际本地")
     elif "distributed_used" in metrics:
         parts.append("⚠️ 本地执行（未用分布式）")
+    # 模型准备 identity 只取本轮 done.metrics，兼容未返回这些字段的旧请求。
+    for key, label in (("model_operation_id", "模型准备"), ("model_config_id", "模型配置")):
+        value = metrics.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{label}：{value}")
+    generation = metrics.get("model_generation")
+    if isinstance(generation, int) and not isinstance(generation, bool):
+        parts.append(f"模型代次：{generation}")
     if history_committed is False:
         parts.append("历史未提交")
     return " · ".join(parts)
@@ -353,8 +417,8 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/delete-session", "args": "", "desc": "删除当前会话及其全部消息（需确认）"},
     {"name": "/mode", "args": "auto|task_graph", "desc": "请求级执行模式（task_graph=显式任务图）"},
     {"name": "/reset", "args": "", "desc": "清空后端会话历史与 KV 缓存（需确认）"},
-    {"name": "/model", "args": "load <id> [engine] [quant] | unload",
-     "desc": "加载/卸载模型（需确认；仅 loopback 后端可调用）"},
+    {"name": "/model", "args": "load <id> [engine] [quant] | unload | cancel | status | connect | mode local|distributed",
+     "desc": "选模与准备状态；local 退出集群并卸载后加载整模，distributed 自动供给并准备"},
     {"name": "/queue",
      "args": "pause | resume | strategy <fifo|mlfq> | clear | cancel <task_id>",
      "desc": "队列控制（clear 需确认）"},

@@ -15,6 +15,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,10 @@ for _candidate in (str(ROOT), str(ROOT / "src")):
 
 import config  # noqa: E402
 import scheduler_pipeline  # noqa: E402
-from relay_segment_client import RelaySegmentError  # noqa: E402
+from relay_segment_client import (  # noqa: E402
+    RelaySegmentError,
+    RelaySegmentOutcome,
+)
 from relay_transport import (  # noqa: E402
     RELAY_TRANSPORT_ERROR,
     expected_hidden_bytes,
@@ -310,6 +314,90 @@ def test_relay_session_is_reused_until_task_finish():
         thread.join(timeout=5)
     finally:
         listener.close()
+
+
+def test_relay_session_cache_key_ignores_dynamic_remaining_timeout():
+    harness = _Harness()
+    first = harness.obj._relay_segment_client_for_task(
+        "stable-timeout", _spec(50183, timeout=5.0), n_embd=N_EMBD,
+    )
+    second = harness.obj._relay_segment_client_for_task(
+        "stable-timeout", _spec(50183, timeout=0.25), n_embd=N_EMBD,
+    )
+
+    assert second is first
+    harness.obj._close_relay_segment_client("stable-timeout")
+
+
+def test_via_relay_passes_wire_deadline_as_absolute_monotonic(
+        monkeypatch: pytest.MonkeyPatch):
+    observed: dict[str, float | None] = {}
+
+    class CapturingClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def forward_hidden(
+                self, hidden, *, n_tokens, seq_meta=None,
+                deadline_monotonic=None):
+            del n_tokens, seq_meta
+            observed["deadline"] = deadline_monotonic
+            return RelaySegmentOutcome(
+                hidden=bytes(hidden),
+                role="middle",
+                endpoint="127.0.0.1:50183",
+            )
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(scheduler_pipeline, "RelaySegmentClient", CapturingClient)
+    harness = _Harness()
+    deadline_ms = int((time.time() + 1.0) * 1000)
+    before = time.monotonic()
+
+    harness.obj._handle_layer_forward_via_relay(
+        _spec(50183),
+        data={
+            "hidden_states": _hidden(),
+            "task_id": "deadline-wire",
+            "step": 0,
+            "request_deadline_ms": deadline_ms,
+        },
+        task_id="deadline-wire", step=0, config_id="c1",
+        model_sha256="sha", model_type="qwen", received_chain_path=[],
+    )
+
+    assert observed["deadline"] is not None
+    assert before < observed["deadline"] <= before + 1.2
+
+
+def test_via_relay_expired_wire_deadline_does_not_construct_client(
+        monkeypatch: pytest.MonkeyPatch):
+    constructed = []
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            constructed.append(True)
+
+    monkeypatch.setattr(scheduler_pipeline, "RelaySegmentClient", UnexpectedClient)
+    harness = _Harness()
+
+    with pytest.raises(RelaySegmentError) as excinfo:
+        harness.obj._handle_layer_forward_via_relay(
+            _spec(50183),
+            data={
+                "hidden_states": _hidden(),
+                "task_id": "expired-wire",
+                "step": 0,
+                "request_deadline_ms": int(time.time() * 1000) - 1,
+            },
+            task_id="expired-wire", step=0, config_id="c1",
+            model_sha256="sha", model_type="qwen", received_chain_path=[],
+        )
+
+    assert excinfo.value.code == "request_deadline_exceeded"
+    assert constructed == []
 
 
 # ---- 失败/越界必须具名（绝不静默）-----------------------------------------

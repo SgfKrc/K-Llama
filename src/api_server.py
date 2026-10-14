@@ -31,11 +31,21 @@ from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Optional, cast
 
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from release_contract import (
+    FIXED_RELEASE_ENV,
+    PRODUCT_VERSION,
+    RELEASE_PROFILE_NAME,
+    release_profile_enforced,
+)
+from distributed_completion import (
+    DistributedCompletionError,
+    validate_distributed_completion,
+)
 from torch_runtime import LazyTorch, cuda_available, loaded_torch
 
 torch = LazyTorch()
@@ -72,6 +82,10 @@ from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
 from model_api_access import require_model_api_source
+from model_intent_access import (
+    is_path_free_intent_request, is_registered_chat_request,
+    mark_registered_chat_request, require_model_intent_source,
+)
 
 if TYPE_CHECKING:  # torch-backed (D-tier); imported lazily so the L-tier can start.
     from paged_kv_cache import PagedKVCache
@@ -89,9 +103,17 @@ from task_graph import (
     TaskGraphError,
     TaskGraphUnavailable,
     WorkflowCancelled,
+    WorkflowDeadlineExceeded,
     WorkflowExecutionError,
     WorkflowNotFound,
     dual_candidate_template,
+)
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    RequestDeadline,
+    RequestDeadlineExceeded,
+    coerce_request_deadline,
+    hold_lock_until_deadline,
 )
 from task_journal import SQLiteTaskJournal, TaskJournalError
 from task_provider import (
@@ -115,6 +137,7 @@ from config import (
     TASK_GRAPH_MAX_PARALLEL_STAGES, TASK_GRAPH_JOURNAL_PATH,
     TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    PIPELINE_TIMEOUT,
     PIPELINE_RELAY_ENABLED,
     PIPELINE_RELAY_PROBE_ONLY,
 )
@@ -148,6 +171,12 @@ _validate_pipeline_role_switches(
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
+from chat_context import (
+    ConversationContextConflict,
+    ConversationContextService,
+    PreparedChatContext,
+    TurnPersistenceResult,
+)
 # ★ 2026-10-07（DIST-NEXT-8）：请求相位/终态的单一来源 —— 取消、拒绝与链路错误
 #   不再被 `fallback` 或 error 语义吞掉（详见 `src/request_outcome.py`）。
 from request_outcome import (
@@ -178,6 +207,9 @@ from cluster_score import build_management_score_snapshot
 from node_config import load_node_config, write_node_config
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+_conversation_transaction_depth: ContextVar[int] = ContextVar(
+    "conversation_transaction_depth", default=0,
+)
 _LOG_BUFFER_MAXLEN = 5000
 _log_buffer: deque[dict] = deque(maxlen=_LOG_BUFFER_MAXLEN)
 # P7: the aggregate endpoint must have a bounded fan-out and one total wait
@@ -396,7 +428,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.8.1",
+    version=PRODUCT_VERSION,
     description="北京交通大学 · 大学生创新创业训练计划",
     lifespan=_lifespan,
 )
@@ -445,6 +477,8 @@ def _is_control_write_path(request: Request) -> bool:
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return False
     path = request.url.path
+    if path.startswith("/api/models/intent") and scheduler._effective_role() == "master":
+        return True
     if path.startswith("/api/cluster/queue"):
         return True
     if path.startswith("/api/cluster/config") or path.startswith("/api/cluster/layers"):
@@ -473,14 +507,34 @@ async def api_boundary_middleware(request: Request, call_next):
     if request.method == "OPTIONS" or not path.startswith("/api/"):
         return await call_next(request)
 
-    if path not in _API_SOURCE_EXEMPT_PATHS:
+    supply_file_request = request.method == "GET" and re.fullmatch(
+        r"/api/models/supply/(supply_[0-9a-f]{32})/files/([^/]+)/(.+)", path,
+    )
+    if supply_file_request:
+        from model_supply import ModelSupplyError
         try:
-            require_model_api_source(request)
+            scheduler._model_supply.authorize_file(
+                *supply_file_request.groups(),
+                request.headers.get("X-QLH-Supply-Token", ""),
+            )
+        except ModelSupplyError as exc:
+            return _boundary_response(403, {"code": exc.code, "message": exc.message})
+    intent_source_request = (
+        is_path_free_intent_request(request)
+        or await mark_registered_chat_request(request, scheduler)
+    )
+    if not supply_file_request and path not in _API_SOURCE_EXEMPT_PATHS:
+        try:
+            if intent_source_request:
+                require_model_intent_source(request, scheduler)
+            else:
+                require_model_api_source(request)
         except HTTPException as exc:
             return _boundary_response(exc.status_code, exc.detail)
 
     if (
         auth_service.auth_required()
+        and not supply_file_request
         and path not in _API_AUTH_EXEMPT_PATHS
         and not (path == "/api/users" and request.method == "POST"
                  and auth_service.is_bootstrap_open())
@@ -508,7 +562,13 @@ async def api_boundary_middleware(request: Request, call_next):
             )
 
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        if intent_source_request:
+            try:
+                require_model_intent_source(request, scheduler)
+            except HTTPException as exc:
+                return _boundary_response(exc.status_code, exc.detail)
+        return response
     except ControlFenceError as exc:
         status = 503 if exc.code == "control_fence_unavailable" else 409
         return _boundary_response(status, {"code": exc.code, "message": str(exc)})
@@ -583,17 +643,33 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 from model_host import SchedulerCallbackSet, model_host
 from koakuma_engine import (
     Capability,
-    accepted_backend_requests,
     backend_capabilities,
     backend_id_for,
     registered_backends,
     runtime_supports,
 )
+from model_load_resolver import (
+    ModelLoadFacts,
+    ModelLoadResolution,
+    ModelLoadResolutionError,
+    OP_DISTRIBUTED_LOAD,
+    OP_DYNAMIC_LAYER_RANGE,
+    OP_FULL_MODEL,
+    effective_pytorch_cuda_available,
+    preferred_engine_for_artifacts,
+    resolve_model_load,
+)
 
 model_manager = model_host
 kv_cache: "Optional[PagedKVCache]" = None  # PagedKVCache is D-tier (torch) only
-active_session_id: Optional[str] = None           # 当前活跃会话 ID
-session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
+_chat_context = ConversationContextService(
+    load_history=lambda session_id: _load_conversation_history(session_id),
+    persist_turn=lambda session_id, user, assistant, metrics: _persist_conversation_turn(
+        session_id, user, assistant, metrics,
+    ),
+)
+active_session_id: Optional[str] = None           # compatibility facade
+session_histories: dict[str, list[dict]] = _chat_context.histories
 conversation_stats: dict = {                    # 累计对话统计（实际消耗追踪）
     "total_prompt_tokens": 0,
     "total_generated_tokens": 0,
@@ -707,6 +783,45 @@ if NODE_ROLE == "auto":
     if scheduler._control_fence is not control_fence:
         control_fence = scheduler._control_fence
 _task_graph_runtime_lock = threading.RLock()
+_RUNTIME_FEATURE_ENV_NAMES = frozenset(FIXED_RELEASE_ENV)
+
+
+def _apply_runtime_feature_settings(
+    requested: Mapping[str, bool],
+) -> dict[str, bool]:
+    '''Validate hot feature changes against the immutable release profile.'''
+    normalized: dict[str, bool] = {}
+    for env_name, value in requested.items():
+        if env_name not in _RUNTIME_FEATURE_ENV_NAMES:
+            raise ValueError(f'unknown runtime feature setting: {env_name}')
+        if not isinstance(value, bool):
+            raise TypeError(f'runtime feature setting must be bool: {env_name}')
+        normalized[env_name] = value
+
+    if not release_profile_enforced():
+        return normalized
+
+    for env_name, value in normalized.items():
+        requested_value = '1' if value else '0'
+        required_value = FIXED_RELEASE_ENV[env_name]
+        if requested_value == required_value:
+            continue
+        raise coded_http_error(
+            409,
+            'RELEASE_PROFILE_FEATURE_LOCKED',
+            {
+                'code': 'RELEASE_PROFILE_FEATURE_LOCKED',
+                'message': (
+                    f'release profile {RELEASE_PROFILE_NAME!r} fixes '
+                    f'{env_name}={required_value}; requested {requested_value}'
+                ),
+                'feature': env_name,
+                'requested': requested_value,
+                'required': required_value,
+                'release_profile': RELEASE_PROFILE_NAME,
+            },
+        )
+    return normalized
 
 
 def _sync_task_worker_runtime_module(enabled: bool) -> None:
@@ -779,6 +894,12 @@ def _set_task_graph_runtime_settings(
             if task_worker_experimental_enabled is None
             else task_worker_experimental_enabled
         )
+        validated = _apply_runtime_feature_settings({
+            'QLH_TASK_GRAPH_ENABLED': next_graph,
+            'QLH_TASK_WORKER_EXPERIMENTAL_ENABLED': next_worker,
+        })
+        next_graph = validated['QLH_TASK_GRAPH_ENABLED']
+        next_worker = validated['QLH_TASK_WORKER_EXPERIMENTAL_ENABLED']
         graph_changed = next_graph != bool(TASK_GRAPH_ENABLED)
         TASK_GRAPH_ENABLED = next_graph
         TASK_WORKER_EXPERIMENTAL_ENABLED = next_worker
@@ -848,7 +969,61 @@ def _create_task_graph_coordinator() -> TaskGraphCoordinator:
         return coordinator
 
 
-task_graph_coordinator = _create_task_graph_coordinator()
+class _LazyTaskGraphCoordinator:
+    """惰性提供 TaskGraph writer —— import 副作用不得争用生产 journal 锁。
+
+    单写者独占锁必须只由「真正承担任务图写服务」的进程持有。探针、
+    pytest 冷启动子进程以及 Windows ``multiprocessing`` spawn worker 往往只是
+    **import** 本模块（拿一些常量/工具函数），并不需要执行任务链；它们若在
+    import 阶段就去获取 journal 锁，就会和已经在跑的生产服务争锁，进而被错误
+    记录为「任务图 journal 初始化失败，任务图已禁用」。
+
+    因此把 writer 的物化（获取独占锁 + 启动恢复 + 保留清理）推迟到**首次真实
+    使用**：真正执行任务链、查询任务工作流状态或运行时热切换时才初始化。
+    失败关闭（fail-closed）语义保持不变：若此刻锁已被另一个进程持有，物化出的
+    coordinator 会携带 availability_error，后续任务链执行全部经
+    ``journal_status()['available'] == False`` 被拒绝，绝不出现双写者。
+    """
+
+    def __init__(self, factory: Any) -> None:
+        self._factory = factory
+        self._lock = threading.RLock()
+        self._coordinator: Optional[TaskGraphCoordinator] = None
+
+    def _ensure(self) -> TaskGraphCoordinator:
+        with self._lock:
+            if self._coordinator is None:
+                self._coordinator = self._factory()
+            return self._coordinator
+
+    def _is_materialized(self) -> bool:
+        """True 表示 writer 已被真实构造（即 journal 锁已被本进程持有）。"""
+        with self._lock:
+            return self._coordinator is not None
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._ensure(), name)
+
+    def close(self) -> None:
+        coordinator = None
+        with self._lock:
+            if self._coordinator is not None:
+                coordinator, self._coordinator = self._coordinator, None
+        if coordinator is not None:
+            coordinator.close()
+
+    def __repr__(self) -> str:
+        return f"<_LazyTaskGraphCoordinator materialized={self._is_materialized()}>"
+
+
+# 模块 import 阶段只创建惰性代理；journal 锁的获取推迟到首次真实使用，
+# 避免 Windows/pytest 冷启动子进程在 import api_server 时与生产 writer 争锁。
+task_graph_coordinator: TaskGraphCoordinator = cast(
+    TaskGraphCoordinator,
+    _LazyTaskGraphCoordinator(_create_task_graph_coordinator),
+)
 _task_graph_execution_slot = threading.BoundedSemaphore(1)
 _generation_registry_lock = threading.RLock()
 _generation_cancel_events: dict[str, threading.Event] = {}
@@ -921,13 +1096,24 @@ def _serialized_conversation_mutation(func):
     """Run synchronous conversation mutations under the full-chat lock."""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with model_host.full_chat_execution_lock:
-            return func(*args, **kwargs)
+        depth = _conversation_transaction_depth.get(0)
+        if depth > 0:
+            with model_host.full_chat_execution_lock:
+                return func(*args, **kwargs)
+        with _chat_context.transaction():
+            token = _conversation_transaction_depth.set(depth + 1)
+            try:
+                with model_host.full_chat_execution_lock:
+                    return func(*args, **kwargs)
+            finally:
+                _conversation_transaction_depth.reset(token)
     return wrapper
 
 
 def _refresh_pipeline_layer_config() -> None:
     """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
+    if not scheduler.get_distributed_inference_enabled():
+        return
     try:
         if scheduler._effective_role() == "master":
             request_sync = getattr(
@@ -944,65 +1130,62 @@ def _refresh_pipeline_layer_config() -> None:
 
 
 def _run_exclusive_model_change(
-    change, prepare=None, *, release_worker_reservation: bool = False,
+    change, prepare=None, *, release_worker_reservation: bool = False, retire_worker_runtime: bool = True,
 ):
-    """Block inference, invalidate old worker ACKs, then refresh the new model."""
+    """Publish control-plane invalidation only after the model change succeeds."""
+    if release_worker_reservation and retire_worker_runtime:
+        _wait_for_worker_prepare_retirement("local_model_load")
     with model_host.full_chat_execution_lock:
-        if prepare is not None:
-            prepare()
-        begin_transition = getattr(
-            scheduler, "_begin_layer_config_model_change", None,
-        )
-        transition_started = callable(begin_transition)
-        if transition_started:
-            begin_transition()
-        invalidate_transaction = getattr(
-            scheduler, "_invalidate_pipeline_load_transaction", None,
-        )
-        if callable(invalidate_transaction):
-            invalidate_transaction(
-                reason_code="pipeline_model_changed",
-                reason="local model replacement started",
-            )
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
-                with scheduler._layer_config_lock:
-                    # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
-                    scheduler._worker_assignments.clear()
-                    scheduler._layer_config_expected.clear()
-                    scheduler._layer_config_acks.clear()
-                    scheduler._active_layer_config = None
-                    scheduler._last_layer_config_ack_payload = None
-                    scheduler._local_pipeline_steps.clear()
-                if release_worker_reservation:
-                    release = getattr(
-                        scheduler,
-                        "release_pipeline_worker_for_local_model",
-                        None,
-                    )
-                    if callable(release):
-                        release()
-                    else:
-                        scheduler._pipeline_worker_reserved = False
+                result = change()
+                if isinstance(result, dict) and result.get("success") is False:
+                    return result
+
+                begin_transition = getattr(
+                    scheduler, "_begin_layer_config_model_change", None,
+                )
+                transition_started = callable(begin_transition)
+                if transition_started:
+                    begin_transition()
                 try:
-                    return change()
-                finally:
-                    # ★ 2026-10-09（稳定性 #73-④）：模型切换（无论成败）之后，必须把**失败态**的
-                    #   流水线加载事务复位 —— 否则它会一直停在 `aborted`/`rejected`，让
-                    #   `_synchronize_pipeline_workers_for_request` 永久判 not ready。
-                    #   实测复现：切到 GGUF 模型（master 引擎不支持）⇒ 事务 `aborted` ⇒ **之后
-                    #   每个请求都 503，连切回正确模型、甚至重启后端都无效**。
-                    #   只复位失败态；`committed` / `committing_local` 等正常态不动。
-                    _tx = getattr(scheduler, "_pipeline_load_transaction", None)
-                    if isinstance(_tx, dict) and str(_tx.get("phase") or "") in {"aborted", "rejected"}:
+                    if prepare is not None:
+                        prepare()
+                    invalidate_transaction = getattr(
+                        scheduler, "_invalidate_pipeline_load_transaction", None,
+                    )
+                    if callable(invalidate_transaction):
+                        invalidate_transaction(
+                            reason_code="pipeline_model_changed",
+                            reason="local model replacement committed",
+                        )
+                    with scheduler._layer_config_lock:
+                        scheduler._worker_assignments.clear()
+                        scheduler._layer_config_retry_state.clear()
                         scheduler._pipeline_load_transaction = None
+                        scheduler._active_pipeline_capacity_plan = None
+                        scheduler._active_layer_config = None
+                        scheduler._last_layer_config_ack_payload = None
+                        scheduler._local_pipeline_steps.clear()
+                    if release_worker_reservation:
+                        release = getattr(
+                            scheduler,
+                            "release_pipeline_worker_for_local_model",
+                            None,
+                        )
+                        if callable(release):
+                            release()
+                        else:
+                            scheduler._pipeline_worker_reserved = False
                     _refresh_pipeline_layer_config()
+                finally:
                     if transition_started:
                         end_transition = getattr(
                             scheduler, "_end_layer_config_model_change", None,
                         )
                         if callable(end_transition):
                             end_transition()
+                return result
 
 
 # ============================================================
@@ -1014,6 +1197,9 @@ def _run_exclusive_model_change(
 # ============================================================
 # 启动事件 — 设备检测（通过 lifespan 调用）
 # ============================================================
+
+_master_discovery_responder = None
+
 
 def _run_runtime_startup() -> None:
     """Run the slower runtime initialization outside the HTTP event loop."""
@@ -1028,7 +1214,7 @@ def _run_runtime_startup() -> None:
 
 def _startup_device_detection():
     """Initialize local runtime components and detect slower hardware in background."""
-    global device_profile, _device_profile_started
+    global device_profile, _device_profile_started, _master_discovery_responder
     active_scheduler: ClusterScheduler = globals()["scheduler"]
 
     _mark_runtime_component("local_store", False)
@@ -1086,6 +1272,10 @@ def _startup_device_detection():
         _mark_runtime_component("scheduler", False, error=str(e))
 
     # L5: 启动日志保留策略清理线程
+    from model_intent_discovery import MasterDiscoveryResponder
+    _master_discovery_responder = MasterDiscoveryResponder(active_scheduler, API_PORT)
+    _master_discovery_responder.start()
+
     try:
         _start_log_retention_thread()
     except Exception as e:
@@ -1121,6 +1311,9 @@ def _startup_device_detection():
 async def _shutdown_resources():
     """应用关闭时清理调度器、推理引擎与 TCP 服务。"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
+    await _intent_routes.shutdown()
+    if _master_discovery_responder is not None:
+        await run_in_threadpool(_master_discovery_responder.stop)
     try:
         with model_host.full_chat_execution_lock:
             task_graph_coordinator.close()
@@ -1217,6 +1410,10 @@ class PreparePipelineModelRequest(BaseModel):
     )
 
 
+class InferenceModeRequest(BaseModel):
+    mode: Literal["distributed", "local"]
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息", min_length=1)
     image_data_urls: list[str] = Field(
@@ -1241,7 +1438,7 @@ class ChatRequest(BaseModel):
     )
     streaming_mode: str = Field(
         default="full",
-        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化） | interactive=真流式逐token + 完成时会话事务提交（T9 聊天页）",
+        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（默认） | fast=真流式逐token | interactive=真流式逐token + T9 事件契约；三者共用历史、裁剪和完成时会话提交",
     )
     routing_preference: Literal[
         "auto", "local_only", "distributed_preferred", "distributed_required"
@@ -1430,6 +1627,19 @@ class ClusterJoinGrantIssue(BaseModel):
     ttl_seconds: int = Field(default=300, ge=60, le=900)
 
 
+class ClusterSecretRotateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    otp_code: Optional[str] = Field(default=None, max_length=16)
+    tailnet_revocation_completed: bool = Field(
+        default=False,
+        description=(
+            "Operator attestation that the revoked node was removed from the Tailnet; "
+            "the service does not query or prove Tailscale control-plane state"
+        ),
+    )
+
+
 class ClusterJoinConsume(BaseModel):
     grant_code: str = Field(..., min_length=12, max_length=16 * 1024)
 
@@ -1442,6 +1652,9 @@ class FirstConnectBootstrapRequest(BaseModel):
     app_variant: str = Field(default="", max_length=32, description="Android full | lite")
     app_version: str = Field(default="", max_length=64, description="客户端版本")
     capabilities: dict = Field(default_factory=dict, description="设备画像/能力")
+    credential_public_key: str = Field(..., min_length=128, max_length=2048)
+    credential_request_nonce: str = Field(..., min_length=16, max_length=128)
+    credential_requested_at: int = Field(..., ge=0)
 
 
 # ============================================================
@@ -1510,7 +1723,8 @@ def _build_chat_prompt(messages: list[dict], system_prompt: Optional[str] = None
 
 def _build_model_chat_prompt(tokenizer, messages: list[dict],
                              system_prompt: Optional[str] = None,
-                             assistant_prefill: Optional[str] = None) -> str:
+                             assistant_prefill: Optional[str] = None,
+                             enable_thinking: Optional[bool] = None) -> str:
     """Build a prompt with the active tokenizer's native chat template."""
     chat_messages = []
     if system_prompt:
@@ -1518,10 +1732,12 @@ def _build_model_chat_prompt(tokenizer, messages: list[dict],
     chat_messages.extend(messages)
 
     try:
+        template_options = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         prompt = tokenizer.apply_chat_template(
             chat_messages,
             tokenize=False,
             add_generation_prompt=True,
+            **template_options,
         )
         # DeepSeek-R1-Distill templates already end with "<think>\n" when
         # add_generation_prompt=True. Appending the legacy Chinese prefill here
@@ -1745,59 +1961,83 @@ def _format_model_response(text: str, show_thinking: bool,
 # 多会话管理
 # ================================================================
 
-def _get_active_history() -> list[dict]:
-    """
-    获取当前活跃会话的对话历史列表。
+def _sync_chat_context_facade() -> None:
+    _chat_context.adopt_facade_state(active_session_id, session_histories)
 
-    如果没有活跃会话，返回空列表（不自动创建会话）。
-    返回的列表对象可被原地修改（append、clear 等）。
-    """
+
+def _publish_chat_context_facade() -> None:
     global active_session_id, session_histories
-    if active_session_id is None:
-        return []  # 不自动创建——由前端在首次发消息时显式创建
-    if active_session_id not in session_histories:
-        session_histories[active_session_id] = []
-    return session_histories[active_session_id]
+    active_session_id = _chat_context.active_session_id
+    session_histories = _chat_context.histories
 
 
-def _switch_session(target_id: str) -> None:
-    """
-    切换到目标会话：暂存当前历史 → 加载目标历史 → 清 KV Cache。
+def _load_conversation_history(session_id: str) -> list[dict]:
+    """Load one canonical context window; storage failures are not empty chats."""
 
-    如果目标会话不在内存中，首先从主节点 SQLite 加载。
-    """
-    global active_session_id, kv_cache
-    if active_session_id == target_id:
-        return
+    try:
+        rows = _local_store.load_local_conversation(session_id)
+    except Exception:
+        logger.error(
+            "SQLite 会话历史加载失败: session=%s", session_id, exc_info=True,
+        )
+        raise
+    return [{"role": row["role"], "content": row["content"]} for row in rows]
 
-    active_session_id = target_id
 
-    # SQLite 是事实源；旧数据库仅用于迁移期只读兼容。
-    if target_id not in session_histories:
-        messages = []
-        try:
-            local_rows = _local_store.load_local_conversation(target_id)
-            messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-        except Exception as exc:
-            logger.error("SQLite 切换会话加载失败: session=%s: %s", target_id, exc)
-        session_histories[target_id] = messages
+def _get_active_history() -> list[dict]:
+    """Return the active canonical history, reloading stale cache if needed."""
 
-    # 清 KV Cache（切换会话后 prompt 不同，必须重建）
-    if kv_cache:
-        kv_cache.clear()
-    _init_kv_cache()
-    logger.info(f"已切换到会话: {target_id}")
+    _sync_chat_context_facade()
+    history = _chat_context.active_history()
+    _publish_chat_context_facade()
+    return history
+
+
+def _prepare_chat_context(
+    requested_session_id: Optional[str],
+    first_message: Optional[str] = None,
+    *,
+    force_reload: bool = False,
+) -> PreparedChatContext:
+    """Resolve one request to the shared session snapshot used by every mode."""
+
+    global kv_cache
+    _sync_chat_context_facade()
+    prepared = _chat_context.prepare(
+        requested_session_id, force_reload=force_reload,
+    )
+    _publish_chat_context_facade()
+
+    if prepared.session_changed or prepared.reloaded:
+        if kv_cache:
+            kv_cache.clear()
+        _init_kv_cache()
+    if first_message and not prepared.history:
+        _auto_title_session(prepared.session_id, first_message)
+    return prepared
+
+
+def _switch_session(target_id: str, *, force_reload: bool = False) -> None:
+    """Activate a session, reloading it even when the ID did not change."""
+
+    prepared = _prepare_chat_context(target_id, force_reload=force_reload)
+    logger.info(
+        "已切换到会话: %s (reloaded=%s)",
+        prepared.session_id,
+        prepared.reloaded,
+    )
 
 
 def _reset_runtime_conversation_state(clear_histories: bool = True) -> None:
     """Clear in-memory conversation/KV state after a model change."""
-    global kv_cache, conversation_stats, session_histories
+    global kv_cache, conversation_stats
 
     if kv_cache:
         kv_cache.clear()
     kv_cache = None
-    if clear_histories:
-        session_histories = {}
+    _sync_chat_context_facade()
+    _chat_context.invalidate(clear_histories=clear_histories)
+    _publish_chat_context_facade()
     conversation_stats = {
         "total_prompt_tokens": 0,
         "total_generated_tokens": 0,
@@ -1822,24 +2062,66 @@ def _persist_conversation_turn(
     user_message: str,
     assistant_message: str,
     metrics: Optional[dict] = None,
-) -> bool:
+) -> TurnPersistenceResult:
     """Commit a completed turn to local SQLite, then optionally export it."""
     try:
         if not _local_store.get_local_save_history():
-            return False
+            return TurnPersistenceResult.SKIPPED
         request_id = _request_id_ctx.get("")
-        _local_store.save_local_conversation_turn(
+        committed = _local_store.save_local_conversation_turn(
             session_id,
             user_message,
             assistant_message,
             metrics,
             operation_id=request_id if request_id and request_id != "-" else None,
         )
+    except ValueError:
+        # Durable operation-id conflicts are contract violations, not a
+        # best-effort persistence failure. Keep them fail-closed.
+        raise
     except Exception as exc:
         logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
-        return False
+        raise RuntimeError("SQLite 对话提交失败") from exc
 
-    return True
+    return (
+        TurnPersistenceResult.COMMITTED
+        if committed
+        else TurnPersistenceResult.REPLAY
+    )
+
+
+def _commit_chat_context_turn(
+    session_id: Optional[str],
+    user_message: str,
+    assistant_message: str,
+    metrics: Optional[dict] = None,
+    *,
+    expected_revision: Optional[int] = None,
+    operation_id: Optional[str] = None,
+) -> bool:
+    """Publish one successful turn to memory and SQLite through one service."""
+
+    _sync_chat_context_facade()
+    resolved_operation_id = operation_id or _request_id_ctx.get("")
+    try:
+        persisted = _chat_context.commit_turn(
+            session_id,
+            user_message,
+            assistant_message,
+            metrics,
+            operation_id=(
+                resolved_operation_id
+                if resolved_operation_id and resolved_operation_id != "-"
+                else None
+            ),
+            expected_revision=expected_revision,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ConversationContextConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _publish_chat_context_facade()
+    return persisted
 
 
 def _is_question(text: str) -> bool:
@@ -2349,7 +2631,7 @@ class SelectGpuRequest(BaseModel):
 
 
 
-def _unload_model_under_model_lock() -> dict:
+def _unload_model_under_model_lock(*, retire_worker_runtime=True) -> dict:
     """Unload the local LLM without materializing the lazy manager when idle.
 
     Model and SD lifecycles share ``full_chat_execution_lock``. Keeping the
@@ -2372,6 +2654,7 @@ def _unload_model_under_model_lock() -> dict:
     unloaded = _run_exclusive_model_change(
         _change,
         release_worker_reservation=True,
+        retire_worker_runtime=retire_worker_runtime,
     )
     try:
         scheduler.refresh_task_worker_capabilities()
@@ -2389,6 +2672,90 @@ def _unload_model_under_model_lock() -> dict:
 
 
 
+
+
+def _node_inference_mode() -> str:
+    return (
+        "distributed"
+        if RUN_MODE == "distributed" and scheduler.get_distributed_inference_enabled()
+        else "local"
+    )
+
+
+def _require_local_model_mode() -> None:
+    """Recheck intent after waiting for the model lock, before loading weights."""
+    if _node_inference_mode() != "local":
+        raise coded_http_error(
+            409, "INFERENCE_MODE_CHANGED",
+            "加载请求等待期间已加入集群；需要整模时请先手动切换到本地推理模式。",
+        )
+
+
+def _load_local_model_under_lock(**kwargs):
+    _require_local_model_mode()
+    return model_manager.load_model(**kwargs)
+
+
+def _sync_local_model_projection() -> None:
+    """Publish rollback state from the current runtime under its ownership lock."""
+    with model_host.full_chat_execution_lock:
+        loaded = bool(getattr(model_manager, "is_loaded", False)) and not _pipeline_model_is_prepared()
+        model_host.model_loaded = loaded
+        model_host.current_quant = getattr(model_manager, "quant_type", None) if loaded else None
+        if loaded:
+            _init_kv_cache()
+
+
+_INFERENCE_MODE_CHANGE_LOCK = threading.Lock()
+
+
+def _wait_for_worker_prepare_retirement(reason_code):
+    """Join physical segment cleanup outside the full-model execution lock."""
+    controller = getattr(scheduler, "_worker_prepare", None)
+    if controller is None:
+        return
+    try:
+        controller.retire_and_join(reason_code, timeout=120)
+    except Exception as exc:
+        raise coded_http_error(409, getattr(exc, "reason_code", "WORKER_RUNTIME_RETIRE_FAILED"), str(exc)) from exc
+
+
+def _set_node_inference_mode(mode: str) -> dict:
+    if mode == "distributed" and RUN_MODE != "distributed":
+        raise coded_http_error(409, "DISTRIBUTED_RUNTIME_DISABLED", "Restart with QLH_RUN_MODE=distributed first.")
+    if not _INFERENCE_MODE_CHANGE_LOCK.acquire(blocking=False):
+        raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Another mode transition is still retiring its runtime.")
+    try:
+        if not model_host.full_chat_execution_lock.acquire(blocking=False):
+            raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active inference before switching modes.")
+        try:
+            with scheduler._task_worker_stage_lock:
+                if scheduler._task_worker_active_attempts:
+                    raise coded_http_error(409, "INFERENCE_MODE_BUSY", "Wait for the active worker task before switching modes.")
+                previous = _node_inference_mode()
+                changed = previous != mode
+                if not changed and mode == "distributed":
+                    return {"success": True, "mode": mode, "enabled": True, "changed": False}
+                scheduler._distributed_inference_enabled = False
+            scheduler.set_distributed_inference_enabled(False)
+            if changed:
+                _unload_model_under_model_lock(retire_worker_runtime=False)
+        finally:
+            model_host.full_chat_execution_lock.release()
+        # Native cleanup needs the same full-chat lock. Joining while holding it
+        # would deadlock; participation stays disabled throughout this wait.
+        _wait_for_worker_prepare_retirement("inference_mode_changed")
+        if mode == "distributed":
+            with model_host.full_chat_execution_lock:
+                scheduler.set_distributed_inference_enabled(True)
+                scheduler.refresh_task_worker_capabilities()
+        logger.info("event=node_inference_mode_changed previous=%s mode=%s", previous, mode)
+        result = {"success": True, "mode": mode, "enabled": mode == "distributed", "changed": changed}
+        if changed:
+            result["loaded"] = False
+        return result
+    finally:
+        _INFERENCE_MODE_CHANGE_LOCK.release()
 
 
 def _chat_origin(req: ChatRequest) -> str:
@@ -2563,23 +2930,26 @@ def _enforce_distributed_required(
     detail: str = "分布式执行未完成",
 ) -> None:
     """Reject silent local fallback for an explicitly required route."""
-    if req.routing_preference != "distributed_required":
-        return
-    if isinstance(metrics, dict) and metrics.get("distributed_used"):
-        return
-    raise HTTPException(
-        503,
-        f"distributed_required 执行失败：{detail}",
-    )
+    try:
+        validate_distributed_completion(
+            req.routing_preference, metrics, detail=detail,
+        )
+    except DistributedCompletionError as exc:
+        raise HTTPException(
+            503, f"distributed_required 执行失败：{exc}",
+        ) from exc
 
 
 def _external_route_decision(req: ChatRequest):
     """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
-    if req.routing_preference == "local_only":
+    if req.routing_preference in {"local_only", "distributed_required"}:
         # T9.5：local_only 覆盖一切外部路由意图，数据不出集群
         from types import SimpleNamespace as _SN
-        return _SN(use_external=False, eligible=False,
-                   reason="local_only_override")
+        return _SN(
+            use_external=False,
+            eligible=False,
+            reason=f"{req.routing_preference}_override",
+        )
     import config as _cfg
     from external_provider import decide_external_route
 
@@ -2627,6 +2997,7 @@ def _execute_external_chat(
     req: ChatRequest,
     history: list,
     target_session_id: Optional[str],
+    context_revision: int,
     cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """整请求路由到外部推理服务（与 llama.cpp/孤岛整请求路径同构）。"""
@@ -2688,18 +3059,14 @@ def _execute_external_chat(
         req,
     )
 
-    db_session_id = target_session_id or "default"
     # 追问生成不再二次外发（少一次数据出集群 + 少一次计费），用模板兜底
     followups = _fallback_followups(completed_history, [])
-    history.extend([
-        {"role": "user", "content": req.message},
-        {"role": "assistant", "content": response_text},
-    ])
 
     save_metrics = dict(metrics)
     save_metrics["followups"] = followups
-    _persist_conversation_turn(
-        db_session_id, req.message, response_text, save_metrics,
+    _commit_chat_context_turn(
+        target_session_id, req.message, response_text, save_metrics,
+        expected_revision=context_revision,
     )
 
     conversation_stats["total_generated_tokens"] += completion_tokens
@@ -2722,7 +3089,9 @@ def _execute_external_chat(
 
 
 def _external_stream_events(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    history: Optional[list[dict]] = None,
 ):
     """
     外部推理服务真流式事件生成器（fast 模式）。
@@ -2737,13 +3106,17 @@ def _external_stream_events(
     client.ensure_connected()
     parts: list[str] = []
     t0 = time.time()
-    for chunk in client.chat_stream(
-        [{
+    request_messages = [
+        *(history or []),
+        {
             "role": "user",
             "content": build_openai_user_content(
                 req.message, req.image_data_urls,
             ),
-        }],
+        },
+    ]
+    for chunk in client.chat_stream(
+        request_messages,
         max_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
@@ -2850,7 +3223,9 @@ def _run_speculative_experiment(req: SpeculativeExperimentRequest) -> dict:
 
 
 def _execute_task_graph_chat(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
 ) -> dict:
     """Run the fixed local task graph without claiming multi-device execution."""
     global conversation_stats
@@ -2872,12 +3247,22 @@ def _execute_task_graph_chat(
         )
     if scheduler._effective_role() != "master":
         raise HTTPException(409, "任务链协调器当前只允许在主节点运行。")
+    if NODE_ROLE == "auto":
+        raise coded_http_error(
+            503, "ha_commit_unavailable", "自动选主尚无 journal 多数提交水位，拒绝任务链写入。",
+        )
 
     if not _task_graph_execution_slot.acquire(blocking=False):
         raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
     try:
-        with model_host.full_chat_execution_lock:
-            return _execute_task_graph_chat_with_slot(req, cancel_event)
+        with hold_lock_until_deadline(
+            model_host.full_chat_execution_lock,
+            request_deadline,
+            operation="full chat execution lock",
+        ):
+            return _execute_task_graph_chat_with_slot(
+                req, cancel_event, request_deadline,
+            )
     finally:
         _task_graph_execution_slot.release()
 
@@ -3188,12 +3573,7 @@ def _execute_task_worker_stage(
         #   `TaskGraphError: 不支持的 Stage 类型: layer_forward`）。
         #   委托同一份实现；但本函数是**模块级**（没有 `self`），所以用一个模块级缓存实例
         #   承载 keep-head 上游（它本来就按 env 创建一次后复用，重载 500MB GGUF 代价高）。
-        global _LAYER_STAGE_HOST
-        if _LAYER_STAGE_HOST is None:
-            from inference_service.engine_host import EngineHost as _EngineHost
-
-            _LAYER_STAGE_HOST = _EngineHost()
-        return _LAYER_STAGE_HOST._execute_layer_forward_stage(
+        return _get_layer_stage_host()._execute_layer_forward_stage(
             stage_request, provider_cancel_event,
         )
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
@@ -3202,12 +3582,33 @@ def _execute_task_worker_stage(
 #: 模块级缓存：`_execute_task_worker_stage` 是模块级函数（无 `self`），层段 Stage 需要
 #: 一个持有 keep-head 上游的载体。上游按 env 创建一次后复用（重载 500MB GGUF 代价高）。
 _LAYER_STAGE_HOST = None
+_LAYER_STAGE_HOST_LOCK = threading.Lock()
+
+
+def _get_layer_stage_host():
+    global _LAYER_STAGE_HOST
+    with _LAYER_STAGE_HOST_LOCK:
+        if _LAYER_STAGE_HOST is None:
+            from inference_service.engine_host import EngineHost as _EngineHost
+            _LAYER_STAGE_HOST = _EngineHost()
+        return _LAYER_STAGE_HOST
+
+
+scheduler._worker_prepare.configure_runtime(_get_layer_stage_host)
 
 
 def _execute_task_graph_chat_with_slot(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
 ) -> dict:
     """Execute one workflow while the process-wide task-graph slot is held."""
+
+    request_deadline = coerce_request_deadline(
+        request_deadline,
+        timeout_seconds=PIPELINE_TIMEOUT,
+    )
+    request_deadline.require_remaining()
 
     remote_stage_id = str(req.task_graph_remote_stage or "")
     remote_provider_id = str(req.task_graph_remote_provider_id or "")
@@ -3250,12 +3651,10 @@ def _execute_task_graph_chat_with_slot(
                 "distributed_required 需要已启用的 PC Full Worker 实验调度。",
             )
 
-    target_session_id = req.session_id or active_session_id
-    if target_session_id and target_session_id != active_session_id:
-        _switch_session(target_session_id)
-    history = _get_active_history()
-    if target_session_id and len(history) == 0:
-        _auto_title_session(target_session_id, req.message)
+    prepared_context = _prepare_chat_context(req.session_id, req.message)
+    request_deadline.require_remaining()
+    target_session_id = prepared_context.session_id
+    history = prepared_context.history
 
     base_messages = list(history) + [{"role": "user", "content": req.message}]
     root_input = {
@@ -3445,6 +3844,7 @@ def _execute_task_graph_chat_with_slot(
                 runtime_context=runtime_context,
                 workflow_id=req.workflow_id,
                 cancel_event=cancel_event,
+                request_deadline=request_deadline,
             )
         else:
             final_output, workflow = task_graph_coordinator.run(
@@ -3458,6 +3858,7 @@ def _execute_task_graph_chat_with_slot(
                 runtime_context=runtime_context,
                 workflow_id=req.workflow_id,
                 cancel_event=cancel_event,
+                request_deadline=request_deadline,
             )
     except WorkflowCancelled as exc:
         raise HTTPException(
@@ -3465,13 +3866,23 @@ def _execute_task_graph_chat_with_slot(
             {"message": "任务链已取消", "workflow_id": exc.workflow_id},
         ) from exc
     except WorkflowExecutionError as exc:
+        status_code = 504 if exc.code == "request_deadline_exceeded" else 500
         raise coded_http_error(
-            500,
+            status_code,
             exc.code,
             {
                 "message": str(exc),
                 "workflow_id": exc.workflow_id,
                 "stage_id": exc.stage_id,
+            },
+        ) from exc
+    except WorkflowDeadlineExceeded as exc:
+        raise coded_http_error(
+            504,
+            exc.code,
+            {
+                "message": str(exc),
+                "workflow_id": exc.workflow_id,
             },
         ) from exc
     except TaskGraphUnavailable as exc:
@@ -3490,28 +3901,92 @@ def _execute_task_graph_chat_with_slot(
     if not response_text:
         raise HTTPException(500, "任务链最终聚合结果为空。")
 
-    history_start = len(history)
+    if distributed_task_required:
+        precommit_attempts = [
+            attempt
+            for stage in workflow.get("stages", [])
+            for attempt in stage.get("attempts", [])
+            if attempt.get("state") == "completed"
+        ]
+        precommit_remote_attempts = [
+            attempt
+            for attempt in precommit_attempts
+            if attempt.get("provider_kind") == "remote_full_worker"
+        ]
+        if not precommit_remote_attempts:
+            try:
+                task_graph_coordinator.discard_result(
+                    workflow["workflow_id"],
+                    terminal_reason_code=REASON_REQUEST_REFUSED,
+                )
+            except TaskGraphUnavailable as exc:
+                raise HTTPException(
+                    503,
+                    {
+                        "message": "distributed_required 校验失败且结果无法丢弃。",
+                        "reason": str(exc),
+                    },
+                ) from exc
+            raise coded_http_error(
+                503,
+                "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
+                "distributed_required 未执行任何远端 Full Worker Stage。",
+            )
+        try:
+            validate_distributed_completion(
+                req.routing_preference,
+                {
+                    "distributed_used": True,
+                    "execution_mode": "task_graph",
+                    "workers_used": [
+                        str(attempt.get("provider_node_id", "") or "")
+                        for attempt in precommit_remote_attempts
+                        if attempt.get("provider_node_id")
+                    ],
+                },
+            )
+        except DistributedCompletionError as exc:
+            try:
+                task_graph_coordinator.discard_result(
+                    workflow["workflow_id"],
+                    terminal_reason_code=REASON_REQUEST_REFUSED,
+                )
+            except TaskGraphUnavailable as discard_exc:
+                raise HTTPException(
+                    503,
+                    {
+                        "message": "发行 profile 拒绝任务图结果且结果无法丢弃。",
+                        "reason": str(discard_exc),
+                    },
+                ) from discard_exc
+            raise coded_http_error(
+                503,
+                "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN",
+                f"distributed_required 发行路线校验失败：{exc}",
+            ) from exc
+
     try:
-        with _generation_registry_lock:
+        with hold_lock_until_deadline(
+            _generation_registry_lock,
+            request_deadline,
+            operation="generation commit lock",
+        ):
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            history.extend([
-                {"role": "user", "content": req.message},
-                {"role": "assistant", "content": response_text},
-            ])
             if cancel_event is not None and cancel_event.is_set():
-                del history[history_start:]
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
             try:
                 workflow = task_graph_coordinator.commit_result(
                     workflow["workflow_id"],
                 )
             except WorkflowCancelled as exc:
-                del history[history_start:]
                 raise ChatGenerationCancelled(
                     req.generation_id or "gen_unknown",
                 ) from exc
+            except WorkflowDeadlineExceeded as exc:
+                raise coded_http_error(
+                    504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+                ) from exc
             except TaskGraphUnavailable:
-                del history[history_start:]
                 raise
     except ChatGenerationCancelled:
         try:
@@ -3673,13 +4148,17 @@ def _execute_task_graph_chat_with_slot(
             else f"{_chat_origin(req)}_to_local_task_graph"
         ),
     )
-    followups = _fallback_followups(history, [])
+    completed_history = [
+        *history,
+        {"role": "user", "content": req.message},
+        {"role": "assistant", "content": response_text},
+    ]
+    followups = _fallback_followups(completed_history, [])
     save_metrics = dict(metrics)
     save_metrics["followups"] = followups
-
-    db_session_id = target_session_id or "default"
-    _persist_conversation_turn(
-        db_session_id, req.message, response_text, save_metrics,
+    _commit_chat_context_turn(
+        target_session_id, req.message, response_text, save_metrics,
+        expected_revision=prepared_context.revision,
     )
 
     conversation_stats["total_prompt_tokens"] += prompt_tokens
@@ -3700,7 +4179,11 @@ def _execute_task_graph_chat_with_slot(
 
 
 def _execute_chat_full(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
+    *,
+    forward_only: bool = False,
 ) -> dict:
     """
     执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
@@ -3716,21 +4199,30 @@ def _execute_chat_full(
         HTTPException: 模型未加载、OOM、推理失败
     """
     global kv_cache, conversation_stats
+    request_deadline = coerce_request_deadline(
+        request_deadline,
+        timeout_seconds=PIPELINE_TIMEOUT,
+    )
+    request_deadline.require_remaining()
     # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
+    if forward_only and (
+        req.routing_preference != "distributed_required"
+        or not _should_forward_chat_to_master()
+    ):
+        raise coded_http_error(
+            409, "DISTRIBUTED_FORWARD_CONTEXT_CHANGED",
+            "The worker forwarding context changed; retry the request",
+        )
     routing_gate = _routing_gate_error(req)
     if routing_gate:
         raise HTTPException(400, routing_gate)
     _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
     # ---- 多会话支持 ----
-    target_session_id = req.session_id or active_session_id
-    if target_session_id and target_session_id != active_session_id:
-        _switch_session(target_session_id)
-
-    # ---- 首条消息自动生成标题 ----
-    history = _get_active_history()
-    if target_session_id and len(history) == 0:
-        _auto_title_session(target_session_id, req.message)
+    prepared_context = _prepare_chat_context(req.session_id, req.message)
+    request_deadline.require_remaining()
+    target_session_id = prepared_context.session_id
+    history = prepared_context.history
 
     # ---- 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）----
     # 决策为纯函数（external_provider.decide_external_route）；不满足条件时
@@ -3759,9 +4251,15 @@ def _execute_chat_full(
     if _ext_decision.use_external:
         try:
             return _execute_external_chat(
-                req, history, target_session_id, cancel_event,
+                req,
+                history,
+                target_session_id,
+                prepared_context.revision,
+                cancel_event,
             )
         except ChatGenerationCancelled:
+            raise
+        except HTTPException:
             raise
         except Exception as exc:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -3793,10 +4291,13 @@ def _execute_chat_full(
             logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
 
     # ---- 分布式推理路由：从节点转发给主节点（local_only 强制本地）----
-    if (req.routing_preference != "local_only"
+    # A request admitted without the host model lock must remain forwarding-only,
+    # even if its role changes after the live check above. The forwarding owner
+    # rechecks the connection/role and required routing rejects any failed result.
+    if (forward_only or (req.routing_preference != "local_only"
             and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
-            and scheduler._effective_role() == "client"):
+            and scheduler._effective_role() == "client")):
         try:
             result = scheduler.forward_inference_to_master(
                 message=req.message,
@@ -3810,8 +4311,15 @@ def _execute_chat_full(
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 request_id=_request_id_ctx.get("-"),   # L5: 链路追踪
                 _cancel_event=cancel_event,
+                _request_deadline=request_deadline,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            if result.get("reason_code") == REQUEST_DEADLINE_EXCEEDED:
+                raise coded_http_error(
+                    504,
+                    REQUEST_DEADLINE_EXCEEDED,
+                    result.get("error") or "request deadline exceeded",
+                )
             if result.get("status") == "ok":
                 response_text = result.get("content", "")
                 forward_metrics = _augment_chat_metrics(
@@ -3832,12 +4340,9 @@ def _execute_chat_full(
                     forward_metrics,
                     detail="从节点转发结果未标记为分布式执行",
                 )
-                history.append({"role": "user", "content": req.message})
-                history.append({"role": "assistant", "content": response_text})
-
-                db_session_id = target_session_id or "default"
-                _persist_conversation_turn(
-                    db_session_id, req.message, response_text, forward_metrics,
+                _commit_chat_context_turn(
+                    target_session_id, req.message, response_text, forward_metrics,
+                    expected_revision=prepared_context.revision,
                 )
 
                 conversation_stats["rounds"] += 1
@@ -3886,7 +4391,8 @@ def _execute_chat_full(
                 "当前无法转发到主节点，已拒绝覆盖分层模型。",
             )
         if not model_host.model_loaded or not model_manager.is_loaded:
-            _auto_load_default_model()
+            if req.routing_preference != 'distributed_required':
+                _auto_load_default_model()
 
     if _pipeline_worker_is_reserved():
         raise HTTPException(
@@ -3921,9 +4427,20 @@ def _execute_chat_full(
                 _require_distributed=(req.routing_preference == "distributed_required"),
                 _force_distributed_assignment=True,
                 _cancel_event=cancel_event,
+                _request_deadline=request_deadline,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
+                if (
+                    pipeline_result.get("reason_code")
+                    == REQUEST_DEADLINE_EXCEEDED
+                ):
+                    raise coded_http_error(
+                        504,
+                        REQUEST_DEADLINE_EXCEEDED,
+                        pipeline_result.get("error")
+                        or "request deadline exceeded",
+                    )
                 pipeline_failure_reason = str(pipeline_result["error"])
                 # ★ 2026-10-05（DIST-4）：pipeline 失败时除了 `error` 字符串，还要
                 #   保住 `metrics.pipeline_readiness` —— 那里带**具名 reason_code**
@@ -3964,10 +4481,6 @@ def _execute_chat_full(
                         pipeline_metrics,
                         detail="流水线结果未标记为分布式执行",
                     )
-                    history.append({"role": "user", "content": req.message})
-                    history.append({"role": "assistant", "content": response_text})
-
-                    db_session_id = target_session_id or "default"
                     if external_fallback_reason and not pipeline_metrics.get(
                         "fallback_reason",
                     ):
@@ -3975,8 +4488,9 @@ def _execute_chat_full(
                         pipeline_metrics["fallback_reason"] = (
                             external_fallback_reason
                         )
-                    _persist_conversation_turn(
-                        db_session_id, req.message, response_text, pipeline_metrics,
+                    _commit_chat_context_turn(
+                        target_session_id, req.message, response_text, pipeline_metrics,
+                        expected_revision=prepared_context.revision,
                     )
 
                     conversation_stats["rounds"] += 1
@@ -3986,7 +4500,9 @@ def _execute_chat_full(
                         except Exception:
                             pass
 
-                    if backend_id_for(model_manager) in ("llama_cpp", "island"):
+                    if _pipeline_model_is_prepared():
+                        followups = _fallback_followups(history, [])
+                    elif backend_id_for(model_manager) in ("llama_cpp", "island"):
                         followups = _generate_followups_llama(history)
                     elif backend_id_for(model_manager) == "pytorch":
                         # 流水线成功后主节点仍保留首段裁剪模型，不能拿它生成追问。
@@ -4002,6 +4518,10 @@ def _execute_chat_full(
                     }
         except ChatGenerationCancelled:
             raise
+        except RequestDeadlineExceeded as exc:
+            raise coded_http_error(
+                504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+            ) from exc
         except HTTPException:
             raise
         except Exception as e:
@@ -4012,6 +4532,21 @@ def _execute_chat_full(
 
     if req.routing_preference == "distributed_required":
         raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
+
+    if _pipeline_model_is_prepared() and not pipeline_attempted:
+        raise HTTPException(
+            409 if req.routing_preference == "local_only" else 503,
+            "当前模型仅以分布式流水线模式准备，禁止作为本地完整模型执行；"
+            "请等待流水线就绪或显式加载完整模型。",
+        )
+
+    if _node_inference_mode() == "distributed":
+        raise coded_http_error(
+            503 if pipeline_attempted else 409,
+            "DISTRIBUTED_FULL_MODEL_FORBIDDEN",
+            "分布式模式禁止执行或恢复整模；请先手动切换到本地推理模式。"
+            + (f" 流水线失败原因: {pipeline_failure_reason}" if pipeline_failure_reason else ""),
+        )
 
     # ---- 流水线失败 ⇒ 整模回退守卫（★ 2026-10-09：**引擎无关**）----
     #   ★ 原先只覆盖 llama.cpp / 孤岛（下面那个分支），PyTorch 路径漏了 ⇒ pipeline 尝试
@@ -4127,20 +4662,16 @@ def _execute_chat_full(
                 req,
             )
 
-            db_session_id = target_session_id or "default"
             followups = _generate_followups_llama(
                 completed_history, cancel_event,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            history.extend([
-                {"role": "user", "content": req.message},
-                {"role": "assistant", "content": response_text},
-            ])
 
             save_metrics = dict(metrics)
             save_metrics["followups"] = followups
-            _persist_conversation_turn(
-                db_session_id, req.message, response_text, save_metrics,
+            _commit_chat_context_turn(
+                target_session_id, req.message, response_text, save_metrics,
+                expected_revision=prepared_context.revision,
             )
 
             conversation_stats["total_generated_tokens"] += completion_tokens
@@ -4157,6 +4688,8 @@ def _execute_chat_full(
                 "followups": followups,
             }
         except ChatGenerationCancelled:
+            raise
+        except HTTPException:
             raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -4198,6 +4731,7 @@ def _execute_chat_full(
             request_history,
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
+            enable_thinking=req.enable_thinking,
         )
         # ★ 数值对照诊断：与 `scheduler_pipeline._run_pipeline` 的同一行日志配对，
         #   用于确认两条路喂给模型的 prompt 是否逐字一致 —— 这是跨机 relay
@@ -4303,8 +4837,6 @@ def _execute_chat_full(
             ),
         )
 
-        db_session_id = target_session_id or "default"
-
         followups = _generate_followups(
             completed_history,
             tokenizer,
@@ -4313,15 +4845,12 @@ def _execute_chat_full(
             cancel_event,
         )
         _raise_if_generation_cancelled(cancel_event, req.generation_id)
-        history.extend([
-            {"role": "user", "content": req.message},
-            {"role": "assistant", "content": response_text},
-        ])
 
         save_metrics = dict(metrics)
         save_metrics["followups"] = followups
-        _persist_conversation_turn(
-            db_session_id, req.message, response_text, save_metrics,
+        _commit_chat_context_turn(
+            target_session_id, req.message, response_text, save_metrics,
+            expected_revision=prepared_context.revision,
         )
 
         conversation_stats["total_prompt_tokens"] += prompt_len
@@ -4346,6 +4875,12 @@ def _execute_chat_full(
 
     except ChatGenerationCancelled:
         raise
+    except RequestDeadlineExceeded as exc:
+        raise coded_http_error(
+            504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+        ) from exc
+    except HTTPException:
+        raise
     except torch.cuda.OutOfMemoryError:
         try:
             scheduler.record_task_error()
@@ -4368,11 +4903,19 @@ def _execute_chat_full(
 
 
 def _execute_requested_chat(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
+    *,
+    forward_only: bool = False,
 ) -> dict:
     if req.execution_mode == "task_graph":
-        return _execute_task_graph_chat(req, cancel_event)
-    return _execute_chat_full(req, cancel_event)
+        return _execute_task_graph_chat(
+            req, cancel_event, request_deadline,
+        )
+    return _execute_chat_full(
+        req, cancel_event, request_deadline, forward_only=forward_only,
+    )
 
 
 def _commit_interactive_history(
@@ -4381,15 +4924,9 @@ def _commit_interactive_history(
     response_text: str,
     metrics: dict,
 ) -> bool:
-    """interactive 模式完成时的一次性会话事务提交（user + assistant）。
-
-    与 full 模式使用同一主节点 SQLite 持久化语义，
-    但只调用一次、一次写入两条消息，供 done 事件上报 history_committed。
-    返回是否实际写入。
-    """
-    db_session_id = session_id or "default"
-    return _persist_conversation_turn(
-        db_session_id, user_message, response_text, metrics,
+    """Compatibility wrapper for the shared completed-turn transaction."""
+    return _commit_chat_context_turn(
+        session_id, user_message, response_text, metrics,
     )
 
 
@@ -4443,12 +4980,24 @@ def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
         model_host.model_loaded and model_manager.is_loaded
     ):
         return
+    if req is not None and req.routing_preference == 'distributed_required':
+        raise coded_http_error(
+            503,
+            'DISTRIBUTED_PIPELINE_NOT_READY',
+            'distributed_required_pipeline_not_ready',
+        )
     _auto_load_default_model()
 
 
 def _auto_load_default_model():
     """自动加载默认模型（用于 thin client / Android 首次请求时服务端无模型的情况）。"""
     global kv_cache, conversation_stats
+
+    if RUN_MODE == "distributed" and scheduler.get_distributed_inference_enabled():
+        raise coded_http_error(
+            409, "DISTRIBUTED_MODEL_SELECTION_REQUIRED",
+            "请先选择并准备分布式模型；整模基线需要手动切换到本地推理模式。",
+        )
 
     import config as cfg
     import glob
@@ -4457,17 +5006,29 @@ def _auto_load_default_model():
     if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
         from island_engine import mask_island_url
 
+        resolution = resolve_model_load(
+            ModelLoadFacts(
+                model_id=None,
+                island_enabled=True,
+                island_base_url=str(cfg.ISLAND_BASE_URL),
+            ),
+            requested_engine="island",
+            requested_quant="island",
+        )
+
         logger.info(
             f"自动加载孤岛引擎: endpoint={mask_island_url(cfg.ISLAND_BASE_URL)}"
         )
         t0 = time.time()
-        cfg.INFERENCE_ENGINE = "island"
-        cfg.QUANT_TYPE = "island"
+        cfg.INFERENCE_ENGINE = resolution.engine
+        cfg.QUANT_TYPE = resolution.quant_type
         cfg.USE_COMPILE = False
         _run_exclusive_model_change(
-            lambda: model_manager.load_model(
+            lambda: _load_local_model_under_lock(
                 profile=device_profile,
-                engine="island",
+                engine=resolution.engine,
+                quant_type=resolution.quant_type,
+                resolution=resolution,
             )
         )
         _init_kv_cache()
@@ -4478,7 +5039,7 @@ def _auto_load_default_model():
             "rounds": 0,
         }
         model_host.model_loaded = True
-        model_host.current_quant = "island"
+        model_host.current_quant = resolution.quant_type
         scheduler.refresh_task_worker_capabilities()
         logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
         return
@@ -4494,12 +5055,17 @@ def _auto_load_default_model():
 
     # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
     gguf_candidates = []
-    gguf_configured = _active_gguf if _active_gguf and os.path.isfile(_active_gguf) else cfg.GGUF_MODEL_PATH
+    gguf_configured = (
+        _active_gguf
+        if _active_id
+        else cfg.GGUF_MODEL_PATH
+    )
     if os.path.isfile(gguf_configured):
         gguf_candidates.append(gguf_configured)
-    # 搜索 models 目录下的所有 .gguf 文件
+    # 只有旧配置没有画像 model_id 时才允许目录扫描；已有 model_id 时若偷换成
+    # 目录里的另一个 GGUF，会造成 active identity 与真实工件不一致。
     models_dir = os.path.dirname(gguf_configured)
-    if os.path.isdir(models_dir):
+    if not _active_id and os.path.isdir(models_dir):
         for f in sorted(glob.glob(os.path.join(models_dir, "*.gguf"))):
             if f not in gguf_candidates:
                 gguf_candidates.append(f)
@@ -4520,30 +5086,46 @@ def _auto_load_default_model():
             f"QLH_PREFER_PYTORCH=1 ⇒ 本机优先走 PyTorch: {_active_safetensors}"
         )
 
-    if gguf_candidates and not prefer_pytorch:
-        gguf_path = gguf_candidates[0]
-        engine = "llama_cpp"
-        model_path = gguf_path
-        quant = "int4"
-        if len(gguf_candidates) > 1:
-            logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {os.path.basename(gguf_path)}")
-    elif _active_safetensors and os.path.isdir(_active_safetensors):
-        # 2a. 画像模型的 Safetensors 目录（PyTorch 后端）
-        engine = "pytorch"
-        model_path = _active_safetensors
-        quant = cfg.QUANT_TYPE
-    elif os.path.isdir(cfg.MODEL_PATH):
-        # 2b. 回退：Safetensors 目录必须使用 PyTorch 后端。
-        engine = "pytorch"
-        model_path = cfg.MODEL_PATH
-        quant = cfg.QUANT_TYPE
-    else:
+    safetensors_path = (
+        _active_safetensors
+        if _active_safetensors and os.path.isdir(_active_safetensors)
+        else "" if _active_id
+        else cfg.MODEL_PATH if os.path.isdir(cfg.MODEL_PATH) else ""
+    )
+    gguf_path = gguf_candidates[0] if gguf_candidates else ""
+    cuda_ok = _resolution_cuda_available()
+    auto_facts = ModelLoadFacts(
+        model_id=_active_id or None,
+        model_name=_active_id or "默认模型",
+        registered=True,
+        has_safetensors=bool(safetensors_path),
+        has_gguf=bool(gguf_path),
+        safetensors_path=safetensors_path or None,
+        gguf_path=gguf_path or None,
+        preferred_engine="pytorch" if prefer_pytorch else preferred_engine_for_artifacts(
+            has_safetensors=bool(safetensors_path),
+            has_gguf=bool(gguf_path),
+            cuda_available=cuda_ok,
+        ),
+        cuda_available=cuda_ok,
+    )
+    try:
+        resolution = resolve_model_load(
+            auto_facts,
+            requested_engine="pytorch" if prefer_pytorch else "auto",
+            requested_quant=getattr(cfg, "QUANT_TYPE", "int4"),
+        )
+    except ModelLoadResolutionError as exc:
         raise FileNotFoundError(
-            f"未找到可自动加载的模型文件。已检查:\n"
+            f"未找到可自动加载的模型文件（{exc.code}: {exc.message}）。已检查:\n"
             f"  GGUF 配置路径: {gguf_configured}\n"
             f"  Safetensors 路径: {cfg.MODEL_PATH}\n"
             f"  models 目录: {models_dir}"
-        )
+        ) from exc
+
+    engine = resolution.engine
+    model_path = resolution.model_path
+    quant = resolution.quant_type
 
     logger.info(f"自动加载默认模型: path={model_path}, engine={engine}")
 
@@ -4553,11 +5135,13 @@ def _auto_load_default_model():
     cfg.USE_COMPILE = False
 
     _run_exclusive_model_change(
-        lambda: model_manager.load_model(
+        lambda: _load_local_model_under_lock(
             model_path=model_path,
             quant_type=quant,
             profile=device_profile,
+            model_id=resolution.model_id,
             engine=engine,
+            resolution=resolution,
         )
     )
 
@@ -5038,12 +5622,15 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
     if file_status["is_available"] and not supported_engines:
         unavailable_reason = "模型文件已存在，但当前设备缺少可用推理后端。"
 
-    if "pytorch" in supported_engines:
-        preferred_engine = "pytorch"
-    elif "llama_cpp" in supported_engines:
-        preferred_engine = "llama_cpp"
-    else:
-        preferred_engine = "auto"
+    # ★ 必须用 `_torch_cuda_available()`（L-tier 档不加载 torch），
+    #   不能用 `_resolution_cuda_available()`（它走 `cuda_available(load=True)`，会强制拉起 torch）。
+    #   列表接口在 GGUF/llama.cpp-only 环境也必须答得出来，不能"为了列模型"而加载 torch。
+    #   回归: tests/test_api_cold_start.py::test_default_gguf_api_import_and_bootstrap_queries_do_not_load_torch
+    preferred_engine = preferred_engine_for_artifacts(
+        has_safetensors=file_status["has_safetensors"],
+        has_gguf=file_status["has_gguf"],
+        cuda_available=_torch_cuda_available(),
+    )
     default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
     profile = _model_profile_payload(model, preferred_engine=preferred_engine)
 
@@ -5079,25 +5666,116 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
     }
 
 
-def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
-    """Return a safe quant value for the concrete engine or raise HTTP 400."""
-    raw = str(quant_type or "").strip()
-    if engine == "llama_cpp":
-        return raw or "gguf"
-    if engine == "island":
-        # 孤岛引擎量化精度由后端决定，网关侧仅作展示标签
-        return "island"
+def _model_resolution_http_error(exc: ModelLoadResolutionError) -> HTTPException:
+    status = 404 if exc.code == "MODEL_NOT_REGISTERED" else 400
+    return coded_http_error(status, exc.code, exc.message)
 
-    quant = raw.lower()
-    # ★ 2026-10-03：允许 fp32（`model_module` 内部的 `runtime_quant` 也用这个名字）。
-    #   跨框架 D→L 的对照基准（`relay_experiment` 的 d2l_mainrepo 路径）上游是
-    #   `torch.float32`，而端点此前只收 fp16/int8/int4 ⇒ 端点路径无法与基准同精度
-    #   对齐，对拍结果会掺进纯精度造成的分叉。
-    if quant in ("f32", "fp32", "float32"):
-        return "fp32"
-    if quant not in ("fp16", "int8", "int4"):
-        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp32, fp16, int8, int4")
-    return quant
+
+def _resolution_cuda_available() -> bool:
+    """Probe CUDA for an actual load decision, preserving injected probes."""
+
+    system_cuda = False
+    try:
+        system_cuda = bool(mc.is_cuda_available())
+    except Exception:
+        pass
+    if not system_cuda:
+        system_cuda = cuda_available(load=True)
+    return effective_pytorch_cuda_available(
+        system_cuda_available=system_cuda,
+        profile=device_profile,
+    )
+
+
+def _model_load_facts(
+    model_id: Optional[str],
+    *,
+    preferred_engine: Optional[str] = None,
+) -> ModelLoadFacts:
+    """Collect registry/filesystem facts without making a backend decision."""
+
+    import config as cfg
+
+    resolved_id = model_id or mc.get_profile_default_model_id()
+    model = mc.get_model_config(resolved_id, _get_registered_experimental_models())
+    if model is None:
+        return ModelLoadFacts(
+            model_id=resolved_id,
+            registered=False,
+            cuda_available=_resolution_cuda_available(),
+            island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
+        )
+
+    status = mc.get_model_file_status(model)
+    cuda_ok = _resolution_cuda_available()
+    preferred = preferred_engine or preferred_engine_for_artifacts(
+        has_safetensors=bool(status["has_safetensors"]),
+        has_gguf=bool(status["has_gguf"]),
+        cuda_available=cuda_ok,
+    )
+    return ModelLoadFacts(
+        model_id=resolved_id,
+        model_name=model.name,
+        registered=True,
+        has_safetensors=bool(status["has_safetensors"]),
+        has_gguf=bool(status["has_gguf"]),
+        safetensors_path=(
+            mc.resolve_model_path(model.model_path)
+            if status["has_safetensors"] else None
+        ),
+        gguf_path=(
+            mc.resolve_model_path(model.gguf_path)
+            if status["has_gguf"] else None
+        ),
+        preferred_engine=preferred,
+        cuda_available=cuda_ok,
+        island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+        island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
+    )
+
+
+def _resolve_model_load_plan(
+    model_id: Optional[str],
+    engine: Optional[str],
+    quant_type: Optional[str],
+    *,
+    operation: str = OP_FULL_MODEL,
+    preferred_engine: Optional[str] = None,
+) -> ModelLoadResolution:
+    try:
+        return resolve_model_load(
+            _model_load_facts(model_id, preferred_engine=preferred_engine),
+            requested_engine=engine,
+            requested_quant=quant_type,
+            operation=operation,
+        )
+    except ModelLoadResolutionError as exc:
+        raise _model_resolution_http_error(exc) from exc
+
+
+def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
+    """Compatibility wrapper; production routes consume one full resolution."""
+
+    canonical = str(engine or "").lower()
+    facts = ModelLoadFacts(
+        model_id=None,
+        has_safetensors=canonical in {"pytorch", "torch"},
+        has_gguf=canonical in {"llama_cpp", "llama.cpp", "llama-cpp", "gguf"},
+        safetensors_path="model-dir" if canonical in {"pytorch", "torch"} else None,
+        gguf_path="model.gguf" if canonical in {"llama_cpp", "llama.cpp", "llama-cpp", "gguf"} else None,
+        cuda_available=_resolution_cuda_available(),
+        island_enabled=canonical == "island",
+        island_base_url="configured" if canonical == "island" else "",
+    )
+    try:
+        return resolve_model_load(
+            facts,
+            requested_engine=engine,
+            requested_quant=quant_type,
+        ).quant_type
+    except ModelLoadResolutionError as exc:
+        raise _model_resolution_http_error(exc) from exc
 
 
 def _estimate_full_model_load_bytes(model_id: Optional[str], engine: str, quant: str) -> int:
@@ -5143,156 +5821,29 @@ def _estimate_full_model_load_bytes(model_id: Optional[str], engine: str, quant:
 
 
 def _decide_pipeline_load_mode(model_id: Optional[str], engine: str, quant: str) -> tuple:
-    """★ 2026-10-09（自适应加载，用户裁定）决定分布式下的加载形态。
-
-    返回 `(mode, reason)`，`mode ∈ {"full", "pipeline"}`：
-    * `"full"` —— 可用显存/内存装得下**整模** ⇒ 直接整模加载（简单、启动快）；
-    * `"pipeline"` —— 装不下整模 ⇒ 走 `prepare_pipeline_model`，**各节点只在自己的分配段物化权重**
-      （这才是为边缘/小显存设计的路径；`#82` 的容量恒拒就发生在这里走错时）。
-
-    判据只做"整模装不装得下"这一层，**不替求解器决定怎么切分** ——
-    切分仍由 `pipeline_capacity` 按真实节点能力求解。
-    """
-    if RUN_MODE != "distributed":
-        return "full", "非分布式模式"
-    need = _estimate_full_model_load_bytes(model_id, engine, quant)
-    if need <= 0:
-        return "full", "无法估计整模需求（保持默认整模加载）"
-    profile = device_profile or {}
-    # ★ 2026-10-09：优先用**实时**探测，而不是注册时的画像快照 ——
-    #   `device_profile` 是启动时 `profiler.to_dict()` 的结果（且顶层未必有 `ram`），
-    #   实测在 CUDA 机器上拿不到可用值 ⇒ 决策退化成"未知 ⇒ 保持整模"。
-    #   这里直接问运行时：CUDA ⇒ `torch.cuda.mem_get_info`；CPU ⇒ `psutil.virtual_memory`。
-    available = 0.0
-    source = ""
-    try:
-        import torch_runtime as _tr
-
-        if _tr.cuda_available(load=False):
-            import torch as _torch
-
-            _free, _total = _torch.cuda.mem_get_info(0)
-            available = float(_free) / 1024 ** 3
-            source = "torch.cuda.mem_get_info"
-    except Exception:  # pragma: no cover - 探测失败则退化
-        available = 0.0
-    if available <= 0:
-        try:
-            import psutil as _psutil
-
-            available = float(_psutil.virtual_memory().available) / 1024 ** 3
-            source = "psutil.virtual_memory"
-        except Exception:  # pragma: no cover
-            available = 0.0
-    if available <= 0:
-        # 最后退化到注册时的画像（字段名兼容 PC 的 `ram.available_gb` 与 `gpu.vram_free_gb`）。
-        gpu_p = profile.get("gpu") or {}
-        ram_p = profile.get("ram") or {}
-        available = float(
-            (gpu_p.get("vram_free_gb") or ram_p.get("available_gb") or 0) or 0
-        )
-        source = "device_profile" if available > 0 else ""
-    if available <= 0:
-        return "full", "可用显存/内存未知（保持默认整模加载）"
-    # 留 15% 余量给 KV 缓存/激活/分配器开销。
-    fits = available * 1024 ** 3 * 0.85 >= need
-    if fits:
-        return "full", f"整模 {need / 1024**3:.2f}GB 可装入 {source}={available:.2f}GB"
-    return (
-        "pipeline",
-        f"整模 {need / 1024**3:.2f}GB 装不下 {source}={available:.2f}GB ⇒ 改为按段物化",
-    )
+    """Choose segment loading unless the user explicitly selects local inference."""
+    if RUN_MODE != "distributed" or not scheduler.get_distributed_inference_enabled():
+        return "full", "explicit_local_inference"
+    return "pipeline", "distributed_segment_loading_required"
 
 
 def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
-    """Reject unavailable model loads before unloading the current model."""
-    if engine == "island":
-        # 孤岛引擎无本地文件依赖；端点可达性在加载时由健康检查校验
-        import config as cfg
-        if not getattr(cfg, "ISLAND_BASE_URL", ""):
-            raise HTTPException(
-                status_code=400,
-                detail="孤岛引擎未配置端点：请设置 QLH_ISLAND_BASE_URL 后重试。",
-            )
-        return
-    if not model_id:
-        return
+    """Compatibility wrapper; production routes consume one full resolution."""
 
-    model = mc.get_model_config(model_id, _get_registered_experimental_models())
-    if model is None:
-        raise coded_http_error(
-            404,
-            "MODEL_NOT_REGISTERED",
-            f"模型 '{model_id}' 未在注册表中找到。",
-        )
-
-    payload = _model_api_payload(model)
-    if not payload["is_available"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"模型 '{model.name}' 不可加载：{payload['unavailable_reason']}",
-        )
-
-    if engine == "llama_cpp" and not payload["has_gguf"]:
-        raise HTTPException(status_code=400, detail=f"模型 '{model.name}' 未配置或未下载 GGUF 文件。")
-    if engine == "pytorch":
-        if not payload["has_safetensors"]:
-            raise HTTPException(status_code=400, detail=f"模型 '{model.name}' 未配置或未下载 Safetensors 文件。")
+    _resolve_model_load_plan(model_id, engine, "int4")
 
 
 def _resolve_model_path_for_engine(model_id: Optional[str], engine: str) -> Optional[str]:
-    """Resolve a registered model path for the requested engine, including DB models."""
-    if not model_id:
-        return None
-    model = mc.get_model_config(model_id, _get_registered_experimental_models())
-    if model is None:
-        return None
-    payload = _model_api_payload(model)
-    selected_engine = engine if engine != "auto" else payload.get("preferred_engine", "auto")
-    if selected_engine == "llama_cpp" and payload.get("has_gguf"):
-        return mc.resolve_model_path(model.gguf_path)
-    if selected_engine == "pytorch" and payload.get("has_safetensors"):
-        return mc.resolve_model_path(model.model_path)
-    return None
+    """Compatibility wrapper; production routes consume one full resolution."""
+
+    return _resolve_model_load_plan(model_id, engine, "int4").model_path
 
 
 def _effective_engine_for_model(model_id: Optional[str], engine: str) -> str:
-    """Return the concrete engine to pass into ModelManager.
+    """Compatibility wrapper preserving both layer-range implementation modes."""
 
-    ★ 2026-10-09（稳定性 #73-④）：**分布式模式下必须落到能承载层段的引擎**。
-    master 要跑 `[0, k)` 本地段（`prepare_pipeline_model` / `load_layer_range`），而
-    **GGUF 路径不支持 `layer_range`** —— 实测报
-    `GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明` ⇒
-    `pipeline_local_commit_failed` ⇒ 事务 aborted ⇒ **之后每个请求都 503，切回模型、
-    甚至重启后端都无效**（本次复现的 ④）。
-
-    而 `LoadModelRequest.engine` 的**默认值就是 `"llama_cpp"`**（并非 `"auto"`，见
-    `api_server.py` 的字段定义），所以"不传引擎"这条最常见路径在分布式模式下**必然选错**。
-    ⇒ 这里对 `auto` / `llama_cpp` / `gguf` 这类"不能承载层段"的取值统一纠正为 pytorch
-      （前提：该模型确实有 safetensors）。显式的 `pytorch` / `island` 不受影响。
-    """
-    if not model_id:
-        return engine
-    model = mc.get_model_config(model_id, _get_registered_experimental_models())
-    if model is None:
-        return engine
-    payload = _model_api_payload(model)
-    preferred = str(payload.get("preferred_engine") or "")
-    non_pipeline_engines = {"auto", "llama_cpp", "llama.cpp", "llama-cpp", "gguf"}
-    if (
-        RUN_MODE == "distributed"
-        and payload.get("has_safetensors")
-        and str(engine).strip().lower() in non_pipeline_engines
-    ):
-        logger.info(
-            "engine=%s 在分布式模式下纠正为 pytorch（模型 %s 有 safetensors；"
-            "GGUF 不支持 layer_range，会令 master 段无法准备）",
-            engine, model_id,
-        )
-        return "pytorch"
-    if engine != "auto":
-        return engine
-    return preferred or engine
+    operation = OP_DISTRIBUTED_LOAD if RUN_MODE == "distributed" else OP_FULL_MODEL
+    return _resolve_model_load_plan(model_id, engine, "int4", operation=operation).engine
 
 
 
@@ -6138,6 +6689,8 @@ from api import routes_health as _health_routes
 from api import routes_logs as _logs_routes
 from api import routes_cluster as _cluster_routes
 from api import routes_models as _models_routes
+from api import routes_model_supply as _supply_routes
+from api import routes_model_intent as _intent_routes
 from api import routes_auth as _auth_routes
 from api import routes_sessions as _sessions_routes
 from api import routes_tasks as _tasks_routes
@@ -6145,7 +6698,7 @@ from api import routes_chat as _chat_routes
 from api import routes_system as _system_routes
 
 _api_route_modules = (
-    _health_routes, _device_routes, _cluster_routes, _models_routes,
+    _health_routes, _device_routes, _cluster_routes, _models_routes, _supply_routes, _intent_routes,
     _auth_routes, _sessions_routes, _tasks_routes, _chat_routes,
     _system_routes, _logs_routes,
 )

@@ -12,7 +12,10 @@ from task_graph import (
     TaskGraphCoordinator,
     TaskGraphError,
     TaskGraphUnavailable,
+    WorkflowDeadlineExceeded,
+    WorkflowExecutionError,
 )
+from request_deadline import RequestDeadline
 from task_journal import SQLiteTaskJournal, TaskJournalError
 from task_provider import (
     DeterministicFakeProvider,
@@ -334,6 +337,163 @@ def test_lease_renewal_extends_running_attempt_without_fallback():
     assert output == {"content": "primary"}
     assert workflow["stages"][0]["retry_count"] == 0
     assert fallback.call_records() == []
+    coordinator.close()
+
+
+def test_request_deadline_stops_local_provider_and_latches_terminal_reason():
+    stopped = threading.Event()
+    registry = ProviderRegistry()
+
+    def execute(_request, cancel_event):
+        assert cancel_event.wait(1.0)
+        stopped.set()
+        raise RuntimeError("provider observed cooperative stop")
+
+    registry.register(LocalFullModelProvider(execute))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        coordinator.run(
+            [StageSpec("answer", "full_inference")],
+            "answer",
+            {},
+            workflow_id="wf_requestdeadline01",
+            request_deadline=RequestDeadline.start(0.08),
+        )
+
+    assert captured.value.code == "request_deadline_exceeded"
+    assert stopped.wait(0.5)
+    snapshot = coordinator.get("wf_requestdeadline01")
+    assert snapshot["state"] == "failed"
+    assert snapshot["stages"][0]["attempts"][0]["state"] == "expired"
+    assert snapshot["terminal_reason"]["reason_code"] == (
+        "request_deadline_exceeded"
+    )
+    coordinator.close()
+
+
+def test_worker_lease_remains_independent_from_request_deadline():
+    release = threading.Event()
+    registry = ProviderRegistry()
+    registry.register(DeterministicFakeProvider(
+        "remote-shaped",
+        block_event=release,
+        output_factory=lambda _request, _cancel: {"content": "done"},
+    ))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+    request_deadline = RequestDeadline.start(1.0)
+    outcome = {}
+
+    def run_workflow():
+        outcome["value"] = coordinator.run(
+            [StageSpec(
+                "answer",
+                "full_inference",
+                provider="remote-shaped",
+                lease_timeout_seconds=0.2,
+            )],
+            "answer",
+            {},
+            workflow_id="wf_renewdeadline01",
+            request_deadline=request_deadline,
+        )
+
+    thread = threading.Thread(target=run_workflow)
+    thread.start()
+    attempt = None
+    poll_deadline = time.monotonic() + 1.0
+    while time.monotonic() < poll_deadline:
+        try:
+            attempts = coordinator.get(
+                "wf_renewdeadline01",
+            )["stages"][0]["attempts"]
+        except TaskGraphError:
+            attempts = []
+        if attempts:
+            attempt = attempts[0]
+            break
+        time.sleep(0.005)
+    assert attempt is not None
+
+    renewed = coordinator.renew_stage_lease(
+        "wf_renewdeadline01",
+        "answer",
+        attempt["attempt_id"],
+        attempt["lease_id"],
+        attempt["lease_epoch"],
+        request_deadline.expires_at_epoch + 1.0,
+    )
+    assert renewed["lease_expires_at"] > request_deadline.expires_at_epoch
+
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert outcome["value"][0] == {"content": "done"}
+    coordinator.close()
+
+
+def test_result_ready_cannot_commit_after_request_deadline():
+    registry = ProviderRegistry()
+    registry.register(DeterministicFakeProvider("instant"))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+    deadline = RequestDeadline.start(0.2)
+
+    output, workflow = coordinator.run(
+        [StageSpec(
+            "answer", "full_inference", provider="instant",
+        )],
+        "answer",
+        {},
+        workflow_id="wf_commitdeadline01",
+        request_deadline=deadline,
+    )
+    assert output == {"content": "answer"}
+    assert workflow["state"] == "result_ready"
+
+    time.sleep(deadline.remaining() + 0.02)
+    with pytest.raises(WorkflowDeadlineExceeded):
+        coordinator.commit_result("wf_commitdeadline01")
+
+    snapshot = coordinator.get("wf_commitdeadline01")
+    assert snapshot["state"] == "failed"
+    assert snapshot["terminal_reason"]["reason_code"] == (
+        "request_deadline_exceeded"
+    )
+    coordinator.cancel("wf_commitdeadline01")
+    snapshot = coordinator.get("wf_commitdeadline01")
+    assert snapshot["terminal_reason"]["reason_code"] == (
+        "request_deadline_exceeded"
+    )
+    assert any(
+        item["reason_code"] == "generation_cancelled"
+        for item in snapshot["terminal_reason"]["secondary_observations"]
+    )
+    coordinator.close()
+
+
+@pytest.mark.parametrize("cancel_method", [
+    "cancel", "request_cancel", "discard_result",
+])
+def test_result_ready_cancel_paths_latch_generation_cancelled(cancel_method):
+    registry = ProviderRegistry()
+    registry.register(DeterministicFakeProvider("instant"))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+    workflow_id = f"wf_readycancel_{cancel_method}"
+    coordinator.run(
+        [StageSpec(
+            "answer", "full_inference", provider="instant",
+        )],
+        "answer",
+        {},
+        workflow_id=workflow_id,
+    )
+
+    getattr(coordinator, cancel_method)(workflow_id)
+    snapshot = coordinator.get(workflow_id)
+    assert snapshot["state"] == "cancelled"
+    assert snapshot["terminal_reason"]["reason_code"] == (
+        "generation_cancelled"
+    )
     coordinator.close()
 
 

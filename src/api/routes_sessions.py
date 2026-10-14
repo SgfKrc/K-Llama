@@ -100,9 +100,9 @@ def delete_conversations(session_id: str = "default"):
         _api_module.logger.error(f"SQLite 清空对话历史失败: {e}")
         raise _api_module.HTTPException(503, f"本地对话存储不可用: {e}")
 
-    history = _api_module.session_histories.get(resolved_session_id)
-    if history is not None:
-        history.clear()
+    _api_module._sync_chat_context_facade()
+    _api_module._chat_context.clear_session(resolved_session_id)
+    _api_module._publish_chat_context_facade()
     if resolved_session_id == _api_module.active_session_id:
         if _api_module.kv_cache:
             _api_module.kv_cache.clear()
@@ -139,7 +139,9 @@ def create_session(req: Optional[CreateSessionRequest] = None):
         raise _api_module.HTTPException(503, f"本地会话存储不可用: {e}")
 
     # 注册到内存并激活
-    _api_module.session_histories[session_id] = []
+    _api_module._sync_chat_context_facade()
+    _api_module._chat_context.set_history(session_id, [])
+    _api_module._publish_chat_context_facade()
     _api_module._switch_session(session_id)
 
     _api_module.logger.info(f"会话已创建: {session_id} ({title})")
@@ -246,11 +248,12 @@ def delete_session(session_id: str):
         raise _api_module.HTTPException(503, f"本地会话存储不可用: {e}")
 
     # 从内存中移除
-    _api_module.session_histories.pop(session_id, None)
+    _api_module._sync_chat_context_facade()
+    was_active = _api_module._chat_context.drop_session(session_id)
+    _api_module._publish_chat_context_facade()
 
     # 如果删除的是活跃会话，清除状态
-    if _api_module.active_session_id == session_id:
-        _api_module.active_session_id = None
+    if was_active:
         if _api_module.kv_cache:
             _api_module.kv_cache.clear()
         _api_module._init_kv_cache()
@@ -283,20 +286,21 @@ def delete_turn(session_id: str, turn_index: int):
     """
     global kv_cache
 
-    # 验证 turn_index 范围
+    _api_module._sync_chat_context_facade()
     history = _api_module.session_histories.get(session_id, [])
-    if not history:
-        try:
-            local_rows = _api_module._local_store.load_local_conversation(session_id)
-            history = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-            _api_module.session_histories[session_id] = history
-        except Exception as e:
-            _api_module.logger.error(f"SQLite 读取待删除轮次失败: {e}")
-            raise _api_module.HTTPException(503, f"本地会话存储不可用: {e}")
-        if not history:
-            raise _api_module.HTTPException(404, f"会话不存在或无消息: {session_id}")
+    try:
+        persisted_message_count = (
+            _api_module._local_store.get_local_conversation_count(session_id)
+        )
+    except Exception as e:
+        _api_module.logger.error(f"SQLite 读取待删除轮次失败: {e}")
+        raise _api_module.HTTPException(503, f"本地会话存储不可用: {e}")
 
-    max_turn = (len(history) // 2) - 1
+    message_count = persisted_message_count or len(history)
+    if message_count < 2:
+        raise _api_module.HTTPException(404, f"会话不存在或无消息: {session_id}")
+
+    max_turn = (message_count // 2) - 1
     if turn_index < 0 or turn_index > max_turn:
         raise _api_module.HTTPException(400, f"无效的轮次索引: {turn_index}（有效范围: 0-{max_turn}）")
 
@@ -306,17 +310,38 @@ def delete_turn(session_id: str, turn_index: int):
         _api_module.logger.error(f"SQLite 删除消息失败: {e}")
         raise _api_module.HTTPException(503, f"本地会话存储不可用: {e}")
 
-    # 从内存中移除这两条消息
-    idx = turn_index * 2
-    if idx + 1 < len(history):
-        del history[idx:idx + 2]
+    reloaded_active = False
+    if persisted_message_count:
+        if deleted_count != 2:
+            raise _api_module.HTTPException(
+                409, "会话已被并发修改，请刷新后重试",
+            )
+        # The context cache contains only the latest window, while turn_index
+        # is relative to the complete SQLite transcript. Never splice the
+        # window with a full-history index; invalidate and reload instead.
+        _api_module._chat_context.invalidate_session(session_id)
+        _api_module._publish_chat_context_facade()
+        if session_id == _api_module.active_session_id:
+            _api_module._switch_session(session_id)
+            reloaded_active = True
+        remaining_turns = max(0, (persisted_message_count - 2) // 2)
+    else:
+        idx = turn_index * 2
+        if idx + 1 < len(history):
+            del history[idx:idx + 2]
+        _api_module._chat_context.mark_current(session_id)
+        _api_module._publish_chat_context_facade()
+        remaining_turns = len(history) // 2
 
     # 如果删除的是活跃会话的轮次，清 KV Cache（token 位置已变）
-    if session_id == _api_module.active_session_id and _api_module.kv_cache:
+    if (
+        not reloaded_active
+        and session_id == _api_module.active_session_id
+        and _api_module.kv_cache
+    ):
         _api_module.kv_cache.clear()
         _api_module._init_kv_cache()
 
-    remaining_turns = len(history) // 2
     _api_module.logger.info(f"已删除会话 {session_id} 第 {turn_index} 轮对话（{deleted_count} DB rows），剩余 {remaining_turns} 轮")
     return {
         "status": "deleted",

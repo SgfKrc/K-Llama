@@ -209,6 +209,13 @@ LIVE_SHAPES = {
 }
 
 
+# Distributed selectors read the master's path-free catalog.
+LIVE_SHAPES["/models/intent/catalog"] = {
+    **LIVE_SHAPES["/models"], "binding": {"status": "connected", "master_node_id": "master"},
+}
+LIVE_SHAPES["/models/intent/current"] = None
+
+
 def _rows(screen, selector):
     from textual.widgets import DataTable
 
@@ -281,7 +288,7 @@ def test_live_backend_shapes_render_every_page():
 
             status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
             assert "运行模式=distributed" in status, status
-            assert "Qwen-1.8B-Chat（未加载）" in status, status
+            assert "尚未选择分布式模型" in status, status
 
     _run(_main())
 
@@ -378,7 +385,6 @@ def test_pages_refresh_lock_allows_only_one_inflight_worker(monkeypatch):
             screen.backend_available = True
             screen.runtime_ready = True
 
-            start = threading.Barrier(3)
             first_fetch = threading.Event()
             release = threading.Event()
             calls = []
@@ -389,27 +395,37 @@ def test_pages_refresh_lock_allows_only_one_inflight_worker(monkeypatch):
                     calls.append(path)
                     is_first = len(calls) == 1
                 if is_first:
+                    # 让第一轮刷新一直停在"在途"，好让第二次调用**确定**撞上
+                    # `_pages_inflight` 守卫。
                     first_fetch.set()
-                    assert release.wait(2)
+                    assert release.wait(5)
                 return {}
 
             monkeypatch.setattr(screen, "fetch_json", fetch_json)
             monkeypatch.setattr(screen, "fetch_json_params", lambda *args, **kwargs: {})
             monkeypatch.setattr(app, "call_from_thread", lambda *args, **kwargs: None)
 
-            def run_loader():
-                start.wait(timeout=2)
-                MainScreen.load_pages.__wrapped__(screen)
+            # ★ 不要用"两个线程靠 Barrier 同时撞锁"来验证：线程调度顺序没有保证，
+            #   若第二个线程在第一个释放锁**之后**才检查 `_pages_inflight`，它就会
+            #   再抓一整轮 —— 实测该写法单跑 8 次即 1 次 flaky（calls 变成 6 项）。
+            #   改为确定性构造：先启动一次刷新并等它真的进入在途，再在当前线程发
+            #   第二次刷新；此时 `_pages_inflight` 必为 True ⇒ 必被折叠。
+            loader = threading.Thread(
+                target=MainScreen.load_pages.__wrapped__, args=(screen,),
+            )
+            loader.start()
+            for _ in range(500):
+                if first_fetch.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert first_fetch.is_set(), "首次页面刷新未进入在途状态"
+            assert screen._pages_inflight is True
 
-            threads = [threading.Thread(target=run_loader) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            start.wait(timeout=2)
-            assert first_fetch.wait(2)
+            MainScreen.load_pages.__wrapped__(screen)   # 第二次：应被折叠为 no-op
+
             release.set()
-            for thread in threads:
-                thread.join(timeout=2)
-                assert not thread.is_alive()
+            loader.join(timeout=5)
+            assert not loader.is_alive()
 
             assert calls == [
                 "/cluster/nodes",
@@ -463,6 +479,36 @@ def _pane_text(widget) -> str:
     return ""
 
 
+def test_status_table_renders_model_and_pipeline_independently():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = _StubApi()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.4)
+            screen = app.screen
+            screen.model_mode = "local"
+            for loaded, prepared in ((False, False), (False, True), (True, False), (True, True)):
+                screen.fill_status(
+                    {"status": "ok"},
+                    {
+                        "model_loaded": loaded,
+                        "pipeline_prepared": prepared,
+                        "model_name": "Qwen",
+                        "active_model_id": "qwen" if loaded else None,
+                    },
+                    {},
+                    {},
+                )
+                rows = {name: value for name, value in _rows(screen, "#status-table")}
+                assert rows["模型"] == f"Qwen（{'已加载' if loaded else '未加载'}）"
+                assert rows["流水线"] == ("已准备" if prepared else "未准备")
+
+    _run(_main())
+
+
 def test_model_loading_summary_is_consistent_with_table():
     """★ 2026-10-09（#73-②，用户截图实证）：加载期间**摘要 pane** 必须与 `model_text` 同源。
 
@@ -481,6 +527,7 @@ def test_model_loading_summary_is_consistent_with_table():
             await pilot.pause(0.4)
             screen = app.screen
             # 模拟"加载已开始、但 /api/status 还没更新"的窗口 —— 矛盾就出现在这个时机。
+            screen.model_mode = "local"
             screen._model_loading_id = "qwen3-5-2b"
             screen.fill_status(
                 {"status": "ok"},

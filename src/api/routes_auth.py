@@ -66,7 +66,7 @@ async def auth_me(principal=Depends(auth_service.require_session)):
     return _api_module._principal_payload(principal)
 
 async def auth_totp_provision(
-    principal=Depends(auth_service.require_role("admin", "operator")),
+    principal=Depends(auth_service.require_authenticated_role("admin", "operator")),
 ):
     """为**当前主体**生成并绑定 TOTP 密钥，返回 `otpauth://` URI 供 Auth App 扫码。
 
@@ -83,12 +83,13 @@ async def auth_totp_provision(
         "algorithm": _api_module.auth_app.TOTP_ALGORITHM,
         "digits": _api_module.auth_app.TOTP_DIGITS,
         "period": _api_module.auth_app.TOTP_INTERVAL_SECONDS,
+        "reauth_required": True,
     }
 
 async def auth_totp_verify(
     req: TotpVerifyRequest,
     request: Request,
-    principal=Depends(auth_service.require_role("admin", "operator")),
+    principal=Depends(auth_service.require_authenticated_role("admin", "operator")),
 ):
     """校验一次当前主体的 TOTP（用于确认 Auth App 绑定成功）。"""
     secret = _api_module.auth_service.get_auth_store().get_totp_secret(principal.username)
@@ -108,7 +109,7 @@ async def auth_totp_verify(
     return {"status": "ok", "verified": bool(ok)}
 
 async def list_users(request: Request = None,
-                     principal=Depends(auth_service.require_role("admin"))):
+                     principal=Depends(auth_service.require_authenticated_role("admin"))):
     """列出账户（不含任何口令/密钥材料）。"""
     _api_module.require_model_api_source(request)
     users = _api_module.auth_service.get_auth_store().list_users()
@@ -135,6 +136,11 @@ async def create_user(req: CreateUserRequest, request: Request = None,
             })
     else:
         _api_module.require_model_api_source(request)
+        if getattr(principal, "username", "anonymous") == "anonymous":
+            raise _api_module.HTTPException(401, {
+                "code": "auth_required",
+                "message": "账户创建需要实名 admin 登录",
+            })
         if not getattr(principal, "is_admin", False):
             raise _api_module.HTTPException(403, {"code": "insufficient_role", "message": "需要 admin 角色"})
     try:
@@ -146,7 +152,7 @@ async def create_user(req: CreateUserRequest, request: Request = None,
             "bootstrap": bootstrap}
 
 async def patch_user(username: str, req: PatchUserRequest, request: Request = None,
-                     principal=Depends(auth_service.require_role("admin"))):
+                     principal=Depends(auth_service.require_authenticated_role("admin"))):
     """修改账户：角色 / 禁用 / 重置口令。禁用会**立即吊销**该用户全部登录态。"""
     _api_module.require_model_api_source(request)
     store = _api_module.auth_service.get_auth_store()
@@ -175,7 +181,7 @@ async def patch_user(username: str, req: PatchUserRequest, request: Request = No
     return {"status": "updated", "username": username, "changed": changed}
 
 async def delete_user(username: str, request: Request = None,
-                      principal=Depends(auth_service.require_role("admin"))):
+                      principal=Depends(auth_service.require_authenticated_role("admin"))):
     """删除账户（及其 TOTP 绑定与登录态，由外键级联）。"""
     _api_module.require_model_api_source(request)
     store = _api_module.auth_service.get_auth_store()

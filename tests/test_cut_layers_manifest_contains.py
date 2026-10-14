@@ -22,7 +22,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "cut_layers.py"
-ARCH = "qwen35"
+#: 用**非 qwen35** 架构：本文件只测"张量归属声明"，与 #67-④ 的必需表无关
+#: （用 qwen35 会被那条校验拒，因为这里的最小 fixture 不含全部必需张量）。
+ARCH = "qwen2"
 N_LAYERS = 8
 
 

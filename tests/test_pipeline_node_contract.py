@@ -74,6 +74,32 @@ def test_layout_requires_exact_coverage_and_stable_public_contract():
     assert public["contract_sha256"] == layout.to_dict()["contract_sha256"]
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("llama.cpp", "llama_cpp"),
+        ("llama-cpp", "llama_cpp"),
+        ("gguf", "llama_cpp"),
+        ("llama", "llama_cpp"),
+        ("torch", "pytorch"),
+    ],
+)
+def test_pipeline_node_normalizes_local_engine_aliases(alias, canonical):
+    node = _node("local", 0, 1, embedding=True, head=True, engine=alias)
+
+    assert node.engine == canonical
+    assert node.to_dict()["engine"] == canonical
+
+
+def test_pipeline_node_preserves_non_local_engine_and_rejects_unknown():
+    assert _node(
+        "local", 0, 1, embedding=True, head=True, engine="external_api",
+    ).engine == "external_api"
+
+    with pytest.raises(PipelineNodeContractError, match="engine is unsupported"):
+        _node("local", 0, 1, embedding=True, head=True, engine="llama_magic")
+
+
 @pytest.mark.parametrize("second_range", [(3, 4), (1, 4)])
 def test_layout_rejects_gap_or_overlap(second_range):
     with pytest.raises(PipelineNodeContractError, match="cover every layer"):
@@ -259,6 +285,50 @@ def test_relay_and_rpc_contracts_map_without_control_plane_imports():
     assert rpc_node.kind == "remote_rpc"
     assert rpc_node.layer_range == (2, 4)
     assert rpc_node.federated is True
+    assert rpc_node.engine == "llama_cpp"
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("llama_cpp", "llama_cpp"),
+        ("llama.cpp", "llama_cpp"),
+        ("llama-cpp", "llama_cpp"),
+        ("gguf", "llama_cpp"),
+        ("llama", "llama_cpp"),
+        ("torch", "pytorch"),
+        ("pytorch", "pytorch"),
+    ],
+)
+def test_rpc_lease_normalizes_local_engine_aliases(alias, canonical):
+    lease = RpcShardLeaseBook().assign(
+        "shard-2", "rpc-edge", MODEL_SHA,
+        {"layer_range": [2, 4], "engine": alias, "artifact_kind": "gguf"},
+    )
+
+    assert pipeline_node_from_rpc_lease(lease).engine == canonical
+
+
+def test_rpc_lease_preserves_non_local_engine_identifier():
+    lease = RpcShardLeaseBook().assign(
+        "shard-2", "rpc-edge", MODEL_SHA,
+        {
+            "layer_range": [2, 4], "engine": "external_api",
+            "artifact_kind": "remote",
+        },
+    )
+
+    assert pipeline_node_from_rpc_lease(lease).engine == "external_api"
+
+
+def test_rpc_lease_rejects_unknown_engine_alias():
+    lease = RpcShardLeaseBook().assign(
+        "shard-2", "rpc-edge", MODEL_SHA,
+        {"layer_range": [2, 4], "engine": "llama_magic", "artifact_kind": "gguf"},
+    )
+
+    with pytest.raises(PipelineNodeContractError, match="allocation.engine is unsupported"):
+        pipeline_node_from_rpc_lease(lease)
 
 
 def test_assignment_manifest_maps_to_the_same_node_contract():

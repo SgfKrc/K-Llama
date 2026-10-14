@@ -8,7 +8,7 @@ SQLite**（`local_store.initialize_local_store()` 返回的路径）—— 不�
 
 ## 表
 * `auth_users`    —— 账户（用户名 / 口令哈希 / 角色 / 禁用位 / 时间戳）
-* `auth_totp`     —— 每账户的 TOTP 共享密钥（Auth App 绑定）
+* `auth_totp`     —— 每账户的 TOTP 加密记录引用（Auth App 绑定）
 * `auth_sessions` —— 登录态（**只存 token 的 SHA256**，不存明文）
 
 ## 口令
@@ -30,7 +30,10 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+from local_secret_store import LocalSecretStore
 
 __all__ = [
     "ROLE_ADMIN",
@@ -52,6 +55,7 @@ VALID_ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 SESSION_TTL_SECONDS = 12 * 3600      # 登录态有效期（12h）
 _PBKDF2_ROUNDS = 200_000
 _SALT_BYTES = 16
+_TOTP_SECRET_REF = "local-secret-store:v1"
 
 
 class AuthStoreError(RuntimeError):
@@ -117,11 +121,28 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _totp_secret_record(username: str) -> str:
+    digest = hashlib.sha256(username.encode("utf-8")).hexdigest()
+    return f"auth_totp:{digest}"
+
+
+def _restrict_database_files(path: str) -> None:
+    for candidate in (Path(path), Path(path + "-wal"), Path(path + "-shm")):
+        if not candidate.exists():
+            continue
+        try:
+            candidate.chmod(0o600)
+        except OSError:
+            pass
+
+
 class AuthStore:
     """Auth 表的读写（**线程安全**：一把 `RLock` + 每次操作新建连接）。"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, secret_store_path: str | None = None):
         self._db_path = db_path
+        default_secret_path = Path(db_path).with_name("auth_secrets.json")
+        self._secret_store = LocalSecretStore(secret_store_path or default_secret_path)
         self._lock = threading.RLock()
         with self._lock:
             conn = self._connect()
@@ -130,12 +151,15 @@ class AuthStore:
                 conn.commit()
             finally:
                 conn.close()
+                _restrict_database_files(self._db_path)
 
     # ---------------------------------------------------------------- 内部
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA secure_delete = ON")
+        _restrict_database_files(self._db_path)
         return conn
 
     @staticmethod
@@ -282,24 +306,48 @@ class AuthStore:
             try:
                 cur = conn.execute("DELETE FROM auth_users WHERE username = ?", (username,))
                 conn.commit()
-                return bool(cur.rowcount)
+                deleted = bool(cur.rowcount)
             finally:
                 conn.close()
+            if deleted:
+                try:
+                    self._secret_store.delete(_totp_secret_record(username))
+                except Exception:
+                    # The account/session deletion already committed. An
+                    # encrypted orphan must not turn success into a false
+                    # failure signal or resurrect the deleted identity.
+                    pass
+            return deleted
 
     # ---------------------------------------------------------------- TOTP
     def bind_totp(self, username: str, secret: str) -> None:
+        value = str(secret or "").strip()
+        if not value:
+            raise AuthStoreError("invalid_totp_secret", "TOTP 密钥不能为空")
         with self._lock:
-            conn = self._connect()
+            record_name = _totp_secret_record(username)
+            previous = self._secret_store.get(record_name)
+            self._secret_store.set(record_name, value)
+            conn = None
             try:
+                conn = self._connect()
                 conn.execute(
                     "INSERT INTO auth_totp (username, secret, confirmed_at) VALUES (?,?,?)"
                     " ON CONFLICT(username) DO UPDATE SET secret = excluded.secret,"
                     " confirmed_at = excluded.confirmed_at",
-                    (username, secret, time.time()),
+                    (username, _TOTP_SECRET_REF, time.time()),
                 )
+                self._revoke_all_sessions_in_transaction(conn, username)
                 conn.commit()
+            except Exception:
+                if previous:
+                    self._secret_store.set(record_name, previous)
+                else:
+                    self._secret_store.delete(record_name)
+                raise
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     def get_totp_secret(self, username: str) -> Optional[str]:
         with self._lock:
@@ -307,7 +355,28 @@ class AuthStore:
             try:
                 row = conn.execute("SELECT secret FROM auth_totp WHERE username = ?",
                                    (username,)).fetchone()
-                return row["secret"] if row else None
+                if row is None:
+                    return None
+                stored_value = str(row["secret"] or "")
+                record_name = _totp_secret_record(username)
+                if stored_value == _TOTP_SECRET_REF:
+                    secret = self._secret_store.get(record_name)
+                    if not secret:
+                        raise AuthStoreError(
+                            "totp_secret_unavailable",
+                            "TOTP 密钥引用存在但加密记录不可用",
+                        )
+                    return secret
+
+                # Migrate legacy plaintext rows on first use. Future database
+                # snapshots expose only a reference, never the TOTP seed.
+                self._secret_store.set(record_name, stored_value)
+                conn.execute(
+                    "UPDATE auth_totp SET secret = ? WHERE username = ?",
+                    (_TOTP_SECRET_REF, username),
+                )
+                conn.commit()
+                return stored_value
             finally:
                 conn.close()
 
@@ -317,9 +386,16 @@ class AuthStore:
             try:
                 cur = conn.execute("DELETE FROM auth_totp WHERE username = ?", (username,))
                 conn.commit()
-                return bool(cur.rowcount)
+                cleared = bool(cur.rowcount)
             finally:
                 conn.close()
+            try:
+                self._secret_store.delete(_totp_secret_record(username))
+            except Exception:
+                # The binding row is already gone. Keep the externally visible
+                # result truthful; the unreachable encrypted record is inert.
+                pass
+            return cleared
 
     # ---------------------------------------------------------------- 登录态
     def issue_session(self, username: str, *,

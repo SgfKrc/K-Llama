@@ -169,8 +169,11 @@ class LocalRpcWorker:
         raise RpcInjectionError(f"worker 未在 {timeout:.0f}s 内监听 {self.endpoint}")
 
     def stop(self) -> None:
-        proc, self.proc = self.proc, None
-        if proc is None or proc.poll() is not None:
+        proc = self.proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            self.proc = None
             return
         proc.terminate()
         try:
@@ -178,6 +181,7 @@ class LocalRpcWorker:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=10)
+        self.proc = None
 
     def __enter__(self) -> "LocalRpcWorker":
         return self.start()
@@ -360,6 +364,14 @@ def patched_model_params(**overrides) -> Iterator[None]:
         lc.llama_model_load_from_file = original
 
 
+class RpcCleanupError(RpcInjectionError):
+    """A failed open still owns a worker and requires an explicit retry."""
+
+    def __init__(self, owner, init_error, cleanup_error):
+        super().__init__(f"RPC open failed: {init_error}; cleanup failed: {cleanup_error}")
+        self.cleanup_owner = owner
+
+
 @dataclass
 class RpcSession:
     """一次性接入会话：可含本地 worker（可选）+ device 注入。"""
@@ -382,18 +394,20 @@ class RpcSession:
         session = cls(endpoints=[str(e) for e in (endpoints or [])])
         try:
             if autostart_worker is not None:
-                worker = LocalRpcWorker(autostart_worker, port=worker_port,
-                                        threads=worker_threads, log_path=worker_log).start()
-                session.worker = worker
-                session.endpoints.append(worker.endpoint)
+                session.worker = LocalRpcWorker(autostart_worker, port=worker_port,
+                                                threads=worker_threads, log_path=worker_log)
+                session.worker.start()
+                session.endpoints.append(session.worker.endpoint)
             if not session.endpoints:
                 raise RpcInjectionError("既没有 endpoints，也没有 autostart_worker")
-            injector = RpcBackendInjector(lib_dir=lib_dir)
-            injector.attach(session.endpoints)
-            session.injector = injector
+            session.injector = RpcBackendInjector(lib_dir=lib_dir)
+            session.injector.attach(session.endpoints)
             return session
-        except Exception:
-            session.close()
+        except Exception as init_error:
+            try:
+                session.close()
+            except Exception as cleanup_error:
+                raise RpcCleanupError(session, init_error, cleanup_error) from cleanup_error
             raise
 
     def close(self) -> None:

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "version": {
+    "product": "0.1.8.3",
+    "launcher": "0.1.8.2",
+    "android_code": 6,
+    "inference_service_contract": "0.1.0"
+  },
+  "profile": {
+    "name": "route-a-production-v1",
+    "default_node_role": "master",
+    "fixed_environment": {
+      "QLH_ROUTE_A_STAGE_OFFER": "1",
+      "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": "1",
+      "QLH_TASK_GRAPH_ENABLED": "0",
+      "QLH_RELAY_ENABLED": "0",
+      "QLH_RELAY_PROBE_ONLY": "1"
+    },
+    "distributed_required": {
+      "allowed_execution_modes": [
+        "route_a_stage_offer_v3",
+        "forwarded_to_master"
+      ],
+      "failure_mode": "named"
+    }
+  }
+}

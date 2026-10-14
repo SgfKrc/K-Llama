@@ -101,6 +101,33 @@ def accepted_backend_requests(*, include_auto: bool = True) -> tuple[str, ...]:
     return ("auto", *backends) if include_auto else backends
 
 
+_BACKEND_REQUEST_ALIASES = {
+    "gguf": BackendId.LLAMA_CPP,
+    "llama": BackendId.LLAMA_CPP,
+    "llama_cpp": BackendId.LLAMA_CPP,
+    "pytorch": BackendId.PYTORCH,
+    "torch": BackendId.PYTORCH,
+    "island": BackendId.ISLAND,
+    "tp_island": BackendId.ISLAND,
+}
+
+
+def normalize_backend_request(value: Any, *, allow_auto: bool = True) -> str:
+    """Strictly normalize a public backend request.
+
+    Request parsing must fail closed: an unknown spelling must never silently
+    become llama.cpp.
+    """
+
+    normalized = str(value or "auto").strip().lower().replace("-", "_").replace(".", "_")
+    if allow_auto and normalized == "auto":
+        return "auto"
+    backend = _BACKEND_REQUEST_ALIASES.get(normalized)
+    if backend is None:
+        raise ValueError(f"unsupported backend request: {value!r}")
+    return backend
+
+
 class Koakuma(Protocol):
     """Common host-facing engine contract.
 
@@ -125,20 +152,11 @@ class Koakuma(Protocol):
     def chat_stream(self, messages: Any, **kwargs: Any) -> Any: ...
 
 
-def canonical_backend(value: Any, default: str = BackendId.LLAMA_CPP) -> str:
-    """Normalize public and historical backend aliases to one identifier."""
+def canonical_backend(value: Any, default: str = "") -> str:
+    """Normalize public and historical backend aliases without guessing."""
 
     normalized = str(value or "").strip().lower().replace("-", "_").replace(".", "_")
-    aliases = {
-        "gguf": BackendId.LLAMA_CPP,
-        "llama": BackendId.LLAMA_CPP,
-        "llama_cpp": BackendId.LLAMA_CPP,
-        "llama__cpp": BackendId.LLAMA_CPP,
-        "pytorch": BackendId.PYTORCH,
-        "torch": BackendId.PYTORCH,
-        "island": BackendId.ISLAND,
-    }
-    return aliases.get(normalized, default)
+    return _BACKEND_REQUEST_ALIASES.get(normalized, default)
 
 
 def backend_capabilities(backend: Any) -> BackendCapabilities:
@@ -146,8 +164,8 @@ def backend_capabilities(backend: Any) -> BackendCapabilities:
 
     if not str(backend or "").strip():
         return _EMPTY_CAPABILITIES
-    backend_id = canonical_backend(backend)
-    return _BACKEND_CAPABILITIES[backend_id]
+    backend_id = canonical_backend(backend, default="")
+    return _BACKEND_CAPABILITIES.get(backend_id, _EMPTY_CAPABILITIES)
 
 
 def _profile_has_cuda(node_profile: Mapping[str, Any] | None) -> bool:
@@ -179,21 +197,16 @@ def select_backend(
     compatibility route and is selected before local backends.
     """
 
-    raw_requested = str(requested or "").strip().lower().replace("-", "_").replace(".", "_")
+    requested_backend = normalize_backend_request(requested, allow_auto=True)
 
-    if raw_requested in {"island", "tp_island"} or (
+    if requested_backend == BackendId.ISLAND or (
         island_enabled and island_base_url
     ):
         return BackendId.ISLAND
 
-    if raw_requested in {
-        BackendId.LLAMA_CPP,
-        "gguf",
-        "llama",
-        "llama.cpp",
-    }:
+    if requested_backend == BackendId.LLAMA_CPP:
         return BackendId.LLAMA_CPP
-    if raw_requested in {BackendId.PYTORCH, "torch"}:
+    if requested_backend == BackendId.PYTORCH:
         return BackendId.PYTORCH
 
     has_cuda = _profile_has_cuda(node_profile)
@@ -216,14 +229,14 @@ def backend_id_for(runtime: Any, default: str = "") -> str:
     public_id = getattr(runtime, "engine_type", missing)
     if public_id is not missing:
         if public_id:
-            return canonical_backend(public_id, default=default or BackendId.LLAMA_CPP)
+            return canonical_backend(public_id, default=default)
         return default
     legacy_id = getattr(runtime, "_engine_type", None)
     if legacy_id:
-        return canonical_backend(legacy_id, default=default or BackendId.LLAMA_CPP)
+        return canonical_backend(legacy_id, default=default)
     public_id = getattr(runtime, "backend_id", None)
     if public_id:
-        return canonical_backend(public_id, default=default or BackendId.LLAMA_CPP)
+        return canonical_backend(public_id, default=default)
     return default
 
 
@@ -247,6 +260,7 @@ __all__ = [
     "backend_capabilities",
     "backend_id_for",
     "canonical_backend",
+    "normalize_backend_request",
     "accepted_backend_requests",
     "registered_backends",
     "runtime_supports",
