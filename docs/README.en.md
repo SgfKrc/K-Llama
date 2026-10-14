@@ -343,7 +343,7 @@ Real hardware, cross-host networks, Android ARM64, performance and long-run soak
 - [Overall architecture](整体架构.md) · [Module interfaces](模块接口说明.md) · [Core principles](核心技术原理.md) · [Distributed resource scheduling](分布式资源调度系统.md)
 - [Cross-framework relay — current baseline and follow-up plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) (index for the relay direction) · [project report](跨框架层接力-项目报告.md) · [capacity-gain measurements](跨框架层接力-容量收益实测-2026-09-21.md)
 - [TUI guide](TUI使用指南.md) · [TUI command set](TUI指令集.md)
-- [Testing and acceptance criteria](测试与评判标准.md) · [test channel notes](测试通道运行说明.md)
+- [Testing and acceptance criteria](测试与评判标准.md) · [test channel notes](测试通道运行说明.md) · [release artifact gate](发行物门-RELEASE-ARTIFACTS.md)
 - [Mainline plan: distributed inference and edge optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5: dynamic master election and distributed management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Parallelism and cross-framework survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md) · [KTransformers migration survey](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
 - [Outstanding work ledger (current)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](DIST后续核心链路缺陷审计-2026-10-07.md)
