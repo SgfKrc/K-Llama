@@ -309,3 +309,22 @@ def test_invalid_custom_stop_is_named_and_never_generates(route):
                                           (999, {999}), ([-1, None, 0, 50, False], {0, 50})])
 def test_eos_normalization(value, expected):
     assert _route_a_eos_ids(value) == expected
+
+
+def test_route_a_inference_keeps_user_selection_identity_distinct_from_task_contract(route):
+    scheduler = route(["2", "<|im_end|>"])
+    selection = {"operation_id": "supply_" + "c" * 32, "config_id": "model-config", "generation": 73}
+    for stage in scheduler.stages:
+        stage["worker_prepare_identity"] = dict(selection)
+    metrics = scheduler.run()["metrics"]
+    assert metrics["model_operation_id"] == selection["operation_id"]
+    assert metrics["model_config_id"] == "model-config" and metrics["model_generation"] == 73
+    assert metrics["config_id"].startswith("route_a:")
+
+
+def test_route_a_never_claims_one_selection_for_mixed_operation_receipts(route):
+    scheduler = route(["2", "<|im_end|>"])
+    for index, stage in enumerate(scheduler.stages):
+        stage["worker_prepare_identity"] = {"operation_id": "supply_" + str(index) * 32,
+                                           "config_id": "model-config", "generation": 73}
+    assert "model_operation_id" not in scheduler.run()["metrics"]

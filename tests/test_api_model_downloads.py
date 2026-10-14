@@ -127,3 +127,62 @@ def test_delete_queued_job_cancels(tmp_path, monkeypatch):
     assert d.status_code == 200
     assert d.json()["cancelled"] is True
     assert d.json()["job"]["status"] == "cancelled"
+
+
+def test_gguf_catalog_hashing_keeps_api_event_loop_responsive(tmp_path, monkeypatch):
+    import asyncio
+    import builtins
+    import hashlib
+    import threading
+    import httpx
+
+    model = tmp_path / "slow.gguf"
+    model.write_bytes(b"gguf catalog bytes")
+    monkeypatch.setattr(api_server, "_MODELS_DIR", str(tmp_path))
+    entered, release = threading.Event(), threading.Event()
+    original_open = builtins.open
+    hash_threads = []
+    loop_thread = threading.get_ident()
+
+    class SlowFile:
+        def __init__(self, file):
+            self.file = file
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.file.close()
+        def read(self, size):
+            if not entered.is_set():
+                hash_threads.append(threading.get_ident())
+                entered.set()
+                assert release.wait(timeout=2.0), "catalog blocked the API event loop"
+            return self.file.read(size)
+
+    def open_file(file, mode="r", *args, **kwargs):
+        result = original_open(file, mode, *args, **kwargs)
+        return SlowFile(result) if str(file) == str(model) and mode == "rb" else result
+
+    monkeypatch.setattr(builtins, "open", open_file)
+
+    async def concurrent_catalog_and_status():
+        transport = httpx.ASGITransport(app=api_server.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            catalog = asyncio.create_task(client.get("/api/models/gguf"))
+            try:
+                assert await asyncio.to_thread(entered.wait, 1.0)
+                status = await asyncio.wait_for(client.get("/api/models/current"), timeout=0.5)
+                assert status.status_code == 200
+                assert not catalog.done(), "slow disk read was not still pending"
+            finally:
+                release.set()
+            response = await asyncio.wait_for(catalog, timeout=2.0)
+            assert response.status_code == 200
+            row = response.json()["models"][0]
+            assert row["sha256"] == hashlib.sha256(b"gguf catalog bytes").hexdigest()
+            assert row["filename"] == "slow.gguf"
+
+    try:
+        asyncio.run(concurrent_catalog_and_status())
+    finally:
+        release.set()
+    assert hash_threads and loop_thread not in hash_threads

@@ -27,6 +27,8 @@ def test_unload_model_is_idempotent_and_keeps_lazy_manager_cold(monkeypatch):
         _active_layer_config=None,
         _last_layer_config_ack_payload=None,
         _local_pipeline_steps={},
+        get_distributed_inference_enabled=lambda: True,
+        _effective_role=lambda: "client",
         release_pipeline_worker_for_local_model=lambda: None,
         refresh_task_worker_capabilities=lambda: None,
     )
@@ -70,6 +72,7 @@ def test_unload_model_releases_engine_runtime_and_worker_reservation(monkeypatch
         _active_layer_config=None,
         _last_layer_config_ack_payload=None,
         _local_pipeline_steps={},
+        get_distributed_inference_enabled=lambda: True,
         _effective_role=lambda: "client",
         release_pipeline_worker_for_local_model=lambda: calls.append("release"),
         refresh_task_worker_capabilities=lambda: calls.append("refresh"),

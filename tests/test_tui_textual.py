@@ -209,6 +209,13 @@ LIVE_SHAPES = {
 }
 
 
+# Distributed selectors read the master's path-free catalog.
+LIVE_SHAPES["/models/intent/catalog"] = {
+    **LIVE_SHAPES["/models"], "binding": {"status": "connected", "master_node_id": "master"},
+}
+LIVE_SHAPES["/models/intent/current"] = None
+
+
 def _rows(screen, selector):
     from textual.widgets import DataTable
 
@@ -281,7 +288,7 @@ def test_live_backend_shapes_render_every_page():
 
             status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
             assert "运行模式=distributed" in status, status
-            assert "Qwen-1.8B-Chat（未加载）" in status, status
+            assert "尚未选择分布式模型" in status, status
 
     _run(_main())
 
@@ -482,6 +489,7 @@ def test_status_table_renders_model_and_pipeline_independently():
             app.show_main()
             await pilot.pause(0.4)
             screen = app.screen
+            screen.model_mode = "local"
             for loaded, prepared in ((False, False), (False, True), (True, False), (True, True)):
                 screen.fill_status(
                     {"status": "ok"},
@@ -519,6 +527,7 @@ def test_model_loading_summary_is_consistent_with_table():
             await pilot.pause(0.4)
             screen = app.screen
             # 模拟"加载已开始、但 /api/status 还没更新"的窗口 —— 矛盾就出现在这个时机。
+            screen.model_mode = "local"
             screen._model_loading_id = "qwen3-5-2b"
             screen.fill_status(
                 {"status": "ok"},

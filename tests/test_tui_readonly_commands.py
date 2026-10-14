@@ -89,6 +89,8 @@ def test_readonly_commands_hit_only_registered_readonly_paths(monkeypatch):
 
     readonly = {
         "/health", "/status", API_PATHS["models_current"], "/models",
+        API_PATHS["models_intent_catalog"], API_PATHS["models_intent_current"],
+        API_PATHS["distributed_config"],
         API_PATHS["cluster_nodes"], API_PATHS["cluster_queue"],
         API_PATHS["device_profile"], API_PATHS["cluster_log_aggregate"],
     }

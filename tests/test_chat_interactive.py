@@ -485,6 +485,181 @@ class TestRoutingPreference:
         assert events[-1]["done"] is True
         assert calls["forward"] == 0
 
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    def test_required_worker_forward_allows_returning_stage_lock(
+        self, interactive_env, monkeypatch, endpoint,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        acquired = threading.Event()
+        stage_threads = []
+
+        def returning_stage():
+            lock = api_server.model_host.full_chat_execution_lock
+            if lock.acquire(timeout=1.0):
+                try:
+                    acquired.set()
+                finally:
+                    lock.release()
+
+        def forward(message, **kwargs):
+            assert kwargs["routing_preference"] == "distributed_required"
+            stage = threading.Thread(target=returning_stage)
+            stage_threads.append(stage)
+            stage.start()
+            stage.join(timeout=2.0)
+            assert acquired.is_set(), "worker held model lock while awaiting master"
+            return {
+                "status": "ok", "content": "2",
+                "metrics": {"distributed_used": True, "workers_used": ["worker"]},
+            }
+
+        monkeypatch.setattr(api_server.scheduler, "forward_inference_to_master", forward)
+        monkeypatch.setattr(
+            api_server, "_auto_load_default_model",
+            lambda: pytest.fail("required worker forwarding loaded a full model"),
+        )
+        response = client.post(endpoint, json={
+            "message": "one plus one", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        for stage in stage_threads:
+            stage.join(timeout=2.0)
+        assert response.status_code == 200
+        result = (_sse_events(response)[-1] if endpoint.endswith("/stream")
+                  else response.json())
+        assert (result.get("response") or result.get("content")) == "2"
+        assert result["metrics"]["distributed_used"] is True
+        assert result["metrics"]["fallback"] is False
+        assert calls.get("chat", 0) == 0
+        assert acquired.is_set()
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    @pytest.mark.parametrize("transition", ["master", "disabled"])
+    def test_unlocked_forward_role_change_never_enters_native_execution(
+        self, interactive_env, monkeypatch, endpoint, transition,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        execute = api_server._execute_requested_chat
+
+        def change_before_execution(req, cancel_event=None, request_deadline=None, **kwargs):
+            assert kwargs["forward_only"] is True
+            calls["role"] = "master" if transition == "master" else "client"
+            calls["distributed_enabled"] = transition != "disabled"
+            return execute(req, cancel_event, request_deadline, **kwargs)
+
+        monkeypatch.setattr(api_server, "_execute_requested_chat", change_before_execution)
+        monkeypatch.setattr(
+            api_server, "_auto_load_default_model",
+            lambda: pytest.fail("forward-only request auto-loaded a full model"),
+        )
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        if endpoint.endswith("/stream"):
+            assert response.status_code == 200
+            error = next(event for event in _sse_events(response) if event.get("error"))
+            assert error["outcome_reason"] == "DISTRIBUTED_FORWARD_CONTEXT_CHANGED"
+        else:
+            assert response.status_code == 409
+            assert response.json()["error_code"] == "DISTRIBUTED_FORWARD_CONTEXT_CHANGED"
+        assert calls.get("chat", 0) == 0
+        assert calls["forward"] == 0
+        assert calls["run_pipeline_safe"] is None
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    @pytest.mark.parametrize("transition", ["master", "disabled"])
+    def test_role_change_after_forward_guard_stays_forward_only(
+        self, interactive_env, monkeypatch, endpoint, transition,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        prepare = api_server._prepare_chat_context
+        forwarded = []
+
+        def change_during_context(*args, **kwargs):
+            context = prepare(*args, **kwargs)
+            calls["role"] = "master" if transition == "master" else "client"
+            calls["distributed_enabled"] = transition != "disabled"
+            return context
+
+        def denied_by_forward_owner(**kwargs):
+            assert not api_server._should_forward_chat_to_master()
+            forwarded.append(True)
+            return {"status": "disconnected", "error": "worker forwarding role changed"}
+
+        monkeypatch.setattr(api_server, "_prepare_chat_context", change_during_context)
+        monkeypatch.setattr(api_server.scheduler, "forward_inference_to_master", denied_by_forward_owner)
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        if endpoint.endswith("/stream"):
+            assert response.status_code == 200
+            assert any(event.get("error") for event in _sse_events(response))
+        else:
+            assert response.status_code == 503
+        assert forwarded == [True]
+        assert calls.get("chat", 0) == 0
+        assert calls["run_pipeline_safe"] is None
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    def test_required_worker_forward_failure_never_runs_local_model(
+        self, interactive_env, monkeypatch, endpoint,
+    ):
+        client, calls = self._set_client_scene(interactive_env, monkeypatch)
+        monkeypatch.setattr(
+            api_server.scheduler, "forward_inference_to_master",
+            lambda **kwargs: {"status": "disconnected", "error": "master unavailable"},
+        )
+        monkeypatch.setattr(
+            api_server, "_auto_load_default_model",
+            lambda: pytest.fail("required forwarding failure loaded a full model"),
+        )
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full",
+            "routing_preference": "distributed_required",
+        })
+        if endpoint.endswith("/stream"):
+            assert response.status_code == 200
+            events = _sse_events(response)
+            assert any(event.get("error") for event in events)
+            assert not any(event.get("done") and not event.get("error") for event in events)
+        else:
+            assert response.status_code == 503
+        assert calls.get("chat", 0) == 0
+        assert calls["run_pipeline_safe"] is None
+
+    @pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+    def test_local_full_chat_still_serializes_model_execution(
+        self, interactive_env, monkeypatch, endpoint,
+    ):
+        client, calls = interactive_env
+        acquired = []
+
+        def chat(messages, **kwargs):
+            def competing_stage():
+                lock = api_server.model_host.full_chat_execution_lock
+                owns = lock.acquire(timeout=0.1)
+                acquired.append(owns)
+                if owns:
+                    lock.release()
+            stage = threading.Thread(target=competing_stage)
+            stage.start()
+            stage.join(timeout=2.0)
+            assert acquired and not any(acquired)
+            return {"content": "local", "usage": {"completion_tokens": 1}}
+
+        monkeypatch.setattr(api_server.model_manager, "chat", chat)
+        response = client.post(endpoint, json={
+            "message": "hi", "streaming_mode": "full", "routing_preference": "local_only",
+        })
+        assert response.status_code == 200
+        result = (_sse_events(response)[-1] if endpoint.endswith("/stream")
+                  else response.json())
+        assert (result.get("response") or result.get("content")) == "local"
+        assert acquired and not any(acquired)
+        assert calls["forward"] == 0
+
     def test_full_mode_distributed_required_rejected(self, interactive_env):
         client, _calls = interactive_env  # 分布式未启用
         response = client.post("/api/chat/stream", json={
@@ -699,3 +874,87 @@ class TestCommitFunction:
         )
         assert committed is True
         assert saved == [("sess_l", "问", "答", {"engine": "llama_cpp"})]
+
+
+def test_full_stream_flushes_before_context_and_generation(interactive_env, monkeypatch):
+    """A proxy can flush SSE headers even while context/native work is blocked."""
+    import asyncio
+    from starlette.requests import Request
+
+    _client, calls = interactive_env
+    acquired = []
+    entered = threading.Event()
+    release = threading.Event()
+    acquire = api_server._chat_context.acquire_transaction
+
+    def capture_acquire(**kwargs):
+        acquired.append(True)
+        return acquire(**kwargs)
+
+    def blocked_execute(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3.0), "stream consumer never released execution"
+        return {"content": "2", "followups": [], "metrics": {"model_generation": 1791914962549556600}}
+
+    monkeypatch.setattr(api_server._chat_context, "acquire_transaction", capture_acquire)
+    monkeypatch.setattr(api_server, "_execute_requested_chat", blocked_execute)
+
+    async def consume():
+        api_server._request_id_ctx.set("full-flush-contract")
+        request = Request({"type": "http", "method": "POST", "path": "/api/chat/stream",
+                           "headers": [], "client": ("127.0.0.1", 1234), "scheme": "http"})
+        response = await api_server.chat_stream(
+            api_server.ChatRequest(message="one plus one", streaming_mode="full", routing_preference="local_only"),
+            request,
+        )
+        iterator = response.body_iterator
+        first = await asyncio.wait_for(anext(iterator), timeout=0.5)
+        assert first == ": processing\n\n"
+        assert not acquired and not entered.is_set()
+        pending = asyncio.create_task(anext(iterator))
+        try:
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            assert not pending.done(), "completion arrived while generation was blocked"
+            release.set()
+            final = await asyncio.wait_for(pending, timeout=2.0)
+            assert json.loads(final.removeprefix("data: ")) == {
+                "done": True, "response": "2", "thinking_content": None,
+                "followups": [], "metrics": {"model_generation": 1791914962549556600}, "request_id": "full-flush-contract",
+            }
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+        finally:
+            release.set()
+            if not pending.done():
+                await pending
+            await iterator.aclose()
+
+    asyncio.run(consume())
+    assert acquired == [True]
+    assert not calls["commits"]
+
+
+def test_full_stream_disconnect_after_first_comment_retires_generation(interactive_env, monkeypatch):
+    import asyncio
+    from starlette.requests import Request
+
+    _client, calls = interactive_env
+    monkeypatch.setattr(api_server._chat_context, "acquire_transaction",
+                        lambda **_kwargs: pytest.fail("disconnected stream acquired a context transaction"))
+    monkeypatch.setattr(api_server, "_execute_requested_chat",
+                        lambda *_args, **_kwargs: pytest.fail("disconnected stream started generation"))
+
+    async def disconnect():
+        request = Request({"type": "http", "method": "POST", "path": "/api/chat/stream",
+                           "headers": [], "client": ("127.0.0.1", 1234), "scheme": "http"})
+        response = await api_server.chat_stream(
+            api_server.ChatRequest(message="hi", streaming_mode="full", routing_preference="local_only"), request)
+        generation = response.headers["x-generation-id"]
+        cancel = api_server._generation_cancel_events[generation]
+        assert await anext(response.body_iterator) == ": processing\n\n"
+        await response.body_iterator.aclose()
+        assert cancel.is_set()
+        assert generation not in api_server._generation_cancel_events
+
+    asyncio.run(disconnect())
+    assert not calls["commits"]
