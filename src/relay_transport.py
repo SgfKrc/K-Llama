@@ -756,8 +756,8 @@ class RelayTcpClient:
         if len(hidden) != expected_hidden_bytes(count, self.n_embd):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         meta = dict(seq_meta or {})
+        meta.setdefault("seq_ids", [0] * count)
         meta.setdefault("positions", pos)
-        meta.setdefault("n_tokens", count)
         sequence = self._sequence
         response = self._exchange(
             RelayFrame(
