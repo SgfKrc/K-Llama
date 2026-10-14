@@ -130,6 +130,18 @@ class RelayFrameKind(IntEnum):
     #: 用途：无 PC 集群下层接力要能"全设备"运行（head 段也在设备上），
     #: 与 `HIDDEN`（吃 hidden 吐 hidden）/ `TOKEN`（吃 hidden 吐 token）配成三种远端角色。
     TOKENS = 6
+    #: ★ 2026-10-14（PIPE-COMM-01 / 票 21b 前置）：**多位置回程** —— 客户端送 γ 个位置的
+    #: hidden（带 `positions`），远端末段对这 γ 个位置**各回一个 argmax token**。
+    #:
+    #: 与 `TOKEN`（单 token 回程）的唯一区别是回程 payload 用 `encode_tokens` 装**列表**。
+    #: 动机：batch=1 decode 下没有 micro-batch 可切，**唯一能让每步往返被摊薄到 1/γ 的途径**
+    #: 就是一次推 γ 个位置、一次回 γ 个 token（见 `docs/层流水线通信开销削减-机制设计与规划-2026-10-14.md`）。
+    #:
+    #: ⚠️ **语义边界（必须由 verify 兜底）**：这 γ 个位置的 argmax 各自只依赖它之前的上下文，
+    #: 因此"一次算 γ 个"与"逐 token 顺序推进"**不保证逐 token 等价**——它与投机解码的 draft
+    #: 是同一类近似。本帧**只用于验证 RTT 摊薄的物理收益**，正确性由既有 per-token argmax
+    #: 判据在 verify 路径上守住。旧对端收到本帧会因不认识 kind 而 fail-closed。
+    TOKEN_SEQ = 7
 
 
 class RelayProtocolError(RuntimeError):
@@ -605,6 +617,33 @@ class RelayTcpClient:
             self.abort()
             raise
 
+    def _decode_tokens_response(
+        self, response: RelayFrame, sequence: int, count: int
+    ) -> list[int]:
+        """★ 2026-10-14：多位置回程的解码（对称于 `_decode_token_response`）。
+
+        `TOKEN_SEQ` 的回程 payload 是 i32 数组，声明数（`n_tokens`）必须与实际长度一致，
+        否则视为协议违规（与 `hidden_token_count_mismatch` 同级别）。
+        """
+        try:
+            if response.kind == RelayFrameKind.ERROR:
+                raise RelayProtocolError(_error_code_from_frame(response, sequence))
+            if response.sequence != sequence:
+                raise RelayProtocolError("response_sequence_mismatch")
+            if response.kind != RelayFrameKind.TOKEN_SEQ:
+                raise RelayProtocolError("tokens_response_required")
+            if response.n_tokens != count:
+                raise RelayProtocolError("token_count_mismatch")
+            tokens = decode_tokens(response.payload, limit=self.max_tokens)
+            if len(tokens) != count:
+                raise RelayProtocolError("token_count_mismatch")
+            if any(t < 0 for t in tokens):
+                raise RelayProtocolError("runner_failed")
+            return tokens
+        except RelayProtocolError:
+            self.abort()
+            raise
+
     def _decode_token_response(self, response: RelayFrame, sequence: int) -> int:
         try:
             token = _decode_token(response, sequence)
@@ -681,6 +720,60 @@ class RelayTcpClient:
         token = self._decode_token_response(response, sequence)
         self._sequence += 1
         return token
+
+    def request_tokens(
+        self,
+        hidden: bytes,
+        *,
+        n_tokens: int,
+        positions: "Sequence[int]",
+        quant: str = "none",
+        seq_meta: dict[str, object] | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> list[int]:
+        """★ 2026-10-14（PIPE-COMM-01）：一次送 γ 个位置的 hidden，**一次回 γ 个 token**。
+
+        与 `request_token`（单 token 回程）的唯一区别是回程帧用 `TOKEN_SEQ`。
+        动机见 `RelayFrameKind.TOKEN_SEQ` 的说明：batch=1 decode 下没有 micro-batch 可切，
+        这是唯一能让每步往返摊薄到 1/γ 的途径。
+
+        ⚠️ `positions` 必须与 `n_tokens` 等长且严格递增（远端按它做逐位 argmax）。
+        ⚠️ **不保证与逐 token 顺序推进等价**（见 `TOKEN_SEQ` 注释）——本接口只用于
+        验证 RTT 摊薄的物理收益，正确性由 verify 路径的 per-token argmax 判据守住。
+        """
+        if self._closed:
+            raise RelayProtocolError("client_closed")
+        count = int(n_tokens)
+        if count < 1:
+            raise RelayProtocolError("token_count_exceeds_limit")
+        if count > self.max_tokens:
+            raise RelayProtocolError("token_count_exceeds_limit")
+        pos = [int(p) for p in positions]
+        if len(pos) != count:
+            raise RelayProtocolError("position_count_mismatch")
+        if any(b <= a for a, b in zip(pos, pos[1:])):
+            raise RelayProtocolError("positions_not_increasing")
+        if len(hidden) != expected_hidden_bytes(count, self.n_embd):
+            raise RelayProtocolError("hidden_payload_size_mismatch")
+        meta = dict(seq_meta or {})
+        meta.setdefault("positions", pos)
+        meta.setdefault("n_tokens", count)
+        sequence = self._sequence
+        response = self._exchange(
+            RelayFrame(
+                RelayFrameKind.HIDDEN_SEQ,
+                sequence,
+                n_tokens=count,
+                payload=encode_hidden_seq(hidden, n_tokens=count, meta=meta,
+                                          quant=quant, n_embd=self.n_embd),
+                quant=quant or "none",
+            ),
+            max_payload_bytes=self.max_payload_bytes,
+            deadline_monotonic=deadline_monotonic,
+        )
+        tokens = self._decode_tokens_response(response, sequence, count)
+        self._sequence += 1
+        return tokens
 
     def request_hidden_from_tokens(
         self,
@@ -981,21 +1074,38 @@ def serve_relay_connection(
                 if not hasattr(runner, "request_token_seq"):
                     raise RelayProtocolError("hidden_seq_unsupported")
                 try:
-                    token = int(runner.request_token_seq(
-                        hidden, n_tokens=n_tokens, meta=meta))
+                    produced = runner.request_token_seq(
+                        hidden, n_tokens=n_tokens, meta=meta)
                 except RelayProtocolError:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Relay tail runner (seq) failed: code=%s",
                                      RELAY_RUNNER_ERROR)
                     raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
-                if token < 0:
-                    raise RelayProtocolError("runner_failed")
-                send_frame(
-                    sock,
-                    RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1,
-                               payload=_TOKEN.pack(token)),
-                )
+                # ★ 2026-10-14（PIPE-COMM-01）：鸭子类型分派，旧实现零改动。
+                #   runner 返回 int  ⇒ 保持 `TOKEN` 单 token 回程（历史行为）；
+                #   runner 返回 list ⇒ 走 `TOKEN_SEQ` 多位置回程（一次推 γ 个位置）。
+                if isinstance(produced, (list, tuple)):
+                    values = [int(t) for t in produced]
+                    if len(values) != n_tokens:
+                        raise RelayProtocolError("token_count_mismatch")
+                    if any(v < 0 for v in values):
+                        raise RelayProtocolError("runner_failed")
+                    send_frame(
+                        sock,
+                        RelayFrame(RelayFrameKind.TOKEN_SEQ, sequence,
+                                   n_tokens=n_tokens,
+                                   payload=encode_tokens(values)),
+                    )
+                else:
+                    token = int(produced)
+                    if token < 0:
+                        raise RelayProtocolError("runner_failed")
+                    send_frame(
+                        sock,
+                        RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1,
+                                   payload=_TOKEN.pack(token)),
+                    )
                 frames += 1
                 tokens += n_tokens
                 payload_bytes += len(frame.payload)
