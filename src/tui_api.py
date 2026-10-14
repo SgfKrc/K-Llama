@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,9 +35,11 @@ BACKEND_HINT = "请先启动本机后端（python src/api_server.py），或用 
 class ApiError(Exception):
     """后端返回的错误（含 HTTP 状态码，便于界面区分 4xx/5xx）。"""
 
-    def __init__(self, message: str, status: Optional[int] = None) -> None:
+    def __init__(self, message: str, status: Optional[int] = None,
+                 reason_code: str = "") -> None:
         super().__init__(message)
         self.status = status
+        self.reason_code = reason_code
 
 
 class ApiClient:
@@ -101,15 +104,19 @@ class ApiClient:
                 text = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             detail = ""
+            reason_code = ""
             try:
                 raw = e.read().decode("utf-8", errors="replace")
                 parsed = json.loads(raw) if raw else {}
                 detail = parsed.get("detail", raw) if isinstance(parsed, dict) else raw
                 if isinstance(detail, dict):
-                    detail = detail.get("message") or json.dumps(detail, ensure_ascii=False)
+                    reason_code = str(detail.get("code") or detail.get("reason_code") or "")
+                    detail = detail.get("message") or detail.get("reason") or json.dumps(detail, ensure_ascii=False)
             except Exception:  # noqa: BLE001 - 响应体不是 JSON 时保留状态码
                 detail = ""
-            raise ApiError("HTTP %d: %s" % (e.code, detail or e.reason), status=e.code)
+            label = f"{reason_code}: " if reason_code else ""
+            raise ApiError("HTTP %d: %s%s" % (e.code, label, detail or e.reason),
+                           status=e.code, reason_code=reason_code)
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
             if isinstance(reason, (TimeoutError, OSError)) and "timed out" in str(reason):
@@ -241,6 +248,66 @@ def load_model(api: ApiClient, model_id: Optional[str] = None, *, engine: str = 
 def unload_model(api: ApiClient) -> Dict[str, Any]:
     """显式释放本地 LLM（POST ``/api/models/unload``）。"""
     return _as_dict(api.request("POST", API_PATHS["models_unload"],
+                               timeout=MODEL_CONTROL_TIMEOUT))
+
+
+
+def _successful_control(value: Dict[str, Any]) -> Dict[str, Any]:
+    if value.get("success") is False or value.get("status") in {"error", "failed"}:
+        raise ApiError(str(value.get("reason") or value.get("message") or "模型控制失败"),
+                       reason_code=str(value.get("reason_code") or ""))
+    return value
+
+
+def set_model_mode(api: ApiClient, mode: str) -> Dict[str, Any]:
+    if mode not in {"local", "distributed"}:
+        raise ValueError("模型模式必须是 local 或 distributed")
+    return _successful_control(_as_dict(api.request(
+        "PUT", API_PATHS["distributed_config"], body={"enabled": mode == "distributed"},
+        timeout=MODEL_CONTROL_TIMEOUT)))
+
+
+def load_local_model(api: ApiClient, model_id: str, *, engine: str = "llama_cpp",
+                     quant_type: str = "int4") -> Dict[str, Any]:
+    """Leave cluster participation and release segments before loading a whole model."""
+    set_model_mode(api, "local")
+    _successful_control(unload_model(api))
+    return _successful_control(load_model(api, model_id, engine=engine, quant_type=quant_type))
+
+
+def create_model_intent(api: ApiClient, model_id: str, *, engine: str = "auto",
+                        quant_type: str = "") -> Dict[str, Any]:
+    return _as_dict(api.request("POST", API_PATHS["models_intent"], body={
+        "model_id": model_id, "engine": engine, "quant_type": quant_type,
+        "strategy": "auto", "timeout_seconds": 3600,
+    }, timeout=MODEL_CONTROL_TIMEOUT))
+
+
+def get_model_intent_catalog(api: ApiClient) -> Dict[str, Any]:
+    return _as_dict(api.get(API_PATHS["models_intent_catalog"]))
+
+
+def current_model_intent(api: ApiClient) -> Optional[Dict[str, Any]]:
+    value = api.get(API_PATHS["models_intent_current"])
+    return value if isinstance(value, dict) and value.get("operation_id") else None
+
+
+def _model_intent_path(operation_id: str) -> str:
+    if not re.fullmatch(r"supply_[0-9a-f]{32}", operation_id):
+        raise ValueError("非法模型 operation_id（需要 supply_32hex）")
+    return API_PATHS["models_intent_operation"].format(operation_id=operation_id)
+
+
+def get_model_intent(api: ApiClient, operation_id: str) -> Dict[str, Any]:
+    return _as_dict(api.get(_model_intent_path(operation_id)))
+
+
+def cancel_model_intent(api: ApiClient, operation_id: str) -> Dict[str, Any]:
+    return _as_dict(api.delete(_model_intent_path(operation_id), timeout=MODEL_CONTROL_TIMEOUT))
+
+
+def connect_model_intent(api: ApiClient) -> Dict[str, Any]:
+    return _as_dict(api.request("POST", API_PATHS["models_intent_connect"], body={},
                                timeout=MODEL_CONTROL_TIMEOUT))
 
 
@@ -443,7 +510,8 @@ def iter_chat_payloads(
     max_new_tokens: int = 1024,
     temperature: float = 0.7,
     top_p: float = 0.9,
-    read_timeout: float = 60.0,
+    read_timeout: Optional[float] = None,
+    streaming_mode: Optional[str] = None,
 ) -> Iterator[Dict[str, Any]]:
     """POST ``/api/chat/stream`` 并逐事件产出 JSON payload（供界面 worker 消费）。
 
@@ -460,6 +528,7 @@ def iter_chat_payloads(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        streaming_mode=streaming_mode,
     )
     url = api.base_url + "/api" + API_PATHS["chat_stream"]
     req = urllib.request.Request(
@@ -470,9 +539,12 @@ def iter_chat_payloads(
         ),
         method="POST",
     )
+    # Full responses have no token activity during distributed prefill.
+    # Match the Android finite read budget; preserve explicit caller overrides.
+    effective_read_timeout = (120.0 if body['streaming_mode'] == 'full' else 60.0) if read_timeout is None else read_timeout
     decoder = SSEDecoder()
     try:
-        with urllib.request.urlopen(req, timeout=read_timeout) as resp:
+        with urllib.request.urlopen(req, timeout=effective_read_timeout) as resp:
             while True:
                 chunk = resp.read(4096)
                 if not chunk:

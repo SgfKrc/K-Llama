@@ -1030,7 +1030,8 @@ async def downloadable_pipeline_assignment(
         raise _api_module.HTTPException(409, "Qwen3 assignment manifest digest changed")
     return manifest
 
-async def list_gguf_models(request: Request = None):
+# Catalog hashing performs blocking disk I/O; FastAPI runs this handler in its worker pool.
+def list_gguf_models(request: Request = None):
     """
     列出可下载的 GGUF 模型文件及其 SHA256 校验值。
 

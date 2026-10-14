@@ -46,6 +46,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from rich.markup import escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -86,7 +87,11 @@ from tui_api import (  # noqa: E402
     iter_chat_payloads,
     list_log_files,
     list_sessions,
-    load_model,
+    load_local_model,
+    create_model_intent,
+    cancel_model_intent,
+    connect_model_intent,
+    set_model_mode,
     clear_spare_master,
     designate_spare_master,
     get_spare_master,
@@ -123,7 +128,10 @@ from tui_api import (  # noqa: E402
     auth_totp_provision,
     auth_totp_verify,
 )
-from tui_shared import API_PATHS, COMMAND_SPECS, format_metrics  # noqa: E402
+from tui_shared import (
+    API_PATHS, COMMAND_SPECS, MODEL_INTENT_TERMINAL, format_metrics,
+    format_model_intent, model_intent_ready,
+)  # noqa: E402
 
 LOGO = (
     "  ██╗  ██╗ ██████╗  █████╗ ██╗  ██╗██╗   ██╗███╗   ███╗ █████╗ \n"
@@ -153,7 +161,7 @@ PAGE_READ_TIMEOUT = 15.0
 PAGES: List[Tuple[str, str, str]] = [
     ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
     ("status", "状态", "运行概览 · /health /status /models"),
-    ("models", "模型", "注册表 · L 加载光标行 · U 卸载当前 · /models"),
+    ("models", "模型", "选模 · L 自动供给并准备 · U 卸载 · C 取消选模"),
     ("cluster", "分布式", "配置 · 容量 · 层段 · /cluster/*"),
     ("nodes", "节点", "成员 · 入群 · 邀请 · 连接 · /cluster/nodes"),
     ("queue", "队列", "MLFQ 三级 · P 暂停/恢复 · S 策略 · C 清空排队"),
@@ -210,6 +218,10 @@ Screen { background: $surface; }
 /* ---------------------------------------------------------------- 内容 */
 #models-table, #resources-table, #nodes-table, #queue-table,
 #status-table, #logs-log { height: 1fr; }
+#model-controls { height: 3; }
+#model-controls Button { min-width: 12; width: 1fr; }
+#intent-pane { height: auto; max-height: 12; overflow-y: auto; }
+#models-pane { height: auto; }
 #status-pane, #queue-pane, #logs-pane { height: auto; color: $text-muted; }
 #ha-pane { height: auto; min-height: 7; border: round $primary 20%; padding: 0 1; margin-bottom: 1; }
 #device-pane, #settings-pane { height: auto; }
@@ -627,6 +639,11 @@ class ChatPane(Vertical):
             self.query_one("#chat-status", Static).update(f"[red]未知命令: {text}")
             return
 
+        gate = self.app.main_screen.chat_model_gate() if self.app.main_screen else ""
+        if gate:
+            event.input.value = event.value
+            self.set_status(escape(gate))
+            return
         self.write_line(f"[b $accent]你[/] {text}")
         self.write_line("[dim]assistant[/] ")
         self.stream_reply(text)
@@ -647,44 +664,30 @@ class ChatPane(Vertical):
 
     def cmd_model(self, text: str) -> None:
         parts = text.split()
-        usage = "用法: /model load <model_id> [engine] [quant] | /model unload"
-        if len(parts) >= 2 and parts[1].lower() == "unload":
-            self.app.confirm(
-                "卸载模型",
-                "将释放后端当前本地模型：正在生成/排队的请求会失败，"
-                "对话上下文与 KV 缓存一并清空。",
-                lambda: self.model_call("unload", "", "", ""),
-                confirm_label="卸载")
+        screen = self.app.main_screen
+        if screen is None:
             return
-        if len(parts) < 3 or parts[1].lower() != "load":
-            self.status_line(usage)
-            return
-        model_id = parts[2]
-        engine = parts[3] if len(parts) > 3 else "llama_cpp"
-        quant = parts[4] if len(parts) > 4 else "int4"
-        self.app.confirm(
-            "加载模型",
-            f"将要加载：[b]{model_id}[/]\n引擎 [b]{engine}[/] · 量化 [b]{quant}[/]\n"
-            "耗时约 5-20 秒；期间会先卸载当前模型，失败由后端自动回滚。",
-            lambda: self.model_call("load", model_id, engine, quant),
-            confirm_label="加载")
+        if len(parts) == 2 and parts[1] == "status":
+            self.write_line(escape(screen.model_intent_text()))
+        elif len(parts) == 2 and parts[1] == "cancel":
+            screen.action_cancel_model_intent()
+        elif len(parts) == 2 and parts[1] == "connect":
+            screen.connect_intent()
+        elif len(parts) == 3 and parts[1] == "mode" and parts[2] in {"local", "distributed"}:
+            screen.confirm_model_mode(parts[2])
+        elif len(parts) == 2 and parts[1] == "unload":
+            screen.confirm_model_unload()
+        elif len(parts) >= 3 and parts[1] == "load":
+            info = screen.model_rows.get(parts[2]) or {}
+            engine, quant = screen.model_load_args(info)
+            screen.confirm_model_load(parts[2], parts[3] if len(parts) > 3 else engine,
+                                      parts[4] if len(parts) > 4 else quant)
+        else:
+            self.status_line("用法: /model load <id> [engine] [quant] | unload | cancel | status | connect | mode local|distributed")
 
-    @work(thread=True, exclusive=True, group="modelctl")
     def model_call(self, kind: str, model_id: str, engine: str, quant: str) -> None:
-        app = self.app
-        label = "加载" if kind == "load" else "卸载"
-        self.app.call_from_thread(self.status_line, f"正在{label}模型（5-20 秒）…")
-        try:
-            if kind == "load":
-                load_model(app.api, model_id, engine=engine, quant_type=quant)
-                text = f"[green]模型已加载[/] {model_id}"
-            else:
-                unload_model(app.api)
-                text = "[green]模型已卸载[/]"
-        except ApiError as exc:
-            text = f"[red]模型{label}失败[/]：{exc}"
-        self.app.call_from_thread(self.write_line, text)
-        self.app.call_from_thread(self.status_line, text)
+        if self.app.main_screen:
+            self.app.main_screen.run_model_action(kind, model_id, engine, quant)
 
     def cmd_login(self, text: str) -> None:
         """★ 2026-09-19（G-⑤）：登录。`/login <username> <password> [totp_code]`。
@@ -1231,64 +1234,99 @@ class ChatPane(Vertical):
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
 
+    def stream_reply(self, message: str) -> Any:
+        """在发送事件中捕获角色与端点，线程启动后不重新解释本次请求。"""
+        app = self.app
+        screen = getattr(app, "main_screen", None)
+        api = app.api
+        context = (api, str(getattr(api, "base_url", "")), screen,
+                   screen.chat_model_context() if screen else None)
+        options = {
+            "session_id": getattr(app, "session_id", None),
+            "generation_id": getattr(app, "generation_id", None),
+            "routing_preference": screen.chat_routing_preference() if screen else app.routing_preference,
+            "execution_mode": getattr(app, "execution_mode", "auto"),
+            "show_thinking": app.show_thinking,
+            "enable_thinking": app.enable_thinking,
+            "streaming_mode": screen.chat_streaming_mode() if screen else None,
+        }
+        return self._stream_reply(message, context, options)
+
+    def chat_context_current(self, context: Tuple[Any, ...]) -> bool:
+        """仅在原端点、模型与角色上下文仍有效时接受回包；在 UI 线程调用。"""
+        api, endpoint, screen, model_context = context
+        if (not self.is_attached or self.app.api is not api
+                or str(getattr(api, "base_url", "")) != endpoint
+                or getattr(self.app, "main_screen", None) is not screen):
+            return False
+        return screen is None or (screen.chat_model_context() == model_context and not screen.chat_model_gate())
+
     @work(thread=True, exclusive=True, group="chat")
-    def stream_reply(self, message: str) -> None:
-        """在后台线程消费 SSE；所有 UI 更新都回到主线程执行。"""
+    def _stream_reply(self, message: str, context: Tuple[Any, ...], options: Dict[str, Any]) -> None:
+        """在后台消费 SSE；回包和收尾先在主线程校验原请求上下文。"""
         app = self.app
         acc: List[str] = []
         status = "…"
         error_text = ""
-        try:
-            for payload in iter_chat_payloads(
-                app.api,
-                message,
-                session_id=getattr(app, "session_id", None),
-                generation_id=getattr(app, "generation_id", None),
-                routing_preference=app.routing_preference,
-                execution_mode=getattr(app, "execution_mode", "auto"),
-                show_thinking=app.show_thinking,
-                enable_thinking=app.enable_thinking,
-            ):
-                if payload.get("start"):
-                    if payload.get("generation_id"):
-                        app.generation_id = payload["generation_id"]
-                    if payload.get("session_id"):
-                        app.session_id = payload["session_id"]
-                elif isinstance(payload.get("token"), str) and payload["token"]:
-                    acc.append(payload["token"])
-                    self.app.call_from_thread(self.append_chunk, payload["token"])
-                elif isinstance(payload.get("thinking"), str) and payload["thinking"]:
-                    if app.show_thinking:
-                        self.app.call_from_thread(
-                            self.append_chunk, f"[dim italic]{payload['thinking']}[/]")
-                elif payload.get("done"):
-                    # 后端把失败放在 done.error（例如"本地回退模型加载失败"）；
-                    # 早先只看 response/metrics，会把错误吞掉，界面表现为"没回复也没原因"。
-                    if payload.get("error"):
-                        error_text = str(payload["error"])
-                    final = payload.get("response")
-                    if isinstance(final, str) and final and "".join(acc) != final:
-                        self.app.call_from_thread(self.replace_transcript, final)
-                    if payload.get("session_id"):
-                        app.session_id = payload["session_id"]
-                    if not error_text:
-                        status = format_metrics(
-                            payload.get("metrics") or None,
-                            history_committed=payload.get("history_committed"),
-                        )
-                elif payload.get("cancelled"):
-                    status = "已被取消"
-                elif payload.get("error"):
+
+        def apply_payload(payload: Dict[str, Any]) -> bool:
+            nonlocal status, error_text
+            if not self.chat_context_current(context):
+                return False
+            if payload.get("start"):
+                if payload.get("generation_id"):
+                    app.generation_id = payload["generation_id"]
+                if payload.get("session_id"):
+                    app.session_id = payload["session_id"]
+            elif isinstance(payload.get("token"), str) and payload["token"]:
+                acc.append(payload["token"])
+                self.append_chunk(payload["token"])
+            elif isinstance(payload.get("thinking"), str) and payload["thinking"]:
+                if options["show_thinking"]:
+                    self.append_chunk(f"[dim italic]{payload['thinking']}[/]")
+            elif payload.get("done"):
+                if payload.get("error"):
                     error_text = str(payload["error"])
-        except Exception as exc:  # noqa: BLE001 - 网络异常不应让界面崩溃
-            error_text = f"{type(exc).__name__}: {exc}"
-        finally:
+                final = payload.get("response")
+                if isinstance(final, str) and final and "".join(acc) != final:
+                    if options["streaming_mode"] == "full" and not acc:
+                        self.append_chunk(final)
+                    else:
+                        self.replace_transcript(final)
+                if payload.get("session_id"):
+                    app.session_id = payload["session_id"]
+                if not error_text:
+                    status = format_metrics(
+                        payload.get("metrics") or None,
+                        history_committed=payload.get("history_committed"),
+                    )
+            elif payload.get("cancelled"):
+                status = "已被取消"
+            elif payload.get("error"):
+                error_text = str(payload["error"])
+            return True
+
+        def finish() -> None:
+            if not self.chat_context_current(context):
+                return
             app.generation_id = None
             if error_text:
                 first = error_text.strip().splitlines()[0]
-                status = f"[red]后端错误: {first}[/]"
-                self.app.call_from_thread(self.append_chunk, f"[red]✗ {error_text}[/]")
-            self.app.call_from_thread(self.set_status, status)
+                self.append_chunk(f"[red]✗ {error_text}[/]")
+                self.set_status(f"[red]后端错误: {first}[/]")
+            else:
+                self.set_status(status)
+
+        try:
+            if not app.call_from_thread(self.chat_context_current, context):
+                return
+            for payload in iter_chat_payloads(context[0], message, **options):
+                if not app.call_from_thread(apply_payload, payload):
+                    return
+        except Exception as exc:  # noqa: BLE001 - 网络异常不应让界面崩溃
+            error_text = f"{type(exc).__name__}: {exc}"
+        finally:
+            app.call_from_thread(finish)
 
     # ------------------------------------------------------------ UI 更新（主线程）
     # write_line / append_chunk / replace_transcript / set_status 见上方"缓冲与渲染"段。
@@ -1329,7 +1367,7 @@ class MainScreen(Screen):
     #: 每屏可用键提示（让"这屏能做什么"可见；与 BINDINGS 保持一致）
     PAGE_KEYS = {
         "chat": "/help 看命令",
-        "models": "L 加载 · U 卸载 · D 下载 · C 取消下载 · F 预检 · I 登记",
+        "models": "L 选模 · U 卸载 · C 取消选模/下载 · J 发现/重试连接",
         "cluster": "T 分布式 · M 最大节点 · R 刷新容量",
         "nodes": "I 邀请 · J 连接 · B 请求码 · O 签发授权 · K 消费授权 · X 注销",
         "queue": "P 暂停/恢复 · S 策略 · C 清空排队",
@@ -1349,6 +1387,20 @@ class MainScreen(Screen):
         #   要等加载完成才更新）⇒ 加载期间同时出现「正在加载 qwen3-5-2b（5-20 秒）…」
         #   与「模型 未加载」两个互相矛盾的状态（用户截图实证）。
         self._model_loading_id = ""
+        self.model_mode: Optional[str] = None
+        self.model_intent: Dict[str, Any] = {}
+        self.model_binding: Dict[str, Any] = {}
+        self.model_selection_id = ""
+        self._selection_epoch = 0
+        self._model_action_inflight = False
+        self._model_error = ""
+        self._model_error_kind = ""
+        self._intent_poll_error = ""
+        self._intent_restore_enabled = True
+        self._intent_unloaded_operation_id = ""
+        self._local_model_ready: Optional[bool] = None
+        self._chat_model_gated = False
+        self._last_core: Optional[Tuple[Any, ...]] = None
         self.log_line_count = 0
         #: ``/models`` 原始项（模型屏写操作需要 engine/quant/可用性）
         self.model_rows: Dict[str, Dict[str, Any]] = {}
@@ -1370,6 +1422,7 @@ class MainScreen(Screen):
         self.backend_available: Optional[bool] = None
         self.runtime_ready: Optional[bool] = None
         self._core_inflight = False
+        self._core_refresh_pending = False
         self._initial_page_data_started = False
         self._pages_inflight = False
         self._device_inflight = False
@@ -1402,6 +1455,12 @@ class MainScreen(Screen):
                 with Vertical(id="page-models", classes="page"):
                     yield Static("模型 · 注册表与当前加载", classes="page-title")
                     yield Static(PAGES[2][2], classes="page-hint")
+                    with Horizontal(id="model-controls"):
+                        yield Button("Local 整模", id="model-mode-local")
+                        yield Button("分布式", id="model-mode-distributed")
+                        yield Button("发现/重试连接", id="model-intent-connect")
+                        yield Button("取消选模", id="model-intent-cancel")
+                    yield Static("加载中…", id="intent-pane", markup=False)
                     yield Static("加载中…", id="models-pane")
                     yield DataTable(id="models-table")
                 with Vertical(id="page-cluster", classes="page"):
@@ -1540,6 +1599,7 @@ class MainScreen(Screen):
         self.refresh_topbar()
         # Only core state is refreshed periodically.  Expensive/optional
         # projections are loaded after the health check and then on demand.
+        self.app.main_screen = self
         self.action_reload()
         self.set_interval(self.app.interval, self.action_reload)
         self.set_interval(self.app.interval, self.refresh_topbar)
@@ -1562,7 +1622,7 @@ class MainScreen(Screen):
                 "[b $accent]后端[/]\n"
                 f"{api.host}:{api.port}\n"
                 f"[dim]健康[/] {self.health_text}\n"
-                f"[dim]模型[/] {self.model_text}\n"
+                f"[dim]模型[/] {escape(self.model_text) if self.model_mode == 'distributed' else self.model_text}\n"
                 f"[dim]刷新[/] {self.app.interval:.0f}s   [dim]当前[/] {page[1]}"
                 + (f"\n[dim]最近[/] {self.op_status}" if self.op_status else ""))
         except Exception:  # noqa: BLE001 - 挂载期间可能尚未就绪
@@ -1578,21 +1638,27 @@ class MainScreen(Screen):
     def action_reload(self, refresh_page: bool = False) -> None:
         with self._refresh_state_lock:
             if self._core_inflight:
+                self._core_refresh_pending = True
                 return
             self._core_inflight = True
+        epoch = self._selection_epoch
+        mode = self.model_mode
+        api = self.app.api
+        endpoint = (api, str(api.base_url))
         # 端点/字段以 2026-09-17 实测的后端真实结构为准：
         #   /status → model_name / model_loaded / active_model_id / engine / run_mode / node_*
         #   /models → {models: [...], active_model_id}（19 个内置模型）
         try:
-            health = self.fetch_json(API_PATHS["health"])
+            health = self.fetch_json(API_PATHS["health"], api=api)
             if "_error" in health:
                 # A failed health probe is authoritative for this refresh cycle.
                 # Do not spend another 15 seconds failing every optional endpoint.
                 error = {"_error": health["_error"]}
                 self.app.call_from_thread(
-                    self.apply_data, health, error, error, error, refresh_page)
+                    self.apply_data, health, error, error, error, refresh_page, None, epoch,
+                    None, None, endpoint)
                 return
-            readiness = self.fetch_json(API_PATHS["readiness"])
+            readiness = self.fetch_json(API_PATHS["readiness"], api=api)
             # Older remote nodes do not expose /ready. Preserve their previous
             # behavior while treating errors from the current endpoint as a
             # real runtime gate.
@@ -1600,37 +1666,85 @@ class MainScreen(Screen):
                 readiness = {"ready": True, "status": "legacy"}
             elif "_error" in readiness:
                 self.app.call_from_thread(
-                    self.apply_data, health, {}, {}, {}, refresh_page, readiness)
+                    self.apply_data, health, {}, {}, {}, refresh_page, readiness, epoch,
+                    None, None, endpoint)
                 return
             if readiness.get("ready") is False:
                 self.app.call_from_thread(
-                    self.apply_data, health, {}, {}, {}, refresh_page, readiness)
+                    self.apply_data, health, {}, {}, {}, refresh_page, readiness, epoch,
+                    None, None, endpoint)
                 return
-            status = self.fetch_json(API_PATHS["system_status"])
-            registry = self.fetch_json(API_PATHS["models_list"])
-            resources = self.fetch_json(API_PATHS["cluster_resources"])
+            status = self.fetch_json(API_PATHS["system_status"], api=api)
+            if mode is None:
+                config = self.fetch_json(API_PATHS["distributed_config"], api=api)
+                if isinstance(config.get("enabled"), bool):
+                    mode = "distributed" if config["enabled"] else "local"
+                elif status.get("run_mode") in {"local", "distributed"}:
+                    mode = status["run_mode"]
+            intent = None
+            if mode == "distributed":
+                registry = self.fetch_json(API_PATHS["models_intent_catalog"], timeout=PAGE_READ_TIMEOUT, api=api)
+                # Current belongs to the master and can be replaced by another device,
+                # including after our previously observed operation became terminal.
+                intent = self.fetch_json(API_PATHS["models_intent_current"], timeout=PAGE_READ_TIMEOUT, api=api)
+            elif mode == "local":
+                registry = self.fetch_json(API_PATHS["models_list"], api=api)
+            else:
+                registry = {"_error": "无法确认模型模式，请刷新或显式选择 Local/分布式"}
+            resources = self.fetch_json(API_PATHS["cluster_resources"], api=api)
             self.app.call_from_thread(
                 self.apply_data, health, status, registry, resources, refresh_page,
-                readiness)
+                readiness, epoch, mode, intent, endpoint)
         finally:
             with self._refresh_state_lock:
                 self._core_inflight = False
+                pending = self._core_refresh_pending
+                self._core_refresh_pending = False
+            if pending and self.is_attached:
+                self.app.call_from_thread(self.action_reload, refresh_page)
 
-    def fetch_json(self, path: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def fetch_json(self, path: str, *, timeout: Optional[float] = None,
+                   api: Any = None) -> Dict[str, Any]:
+        api = self.app.api if api is None else api
         try:
             normalized = path if path.startswith("/") else "/" + path
-            if timeout is not None and isinstance(self.app.api, ApiClient):
-                value = self.app.api.get(normalized, timeout=timeout)
+            if timeout is not None and isinstance(api, ApiClient):
+                value = api.get(normalized, timeout=timeout)
             else:
-                value = self.app.api.get(normalized)
+                value = api.get(normalized)
             return value if isinstance(value, dict) else {"value": value}
         except ApiError as exc:
-            return {"_error": str(exc), "_status": exc.status}
+            return {"_error": str(exc), "_status": exc.status, "_code": exc.reason_code}
 
     def apply_data(self, health: Dict[str, Any], status: Dict[str, Any],
                    registry: Dict[str, Any], resources: Dict[str, Any],
                    refresh_page: bool = False,
-                   readiness: Optional[Dict[str, Any]] = None) -> None:
+                   readiness: Optional[Dict[str, Any]] = None,
+                   model_epoch: Optional[int] = None,
+                   model_mode: Optional[str] = None,
+                   intent: Optional[Dict[str, Any]] = None,
+                   model_endpoint: Optional[Tuple[Any, str]] = None) -> None:
+        if not self.is_attached or not self.query("#status-pane"):
+            return
+        if ((model_epoch is not None and model_epoch != self._selection_epoch)
+                or (model_endpoint is not None and
+                    (model_endpoint[0] is not self.app.api
+                     or model_endpoint[1] != str(self.app.api.base_url)))):
+            self._core_refresh_pending = True
+            return
+        if self.model_mode is None and model_mode is not None:
+            self.model_mode = model_mode
+        if self.model_mode == "distributed" and not self._model_action_inflight:
+            if "_error" in registry:
+                self.model_binding = {"status": "disconnected", "reason": registry["_error"],
+                                      "reason_code": registry.get("_code") or "INTENT_CATALOG_UNAVAILABLE"}
+            elif isinstance(registry.get("binding"), dict):
+                self.model_binding = registry["binding"]
+                if self.model_binding.get("status") == "connected" and self._model_error_kind == "connect":
+                    self._model_error = ""
+            if intent is not None:
+                self.apply_model_intent(intent, authoritative_current=True)
+        self._last_core = (health, status, registry, readiness)
         self.backend_available = "_error" not in health
         self.runtime_ready = (
             False
@@ -1641,7 +1755,7 @@ class MainScreen(Screen):
                 else self.backend_available
             )
         )
-        self.fill_status(health, status, registry, readiness)
+        self.render_model_intent()
         if self.runtime_ready is False:
             self.refresh_topbar()
             return
@@ -1692,7 +1806,7 @@ class MainScreen(Screen):
         table.clear()
         if "_error" in health:
             self.health_text = "[red]不可达[/]"
-            self.model_text = "—"
+            self.model_text = self.model_intent_summary() if self.model_mode == "distributed" else "—"
             pane.update(f"[red]后端不可达[/]  ·  {health['_error']}")
             table.add_row("后端地址", self.app.api.base_url)
             table.add_row("连接状态", "[red]不可达[/]")
@@ -1718,9 +1832,29 @@ class MainScreen(Screen):
             return
 
         self.health_text = "[green]ok[/]"
-        loaded = bool(status.get("model_loaded"))
-        model_name = status.get("model_name") or "—"
-        active = status.get("active_model_id") or registry.get("active_model_id")
+        if self.model_mode == "distributed":
+            self.model_text = self.model_intent_summary()
+            pane.update(f"[green]后端可用[/] · 分布式 · {escape(self.model_text)}")
+            table.add_row("后端地址", self.app.api.base_url)
+            table.add_row("运行模式", "distributed")
+            table.add_row("节点角色", str(status.get("node_role") or "—"))
+            table.add_row("模型", escape(self.model_text))
+            table.add_row("operation_id", str(self.model_intent.get("operation_id") or "—"))
+            table.add_row("config_id", str(self.model_intent.get("config_id") or "—"))
+            table.add_row("generation", str(self.model_intent.get("generation", 0)))
+            table.add_row("loaded_ready", str(model_intent_ready(self.model_intent)).lower())
+            table.add_row("流水线", "已准备" if model_intent_ready(self.model_intent) else "未准备")
+            reason_source = (self.model_binding if self.model_binding.get("status") != "connected"
+                             else self.model_intent)
+            table.add_row("原因", escape(self._intent_poll_error or self._model_error or
+                          f"{reason_source.get('reason_code', '')}: {reason_source.get('reason', '')}"))
+            return
+        loaded = (bool(status.get("model_loaded")) if self._local_model_ready is None
+                  else self._local_model_ready)
+        model_name = (status.get("model_name") or "—" if self._local_model_ready is None
+                      else self.model_selection_id or "—")
+        active = ((status.get("active_model_id") or registry.get("active_model_id"))
+                  if self._local_model_ready is None else self.model_selection_id if loaded else None)
         # ★ 2026-10-09（#73-②）：`正在加载` 优先于 `/api/status`（后者要到加载完成才更新），
         #   否则加载中会同时出现「正在加载…」与「未加载」。
         if self._model_loading_id:
@@ -1742,7 +1876,7 @@ class MainScreen(Screen):
                         f"  ·  {self.app.api.base_url}")
         table.add_row("后端地址", self.app.api.base_url)
         table.add_row("健康", str(health.get("status") or health.get("ok") or "ok"))
-        table.add_row("运行模式", str(status.get("run_mode") or "—"))
+        table.add_row("运行模式", str(self.model_mode or status.get("run_mode") or "—"))
         table.add_row("节点角色", f"{status.get('node_role') or '—'} · {status.get('node_id') or '—'}")
         table.add_row("最大节点数", str(status.get("max_nodes", "—")))
         if self._model_loading_id:
@@ -1753,7 +1887,8 @@ class MainScreen(Screen):
             table.add_row("当前模型 ID", str(active or "—（未加载）"))
         table.add_row("引擎", str(status.get("engine") or "—（未加载）"))
         table.add_row("量化", str(status.get("current_quant") or "—"))
-        table.add_row("流水线", "已准备" if status.get("pipeline_prepared") else "未准备")
+        prepared = status.get("pipeline_prepared") if self._local_model_ready is None else False
+        table.add_row("流水线", "已准备" if prepared else "未准备")
         table.add_row("对话轮次", str(status.get("conversation_turns", "—")))
         table.add_row("可用模型数", str(len(registry.get("models") or []))
                       if "_error" not in registry else "—")
@@ -1808,7 +1943,12 @@ class MainScreen(Screen):
             if not isinstance(rows, list) or not rows:
                 table.add_row("", "[dim]（后端未返回模型列表）[/]", "", "", "", "")
                 return
-            active = registry.get("active_model_id") or status.get("active_model_id")
+            if self.model_mode == "distributed":
+                active = (self.model_intent.get("intent") or {}).get("model_id")
+            elif self._local_model_ready is not None:
+                active = self.model_selection_id if self._local_model_ready else None
+            else:
+                active = registry.get("active_model_id") or status.get("active_model_id")
             for item in rows[:64]:
                 if not isinstance(item, dict):
                     continue
@@ -1841,6 +1981,8 @@ class MainScreen(Screen):
             self._model_aux_inflight = True
         payload: Dict[str, Any] = {}
         try:
+            if self.model_mode == "distributed":
+                return
             for name, path in (
                 ("assets", "/models/local-assets"),
                 ("presets", "/models/presets"),
@@ -1853,8 +1995,14 @@ class MainScreen(Screen):
                 self._model_aux_inflight = False
 
     def fill_model_aux(self, payload: Dict[str, Any]) -> None:
+        if not self.is_attached or not self.query("#models-pane"):
+            return
         self.model_aux = payload
         pane = self.query_one("#models-pane", Static)
+        if self.model_mode == "distributed":
+            pane.update("主节点注册表 · 光标仅浏览，L 确认选模 · ◆ 当前 operation 的模型\n"
+                        "自动供给 → prepare · 就绪前可取消 · 层段由后端规划")
+            return
         assets = payload.get("assets") or {}
         presets = payload.get("presets") or {}
         downloads = payload.get("downloads") or {}
@@ -2243,6 +2391,8 @@ class MainScreen(Screen):
         enabled = distributed.get("enabled") if isinstance(distributed, dict) else None
         if enabled is None and isinstance(config, dict):
             enabled = config.get("distributed_inference_enabled")
+        if self.model_mode is not None:
+            enabled = self.model_mode == "distributed"
         parts = [
             f"角色 {role.get('role') or role.get('node_role') or '—'}",
             f"分布式 {'开启' if enabled else '关闭' if enabled is not None else '未知'}",
@@ -2256,21 +2406,12 @@ class MainScreen(Screen):
     def action_cluster_toggle(self) -> None:
         if PAGES[self.page_index][0] != "cluster":
             return
-        distributed = self.cluster_aux.get("distributed") or {}
-        current = distributed.get("enabled") if isinstance(distributed, dict) else None
-        if current is None:
+        current = (self.cluster_aux.get("distributed") or {}).get("enabled")
+        if current is None and self.model_mode is None:
             self.write_status("[yellow]分布式配置尚未加载，请先刷新[/]")
             return
-        target = not bool(current)
-        self.app.confirm(
-            "切换分布式推理",
-            f"当前状态：{'开启' if current else '关闭'} → {'开启' if target else '关闭'}\n"
-            "新请求将按该配置参与调度，正在执行的任务不强行迁移。",
-            lambda: self.run_json_operation(
-                "PUT", "/cluster/config/distributed-inference", {"enabled": target},
-                success="分布式配置已更新", refresh=(self.load_cluster_aux, self.action_reload)),
-            confirm_label="切换",
-        )
+        mode = self.model_mode or ("distributed" if current else "local")
+        self.confirm_model_mode("local" if mode == "distributed" else "distributed")
 
     def action_cluster_max_nodes(self) -> None:
         if PAGES[self.page_index][0] != "cluster":
@@ -2299,40 +2440,12 @@ class MainScreen(Screen):
         )
 
     def action_cluster_connect(self) -> None:
-        if PAGES[self.page_index][0] not in {"cluster", "nodes"}:
-            return
-        self.open_form(
-            "连接主节点",
-            "从节点填写主节点地址；切换角色是持久性操作，默认不自动切换。",
-            [
-                ("master_host", "主节点地址", ""),
-                ("master_port", "端口", "8888"),
-                ("switch_to_client", "切换为从节点：true/false", "false"),
-            ],
-            self.submit_cluster_connect,
-        )
+        if PAGES[self.page_index][0] in {"models", "cluster", "nodes"}:
+            self.connect_intent()
 
     def submit_cluster_connect(self, values: Dict[str, str]) -> None:
-        try:
-            port = int(values.get("master_port", "8888"))
-        except ValueError:
-            self.write_status("[red]端口必须是整数[/]")
-            return
-        body = {
-            "master_host": values.get("master_host", "").strip(),
-            "master_port": port,
-            "switch_to_client": values.get("switch_to_client", "false").lower() in {"1", "true", "yes", "是"},
-        }
-        if not body["master_host"]:
-            self.write_status("[red]必须填写主节点地址[/]")
-            return
-        self.app.confirm(
-            "连接主节点", f"{body['master_host']}:{port}\n切换为从节点：{body['switch_to_client']}",
-            lambda: self.run_json_operation(
-                "POST", "/cluster/connect", body, success="主节点连接请求已发送",
-                refresh=(self.load_cluster_aux, self.load_pages)),
-            confirm_label="连接",
-        )
+        # Kept for callers of the former form; discovery owns the destination.
+        self.connect_intent()
 
     def action_cluster_join_request(self) -> None:
         if PAGES[self.page_index][0] != "nodes":
@@ -2934,8 +3047,8 @@ class MainScreen(Screen):
     def model_load_args(self, info: Dict[str, Any]) -> Tuple[str, str]:
         """由注册表项推出 (engine, quant_type)——不猜参数，缺省即后端默认。
 
-        量化**优先 int4**（与后端 ``LoadModelRequest`` 默认值一致，显存占用最低）；
-        注册表未给 int4 时才退到其列表首项。
+        量化沿用目录的 default_quant_type；旧目录缺此字段时优先 int4，
+        再退到可用列表首项。
         """
         engine = str(info.get("preferred_engine") or "llama_cpp")
         quant_types = info.get("quant_types") or info.get("quantizations") or []
@@ -2944,82 +3057,329 @@ class MainScreen(Screen):
         elif isinstance(quant_types, str):
             quant_types = [quant_types]
         choices = [str(item) for item in quant_types]
-        if "int4" in choices:
+        if info.get("default_quant_type"):
+            quant = str(info["default_quant_type"])
+        elif "int4" in choices:
             quant = "int4"
         else:
             quant = choices[0] if choices else "int4"
         return engine, quant
 
     def action_load_model(self) -> None:
-        """模型屏 L：加载光标行的模型（先确认，再走 worker，避免阻塞 UI）。"""
         if PAGES[self.page_index][0] != "models":
             self.write_status("[yellow]请先切到「模型」屏（侧栏或 [ ] 键）[/]")
             return
-        table = self.query_one("#models-table", DataTable)
-        model_id = self.selected_model_id(table)
-        if not model_id:
+        model_id = self.selected_model_id(self.query_one("#models-table", DataTable))
+        if not model_id or model_id not in self.model_rows:
             self.write_status("[yellow]模型屏没有可加载的行[/]")
             return
-        info = self.model_rows.get(model_id) or {}
+        info = self.model_rows[model_id]
         if info.get("is_available") is False:
-            reason = info.get("unavailable_reason") or "后端未说明原因"
-            self.write_status(f"[yellow]{model_id} 不可用[/]：{reason}")
+            self.write_status(f"[yellow]{model_id} 不可用[/]：{escape(str(info.get('unavailable_reason') or '后端未说明原因'))}")
             return
         engine, quant = self.model_load_args(info)
-        name = str(info.get("name") or model_id)
-        note = ""
-        if engine in {"pytorch", "island"} and self.cuda_available is False:
-            note = "\n[yellow]提示[/]：本机 CUDA 不可用，PyTorch/孤岛引擎会走 CPU（很慢）。"
+        self.confirm_model_load(model_id, engine, quant)
+
+    def confirm_model_load(self, model_id: str, engine: str, quant: str) -> None:
+        if self.model_mode is None:
+            self.write_status("[yellow]请先选择 Local 或分布式模式[/]")
+            return
+        if self._model_action_inflight:
+            self.write_status("[yellow]模型操作进行中，请等待[/]")
+            return
+        if self.model_mode == "distributed":
+            note = "自动规划与供给层段，然后准备推理；无需手选层段。就绪前聊天等待。"
+            if self.model_intent and self.model_intent.get("status") not in MODEL_INTENT_TERMINAL:
+                note += "\n若更换选择，将先取消尚未完成的选模 operation。"
+        else:
+            note = "显式退出集群，真实卸载当前模型/层段，然后加载本地整模。"
         self.app.confirm(
-            "加载模型",
-            f"将要加载：[b]{model_id}[/]（{name}）\n"
-            f"引擎 [b]{engine}[/] · 量化 [b]{quant}[/]\n"
-            "耗时约 5-20 秒；期间会**先卸载当前模型**，失败由后端自动回滚。"
-            f"{note}",
-            lambda: self.run_model_action("load", model_id, engine, quant),
-            confirm_label="加载",
-        )
+            "选择模型", f"{model_id}\n引擎 {engine} · 量化 {quant}\n{note}",
+            lambda: self.run_model_action("load", model_id, engine, quant), confirm_label="加载")
 
     def action_unload_model(self) -> None:
-        """模型屏 U：卸载当前模型（破坏性：会中断正在生成的请求）。"""
         if PAGES[self.page_index][0] != "models":
             self.write_status("[yellow]请先切到「模型」屏（侧栏或 [ ] 键）[/]")
             return
-        active = self.model_text.replace("[yellow]", "").replace("[/]", "")
-        self.app.confirm(
-            "卸载模型",
-            f"将**释放**当前本地模型：{active or '（当前未加载）'}\n"
-            "影响：正在生成/排队的请求会失败；KV 缓存与对话上下文一并清空。\n"
-            "之后需要重新「加载模型」才能对话。",
-            lambda: self.run_model_action("unload", "", "", ""),
-            confirm_label="卸载",
-        )
+        self.confirm_model_unload()
 
-    @work(thread=True, exclusive=True, group="modelctl")
+    def confirm_model_unload(self) -> None:
+        if self.model_mode == "distributed" and self.model_intent and self.model_intent.get("status") not in MODEL_INTENT_TERMINAL:
+            self.action_cancel_model_intent()
+            return
+        self.app.confirm(
+            "卸载模型", "释放当前模型与推理计划；正在生成/排队的请求会失败。",
+            lambda: self.run_model_action("unload", "", "", ""), confirm_label="卸载")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "model-mode-local": lambda: self.confirm_model_mode("local"),
+            "model-mode-distributed": lambda: self.confirm_model_mode("distributed"),
+            "model-intent-connect": self.connect_intent,
+            "model-intent-cancel": self.action_cancel_model_intent,
+        }
+        if event.button.id in actions:
+            event.stop()
+            actions[event.button.id]()
+
+    def confirm_model_mode(self, mode: str) -> None:
+        if self._model_action_inflight:
+            self.write_status("[yellow]模型操作进行中，请等待[/]")
+            return
+        text = ("退出集群，取消未完成的选模并真实卸载模型/层段；随后可选择本地整模。"
+                if mode == "local" else "启用集群参与；从主节点注册表选模并自动供给、准备。")
+        self.app.confirm("切换模型模式", text,
+                         lambda: self.run_model_action(mode, "", "", ""), confirm_label="切换")
+
+    def action_cancel_model_intent(self) -> None:
+        if self.model_mode != "distributed" or not self.model_intent:
+            self.write_status("[yellow]没有可取消的选模 operation[/]")
+            return
+        if self.model_intent.get("status") in MODEL_INTENT_TERMINAL:
+            self.write_status("[yellow]选模已结束；ready 模型请用 U 卸载[/]")
+            return
+        self.app.confirm("取消选模", str(self.model_intent["operation_id"]),
+                         lambda: self.run_model_action("cancel", "", "", ""), confirm_label="取消选模")
+
+    def connect_intent(self) -> None:
+        if self.model_mode != "distributed":
+            self.write_status("[yellow]请先显式切换到分布式模式，再发现主节点[/]")
+            return
+        self.run_model_action("connect", "", "", "")
+
     def run_model_action(self, kind: str, model_id: str, engine: str, quant: str) -> None:
-        """模型控制走独立 worker 组：加载 5-20 秒，不能阻塞 UI 也不与只读刷新互斥。"""
-        app = self.app
+        # Capture the user's choice synchronously, before starting a worker or poll.
+        if self._model_action_inflight:
+            self.write_status("[yellow]模型操作进行中，请等待[/]")
+            return
+        previous = dict(self.model_intent)
+        if kind in {"load", "local", "distributed"}:
+            self._intent_restore_enabled = True
+        elif kind == "unload":
+            self._intent_restore_enabled = False
+            self._intent_unloaded_operation_id = str(previous.get("operation_id") or "")
+        if kind in {"local", "distributed"}:
+            self.model_mode = kind
+            self.model_intent = {}
+            self.model_selection_id = ""
+            self.model_rows = {}
+            self.query_one("#models-table", DataTable).clear()
+            self.model_aux = {}
+            self.model_binding = {}
         if kind == "load":
-            # ★ 2026-10-09（稳定性 #73-②）：先落"加载中"权威状态，再发请求。
-            #   必须 try/finally —— 否则加载失败时该标记会永久残留（状态永远停在"加载中"）。
-            self.app.call_from_thread(self._begin_model_load, model_id)
-            self.app.call_from_thread(self.set_busy, f"正在加载 {model_id}（5-20 秒）…")
-            try:
-                result = load_model(app.api, model_id, engine=engine, quant_type=quant)
-                detail = result.get("message") or result.get("detail") or ""
-                text = f"[green]模型已加载[/] {model_id} {detail}".strip()
-            except ApiError as exc:
-                text = f"[red]模型加载失败[/]：{exc}"
-            finally:
-                self.app.call_from_thread(self._end_model_load)
+            self.model_selection_id = model_id
+            self.model_intent = {}
+            self._begin_model_load(model_id)
+        self._selection_epoch += 1
+        self._model_action_inflight = True
+        self._model_error = ""
+        self._intent_poll_error = ""
+        if self.model_mode == "local" or kind == "unload":
+            self._local_model_ready = False
+        self.render_model_intent()
+        self.set_busy("发现/连接主节点…" if kind == "connect" else "模型操作进行中…")
+        self.model_action_worker(kind, model_id, engine, quant, self.model_mode,
+                                 self._selection_epoch, previous)
+
+    @work(thread=True, group="model-intent-control")
+    def model_action_worker(self, kind: str, model_id: str, engine: str, quant: str,
+                            mode: Optional[str], epoch: int, previous: Dict[str, Any]) -> None:
+        result: Dict[str, Any] = {}
+        error = ""
+        try:
+            if kind == "load" and mode == "distributed":
+                old_intent = previous.get("intent") or {}
+                same_selection = (old_intent.get("model_id") == model_id
+                                  and old_intent.get("engine", engine) == engine
+                                  and old_intent.get("quant_type", quant) == quant)
+                if previous.get("operation_id") and previous.get("status") not in MODEL_INTENT_TERMINAL and not same_selection:
+                    cancel_model_intent(self.app.api, str(previous["operation_id"]))
+                result = create_model_intent(self.app.api, model_id, engine=engine, quant_type=quant)
+                if not result.get("operation_id"):
+                    raise ApiError("INTENT_RESPONSE_INVALID: 主节点未返回 operation_id")
+            elif kind == "cancel":
+                result = cancel_model_intent(self.app.api, str(previous["operation_id"]))
+            elif kind == "connect":
+                result = connect_model_intent(self.app.api)
+            else:
+                if previous.get("operation_id") and previous.get("status") not in MODEL_INTENT_TERMINAL:
+                    cancel_model_intent(self.app.api, str(previous["operation_id"]))
+                if kind == "load":
+                    result = load_local_model(self.app.api, model_id, engine=engine, quant_type=quant)
+                elif kind in {"local", "distributed"}:
+                    result = set_model_mode(self.app.api, kind)
+                    if kind == "local":
+                        result = unload_model(self.app.api)
+                else:
+                    result = unload_model(self.app.api)
+                if result.get("success") is False or result.get("status") in {"error", "failed"}:
+                    raise ApiError(str(result.get("reason") or result.get("message") or "模型操作失败"))
+        except Exception as exc:  # network/runtime failures must release the UI gate
+            error = str(exc)
+        self.app.call_from_thread(self.finish_model_action, kind, model_id, epoch, result, error)
+
+    def finish_model_action(self, kind: str, model_id: str, epoch: int,
+                            result: Dict[str, Any], error: str) -> None:
+        if not self.is_attached or not self.query("#intent-pane") or epoch != self._selection_epoch:
+            return
+        # Polls begun while this write was in flight must also be retired.
+        self._selection_epoch += 1
+        self._model_action_inflight = False
+        self._end_model_load()
+        self._model_error = error
+        self._model_error_kind = kind if error else ""
+        if error:
+            text = f"[red]模型操作失败[/]：{escape(error)} · 可重试"
+            if kind == "connect":
+                self.model_binding = {"status": "disconnected", "reason": error,
+                                      "reason_code": "INTENT_CONNECT_FAILED"}
+        elif kind in {"load", "cancel"} and self.model_mode == "distributed":
+            self.apply_model_intent(result)
+            text = escape(self.model_intent_summary())
+        elif kind == "connect":
+            self.model_binding = result.get("binding", result)
+            text = ("主节点发现/连接已完成" if self.model_binding.get("status") == "connected"
+                    else "主节点连接尚未完成，请重试：" + escape(str(self.model_binding.get("reason_code") or "INTENT_MASTER_DISCONNECTED")))
+        elif kind == "load":
+            self._local_model_ready = True
+            text = f"[green]本地整模已加载[/] {model_id}"
         else:
-            self.app.call_from_thread(self.set_busy, "正在卸载模型…")
-            try:
-                unload_model(app.api)
-                text = "[green]模型已卸载[/]"
-            except ApiError as exc:
-                text = f"[red]模型卸载失败[/]：{exc}"
-        self.app.call_from_thread(self.finish_write_action, text)
+            if kind == "unload":
+                self.model_intent = {}
+                self.model_selection_id = ""
+            text = "本地模式已启用，模型已卸载" if kind == "local" else "分布式模式已启用" if kind == "distributed" else "模型已卸载"
+        self.render_model_intent()
+        self.query_one("#chat-pane", ChatPane).write_line(text)
+        self.write_status(text)
+        self.action_reload()
+
+    def apply_model_intent(self, value: Dict[str, Any], *, authoritative_current: bool = False) -> None:
+        # Core current reads have already passed the epoch and endpoint checks.
+        # Writes and operation-specific results must still match our selection.
+        if authoritative_current and self._model_action_inflight:
+            return
+        if "_error" in value:
+            self._intent_poll_error = str(value["_error"])
+            return
+        incoming_id = value.get("operation_id")
+        if not incoming_id:
+            if authoritative_current and (not value or value == {"value": None}):
+                self._intent_poll_error = ""
+                self.model_intent = {}
+            return
+        current_id = self.model_intent.get("operation_id")
+        if authoritative_current:
+            # An explicit unload suppresses only that old operation. A later
+            # selection on another device must still become visible here.
+            if not self._intent_restore_enabled and incoming_id == self._intent_unloaded_operation_id:
+                self._intent_poll_error = ""
+                return
+            self._intent_restore_enabled = True
+            if incoming_id != current_id and self._model_error_kind in {"load", "cancel"}:
+                self._model_error = ""
+                self._model_error_kind = ""
+        else:
+            if current_id and incoming_id != current_id:
+                return
+            returned_model = (value.get("intent") or {}).get("model_id")
+            if not current_id and self.model_selection_id and returned_model and returned_model != self.model_selection_id:
+                return
+        self._intent_poll_error = ""
+        self.model_intent = value
+        if model_intent_ready(value) and self._model_error_kind == "cancel":
+            self._model_error = ""
+
+    def model_intent_summary(self) -> str:
+        if self._model_action_inflight:
+            return f"{self.model_selection_id} · 操作进行中"
+        if self._model_error:
+            return f"{self.model_selection_id} · 失败: {self._model_error}"
+        summary = format_model_intent(self.model_intent).splitlines()[0]
+        if self._intent_poll_error or self.model_binding.get("status") != "connected":
+            return f"主节点状态待确认 · 上次: {summary}"
+        return summary
+
+    def model_intent_text(self) -> str:
+        text = f"模式: {self.model_mode or '待确认'}"
+        if self.model_mode == "distributed":
+            binding = self.model_binding
+            master = binding.get("master_node_id") or binding.get("master_host") or ("本机主节点" if binding.get("is_master") else "—")
+            text += f" · 主节点: {master} · {binding.get('status') or '待连接'}"
+            if binding.get("reason_code") or binding.get("reason"):
+                text += f"\n{binding.get('reason_code') or ''}: {binding.get('reason') or ''} · 发现/重试连接 (J)"
+            text += "\n" + format_model_intent(self.model_intent)
+        if self._model_action_inflight:
+            text += f"\n{self.model_selection_id} · 模型操作进行中"
+        if self._model_error or self._intent_poll_error:
+            text += f"\n{self._model_error or self._intent_poll_error} · 请刷新/重试"
+        return text
+
+    def chat_routing_preference(self) -> str:
+        """发送路由由 owner 模式决定；未知模式沿用 app 的命令偏好。"""
+        return {"distributed": "distributed_required", "local": "local_only"}.get(
+            self.model_mode, self.app.routing_preference)
+
+    def chat_streaming_mode(self) -> str:
+        """从节点用既有 full 转发入口；主节点和本地文本保留 interactive。"""
+        if (self.model_mode == "distributed" and self.model_binding.get("status") == "connected"
+                and self.model_binding.get("is_master") is False):
+            return "full"
+        return "interactive"
+
+    def chat_model_context(self) -> Tuple[Any, ...]:
+        """复用模型控制 epoch 和 owner 投影，隔离角色/选模变化后的迟到回包。"""
+        return (self._selection_epoch, self.model_mode,
+                self.model_binding.get("status"), self.model_binding.get("is_master"),
+                self.model_binding.get("master_node_id"), self.model_binding.get("master_host"),
+                self.model_intent.get("operation_id"), self.model_intent.get("config_id"),
+                self.model_intent.get("generation"), model_intent_ready(self.model_intent))
+
+    def chat_model_gate(self) -> str:
+        prefix = ""
+        if self._model_action_inflight or self._model_loading_id:
+            prefix = "模型操作进行中，请等待。"
+        elif self._model_error:
+            prefix = "模型操作失败，请重试。"
+        elif self.model_mode == "distributed":
+            if self._intent_poll_error or self.model_binding.get("status") != "connected":
+                prefix = "主节点失连，请使用发现/重试连接。"
+            elif not model_intent_ready(self.model_intent):
+                prefix = "模型尚未就绪，请等待或重新选模。"
+        elif self.model_mode == "local" and self._local_model_ready is False:
+            prefix = "本地模型未就绪，请加载整模后发送。"
+        if not prefix:
+            return ""
+        # Keep input visible even for a large cluster; full node receipts live on the model page.
+        details = self.model_intent_summary() if self.model_mode == "distributed" else self.model_selection_id
+        operation_id = self.model_intent.get("operation_id")
+        if operation_id:
+            details += f"\noperation_id: {operation_id}"
+        reason = self._model_error or self._intent_poll_error
+        if not reason:
+            source = self.model_binding if self.model_binding.get("status") != "connected" else self.model_intent
+            reason = f"{source.get('reason_code') or ''}: {source.get('reason') or ''}".strip(": ")
+        if reason:
+            details += f"\n{reason}"
+        return prefix + "\n" + details
+
+    def render_model_intent(self) -> None:
+        self.query_one("#intent-pane", Static).update(self.model_intent_text())
+        if self.model_mode == "distributed":
+            self.fill_model_aux({})
+        self.query_one("#model-mode-local", Button).variant = "primary" if self.model_mode == "local" else "default"
+        self.query_one("#model-mode-distributed", Button).variant = "primary" if self.model_mode == "distributed" else "default"
+        self.query_one("#model-intent-cancel", Button).disabled = (
+            self._model_action_inflight or not self.model_intent or
+            self.model_intent.get("status") in MODEL_INTENT_TERMINAL)
+        if self.model_mode == "distributed":
+            self.model_text = self.model_intent_summary()
+        if self._last_core:
+            self.fill_status(*self._last_core)
+        gate = self.chat_model_gate()
+        if gate or self._chat_model_gated:
+            self.query_one("#chat-pane", ChatPane).set_status(escape(gate) if gate else "模型已就绪，可以发送消息。")
+        self._chat_model_gated = bool(gate)
+        self.refresh_topbar()
 
     def set_busy(self, text: str) -> None:
         self.write_status(f"[yellow]…[/] {text}")
@@ -3068,7 +3428,10 @@ class MainScreen(Screen):
     def action_queue_clear(self) -> None:
         """队列屏 C：清空排队任务（列出将清空的内容后再确认）。"""
         if PAGES[self.page_index][0] == "models":
-            self.action_model_cancel_download()
+            if self.model_intent and self.model_intent.get("status") not in MODEL_INTENT_TERMINAL:
+                self.action_cancel_model_intent()
+            else:
+                self.action_model_cancel_download()
             return
         if PAGES[self.page_index][0] != "queue":
             self.write_status("[yellow]请先切到「队列」屏[/]")
@@ -3359,6 +3722,7 @@ class KoakumaApp(App):
         self.supervisor = supervisor
         self.session_id: Optional[str] = None
         self.generation_id: Optional[str] = None
+        self.main_screen: Optional[MainScreen] = None
 
     # ------------------------------------------------------------ 启动流程
 

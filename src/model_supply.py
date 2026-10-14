@@ -203,7 +203,10 @@ class ModelSupplyCoordinator:
     def cancel_active(self):
         with self._condition:
             op_id = self._active
-            active = op_id and self._operations[op_id]["status"] not in self.TERMINAL
+            # Available is only a file receipt. Opt-out must also revoke the
+            # supply->prepare gap and an already-entered prepare guard.
+            # Repeated opt-out also retries cleanup after a failed save/abort.
+            active = op_id and op_id in self._operations
         if active:
             self.cancel(op_id)
 
@@ -213,7 +216,7 @@ class ModelSupplyCoordinator:
         if not self.scheduler.get_distributed_inference_enabled():
             raise ModelSupplyError("SUPPLY_LOCAL_MODE", "Node has opted out of distributed inference")
 
-    def create(self, intent: dict) -> dict:
+    def create(self, intent: dict, *, wait_for_nodes: bool = False) -> dict:
         self._check_master()
         if str(intent.get("quant_type", "")).lower() in {"fp32", "f32", "float32"}:
             raise ModelSupplyError("SUPPLY_RUNTIME_PRECISION_UNSUPPORTED", "FP32 supply requires per-tensor materialized byte admission")
@@ -244,7 +247,7 @@ class ModelSupplyCoordinator:
             operation = {"operation_id": op_id, "intent": copy.deepcopy(intent),
                          "status": "queued", "reason_code": "", "created_at": time.time(),
                          "updated_at": time.time(), "loaded_ready": False, "nodes": {},
-                         "plan": None, "requires_prepare": True}
+                         "plan": None, "requires_prepare": True, "wait_for_nodes": wait_for_nodes}
             self._operations[op_id] = operation
             self._events[op_id] = threading.Event()
             self._active = op_id
@@ -300,6 +303,7 @@ class ModelSupplyCoordinator:
     def cancel(self, op_id):
         # Verified assets stay available on disk. Cancellation still fences the
         # pending prepare, including the interval before its transaction exists.
+        errors = []
         with self._condition:
             op = self._operations.get(op_id)
             if not op:
@@ -307,21 +311,40 @@ class ModelSupplyCoordinator:
             if self._preparing == op_id:
                 self._prepare_cancelled = True
             terminal = op["status"] in self.TERMINAL
+            self._events.setdefault(op_id, threading.Event()).set()
             if not terminal:
-                self._events[op_id].set()
                 op.update(status="cancelled", reason_code="SUPPLY_CANCELLED", updated_at=time.time())
-                self._persist(op)
-                for key in list(self._leases):
-                    if key[0] == op_id:
-                        self._leases.pop(key, None)
-                self._condition.notify_all()
+            # Revocation cannot depend on a successful disk write. Repeated
+            # cancellation retries a previously failed save and receiver cleanup.
+            for key in list(self._leases):
+                if key[0] == op_id:
+                    self._leases.pop(key, None)
+            self._condition.notify_all()
+            if not terminal or op["status"] == "cancelled":
+                try:
+                    self._persist(op)
+                except Exception as exc:
+                    errors.append(("persist", exc))
             result = copy.deepcopy(op)
-        # Do not hold the supply condition while acquiring the transaction lock.
+        # Never take the native transaction lock while holding the condition.
+        # Attempt both owners even if persistence or the other cleanup fails.
         cancel_prepare = getattr(self.scheduler, "cancel_worker_prepare_operation", None)
         if callable(cancel_prepare):
-            cancel_prepare(op_id)
-        if not terminal:
-            self._cancel_receivers(op_id, list(result["nodes"]))
+            try:
+                cancel_prepare(op_id)
+            except Exception as exc:
+                errors.append(("native", exc))
+        if result["status"] != "available":
+            try:
+                self._cancel_receivers(op_id, list(result["nodes"]))
+            except Exception as exc:
+                errors.append(("receivers", exc))
+        for stage, exc in errors:
+            logger.error("event=model_supply_cancel_failed operation_id=%s stage=%s reason_code=%s",
+                         op_id, stage, getattr(exc, "code", "SUPPLY_CANCEL_FAILED"),
+                         exc_info=(type(exc), exc, exc.__traceback__))
+        if errors:
+            raise errors[0][1]
         return result
 
     def _cancel_receivers(self, op_id, node_ids):
@@ -358,13 +381,48 @@ class ModelSupplyCoordinator:
                     "downloaded_bytes", "actual_downloaded_bytes", "reused_bytes",
                     "resumed_bytes", "total_bytes", "files_completed", "files_total",
                 ) if type(payload.get(key)) is int and payload[key] >= 0}
-                if payload.get("phase") in {"receiving", "building", "verifying", "registering",
+                if payload.get("phase") in {"receiving", "downloading", "building", "verifying", "registering",
                                             "download", "verify", "build"}:
                     allowed["phase"] = payload["phase"]
                 op["nodes"][node_id].update(allowed)
             else:
                 self._responses[(op_id, node_id, action)] = copy.deepcopy(payload)
             self._condition.notify_all()
+
+    def _worker_connections(self, selected):
+        from scheduler_types import WORKER_HEARTBEAT_MAX_AGE
+        with self.scheduler._nodes_lock:
+            all_nodes = list(self.scheduler.nodes.items())
+        now = time.time()
+        server = self.scheduler._tcp_server
+        return {node_id: server.get_client_info(node_id) for node_id, node in all_nodes
+                if node_id != "master" and node.is_available()
+                and node.is_heartbeat_fresh(now, WORKER_HEARTBEAT_MAX_AGE)
+                and (not selected or node_id in selected) and server}
+
+    def _worker_handshake_ready(self, node_id, connection):
+        # Project the existing control/REGISTER owners, without requiring a model
+        # or layer range that this supply operation is about to install.
+        server = self.scheduler._tcp_server
+        control = getattr(self.scheduler, "_task_worker_control", None)
+        if not server or not control or not connection:
+            return False
+        try:
+            epoch = server.get_authenticated_peer_epoch(node_id)
+            worker = control.worker_snapshot(node_id)
+            return bool(
+                type(epoch) is int and epoch > 0
+                and epoch == connection.get("registration_epoch")
+                and worker.get("manual_stage_dispatch_enabled") is True
+                # A same-id reconnect may retain the previous accepted hello
+                # until the REGISTER callback marks it pending. It is stale.
+                and worker.get("hello_received_at", 0) >= connection["connected_at"]
+                # The original hello handler resolves pending after sending ACK.
+                and node_id not in control.pending_worker_ids()
+                and server.get_authenticated_peer_epoch(node_id) == epoch
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
 
     def _send(self, op_id, node_id, payload):
         from transport_port import MessageType
@@ -376,7 +434,12 @@ class ModelSupplyCoordinator:
             info = server.get_client_info(node_id) if server else None
             if not info:
                 raise ModelSupplyError("SUPPLY_WORKER_DISCONNECTED", f"Worker {node_id} disconnected")
-            self._connections[(op_id, node_id)] = info.get("connected_at")
+            key = (op_id, node_id)
+            if key in self._connections and self._connections[key] != info.get("connected_at"):
+                raise ModelSupplyError("SUPPLY_WORKER_DISCONNECTED", f"Worker {node_id} connection changed")
+            if payload.get("action") == "inventory" and not self._worker_handshake_ready(node_id, info):
+                raise ModelSupplyError("SUPPLY_WORKERS_UNAVAILABLE", f"Worker {node_id} has not finished joining")
+            self._connections.setdefault(key, info.get("connected_at"))
             sent = server.send_to_client(node_id, {**payload, "operation_id": op_id}, MessageType.MODEL_SUPPLY)
             if sent is False:
                 raise ModelSupplyError("SUPPLY_WORKER_DISCONNECTED", f"Worker {node_id} send failed")
@@ -409,7 +472,7 @@ class ModelSupplyCoordinator:
         with self._condition:
             while True:
                 self._check(op_id)
-                if action == "result":
+                if action in {"inventory_result", "result"}:
                     self._check_receivers(op_id)
                 value = self._responses.pop((op_id, node_id, action), None)
                 if value is not None:
@@ -421,6 +484,56 @@ class ModelSupplyCoordinator:
                 if remaining <= 0:
                     raise ModelSupplyError("SUPPLY_WORKER_TIMEOUT", f"Worker {node_id} did not return {action}")
                 self._condition.wait(min(remaining, 0.5))
+
+    def _extend_auto_inventory(self, op_id, intent, worker_ids, nodes, inventories, deadline, *, wait_for_new=False):
+        """Extend only the unpublished automatic pool, using the live join owners."""
+        expanded = False
+        while True:
+            with self._condition:
+                self._check(op_id)
+                self._check_receivers(op_id)
+            connections = self._worker_connections(set())
+            ready = [node_id for node_id, info in connections.items()
+                     if self._worker_handshake_ready(node_id, info)]
+            pending = any(info and node_id not in ready for node_id, info in connections.items())
+            added = [node_id for node_id in ready if node_id not in worker_ids]
+            if not pending and not added and not wait_for_new:
+                return expanded
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if wait_for_new and not pending:
+                    return expanded
+                raise ModelSupplyError("SUPPLY_WORKERS_TIMEOUT", "No joined supply workers before the operation deadline")
+            if added and not pending:
+                if any(re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", node_id) is None for node_id in added):
+                    raise ModelSupplyError("SUPPLY_NODE_ID_INVALID", "Registered worker identity is unsafe for supply")
+                # Publish recipients before dispatch so immediate inventory replies
+                # pass handle(), and cancellation cleans up every added receiver.
+                with self._condition:
+                    self._check(op_id)
+                    self._check_receivers(op_id)
+                    nodes.update({node_id: {"status": "inventory"} for node_id in added})
+                    self._update(op_id, status="inventory", nodes=nodes, reason_code="", reason="")
+                for node_id in added:
+                    self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
+                                               "source_model_sha256": ""})
+                for node_id in added:
+                    inventory = self._wait(op_id, node_id, "inventory_result",
+                                           min(90, max(0, deadline - time.monotonic())))
+                    if not inventory.get("distributed"):
+                        raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
+                    with self._condition:
+                        self._check(op_id)
+                        self._check_receivers(op_id)
+                        inventories[node_id] = inventory
+                        worker_ids.append(node_id)
+                expanded, wait_for_new = True, False
+                # Inventory/source inspection can take long enough for another
+                # peer to register. Drain new joined peers before planning once.
+                continue
+            self._update(op_id, status="waiting_nodes", reason_code="SUPPLY_WAITING_NODES",
+                         reason="Waiting for additional distributed workers to finish joining")
+            self._events[op_id].wait(min(remaining, 0.25))
 
     def authorize_file(self, op_id, node_id, filename, token):
         with self._condition:
@@ -519,22 +632,34 @@ class ModelSupplyCoordinator:
         self._check(op_id)
         intent = self.get(op_id)["intent"]
         self._update(op_id, status="inspecting")
-        with self.scheduler._nodes_lock:
-            all_nodes = list(self.scheduler.nodes.items())
         selected = set(intent.get("node_ids") or [])
-        from scheduler_types import WORKER_HEARTBEAT_MAX_AGE
-        now = time.time()
-        worker_ids = [node_id for node_id, node in all_nodes
-                      if node_id != "master" and node.is_available()
-                      and node.is_heartbeat_fresh(now, WORKER_HEARTBEAT_MAX_AGE)
-                      and (not selected or node_id in selected)
-                      and self.scheduler._tcp_server and self.scheduler._tcp_server.get_client_info(node_id)]
-        if selected and selected - set(worker_ids) - {"master"}:
-            raise ModelSupplyError("SUPPLY_REQUESTED_NODE_UNAVAILABLE", "A requested node is disconnected")
+        auto_pool = not selected and self.get(op_id).get("wait_for_nodes") is True
+        deadline = time.monotonic() + int(intent.get("timeout_seconds", 3600))
+        while True:
+            self._check(op_id)
+            connections = self._worker_connections(selected)
+            worker_ids = [node_id for node_id, info in connections.items()
+                          if self._worker_handshake_ready(node_id, info)]
+            missing = selected - set(worker_ids) - {"master"}
+            # Auto selection must wait for connected peers still negotiating,
+            # instead of silently planning only the faster PC before Android hello.
+            pending = any(info and node_id not in worker_ids for node_id, info in connections.items())
+            if worker_ids and not missing and not pending:
+                break
+            if not self.get(op_id).get("wait_for_nodes"):
+                if missing:
+                    raise ModelSupplyError("SUPPLY_REQUESTED_NODE_UNAVAILABLE", "A requested node has not finished joining")
+                raise ModelSupplyError("SUPPLY_WORKERS_UNAVAILABLE", "No joined supply workers")
+            if time.monotonic() >= deadline:
+                raise ModelSupplyError("SUPPLY_WORKERS_TIMEOUT", "No joined supply workers before the operation deadline")
+            self._update(op_id, status="waiting_nodes", reason_code="SUPPLY_WAITING_NODES",
+                         reason="Waiting for distributed workers to finish joining")
+            self._events[op_id].wait(0.25)
+        self._update(op_id, reason_code="", reason="")
         if any(re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) is None for value in worker_ids):
             raise ModelSupplyError("SUPPLY_NODE_ID_INVALID", "Registered worker identity is unsafe for supply")
         if not worker_ids:
-            raise ModelSupplyError("SUPPLY_WORKERS_UNAVAILABLE", "No connected supply workers")
+            raise ModelSupplyError("SUPPLY_WORKERS_UNAVAILABLE", "No joined supply workers")
         nodes = {node_id: {"status": "inventory"} for node_id in ["master", *worker_ids]}
         self._update(op_id, status="inventory", nodes=nodes)
         for node_id in worker_ids:
@@ -548,101 +673,131 @@ class ModelSupplyCoordinator:
         want_gguf = intent.get("engine") != "pytorch" or any(
             "pytorch" not in inventories[node_id].get("engines", []) for node_id in worker_ids)
         sources = self._sources(op_id, intent, want_gguf=want_gguf)
-        self._check(op_id)
-        self._update(op_id, status="planning", source_model_sha256=sources["source_model_sha256"],
-                     tokenizer_sha256=sources["tokenizer_sha256"])
-        capacity = self.scheduler._get_pipeline_capacity_nodes(set(worker_ids) | {"master"})
-        capacity_by_id = {record["node_id"]: record for record in capacity}
-        records = []
-        runtime_descriptors = {}
-        runtime_host_descriptors = {}
-        for node_id, inventory in inventories.items():
-            base = dict(capacity_by_id.get(node_id) or {})
-            if not base:
-                from config import PIPELINE_CAPACITY_RESERVE_MB
-                base = {"node_id": node_id, "role": "client", "score": 0.0,
-                        "reserve_bytes": int(PIPELINE_CAPACITY_RESERVE_MB * 1024**2)}
-            engines = inventory.get("engines") or []
-            engine = sources["master_engine"] if node_id == "master" else (
-                "llama_cpp" if "llama_cpp" in engines and "llama_cpp" in sources["descriptors"] else
-                "pytorch" if "pytorch" in engines and "pytorch" in sources["descriptors"] else "")
-            if not engine:
-                raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No compatible source for {node_id}")
-            if engine == "llama_cpp":
-                base.update(capacity_bytes=int(inventory.get("memory_available_bytes", 0)),
-                            capacity_source="supply.ram.available_bytes_live", execution_device="cpu", runtime_multiplier=2.0)
-            if engine == "pytorch":
-                from model_supply_runtime_capacity import project_runtime_descriptor
-                runtime = inventory.get("pytorch_runtime")
-                if not isinstance(runtime, dict):
-                    raise ModelSupplyError("SUPPLY_RUNTIME_BUDGET_MISSING", f"Worker {node_id} has no selected PyTorch runtime budget")
-                device = str(runtime.get("execution_device", ""))
-                element_size = runtime.get("target_element_size")
-                available = runtime.get("available_bytes")
-                if (device not in {"cpu", "cuda"} or type(available) is not int or available <= 0):
-                    raise ModelSupplyError("SUPPLY_RUNTIME_BUDGET_MISSING", f"Worker {node_id} has an invalid runtime memory budget")
-                projection = project_runtime_descriptor(sources["hf"], sources["descriptors"]["pytorch"], element_size)
-                if device == "cuda":
-                    # Selective loaders read Safetensors on CPU and transfer one
-                    # tensor at a time. Charge target weights to VRAM, source
-                    # staging separately to RAM, never RAM bytes to VRAM.
-                    runtime_host_descriptors[node_id] = projection
-                    projection = {**projection,
-                        "weight_bytes": projection["runtime_weight_bytes"],
-                        "layer_weight_bytes": projection["runtime_layer_weight_bytes"],
-                        "component_weight_bytes": projection["runtime_component_weight_bytes"]}
-                runtime_descriptors[node_id] = projection
-                base.update(capacity_bytes=available, execution_device=device, runtime_multiplier=1.0,
-                            capacity_source="supply.cuda.mem_get_info" if device == "cuda" else "supply.ram.available_bytes_live")
-            base["engine"] = engine
-            logger.info("event=supply_runtime_budget operation=%s node=%s engine=%s device=%s capacity_bytes=%s reserve_bytes=%s multiplier=%s score=%s",
-                        op_id, node_id, engine, base.get("execution_device"), base.get("capacity_bytes"),
-                        base.get("reserve_bytes"), base.get("runtime_multiplier"), base.get("score"))
-            records.append(base)
-        from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
-        from model_supply_host_capacity import allowed_host_layer_ranges
-        runtime_host_ranges = {}
-        for node_id, projection in runtime_host_descriptors.items():
-            runtime_host_ranges[node_id] = allowed_host_layer_ranges(
-                projection, node_id=node_id,
-                available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
-                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
-            )
-            if not runtime_host_ranges[node_id]:
-                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage a proper source segment in RAM")
-        from model_supply_plan_reuse import plan_segment_supply_reuse
-        def capacity_plan(*, preferred_ranges):
-            return plan_segment_supply(sources["descriptors"], records,
-                master_engine=sources["master_engine"], alignment=sources["alignment"],
-                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
-                runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
-                runtime_host_ranges=runtime_host_ranges)
-        plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
-            planner=capacity_plan, source_model_id=sources["source_model_id"],
-            source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
-            engine_by_node={record["node_id"]:record["engine"] for record in records},
-            alignment=sources["alignment"])
-        if not plan.get("admitted"):
-            raise ModelSupplyError(str(plan.get("reason_code", "SUPPLY_CAPACITY_INSUFFICIENT")), "No feasible segment supply plan")
-        # CUDA still needs host source mappings. Gate the selected segment's
-        # complete source bytes against real RAM plus the configured reserve.
-        for assignment in plan["assignments"]:
-            node_id = assignment["node_id"]
-            projection = runtime_host_descriptors.get(node_id)
-            if projection is None:
+        while True:
+            if auto_pool:
+                self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline)
+                needs_gguf = intent.get("engine") != "pytorch" or any(
+                    "pytorch" not in inventories[node_id].get("engines", []) for node_id in worker_ids)
+                if needs_gguf and not want_gguf:
+                    # The original source owner supplies conversion/provenance;
+                    # a late Android never changes the operation's source identity.
+                    extended = self._sources(op_id, intent, want_gguf=True)
+                    with self._condition:
+                        self._check(op_id)
+                        self._check_receivers(op_id)
+                    if any(extended[key] != sources[key] for key in (
+                            "source_model_id", "source_model_sha256", "tokenizer_sha256")):
+                        raise ModelSupplyError("SUPPLY_SOURCE_CONTRACT_MISMATCH", "Source identity changed while workers joined")
+                    sources, want_gguf = extended, True
+                    continue
+            with self._condition:
+                self._check(op_id)
+                self._check_receivers(op_id)
+            self._update(op_id, status="planning", source_model_sha256=sources["source_model_sha256"],
+                         tokenizer_sha256=sources["tokenizer_sha256"], reason_code="", reason="")
+            capacity = self.scheduler._get_pipeline_capacity_nodes(set(worker_ids) | {"master"})
+            capacity_by_id = {record["node_id"]: record for record in capacity}
+            records = []
+            runtime_descriptors = {}
+            runtime_host_descriptors = {}
+            for node_id, inventory in inventories.items():
+                base = dict(capacity_by_id.get(node_id) or {})
+                if not base:
+                    from config import PIPELINE_CAPACITY_RESERVE_MB
+                    base = {"node_id": node_id, "role": "client", "score": 0.0,
+                            "reserve_bytes": int(PIPELINE_CAPACITY_RESERVE_MB * 1024**2)}
+                engines = inventory.get("engines") or []
+                engine = sources["master_engine"] if node_id == "master" else (
+                    "llama_cpp" if "llama_cpp" in engines and "llama_cpp" in sources["descriptors"] else
+                    "pytorch" if "pytorch" in engines and "pytorch" in sources["descriptors"] else "")
+                if not engine:
+                    raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No compatible source for {node_id}")
+                if engine == "llama_cpp":
+                    base.update(capacity_bytes=int(inventory.get("memory_available_bytes", 0)),
+                                capacity_source="supply.ram.available_bytes_live", execution_device="cpu", runtime_multiplier=2.0)
+                if engine == "pytorch":
+                    from model_supply_runtime_capacity import project_runtime_descriptor
+                    runtime = inventory.get("pytorch_runtime")
+                    if not isinstance(runtime, dict):
+                        raise ModelSupplyError("SUPPLY_RUNTIME_BUDGET_MISSING", f"Worker {node_id} has no selected PyTorch runtime budget")
+                    device = str(runtime.get("execution_device", ""))
+                    element_size = runtime.get("target_element_size")
+                    available = runtime.get("available_bytes")
+                    if (device not in {"cpu", "cuda"} or type(available) is not int or available <= 0):
+                        raise ModelSupplyError("SUPPLY_RUNTIME_BUDGET_MISSING", f"Worker {node_id} has an invalid runtime memory budget")
+                    projection = project_runtime_descriptor(sources["hf"], sources["descriptors"]["pytorch"], element_size)
+                    if device == "cuda":
+                        # Selective loaders read Safetensors on CPU and transfer one
+                        # tensor at a time. Charge target weights to VRAM, source
+                        # staging separately to RAM, never RAM bytes to VRAM.
+                        runtime_host_descriptors[node_id] = projection
+                        projection = {**projection,
+                            "weight_bytes": projection["runtime_weight_bytes"],
+                            "layer_weight_bytes": projection["runtime_layer_weight_bytes"],
+                            "component_weight_bytes": projection["runtime_component_weight_bytes"]}
+                    runtime_descriptors[node_id] = projection
+                    base.update(capacity_bytes=available, execution_device=device, runtime_multiplier=1.0,
+                                capacity_source="supply.cuda.mem_get_info" if device == "cuda" else "supply.ram.available_bytes_live")
+                base["engine"] = engine
+                logger.info("event=supply_runtime_budget operation=%s node=%s engine=%s device=%s capacity_bytes=%s reserve_bytes=%s multiplier=%s score=%s",
+                            op_id, node_id, engine, base.get("execution_device"), base.get("capacity_bytes"),
+                            base.get("reserve_bytes"), base.get("runtime_multiplier"), base.get("score"))
+                records.append(base)
+            from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
+            from model_supply_host_capacity import allowed_host_layer_ranges
+            runtime_host_ranges = {}
+            for node_id, projection in runtime_host_descriptors.items():
+                runtime_host_ranges[node_id] = allowed_host_layer_ranges(
+                    projection, node_id=node_id,
+                    available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                    reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                )
+                if not runtime_host_ranges[node_id]:
+                    raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage a proper source segment in RAM")
+            from model_supply_plan_reuse import plan_segment_supply_reuse
+            def capacity_plan(*, preferred_ranges):
+                return plan_segment_supply(sources["descriptors"], records,
+                    master_engine=sources["master_engine"], alignment=sources["alignment"],
+                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                    runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
+                    runtime_host_ranges=runtime_host_ranges)
+            plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
+                planner=capacity_plan, source_model_id=sources["source_model_id"],
+                source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
+                engine_by_node={record["node_id"]:record["engine"] for record in records},
+                alignment=sources["alignment"])
+            if not plan.get("admitted"):
+                code = str(plan.get("reason_code", "SUPPLY_CAPACITY_INSUFFICIENT"))
+                if (auto_pool and code in {"pipeline_distributed_capacity_insufficient", "SUPPLY_CAPACITY_INSUFFICIENT"}
+                        and self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline,
+                                                        wait_for_new=True)):
+                    continue
+                raise ModelSupplyError(code, "No feasible segment supply plan")
+            if auto_pool and self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline):
                 continue
-            components = projection["source_component_weight_bytes"]
-            keys = ("embedding", "final_norm", "other") if node_id == "master" else ("embedding", "final_norm", "lm_head", "other")
-            source_bytes = sum(projection["source_layer_weight_bytes"][assignment["start_layer"]:assignment["end_layer"]])
-            source_bytes += sum(int(components.get(key, 0)) for key in keys)
-            reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
-            required = math.ceil(source_bytes * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
-            if required > int(inventories[node_id].get("memory_available_bytes", 0)):
-                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage its selected source tensors in RAM")
-            assignment.update(host_source_bytes=source_bytes, host_required_bytes=required,
-                              runtime_target_element_size=projection["runtime_target_element_size"])
-        self._update(op_id, status="building", plan=plan)
+            # CUDA still needs host source mappings. Gate the selected segment's
+            # complete source bytes against real RAM plus the configured reserve.
+            for assignment in plan["assignments"]:
+                node_id = assignment["node_id"]
+                projection = runtime_host_descriptors.get(node_id)
+                if projection is None:
+                    continue
+                components = projection["source_component_weight_bytes"]
+                keys = ("embedding", "final_norm", "other") if node_id == "master" else ("embedding", "final_norm", "lm_head", "other")
+                source_bytes = sum(projection["source_layer_weight_bytes"][assignment["start_layer"]:assignment["end_layer"]])
+                source_bytes += sum(int(components.get(key, 0)) for key in keys)
+                reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
+                required = math.ceil(source_bytes * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
+                if required > int(inventories[node_id].get("memory_available_bytes", 0)):
+                    raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage its selected source tensors in RAM")
+                assignment.update(host_source_bytes=source_bytes, host_required_bytes=required,
+                                  runtime_target_element_size=projection["runtime_target_element_size"])
+            break
+        with self._condition:
+            self._check(op_id)
+            self._check_receivers(op_id)
+            self._update(op_id, status="building", plan=plan)
         from model_supply_assets import build_gguf_segment, build_safetensors_segment
         pending_receipts = []
         for assignment in plan["assignments"]:
@@ -743,8 +898,15 @@ class ModelSupplyCoordinator:
 
     def ensure_prepare_not_cancelled(self, op_id):
         with self._condition:
-            if self._preparing == op_id and self._prepare_cancelled:
+            event = self._events.get(op_id)
+            # A live guard owns its attempt. Keep the operation event as a fence
+            # after that guard exits, when an abandoned native thread may return.
+            cancelled = self._prepare_cancelled if self._preparing == op_id else bool(event and event.is_set())
+            if cancelled:
                 raise ModelSupplyError("SUPPLY_PREPARE_CANCELLED", "Model preparation cancelled by user")
+            if self._active and self._active != op_id:
+                raise ModelSupplyError("SUPPLY_OPERATION_STALE", "Model preparation was superseded")
+        self._check_master()
 
     def prepared_source(self, op_id) -> dict:
         self._check_master()

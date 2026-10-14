@@ -35,7 +35,7 @@ try:  # 直接运行（python src/tui_commands.py）
         ApiClient,
         ApiError,
     )
-    from tui_shared import API_PATHS, format_metrics, parse_session_line
+    from tui_shared import API_PATHS, format_metrics, format_model_intent, parse_session_line
     from tui_sse import SSEDecoder, decode_json_event
 except ImportError:  # pragma: no cover - 包导入路径
     from .tui_api import (  # type: ignore
@@ -45,14 +45,14 @@ except ImportError:  # pragma: no cover - 包导入路径
         ApiClient,
         ApiError,
     )
-    from .tui_shared import API_PATHS, format_metrics, parse_session_line  # type: ignore
+    from .tui_shared import API_PATHS, format_metrics, format_model_intent, parse_session_line  # type: ignore
     from .tui_sse import SSEDecoder, decode_json_event  # type: ignore
 
 # ---------------------------------------------------------------- 只读命令表
 
 READ_ONLY_COMMANDS: Dict[str, str] = {
     "status": "系统状态与当前模型（/health、/status、/models/current）",
-    "models": "模型列表与当前模型（/models、/models/current）",
+    "models": "模型目录与当前状态（分布式读取 intent catalog/current）",
     "nodes": "集群节点列表（/cluster/nodes）",
     "queue": "请求队列与调度策略（/cluster/queue）",
     "device": "本机设备画像（/device/profile）",
@@ -123,7 +123,8 @@ def _line(label: str, value: Any) -> str:
 def cmd_status(api: ApiClient, args: argparse.Namespace) -> int:
     health = api.get("/health")
     status = _safe(api, "/status")
-    current = _safe(api, API_PATHS["models_current"])
+    distributed = _distributed_mode(api, status)
+    current = _safe(api, API_PATHS["models_intent_current"] if distributed else API_PATHS["models_current"])
     _emit({"health": health, "status": status, "current_model": current}, args.json)
     if args.json:
         return 0
@@ -134,7 +135,9 @@ def cmd_status(api: ApiClient, args: argparse.Namespace) -> int:
         print(_line("节点角色", status.get("node_role")))
         print(_line("节点 ID", status.get("node_id")))
         print(_line("最大节点数", status.get("max_nodes")))
-    if isinstance(current, dict):
+    if distributed and isinstance(current, dict):
+        print(format_model_intent(current))
+    elif isinstance(current, dict):
         print(_line("当前模型", current.get("model_id") or current.get("name")))
         print(_line("引擎", current.get("engine")))
         print(_line("格式", current.get("format")))
@@ -142,12 +145,22 @@ def cmd_status(api: ApiClient, args: argparse.Namespace) -> int:
 
 
 def cmd_models(api: ApiClient, args: argparse.Namespace) -> int:
-    registry = _safe(api, "/models")
-    current = _safe(api, API_PATHS["models_current"])
+    status = _safe(api, API_PATHS["system_status"])
+    distributed = _distributed_mode(api, status)
+    registry = _safe(api, API_PATHS["models_intent_catalog"] if distributed else API_PATHS["models_list"])
+    current = _safe(api, API_PATHS["models_intent_current"] if distributed else API_PATHS["models_current"])
     _emit({"models": registry, "current": current}, args.json)
     if args.json:
         return 0
-    current_id = (current or {}).get("model_id") if isinstance(current, dict) else None
+    current_id = ((current.get("intent") or {}).get("model_id") if distributed
+                  else current.get("model_id")) if isinstance(current, dict) else None
+    if distributed:
+        binding = (registry.get("binding") or {}) if isinstance(registry, dict) else {}
+        print(_line("主节点连接", binding.get("status")))
+        if binding.get("reason_code") or binding.get("reason"):
+            print(_line("连接原因", f"{binding.get('reason_code', '')}: {binding.get('reason', '')} · TUI J 发现/重试连接"))
+        if isinstance(current, dict):
+            print(format_model_intent(current))
     items = registry.get("models") if isinstance(registry, dict) else registry
     if isinstance(items, dict):
         items = [{"model_id": key, **(value if isinstance(value, dict) else {})}
@@ -161,7 +174,8 @@ def cmd_models(api: ApiClient, args: argparse.Namespace) -> int:
         model_id = item.get("model_id") or item.get("name") or "—"
         mark = "*" if model_id == current_id else " "
         print("  %s %-32s %-9s %s" % (
-            mark, model_id, item.get("format") or "—", item.get("engine") or "—"))
+            mark, model_id, item.get("format") or ", ".join(item.get("available_formats") or []) or "—",
+            item.get("engine") or item.get("preferred_engine") or "—"))
     print(_line("当前模型", current_id))
     return 0
 
@@ -298,6 +312,13 @@ COMMAND_HANDLERS: Dict[str, Callable[[ApiClient, argparse.Namespace], int]] = {
     "device": cmd_device,
     "logs": cmd_logs,
 }
+
+
+def _distributed_mode(api: ApiClient, status: Any) -> bool:
+    config = _safe(api, API_PATHS["distributed_config"])
+    if isinstance(config, dict) and isinstance(config.get("enabled"), bool):
+        return config["enabled"]
+    return isinstance(status, dict) and status.get("run_mode") == "distributed"
 
 
 def _safe(api: ApiClient, path: str) -> Any:

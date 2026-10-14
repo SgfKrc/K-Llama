@@ -2509,8 +2509,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         #   路径（同层范围、同 prompt）的输出**逐位对照**，而此前链路上没有任何可对照
         #   的中间量 —— 只能看到"最终 token 不同"，无法判断差异出在 master 段还是设备段。
         logger.info(
-            "Route-A stage handoff: node=%s stage=%s tokens=%d hidden_sha256=%s",
+            "Route-A stage handoff: node=%s stage=%s tokens=%d hidden_sha256=%s "
+            "workflow_id=%s stage_request_id=%s",
             node_id, stage_id, n_tokens, stage_fields["hidden_sha256"],
+            workflow_id, request_id,
         )
         request = StageRequest(
             workflow_id=str(workflow_id),
@@ -7766,6 +7768,16 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             #   （`route_a:{task_id}`）。
             "config_id": f"route_a:{task_id}",
         }
+        # Expose the immutable model selection identity alongside the task's
+        # Route-A contract ID. UI progress can follow supply -> native commit ->
+        # inference without confusing the per-request task with its model plan.
+        prepare_identities = [item.get("worker_prepare_identity", {}) for item in stage_nodes]
+        model_selections = {(item.get("operation_id"), item.get("config_id"), item.get("generation"))
+                            for item in prepare_identities}
+        if len(model_selections) == 1 and all(item.get("operation_id") for item in prepare_identities):
+            operation_id, model_config_id, model_generation = next(iter(model_selections))
+            pipeline_metrics.update(model_operation_id=operation_id, model_config_id=model_config_id,
+                                    model_generation=model_generation)
         generated_ids: list[int] = []
         full_input_ids = input_ids
         new_token_id: int | None = None

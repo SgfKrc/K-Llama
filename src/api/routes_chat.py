@@ -238,6 +238,11 @@ async def _watch_client_disconnect(request: Request, cancel_event,
     except Exception:                       # 断开检测本身失败不得影响请求
         _api_module.logger.warning("客户端断开检测失败", exc_info=True)
 
+def _check_registered_chat_source(request):
+    if _api_module.is_registered_chat_request(request):
+        _api_module.require_model_intent_source(request, _api_module.scheduler)
+
+
 async def chat(req: ChatRequest, request: Request = None):
     """
     发送消息并获取模型回复（多轮对话）。
@@ -249,6 +254,7 @@ async def chat(req: ChatRequest, request: Request = None):
     （`tests/test_task_graph_api.py` 多处 `api_server.chat(req)`）；
     经 FastAPI 路由进入时总会被注入真实 `Request`，断开检测才会生效。
     """
+    _check_registered_chat_source(request)
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
     request_deadline = _api_module.RequestDeadline.start(
@@ -280,6 +286,7 @@ async def chat(req: ChatRequest, request: Request = None):
         )
 
     def _run_chat_request_unlocked():
+        _check_registered_chat_source(request)
         if req.execution_mode == "task_graph":
             if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
                 raise _api_module.HTTPException(
@@ -288,6 +295,15 @@ async def chat(req: ChatRequest, request: Request = None):
                 )
             return _api_module._execute_requested_chat(
                 req, cancel_event, request_deadline,
+            )
+        # A required worker request waits on the master, which can dispatch a
+        # layer stage back to this same worker. Holding its model lock across
+        # that wait would prevent the stage from executing. Required routing
+        # already fails closed instead of running a local fallback.
+        if (req.routing_preference == "distributed_required"
+                and _api_module._should_forward_chat_to_master()):
+            return _api_module._execute_requested_chat(
+                req, cancel_event, request_deadline, forward_only=True,
             )
         with _api_module.hold_lock_until_deadline(
             _api_module.model_host.full_chat_execution_lock,
@@ -395,6 +411,7 @@ async def chat_stream(req: ChatRequest, request: Request):
     import asyncio as _asyncio
     import json as _json
     request_id = _api_module._request_id_ctx.get("-")
+    _check_registered_chat_source(request)
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
     request_deadline = _api_module.RequestDeadline.start(
@@ -407,6 +424,11 @@ async def chat_stream(req: ChatRequest, request: Request):
         completed_normally = False
         transaction_acquired = False
         try:
+            if req.streaming_mode == "full" or req.execution_mode == "task_graph":
+                # Flush headers through proxies before context/model locks or
+                # generation can consume the client's connection timeout.
+                # SSE comments carry no token or completion semantics.
+                yield ": processing\n\n"
             loop = _asyncio.get_running_loop()
             acquire_future = loop.run_in_executor(
                 None,
@@ -855,6 +877,7 @@ async def chat_stream(req: ChatRequest, request: Request):
             loop = _asyncio.get_running_loop()
 
             def _execute_full_stream_request():
+                _check_registered_chat_source(request)
                 if req.execution_mode == "task_graph":
                     if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
                         raise _api_module.HTTPException(
@@ -863,6 +886,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                         )
                     return _api_module._execute_requested_chat(
                         req, cancel_event, request_deadline,
+                    )
+                # Keep this worker available for the master's returning stage.
+                if (req.routing_preference == "distributed_required"
+                        and _api_module._should_forward_chat_to_master()):
+                    return _api_module._execute_requested_chat(
+                        req, cancel_event, request_deadline, forward_only=True,
                     )
                 with _api_module.hold_lock_until_deadline(
                     _api_module.model_host.full_chat_execution_lock,
@@ -883,6 +912,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 result = await _run_with_request_id(
                     loop, _execute_full_stream_request,
                 )
+                _check_registered_chat_source(request)
                 _done_payload = _json.dumps({
                     'done': True,
                     'response': result['content'],

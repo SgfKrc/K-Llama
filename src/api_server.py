@@ -82,6 +82,10 @@ from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
 from model_api_access import require_model_api_source
+from model_intent_access import (
+    is_path_free_intent_request, is_registered_chat_request,
+    mark_registered_chat_request, require_model_intent_source,
+)
 
 if TYPE_CHECKING:  # torch-backed (D-tier); imported lazily so the L-tier can start.
     from paged_kv_cache import PagedKVCache
@@ -473,6 +477,8 @@ def _is_control_write_path(request: Request) -> bool:
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return False
     path = request.url.path
+    if path.startswith("/api/models/intent") and scheduler._effective_role() == "master":
+        return True
     if path.startswith("/api/cluster/queue"):
         return True
     if path.startswith("/api/cluster/config") or path.startswith("/api/cluster/layers"):
@@ -513,9 +519,16 @@ async def api_boundary_middleware(request: Request, call_next):
             )
         except ModelSupplyError as exc:
             return _boundary_response(403, {"code": exc.code, "message": exc.message})
+    intent_source_request = (
+        is_path_free_intent_request(request)
+        or await mark_registered_chat_request(request, scheduler)
+    )
     if not supply_file_request and path not in _API_SOURCE_EXEMPT_PATHS:
         try:
-            require_model_api_source(request)
+            if intent_source_request:
+                require_model_intent_source(request, scheduler)
+            else:
+                require_model_api_source(request)
         except HTTPException as exc:
             return _boundary_response(exc.status_code, exc.detail)
 
@@ -549,7 +562,13 @@ async def api_boundary_middleware(request: Request, call_next):
             )
 
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        if intent_source_request:
+            try:
+                require_model_intent_source(request, scheduler)
+            except HTTPException as exc:
+                return _boundary_response(exc.status_code, exc.detail)
+        return response
     except ControlFenceError as exc:
         status = 503 if exc.code == "control_fence_unavailable" else 409
         return _boundary_response(status, {"code": exc.code, "message": str(exc)})
@@ -1179,6 +1198,9 @@ def _run_exclusive_model_change(
 # 启动事件 — 设备检测（通过 lifespan 调用）
 # ============================================================
 
+_master_discovery_responder = None
+
+
 def _run_runtime_startup() -> None:
     """Run the slower runtime initialization outside the HTTP event loop."""
     try:
@@ -1192,7 +1214,7 @@ def _run_runtime_startup() -> None:
 
 def _startup_device_detection():
     """Initialize local runtime components and detect slower hardware in background."""
-    global device_profile, _device_profile_started
+    global device_profile, _device_profile_started, _master_discovery_responder
     active_scheduler: ClusterScheduler = globals()["scheduler"]
 
     _mark_runtime_component("local_store", False)
@@ -1250,6 +1272,10 @@ def _startup_device_detection():
         _mark_runtime_component("scheduler", False, error=str(e))
 
     # L5: 启动日志保留策略清理线程
+    from model_intent_discovery import MasterDiscoveryResponder
+    _master_discovery_responder = MasterDiscoveryResponder(active_scheduler, API_PORT)
+    _master_discovery_responder.start()
+
     try:
         _start_log_retention_thread()
     except Exception as e:
@@ -1285,6 +1311,9 @@ def _startup_device_detection():
 async def _shutdown_resources():
     """应用关闭时清理调度器、推理引擎与 TCP 服务。"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
+    await _intent_routes.shutdown()
+    if _master_discovery_responder is not None:
+        await run_in_threadpool(_master_discovery_responder.stop)
     try:
         with model_host.full_chat_execution_lock:
             task_graph_coordinator.close()
@@ -4153,6 +4182,8 @@ def _execute_chat_full(
     req: ChatRequest,
     cancel_event: Optional[threading.Event] = None,
     request_deadline: Optional[RequestDeadline] = None,
+    *,
+    forward_only: bool = False,
 ) -> dict:
     """
     执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
@@ -4174,6 +4205,14 @@ def _execute_chat_full(
     )
     request_deadline.require_remaining()
     # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
+    if forward_only and (
+        req.routing_preference != "distributed_required"
+        or not _should_forward_chat_to_master()
+    ):
+        raise coded_http_error(
+            409, "DISTRIBUTED_FORWARD_CONTEXT_CHANGED",
+            "The worker forwarding context changed; retry the request",
+        )
     routing_gate = _routing_gate_error(req)
     if routing_gate:
         raise HTTPException(400, routing_gate)
@@ -4252,10 +4291,13 @@ def _execute_chat_full(
             logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
 
     # ---- 分布式推理路由：从节点转发给主节点（local_only 强制本地）----
-    if (req.routing_preference != "local_only"
+    # A request admitted without the host model lock must remain forwarding-only,
+    # even if its role changes after the live check above. The forwarding owner
+    # rechecks the connection/role and required routing rejects any failed result.
+    if (forward_only or (req.routing_preference != "local_only"
             and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
-            and scheduler._effective_role() == "client"):
+            and scheduler._effective_role() == "client")):
         try:
             result = scheduler.forward_inference_to_master(
                 message=req.message,
@@ -4864,12 +4906,16 @@ def _execute_requested_chat(
     req: ChatRequest,
     cancel_event: Optional[threading.Event] = None,
     request_deadline: Optional[RequestDeadline] = None,
+    *,
+    forward_only: bool = False,
 ) -> dict:
     if req.execution_mode == "task_graph":
         return _execute_task_graph_chat(
             req, cancel_event, request_deadline,
         )
-    return _execute_chat_full(req, cancel_event, request_deadline)
+    return _execute_chat_full(
+        req, cancel_event, request_deadline, forward_only=forward_only,
+    )
 
 
 def _commit_interactive_history(
@@ -6644,6 +6690,7 @@ from api import routes_logs as _logs_routes
 from api import routes_cluster as _cluster_routes
 from api import routes_models as _models_routes
 from api import routes_model_supply as _supply_routes
+from api import routes_model_intent as _intent_routes
 from api import routes_auth as _auth_routes
 from api import routes_sessions as _sessions_routes
 from api import routes_tasks as _tasks_routes
@@ -6651,7 +6698,7 @@ from api import routes_chat as _chat_routes
 from api import routes_system as _system_routes
 
 _api_route_modules = (
-    _health_routes, _device_routes, _cluster_routes, _models_routes, _supply_routes,
+    _health_routes, _device_routes, _cluster_routes, _models_routes, _supply_routes, _intent_routes,
     _auth_routes, _sessions_routes, _tasks_routes, _chat_routes,
     _system_routes, _logs_routes,
 )
