@@ -4,7 +4,9 @@ K-Llama（Llama for Koakuma）是面向异构边缘设备的分布式推理核�
 
 > **独立项目 · 非官方**：K-Llama 是独立的学生创新项目（北京交通大学 2026 大创），与 llama.cpp 项目没有隶属、赞助或背书关系，也不代表其官方立场。项目基于 llama.cpp 构建（描述性引用），不主张对 "llama.cpp"、"llama" 或任何上游名称的所有权或商标权；上游组件保留其自身许可证与版本锁定。
 
-> 状态：**现行**（2026-10-02）
+> 状态：**现行**
+>
+> 更新日期：2026-10-14
 >
 > 本 README 只描述主仓当前边界和可复现入口。实验记录、历史实现和外置子项目不等同于主仓生产能力。
 >
@@ -17,7 +19,7 @@ K-Llama（Llama for Koakuma）是面向异构边缘设备的分布式推理核�
 - 让 Edge 节点默认使用 1B 以内模型完成本地推理，同时保留作为大模型 RPC worker 的能力。
 - 用同一套层段合同管理三类节点（本机、远端 RPC、跨框架），并按设备画像与能力选择引擎。
 - 通过设备画像、容量计划、模型身份、层段合同、租约和 epoch fencing 控制分布式准入与故障恢复。
-- 用 Textual TUI 访问聊天、模型资产、节点、分布式布局、队列、设备、日志和设置；只读单命令走标准库薄层。
+- 用 Textual TUI 访问聊天、状态、模型资产、节点、分布式布局、队列、设备、日志和设置；只读单命令走标准库薄层。
 
 引擎分**双档**，两档都在主仓：
 
@@ -25,6 +27,8 @@ K-Llama（Llama for Koakuma）是面向异构边缘设备的分布式推理核�
 | --- | --- | --- | --- |
 | **L 档** | llama.cpp / GGUF | 单机推理、RPC 部分驻留、TUI 对话、优化三件套 | 无 torch（Edge 默认） |
 | **D 档** | PyTorch / Safetensors | 层拆分与张量放置、层间流水线、多节点层段承载、跨框架接力上游侧，以及同卡对照实验 | torch |
+
+L 档内部按能力再分两条路径，由 `src/inference_path_selector.py` 的 `select_inference_path` 裁决、`src/config.py` 的 `INFER_PATH` 开关控制（默认 `auto`）：检测到 CUDA 且本机有 `llama-server` 二进制时走 `llama_server` 子进程路径，否则走 QLH 引擎内的 llama.cpp 绑定路径；层段接力强制绑定，显式请求 `llama_server` 而二进制缺失时 fail-closed。两条路径对外都报 `engine_type="llama_cpp"`（`src/llama_server_engine.py`），差异经 `inference_path` / `capability()` / `supports()` 暴露。
 
 D 档不进入 Edge 默认依赖，但层拆分、层流水线、跨框架接力由 PyTorch 系实现（`src/model_module.py`、`src/tcp_comm.py`、`src/qwen3_pipeline_*.py`）。同卡单序列实测 llama.cpp 更快（约 4.3×，口径见[跨框架层接力项目报告](docs/跨框架层接力-项目报告.md)），默认生产路径是 L 档。
 
@@ -105,11 +109,11 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 | --- | --- |
 | 正确性 | 主仓双引擎 D→L 矩阵 27/27 逐 token 一致（qwen2.5-0.5B K=4/8/12/16/20、qwen3.5-2B K=8/12/16/20；负载 prefill 32/128/512、decode 32/64/256；batch 2/4；混合精度 fp16·f32·NF4 × Q4_K_M） |
 | 样本 | qwen2.5-0.5B、12+12 层、gen=32：上游 `model_module.forward_layers` + 下游 `llama_engine.forward_layers_from_hidden`，**47.501 ms/步**，与纯 llama.cpp 整模逐 token 一致 |
-| 容量 | 两段切分收益 qwen2.5-0.5B **1.568×** / qwen3-2b **1.547×**；同一受控 3.0 GB CUDA 预算下整模被拒、12 层上游通过（该预算是可复现实验约束，非物理 OOM） |
+| 容量 | 两段切分收益 qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×**（严格口径：`C` 只计不属于任何 `*.layers.<i>.*` 的张量，实算见 `src/relay_capacity_budget.py`；把 `model.visual.*` 视觉塔也算可分层时为 1.613×）；同一受控 3.0 GB CUDA 预算下整模被拒、12 层上游通过（该预算是可复现实验约束，非物理 OOM） |
 | 上游 compile | 上游 PyTorch 全精度 + 下游 GGUF 量化是刻意的"不完整量化"策略，必须与同精度下游整模对拍 |
 | L→L 通道 | pip 绑定的 `llama_get_embeddings_ith` 返回 `output_norm(H)`（实测 cos 0.999998），不能作层接力上游；补丁版 keep-head 通道已打通，`--path l2l_keep_head` / `d2l2l_keep_head` 实测 32/32（含「1 torch 上游 + 2 llama 下游」三段） |
 | 切点求解 | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`：从实测拟合段画像（固定开销 + 每层耗时）再求解，输出 `capacity_feasible` / `latency_estimate` / `risk_penalty`；n 段、含 Qwen3.5 的 4 层倍数硬约束。2 段闭环在 qwen2.5（r² 0.96/0.99）与 qwen3.5（0.79/0.96）通过 |
-| 生产定位 | 正确性已满足 Relay 合同准入；速度只影响默认路由倾向。长时、跨机资产自动分发和多段故障验收未完成 |
+| 生产定位 | 正确性已满足 Relay 合同准入；速度只影响默认路由倾向。跨机长时（LL/DL 三段 `gen=256` 逐 token 一致）与多段切点组合（G2/G3 32/32）已于 2026-09-26 通过；资产自动分发与故障注入验收未完成 |
 
 **关键量化结论**：两侧计算占 99.3%（通信 + 同步 + 批量仅 0.34%）；单项最大收益是消除上游对 20 层的空转（10.7×）；层流水线上游只载 `embed_tokens + L0-3`（1.47 GB vs 4.55 GB，3.1×）。已否证的假设：进程边界（仅 8%）、复用 `llama_batch`（0.09%）、上游层朴素截断（数值错）、把 `--override-tensor` 当提速（实为容量旋钮）。瓶颈在两侧计算（切点、kernel、批量），不在传输层。
 
@@ -145,12 +149,13 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 | 同机双进程 RPC | 已有 llama host + `ggml-rpc-server` 模拟及合同测试；不等同于跨机生产准入 |
 | PC RPC | 有设备评分、自动层数规划、租约/断线回退和资产同步合同；吞吐收益未宣称，容量收益与 D→L 分开验收 |
 | 层段合同与自动重分片 | 合同、布局 fail-closed 校验、容量重解与 epoch 原子提交的开发门已完成；真实 PC/Android 故障注入、长时和性能验收待做 |
-| 跨框架逐层接力（D→L） | 正确性已准入（27/27 逐 token 一致）；长时、跨机与多段验收待补。默认路由优先可直接整模运行的 L/RPC 路径 |
+| 跨框架逐层接力（D→L） | 正确性已准入（27/27 逐 token 一致）；跨机长时（LL/DL 三段 `gen=256`，256/256）与多段切点组合（32/32）已通过；资产自动分发与故障注入验收待补。默认路由优先可直接整模运行的 L/RPC 路径 |
 | PyTorch D 档 | 层拆分/层间流水线/多节点层段承载的实现方，兼作对照实验；不进入 Edge 默认依赖 |
 | Relay R | L→L、D→L、f32/采样矩阵和 SSH 跨机证据已完成正确性验证；容量收益已量化；默认路由不替代可直接整模的 L/RPC |
 | Android | `qlh-android` P0 交叉编译/JNI 已完成；P1 的设备运行、RPC worker、断线、热/电和安全证据未完成 |
 | 运行环境 | 版本窗口以 [`requirements.txt`](requirements.txt) 为准（`transformers>=5.17.0,<5.18.0`、`llama-cpp-python==0.3.35`）；全部 PyTorch 侧车统一到 5.17.0；`.venv-test` 含 `triton-windows`，Windows 原生 `torch.compile` 可用 |
-| 模型资产 | 模型文件不入 Git；主仓资产清单支持 Qwen2.5-0.5B、Qwen3-0.6B、MiniCPM4-0.5B、DistilQwen2.5-DS3-0324-7B 等登记模型 |
+| 模型资产 | 模型文件不入 Git（本机 `models/` 是 Junction，指向仓库外目录）；主仓资产清单支持 Qwen2.5-0.5B、Qwen3-0.6B、Qwen3.5-2B、Qwen3VL-4B、MiniCPM4-0.5B、DistilQwen2.5-DS3-0324-7B 等登记模型；Qwen3.6-35B-A3B 及其社区蒸馏/派生版（`qwen35moe` 与 `qwen3next` 两种架构头）已在本机 llama.cpp `b10964` 实测可加载 |
+| 选模与供给意图 | 统一入口 `POST/GET/DELETE /api/models/intent`（含 `/catalog`、`/current`、`/connect`）：用户只提交模型 ID、engine、量化与自动策略，master 沿既有供给与 native prepare 事务完成规划、传输、校验、装载与提交；Web 模型页、Textual TUI 与 Android 选模面板共用同一目录与 operation 进度（`src/model_intent*.py`、`src/api/routes_model_intent.py`） |
 
 没有标注真实设备、跨机或生产验收的实验，只作为开发证据或 PoC 使用。
 
@@ -265,12 +270,12 @@ python -m pip install -r requirements-tui.txt
 ```bash
 python qlh.py chat
 python qlh.py chat --route distributed_preferred --thinking
-python qlh.py chat --fixture fixtures/chat.json
+python qlh.py chat --fixture fixtures/chat_interactive_fixture.sse
 python qlh.py status
 python qlh.py models
 ```
 
-`qlh chat` 在本机后端未运行时于当前进程的 daemon 线程中启动后端，并在启动屏显示探活阶段；后端日志写入既有日志文件与日志页面。`status`、`models` 等单命令不自动启动后端，`--fixture` 是不联网的聊天事件回放路径。写操作从外壳发起：模型屏 `L` 加载 / `U` 卸载，队列屏 `P` 暂停-恢复 / `S` 策略 / `C` 清空排队，聊天屏可用 `/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`；破坏性与长耗时操作先弹确认框。模型控制接口按 loopback 默认放行，远程控制主节点需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
+`qlh chat` 在本机后端未运行时于当前进程的 daemon 线程中启动后端，并在启动屏显示探活阶段；后端日志写入既有日志文件与日志页面。`status`、`models` 等单命令不自动启动后端，`--fixture` 是不联网的聊天事件回放路径。写操作从外壳发起：模型屏 `L` 选模（自动供给并准备）/ `U` 卸载 / `C` 取消选模，队列屏 `P` 暂停-恢复 / `S` 策略 / `C` 清空排队，聊天屏可用 `/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`；破坏性与长耗时操作先弹确认框。模型控制接口按 loopback 默认放行，远程控制主节点需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
 
 Windows 可直接用 `qlh.bat`（或 `K-Llama.bat`），Linux/macOS 用 `qlh.sh`（或 `K-Llama.sh`）；三者转发到同一入口脚本 `qlh.py`。页面清单与命令语义见 [TUI 使用指南](docs/TUI使用指南.md) 与 [TUI 指令集](docs/TUI指令集.md)。
 
@@ -326,7 +331,7 @@ python -m venv .venv-test
 .\.venv-test\Scripts\python.exe -m pytest -q tests/test_pipeline_node_contract.py tests/test_pipeline_reshard.py tests/test_pipeline_capacity.py
 ```
 
-串行全量基线：**3751 passed / 30 skipped / 0 failed**（`-n 0`，2026-10-02，HEAD `fa5280ca`）。xdist 并发下偶有 flaky，判定以串行为准。
+串行全量基线：**6055 passed / 33 skipped / 0 failed**（`-n 0`，2026-10-14，HEAD `b84522f3`）。xdist 并发下偶有 flaky，判定以串行为准。
 
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯不替代这些证据。测试通道划分与标记语义见[测试通道运行说明](docs/测试通道运行说明.md)，判据与对照组见[测试与评判标准](docs/测试与评判标准.md)。
 

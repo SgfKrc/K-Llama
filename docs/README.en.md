@@ -4,7 +4,9 @@ K-Llama (Llama for Koakuma) is a distributed inference core for heterogeneous ed
 
 > **Independent project · not official**: K-Llama is an independent student innovation project (Beijing Jiaotong University, 2026) with no affiliation, sponsorship or endorsement from the llama.cpp project, and it does not represent that project's position. It is built on llama.cpp (a descriptive reference only; no ownership of or trademark claim to "llama.cpp", "llama" or any upstream name is asserted). Upstream components keep their own licenses and version pins.
 
-> Status: **current** (2026-10-02)
+> Status: **current**
+>
+> Updated: 2026-10-14
 >
 > This README describes only the current boundary of the main repository and its reproducible entry points. Experiment logs, historical implementations and external sub-projects are not equivalent to production capability.
 >
@@ -17,7 +19,7 @@ K-Llama (Llama for Koakuma) is a distributed inference core for heterogeneous ed
 - Lets an Edge node complete local inference with <=1B models by default, while retaining the ability to serve as an RPC worker for larger models.
 - Manages three node kinds (local, remote RPC, cross-framework) under one layer-segment contract, and selects the engine by device profile and capability.
 - Controls distributed admission and failure recovery through device profiling, capacity planning, model identity, layer-segment contracts, leases and epoch fencing.
-- Uses a Textual TUI for chat, model assets, nodes, distributed layout, queue, device, logs and settings; read-only single commands use a standard-library thin layer.
+- Uses a Textual TUI for chat, status, model assets, nodes, distributed layout, queue, device, logs and settings; read-only single commands use a standard-library thin layer.
 
 The engine is **dual-track**, and both tracks live in the main repository:
 
@@ -25,6 +27,8 @@ The engine is **dual-track**, and both tracks live in the main repository:
 | --- | --- | --- | --- |
 | **L** | llama.cpp / GGUF | Single-machine inference, RPC partial residency, TUI chat, the optimization trio | No torch (Edge default) |
 | **D** | PyTorch / Safetensors | Layer splitting and tensor placement, inter-layer pipeline, multi-node layer-segment hosting, the upstream side of cross-framework relay, and the same-card control experiments | torch |
+
+The L track is itself split into two paths by capability, decided by `select_inference_path` in `src/inference_path_selector.py` and controlled by the `INFER_PATH` switch in `src/config.py` (default `auto`): with CUDA detected and a local `llama-server` binary present it uses the `llama_server` subprocess path, otherwise it uses the llama.cpp binding inside the QLH engine. Layer-segment relay is forced onto the binding path, and an explicit `llama_server` request with no binary fails closed. Both paths report `engine_type="llama_cpp"` externally (`src/llama_server_engine.py`); the difference surfaces through `inference_path` / `capability()` / `supports()`.
 
 The D track is not part of the Edge default dependency set, but layer splitting, the layer pipeline and cross-framework relay are implemented by the PyTorch stack (`src/model_module.py`, `src/tcp_comm.py`, `src/qwen3_pipeline_*.py`). On the same card llama.cpp is faster for a single sequence (about 4.3x; for the measurement setup see the [cross-framework relay project report](跨框架层接力-项目报告.md)), so the default production path is the L track.
 
@@ -106,11 +110,11 @@ It solves two things: letting a model that does not fit on one machine be carrie
 | --- | --- |
 | Correctness | Main-repository dual-engine D→L matrix 27/27 per-token identical (qwen2.5-0.5B K=4/8/12/16/20, qwen3.5-2B K=8/12/16/20; loads prefill 32/128/512, decode 32/64/256; batch 2/4; mixed precision fp16·f32·NF4 × Q4_K_M) |
 | Sample | qwen2.5-0.5B, 12+12 layers, gen=32: upstream `model_module.forward_layers` + downstream `llama_engine.forward_layers_from_hidden`, **47.501 ms/step**, per-token identical to the plain llama.cpp monolithic model |
-| Capacity | Two-segment gain **1.568x** for qwen2.5-0.5B and **1.547x** for qwen3-2b; under the same controlled 3.0 GB CUDA budget the monolithic model is rejected while a 12-layer upstream fits (the budget is a reproducible experiment constraint, not physical OOM) |
+| Capacity | Two-segment gain **1.568x** for qwen2.5-0.5B and **1.457x** for qwen3-2b (strict definition: `C` counts only tensors outside every `*.layers.<i>.*`, computed by `src/relay_capacity_budget.py`; counting the `model.visual.*` tower as splittable gives 1.613x); under the same controlled 3.0 GB CUDA budget the monolithic model is rejected while a 12-layer upstream fits (the budget is a reproducible experiment constraint, not physical OOM) |
 | Upstream precision | Full-precision PyTorch upstream + quantized GGUF downstream is a deliberate "incomplete quantization" strategy and must be compared against a same-precision downstream monolith |
 | L→L channel | The pip binding's `llama_get_embeddings_ith` returns `output_norm(H)` (measured cos 0.999998) and cannot serve as a relay upstream; the patched keep-head channel works — `--path l2l_keep_head` / `d2l2l_keep_head` measured 32/32 (including a three-stage "1 torch upstream + 2 llama downstream" chain) |
 | Cut-point solver | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`: fit segment profiles from measurements (fixed overhead + per-layer cost), then solve, emitting `capacity_feasible` / `latency_estimate` / `risk_penalty`; supports n segments and the 4-layer multiple hard constraint for Qwen3.5. The two-segment loop passes on qwen2.5 (r² 0.96/0.99) and qwen3.5 (0.79/0.96) |
-| Production role | Correctness already meets the Relay contract admission; speed only shifts the default routing preference. Long-run, cross-host artifact distribution and multi-segment fault acceptance remain open |
+| Production role | Correctness already meets the Relay contract admission; speed only shifts the default routing preference. Cross-host long-run (LL/DL three-segment `gen=256`, per-token identical) and multi-segment cut-point combinations (G2/G3 32/32) passed on 2026-09-26; artifact auto-distribution and fault-injection acceptance remain open |
 
 **Key quantitative conclusions**: the two sides' computation accounts for 99.3% (communication + sync + batching only 0.34%); the single largest gain is removing upstream idling on 20 layers (10.7x); the pipeline upstream holds only `embed_tokens + L0-3` (1.47 GB vs 4.55 GB, 3.1x). Rejected hypotheses: process boundary (8% only), reusing `llama_batch` (0.09%), naive truncation of upstream layers (numerically wrong), and treating `--override-tensor` as a speed lever (it is a capacity knob). The bottleneck is computation on both sides (cut point, kernel, batching), not the transport layer.
 
@@ -146,12 +150,13 @@ The TUI and API top level only need aggregate resources (GPU/CPU/memory) and whe
 | Same-host two-process RPC | llama host + `ggml-rpc-server` simulation and contract tests exist; not equivalent to cross-host production admission |
 | PC RPC | Device scoring, automatic layer planning, lease/disconnect fallback and artifact-sync contracts exist; throughput gains are not claimed, and capacity gains are verified separately from D→L |
 | Layer-segment contract and automatic resharding | Contract, fail-closed layout validation, capacity re-solve and atomic epoch commit have passed the development gate; real PC/Android fault injection, long-run and performance acceptance remain |
-| Cross-framework relay (D→L) | Correctness admitted (27/27 per-token identical); long-run, cross-host and multi-segment acceptance remain. Default routing prefers the directly runnable L/RPC path |
+| Cross-framework relay (D→L) | Correctness admitted (27/27 per-token identical); cross-host long-run (LL/DL three-segment `gen=256`, 256/256) and multi-segment cut-point combinations (32/32) passed; artifact auto-distribution and fault-injection acceptance remain. Default routing prefers the directly runnable L/RPC path |
 | PyTorch D track | The implementation of layer splitting, the layer pipeline and multi-node layer-segment hosting, and the control experiments; not part of the Edge default dependency set |
 | Relay R | L→L, D→L, the f32/sampling matrix and SSH cross-host evidence all passed correctness verification; capacity gains quantified; default routing does not replace directly runnable L/RPC |
 | Android | `qlh-android` P0 cross-compilation/JNI done; P1 device run, RPC worker, disconnect, thermal/power and security evidence outstanding |
 | Runtime | Version windows follow [`requirements.txt`](../requirements.txt) (`transformers>=5.17.0,<5.18.0`, `llama-cpp-python==0.3.35`); all PyTorch sidecars are on 5.17.0; `.venv-test` ships `triton-windows` so native Windows `torch.compile` is available |
-| Model assets | Model files are not committed; the asset catalog covers registered models such as Qwen2.5-0.5B, Qwen3-0.6B, MiniCPM4-0.5B and DistilQwen2.5-DS3-0324-7B |
+| Model assets | Model files are not committed (locally `models/` is a junction pointing outside the repository); the asset catalog covers registered models such as Qwen2.5-0.5B, Qwen3-0.6B, Qwen3.5-2B, Qwen3VL-4B, MiniCPM4-0.5B and DistilQwen2.5-DS3-0324-7B; Qwen3.6-35B-A3B and its community distill/derivative builds (both `qwen35moe` and `qwen3next` architecture headers) have been verified to load on llama.cpp `b10964` on this machine |
+| Model selection and supply intent | Unified entry `POST/GET/DELETE /api/models/intent` (with `/catalog`, `/current`, `/connect`): the user submits only a model ID, engine, quantization and auto strategy, and the master runs planning, transfer, verification, loading and commit along the existing supply and native-prepare transactions; the Web model page, the Textual TUI and the Android selection panel share one catalog and operation progress (`src/model_intent*.py`, `src/api/routes_model_intent.py`) |
 
 Experiments without a real-device, cross-host or production acceptance record count only as development evidence or PoC.
 
@@ -266,12 +271,12 @@ python -m pip install -r requirements-tui.txt
 ```bash
 python qlh.py chat
 python qlh.py chat --route distributed_preferred --thinking
-python qlh.py chat --fixture fixtures/chat.json
+python qlh.py chat --fixture fixtures/chat_interactive_fixture.sse
 python qlh.py status
 python qlh.py models
 ```
 
-`qlh chat` starts the backend in a daemon thread of the current process when no local backend is running, showing the probe phase on the splash screen; backend logs go to the log files and the log screen. Single commands such as `status` and `models` do not auto-start the backend, and `--fixture` is the offline chat event replay path. Write operations start from the shell: the model screen uses `L` to load / `U` to unload, the queue screen `P` pause-resume / `S` policy / `C` clear queued items, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations show a confirmation dialog first. Model control endpoints are allowed by default over loopback; controlling a remote master requires `QLH_MODEL_API_TRUSTED_CIDRS` on that master.
+`qlh chat` starts the backend in a daemon thread of the current process when no local backend is running, showing the probe phase on the splash screen; backend logs go to the log files and the log screen. Single commands such as `status` and `models` do not auto-start the backend, and `--fixture` is the offline chat event replay path. Write operations start from the shell: the model screen uses `L` to select a model (auto supply and prepare) / `U` to unload / `C` to cancel the selection, the queue screen `P` pause-resume / `S` policy / `C` clear queued items, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations show a confirmation dialog first. Model control endpoints are allowed by default over loopback; controlling a remote master requires `QLH_MODEL_API_TRUSTED_CIDRS` on that master.
 
 On Windows use `qlh.bat` (or `K-Llama.bat`), on Linux/macOS `qlh.sh` (or `K-Llama.sh`); all forward to the same entry script `qlh.py`. Screens and command semantics: [TUI guide](TUI使用指南.md) and [TUI command set](TUI指令集.md).
 
@@ -327,7 +332,7 @@ Targeted checks on high-risk mainlines:
 .\.venv-test\Scripts\python.exe -m pytest -q tests/test_pipeline_node_contract.py tests/test_pipeline_reshard.py tests/test_pipeline_capacity.py
 ```
 
-Serial full baseline: **3751 passed / 30 skipped / 0 failed** (`-n 0`, 2026-10-02, HEAD `fa5280ca`). Occasional flakiness appears under xdist; the serial run is authoritative.
+Serial full baseline: **6055 passed / 33 skipped / 0 failed** (`-n 0`, 2026-10-14, HEAD `b84522f3`). Occasional flakiness appears under xdist; the serial run is authoritative.
 
 Real hardware, cross-host networks, Android ARM64, performance and long-run soak must store the raw command, environment, model digest, topology, output and failure boundary; a green test suite is not a substitute. Test channel split and marker semantics: [test channel notes](测试通道运行说明.md); criteria and control groups: [testing and acceptance criteria](测试与评判标准.md).
 

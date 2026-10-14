@@ -1,6 +1,8 @@
 # K-Llama at a Glance (Newcomers · Reviewers Quick Entry)
 
-> Status: **current** (2026-10-02)
+> Status: **current**
+>
+> Updated: 2026-10-14
 >
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
@@ -19,7 +21,9 @@ K-Llama is a **lightweight distributed LLM inference system for heterogeneous ed
 | **L tier** | llama.cpp / GGUF (including cut GGUF + `embd` injection) | Lightweight, edge, torch-less nodes |
 | **D tier** | PyTorch (layer splitting, inter-layer pipeline, multi-node segments) | CUDA PCs; also the platform for cut-point search and experiments |
 
-**Three node kinds are isomorphic** and share one contract plus fail-closed validation: `local` (in-process), `remote_rpc` (borrowed compute over the network — `ggml-rpc-server` on Android/PC), and `cross_framework` (cross-engine layer handoff). The optional Relay R track (cut GGUF + `embd` injection, same-host or cross-host) serves **capacity merging and heterogeneous capability composition**; relay is a capacity mechanism, a same-host CUDA monolith is faster, and default routing prefers the L / RPC paths that can run the model outright (numbers and setup: [README §layer pipeline](../README.md#layer-pipeline-and-cross-framework-layer-relay)).
+The L tier is itself split into two paths by capability (`select_inference_path` in `src/inference_path_selector.py`, controlled by the `INFER_PATH` switch in `src/config.py`, default `auto`): with CUDA detected and a local `llama-server` binary present it uses the `llama_server` subprocess, otherwise it uses the llama.cpp binding inside the QLH engine. CUDA therefore affects more than the D tier: a machine without CUDA still runs the L binding path, and with CUDA the L tier switches to the subprocess.
+
+**Three node kinds are isomorphic** and share one contract plus fail-closed validation: `local` (in-process), `remote_rpc` (borrowed compute over the network — `ggml-rpc-server` on Android/PC), and `cross_framework` (cross-engine layer handoff). The optional Relay R track (cut GGUF + `embd` injection, same-host or cross-host) serves **capacity merging and heterogeneous capability composition**; relay is a capacity mechanism, a same-host CUDA monolith is faster, and default routing prefers the L / RPC paths that can run the model outright (numbers and setup: [README §layer pipeline](README.en.md#layer-pipeline-and-cross-framework-layer-relay)).
 
 Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**.
 
@@ -27,10 +31,10 @@ Design principles: **data stays in-cluster, offline autonomy, reproducible accep
 
 | Capability | Criterion / date |
 |---|---|
-| Dual-machine real-device layer pipeline (QW1.8B layers 0-21 / 21-24) | 3× `distributed_required` all passed, RTT 6-12 ms (2026-08-20) |
+| Dual-machine real-device layer pipeline (QW1.8B layers 0-21 / 21-24; this model has since been retired from the built-in candidate list) | 3× `distributed_required` all passed, RTT 6-12 ms (2026-08-20) |
 | Task-graph restart / kill-and-recover + Tailnet IPv6 | `wf_330d0aa1…`, reassignment 0 (2026-08-21) |
 | D→L cross-framework relay correctness | Main-repo dual-engine matrix **27/27 per-token identical** (2026-09-21) |
-| D→L capacity gain | qwen2.5-0.5B **1.568×** / qwen3-2b **1.547×**; under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes (2026-09-21) |
+| D→L capacity gain | qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×** (strict definition: `C` counts only tensors outside every `*.layers.<i>.*`; counting the visual tower gives 1.613×); under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes (2026-09-21) |
 | L→L keep-head channel | `--path l2l_keep_head` / `d2l2l_keep_head` **32/32**, including the three-stage "1 torch upstream + 2 llama downstream" case (2026-09-21) |
 | Pure L→L multi-hop (three stages, all on device) | y700 head8 → y700 mid8-16 → y700 cut-k16 tail, host only sends commands ⇒ **32/32** (2026-09-22) |
 | Pure L→L cross-device (three stages) | y700 head8 → **Surface** mid8-16 → y700 tail ⇒ **32/32**, two real machines cooperating with the host doing no compute (2026-09-22) |
@@ -38,14 +42,14 @@ Design principles: **data stays in-cluster, offline autonomy, reproducible accep
 | Cut-point solver closed loop | `scripts/relay_cut_plan.py` fits segment profiles from measurements, then solves; the two-segment loop passes on qwen2.5 (r² 0.96/0.99) and qwen3.5 (0.79/0.96) |
 | Windows native compile path | `triton-windows==3.8.0.post28` verified working; `PYTHONUTF8=1` is a prerequisite |
 | Judging-policy fix | multi-model 0/4 → loose+512 becomes discriminative; DS3-0324-7B replaces R1 (v2 policy 2/4×3, format 8/11×3) |
-| Sub-project: small-model harness workbench (S1-S8) | context budget / STATE memory / RAG / MCP, local gates |
-| Web search / lightweight Fetch (WEB-TOOL G1-G6) | local dev gates, `production_network_enabled=false` |
+| Sub-project: small-model harness workbench (S1-S8) | context budget / STATE memory / RAG / MCP, local gates; the related implementation has moved out to `harness_workbench` (Koakumix) |
+| Web search / lightweight Fetch (WEB-TOOL G1-G6) | local dev gates; the capability and its `production_network_enabled` switch have moved out to `harness_workbench` and are no longer in the main-repository `src/` |
 
 Full matrix, setups and report paths: [cross-framework relay — current baseline](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md).
 
 ## Outstanding work
 
-- Cross-host RPC vs relay has not been compared; D→L long-run, cross-host and multi-segment failure acceptance remain.
+- Cross-host RPC vs relay has not been compared; cross-host long-run (LL/DL three-segment `gen=256`, 256/256) and multi-segment cut-point combinations (G2/G3 32/32) passed on 2026-09-26, while artifact auto-distribution and fault injection remain queued.
 - A middle stage must share a LAN with its caller: with the middle stage on a cross-network node (Surface through the Tailscale DERP relay, RTT 777 ms) every step costs a round trip, and end-to-end went from ~140 ms median to ~800 ms.
 - Production routing admission (`task_dispatch` off), long-running and power-loss recovery, real 443/WSS, IPv6-only installers and real 7B/12B three-node peak memory are in the deferred acceptance queue; local gates and simulations do not count as passes.
 - Android is at P0 only (cross-compile/JNI + layer-segment numerical validation); on-device running, RPC worker, disconnection, thermal/power and security evidence are outstanding.
@@ -58,32 +62,33 @@ Prerequisites:
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| Python | ≥ 3.10 (3.12 recommended) | Main runtime and tool scripts |
+| Python | ≥ 3.10 (3.12 recommended; the Edge tier needs 3.12+, since `requirements-edge.txt` pins `numpy==2.5.3`) | Main runtime and tool scripts |
 | Node.js + npm | Node ≥ 18 | Product-shell branch only (`qlh-shell`) |
-| JDK 17 + Android SDK (API 34+) | — | Only when building Android |
+| JDK 17 + Android SDK (`compileSdk 36` / `minSdk 26`) | — | Only when building Android |
 | Tailscale | latest | Distributed mode; most stable when nodes share a LAN |
 | Git | — | clone (with submodules) |
-| NVIDIA driver + CUDA (optional) | — | D tier / discrete-GPU PC |
+| NVIDIA driver + CUDA (optional) | — | The L-tier `llama_server` path (auto-selected when CUDA and a local `llama-server` are both present) and the D tier |
 
 ```bash
 git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
 cd LEDS_BJTU
 python scripts/setup_envs.py --all            # mainline Python environments (no Node by default)
 python scripts/setup_envs.py --all --with-node # also configure the product-shell Node source
-python scripts/setup_envs.py --only test,tui  # only the named environments
+python scripts/setup_envs.py --only test    # only the named environments (names below)
 python scripts/setup_envs.py --check          # verify only, no side effects
 ```
 
-`setup_envs.py` covers the main environment plus `.venv-test` / `.venv-tui` / `.venv-qwen3-sidecar` and others; platform-specific heavy packages such as torch are not installed automatically — the script filters them and prints each environment's install command (for example `--torch-index-url https://download.pytorch.org/whl/cu126`). Re-run `--check` afterwards. Other environments and startup paths: [README Quick Start](../README.md#quick-start).
+`setup_envs.py` covers six environments — `main` / `test` (`.venv-test`) / `edge` / `gemma4-native` / `gemma4-pipeline` / `qwen3-sidecar`; platform-specific heavy packages such as torch are not installed automatically — the script filters them and prints each environment's install command (for example `--torch-index-url https://download.pytorch.org/whl/cu126`). Re-run `--check` afterwards. Other environments and startup paths: [README Quick Start](README.en.md#quick-start).
 
 The default model is chosen by device profile (`DEFAULT_MODEL_BY_TIER` in `src/model_config.py`, consumed by `get_active_model_paths()` in `src/config.py`):
 
 | Device tier | Default model |
 |---|---|
-| Mobile / edge / ultrabook (shared VRAM ≤ 2 GB) | `<1B`: `qwen3-0.6b` |
+| Mobile | `<1B`: `qwen2.5-0.5b` |
+| Ultrabook / edge device (shared VRAM ≤ 2 GB) | `<1B`: `qwen3-0.6b` |
 | PC with discrete GPU | `~2B`: `qwen3-5-2b` |
 
-The 2B tier peaks at 2.24 GB VRAM in measurement, which does not fit an ultrabook with ≤ 2 GB shared VRAM. Model files are not committed (`models/` is gitignored); acquisition: [README §models and distribution](../README.md#models-and-distribution).
+The 2B tier peaks at 2.24 GB VRAM in measurement, which does not fit an ultrabook with ≤ 2 GB shared VRAM. Model files are not committed (`models/` is gitignored); acquisition: [README §models and distribution](README.en.md#models-and-distribution).
 
 ## How to read the docs
 
