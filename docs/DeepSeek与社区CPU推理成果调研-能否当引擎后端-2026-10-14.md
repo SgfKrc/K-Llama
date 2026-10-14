@@ -50,7 +50,8 @@
 | DualPipe | 双向流水线 + 计算-通信重叠 | GPU 向 | ⚠️ **机制不能搬**（见 §4） |
 | **3FS** | 分布式文件系统 | **CPU/host 侧** | ✅ **与装备/供给（supply）有关**，可借鉴其设计 |
 | profile-data | 推理 trace 数据 | GPU 向 | ⚠️ 仅供参考 |
-| **EPLB / LPLB** | 专家/负载均衡**放置算法** | **纯 Python，CPU 可跑** | ✅✅ **对"层段分配"有直接参考**（正是 `relay_cut_objective.py` 在做的事） |
+| **EPLB** | 专家负载均衡**放置算法** | ✅ **纯 Python，CPU 可跑**（顶层只 `import torch`） | ⚠️ **算法不可搬**（见下），但 2026-10-14 分析确认「**不引入迭代式再平衡**」——本仓切点求解对 2–3 段已精确最优；详见 `22c-EPLB与LPLB能否借用到层段分配-分析-2026-10-14.md` |
+| **LPLB** | 同上 + 线性规划（2025-11，比 EPLB 晚 9 个月） | ❌ **不是纯 Python**：C++/CUDA 扩展（`from lplb._cpp import CompiledSolver` + `.cuda()`），需 CUDA Toolkit ≥12.6.3 与 cuSolverDx；官方自述 "early research stage" | ❌ 不可用（且"每批重定向"在层流水线里结构上不成立） |
 | Engram / DeepSpec / TileKernels / DeepJIT / DeepSelect | 2026 增补 | GPU 向（Engram 提及 GPU **或 CPU** 上存储） | ⚠️ Engram 是唯一提到 host-memory offload 的 |
 
 ### 技术报告四项对 CPU offload 的启示
