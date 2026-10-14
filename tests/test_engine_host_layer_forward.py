@@ -32,6 +32,9 @@ class _FakeUpstream:
         self.hidden_calls = []
         self.token_calls = []
         self.reset_count = 0
+        # ★ `EngineHost._layer_forward_upstream`（engine_host.py:2925）会读
+        #   `_layer_upstream.is_available` 决定复用现有上游还是重建，替身需提供该属性。
+        self.is_available = True
 
     def reset(self):
         # 批次从位置 0 开始时（新 prompt 的 prefill）上游必须清 KV，否则上一个请求的

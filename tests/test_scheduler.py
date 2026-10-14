@@ -2987,6 +2987,8 @@ class TestPipelineReadiness:
             "assignment_id": "",
             "generation": 3,
             "action": "finalize",
+            # ★ 票 12 WORKER-PREPARE-01 起 cleanup ledger 条目带 legacy_identity 标记。
+            "legacy_identity": False,
             "created_at": cleanup["created_at"],
             "payload": cleanup["payload"],
         }]

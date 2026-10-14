@@ -106,6 +106,17 @@ def scheduler():
     return Scheduler()
 
 
+@pytest.fixture(autouse=True)
+def _local_inference_mode(scheduler):
+    """★ 分布式模式禁止整模回退（`scheduler_pipeline.py:10235` ⇒
+    `reason_code=distributed_full_model_forbidden`）。本文件的用例验证的是**本地整模
+    回退**语义，因此显式关闭分布式开关；分布式下的禁止行为由
+    `test_fallback_forbidden_in_distributed_mode` 单独覆盖。
+    """
+    scheduler.get_distributed_inference_enabled = lambda: False
+    return scheduler
+
+
 @pytest.fixture
 def mgr(tiny_model):
     """创建 ModelManager 并注入 tiny 模型 + mock tokenizer。"""
@@ -134,6 +145,16 @@ class TestDistributedInferenceWorkflow:
     chat request → run_pipeline_safe → (回退到) _run_full_model_inference →
     model_manager.chat → 返回 response。
     """
+
+    def test_fallback_forbidden_in_distributed_mode(self, scheduler, mgr):
+        """★ 分布式模式下整模回退必须 fail-closed（新增契约的负例）。"""
+        scheduler.get_distributed_inference_enabled = lambda: True
+        result = scheduler._run_full_model_inference(
+            prompt="Hello, how are you?",
+            max_new_tokens=8,
+        )
+        assert result["response"] == ""
+        assert result["reason_code"] == "distributed_full_model_forbidden"
 
     def test_fallback_inference_produces_response(self, scheduler, mgr):
         """无流水线节点时，回退到全模型推理，应返回非空 response。"""
@@ -173,6 +194,8 @@ class TestDistributedInferenceWorkflow:
             max_new_tokens=8,
         )
         assert result["response"] == ""
+        # ★ 裁层痕迹分支（scheduler_pipeline.py 的 fail-closed 判据）返回 error 文本，
+        #   不是 reason_code；这里断言的是该分支的具名标识。
         assert "refusing_full_model_fallback_with_partial_artifact" in result["error"]
 
     def test_stream_fallback_refuses_partial_artifact(self, scheduler, mgr, monkeypatch):
