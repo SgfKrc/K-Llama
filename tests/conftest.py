@@ -17,14 +17,33 @@ transformers 5.x 下无法导入，而 transformers 5.x 的 `dynamic_module_util
 """
 from __future__ import annotations
 
+import atexit
 import os
 import random
+import shutil
 import sys
+import tempfile
 from copy import deepcopy
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+# Session-wide backstop for the SQLite path.
+#
+# `_isolate_local_store` narrows the path per test but restores the environment
+# on teardown.  A worker thread that outlives its test (a scheduler started in
+# `threading.Thread`, for example) can then still reach `local_store`, and with
+# an empty `QLH_SQLITE_PATH` it writes straight into
+# `%LOCALAPPDATA%\QLH-Edge-Inference\state`.  That was observed as a rewritten
+# `master_identity_v1` (the test patches `get_mac_addresses` to a dummy MAC),
+# which makes the real master fail its own MAC check afterwards.
+#
+# Setting the variable at import time makes the fallback land in a throwaway
+# store for the whole session, independent of fixture ordering or teardown.
+_session_store_dir = tempfile.mkdtemp(prefix="qlh-pytest-store-")
+os.environ["QLH_SQLITE_PATH"] = os.path.join(_session_store_dir, "local-store.sqlite3")
+atexit.register(shutil.rmtree, _session_store_dir, True)
 
 
 def pytest_addoption(parser) -> None:
