@@ -612,6 +612,10 @@ def test_estimate_gpu_layers_budget_gate():
     assert zero == 0
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "gemma4-native")),
+    reason="缺本地工件 models/gemma4-native（CI 不拉模型）",
+)
 def test_load_gemma4_native_fails_closed_on_vram_shortage(monkeypatch):
     """require_gpu_layers 不满足时 fail-closed（不加载）。"""
     monkeypatch.setattr(LlamaCppEngine, "_vram_free_bytes", staticmethod(lambda: int(0.5 * 2**30)))

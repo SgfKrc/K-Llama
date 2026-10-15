@@ -280,6 +280,10 @@ def test_descriptor_rejects_missing_layer(tmp_path):
         raise AssertionError("descriptor accepted an incomplete layer set")
 
 
+@pytest.mark.skipif(
+    not Path("models/qwen3-4b").exists(),
+    reason="缺本地工件 models/qwen3-4b（CI 不拉模型）",
+)
 def test_real_qwen3_artifact_is_described_but_not_admitted():
     descriptor = inspect_pipeline_model("models/qwen3-4b", model_id="qwen3-4b")
     assert descriptor["model_type"] == "qwen3"

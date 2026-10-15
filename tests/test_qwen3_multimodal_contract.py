@@ -7,6 +7,13 @@ from pathlib import Path
 
 import pytest
 
+# CI 不拉模型工件（本机 models 是 Junction）；本文件按工作目录相对路径读模型配置。
+pytestmark = pytest.mark.skipif(
+    not Path("models/qwen3-vl-4b-instruct/config.json").exists()
+    or not Path("models/qwen3-5-2b/config.json").exists(),
+    reason="缺本地工件 models/{qwen3-vl-4b-instruct,qwen3-5-2b}（CI 不拉模型）",
+)
+
 sys.path.insert(0, "src")
 
 from qwen3_multimodal_contract import (  # noqa: E402

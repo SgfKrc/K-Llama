@@ -583,6 +583,10 @@ def test_load_model_rejects_invalid_quant_for_pytorch(monkeypatch):
     assert exc.value.status_code == 400
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_normalize_quant_marks_gguf_precision_as_artifact_owned():
     """llama_cpp 的 effective quant 不得伪装成请求的 PyTorch dtype。"""
     api_server._validate_model_load_request(None, "llama_cpp")
@@ -744,6 +748,10 @@ def test_load_model_rejects_nonexistent_model_id(monkeypatch):
     assert exc.value.status_code == 404
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_load_model_uses_switch_model_internally(monkeypatch):
     monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """验证 /api/models/load 使用 switch_model（B2 修复）"""
@@ -994,6 +1002,10 @@ def test_prepare_pipeline_model_rejects_synchronous_aborted_commit(
     assert len(aborted) == 1
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_load_model_reports_effective_cpu_quant(monkeypatch):
     monkeypatch.setattr(api_server.scheduler, "_distributed_inference_enabled", False)
     """CPU loader 归一为 FP32 后，API 状态不能继续上报请求的 FP16。"""
@@ -1541,6 +1553,10 @@ def test_list_models_includes_active_model_id(monkeypatch):
     assert "qwen3-0.6b" in model_ids
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_list_models_exposes_new_model_assets_for_frontend_selection(monkeypatch):
     class FakeManager:
         active_model_id = ""

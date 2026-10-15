@@ -10,6 +10,12 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# CI 不拉模型工件（本机 models 是 Junction）。缺工件按项目约定跳过。
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "models" / "qwen3-vl-4b-instruct" / "config.json").exists(),
+    reason="缺本地工件 models/qwen3-vl-4b-instruct（CI 不拉模型）",
+)
 sys.path.insert(0, str(ROOT / "src"))
 
 from qwen3_multimodal_contract import build_mm1_model_manifest, build_mm1_model_profile  # noqa: E402

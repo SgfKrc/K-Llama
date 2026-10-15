@@ -9,6 +9,12 @@ import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# CI 不拉模型工件（本机 models 是 Junction）。缺工件按项目约定跳过。
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "models" / "qwen3-vl-4b-instruct" / "config.json").exists(),
+    reason="缺本地工件 models/qwen3-vl-4b-instruct（CI 不拉模型）",
+)
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))

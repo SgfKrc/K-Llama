@@ -1,9 +1,15 @@
 import os
 import sys
+from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import model_config as mc
+
+# 默认模型的本地工件（本机 models 是 Junction；CI 不拉模型）。
+_MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
 
 def test_deepseek_r1_distill_qwen_slots_are_registered():
@@ -174,6 +180,7 @@ def test_default_model_id_accepts_enum_and_str():
     assert mc.get_default_model_id("workstation") == "qwen3-5-2b"
 
 
+@pytest.mark.skipif(not _MODELS_DIR.is_dir(), reason="缺本地模型目录 models/（CI 不拉模型）")
 def test_profile_default_paths_resolve_to_existing_files():
     """`get_profile_default_model_paths()` 解析出的路径必须真实存在（否则自动加载必失败）。"""
     paths = mc.get_profile_default_model_paths()

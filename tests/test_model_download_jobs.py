@@ -79,11 +79,17 @@ def test_invalid_pin_manifest_blocks_remote_presets(tmp_path, monkeypatch):
     assert presets["qwen3-0.6b"]["blocked_reasons"]["artifact_pin"] == "PRESET_PIN_INVALID"
 
 
-def test_pin_paths_reject_parent_and_drive_escape():
-    for value in ("../model.safetensors", "C:/model.safetensors"):
-        with pytest.raises(mj.JobError) as exc:
-            mj._validate_pin_path(value, field="test")
-        assert exc.value.code == "PRESET_PIN_INVALID"
+def test_pin_paths_reject_parent_escape():
+    with pytest.raises(mj.JobError) as exc:
+        mj._validate_pin_path("../model.safetensors", field="test")
+    assert exc.value.code == "PRESET_PIN_INVALID"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="盘符逃逸是 Windows 语义（POSIX 上 'C:/x' 不是绝对路径）")
+def test_pin_paths_reject_drive_escape():
+    with pytest.raises(mj.JobError) as exc:
+        mj._validate_pin_path("C:/model.safetensors", field="test")
+    assert exc.value.code == "PRESET_PIN_INVALID"
 
 
 def test_download_passes_remote_pin_to_huggingface(tmp_path, monkeypatch):

@@ -2496,6 +2496,10 @@ def live_inference_svc():
     thread.join(timeout=5)
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_inference_client_lifecycle(live_inference_svc):
     from inference_client import InferenceClient
 
@@ -3141,6 +3145,10 @@ def test_models_load_invalid_engine_400(client):
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_models_load_engine_case_normalized(client):
     """大写的 LLAMA_CPP：白名单校验用小写归一化，执行侧也必须用小写
     （修复前校验通过但执行传原始大小写会走错引擎分支）。"""
@@ -3149,6 +3157,10 @@ def test_models_load_engine_case_normalized(client):
     assert resp.status_code == 200
 
 
+@pytest.mark.skipif(
+    not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3-0.6b")),
+    reason="缺本地工件 models/qwen3-0.6b（CI 不拉模型）",
+)
 def test_models_load_torch_alias_uses_pytorch(client):
     resp = client.post("/v1/models/load", json={
         "engine": "torch", "quant_type": "int4", "model_id": "qwen3-0.6b"})
