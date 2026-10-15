@@ -1,16 +1,13 @@
-"""Run the parallel, external-resource, and real-model test channels.
+"""Run unit, external-resource and opted-in real-model test channels.
 
-通道：`unit`（并行，排除重资源标记）→ `external`（串行）→ `smoke`
-（`real_model`，串行加载真实权重）。
+Physical markers require QLH_RUN_PHYSICAL_TESTS=1 (or the legacy
+QLH_RUN_REAL_MODEL_SMOKE=1). Ordinary all-channel CI validates unit/external
+and explicitly records physical/smoke NOT_RUN. Every expected run needs both
+an integer zero return code and JUnit evidence containing actual passed tests.
 
-**物理设备 / 重档用例是显式 opt-in**（票 13 第三条）：`real_model`、`requires_gpu`、`slow`、
-`requires_db` 只有在 `QLH_RUN_PHYSICAL_TESTS=1` 时才被收集（`QLH_RUN_REAL_MODEL_SMOKE=1`
-保留为向后兼容的等价开关）。未开启时它们**不进入收集**，而不是"跑了再 skip" —— 后者在有
-GPU 的机器上会真的跑起来，等于隐式 opt-in。
-
-`--channel all` 会按上述顺序跑；smoke 未开启时**不影响退出码**，但跳过状态会写进
-`manifest.json` 的 `smoke` 字段、opt-in 状态写进 `physical` 字段 —— 避免"全绿"被误读成
-"real_model 也验过了"。
+--session NAME creates a new, non-reusable directory under --artifacts-dir.
+--require-physical requires opt-in and channel=all, with attributed physical
+passes in every external and smoke repetition; skips never count as passes.
 """
 
 from __future__ import annotations
@@ -29,6 +26,18 @@ from typing import Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Support both direct CLI execution and imports from the repository's tests.
+try:
+    from scripts.summarize_test_channels import (
+        evaluate_manifest, evaluate_run, execution_status, expected_runs, session_path,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "scripts":
+        raise
+    from summarize_test_channels import (
+        evaluate_manifest, evaluate_run, execution_status, expected_runs, session_path,
+    )
 
 
 def _write_console(text: str) -> None:
@@ -77,6 +86,28 @@ def _external_marker_expression(*, physical: bool) -> str:
     return f'{excluded} and (external)'
 
 
+def pytest_collection_finish(session) -> None:
+    """Persist marker attribution in JUnit without importing pytest in the CLI.
+
+    Loaded with -p scripts.run_test_channels only for opted-in serial channels.
+    Runs after all collection_modifyitems hooks, so classification is final.
+    Ordinary external passes therefore cannot masquerade as physical execution.
+    """
+    if not _physical_opt_in():
+        return
+    for item in session.items:
+        markers = sorted({marker.name for marker in item.iter_markers()}
+                         & set(PHYSICAL_MARKERS))
+        if markers:
+            item.user_properties.append(("qlh_physical_markers", ",".join(markers)))
+
+
+def _write_json_atomic(path: Path, data: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}-{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _pytest_env() -> dict[str, str]:
     env = os.environ.copy()
     src = str(ROOT / "src")
@@ -116,11 +147,17 @@ def _run_pytest(
                 _write_console(line)
                 log.write(line)
             returncode = process.wait()
-        except Exception as exc:  # noqa: BLE001 - runner failures need an artifact
+        except (Exception, KeyboardInterrupt) as exc:  # runner failures need an artifact
             log.write(f"\n[test-channels] runner error: {exc!r}\n")
             if process is not None and process.poll() is None:
                 process.terminate()
-                process.wait(timeout=10)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+            if isinstance(exc, KeyboardInterrupt):
+                raise
             returncode = 2
     return returncode, time.monotonic() - started
 
@@ -221,6 +258,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
         help='directory for per-run JUnit XML, logs, and manifest.json',
     )
+    parser.add_argument(
+        '--session',
+        help='exact new session directory name under --artifacts-dir; never reused',
+    )
+    parser.add_argument(
+        '--require-physical',
+        action='store_true',
+        help='require opted-in all-channel execution with actual physical passes',
+    )
     return parser.parse_args(argv)
 
 
@@ -262,9 +308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit('--workers must be between 1 and 16')
     if not 1 <= args.repeat <= 100:
         raise SystemExit('--repeat must be between 1 and 100')
-    if not _check_python_environment(
-        allow_system_python=args.allow_system_python,
-    ):
+    if not _check_python_environment(allow_system_python=args.allow_system_python):
         return 2
 
     order_seed = args.order_seed
@@ -272,161 +316,134 @@ def main(argv: Sequence[str] | None = None) -> int:
         order_seed = random.SystemRandom().randrange(1, 2**32)
     artifact_base = args.artifacts_dir.expanduser().resolve()
     artifact_base.mkdir(parents=True, exist_ok=True)
-    session_name = (
+    session_name = args.session if args.session is not None else (
         'test-channels-'
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
         f'{os.getpid()}'
     )
-    artifact_dir = artifact_base / session_name
+    try:
+        artifact_dir = session_path(artifact_base, session_name)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     suffix = 1
-    while artifact_dir.exists():
-        suffix += 1
-        artifact_dir = artifact_base / f'{session_name}-{suffix}'
-    artifact_dir.mkdir()
+    while True:
+        try:
+            artifact_dir.mkdir()
+            break
+        except FileExistsError:
+            if args.session is not None:
+                raise SystemExit(f'session already exists: {artifact_dir}')
+            suffix += 1
+            artifact_dir = artifact_base / f'{session_name}-{suffix}'
+    # Select this invocation before writing its manifest or launching anything.
+    # A missing/partial manifest in this session must never reveal an older pass.
+    _write_json_atomic(artifact_base / 'latest.json', {'session': artifact_dir.name})
     print(f'[test-channels] artifacts: {artifact_dir}', flush=True)
     print(f'[test-channels] order seed: {order_seed}', flush=True)
 
     env = _pytest_env()
     physical = _physical_opt_in()
-    external_args = [
-        'tests',
-        '-q',
-        '-m',
-        _external_marker_expression(physical=physical),
-    ]
-    if importlib.util.find_spec('xdist') is not None:
-        external_args.extend(['-n', '0'])
-
-    channels = ('unit', 'external')
-    failures: list[str] = []
     runs: list[dict[str, object]] = []
-    #: ★ 2026-09-30：smoke（real_model）是 **opt-in** 通道，未开启时原先只打印一行
-    #: 就跳过、不影响退出码 ⇒ `--channel all` 跑绿会被误读成"real_model 也验过了"。
-    #: 这里把跳过状态**显式写进 manifest**，让"没跑"不可能被当成"通过"。
-    smoke_status: dict[str, object] = {
-        'requested': args.channel in ('all', 'smoke'),
-        'ran': False,
-        'reason': 'QLH_RUN_REAL_MODEL_SMOKE is not set to 1',
-    }
-    #: ★ 票 13 第三条：物理设备/重档的**显式 opt-in** 状态也写进 manifest。
-    #: 未开启时这些用例不被收集（不是"跑了再 skip"），因此"没跑"与"跑过"必须可区分。
-    physical_status: dict[str, object] = {
-        'opt_in_env': PHYSICAL_OPT_IN_ENV,
-        'legacy_env': LEGACY_SMOKE_ENV,
-        'requested': True,
-        'ran': physical,
-        'reason': '' if physical else f'{PHYSICAL_OPT_IN_ENV} is not set to 1',
-        'covers_markers': list(PHYSICAL_MARKERS),
-        'external_marker_expression': _external_marker_expression(physical=physical),
+    evidence_runs: list[dict[str, object]] = []
+    manifest: dict[str, object] = {
+        'schema_version': 2,
+        'session': artifact_dir.name,
+        'state': 'running',
+        'started_at': datetime.now(timezone.utc).isoformat(),
+        'channel': args.channel,
+        'workers': args.workers,
+        'dist': args.dist,
+        'repeat': args.repeat,
+        'order_seed': order_seed,
+        'require_physical': args.require_physical,
+        'expected_runs': expected_runs(args.channel, args.repeat, physical),
+        'runs': runs,
     }
 
     def record_manifest() -> None:
-        (artifact_dir / 'manifest.json').write_text(
-            json.dumps(
-                {
-                    'channel': args.channel,
-                    'workers': args.workers,
-                    'dist': args.dist,
-                    'repeat': args.repeat,
-                    'order_seed': order_seed,
-                    'smoke': smoke_status,
-                    'physical': physical_status,
-                    'runs': runs,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + '\n',
-            encoding='utf-8',
+        manifest['smoke'] = execution_status(
+            evidence_runs, requested=args.channel in ('all', 'smoke'),
+            opt_in=physical, smoke=True,
         )
+        manifest['physical'] = {
+            'opt_in_env': PHYSICAL_OPT_IN_ENV,
+            'legacy_env': LEGACY_SMOKE_ENV,
+            'covers_markers': list(PHYSICAL_MARKERS),
+            'external_marker_expression': _external_marker_expression(physical=physical),
+            **execution_status(evidence_runs,
+                               requested=args.channel in ('all', 'external', 'smoke'),
+                               opt_in=physical),
+        }
+        for label in ('smoke', 'physical'):
+            status = manifest[label]
+            if status['status'] == 'PASS' and manifest['state'] != 'completed':
+                status.update(status='FAIL' if manifest['state'] == 'interrupted' else 'RUNNING',
+                              reason='session has not completed')
+        _write_json_atomic(artifact_dir / 'manifest.json', manifest)
 
-    # Create an evidence file even when the smoke channel is intentionally
-    # skipped, so every invocation has a machine-readable outcome.
     record_manifest()
-
-    for repetition in range(1, args.repeat + 1):
-        run_order_seed = (order_seed + repetition - 1) % (2**32)
-        for name in channels:
-            if args.channel not in ('all', name):
-                continue
-            print(f'\n[test-channels] {name} channel (run {repetition}/{args.repeat})', flush=True)
+    invalid_physical_request = args.require_physical and (not physical or args.channel != 'all')
+    if not invalid_physical_request:
+        # Keep the established order: unit/external pairs, then smoke repeats.
+        run_order = [(name, repetition) for repetition in range(1, args.repeat + 1)
+                     for name in ('unit', 'external') if args.channel in ('all', name)]
+        if physical and args.channel in ('all', 'smoke'):
+            run_order.extend(('smoke', repetition) for repetition in range(1, args.repeat + 1))
+        for name, repetition in run_order:
+            seed = (order_seed + repetition - 1) % (2**32)
             junitxml = artifact_dir / f'{name}-{repetition:03d}.xml'
             log_path = artifact_dir / f'{name}-{repetition:03d}.log'
             if name == 'unit':
-                command = _unit_args(
-                    args.workers,
-                    dist=args.dist,
-                    junitxml=junitxml,
-                    order_seed=run_order_seed,
-                )
+                command = _unit_args(args.workers, dist=args.dist,
+                                     junitxml=junitxml, order_seed=seed)
             else:
-                command = [
-                    *external_args,
-                    *_quality_args(junitxml=junitxml, order_seed=run_order_seed),
-                ]
-            returncode, duration = _run_pytest(command, env, log_path=log_path)
-            runs.append({
-                'channel': name,
-                'run': repetition,
-                'order_seed': run_order_seed,
-                'returncode': returncode,
-                'duration_s': round(duration, 3),
-                'junitxml': junitxml.name,
-                'log': log_path.name,
-                'command': [sys.executable, '-m', 'pytest', *command],
-            })
-            record_manifest()
-            if returncode != 0:
-                failures.append(f'{name}#{repetition}')
-
-    if args.channel in ('all', 'smoke'):
-        if not physical:
-            print(
-                '\n[test-channels] smoke channel skipped: set '
-                f'{PHYSICAL_OPT_IN_ENV}=1 (physical/real-weight tests) '
-                f'or {LEGACY_SMOKE_ENV}=1 to load real weights.',
-                flush=True,
-            )
-        else:
-            print('\n[test-channels] smoke channel', flush=True)
-            smoke_status['ran'] = True
-            smoke_status['reason'] = ''
-            for repetition in range(1, args.repeat + 1):
-                smoke_args = [
-                    'tests',
-                    '-q',
-                    '-m',
-                    'real_model',
-                ]
+                expression = 'real_model' if name == 'smoke' else _external_marker_expression(physical=physical)
+                command = ['tests', '-q', '-m', expression]
                 if importlib.util.find_spec('xdist') is not None:
-                    smoke_args.extend(['-n', '0'])
-                smoke_args.extend(_quality_args(
-                    junitxml=artifact_dir / f'smoke-{repetition:03d}.xml',
-                    order_seed=(order_seed + repetition - 1) % (2**32),
-                ))
-                log_path = artifact_dir / f'smoke-{repetition:03d}.log'
-                returncode, duration = _run_pytest(smoke_args, env, log_path=log_path)
-                runs.append({
-                    'channel': 'smoke',
-                    'run': repetition,
-                    'order_seed': (order_seed + repetition - 1) % (2**32),
-                    'returncode': returncode,
-                    'duration_s': round(duration, 3),
-                    'junitxml': f'smoke-{repetition:03d}.xml',
-                    'log': log_path.name,
-                    'command': [sys.executable, '-m', 'pytest', *smoke_args],
-                })
+                    command.extend(['-n', '0'])
+                if physical:
+                    command.extend(['-p', 'scripts.run_test_channels'])
+                command.extend(_quality_args(junitxml=junitxml, order_seed=seed))
+            run: dict[str, object] = {
+                'channel': name, 'run': repetition, 'order_seed': seed,
+                'state': 'running', 'returncode': None,
+                'junitxml': junitxml.name, 'log': log_path.name,
+                'command': [sys.executable, '-m', 'pytest', *command],
+            }
+            runs.append(run)
+            # Record the attempt before launch, including when launch interrupts.
+            evidence_runs.append(dict(run))
+            record_manifest()
+            print(f'\n[test-channels] {name} channel (run {repetition}/{args.repeat})', flush=True)
+            try:
+                returncode, duration = _run_pytest(command, env, log_path=log_path)
+            except (Exception, KeyboardInterrupt) as exc:
+                manifest['state'] = 'interrupted'
+                manifest['runner_error'] = repr(exc)
                 record_manifest()
-                if returncode != 0:
-                    failures.append(f'smoke#{repetition}')
+                print(f'[test-channels] interrupted: {exc!r}', flush=True)
+                return 1
+            run.update(state='completed', returncode=returncode, duration_s=round(duration, 3))
+            evidence = evaluate_run(run, artifact_dir)
+            run.update({key: evidence[key] for key in ('counts', 'physical_counts', 'status', 'errors')})
+            evidence_runs[-1] = evidence
+            record_manifest()
 
-    if failures:
-        print('\n[test-channels] failed: ' + ', '.join(failures), flush=True)
-        print(f'[test-channels] evidence: {artifact_dir}', flush=True)
-        return 1
-    print('\n[test-channels] completed', flush=True)
+    if not physical and args.channel in ('all', 'smoke'):
+        print(f'\n[test-channels] smoke NOT_RUN: set {PHYSICAL_OPT_IN_ENV}=1 or {LEGACY_SMOKE_ENV}=1.', flush=True)
+    manifest['state'] = 'completed'
+    manifest['finished_at'] = datetime.now(timezone.utc).isoformat()
+    record_manifest()
+    code, result = evaluate_manifest(manifest, artifact_dir,
+                                     require_physical=args.require_physical)
+    for run in result['runs']:
+        for error in run['errors']:
+            print(f"[test-channels] {run['channel']}#{run['run']}: {error}", flush=True)
+    for error in result['errors']:
+        print(f'[test-channels] {error}', flush=True)
+    print(f"\n[test-channels] {result['status']}", flush=True)
     print(f'[test-channels] evidence: {artifact_dir}', flush=True)
-    return 0
+    return code
 
 
 if __name__ == '__main__':
