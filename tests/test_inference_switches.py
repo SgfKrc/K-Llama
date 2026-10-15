@@ -104,6 +104,22 @@ class TestEnvOverrides:
         assert off.flash_attn is False and off.overrides["flash_attn"] == "off"
         assert bogus.flash_attn is False and "flash_attn" not in bogus.overrides
 
+    def test_kv_cache_requires_flash_attn_measured_constraint(self, monkeypatch):
+        """实测：量化 KV cache 必须配 flash-attn（否则 context 创建失败）⇒ 自动联动。"""
+        _clean_env(monkeypatch)
+        switches = resolve_inference_switches(None, env={ENV_KV_CACHE: "q8_0"}, engine_isa={})
+        assert switches.kv_cache_type_k == "q8_0"
+        assert switches.flash_attn is True
+        assert switches.overrides["flash_attn"] == "on(kv-cache-required)"
+
+    def test_kv_cache_with_explicit_flash_attn_off_is_rejected(self, monkeypatch):
+        """显式给出不可能的组合时 fail-fast，而不是让加载在运行时才失败。"""
+        _clean_env(monkeypatch)
+        with pytest.raises(ValueError):
+            resolve_inference_switches(
+                None, env={ENV_KV_CACHE: "q4_0", ENV_FLASH_ATTN: "0"}, engine_isa={},
+            )
+
     def test_threads_override_requires_positive_int(self, monkeypatch):
         _clean_env(monkeypatch)
         good = resolve_inference_switches(None, env={ENV_THREADS: "8"}, engine_isa={})
@@ -133,7 +149,8 @@ class TestApplyToLoadKwargs:
         switches = resolve_inference_switches(None, env={ENV_KV_CACHE: "q4_0"}, engine_isa={})
         kwargs: dict = {}
         apply_to_load_kwargs(switches, kwargs)
-        assert kwargs == {"type_k": "q4_0", "type_v": "q4_0"}
+        # 量化 KV 会联动打开 flash-attn（实测硬约束，见 resolve 里的注释）
+        assert kwargs == {"type_k": "q4_0", "type_v": "q4_0", "flash_attn": True}
 
 
 class TestServerArgTranslation:
@@ -152,22 +169,25 @@ class TestServerArgTranslation:
         _clean_env(monkeypatch)
         switches = resolve_inference_switches(
             None,
-            env={ENV_KV_CACHE: "q8_0", ENV_FLASH_ATTN: "0", ENV_THREADS: "6"},
+            env={ENV_KV_CACHE: "q8_0", ENV_FLASH_ATTN: "1", ENV_THREADS: "6"},
             engine_isa={},
         )
         assert server_argv_args(switches) == [
             "--threads", "6",
             "--cache-type-k", "q8_0",
             "--cache-type-v", "q8_0",
-            "--flash-attn", "off",
+            "--flash-attn", "on",
         ]
 
     def test_flash_attn_absent_until_explicitly_overridden(self, monkeypatch):
-        """不传 `--flash-attn` 即沿用 server 自身的 auto；显式关闭才写 `off`。"""
+        """不传 `--flash-attn` 即沿用 server 自身的 auto；显式关闭才写 `off`。
+
+        （注意：量化 KV 会强制带上 `--flash-attn on`，所以这里只用线程覆盖来验证。）
+        """
         _clean_env(monkeypatch)
-        switches = resolve_inference_switches(None, env={ENV_KV_CACHE: "q4_0"}, engine_isa={})
+        switches = resolve_inference_switches(None, env={ENV_THREADS: "4"}, engine_isa={})
         args = server_argv_args(switches)
-        assert args == ["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"]
+        assert args == ["--threads", "4"]
         assert "--flash-attn" not in args
 
 

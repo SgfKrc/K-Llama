@@ -44,18 +44,23 @@ ENV_THREADS = "QLH_INFER_THREADS"
 #: 每条映射的实测依据。数值口径随原始记录，跨设备不可直接套用。
 EVIDENCE: Dict[str, str] = {
     "kv_cache_type": (
-        "CPU 边缘段实测净亏：q8_0 0.89×、q4_0 0.84×（输出 sha8 全同），"
-        "见 archive/relay/KV缓存优化与注意力结构调研-GQA与MLA-2026-10-14.md"
+        "只在需要省显存时才值得：llama-bench 实测 8 个有效组合 tg 落在 0.935–1.049×"
+        "（最低为 CUDA dense 2B 的 0.935×），CPU dense 2B 的 pp 明显变差"
+        "（q8_0：115.7 → 95.7 tok/s）；且**要求 flash-attn**（-fa off 时无法创建 context）。"
+        "见 docs/设备感知推理开关实测-2026-10-15.md"
     ),
     "flash_attn": (
-        "CPU 上仅 1.06×（噪声级）；CUDA 路径无同口径实测，见同一调研 §实测"
+        "随路径与模型规模而异（同机反例）：CPU dense 2B 0.927×（亏，pp 也降）、"
+        "CPU dense 9B 1.053×、CPU MoE 35B-A3B 1.041×；CUDA 三条路径 tg 1.009–1.020×、"
+        "pp +8.3–11.6%。见同一实测"
     ),
     "n_threads": (
         "Surface（4C8T）实测 n_threads=8 最优；线程数属每机标定，不按画像盲推"
     ),
     "cpu_moe": (
         "35B-A3B 实测 `-ngl 99 --cpu-moe` 15.94 tok/s（2.66×）且仅占 2863 MiB 显存；"
-        "沿用引擎既有的 MoE 判定，不由画像决定"
+        "`llama-bench` 侧复现为 `-ncmoe 999`（CUDA 19.6 tok/s）。沿用引擎既有的 MoE 判定，"
+        "不由画像决定"
     ),
 }
 
@@ -281,6 +286,18 @@ def resolve_inference_switches(
             switches.overrides["n_threads"] = str(parsed)
         else:
             logger.warning("忽略无效的 %s=%r（需正整数）", ENV_THREADS, raw_threads)
+
+    # 实测硬约束（2026-10-15 llama-bench，见 docs/设备感知推理开关实测-2026-10-15.md）：
+    # 量化的 KV cache 要求 flash-attn 打开 —— `-fa off -ctk q8_0` 在 CPU 与 CUDA 两条
+    # 路径上都直接 `failed to create context with model`；这不是性能差异，而是**无法加载**。
+    if switches.kv_cache_type_k and not switches.flash_attn:
+        if switches.overrides.get("flash_attn") == "off":
+            raise ValueError(
+                f"{ENV_KV_CACHE}={switches.kv_cache_type_k} 与 {ENV_FLASH_ATTN}=0 不能同时使用："
+                "量化 KV cache 要求 flash-attn（实测该组合无法创建 context）"
+            )
+        switches.flash_attn = True
+        switches.overrides["flash_attn"] = "on(kv-cache-required)"
 
     if profile is not None:
         switches.overrides.setdefault("profile_tier", str(profile.get("tier", "unknown")))
