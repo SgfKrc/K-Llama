@@ -45,6 +45,13 @@ def require(condition: object, message: str) -> None:
         raise EvidenceError(message)
 
 
+def clean_source(value: dict, name: str) -> None:
+    # Legacy evidence may omit this fact. An explicit value must be boolean false;
+    # falsy JSON values such as 0, null or an empty container do not prove clean.
+    require(value.get("source_dirty", False) is False,
+            f"{name}.source_dirty: explicit dirty or invalid source cannot prove clean release evidence")
+
+
 def integer(value: object, name: str, minimum: int = 0) -> int:
     require(type(value) is int and value >= minimum, f"{name}: expected integer >= {minimum}")
     return value
@@ -112,6 +119,7 @@ def _observation(value: dict, identity: tuple, started: float, finished: float) 
 def _validate_run(base: Path, run: dict, revision: str, started: float, finished: float) -> dict:
     mode = run.get("mode")
     require(mode in ("DL", "LL"), "mode must be DL or LL")
+    clean_source(run, "run")
     intent = _json(base, run.get("intent"))
     identity = _identity(intent)
     require(intent.get("status") == "ready" and intent.get("loaded_ready") is True,
@@ -241,6 +249,7 @@ def _validate_run(base: Path, run: dict, revision: str, started: float, finished
         require(node in nodes and node not in observed_nodes, "duplicate/unknown native observer")
         observed_nodes.add(node)
         require(observation.get("source_revision") == revision, "native node executes another source revision")
+        clean_source(observation, f"native node {node}")
         require(observation.get("source") in ("os_process_mappings", "native_loader_receipt"),
                 "native load requires process mappings or native loader receipts")
         require(observation.get("full_model_loaded") is False, "full model loaded or fact missing")
@@ -277,6 +286,7 @@ def validate_bundle(bundle_path: Path, expected_revision: str,
         require(type(bundle.get("schema_version")) is int and bundle["schema_version"] == 1,
                 "unsupported product evidence schema")
         require(bundle.get("source_revision") == expected_revision, "bundle source revision mismatch")
+        clean_source(bundle, "bundle")
         require(bundle.get("physical_opt_in") is True, "physical run was not explicitly opted in")
         started = timestamp(bundle.get("capture_started_at"), "capture_started_at")
         finished = timestamp(bundle.get("capture_finished_at"), "capture_finished_at")

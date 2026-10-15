@@ -243,3 +243,95 @@ def test_eos_requires_its_own_complete_final_handoff_round(bundle):
     ref.update(write_file(base, ref["path"], "\n".join(lines + [gate.COMPLETED_PREFIX+json.dumps(e) for e in events])))
     result = validate(bundle)
     assert result["passed"], result
+
+
+
+def mark_source(bundle, level, value):
+    """Preserve raw evidence hashes when marking a native node's source facts."""
+    base, manifest = bundle[0].parent, bundle[1]
+    if level == "bundle":
+        manifest["source_dirty"] = value
+    elif level in ("DL", "LL"):
+        next(run for run in manifest["runs"] if run["mode"] == level)["source_dirty"] = value
+    else:
+        node = level.removeprefix("native-")
+        update_json(base, manifest["runs"][0]["native"],
+                    lambda obj: next(item for item in obj["nodes"] if item["node_id"] == node)
+                    .update(source_dirty=value))
+
+
+def test_explicit_false_and_missing_source_dirty_remain_compatible(bundle):
+    assert validate(bundle)["passed"]  # Legacy input has no source_dirty fields.
+    for level in ("bundle", "DL", "LL", "native-master", "native-pc", "native-android"):
+        mark_source(bundle, level, False)
+    assert validate(bundle)["passed"]
+
+
+@pytest.mark.parametrize("level", ["bundle", "DL", "LL", "native-master", "native-pc", "native-android"])
+@pytest.mark.parametrize("value", [True, None, 0, 1, 0.0, "false", "true", "", [], {}])
+def test_explicit_dirty_or_invalid_source_cannot_be_same_revision_evidence(bundle, level, value):
+    # Clean outer facts must not override a dirty/invalid run or native node.
+    for clean_level in ("bundle", "DL", "LL", "native-master", "native-pc", "native-android"):
+        mark_source(bundle, clean_level, False)
+    mark_source(bundle, level, value)
+    result = validate(bundle)
+    assert result["passed"] is False
+    assert any("source_dirty" in error for error in result["errors"]), result
+    if level in ("DL", "LL"):
+        assert any(error.startswith(f"{level}:") for error in result["errors"])
+        assert [run["mode"] for run in result["runs"]] == ["LL" if level == "DL" else "DL"]
+
+
+def load_script(name, relative):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("level", ["bundle", "DL", "LL", "native-android"])
+@pytest.mark.parametrize("value", [True, 0])
+def test_runner_combine_rejects_explicit_bad_source_before_writing_bundle(bundle, tmp_path, level, value):
+    runner = load_script("product_source_dirty_runner", "scripts/run_product_relay_gate.py")
+    mark_source(bundle, level, value)
+    inputs = []
+    for run in bundle[1]["runs"]:
+        path = tmp_path / f"input-{run['mode']}.json"
+        path.write_text(json.dumps({**bundle[1], "runs": [run]}), encoding="utf-8")
+        inputs.append(str(path))
+    output = tmp_path / "combined" / "bundle.json"
+    assert runner.main(["combine", "--inputs", *inputs, "--output", str(output)]) == 1
+    report = json.loads(runner.result_path(output).read_text(encoding="utf-8"))
+    assert report["passed"] is False and any("source_dirty" in error for error in report["errors"])
+    assert not output.exists()
+    assert not (output.parent / "DL").exists()
+
+
+@pytest.mark.parametrize("level", ["bundle", "DL", "LL", "native-android"])
+@pytest.mark.parametrize("value", [True, 0])
+def test_release_acceptance_rejects_bad_product_source_even_with_passing_platforms(bundle, tmp_path, level, value):
+    acceptance = load_script("product_source_dirty_acceptance", "scripts/package_contract/release_acceptance.py")
+    contract_bytes = (ROOT / "release-contract.json").read_bytes()
+    reports = {}
+    for platform in acceptance.PLATFORMS:
+        path = tmp_path / f"{platform}.json"
+        report = {
+            "schema_version": 2, "gate": "release-artifacts", "passed": True, "status": "passed",
+            "source_revision": REVISION, "required_revision": REVISION, "revision_verified": True,
+            "requested_platforms": [platform], "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
+            "contract_version": json.loads(contract_bytes)["version"], "reports": [{
+                "platform": platform, "passed": True, "status": "passed", "items": [
+                    {"check": check, "passed": True, "status": "passed", "evidence": {
+                        "source_revision": REVISION, "revision_verified": True}}
+                    for check in sorted(acceptance.MANDATORY[platform])]}],
+        }
+        path.write_text(json.dumps(report), encoding="utf-8")
+        reports[platform] = path
+    assert validate(bundle)["passed"]
+    assert acceptance.summarize_release(reports, bundle[0], REVISION)["passed"]
+    mark_source(bundle, level, value)
+    validate(bundle)  # Persist the marked fixture for the real acceptance validator.
+    result = acceptance.summarize_release(reports, bundle[0], REVISION)
+    assert all(report["passed"] for report in result["platforms"].values())
+    assert result["passed"] is False and result["product"]["passed"] is False
+    assert any("source_dirty" in error for error in result["product"]["errors"])

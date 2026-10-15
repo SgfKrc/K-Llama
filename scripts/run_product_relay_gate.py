@@ -258,8 +258,11 @@ def current_rendered_answer(before, after, message):
     return body.rsplit("\nassistant ", 1)[-1]
 
 
-def widget_text(widget):
-    rendered = widget.render()
+def widget_text(app, selector):
+    # App.query_one may search the default screen after a pushed screen becomes
+    # active. Read the visible screen, never a hidden/default transcript.
+    from textual.widgets import Static
+    rendered = app.screen.query_one(selector, Static).render()
     plain = getattr(rendered, "plain", None)
     require(isinstance(plain, str), "cannot read actual rendered Textual widget text")
     return plain
@@ -313,7 +316,7 @@ async def drive_tui(api, args, attachments, base):
                 and message.value == MESSAGE and not submission):
             require(not any(w.group == "sessions" and not w.is_finished for w in app.workers),
                     "session worker raced with message submission")
-            before = widget_text(app.query_one("#chat-log", Static))
+            before = widget_text(app, "#chat-log")
             submission.update(before=before, offset=len(before), captured_at=time.time(),
                               session_id=app.session_id)
             with (attachments / "transcript-before.txt").open("x", encoding="utf-8") as stream:
@@ -326,7 +329,7 @@ async def drive_tui(api, args, attachments, base):
             while app.main_screen is None or app.main_screen.model_mode != "distributed" \
                     or app.main_screen.chat_model_gate():
                 await pilot.pause(0.1)
-            chat_input = app.query_one("#chat-input", Input)
+            chat_input = app.screen.query_one("#chat-input", Input)
             await pilot.click("#chat-input")
             session_title = None if args.session else f"CI-RELEASE-{args.mode}-{uuid.uuid4().hex}"
             chat_input.value = f"/resume {args.session}" if args.session else f"/new {session_title}"
@@ -354,7 +357,7 @@ async def drive_tui(api, args, attachments, base):
             response = done_payloads[0]
             require(response.get("done") is True, "real SSE done was not true")
             # Extract from the actual rendered chat widget, never from the SSE answer.
-            transcript = widget_text(app.query_one("#chat-log", Static))
+            transcript = widget_text(app, "#chat-log")
             with (attachments / "transcript-after.txt").open("x", encoding="utf-8") as stream:
                 stream.write(transcript)
             require(bool(submission), "Pilot did not submit the arithmetic message")
@@ -367,7 +370,7 @@ async def drive_tui(api, args, attachments, base):
                 stream.write(app.export_screenshot())
             ui = {"entry": "textual", "done": True, "request_id": metrics["request_id"],
                   "submitted_message": MESSAGE, "expected_response": "2",
-                  "rendered_response": rendered, "status_text": widget_text(app.query_one("#chat-status", Static)),
+                  "rendered_response": rendered, "status_text": widget_text(app, "#chat-status"),
                   "captured_at": time.time(), "screen": file_ref(screen, base),
                   "session_id": app.session_id, "session_title": session_title,
                   "submitted_at": submission["captured_at"], "transcript_before_offset": submission["offset"],

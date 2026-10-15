@@ -361,3 +361,34 @@ def test_combine_preserves_existing_narrow_per_mode_windows(tmp_path, inputs):
     assert merged["capture_finished_at"] == 110
     assert all(window["capture_started_at"] == 100 and window["capture_finished_at"] == 110
                for window in merged["input_windows"])
+
+
+@pytest.mark.parametrize("selector", ["#chat-log", "#chat-status"])
+def test_capture_reads_actual_active_screen_instead_of_hidden_default(selector):
+    """Real Textual DOM only; no backend, inference or synthetic stream is run."""
+    import asyncio
+    pytest.importorskip("textual")
+    from textual.app import App, ComposeResult
+    from textual.screen import Screen
+    from textual.widgets import Static
+
+    class VisibleChat(Screen):
+        def compose(self) -> ComposeResult:
+            yield Static("current rendered answer", id="chat-log")
+            yield Static("current request completed", id="chat-status")
+
+    class Screens(App):
+        def compose(self) -> ComposeResult:
+            yield Static("hidden historical answer", id="chat-log")
+            yield Static("hidden historical request", id="chat-status")
+
+    async def run():
+        app = Screens()
+        async with app.run_test() as pilot:
+            app.push_screen(VisibleChat())
+            await pilot.pause()
+            expected = "current rendered answer" if selector == "#chat-log" else "current request completed"
+            assert runner.widget_text(app, selector) == expected
+            assert app.query_one(selector, Static).render().plain != expected
+
+    asyncio.run(run())

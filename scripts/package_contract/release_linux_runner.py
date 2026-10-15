@@ -101,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("invalid or unsigned installed build-info.json")
             if args.require_revision and revision != args.require_revision:
                 raise ValueError("installed source_revision differs from --require-revision")
+            if "source_dirty" in info and info["source_dirty"] is not False:
+                raise ValueError("installed artifact was built from modified or unverifiable source")
             report.ok("bundle.revision", "source revision authenticated by installed signed file set",
                       source_revision=revision, revision_verified=True)
         except (OSError, ValueError) as exc:
