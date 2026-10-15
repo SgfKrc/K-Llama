@@ -49,13 +49,17 @@ Docker CLI 可执行不代表 daemon 已启动；源码 `linux_clean_gate.py` �
 
 真机安装／启动要求显式 `--android-device-probe --android-serial <serial>` 和 `--android-cert-sha256 <pin>`。探针仅用于独立干净验收设备：设备已有 `com.qlh.inference` 时拒绝替换或停止，不触碰已有 SAF／模型数据。新安装后回读 APK 摘要，确认它就是本次接受的文件，再启动 Activity 并观察进程及 resumed 状态，最后移除本次安装。
 
-**Activity smoke 仅证明 UI 启动。** 当前 release 侧尚缺能自动读取实际 worker 角色／native runtime 就绪的合同，因此 `android.roles` 和 `android.native-runtime` 保留 unverified；不能以 pidof 或历史 logcat 抹掉缺口。后续需要 Android 端提供与接受的 APK／本次进程绑定的真实角色及 native 观测，才可关闭该面。
+Activity smoke 后必须执行现有非导出 `InferenceService` 的只读 dumpsys 探针：`--qlh-release-probe <32位小写hex nonce>`。主机在请求前后读取 PID，校验本次 nonce、进程版本、时间窗口、真实 worker 生命周期及同一模型锁内读取的 JNI 后端信息。空后端、stub、角色与连接矛盾、重启、超时和默认分布式加载整模均失败。新装发行包应呈现 distributed/client、worker STOPPED 且没有加载模型；已有开发设备的 READY worker 可单独诊断，不能代替新装发行验收。
+
+探针不加载／卸载模型，不修改模式或凭据；JNI 查询使用有界单 worker，避免超时后持续创建线程。进程 socket 与模型映射是附加 OS 事实，拒绝或不完整时如实记录。它没有增加网络入口或 exported 组件。通过可信 APK 与运行进程的上述核对后，`android.roles`／`android.native-runtime` 才能通过；只有 Activity 或 pidof 不足以通过。
+
+Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.json` 纳入 APK。生成器从主仓与固定子模块 Git 图及实际源码字节计算身份，记录 `source_dirty` 与源码树摘要，不接受环境变量指定 revision。生成任务每次重算；所有 APK variant 在 package 动作前用 `--verify` 逐字段、逐类型核对构建前快照，原快照不刷新；缺仓库、缺子模块或并发源码变化均失败。发行门拒绝明确 dirty 的来源。debug 包可以用于开发真机验证，但不能充当同 revision 的可信发行包。
 
 ## CI 与总门
 
 `.github/workflows/release-acceptance.yml` 通过显式 dispatch 接收成功构建 run id、完整 revision 和物理 opt-in。它从同一 run 下载 `qlh-final-windows`、`qlh-final-linux`、`qlh-final-android`、`qlh-product-relay-evidence`；缺附件立即失败。实验台的 self-hosted runner 需准备平台工具、Linux 镜像，Android 需配置独立验收 serial 及可信证书 pin。
 
-当前工作流使用 `qlh-release`／`qlh-release-android` labels；仓库未验证这些 runner 已配置。该工作流的源码接线已完成，不能把尚未配置或尚未执行的 job 记作成功。新打包应把真实构建 revision 写入上述签名覆盖的 build-info；旧包不能靠事后填 JSON 冒充已认证构建。
+当前工作流使用 `qlh-release`／`qlh-release-android` labels；仓库未验证这些 runner 已配置。该工作流的源码接线已完成，不能把尚未配置或尚未执行的 job 记作成功。现有 Windows CPU／Launcher 及 Linux 构建入口已接入独立源码快照：构建前生成、签名前复核并原样纳入应用树。来源变化、已有签名树或已有 build-info 都会拒绝重新贴身份。Linux 无 Git 导出目录以 `SOURCE_CHECKOUT_REQUIRED` 失败，需真实主仓及固定子模块；不能用环境变量 revision 代替。旧包不能靠事后填 JSON 冒充已认证构建。
 
 `scripts/package_contract/release_acceptance.py` 要求三个平台完整且真实执行的报告，再校验同 revision 的 [DL／LL 产品证据](产品接力证据门-CI-RELEASE-01.md)。每个必验项、发行合同摘要和各包源码身份均须一致。
 
@@ -72,4 +76,6 @@ Docker CLI 可执行不代表 daemon 已启动；源码 `linux_clean_gate.py` �
 | Linux | 没有最终 CPU .deb；Docker CLI 存在，但 dockerDesktopLinuxEngine pipe 不存在，daemon 未运行 |
 | Android | SDK 工具可找到；dist 中没有最终 release APK，未安装／未启动；角色／native 面仍有上述合同缺口 |
 
-这些失败记录保留；没有为通过门补写版本、替换信任库、复用 debug APK 或修改真实节点状态。
+上述首次失败记录保留。后续复核见 `build/ci-release-followup-20261015/final-artifact-result.json`：Linux daemon 已能应答，但仍无最终 `.deb`；Windows 现有 CPU／Launcher 的失败条件未解除；Android 仍无最终 release APK，签名配置缺失。Android 角色／native 探针代码已补齐并在保数据更新的 Y700 debug 包上获得本次 nonce／PID 的真实 JNI 观测，其最终 release 验收仍待可信签名包。没有为通过门替换信任库或复用 debug 签名。
+
+2026-10-15 后续复核已预备 Linux 验收镜像，并在禁网容器确认环境；最终 `.deb` 仍缺失。量化工具已完成真实 Windows GNU／Ninja Release 构建，补丁来源与运行依赖验证通过。最新三平台门仍退出 1，见 `build/ci-release-followup-20261015/final-artifact-retry-result.json`；具体构建修复与测试见 [票 13 续验](ci-release-followup-2026-10-15.md#构建来源与量化工具闭环)。

@@ -38,8 +38,10 @@
   --json build/product-release/result.json
 ```
 
+bundle、run 或 native 节点观测若显式含 `source_dirty`，只能是布尔 `false`；`true`、null、0 或字符串等值一律拒绝。旧 schema 缺省字段仍兼容，但不能通过外层 clean 标记覆盖内部 dirty 事实。
+
 缺 bundle、缺某档、缺附件、错误 SHA、非当前源码 revision、旧请求／代际拼接、全 skip 均不会变成 PASS。历史三机材料可以保留用于追溯；没有本轮新完成记录与同 revision 观测时，不能改写为本轮通过。
 
 ## 当前验收范围
 
-本轮可完成判定器、负向回归、真实采集入口及发行流程接线。本机与 ROG 两机不能满足此门的两个远端要求。Surface 离线、Y700 无电时保留物理验收未完成；后续设备恢复后运行上述真实入口。
+2026-10-15 的首轮两机 LL 和 DL 容量等待材料按原结果保留。修复 HELLO 锁竞争和并发收尾后，master／ROG／Y700 的 Qwen3.5-9B 自动三段 LL 与 DL 均完成真实 API 2／6、Textual/SSE 2，正常停止且无 fallback；LL 42／DL 12 条远端完成回执逐项核对，原生层段观测有独立材料。开发证据汇总为 `build/ci-release-followup-20261015/physical-post-fix-final.json`。当前 dirty 开发部署和 Y700 debug APK 不能组成同 revision 的可信发行 bundle；`final_release_gate_passed=false`，最终发行门仍开放。详见 [票 13 续验记录](ci-release-followup-2026-10-15.md)。
