@@ -8,6 +8,7 @@ import pytest
 
 import scheduler_pipeline
 from scheduler_pipeline import SchedulerPipelineMixin
+from task_worker_adapter import TaskWorkerControlPlane
 
 
 WAIT_SECONDS = 5
@@ -73,6 +74,7 @@ class LayerHost:
 class Worker(SchedulerPipelineMixin):
     def __init__(self):
         self._host = LayerHost()
+        self._task_worker_control = TaskWorkerControlPlane()
         self._distributed_inference_enabled = True
         self._layer_config_lock = threading.Lock()
         self._layer_execution_lock = threading.RLock()

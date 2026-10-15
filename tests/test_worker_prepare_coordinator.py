@@ -28,7 +28,7 @@ def stage_case(retirement_case, monkeypatch):
     master._tcp_server.send_to_client = lambda node, payload, msg_type: case.sent.append((node, deepcopy(payload), msg_type.value))
     monkeypatch.setattr(master, "_task_worker_layer_stage_ids", lambda _ids: {"worker", "android"})
     monkeypatch.setattr(master, "_assignment_connection_generation", lambda _node: 11)
-    def capacity(_ids, *, descriptor, require_distributed):
+    def capacity(_ids, *, descriptor, require_distributed, capacity_evidence=None):
         plan = _capacity_plan(descriptor)
         plan["assignments"] = [plan["assignments"][0]]
         for node, span in (("worker", [4, 6]), ("android", [6, 8])):

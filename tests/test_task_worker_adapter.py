@@ -743,6 +743,7 @@ def test_scheduler_admits_android_worker_only_for_android_node(monkeypatch):
 
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    scheduler._task_worker_control.mark_worker_connection_pending("android_worker_01")
     assert scheduler.register_node(
         "android_worker_01", role="client", node_type="android",
     ) is True
@@ -912,7 +913,7 @@ def test_reconnected_hello_reopens_config_sync_even_when_capabilities_match():
         node_id="worker_01", capabilities=_capabilities(), sent_at_ms=1000,
     )
     assert first is not None
-    coordinator.mark_worker_connection_pending("worker_01")
+    coordinator.mark_worker_connection_pending("worker_01", connection_generation=1)
     coordinator.receive_on_coordinator(
         "worker_01", first.snapshot(), coordinator_node_id="master",
         sent_at_ms=1001,
@@ -925,7 +926,7 @@ def test_reconnected_hello_reopens_config_sync_even_when_capabilities_match():
         node_id="worker_01", capabilities=_capabilities(), sent_at_ms=2000,
     )
     assert second is not None
-    coordinator.mark_worker_connection_pending("worker_01")
+    coordinator.mark_worker_connection_pending("worker_01", connection_generation=2)
     coordinator.receive_on_coordinator(
         "worker_01", second.snapshot(), coordinator_node_id="master",
         sent_at_ms=2001,
@@ -1685,6 +1686,7 @@ def test_scheduler_binds_full_worker_hello_to_registered_pc_client(monkeypatch):
 
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    scheduler._task_worker_control.mark_worker_connection_pending("worker_01")
     scheduler.nodes["worker_01"] = NodeInfo(
         node_id="worker_01",
         role=NodeRole.CLIENT,
@@ -1722,6 +1724,7 @@ def test_recovery_hello_does_not_publish_two_layer_generations(monkeypatch):
 
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    scheduler._task_worker_control.mark_worker_connection_pending("android_layer_01")
     scheduler._pipeline_recovery_pending = True
     scheduler.nodes["android_layer_01"] = NodeInfo(
         node_id="android_layer_01",
@@ -1769,6 +1772,7 @@ def test_scheduler_full_worker_hello_releases_layer_reservation(monkeypatch):
 
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    scheduler._task_worker_control.mark_worker_connection_pending("worker_01")
     scheduler.nodes["worker_01"] = NodeInfo(
         node_id="worker_01",
         role=NodeRole.CLIENT,
@@ -2008,6 +2012,7 @@ def test_scheduler_experimental_gate_reports_physical_validation_pending(
     )
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    scheduler._task_worker_control.mark_worker_connection_pending("worker_01")
     scheduler.nodes["worker_01"] = NodeInfo(
         node_id="worker_01",
         role=NodeRole.CLIENT,
@@ -2047,6 +2052,7 @@ def test_scheduler_does_not_advertise_worker_without_full_model_as_dispatchable(
     )
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    scheduler._task_worker_control.mark_worker_connection_pending("worker_01")
     scheduler.nodes["worker_01"] = NodeInfo(
         node_id="worker_01",
         role=NodeRole.CLIENT,

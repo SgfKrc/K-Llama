@@ -1,4 +1,6 @@
+import json
 import os
+import subprocess
 import sys
 import pytest
 
@@ -16,7 +18,6 @@ from task_journal import (
     TaskJournalInUse,
 )
 from task_provider import ProviderExecutionError
-import config
 
 
 def _event(event_id="evt_one", sequence=1, occurred_at=100.0, payload=None):
@@ -107,13 +108,53 @@ def test_sqlite_journal_has_single_process_owner_until_closed(tmp_path):
     second.close()
 
 
-def test_state_dir_override_is_user_configurable(tmp_path, monkeypatch):
+def test_state_dir_override_is_user_configurable(tmp_path):
     configured = tmp_path / "custom-state"
-    monkeypatch.setenv("QLH_STATE_DIR", str(configured))
-
-    assert config._get_state_dir() == str(configured.resolve())
-    assert os.path.basename(config.TASK_GRAPH_JOURNAL_PATH).startswith("instance-")
-    assert os.path.basename(config.TASK_GRAPH_JOURNAL_PATH).endswith(".sqlite3")
+    # conftest deliberately replaces cached paths in the test process. Probe
+    # real import-time Config resolution in a fresh interpreter instead.
+    node_config_path = tmp_path / "probe-node-config.json"
+    node_config_path.write_text("{}", encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "QLH_STATE_DIR": str(configured),
+        "QLH_NODE_CONFIG_PATH": str(node_config_path),
+        "QLH_NODE_SECRET_STORE_PATH": str(tmp_path / "probe-node-secrets.json"),
+        "QLH_SQLITE_PATH": str(tmp_path / "probe-local-store.sqlite3"),
+        "QLH_TASK_GRAPH_INSTANCE_ID": "state-dir-probe",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    src_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (src_root, env.get("PYTHONPATH", "")) if path
+    )
+    probe = """
+import json
+import config
+print(json.dumps({
+    "resolved_state_dir": config._get_state_dir(),
+    "state_dir": config.STATE_DIR,
+    "journal_path": config.TASK_GRAPH_JOURNAL_PATH,
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", probe],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    resolved = json.loads(completed.stdout)
+    assert resolved["resolved_state_dir"] == str(configured.resolve())
+    assert resolved["state_dir"] == str(configured.resolve())
+    assert os.path.dirname(resolved["journal_path"]) == str(configured / "task_graph")
+    filename = os.path.basename(resolved["journal_path"])
+    assert filename.startswith("instance-state-dir-probe-")
+    assert filename.endswith(".sqlite3")
 
 
 def test_event_and_snapshot_commit_atomically_and_replay_is_idempotent(tmp_path):

@@ -1081,6 +1081,8 @@ class Scheduler(
         self._pipeline_recovery_pending = False
         self._pipeline_recovery_failure = ""
         self._pipeline_recovery_state: Optional[dict] = None
+        # Validation of restored obligations is independent of later write I/O.
+        self._pipeline_recovery_validated = True
         self._pipeline_lifecycle_persist_ok = True
         # Qwen3 remains outside production runtime admission.  This isolated
         # state machine exercises the C2 lifecycle without network dispatch,
@@ -3078,6 +3080,7 @@ class Scheduler(
                 "runtime_multiplier": runtime_multiplier,
                 "execution_device": execution_device,
                 "capacity_source": capacity_source,
+                "engine": engine,
                 "score": self._compute_node_weight(device_info),
             }
             if node_id in layer_ranges_by_node:
@@ -3131,6 +3134,10 @@ class Scheduler(
         )
         with self._nodes_lock:
             snapshot = list(self.nodes.items())
+        # Public host identity is lazy-safe. A prepared candidate must not
+        # relabel a still-serving active plan; fresh plans bind their engine
+        # from the same candidate-aware capacity records used for admission.
+        local_engine = backend_id_for(self._host, default="")
         worker_engines: dict[str, str] = {}
         if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
             try:
@@ -3178,20 +3185,36 @@ class Scheduler(
                 "engine": (
                     "relay_middle"
                     if self._is_relay_host(node_id)
-                    else worker_engines.get(
-                        node_id,
-                        str((_node.device_info or {}).get("backend_id") or "pytorch"),
+                    else (
+                        local_engine if node_id == local_node_id and local_engine
+                        else worker_engines.get(
+                            node_id,
+                            str((_node.device_info or {}).get("backend_id") or "pytorch"),
+                        )
                     )
                 ),
             }
             for node_id, _node in snapshot
         }
 
-    def _attach_pipeline_node_contract(self, plan: dict) -> dict:
+    def _attach_pipeline_node_contract(
+        self, plan: dict, *, capacity_nodes: Optional[list[dict]] = None,
+    ) -> dict:
         """Attach the canonical node layout or reject a malformed admission."""
         if not isinstance(plan, dict) or plan.get("admitted") is not True:
             return plan
         result = dict(plan)
+        if capacity_nodes is not None:
+            engines = {
+                item["node_id"]: item["engine"] for item in capacity_nodes
+                if item.get("engine")
+            }
+            result["assignments"] = [
+                {**item, "engine": engines[item["node_id"]]}
+                if item.get("node_id") in engines and not item.get("engine")
+                else dict(item)
+                for item in (result.get("assignments") or [])
+            ]
         # ★ A1 / X 档（Y 档第二条缺口 6 / 2b）：带**认领区间**的 relay 零层条目**不再剔除**。
         #   它们现在是 `start_layer/end_layer = 认领区间`（如 `(8, 24)`）+ `claimed_layers`，
         #   正好补上"`[k, total)` 由远端段执行"这一块覆盖，让 layout 校验
@@ -3397,6 +3420,7 @@ class Scheduler(
         self, eligible_node_ids: Optional[set[str]] = None,
         *, descriptor: Optional[dict] = None,
         require_distributed: bool = False,
+        capacity_evidence=None,
     ) -> dict:
         """Compute an all-or-nothing metadata-only cluster capacity plan.
 
@@ -3505,6 +3529,9 @@ class Scheduler(
                 sorted(eligible_node_ids) if eligible_node_ids else None,
             )
             capacity_nodes = self._get_pipeline_capacity_nodes(eligible_node_ids)
+            evidence_provenance = []
+            if capacity_evidence is not None:
+                capacity_nodes, evidence_provenance = capacity_evidence.project(capacity_nodes)
             result = solve_pipeline_capacity(
                 descriptor,
                 capacity_nodes,
@@ -3531,6 +3558,8 @@ class Scheduler(
                 nodes=capacity_nodes,
                 require_distributed=require_distributed,
             )
+        if evidence_provenance:
+            result["capacity_evidence"] = evidence_provenance
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
@@ -3544,7 +3573,7 @@ class Scheduler(
             result["reason"] = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"
             )
-        return self._attach_pipeline_node_contract(result)
+        return self._attach_pipeline_node_contract(result, capacity_nodes=capacity_nodes)
 
     def _build_manual_pipeline_capacity_plan(
         self, assignments: list[dict], *, descriptor: Optional[dict] = None,
@@ -3760,7 +3789,7 @@ class Scheduler(
             nodes=capacity_records,
             require_distributed=len(planned) > 1,
         )
-        return self._attach_pipeline_node_contract(plan)
+        return self._attach_pipeline_node_contract(plan, capacity_nodes=capacity_records)
 
     def _normalize_manual_assignments(self, assignments: list) -> list:
         """补齐手动区间的运行字段，并按节点能力放置 Embedding/LM Head。"""
@@ -4089,6 +4118,24 @@ class Scheduler(
             node = self.nodes.get(client_id)
             if node is None or node.role == NodeRole.MASTER:
                 return
+        epoch_getter = getattr(self._tcp_server, "get_authenticated_peer_epoch", None)
+        if callable(epoch_getter) and epoch_getter(client_id) is None:
+            # A late callback for a replaced socket cannot mark the successor
+            # pending, replay its cleanup or broadcast a new scheduling view.
+            return
+
+        # Fence the socket before any recovery/cleanup delivery. REGISTER ACK
+        # is not a task-worker HELLO_ACK; Android cannot accept native commands
+        # while it is still negotiating that acknowledgement.
+        task_worker_handshake_pending = (
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+            and getattr(node, "node_type", "pc") in {"pc", "android"}
+        )
+        if task_worker_handshake_pending:
+            self._task_worker_control.mark_worker_connection_pending(
+                client_id,
+                connection_generation=self._assignment_connection_generation(client_id),
+            )
 
         qwen3_release = []
         with self._layer_config_lock:
@@ -4115,12 +4162,6 @@ class Scheduler(
         # REGISTER ACK precedes the client's task-worker hello. Fence this
         # connection from legacy layer assignment until that hello arrives.
         # The hello handler resolves the fence and triggers a fresh push.
-        task_worker_handshake_pending = (
-            TASK_WORKER_EXPERIMENTAL_ENABLED
-            and getattr(node, "node_type", "pc") in {"pc", "android"}
-        )
-        if task_worker_handshake_pending:
-            self._task_worker_control.mark_worker_connection_pending(client_id)
         if cleanup_replayed:
             logger.info(
                 "legacy_layer_config skipped reason=model_cleanup_pending node=%s",
@@ -4190,6 +4231,23 @@ class Scheduler(
                 if self._tcp_server:
                     self._tcp_server.reject_client(client_id, reason)
                 return
+
+            # Arm the fence before TCPServer confirms REGISTER. Unconfirmed
+            # sockets are also excluded by the generation-bound send path.
+            if (
+                self._effective_role() == "master"
+                and TASK_WORKER_EXPERIMENTAL_ENABLED
+                and data.get("node_type", "pc") in {"pc", "android"}
+            ):
+                # This callback precedes REGISTER ACK. Use the exact inbound
+                # registration epoch even while that socket is unconfirmed.
+                epoch_getter = getattr(self._tcp_server, "get_registration_peer_epoch", None)
+                epoch = (epoch_getter(client_id) if callable(epoch_getter)
+                         else self._assignment_connection_generation(client_id))
+                if epoch is not None:
+                    self._task_worker_control.mark_worker_connection_pending(
+                        client_id, connection_generation=epoch,
+                    )
 
             # TCPServer sends REGISTER ACK first, then invokes
             # _on_tcp_registration_confirmed.  Keeping all business pushes in

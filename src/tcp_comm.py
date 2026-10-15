@@ -1906,7 +1906,8 @@ class TCPServer:
                 logger.debug(f"心跳 ACK 发送失败: client={client_id}, error={e}", exc_info=True)
 
     def send_to_client(self, client_id: str, data: Any,
-                       msg_type: MessageType = MessageType.TENSOR) -> None:
+                       msg_type: MessageType = MessageType.TENSOR,
+                       *, registration_epoch: int | None = None) -> None:
         """
         向指定从节点发送数据。
 
@@ -1923,6 +1924,12 @@ class TCPServer:
         try:
             # 心跳 ACK、控制消息和大张量会由不同线程发送，必须保持完整帧原子写入。
             with conn.send_lock:
+                if registration_epoch is not None and (
+                    not conn.registration_confirmed
+                    or conn.registration_epoch != registration_epoch
+                    or self._get_client(client_id) is not conn
+                ):
+                    raise ConnectionError(f"node {client_id} registration changed before send")
                 conn.sock.sendall(packet)
         except OSError as e:
             raise ConnectionError(f"向 {client_id} 发送失败: {e}")
@@ -1936,9 +1943,12 @@ class TCPServer:
             except ConnectionError as e:
                 logger.warning(f"广播跳过 {cid}: {e}", exc_info=True)
 
-    def send_layer_config(self, client_id: str, assignment: dict) -> None:
+    def send_layer_config(
+        self, client_id: str, assignment: dict, *, registration_epoch: int | None = None,
+    ) -> None:
         """向指定从节点推送分层配置"""
-        self.send_to_client(client_id, assignment, MessageType.LAYER_CONFIG)
+        send_options = {"registration_epoch": registration_epoch} if registration_epoch is not None else {}
+        self.send_to_client(client_id, assignment, MessageType.LAYER_CONFIG, **send_options)
 
     def is_authenticated_loopback_client(self, client_id: str) -> bool:
         """Return whether HMAC registration completed on a loopback socket."""
@@ -1950,11 +1960,27 @@ class TCPServer:
         except ValueError:
             return False
 
+    def get_registration_peer_epoch(self, client_id: str) -> int | None:
+        """Return the exact live epoch, including the pre-REGISTER-ACK edge."""
+        client = self._get_client(client_id)
+        callback_client = getattr(self._registration_context, "client", None)
+        if (callback_client is not None and callback_client.client_id == client_id
+                and callback_client is not client):
+            return None
+        return int(client.registration_epoch) if client is not None else None
+
     def get_authenticated_peer_epoch(self, client_id: str) -> int | None:
         """Return the live registration epoch, or ``None`` when unauthenticated."""
         client = self._get_client(client_id)
+        callback_client = getattr(self._registration_context, "client", None)
+        if (callback_client is not None and callback_client.client_id == client_id
+                and callback_client is not client):
+            return None
         if client is None or not client.registration_confirmed:
             return None
+        # Check confirmation and return the epoch from the same object. A
+        # second lookup could substitute an unconfirmed reconnect after this
+        # check, authorizing commands before that successor's HELLO_ACK.
         return int(client.registration_epoch)
 
     def is_authenticated_loopback_peer(self, client_id: str, epoch: int) -> bool:
@@ -2088,6 +2114,9 @@ class TCPServer:
 class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
+    MAX_RECONNECT_FAILURES = 8
+    MAX_RECONNECT_BACKOFF_SECONDS = 30.0
+
     # A healthy peer must answer within at least one socket receive-timeout
     # window.  Counting heartbeat periods keeps the watchdog deterministic
     # when recv() repeatedly returns socket.timeout on a half-open connection.
@@ -2121,6 +2150,7 @@ class TCPClient:
         self.on_message: Optional[Callable] = None
         self.on_heartbeat: Optional[Callable] = None  # 心跳发送后回调（无参数）
         self.on_disconnect: Optional[Callable] = None
+        self.on_reconnect: Optional[Callable] = None
         self._disconnect_callback_lock = threading.Lock()
         self._disconnect_notified = False
         self._connection_generation = 0
@@ -2137,7 +2167,36 @@ class TCPClient:
         self._reconnect_state_lock = threading.Lock()
         self._reconnect_in_progress = False
         self._reconnect_retry_scheduled = False
+        self._reconnect_retry_owner = None
+        self._reconnect_intent_epoch = 0
+        self._reconnect_enabled = True
+        self._reconnect_context = threading.local()
+        self.reconnect_failure_count = 0
+        self.reconnect_state = "idle"
+        self.last_reconnect_error = ""
+        self.next_reconnect_at = 0.0
         self._control_fence: ControlFence | None = None
+
+    def capture_registration_owner(self) -> tuple | None:
+        """Capture an authenticated (client, epoch, socket) under its publish lock."""
+        with self._disconnect_callback_lock:
+            if not self._registered or self.sock is None:
+                return None
+            return (self, self._registration_epoch, self.sock)
+
+    def run_if_registration_owner(self, owner: tuple, action: Callable) -> Any:
+        """Run a short state action atomically with registration/retirement.
+
+        The action must not perform I/O, wait for a sender, or acquire the
+        reconnect intent lock. Callers take their scheduler owner lock first.
+        Socket sends happen afterwards, bound to owner[2], outside this lock.
+        """
+        with self._disconnect_callback_lock:
+            if (owner[0] is not self or not self._registered
+                    or owner[1] != self._registration_epoch
+                    or owner[2] is not self.sock):
+                return None
+            return action()
 
     def set_control_fence(self, fence: ControlFence | None) -> None:
         if fence is not None and not isinstance(fence, ControlFence):
@@ -2286,9 +2345,27 @@ class TCPClient:
             logger.warning("connect() 已在执行中，忽略并发调用")
             return False
         try:
-            self.on_message = on_message
-            self._registered = False
-            self.last_register_error = ""
+            with self._reconnect_state_lock:
+                intent_epoch = getattr(self._reconnect_context, "epoch", None)
+                if intent_epoch is None:
+                    # Only an explicit connect starts a new intent after a manual stop.
+                    self._reconnect_intent_epoch += 1
+                    intent_epoch = self._reconnect_intent_epoch
+                    self._reconnect_enabled = True
+                    if self._reconnect_retry_owner is not None:
+                        self._reconnect_retry_owner[1].set()
+                    self._reconnect_retry_owner = None
+                    self._reconnect_retry_scheduled = False
+                    self.reconnect_failure_count = 0
+                    self.last_reconnect_error = ""
+                    self.next_reconnect_at = 0.0
+                if not self._reconnect_enabled or intent_epoch != self._reconnect_intent_epoch:
+                    return False
+                self.reconnect_state = "connecting"
+                self.on_message = on_message
+                with self._disconnect_callback_lock:
+                    self._registered = False
+                self.last_register_error = ""
 
             # 所有可能较慢的注册准备必须在建立 TCP 连接前完成。首次模型
             # 摘要和 Windows 网络检测都可能超过服务端的注册等待超时。
@@ -2315,9 +2392,18 @@ class TCPClient:
             hostname = _platform.node()
 
             for attempt in range(RECONNECT_MAX_RETRIES):
+                with self._reconnect_state_lock:
+                    if not self._reconnect_enabled or intent_epoch != self._reconnect_intent_epoch:
+                        return False
                 try:
-                    self.sock = self._connect_socket(self.server_host, self.server_port)
-                    self._running = True
+                    opened_sock = self._connect_socket(self.server_host, self.server_port)
+                    with self._reconnect_state_lock:
+                        if not self._reconnect_enabled or intent_epoch != self._reconnect_intent_epoch:
+                            opened_sock.close()
+                            return False
+                        with self._disconnect_callback_lock:
+                            self.sock = opened_sock
+                            self._running = True
                     logger.info(f"已连接主节点: {self.server_host}:{self.server_port}")
 
                     # 发送注册消息（携带身份、网络类型、服务端点和设备画像）
@@ -2361,13 +2447,13 @@ class TCPClient:
 
                     # 等待注册确认
                     register_reason = "未收到注册确认"
+                    registered = False
                     try:
                         ack_msg = self.recv_data()
                         if ack_msg and ack_msg.get("type") == "register":
                             ack_data = ack_msg.get("data", {})
                             if ack_data.get("status") == "registered":
-                                self._registered = True
-                                self._registration_epoch += 1
+                                registered = True
                                 logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
                             else:
                                 status = ack_data.get("status") or "unknown"
@@ -2379,7 +2465,7 @@ class TCPClient:
                         register_reason = f"注册确认等待失败: {e}"
                         logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
-                    if not self._registered:
+                    if not registered:
                         self.last_register_error = register_reason
                         # Fence worker threads before closing a failed
                         # registration socket. Otherwise an old heartbeat can
@@ -2409,42 +2495,38 @@ class TCPClient:
                         )
                         return False
 
-                    # 注册成功后才推进连接代数：若 TCP 连上但注册失败，
-                    # 代数保持不变，旧心跳线程不会因代数失配而退出，
-                    # 可以继续驱动 _reconnect() 持续重连
-                    with self._disconnect_callback_lock:
-                        self._connection_generation += 1
-                        connection_generation = self._connection_generation
-                        # Bind both workers to this exact socket.  A worker from a
-                        # previous generation may be delayed until after reconnect;
-                        # reading self.sock from inside that worker could otherwise
-                        # make it close or use the newly registered connection.
-                        connection_sock = self.sock
-                        self._disconnect_notified = False
-                        self._last_heartbeat_send = 0.0
-                        self._last_heartbeat_ack_send = 0.0
-                        self._heartbeat_ack_missed = 0
-                        self._heartbeat_quality.begin_generation(connection_generation)
-                        self._transport_runtime_call(
-                            "connected", connection_generation,
+                    # Publish REGISTER and start its loops under the intent lock.
+                    # A stop during socket connect or REGISTER can never publish a late success.
+                    with self._reconnect_state_lock:
+                        if not self._reconnect_enabled or intent_epoch != self._reconnect_intent_epoch:
+                            opened_sock.close()
+                            return False
+                        with self._disconnect_callback_lock:
+                            self._registered = True
+                            self._registration_epoch += 1
+                            self._connection_generation += 1
+                            connection_generation = self._connection_generation
+                            connection_sock = self.sock
+                            self._disconnect_notified = False
+                            self._last_heartbeat_send = 0.0
+                            self._last_heartbeat_ack_send = 0.0
+                            self._heartbeat_ack_missed = 0
+                            self._heartbeat_quality.begin_generation(connection_generation)
+                            self._transport_runtime_call("connected", connection_generation)
+                        self.reconnect_failure_count = 0
+                        self.reconnect_state = "ready"
+                        self.last_reconnect_error = ""
+                        self.next_reconnect_at = 0.0
+                        self._heartbeat_thread = threading.Thread(
+                            target=self._heartbeat_loop,
+                            args=(connection_generation, connection_sock), daemon=True,
                         )
-
-                    # 启动心跳线程
-                    self._heartbeat_thread = threading.Thread(
-                        target=self._heartbeat_loop,
-                        args=(connection_generation, connection_sock),
-                        daemon=True,
-                    )
-                    self._heartbeat_thread.start()
-
-                    # 启动接收线程
-                    self._recv_thread = threading.Thread(
-                        target=self._recv_loop,
-                        args=(connection_generation, connection_sock),
-                        daemon=True,
-                    )
-                    self._recv_thread.start()
-
+                        self._recv_thread = threading.Thread(
+                            target=self._recv_loop,
+                            args=(connection_generation, connection_sock), daemon=True,
+                        )
+                        self._heartbeat_thread.start()
+                        self._recv_thread.start()
                     return True
                 except ConnectionRefusedError:
                     logger.warning(
@@ -2532,22 +2614,23 @@ class TCPClient:
         finally:
             # 无论以何种方式退出循环，都必须完成清理并通知断连，
             # 否则上层健康监控无法感知断开、不会触发重连
+            self._notify_disconnect(connection_generation, connection_sock=connection_sock)
             with self._disconnect_callback_lock:
                 is_current = (
                     connection_generation is None
                     or connection_generation == self._connection_generation
                 )
-                if is_current and self.sock is connection_sock:
+                retired_current = is_current and self.sock is connection_sock
+                if retired_current:
                     self.sock = None
+                    self._running = False
             if connection_sock is not None:
                 try:
                     connection_sock.close()
                 except OSError:
                     pass
-            self._notify_disconnect(
-                connection_generation,
-                connection_sock=connection_sock,
-            )
+            if retired_current:
+                self._schedule_reconnect_retry()
             logger.info(f"接收循环已退出: {self.client_id}")
 
     def _notify_disconnect(
@@ -2764,53 +2847,72 @@ class TCPClient:
                 self._reconnect()
 
     def _schedule_reconnect_retry(self) -> None:
-        """Schedule one retry without reviving a stale heartbeat thread."""
+        """One waiting owner; transfer to an active owner atomically under the same lock."""
         with self._reconnect_state_lock:
-            if self._reconnect_retry_scheduled:
+            caller_epoch = getattr(self._reconnect_context, "epoch", None)
+            if (caller_epoch is not None and caller_epoch != self._reconnect_intent_epoch):
                 return
+            if (not self._reconnect_enabled or self._reconnect_in_progress
+                    or self._reconnect_retry_owner is not None or self._registered
+                    or self.reconnect_failure_count >= self.MAX_RECONNECT_FAILURES):
+                return
+            epoch = self._reconnect_intent_epoch
+            wake = threading.Event()
+            owner = (epoch, wake)
+            self._reconnect_retry_owner = owner
             self._reconnect_retry_scheduled = True
+            delay = min(
+                RECONNECT_DELAY * 2 ** max(0, self.reconnect_failure_count - 1),
+                self.MAX_RECONNECT_BACKOFF_SECONDS,
+            )
+            self.next_reconnect_at = time.time() + delay
+            self.reconnect_state = "backing_off"
 
         def _retry() -> None:
             try:
-                time.sleep(RECONNECT_DELAY)
-                with self._disconnect_callback_lock:
-                    should_retry = not self._running and not self._registered
-                if should_retry:
-                    self._reconnect()
+                if not wake.wait(delay):
+                    self._reconnect(_intent_epoch=epoch, _retry_owner=owner)
             finally:
                 with self._reconnect_state_lock:
-                    self._reconnect_retry_scheduled = False
+                    # Never clear the successor's ownership after handing this one off.
+                    if self._reconnect_retry_owner is owner:
+                        self._reconnect_retry_owner = None
+                        self._reconnect_retry_scheduled = False
 
         threading.Thread(
-            target=_retry,
-            name=f"tcp-reconnect-{self.client_id}",
-            daemon=True,
+            target=_retry, name=f"tcp-reconnect-{self.client_id}", daemon=True,
         ).start()
 
-    def _reconnect(self) -> None:
-        """断线重连
-
-        connect() 内部已有 RECONNECT_MAX_RETRIES 次重试，
-        此处不再额外循环。若 connect() 全部失败，设置 _running=True
-        并延迟，使心跳循环在下次迭代时自动触发重连。
-        """
+    def _reconnect(self, *, _intent_epoch=None, _retry_owner=None) -> None:
+        """Retire the old generation, reconnect once, then hand failure to one delayed owner."""
         with self._reconnect_state_lock:
-            if self._reconnect_in_progress:
+            epoch = self._reconnect_intent_epoch if _intent_epoch is None else _intent_epoch
+            if (not self._reconnect_enabled or epoch != self._reconnect_intent_epoch
+                    or self._reconnect_in_progress
+                    or self.reconnect_failure_count >= self.MAX_RECONNECT_FAILURES):
                 return
+            if _retry_owner is not None:
+                if self._reconnect_retry_owner is not _retry_owner:
+                    return
+                self._reconnect_retry_owner = None
+                self._reconnect_retry_scheduled = False
+            elif self._reconnect_retry_owner is not None:
+                return
+            # Clearing waiting ownership and claiming active ownership are one atomic operation.
             self._reconnect_in_progress = True
-        try:
-            logger.info(
-                f"开始重连主节点: client={self.client_id}, "
-                f"target={self.server_host}:{self.server_port}"
-            )
-            # Fence every older heartbeat/receive loop before closing its socket.
-            # A failed REGISTER must never revive that stale loop.
+            registration_epoch_before = self._registration_epoch
+            self.reconnect_state = "connecting"
+            self.next_reconnect_at = 0.0
             with self._disconnect_callback_lock:
                 self._connection_generation += 1
                 self._running = False
                 self._registered = False
                 old_sock = self.sock
                 self.sock = None
+        retry = False
+        try:
+            logger.info("开始重连主节点: client=%s target=%s:%s intent_epoch=%s",
+                        self.client_id, self.server_host, self.server_port, epoch)
             if old_sock is not None:
                 try:
                     old_sock.shutdown(socket.SHUT_RDWR)
@@ -2820,22 +2922,66 @@ class TCPClient:
                     old_sock.close()
                 except OSError:
                     pass
-
-            # connect() internally retries transport errors; REGISTER rejection
-            # returns immediately so the delayed retry below can wait for the
-            # server to retire the old session without reviving old threads.
+            # Thread-local context preserves connect(on_message)'s public and injected contract.
+            self._reconnect_context.epoch = epoch
             ok = self.connect(self.on_message)
-            if ok:
-                logger.info(f"重连主节点成功: client={self.client_id}")
-            else:
-                logger.error(
-                    f"重连主节点失败: client={self.client_id}，"
-                    f"将在 {RECONNECT_DELAY}s 后单独重试"
-                )
-                self._schedule_reconnect_retry()
+            with self._reconnect_state_lock:
+                if not self._reconnect_enabled or epoch != self._reconnect_intent_epoch:
+                    # A newer explicit connect owns its own socket. Never retire that owner.
+                    # Production connect fences its unpublished socket before returning.
+                    if not self._reconnect_enabled:
+                        with self._disconnect_callback_lock:
+                            late_sock = self.sock
+                            self.sock = None
+                            self._running = self._registered = False
+                        if late_sock is not None:
+                            try:
+                                late_sock.close()
+                            except OSError:
+                                pass
+                    return
+                if ok:
+                    self.reconnect_failure_count = 0
+                    self.reconnect_state = "ready"
+                    self.last_reconnect_error = ""
+                    logger.info("重连主节点成功: client=%s intent_epoch=%s", self.client_id, epoch)
+                else:
+                    self.reconnect_failure_count += 1
+                    retry = self.reconnect_failure_count < self.MAX_RECONNECT_FAILURES
+                    self.reconnect_state = "backing_off" if retry else "retry_exhausted"
+                    self.last_reconnect_error = "worker_reconnect_failed" if retry else "worker_reconnect_exhausted"
+                    logger.error("%s: client=%s failures=%s registration_reason=%s",
+                                 self.last_reconnect_error, self.client_id,
+                                 self.reconnect_failure_count, self.last_register_error)
+            # Transport registration alone does not restore the upper worker protocol.
+            # Run outside the intent lock so an owner can schedule its fenced hello.
+            if ok and self._registered and self.on_reconnect:
+                try:
+                    self.on_reconnect()
+                except Exception:
+                    logger.warning("event=tcp_reconnect_callback_failed client=%s",
+                                   self.client_id, exc_info=True)
         finally:
             with self._reconnect_state_lock:
                 self._reconnect_in_progress = False
+                with self._disconnect_callback_lock:
+                    lost_published_connection = (
+                        self._registration_epoch > registration_epoch_before
+                        and not self._registered
+                    )
+                # EOF can retire a newly accepted REGISTER while this owner is still active.
+                # Its scheduling request was suppressed above; hand it off after releasing
+                # active ownership, but only within this same, still-enabled connect intent.
+                if (self._reconnect_enabled and epoch == self._reconnect_intent_epoch
+                        and lost_published_connection):
+                    retry = True
+            # Keep this caller's intent until its successor is scheduled. A stopped/superseded
+            # failure must not enqueue a retry into a newer explicit connect intent.
+            try:
+                if retry:
+                    self._schedule_reconnect_retry()
+            finally:
+                self._reconnect_context.epoch = None
 
     @property
     def is_registered(self) -> bool:
@@ -2859,12 +3005,21 @@ class TCPClient:
         """断开连接"""
         # Advance the generation before closing so delayed receive/heartbeat
         # workers cannot operate on this socket after an explicit disconnect.
-        with self._disconnect_callback_lock:
-            self._connection_generation += 1
-            self._running = False
-            self._registered = False
-            active_sock = self.sock
-            self.sock = None
+        with self._reconnect_state_lock:
+            self._reconnect_intent_epoch += 1
+            self._reconnect_enabled = False
+            self.reconnect_state = "stopped"
+            self.next_reconnect_at = 0.0
+            if self._reconnect_retry_owner is not None:
+                self._reconnect_retry_owner[1].set()
+            self._reconnect_retry_owner = None
+            self._reconnect_retry_scheduled = False
+            with self._disconnect_callback_lock:
+                self._connection_generation += 1
+                self._running = False
+                self._registered = False
+                active_sock = self.sock
+                self.sock = None
         if active_sock is not None:
             try:
                 shutdown = getattr(active_sock, "shutdown", None)

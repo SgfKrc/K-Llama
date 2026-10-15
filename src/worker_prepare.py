@@ -403,14 +403,37 @@ class WorkerPrepareController:
                 self._stage_fenced = True
             self._publish(command, preparing)
             runtime.fence_worker_runtime()
+            started_at = time.monotonic()
+            selection_started_at = started_at
             selected = resolve_prepare_selection(self.scheduler, identity)
+            logger.info(
+                "event=worker_prepare_selection node=%s operation=%s config=%s "
+                "range=%s elapsed_ms=%.1f",
+                identity["node_id"], identity["operation_id"], identity["config_id"],
+                identity["layer_range"], (time.monotonic() - selection_started_at) * 1000,
+            )
+            runtime_started_at = time.monotonic()
             runtime.prepare_worker_runtime(payload, selected, command.cancelled)
+            logger.info(
+                "event=worker_prepare_runtime_loaded node=%s operation=%s config=%s "
+                "range=%s elapsed_ms=%.1f",
+                identity["node_id"], identity["operation_id"], identity["config_id"],
+                identity["layer_range"], (time.monotonic() - runtime_started_at) * 1000,
+            )
             if command.cancelled.is_set() or not self._valid(command) or identity != self._latest_prepare:
                 runtime.abort_worker_runtime(identity, restore_previous=False)
                 raise WorkerPrepareError("worker_prepare_fence_changed")
+            selection_recheck_started_at = time.monotonic()
             if resolve_prepare_selection(self.scheduler, identity) != selected:
                 runtime.abort_worker_runtime(identity, restore_previous=False)
                 raise WorkerPrepareError("worker_prepare_registration_changed")
+            logger.info(
+                "event=worker_prepare_selection_recheck node=%s operation=%s config=%s "
+                "range=%s elapsed_ms=%.1f total_elapsed_ms=%.1f",
+                identity["node_id"], identity["operation_id"], identity["config_id"],
+                identity["layer_range"], (time.monotonic() - selection_recheck_started_at) * 1000,
+                (time.monotonic() - started_at) * 1000,
+            )
             self._publish(command, lambda: setattr(self, "_candidate_phase", "prepared"))
         elif action == "commit":
             with self._lock:

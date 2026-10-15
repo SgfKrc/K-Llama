@@ -612,6 +612,11 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             or self._effective_role() != "master"
         ):
             return
+        if not self._pipeline_recovery_validated:
+            # A partial ledger cannot replace the original unvalidated record.
+            # An exact ACK may settle one known debt, but cannot erase evidence
+            # of obligations that failed restart validation.
+            return
         state = self._pipeline_lifecycle_snapshot_locked()
         if state is None:
             return
@@ -620,11 +625,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
 
             set_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, state)
             self._pipeline_lifecycle_persist_ok = True
-            if self._pipeline_recovery_pending and self._pipeline_recovery_failure in {
-                "pipeline_lifecycle_persist_failed",
-                "pipeline_recovery_state_unavailable",
-                "pipeline_recovery_state_invalid",
-            }:
+            if (self._pipeline_recovery_pending
+                    and self._pipeline_recovery_failure == "pipeline_lifecycle_persist_failed"):
                 self._pipeline_recovery_failure = "pipeline_recovery_pending"
         except Exception:
             self._pipeline_lifecycle_persist_ok = False
@@ -728,7 +730,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         if server is None or not getattr(server, "_running", False):
             return False
         try:
-            self._send_pipeline_worker_config(node_id, dict(record.get("payload", {})))
+            if self._send_pipeline_worker_config(
+                node_id, dict(record.get("payload", {})),
+            ) is False:
+                return False
         except Exception:
             logger.warning(
                 "发送候选终局清理失败: action=%s node=%s candidate=%s",
@@ -870,6 +875,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
 
     def _load_pipeline_recovery_state(self) -> None:
         """Arm a restart fence from the last active transaction."""
+        self._pipeline_recovery_validated = False
         try:
             from local_store import get_local_setting
 
@@ -882,6 +888,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             return
         self._pipeline_lifecycle_persist_ok = True
         if raw is None:
+            self._pipeline_recovery_validated = True
             return
         try:
             schema_version = int(raw.get("schema_version", 0) or 0)
@@ -1047,8 +1054,6 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         generation=int(raw["generation"]), action=action,
                         assignment_id=identity["assignment_id"], payload=payload,
                     )
-                if self._pipeline_model_cleanup_ledger:
-                    self._persist_pipeline_lifecycle_locked()
         if phase in _PIPELINE_RECOVERY_PHASES:
             persisted_sha256 = str(raw.get("model_sha256", "") or "").lower()
             if (
@@ -1074,6 +1079,11 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 raw.get("config_id", ""), raw.get("generation", ""), phase,
             )
 
+        self._pipeline_recovery_validated = True
+        if self._pipeline_model_cleanup_ledger:
+            with self._layer_config_lock:
+                self._persist_pipeline_lifecycle_locked()
+
     def _restore_pipeline_model_for_recovery(self) -> bool:
         """Restore distributed-only model metadata before workers reconnect.
 
@@ -1084,6 +1094,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         """
         if not self._pipeline_recovery_pending:
             return True
+        if not self._pipeline_recovery_validated:
+            return False
         state = self._pipeline_recovery_state
         if not isinstance(state, dict):
             return False
@@ -1258,6 +1270,42 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         self._pipeline_recovery_pending = False
         self._pipeline_recovery_failure = ""
 
+    def retire_pipeline_recovery_for_model_change(self) -> bool:
+        """Persist explicit retirement without forgiving any native cleanup.
+
+        The model-change owner calls this only after a successful local change
+        and invalidation of the old transaction. A restart recovery identity is
+        no longer a target after that explicit choice; its native debts retain
+        their separate, ACK-owned lifecycle.
+        """
+        with self._layer_config_lock:
+            if not self._pipeline_recovery_validated:
+                return False
+            recovery = self._pipeline_recovery_state
+            if not isinstance(recovery, dict):
+                return not self._pipeline_recovery_pending
+            if (self._pipeline_load_transaction is not None
+                    or self._active_pipeline_capacity_plan is not None
+                    or not getattr(self, "_running", False)
+                    or self._effective_role() != "master"):
+                return False
+            if (not self._pipeline_lifecycle_persist_ok
+                    and self._pipeline_recovery_failure != "pipeline_lifecycle_persist_failed"):
+                # Invalid/unreadable cleanup records cannot be reconstructed by
+                # replacing the local model. Preserve their existing fence.
+                return False
+            self._pipeline_recovery_state = {
+                **recovery,
+                "phase": "invalidated",
+                "published": False,
+                "updated_at": time.time(),
+            }
+            self._persist_pipeline_lifecycle_locked()
+            if not self._pipeline_lifecycle_persist_ok:
+                return False
+            self._clear_pipeline_recovery_fence()
+            return True
+
     def _recovery_model_matches(self, model_info: dict) -> bool:
         """Fence a fresh generation to the model persisted before restart."""
         if not self._pipeline_recovery_pending:
@@ -1288,7 +1336,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         """Release the restart fence only after the fresh generation is ready."""
         if not self._pipeline_recovery_pending:
             return
-        if not self._pipeline_lifecycle_persist_ok:
+        if (not self._pipeline_lifecycle_persist_ok
+                or not self._pipeline_recovery_validated):
             return
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
@@ -1455,6 +1504,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         self, *, candidate_id: str, descriptor: dict,
         model_path: str, quant_type: str = "",
         require_distributed: bool = True, on_commit=None, operation_id: str = "",
+        capacity_evidence=None,
     ) -> dict:
         """Start one explicit model candidate without replacing active state."""
         candidate_id = str(candidate_id or "").strip()
@@ -1538,6 +1588,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         "quant_type": str(quant_type or ""),
                         "on_commit": on_commit,
                         "operation_id": operation_id,
+                        "capacity_evidence": capacity_evidence,
                     },
                 )
             finally:
@@ -1910,6 +1961,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     eligible_node_ids,
                     descriptor=candidate_descriptor,
                     require_distributed=require_distributed,
+                    **({"capacity_evidence": candidate["capacity_evidence"]}
+                       if candidate and candidate.get("capacity_evidence") is not None else {}),
                 )
             if isinstance(capacity_plan, dict):
                 capacity_plan = dict(capacity_plan)

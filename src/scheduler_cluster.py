@@ -2251,6 +2251,7 @@ class SchedulerClusterMixin:
         *,
         force_bootstrap: bool = False,
         persist_preference: bool = False,
+        _automatic: bool = False,
     ) -> dict:
         """串行建立唯一的主节点连接。"""
         from network_address import canonical_host
@@ -2281,6 +2282,22 @@ class SchedulerClusterMixin:
                     "reused": True,
                     **preference,
                 }
+            # TCP owns its entire automatic retry intent, including backoff,
+            # the EOF-to-retry handoff and finite exhaustion. A periodic health
+            # observer must not create another TCPClient for the same target.
+            if current is not None and getattr(current, "_reconnect_enabled", False):
+                same_target = (str(getattr(current, "server_host", "")) == str(master_host)
+                               and int(getattr(current, "server_port", 0)) == master_port)
+                if _automatic and same_target:
+                    state = getattr(current, "reconnect_state", "connecting")
+                    return {"status": "retry_exhausted" if state == "retry_exhausted" else "reconnecting",
+                            "node_id": self.get_effective_node_id(), "reused": True,
+                            "reason_code": getattr(current, "last_reconnect_error", ""),
+                            "master": f"{master_host}:{master_port}"}
+                if not current_connected:
+                    # An explicit retry or a newly discovered endpoint starts
+                    # a fresh intent only after the previous one is stopped.
+                    current.disconnect()
             return self._connect_to_master_locked(
                 master_host,
                 master_port,
@@ -2385,6 +2402,12 @@ class SchedulerClusterMixin:
 
             from transport_port import create_client
 
+            def _publish_client(target_client) -> None:
+                # Same short boundary used by hello creation and disconnect
+                # cleanup. Never hold it across connect(), hashing or sending.
+                with self._task_worker_refresh_lock:
+                    self._tcp_client = target_client
+
             previous_client = getattr(self, "_tcp_client", None)
             previous_callback = (
                 getattr(previous_client, "on_disconnect", None)
@@ -2409,17 +2432,17 @@ class SchedulerClusterMixin:
 
             def _restore_previous_client() -> None:
                 if previous_client is None:
-                    self._tcp_client = None
+                    _publish_client(None)
                     return
                 if not (
                     getattr(previous_client, "_running", False)
                     and getattr(previous_client, "is_registered", False)
                     and getattr(previous_client, "sock", None) is not None
                 ):
-                    self._tcp_client = None
+                    _publish_client(None)
                     return
                 previous_client.on_disconnect = previous_callback
-                self._tcp_client = previous_client
+                _publish_client(previous_client)
                 previous_node_id = getattr(previous_client, "client_id", "")
                 if previous_node_id:
                     self._scheduler_facade_global('_sync_runtime_node_config')(
@@ -2440,7 +2463,7 @@ class SchedulerClusterMixin:
             # REGISTER_ACK 后主节点会立即下发层配置，接收线程可能在
             # connect() 返回前进入回调。提前绑定连接和最终 node_id，保证
             # 模型同步能取得主节点地址，且 ready/error ACK 能正常发回。
-            self._tcp_client = client
+            _publish_client(client)
             if self._control_fence is not None:
                 client.set_control_fence(self._control_fence)
             self._scheduler_facade_global('_sync_runtime_node_config')(node_id=node_id, node_role="client")
@@ -2452,11 +2475,25 @@ class SchedulerClusterMixin:
                     self._report_local_device_profile(target_client, node_id)
                     self._task_worker_control.mark_coordinator_heartbeat()
 
+                def _on_client_reconnect() -> None:
+                    if (self._tcp_client is target_client
+                            and getattr(target_client, "is_registered", False)):
+                        self.refresh_task_worker_capabilities()
+
                 target_client.on_heartbeat = _on_client_heartbeat
-                target_client.on_disconnect = (
-                    lambda bound_client=target_client:
-                    self._on_master_connection_lost(bound_client)
-                )
+                target_client.on_reconnect = _on_client_reconnect
+                def _on_client_disconnect() -> None:
+                    # TCP notifies outside its registration lock. Serialize
+                    # cleanup with hello creation, and skip a delayed callback
+                    # once this client has already registered again.
+                    with self._task_worker_refresh_lock:
+                        if (self._tcp_client is not target_client
+                                or getattr(target_client, "is_registered", False)):
+                            logger.debug("event=task_worker_disconnect_callback_stale")
+                            return
+                        self._on_master_connection_lost(target_client)
+
+                target_client.on_disconnect = _on_client_disconnect
 
             _bind_client_callbacks(client)
 
@@ -2523,7 +2560,7 @@ class SchedulerClusterMixin:
                         device_info=self._local_device_profile,
                         **self._transport_runtime_kwargs(node_id),
                     )
-                    self._tcp_client = client
+                    _publish_client(client)
                     if self._control_fence is not None:
                         client.set_control_fence(self._control_fence)
                     self._scheduler_facade_global('_sync_runtime_node_config')(node_id=node_id, node_role="client")
@@ -2579,7 +2616,7 @@ class SchedulerClusterMixin:
                 if 'previous_client' in locals() and previous_client is not None:
                     _restore_previous_client()
                 else:
-                    self._tcp_client = None
+                    _publish_client(None)
             logger.error(f"连接主节点 {master_host}:{master_port} 失败: {e}")
             return {"status": "error", "reason": f"{master_host}:{master_port} - {e}"}
 
@@ -2977,7 +3014,7 @@ class SchedulerClusterMixin:
             return
         # 如果已经连接（例如通过 activate_client_mode），跳过
         tcp_client = getattr(self, '_tcp_client', None)
-        if tcp_client and tcp_client._running:
+        if tcp_client and (tcp_client._running or getattr(tcp_client, "_reconnect_enabled", False)):
             logger.info("已有活跃 TCP 连接，跳过启动自动连接")
             return
 
@@ -3727,7 +3764,7 @@ class SchedulerClusterMixin:
                         host = health.get("master_host", "")
                         port = health.get("master_port", 0)
                         if host and port:
-                            result = self.connect_to_master(host, port)
+                            result = self.connect_to_master(host, port, _automatic=True)
                             if result.get("status") == "connected":
                                 logger.info(f"🔄 已自动重连到主节点 {host}:{port}")
 
@@ -3753,15 +3790,15 @@ class SchedulerClusterMixin:
                                 logger.info(
                                     f"🔄 周期性重连尝试: {host}:{port}"
                                 )
-                                result = self.connect_to_master(host, port)
+                                result = self.connect_to_master(host, port, _automatic=True)
                                 if result.get("status") == "connected":
                                     logger.info(f"✅ 周期性重连成功: {host}:{port}")
                                     self._client_last_reconnect_attempt = 0.0  # 成功后重置
-                                else:
+                                elif result.get("status") not in {"reconnecting", "retry_exhausted"}:
                                     for alternate in self._discover_master_fallbacks(host, port):
                                         alt_result = self.connect_to_master(
                                             alternate["master_host"],
-                                            alternate["master_port"],
+                                            alternate["master_port"], _automatic=True,
                                         )
                                         if alt_result.get("status") == "connected":
                                             self._client_last_reconnect_attempt = 0.0

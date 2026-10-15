@@ -112,9 +112,10 @@ class TaskWorkerControlPlane:
         self._workers: dict[str, dict[str, Any]] = {}
         self._coordinator: dict[str, Any] = {}
         self._worker_hello_pending = False
+        self._worker_hello_owner: tuple | None = None
         # REGISTER ACK may precede the peer's task-worker hello. Fence that
         # connection from legacy layer assignment during this handshake.
-        self._coordinator_pending_workers: set[str] = set()
+        self._coordinator_connections: dict[str, dict[str, Any]] = {}
         self._seen: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
         self._seen_order: collections.deque[tuple[str, str]] = collections.deque()
         self._rejected_message_count = 0
@@ -162,12 +163,18 @@ class TaskWorkerControlPlane:
         capabilities: Mapping[str, Any],
         worker_kind: str = "pc_full_worker",
         sent_at_ms: Optional[int] = None,
+        registration_owner: tuple | None = None,
     ) -> Optional[WorkerMessage]:
         """Build one v2 hello; overlapping negotiations are deliberately fenced."""
         now_ms = int(time.time() * 1000) if sent_at_ms is None else int(sent_at_ms)
         with self._lock:
             if self._worker_hello_pending:
-                return None
+                previous = self._worker_hello_owner
+                if (registration_owner is None
+                        or (previous is not None and previous[:3] == registration_owner)):
+                    return None
+                # A new authenticated registration supersedes a pending old hello,
+                # even when that registration's disconnect callback was delayed.
             message = build_message(
                 "hello",
                 {
@@ -182,6 +189,10 @@ class TaskWorkerControlPlane:
                 version=PROTOCOL_VERSION,
             )
             self._worker_hello_pending = True
+            self._worker_hello_owner = (
+                (*registration_owner, message.message_id)
+                if registration_owner is not None else None
+            )
             self._coordinator = {
                 "node_id": "",
                 "connected": True,
@@ -201,10 +212,18 @@ class TaskWorkerControlPlane:
         *,
         coordinator_node_id: str,
         sent_at_ms: Optional[int] = None,
+        connection_generation: int | None = None,
     ) -> WorkerMessage:
         """Validate a worker hello and return a deterministic hello_ack."""
         message = decode_message(raw)
         with self._lock:
+            connection = self._coordinator_connections.get(str(peer_id))
+            if connection_generation is not None and (
+                connection is None
+                or not connection["connected"]
+                or connection["generation"] != connection_generation
+            ):
+                raise self._reject("worker_connection_changed", "hello registration is no longer current")
             duplicate = self._duplicate_response(peer_id, message)
             if duplicate is not None:
                 return duplicate
@@ -263,7 +282,7 @@ class TaskWorkerControlPlane:
             #   `hello → push → load_layer_range → refresh → hello` 自激环：每次 push 都取
             #   新 generation，worker 端永远判成"新配置"。
             #   首次 hello（`previous is None`）等效"变化"，保证仍会推一次。
-            connection_rebound = peer_id in self._coordinator_pending_workers
+            connection_rebound = bool(connection and connection["pending"])
             capabilities_changed = connection_rebound or _canonical_capabilities(
                 payload.get("capabilities")
             ) != _canonical_capabilities(
@@ -344,17 +363,43 @@ class TaskWorkerControlPlane:
         with self._lock:
             self._rejected_message_count += 1
 
-    def mark_worker_connection_pending(self, peer_id: str) -> None:
+    def mark_worker_connection_pending(
+        self, peer_id: str, *, connection_generation: int = 0,
+    ) -> bool:
         with self._lock:
-            self._coordinator_pending_workers.add(str(peer_id))
+            peer_id = str(peer_id)
+            current = self._coordinator_connections.get(peer_id)
+            if current and connection_generation <= current["generation"]:
+                # Neither a stale REGISTER nor a repeated post-ACK callback
+                # may reset the handshake of a newer/already accepted socket.
+                return False
+            self._coordinator_connections[peer_id] = {
+                "generation": connection_generation, "pending": True, "connected": True,
+            }
+            worker = self._workers.get(peer_id)
+            if worker is not None:
+                worker["connected"] = False
+            return True
 
-    def resolve_worker_connection_pending(self, peer_id: str) -> None:
+    def resolve_worker_connection_pending(
+        self, peer_id: str, *, connection_generation: int | None = None,
+    ) -> bool:
         with self._lock:
-            self._coordinator_pending_workers.discard(str(peer_id))
+            peer_id = str(peer_id)
+            current = self._coordinator_connections.get(peer_id)
+            if connection_generation is not None and (
+                current is None or not current["connected"]
+                or current["generation"] != connection_generation
+            ):
+                return False
+            if current is not None:
+                current["pending"] = False
+            return True
 
     def pending_worker_ids(self) -> set[str]:
         with self._lock:
-            return set(self._coordinator_pending_workers)
+            return {node for node, state in self._coordinator_connections.items()
+                    if state["connected"] and state["pending"]}
 
     def connected_layer_stage_workers(
         self, peer_ids: Optional[set[str]] = None,
@@ -403,19 +448,30 @@ class TaskWorkerControlPlane:
 
     def disconnect_worker(self, peer_id: str) -> None:
         with self._lock:
-            self._coordinator_pending_workers.discard(str(peer_id))
+            connection = self._coordinator_connections.get(str(peer_id))
+            if connection is not None:
+                connection["connected"] = connection["pending"] = False
             worker = self._workers.get(peer_id)
             if worker is not None:
                 worker["connected"] = False
                 worker["disconnected_at"] = time.time()
 
-    def disconnect_coordinator(self) -> None:
+    def disconnect_coordinator(self, *, owner: tuple | None = None) -> bool:
+        """Retire a coordinator, optionally only for the hello that failed.
+
+        Keep the owner after ACK: a delayed send failure must also distinguish
+        successive hellos on the same registration, not just pending ones.
+        """
         with self._lock:
+            if owner is not None and self._worker_hello_owner != owner:
+                return False
             if self._coordinator:
                 self._coordinator["connected"] = False
                 self._coordinator["healthy"] = False
                 self._coordinator["disconnected_at"] = time.time()
             self._worker_hello_pending = False
+            self._worker_hello_owner = None
+            return True
 
     def worker_snapshot(self, peer_id: str) -> dict[str, Any]:
         """Return one public worker snapshot for Provider inspection."""
