@@ -2459,8 +2459,9 @@ class TestSwitchModel:
         assert mgr._active_model_id == "qwen3-0.6b"
 
     @pytest.mark.skipif(
-        not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "models")),
-        reason="缺本地模型目录 models/（CI 不拉模型）",
+        not os.path.isfile(os.path.join(os.path.dirname(__file__), "..", "models",
+                                        "qwen3-0.6b", "config.json")),
+        reason="缺本地工件 models/qwen3-0.6b（CI 只检出 models/README.md 与 lock 文件）",
     )
     def test_switch_rollback_on_failure(self, monkeypatch):
         """加载新模型失败 → 回滚到旧模型"""

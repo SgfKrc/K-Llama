@@ -180,7 +180,10 @@ def test_default_model_id_accepts_enum_and_str():
     assert mc.get_default_model_id("workstation") == "qwen3-5-2b"
 
 
-@pytest.mark.skipif(not _MODELS_DIR.is_dir(), reason="缺本地模型目录 models/（CI 不拉模型）")
+@pytest.mark.skipif(
+    not (_MODELS_DIR / "qwen3-0.6b" / "config.json").is_file(),
+    reason="缺本地工件 models/qwen3-0.6b（CI 只检出 models/README.md 与 lock 文件）",
+)
 def test_profile_default_paths_resolve_to_existing_files():
     """`get_profile_default_model_paths()` 解析出的路径必须真实存在（否则自动加载必失败）。"""
     paths = mc.get_profile_default_model_paths()

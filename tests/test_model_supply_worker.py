@@ -1310,6 +1310,11 @@ def test_registration_replace_failure_is_bounded_and_preserves_pointer(
     assert not list(worker.root.glob(".current-*.tmp"))
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="该重试路径是 Windows 专用的文件替换冲突（winerror ∈ {5,32,33}），"
+           "见 src/model_supply_worker.py:1070 —— 非 Windows 上这段代码不执行",
+)
 @pytest.mark.parametrize("repeat_registration,change", [
     (local, change)
     for local in (False, True)
