@@ -475,6 +475,7 @@ def api_retirement_runtime(tiny_supply, monkeypatch):
         _configured_layer_artifact=lambda: value["stage_model_identity"],
         _task_worker_layer_artifact_identity=lambda artifact: artifact,
         _distributed_inference_enabled=True, _task_worker_stage_lock=threading.RLock(),
+        _task_worker_refresh_lock=threading.RLock(),
         _task_worker_active_attempts={}, _inference_lock=threading.RLock(),
         _layer_execution_lock=threading.RLock(), _layer_config_lock=threading.RLock(),
         _worker_assignments={}, _layer_config_retry_state={}, _local_pipeline_steps={},

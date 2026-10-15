@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 import logging
 import json
 import os
@@ -2798,9 +2800,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
 
 
     def _abort_pipeline_load_transaction(
-        self, config_id: str, reason_code: str, reason: str = "",
+        self, config_id: str, reason_code: str, reason: str = "", *,
+        _deferred_dispatch: list | None = None,
     ) -> None:
-        """Abort one candidate and restore the last committed control state."""
+        """Abort state now; optionally dispatch cleanup after an outer guard."""
         cleanup_records = []
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
@@ -2812,6 +2815,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             if not retire_published:
                 worker_ids = set(transaction.get("worker_ids", set()))
                 candidate_id = str(transaction.get("candidate_id", "") or "")
+                legacy_host = self._host if not candidate_id else None
                 self._layer_config_generation = max(
                     self._layer_config_generation + 1,
                     time.time_ns(),
@@ -2848,66 +2852,92 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     )
                 self._persist_pipeline_lifecycle_locked()
         if retire_published:
-            self._invalidate_pipeline_load_transaction(reason_code, reason, expected_config_id=config_id)
-            return
-        if candidate_id:
-            for record in cleanup_records:
-                self._dispatch_pipeline_model_cleanup(record)
-        else:
-            abort_materialization = getattr(
-                self._host, "abort_pipeline_materialization", None
+            self._invalidate_pipeline_load_transaction(
+                reason_code, reason, expected_config_id=config_id,
+                _deferred_dispatch=_deferred_dispatch,
             )
-            if callable(abort_materialization):
-                try:
-                    abort_materialization()
-                    self._host.model_loaded = False
-                except Exception:
-                    logger.warning("主节点回滚流水线层段失败", exc_info=True)
-            abort_id = uuid.uuid4().hex
-            native_records = []
-            with self._layer_config_lock:
-                for node, expected in transaction.get("expected", {}).items():
-                    identity = expected.get("worker_prepare_identity")
-                    if isinstance(identity, dict):
-                        native_records.append(self._record_pipeline_model_cleanup_locked(
-                            node_id=node, candidate_config_id=config_id, generation=generation,
-                            action="abort", assignment_id=identity["assignment_id"],
-                            payload={"worker_prepare_identity": identity, "release": True, "abort": True,
-                                     "aborted_config_id": config_id},
-                        ))
-                self._persist_pipeline_lifecycle_locked()
-            for record in native_records:
-                self._dispatch_pipeline_model_cleanup(record)
-            configs = {
-                node_id: {
-                    "node_id": node_id,
-                    "config_id": abort_id,
-                    "generation": generation,
-                    "release": True,
-                    "abort": True,
-                    "aborted_config_id": config_id,
-                    "model_id": model_id,
-                    "reason_code": reason_code,
+            return
+        def dispatch():
+            if candidate_id:
+                for record in cleanup_records:
+                    self._dispatch_pipeline_model_cleanup(record)
+            else:
+                execution_lock = getattr(
+                    legacy_host, "full_chat_execution_lock", self._layer_execution_lock,
+                )
+                with execution_lock:
+                    # Legacy loads share this execution lock. Recheck only after
+                    # waiting: an aborted transaction may have been superseded
+                    # before its deferred cleanup reached the native boundary.
+                    with self._layer_config_lock:
+                        cleanup_current = (
+                            self._host is legacy_host
+                            and self._pipeline_load_transaction is transaction
+                            and transaction.get("phase") == "aborted"
+                        )
+                    if cleanup_current:
+                        abort_materialization = getattr(
+                            legacy_host, "abort_pipeline_materialization", None,
+                        )
+                        if callable(abort_materialization):
+                            try:
+                                abort_materialization()
+                                # Update only the captured, guarded host. A new
+                                # materialization cannot run until lock release.
+                                legacy_host.model_loaded = False
+                            except Exception:
+                                logger.warning("主节点回滚流水线层段失败", exc_info=True)
+                abort_id = uuid.uuid4().hex
+                native_records = []
+                with self._layer_config_lock:
+                    for node, expected in transaction.get("expected", {}).items():
+                        identity = expected.get("worker_prepare_identity")
+                        if isinstance(identity, dict):
+                            native_records.append(self._record_pipeline_model_cleanup_locked(
+                                node_id=node, candidate_config_id=config_id, generation=generation,
+                                action="abort", assignment_id=identity["assignment_id"],
+                                payload={"worker_prepare_identity": identity, "release": True, "abort": True,
+                                         "aborted_config_id": config_id},
+                            ))
+                    self._persist_pipeline_lifecycle_locked()
+                for record in native_records:
+                    self._dispatch_pipeline_model_cleanup(record)
+                configs = {
+                    node_id: {
+                        "node_id": node_id,
+                        "config_id": abort_id,
+                        "generation": generation,
+                        "release": True,
+                        "abort": True,
+                        "aborted_config_id": config_id,
+                        "model_id": model_id,
+                        "reason_code": reason_code,
+                    }
+                    for node_id in worker_ids
+                    if not transaction.get("expected", {}).get(node_id, {}).get("worker_prepare_identity")
                 }
-                for node_id in worker_ids
-                if not transaction.get("expected", {}).get(node_id, {}).get("worker_prepare_identity")
-            }
-            for node_id, payload in configs.items():
-                try:
-                    self._tcp_server.send_layer_config(node_id, payload)
-                except Exception:
-                    logger.warning(
-                        "发送候选事务中止失败: node=%s config=%s",
-                        node_id, config_id, exc_info=True,
-                    )
-        logger.error(
-            "流水线加载事务已中止: config=%s reason_code=%s reason=%s",
-            config_id, reason_code, reason,
-        )
+                for node_id, payload in configs.items():
+                    try:
+                        self._tcp_server.send_layer_config(node_id, payload)
+                    except Exception:
+                        logger.warning(
+                            "发送候选事务中止失败: node=%s config=%s",
+                            node_id, config_id, exc_info=True,
+                        )
+            logger.error(
+                "流水线加载事务已中止: config=%s reason_code=%s reason=%s",
+                config_id, reason_code, reason,
+            )
+
+        if _deferred_dispatch is None:
+            dispatch()
+        else:
+            _deferred_dispatch.append(dispatch)
 
 
     def _invalidate_pipeline_load_transaction(
         self, reason_code: str = "pipeline_model_changed", reason: str = "", *, expected_config_id: str = "",
+        _deferred_dispatch: list | None = None,
     ) -> None:
         """Fence a pipeline transaction before replacing the local model."""
         cleanup_records = []
@@ -2957,8 +2987,14 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 self._worker_assignments.release(node, reason_code=reason_code, aborted=True)
             self._prepared_layer_configs.clear()
             self._layer_config_inflight.clear()
-        for record in cleanup_records:
-            self._dispatch_pipeline_model_cleanup(record)
+        def dispatch():
+            for record in cleanup_records:
+                self._dispatch_pipeline_model_cleanup(record)
+
+        if _deferred_dispatch is None:
+            dispatch()
+        else:
+            _deferred_dispatch.append(dispatch)
 
 
     def _commit_pipeline_load_transaction(self, config_id: str) -> None:
@@ -2974,6 +3010,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             plan = dict(transaction.get("plan", {}))
             worker_ids = set(transaction.get("worker_ids", set()))
             candidate_id = str(transaction.get("candidate_id", "") or "")
+            legacy_host = self._host if not candidate_id else None
             candidate_expected = transaction.get("expected", {})
             expected = {
                 node_id: dict(
@@ -3025,52 +3062,64 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         model_id=str(plan.get("model_id", "") or ""),
                     )
             else:
-                # Compatibility for legacy callers that do not own an isolated
-                # ModelHost candidate yet.
-                if local_assignment is not None and not getattr(
-                    self._host, "is_pipeline_prepared", False
-                ):
-                    prepare_local = getattr(
-                        self._host, "prepare_pipeline_model", None,
+                execution_lock = getattr(
+                    legacy_host, "full_chat_execution_lock", self._layer_execution_lock,
+                )
+                with execution_lock:
+                    # Match the deferred legacy abort's execution -> config
+                    # order. No native/stage operation runs under config or
+                    # registration locks, and stale commits cannot reload later.
+                    with self._layer_config_lock:
+                        if (self._host is not legacy_host
+                                or self._pipeline_load_transaction is not transaction
+                                or transaction.get("phase") != "committing_local"):
+                            return
+                    # Compatibility for legacy callers that do not own an isolated
+                    # ModelHost candidate yet.
+                    if local_assignment is not None and not getattr(
+                        legacy_host, "is_pipeline_prepared", False
+                    ):
+                        prepare_local = getattr(
+                            legacy_host, "prepare_pipeline_model", None,
+                        )
+                        local_model_path = (
+                            getattr(legacy_host, "_full_model_path", None)
+                            or getattr(legacy_host, "_model_path", None)
+                            or getattr(legacy_host, "model_path", None)
+                        )
+                        if callable(prepare_local) and local_model_path:
+                            prepare_local(
+                                model_id=str(plan.get("model_id", "") or ""),
+                                model_path=str(local_model_path),
+                                quant_type=getattr(legacy_host, "quant_type", None),
+                                layer_range=(
+                                    int(local_assignment["start_layer"]),
+                                    int(local_assignment["end_layer"]),
+                                ),
+                                model_sha256=None,
+                            )
+                    prepare_tokenizer = getattr(
+                        legacy_host, "prepare_pipeline_tokenizer", None,
                     )
-                    local_model_path = (
-                        getattr(self._host, "_full_model_path", None)
-                        or getattr(self._host, "_model_path", None)
-                        or getattr(self._host, "model_path", None)
-                    )
-                    if callable(prepare_local) and local_model_path:
-                        prepare_local(
-                            model_id=str(plan.get("model_id", "") or ""),
-                            model_path=str(local_model_path),
-                            quant_type=getattr(self._host, "quant_type", None),
-                            layer_range=(
+                    if callable(prepare_tokenizer):
+                        prepare_tokenizer()
+                    if local_assignment is not None:
+                        legacy_host.load_layer_range(
                                 int(local_assignment["start_layer"]),
                                 int(local_assignment["end_layer"]),
+                            has_embedding=bool(
+                                local_assignment.get("has_embedding")
                             ),
-                            model_sha256=None,
+                            has_lm_head=bool(
+                                local_assignment.get("has_lm_head")
+                            ),
+                            model_path=getattr(
+                                legacy_host, "_full_model_path", None,
+                            ),
+                            quant_type=getattr(legacy_host, "quant_type", None),
+                            total_layers=int(plan.get("total_layers", 0) or 0),
+                            model_id=str(plan.get("model_id", "") or ""),
                         )
-                prepare_tokenizer = getattr(
-                    self._host, "prepare_pipeline_tokenizer", None,
-                )
-                if callable(prepare_tokenizer):
-                    prepare_tokenizer()
-                if local_assignment is not None:
-                    self._host.load_layer_range(
-                            int(local_assignment["start_layer"]),
-                            int(local_assignment["end_layer"]),
-                        has_embedding=bool(
-                            local_assignment.get("has_embedding")
-                        ),
-                        has_lm_head=bool(
-                            local_assignment.get("has_lm_head")
-                        ),
-                        model_path=getattr(
-                            self._host, "_full_model_path", None,
-                        ),
-                        quant_type=getattr(self._host, "quant_type", None),
-                        total_layers=int(plan.get("total_layers", 0) or 0),
-                        model_id=str(plan.get("model_id", "") or ""),
-                    )
         except Exception as exc:
             self._abort_pipeline_load_transaction(
                 config_id, "pipeline_local_commit_failed", str(exc)
@@ -5674,7 +5723,9 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             )
 
 
-    def _handle_layer_worker_opt_out(self, client_id: str, msg: dict) -> None:
+    def _handle_layer_worker_opt_out(
+        self, client_id: str, msg: dict, *, hello_work=None,
+    ) -> None:
         """Remove a connected client from future layer assignments."""
         data = msg.get("data", {})
         node_id = str(data.get("node_id", client_id))
@@ -5685,30 +5736,57 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 node_id,
             )
             return
-        if self._is_relay_host(client_id):
-            with self._layer_config_lock:
+        deferred_dispatch = []
+        with self._layer_config_lock, ExitStack() as owner_guard:
+            if hello_work is not None:
+                server = hello_work[0]
+                if self._tcp_server is not server:
+                    return
+                # Lock order: config -> transport owner -> control owner.
+                # REGISTER replacement and HELLO snapshot updates use these
+                # existing owner locks. Validate only after the config wait,
+                # then keep identity fixed through ALL control-state changes.
+                owner_guard.enter_context(server._clients_lock)
+                owner_guard.enter_context(self._task_worker_control._lock)
+                if not self._task_worker_hello_followup_current(client_id, hello_work):
+                    return
+                # Wall-clock HELLO timestamps can coincide. Check the live
+                # role under the same owner lock before releasing reservations.
+                snapshot = self._task_worker_control.worker_snapshot(client_id)
+                capabilities = snapshot.get("capabilities") or {}
+                if (not snapshot.get("accepted") or not capabilities.get("models")
+                        or capabilities.get("layer_worker", False)
+                        or ("layer_forward" in capabilities.get("stage_types", [])
+                            and capabilities.get("layer_ranges"))):
+                    return
+            relay = self._is_relay_host(client_id)
+            if relay:
                 self._pipeline_worker_opt_out.discard(client_id)
-            logger.info(
-                "忽略 relay 节点的本地分层退出通知: node=%s", client_id,
-            )
-            self.push_layer_config_to_clients()
-            return
-        abort = None
-        retire = False
-        with self._layer_config_lock:
-            self._pipeline_worker_opt_out.add(client_id)
-            transaction = self._pipeline_load_transaction
-            if transaction and client_id in set(transaction.get("worker_ids", set())):
-                if transaction.get("phase") in {"preparing", "committing_local", "committing", "committing_global"}:
-                    abort = (transaction["config_id"], "pipeline_worker_opted_out", "worker left distributed inference")
-                elif transaction.get("phase") == "ready":
-                    retire = True
-        if abort:
-            self._abort_pipeline_load_transaction(*abort)
-        elif retire:
-            self._invalidate_pipeline_load_transaction("pipeline_worker_opted_out")
-        self._clear_layer_config_state(client_id)
-        logger.info("从节点已退出 PyTorch 分层计算: node=%s", client_id)
+            else:
+                self._pipeline_worker_opt_out.add(client_id)
+                transaction = self._pipeline_load_transaction
+                if transaction and client_id in set(transaction.get("worker_ids", set())):
+                    if transaction.get("phase") in {"preparing", "committing_local", "committing", "committing_global"}:
+                        self._abort_pipeline_load_transaction(
+                            transaction["config_id"], "pipeline_worker_opted_out",
+                            "worker left distributed inference",
+                            _deferred_dispatch=deferred_dispatch,
+                        )
+                    elif transaction.get("phase") == "ready":
+                        self._invalidate_pipeline_load_transaction(
+                            "pipeline_worker_opted_out",
+                            expected_config_id=transaction["config_id"],
+                            _deferred_dispatch=deferred_dispatch,
+                        )
+                self._clear_layer_config_state(client_id)
+        # Host/stage work and network sends must run outside registration and
+        # config locks. The existing ledger retains exact cleanup identities.
+        for dispatch in deferred_dispatch:
+            dispatch()
+        if relay:
+            logger.info("忽略 relay 节点的本地分层退出通知: node=%s", client_id)
+        else:
+            logger.info("从节点已退出 PyTorch 分层计算: node=%s", client_id)
         self.push_layer_config_to_clients()
 
 

@@ -72,6 +72,8 @@ def test_cleanup_waits_for_hello_ack_then_replays_before_replanning(reconnect_ca
         return send(target, payload, kind)
     master._tcp_server.send_to_client = send_with_retry
     hello(master, node)
+    assert [packet[2] for packet in case.sent] == ["task_worker"]
+    master._drain_task_worker_hello_followups()
     assert [packet[2] for packet in case.sent] == ["task_worker", "model_prepare"]
     assert case.sent[0][1]["payload"]["accepted"] is True
     cleanup = case.sent[1][1]

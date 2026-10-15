@@ -738,6 +738,20 @@ def test_android_full_worker_provider_requires_resource_gate_and_exact_model():
     ) is False
 
 
+def _enable_hello_followups(scheduler, node_id, monkeypatch):
+    scheduler._running = True
+    scheduler._distributed_inference_enabled = True
+    if scheduler._tcp_server is None:
+        scheduler._tcp_server = SimpleNamespace(_running=True)
+    else:
+        scheduler._tcp_server._running = True
+    monkeypatch.setattr(scheduler, "_assignment_connection_generation", lambda _node: 1)
+    monkeypatch.setattr(scheduler, "_start_layer_config_retry_monitor", lambda: None)
+    scheduler._task_worker_control.mark_worker_connection_pending(
+        node_id, connection_generation=1,
+    )
+
+
 def test_scheduler_admits_android_worker_only_for_android_node(monkeypatch):
     from scheduler import Scheduler
 
@@ -752,6 +766,7 @@ def test_scheduler_admits_android_worker_only_for_android_node(monkeypatch):
         scheduler, "_send_task_worker_to_node",
         lambda _node_id, message: sent.append(message),
     )
+    _enable_hello_followups(scheduler, "android_worker_01", monkeypatch)
     worker = TaskWorkerControlPlane()
     hello = worker.begin_worker_hello(
         node_id="android_worker_01",
@@ -762,6 +777,7 @@ def test_scheduler_admits_android_worker_only_for_android_node(monkeypatch):
     scheduler._handle_task_worker_message(
         "android_worker_01", {"data": hello.snapshot()},
     )
+    scheduler._drain_task_worker_hello_followups()
     assert sent and sent[0].message_type == "hello_ack"
     assert sent[0].payload["accepted"] is True
     providers = scheduler.remote_task_worker_providers()
@@ -1750,6 +1766,7 @@ def test_recovery_hello_does_not_publish_two_layer_generations(monkeypatch):
         "request_authoritative_layer_sync",
         lambda **kwargs: authoritative_pushes.append(kwargs) or True,
     )
+    _enable_hello_followups(scheduler, "android_layer_01", monkeypatch)
     worker = TaskWorkerControlPlane()
     hello = worker.begin_worker_hello(
         node_id="android_layer_01",
@@ -1761,6 +1778,7 @@ def test_recovery_hello_does_not_publish_two_layer_generations(monkeypatch):
     scheduler._handle_task_worker_message(
         "android_layer_01", {"data": hello.snapshot()},
     )
+    scheduler._drain_task_worker_hello_followups()
 
     assert sent[0][1]["payload"]["accepted"] is True
     assert normal_pushes == []
@@ -1790,8 +1808,9 @@ def test_scheduler_full_worker_hello_releases_layer_reservation(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "_handle_layer_worker_opt_out",
-        lambda node_id, msg: opted_out.append((node_id, msg)),
+        lambda node_id, msg, *, hello_work: opted_out.append((node_id, msg)),
     )
+    _enable_hello_followups(scheduler, "worker_01", monkeypatch)
     worker = TaskWorkerControlPlane()
     hello = worker.begin_worker_hello(
         node_id="worker_01", capabilities=_capabilities(),
@@ -1801,6 +1820,7 @@ def test_scheduler_full_worker_hello_releases_layer_reservation(monkeypatch):
     scheduler._handle_task_worker_message(
         "worker_01", {"data": hello.snapshot()},
     )
+    scheduler._drain_task_worker_hello_followups()
 
     assert sent[0][1]["payload"]["accepted"] is True
     assert opted_out == [("worker_01", {"data": {"node_id": "worker_01"}})]
