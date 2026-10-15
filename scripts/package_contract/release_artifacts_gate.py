@@ -25,6 +25,7 @@ MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 from release_gate_runtime import Report, isolated_environment, json_output, probe_service, run_command
+from android_runtime_probe import observe_runtime
 
 ROOT = MODULE_DIR.parents[1]
 CONTRACT_PATH = ROOT / "release-contract.json"
@@ -114,6 +115,9 @@ def check_revision(report: Report, check: str, info: dict | None, *, authenticat
         return None
     if required and revision != required:
         report.fail(check, f"artifact source_revision {revision} != required {required}", **evidence)
+        return None
+    if "source_dirty" in info and info["source_dirty"] is not False:
+        report.fail(check, "artifact was built from modified or unverifiable source", **evidence)
         return None
     report.ok(check, "source revision authenticated with artifact", source_revision=revision,
               revision_verified=True, **evidence)
@@ -492,7 +496,8 @@ def signer_digest(output: str) -> str:
 
 
 def android_device_smoke(report: Report, *, adb: str, serial: str, apk: Path,
-                         work: Path, env: dict[str, str]) -> None:
+                         work: Path, env: dict[str, str], version_name: str | None = None,
+                         version_code: int | None = None) -> None:
     """Explicit test device only; never replace or stop a pre-existing installation."""
     package = "com.qlh.inference"
     def run(name: str, arguments: list[str], timeout: float = 30) -> dict:
@@ -539,8 +544,20 @@ def android_device_smoke(report: Report, *, adb: str, serial: str, apk: Path,
                 raise ValueError("release Activity not observed resumed")
             if index == 0:
                 time.sleep(2)
-        report.ok("android.startup", "real accepted APK installed, launched and Activity observed resumed twice; UI smoke only",
+        report.ok("android.startup", "real accepted APK installed, launched and Activity observed resumed twice",
                   device_serial=serial, artifact_sha256=sha256(apk), executions=executions)
+        runtime = observe_runtime(adb=adb, serial=serial, package=package, work=work / "runtime",
+                                  env=env, version_name=version_name, version_code=version_code,
+                                  require_idle=True, timeout=20)
+        if runtime["passed"] is not True:
+            for check in ("roles", "native-runtime"):
+                report.fail("android." + check, "fresh process runtime observation did not pass", runtime=runtime)
+        else:
+            for check, detail in (
+                ("roles", "actual idle default distributed client; no worker or full model was started"),
+                ("native-runtime", "real JNI backend devices and system information from the accepted APK process"),
+            ):
+                report.ok("android." + check, detail, artifact_sha256=sha256(apk), runtime=runtime)
     except (OSError, ValueError) as exc:
         report.fail("android.startup", str(exc), executions=executions)
     finally:
@@ -623,8 +640,8 @@ def gate_android(dist: Path, contract: dict[str, Any], options: dict | None = No
         pass
     check_revision(report, "android.revision", info, authenticated=authenticated,
                    required=(options or {}).get("require_revision"), artifact=str(apk))
-    # No existing release-side endpoint exports AndroidRuntimeStatus/worker role. Do not
-    # promote pidof/Activity launch or old unscoped logcat into runtime/native acceptance.
+    # Role and native readiness require the existing service's nonce/PID-bound
+    # dumpsys observation; Activity lifetime alone never proves those checks.
     serial = (options or {}).get("android_serial")
     online = []
     if tools["adb"]:
@@ -637,17 +654,19 @@ def gate_android(dist: Path, contract: dict[str, Any], options: dict | None = No
                    execution=result, requested_serial=serial, online_devices=online)
     enabled = (options or {}).get("android_device_probe", False)
     prerequisites = all(any(i["check"] == "android." + name and i["passed"] for i in report.items)
-                        for name in ("version", "dependencies", "signature"))
+                        for name in ("version", "dependencies", "signature", "revision"))
     if (enabled and serial in online and prerequisites and tools["adb"]
             and os.environ.get(LAUNCH_PROBE_ENV, "1") != "0"):
-        android_device_smoke(report, adb=tools["adb"], serial=serial, apk=apk, work=work, env=env)
+        android_device_smoke(report, adb=tools["adb"], serial=serial, apk=apk, work=work, env=env,
+                             version_name=contract["version"]["product"],
+                             version_code=contract["version"]["android_code"])
     else:
         report.unverified("android.startup", "device smoke requires --android-device-probe, explicit online serial, "
                           "valid APK/pinned signature and enabled launch probe; not executed")
     for check in ("roles", "native-runtime"):
-        report.unverified("android." + check,
-                          "release APK device runtime/role/native probe not available in current app interface; "
-                          "requires Android-side runtime probe outside this write set; raw Activity smoke cannot prove this face")
+        if not any(item["check"] == "android." + check for item in report.items):
+            report.unverified("android." + check,
+                              "accepted APK process runtime observation not executed; Activity smoke is insufficient")
     return report
 
 
