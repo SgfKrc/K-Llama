@@ -131,6 +131,92 @@ def model_intent_ready(operation: Dict[str, Any]) -> bool:
     return operation.get("status") == "ready" and operation.get("loaded_ready") is True
 
 
+# These are capacity rejections, rather than worker discovery/registration states.
+_MODEL_INTENT_CAPACITY_REASONS = frozenset({
+    "pipeline_distributed_capacity_insufficient",
+    "pipeline_cluster_capacity_insufficient",
+    "pipeline_capacity_single_node_insufficient",
+    "pipeline_capacity_manual_insufficient",
+    "pipeline_reshard_capacity_insufficient",
+    "node_capacity_unavailable",
+    "SUPPLY_CAPACITY_INSUFFICIENT",
+    "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
+    "SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT",
+})
+
+
+def _format_capacity_bytes(value: Any) -> Optional[str]:
+    # Missing/legacy fields are not zero budgets. Never derive a deficit here.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    for unit, divisor in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
+        if value >= divisor:
+            return f"{value / divisor:.2f} {unit} ({value} bytes)"
+    return f"{value} bytes"
+
+
+def _capacity_diagnostic_has_positive_deficit(diagnostic: Dict[str, Any]) -> bool:
+    nodes = diagnostic.get("nodes")
+    if not isinstance(nodes, (list, tuple)):
+        return False
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        deficit = node.get("deficit_bytes")
+        if isinstance(deficit, int) and not isinstance(deficit, bool) and deficit > 0:
+            return True
+    return False
+
+
+def _format_model_intent_capacity(
+    diagnostic: Dict[str, Any], *, displayed_reason: Optional[str] = None,
+) -> List[str]:
+    scope_value = diagnostic.get("scope")
+    scope = {"candidate_plan": "候选方案", "minimum_segment": "最小层段"}.get(
+        scope_value if isinstance(scope_value, str) else "", "范围未提供"
+    )
+    lines = [f"容量不足（{scope}；释放所示缺口不保证可执行）"]
+    reason = diagnostic.get("reason")
+    if isinstance(reason, str) and reason.strip() and reason != displayed_reason:
+        lines.append(reason)
+    nodes = diagnostic.get("nodes")
+    if isinstance(nodes, (list, tuple)):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("node_id")
+            parts = [node_id if isinstance(node_id, str) and node_id else "未标识节点"]
+            for key, labels in (
+                ("engine", {"llama_cpp": "llama.cpp", "pytorch": "PyTorch"}),
+                ("execution_device", {"cpu": "CPU", "cuda": "CUDA"}),
+                ("resource", {"ram": "RAM", "vram": "显存（VRAM）", "host_ram": "主机暂存 RAM"}),
+            ):
+                value = node.get(key)
+                if isinstance(value, str) and value:
+                    parts.append(labels.get(value, value))
+            layer_range = node.get("layer_range")
+            if (isinstance(layer_range, (list, tuple)) and len(layer_range) == 2
+                    and all(isinstance(bound, int) and not isinstance(bound, bool) for bound in layer_range)
+                    and 0 <= layer_range[0] < layer_range[1]):
+                parts.append(f"层段 [{layer_range[0]}, {layer_range[1]})")
+            reserve_label = "含边界的预留" if node.get("resource") in ("ram", "vram") else "预留"
+            for key, label in (("available_bytes", "可用"), ("required_bytes", "所需"),
+                               ("deficit_bytes", "缺口"), ("reserve_bytes", reserve_label)):
+                value = _format_capacity_bytes(node.get(key))
+                if value is not None:
+                    parts.append(f"{label} {value}")
+            lines.append(" · ".join(parts))
+    pending = diagnostic.get("pending_node_ids")
+    if isinstance(pending, list):
+        pending_ids = [node_id for node_id in pending if isinstance(node_id, str) and node_id.strip()]
+        if pending_ids:
+            lines.append(f"仍在加入的节点：{', '.join(pending_ids)}")
+    action = diagnostic.get("suggested_action")
+    if isinstance(action, str) and action.strip():
+        lines.append(f"建议：{action}")
+    return lines
+
+
 def format_model_intent(operation: Dict[str, Any]) -> str:
     """Display only the intent owner's facts, including node receipts and reasons."""
     if not operation:
@@ -139,6 +225,20 @@ def format_model_intent(operation: Dict[str, Any]) -> str:
     intent = operation.get("intent") or {}
     model_id = intent.get("model_id", "") if isinstance(intent, dict) else ""
     label = MODEL_INTENT_LABELS.get(status, status)
+    reason_code = operation.get("reason_code")
+    diagnostic = operation.get("capacity_diagnostic")
+    diagnostic_matches = (isinstance(diagnostic, dict) and isinstance(reason_code, str)
+                          and bool(reason_code) and diagnostic.get("reason_code") == reason_code)
+    # Solver exclusions may share a code with worker/segment availability failures.
+    # Only the owner's explicit positive deficit disambiguates an unfamiliar code.
+    capacity_cause = (
+        status in {"waiting_nodes", "failed"} and isinstance(reason_code, str)
+        and reason_code != "SUPPLY_WAITING_NODES"
+        and (reason_code in _MODEL_INTENT_CAPACITY_REASONS
+             or (diagnostic_matches and _capacity_diagnostic_has_positive_deficit(diagnostic)))
+    )
+    if status == "waiting_nodes" and capacity_cause:
+        label = "等待容量"
     if status == "ready" and not model_intent_ready(operation):
         label = "等待加载确认"
     lines = [f"{model_id} · {label} ({status})",
@@ -147,6 +247,12 @@ def format_model_intent(operation: Dict[str, Any]) -> str:
              f" · loaded_ready: {str(operation.get('loaded_ready') is True).lower()}"]
     if operation.get("reason_code") or operation.get("reason"):
         lines.append(f"{operation.get('reason_code') or ''}: {operation.get('reason') or ''}")
+    # A matching failed cause remains useful after a deadline or host RAM rejection.
+    # Other lifecycle states and reasons must not display a previous plan's diagnosis.
+    if capacity_cause and diagnostic_matches:
+        lines.extend(_format_model_intent_capacity(
+            diagnostic, displayed_reason=operation.get("reason"),
+        ))
     nodes = operation.get("nodes") or {}
     if isinstance(nodes, dict):
         for node_id, node in nodes.items():

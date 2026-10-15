@@ -100,7 +100,7 @@ class ModelIntentCoordinator:
         supply = self.scheduler._model_supply.get(operation_id)
         result = {key: deepcopy(supply[key]) for key in (
             "operation_id", "intent", "status", "reason_code", "reason", "created_at", "updated_at",
-            "nodes", "plan", "source_progress",
+            "nodes", "plan", "source_progress", "capacity_diagnostic",
         ) if key in supply}
         result.update(config_id=record.get("config_id", ""), generation=record.get("generation", 0),
                       loaded_ready=False, reason=result.get("reason", ""), reason_code=result.get("reason_code", ""))
@@ -380,7 +380,13 @@ class ModelIntentCoordinator:
                     self._update(operation_id, status=supply["status"], reason_code=supply.get("reason_code", ""), reason=supply.get("reason", ""))
                     return
                 if time.monotonic() >= deadline:
-                    self._fail(operation_id, "INTENT_DEADLINE_EXCEEDED", "Model selection timed out")
+                    diagnostic = supply.get("capacity_diagnostic")
+                    if (isinstance(diagnostic, dict) and diagnostic.get("reason_code")
+                            and diagnostic["reason_code"] == supply.get("reason_code")):
+                        self._fail(operation_id, diagnostic["reason_code"],
+                                   diagnostic["reason"] + " 本次选择已到截止时间，请释放资源或增加节点后重试。")
+                    else:
+                        self._fail(operation_id, "INTENT_DEADLINE_EXCEEDED", "Model selection timed out")
                     return
                 if supply["status"] == "available":
                     break
