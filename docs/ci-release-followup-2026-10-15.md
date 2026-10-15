@@ -104,6 +104,10 @@ DL 原生加载证据分别在 `three-node-post-hello-dl/`：
 
 收尾健康观测 `final-runtime-health.json` 确认 master PID 21696、ROG/Y700 accepted 且 healthy、三节点 online、DL ready、所有段均为 proper segment；1,021 份源码／配置及真实身份未变化。服务保留在该 DL 就绪状态。没有运行显式整模基线，不宣称这次证明了整模单机绝不可能运行或特定性能提升。
 
+### 后续容量诊断与 MTP 预算修复
+
+用户安排先处理两项开发修复，最终发行物验收等待真实设备窗口。代码、真实源预算复算与隔离原生层段观测见 [专项记录](容量诊断与MTP预算修复-2026-10-15.md)。本轮未部署生产三机，不替换上文各次真实验收的来源或历史结论。
+
 ### 仍待排期／外部验收
 
 | 项目 | 本轮结论与下一步 |
@@ -112,9 +116,9 @@ DL 原生加载证据分别在 `three-node-post-hello-dl/`：
 | Windows | CPU 最终 version／安装签清单缺失；旧 Launcher key 不受当前 trust。按正式信任链重建并验安装／启动，不能借临时 key 绕过。 |
 | Linux | Docker daemon 与预备镜像已可用；最终签名 `.deb` 及安装／首启验收仍缺。 |
 | Android | 当前 debug JNI／adb 开发验收通过；可信 release APK、最终升级与来源／签名验收仍缺。 |
-| CI | 本机普通通道 7,035 passed／16 skipped；物理 pytest／smoke 是 NOT_RUN。另存的真实设备开发实测不能冒充一次成功的最终 CI release run。 |
-| 准入说明 UX | 容量不满足目前统一显示等待更多 worker；后续应保留实际容量／host staging 拒绝原因及精确缺口，让用户区分正在加入与容量不足。 |
-| 预算同源性 | MTP 被 builder 排除而 planner 边界仍计入的保守多计已记录；后续按同源选权重逻辑和 native 峰值修，不能靠调小守卫通过验收。 |
+| CI | 后续容量／MTP 修复最终普通通道 unit 7,284 passed／16 skipped、external 32 passed；物理 pytest／smoke 是 NOT_RUN。另存的真实设备开发实测不能冒充一次成功的最终 CI release run。 |
+| 准入说明 UX | 后续已修：保留真实容量原因，API／TUI／Android 展示各节点 RAM／显存／host staging 候选缺口，区分容量等待与实际加入；详见 [容量诊断与 MTP 修复](容量诊断与MTP预算修复-2026-10-15.md)。 |
+| 预算同源性 | 后续已修：descriptor 与 builder 共用 GGUF 张量选择，排除明确声明的 decoder 外 MTP，保留未知非块张量。真实源最低四层预算减少 362,353,459 字节，倍率／余量不变；独立四层 native 峰值观测通过，范围与限制见上述修复记录。 |
 | 用户后置事项 | 重启自动拉起、显式本地整模基线仍后置；单机退出集群／本地模式的设计不因本轮改变。 |
 
 
