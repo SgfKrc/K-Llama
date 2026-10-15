@@ -359,3 +359,141 @@ def resolve_from_device_profile() -> InferenceSwitches:
     except Exception as exc:  # pragma: no cover - 画像属可选事实
         logger.debug("设备画像不可用，推理开关按默认档位继续: %s", exc)
     return resolve_inference_switches(profile)
+
+
+# ---------------------------------------------------------------- KV 预算 → n_ctx
+
+
+#: ggml 每元素实际字节（含量化 block 的尺度开销）：
+#: `f16` 2.0；`q8_0` = 34/32（32 元素 + 1 个 fp16 尺度）；`q4_0` = 18/32。
+KV_TYPE_ELEMENT_BYTES: Dict[str, float] = {
+    "f16": 2.0,
+    "q8_0": 34 / 32,
+    "q4_0": 18 / 32,
+}
+
+#: KV 预算默认取「设备可用内存」的这一比例。保守取 1/8：KV 是加载之外的额外占用，
+#: 且该预算**只用于把 `n_ctx` 往下收窄**（见 `suggest_n_ctx` 的 `max_ctx`）。
+KV_BUDGET_MEMORY_RATIO = 1 / 8
+
+
+def kv_bytes_per_token(
+    layer_count: int,
+    kv_heads: int,
+    key_length: int,
+    *,
+    cache_type_k: Optional[str] = None,
+    cache_type_v: Optional[str] = None,
+    value_length: Optional[int] = None,
+) -> float:
+    """单 token 在**本段**占用的 KV 字节（K 与 V 各按自己的量化档计）。
+
+    `value_length` 缺省等于 `key_length`（GGUF 契约只强制 `key_length`）。
+    """
+    layers = max(0, int(layer_count))
+    heads = max(0, int(kv_heads))
+    key_dim = max(0, int(key_length))
+    value_dim = key_dim if value_length is None else max(0, int(value_length))
+    default = KV_TYPE_ELEMENT_BYTES["f16"]
+    bytes_k = KV_TYPE_ELEMENT_BYTES.get(str(cache_type_k or "f16"), default)
+    bytes_v = KV_TYPE_ELEMENT_BYTES.get(str(cache_type_v or "f16"), default)
+    return layers * heads * (key_dim * bytes_k + value_dim * bytes_v)
+
+
+def suggest_n_ctx(
+    *,
+    budget_bytes: float,
+    layer_count: int,
+    kv_heads: int,
+    key_length: int,
+    cache_type_k: Optional[str] = None,
+    cache_type_v: Optional[str] = None,
+    value_length: Optional[int] = None,
+    n_seq_max: int = 1,
+    min_ctx: int = 512,
+    max_ctx: Optional[int] = None,
+) -> Optional[int]:
+    """按「每段 KV 预算」反推 `n_ctx`（票 20 完成定义第三条）。
+
+    `llama.cpp` 把 `n_ctx` 按 `n_seq_max` **均分**（见 `src/llama_keep_head.py` 的
+    `ctx_per_seq_for`），所以本函数返回的是**总槽位**：单序列可用 = 返回值 // n_seq_max。
+
+    返回 `None` 表示"不足以下结论"（预算或字段缺失，或算出的槽位小于 `min_ctx`），
+    调用方应回退自己的既有默认值。给出 `max_ctx` 时结果**只可能不大于**它 ——
+    本函数只把上下文往下收窄，不会放大。
+    """
+    per_token = kv_bytes_per_token(
+        layer_count, kv_heads, key_length,
+        cache_type_k=cache_type_k, cache_type_v=cache_type_v, value_length=value_length,
+    )
+    if per_token <= 0 or budget_bytes <= 0:
+        return None
+    slots = int(budget_bytes // per_token)
+    if max_ctx is not None:
+        slots = min(slots, int(max_ctx))
+    if slots < max(1, int(min_ctx)):
+        return None
+    return slots
+
+
+def kv_budget_bytes_from_profile(profile: Optional[Mapping[str, Any]] = None) -> Optional[int]:
+    """从设备画像推出可用于 KV 的字节数；画像不可用时返回 `None`。"""
+    if profile is None:
+        try:
+            from device_profiler import get_profile
+
+            profile = get_profile().to_dict()
+        except Exception as exc:  # pragma: no cover - 画像属可选事实
+            logger.debug("KV 预算：设备画像不可用: %s", exc)
+            return None
+    ram = (profile or {}).get("ram") or {}
+    try:
+        available_gb = float(ram.get("available_gb"))
+    except (TypeError, ValueError):
+        return None
+    if available_gb <= 0:
+        return None
+    return int(available_gb * (1024 ** 3) * KV_BUDGET_MEMORY_RATIO)
+
+
+def suggest_n_ctx_from_gguf(
+    model_path: str,
+    *,
+    budget_bytes: Optional[int] = None,
+    n_seq_max: int = 1,
+    cache_type_k: Optional[str] = None,
+    cache_type_v: Optional[str] = None,
+    min_ctx: int = 512,
+    max_ctx: Optional[int] = None,
+) -> Optional[int]:
+    """读 GGUF 头（不加载模型）后按预算反推 `n_ctx`；任何一步不可用即 `None`。"""
+    if budget_bytes is None:
+        budget_bytes = kv_budget_bytes_from_profile()
+    if not budget_bytes:
+        return None
+    try:
+        from gguf_metadata_contract import read_gguf_metadata
+
+        metadata = read_gguf_metadata(model_path)
+    except Exception as exc:
+        logger.debug("KV 预算：读不到 GGUF 头 %s: %s", model_path, exc)
+        return None
+    try:
+        layer_count = int(metadata.get("block_count"))
+        raw_heads = metadata.get("head_count_kv")
+        kv_heads = max(int(item) for item in (raw_heads if isinstance(raw_heads, (list, tuple)) else [raw_heads]))
+        key_length = int(metadata.get("key_length"))
+    except (TypeError, ValueError):
+        logger.debug("KV 预算：GGUF 头缺 block_count/head_count_kv/key_length，按既有默认继续")
+        return None
+    return suggest_n_ctx(
+        budget_bytes=budget_bytes,
+        layer_count=layer_count,
+        kv_heads=kv_heads,
+        key_length=key_length,
+        cache_type_k=cache_type_k,
+        cache_type_v=cache_type_v,
+        n_seq_max=n_seq_max,
+        min_ctx=min_ctx,
+        max_ctx=max_ctx,
+    )

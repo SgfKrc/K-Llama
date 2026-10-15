@@ -12,7 +12,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import inference_switches as switch_mod
+import pytest
+
+import inference_switches as mod
 from inference_switches import (
     ENV_FLASH_ATTN,
     ENV_KV_CACHE,
@@ -174,7 +176,7 @@ class TestObservability:
         _clean_env(monkeypatch)
         switches = resolve_inference_switches(None, env={}, engine_isa={"AVX2": 1})
         payload = switches.to_dict()
-        assert payload["schema_version"] == switch_mod.SCHEMA_VERSION
+        assert payload["schema_version"] == mod.SCHEMA_VERSION
         assert payload["engine_isa"] == {"AVX2": 1}
         assert payload["is_default"] is True
         assert payload["evidence"]["kv_cache_type"], "每条映射必须带实测依据"
@@ -194,3 +196,70 @@ class TestObservability:
         profile = DeviceProfiler.mock_edge().to_dict()
         assert profile["inference_switches"] is not None
         assert profile["inference_switches"]["is_default"] is True
+
+
+class TestKvBudgetAndCtx:
+    """票 20 完成定义第三条：`n_ctx` 由每段 KV 预算（层数 × 每层字节 × ctx）推导。"""
+
+    def test_bytes_per_token_counts_k_and_v_per_layer(self):
+        # 24 层、4 个 KV 头、head_dim 128、f16 ⇒ 24 × 4 × (128×2 + 128×2)
+        assert mod.kv_bytes_per_token(24, 4, 128) == 24 * 4 * 512
+
+    def test_bytes_per_token_follows_the_quantised_cache_type(self):
+        f16 = mod.kv_bytes_per_token(24, 4, 128)
+        q8 = mod.kv_bytes_per_token(24, 4, 128, cache_type_k="q8_0", cache_type_v="q8_0")
+        q4 = mod.kv_bytes_per_token(24, 4, 128, cache_type_k="q4_0", cache_type_v="q4_0")
+        assert q8 < f16 and q4 < q8
+        assert q4 == pytest.approx(f16 * (18 / 32) / 2, rel=1e-6)
+
+    def test_suggest_n_ctx_is_budget_over_bytes_per_token(self):
+        per_token = mod.kv_bytes_per_token(24, 4, 128)
+        assert mod.suggest_n_ctx(
+            budget_bytes=per_token * 4096, layer_count=24, kv_heads=4, key_length=128,
+        ) == 4096
+
+    def test_suggest_n_ctx_never_widens_past_max_ctx(self):
+        per_token = mod.kv_bytes_per_token(24, 4, 128)
+        assert mod.suggest_n_ctx(
+            budget_bytes=per_token * 100000, layer_count=24, kv_heads=4, key_length=128,
+            max_ctx=4096,
+        ) == 4096
+
+    def test_suggest_n_ctx_refuses_to_conclude_below_min_ctx(self):
+        per_token = mod.kv_bytes_per_token(24, 4, 128)
+        assert mod.suggest_n_ctx(
+            budget_bytes=per_token * 10, layer_count=24, kv_heads=4, key_length=128,
+        ) is None
+        assert mod.suggest_n_ctx(
+            budget_bytes=0, layer_count=24, kv_heads=4, key_length=128,
+        ) is None
+
+    def test_budget_from_profile_is_available_memory_over_eight(self):
+        budget = mod.kv_budget_bytes_from_profile({"ram": {"available_gb": 32}})
+        assert budget == int(32 * (1024 ** 3) * mod.KV_BUDGET_MEMORY_RATIO)
+
+    def test_budget_from_profile_is_none_without_usable_ram(self):
+        assert mod.kv_budget_bytes_from_profile({}) is None
+        assert mod.kv_budget_bytes_from_profile({"ram": {"available_gb": "many"}}) is None
+        assert mod.kv_budget_bytes_from_profile({"ram": {"available_gb": 0}}) is None
+
+    def test_from_gguf_uses_header_fields(self, monkeypatch):
+        """读 GGUF 头（不加载模型）+ 预算 ⇒ 推导；head_count_kv 为按层数组时取最大。"""
+        metadata = {"block_count": 24, "head_count_kv": [4, 4, 8], "key_length": 128}
+        monkeypatch.setattr("gguf_metadata_contract.read_gguf_metadata", lambda path: dict(metadata))
+        per_token = mod.kv_bytes_per_token(24, 8, 128)
+        assert mod.suggest_n_ctx_from_gguf(
+            "dummy.gguf", budget_bytes=per_token * 2048, max_ctx=8192,
+        ) == 2048
+
+    def test_from_gguf_returns_none_when_header_unreadable(self, monkeypatch):
+        def _boom(path):
+            raise OSError("not a gguf")
+
+        monkeypatch.setattr("gguf_metadata_contract.read_gguf_metadata", _boom)
+        assert mod.suggest_n_ctx_from_gguf("dummy.gguf", budget_bytes=10 ** 9) is None
+
+    def test_from_gguf_returns_none_without_required_fields(self, monkeypatch):
+        monkeypatch.setattr("gguf_metadata_contract.read_gguf_metadata",
+                            lambda path: {"block_count": 24})
+        assert mod.suggest_n_ctx_from_gguf("dummy.gguf", budget_bytes=10 ** 9) is None

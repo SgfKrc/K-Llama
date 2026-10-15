@@ -152,6 +152,32 @@ def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
     )
 
 
+def _default_n_ctx(model_path: str) -> int:
+    """未显式给 `n_ctx` 时的默认值：先用「每段 KV 预算」收窄，再回退既有常量。
+
+    票 20 完成定义第三条：`n_ctx` 应基于每段 KV 预算（层数 × 每层字节 × ctx），
+    而不是全局常量。这里**只往下收窄** —— 推导结果不会超过既有默认值，所以
+    无画像、读不到 GGUF 头或内存充足时，行为与从前逐字一致。
+    """
+    from config import MAX_SEQ_LEN
+
+    baseline = MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else 4096
+    try:
+        import inference_switches
+
+        suggested = inference_switches.suggest_n_ctx_from_gguf(model_path, max_ctx=baseline)
+    except Exception as exc:  # pragma: no cover - 预算属可选事实
+        logger.debug("KV 预算推导不可用，n_ctx 用既有默认 %s: %s", baseline, exc)
+        return baseline
+    if suggested and suggested != baseline:
+        logger.info(
+            "n_ctx 按每段 KV 预算收窄：%s → %s（预算 = 设备可用内存 × %s）",
+            baseline, suggested, inference_switches.KV_BUDGET_MEMORY_RATIO,
+        )
+        return suggested
+    return baseline
+
+
 def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
     """按设备画像与环境覆盖挂上推理开关（就地修改 `load_kwargs`）。
 
@@ -938,7 +964,7 @@ class LlamaCppEngine:
             self._quant_type = "GGUF"
 
         if n_ctx is None:
-            n_ctx = MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else 4096
+            n_ctx = _default_n_ctx(model_path)
         if n_threads is None:
             n_threads = self._auto_threads()
 
