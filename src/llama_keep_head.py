@@ -66,6 +66,8 @@ FORWARD_ERRORS = {
     -2: "llama_decode 失败",
     -3: "llama_get_embeddings_layer_inp 返回空（该槽位导出没打开，或架构没登记该槽位）",
     -4: "保留（旧 nextn 通道已停用：现统一走 layer_inp 的 n_layer 槽位）",
+    -6: "tail logits or vocabulary unavailable",
+    -7: "tail logits contain NaN or Inf",
     -5: "参数非法（句柄 / embd / 输出缓冲）",
 }
 

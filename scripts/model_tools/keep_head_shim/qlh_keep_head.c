@@ -35,6 +35,7 @@
 
 #include "llama.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -347,6 +348,9 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
                                   const int32_t * n_seq_id, const int32_t * seq_ids,
                                   const int32_t * positions, int32_t * out_token) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (out_token != NULL) {
+        *out_token = -1;
+    }
     if (handle == NULL || embd == NULL || out_token == NULL || n_tokens <= 0) {
         return -5;
     }
@@ -371,28 +375,50 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
         return -2;
     }
 
-    const float * logits = llama_get_logits_ith(handle->ctx, n_tokens - 1);
-    if (logits == NULL) {
-        return -6;
-    }
     const struct llama_model * model = llama_get_model(handle->ctx);
-    if (model == NULL) {
-        return -6;
-    }
-    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const struct llama_vocab * vocab = model == NULL ? NULL : llama_model_get_vocab(model);
+    const int32_t n_vocab = vocab == NULL ? 0 : llama_vocab_n_tokens(vocab);
     if (n_vocab <= 0) {
         return -6;
     }
     int32_t best = 0;
-    float best_logit = logits[0];
-    for (int32_t i = 1; i < n_vocab; ++i) {
-        if (logits[i] > best_logit) {
-            best_logit = logits[i];
-            best = i;
+    float best_logit = 0.0f;
+    /* All rows are marked as outputs, including prefill. Reject any NaN/Inf
+     * before publishing the last row's argmax. Keep last_error as decode rc. */
+    for (int32_t row = 0; row < n_tokens; ++row) {
+        const float * logits = llama_get_logits_ith(handle->ctx, row);
+        if (logits == NULL) {
+            return -6;
+        }
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            const float value = logits[i];
+            if (!isfinite(value)) {
+                fprintf(stderr, "[qlh_keep_head] non-finite logits (row=%d, vocab_index=%d)\n",
+                        row, i);
+                return -7;
+            }
+            if (row == n_tokens - 1 && (i == 0 || value > best_logit)) {
+                best_logit = value;
+                best = i;
+            }
         }
     }
     *out_token = best;
     return 0;
+}
+
+/* Optional capabilities; older shims do not export these symbols. */
+int32_t qlh_kh_finite_logits_guard(void) {
+    return 1;
+}
+
+int32_t qlh_kh_n_vocab(void * handle_void) {
+    const qlh_keep_head * handle = (const qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->model == NULL) {
+        return 0;
+    }
+    const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
+    return vocab == NULL ? 0 : llama_vocab_n_tokens(vocab);
 }
 
 int32_t qlh_kh_n_embd(void * handle_void) {    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
