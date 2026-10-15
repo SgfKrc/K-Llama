@@ -11,7 +11,7 @@
 >
 > **适用范围**：Windows Inno Setup 与 Linux `.deb` 的可选全局命令注册。只管理 `PATH` 中的 QLH 稳定命令入口，不写入端口、模型路径、SQLite 路径、代理、集群密钥或其他配置。
 >
-> **关联文档**：[TUI 使用指南](TUI使用指南.md)、[TUI 适配与聊天页实施计划](TUI适配实施计划.md)、[打包说明](../../qlh-release/README.md)
+> **关联文档**：[TUI 使用指南](../../TUI使用指南.md)、[TUI 适配与聊天页实施计划](TUI适配实施计划.md)、[打包说明](../../qlh-release/README.md)
 
 ---
 

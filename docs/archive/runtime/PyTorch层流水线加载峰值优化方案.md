@@ -14,7 +14,7 @@
 
 > **实施复核（2026-08-13）**：P0 已完成，P2 的本机开发基线已完成。`ModelManager.load_layer_range` 现在强制 Qwen/Qwen2 架构加载器返回 `_LayerRangeLoadTracker`；每个 safetensors tensor 在 `get_tensor` 前先校验 key 是否属于分配层段，越界物化、缺失分配层或绕过守卫均 fail-closed。加载过程在 meta 骨架完成、tensor 读取、目标设备安装、裁剪和清理边界采样进程 RSS 与 CUDA allocated，并通过 `get_model_info().layer_load_metrics` 暴露层索引、tensor 数、源/目标字节和峰值增量，不记录文件路径或权重 key。定向回归 `95 passed / 1 skipped`，Python 全量 `2105 passed / 8 skipped`。
 >
-> **双机验收补充（2026-08-20）**：QW1.8B 分层数据面真机通过——主节点 RTX 4060（Layer 0-21）+ Surface 从节点（Layer 21-24，无 CUDA），双方本地选择性加载、网络只传 hidden/KV，三次 `distributed_required` 均 `distributed_used=true`/`fallback=false`、RTT 6-12ms、64 心跳窗口无重连（见[项目进展与下一步计划](archive/项目进展与下一步计划.md) 2026-08-20 条目）。**本方案在 QW1.8B 上的真机边界已闭合**；真实 7B/12B 重量级模型三节点分段与峰值实测仍后置（见 §"六期"）。
+> **双机验收补充（2026-08-20）**：QW1.8B 分层数据面真机通过——主节点 RTX 4060（Layer 0-21）+ Surface 从节点（Layer 21-24，无 CUDA），双方本地选择性加载、网络只传 hidden/KV，三次 `distributed_required` 均 `distributed_used=true`/`fallback=false`、RTT 6-12ms、64 心跳窗口无重连（见[项目进展与下一步计划](../distributed/项目进展与下一步计划.md) 2026-08-20 条目）。**本方案在 QW1.8B 上的真机边界已闭合**；真实 7B/12B 重量级模型三节点分段与峰值实测仍后置（见 §"六期"）。
 
 ---
 
@@ -92,7 +92,7 @@
 
 ## 7. 关联与登记
 
-- 关联：`docs/Gemma-4-12B多模态支持方案.md` §2.4（PyTorch 候选 S2 接入层流水线时按本方案模板）；`docs/验收清单与资源限制登记.md` A4（双机验收含峰值实测）；`docs/张量并行外部辅助与混合拆分调研方案.md`（层间拆分 vs TP 的显存语义区分）。
+- 关联：`docs/archive/models/Gemma-4-12B多模态支持方案.md` §2.4（PyTorch 候选 S2 接入层流水线时按本方案模板）；`docs/验收清单与资源限制登记.md` A4（双机验收含峰值实测）；`docs/archive/relay/张量并行外部辅助与混合拆分调研方案.md`（层间拆分 vs TP 的显存语义区分）。
 - 优先级：P0、P2 本机开发基线与 Gemma 4 KIP-11A/11B 开发门已完成；KIP-12 受管 native binding 冻结身份门也已关闭。当前下一票转 KIP-13（P6 完整加载复用指纹）；硬件到位后再执行真实工件三轮峰值标定与阈值冻结，KIP-11B 不因 tiny smoke 进入生产 allow-list。
 - 本方案不改变任何已验收行为；当前 Qwen 系分布式加载行为不变（已是目标形态）。
 
