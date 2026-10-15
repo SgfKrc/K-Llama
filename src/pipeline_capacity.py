@@ -562,6 +562,7 @@ def solve_pipeline_capacity(
     local_layer_budget: int | None = None,
     relay_claims: dict[str, tuple[int, int]] | None = None,
     prefer_all_workers: bool = False,
+    required_node_id: str | None = None,
 ) -> dict[str, Any]:
     """Return an all-or-nothing contiguous layer placement.
 
@@ -572,6 +573,9 @@ def solve_pipeline_capacity(
     deliberately rejected; the returned plan must contain at least two
     participating nodes. This is used by an explicitly distributed request,
     while ordinary capacity inspection remains single-node efficient.
+    ``required_node_id`` additionally requires that node to execute a nonempty
+    segment; supply uses it for the master instead of rejecting an otherwise
+    feasible result after the solver has optimized the master away.
 
     ``prefer_all_workers`` flips the optimization between feasible placements
     from "fewest nodes" (default: least network hops) to "most nodes" — the
@@ -580,6 +584,10 @@ def solve_pipeline_capacity(
     always fewer.
     """
 
+    if required_node_id is not None and (
+            not isinstance(required_node_id, str) or not required_node_id
+            or required_node_id.strip() != required_node_id):
+        raise PipelineCapacityError("required_node_id must be a nonempty node identity")
     safety_margin = _positive_float(safety_margin, "safety_margin")
     if safety_margin < 1.0:
         raise PipelineCapacityError("safety_margin must be at least 1.0")
@@ -643,6 +651,16 @@ def solve_pipeline_capacity(
         "candidate_node_count": len(usable),
         "excluded_nodes": excluded,
     }
+    required_node_index = next((index for index, node in enumerate(usable)
+                                if node["node_id"] == required_node_id), None)
+    if required_node_id is not None and required_node_index is None:
+        return {
+            **base, "status": "rejected", "admitted": False,
+            "reason_code": "pipeline_required_node_unavailable",
+            "reason": f"required executor {required_node_id} has no usable model capacity",
+            "required_node_id": required_node_id,
+            "assignments": [], "control_only_nodes": [node["node_id"] for node in usable],
+        }
     if not usable and not relay_only:
         return {
             **base,
@@ -712,6 +730,10 @@ def solve_pipeline_capacity(
         source_model_sha256: str,
     ):
         if cursor == layer_budget:
+            # A mandatory executor cannot be skipped by completing the model
+            # on earlier nodes. Past its index, the skip branch below proves use.
+            if required_node_index is not None and node_index <= required_node_index:
+                return None
             # ★ Y 档第二条：relay 段**算参与节点**（它承载远端段工件），只是不占本机容量
             #   ⇒ "分布式"的判据是 `本机层节点数 + relay 段数 >= 2`，而不是只看前者。
             #   否则 `master(0-8) + relay 段(8-24)` 这种**合法**拓扑会被误拒。
@@ -722,7 +744,7 @@ def solve_pipeline_capacity(
         if node_index >= len(usable):
             return None
         node = usable[node_index]
-        best = search(
+        best = None if node["node_id"] == required_node_id else search(
             node_index + 1, cursor, started, used_count, source_model_sha256,
         )
         remaining = layer_budget - cursor
@@ -885,6 +907,7 @@ def solve_pipeline_capacity(
                 require_distributed=require_distributed,
                 local_layer_budget=local_layer_budget,
                 relay_claims=relay_claims,
+                required_node_id=required_node_id,
             )
             if segmentless.get("admitted"):
                 return {
@@ -926,6 +949,7 @@ def solve_pipeline_capacity(
                 require_distributed=require_distributed,
                 local_layer_budget=local_layer_budget,
                 relay_claims=relay_claims,
+                required_node_id=required_node_id,
             )
             unconstrained_admission = bool(unconstrained.get("admitted"))
         if range_constrained and unconstrained_admission:

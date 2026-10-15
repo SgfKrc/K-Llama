@@ -10233,6 +10233,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             "（总容量够，但切分后单节点不够 ⇒ 检查各节点空闲内存/降低精度）"
         ),
         "pipeline_distributed_capacity_insufficient": "分布式各节点总容量不足",
+        "pipeline_required_node_unavailable": "指定执行节点当前没有可用的模型容量",
         "node_capacity_unavailable": "节点容量不足（内存/显存）",
         "pipeline_capacity_rejected": "集群容量准入被拒",
         "pipeline_reshard_capacity_insufficient": "重新分片后容量不足",
