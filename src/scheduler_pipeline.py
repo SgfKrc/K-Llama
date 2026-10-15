@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
 import time
@@ -2627,9 +2628,27 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 reservation,
                 cancel_event or threading.Event(),
             )
-            return _layer_stage_result_to_pipeline_value(
+            value = _layer_stage_result_to_pipeline_value(
                 result.output, hidden_spec=hidden_spec,
             )
+            # A dispatch log precedes execution and cannot prove a handoff
+            # succeeded. Emit this receipt only after the result is validated.
+            logger.info(
+                "Route-A stage completed: %s",
+                json.dumps({
+                    "workflow_id": str(workflow_id),
+                    "stage_request_id": str(request_id),
+                    "stage_id": str(stage_id),
+                    "node_id": str(node_id),
+                    "layer_range": stage_fields["layer_range"],
+                    **stage_fields["prepare_identity"],
+                    "tokens": n_tokens,
+                    "hidden_sha256": stage_fields["hidden_sha256"],
+                    "result_kind": value["kind"],
+                    "completed_at": time.time(),
+                }, sort_keys=True, separators=(",", ":")),
+            )
+            return value
         finally:
             provider.release(reservation.reservation_id)
 
