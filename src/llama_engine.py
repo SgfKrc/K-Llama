@@ -165,16 +165,8 @@ def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
         logger.warning("推理开关模块不可用，按默认档位继续: %s", exc)
         return
 
-    profile = None
     try:
-        from device_profiler import get_profile
-
-        profile = get_profile().to_dict()
-    except Exception as exc:
-        logger.debug("设备画像不可用，推理开关按默认档位继续: %s", exc)
-
-    try:
-        switches = inference_switches.resolve_inference_switches(profile)
+        switches = inference_switches.resolve_from_device_profile()
         inference_switches.apply_to_load_kwargs(switches, load_kwargs)
     except Exception as exc:
         logger.warning("推理开关解析失败，按默认档位继续: %s", exc)
@@ -497,36 +489,22 @@ class LlamaCppEngine:
         tensor_bytes = read_gguf_tensor_bytes(path)
         if not tensor_bytes:
             return {}
-        layer_weight_bytes = [0] * total_layers
-        component_weight_bytes = {
-            "embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0,
-        }
-        block_prefix = re.compile(r"^blk\.(\d+)\.")
-        for tensor_name, size in tensor_bytes.items():
-            block = block_prefix.match(tensor_name)
-            if block:
-                # 工件内的 blk 索引是**本段局部**的（0..local_total_layers-1），
-                # 要按 manifest 的 source_layer_range 平移到源模型坐标系。
-                index = segment_start + int(block.group(1))
-                if index < total_layers:
-                    layer_weight_bytes[index] += size
-                    continue
-            if tensor_name.startswith("token_embd."):
-                component_weight_bytes["embedding"] += size
-            elif tensor_name.startswith("output_norm."):
-                component_weight_bytes["final_norm"] += size
-            elif tensor_name.startswith("output."):
-                component_weight_bytes["lm_head"] += size
-            else:
-                component_weight_bytes["other"] += size
-        # 只要求**本段**覆盖到字节：其它层属于别的段（远端执行），不是"缺失"。
-        segment_span = (segment_start, segment_start + local_total_layers)
-        if any(
-            size <= 0
-            for index, size in enumerate(layer_weight_bytes)
-            if segment_span[0] <= index < segment_span[1]
-        ):
+        from gguf_tensor_selection import select_gguf_tensors
+
+        nextn = info.get("nextn_predict_layers", 0)
+        try:
+            block_count = info.get("block_count", local_total_layers + nextn)
+            selection = select_gguf_tensors(
+                tensor_bytes, block_count=block_count, nextn_predict_layers=nextn,
+            )
+            if len(selection.layer_weight_bytes) != local_total_layers:
+                raise ValueError("GGUF decoder count differs from layer metadata")
+        except (TypeError, ValueError) as exc:
+            logger.warning("GGUF pipeline tensor budget rejected: %s", exc)
             return {}
+        layer_weight_bytes = [0] * total_layers
+        layer_weight_bytes[segment_start:segment_start + local_total_layers] = selection.layer_weight_bytes
+        component_weight_bytes = selection.component_weight_bytes
         try:
             weight_bytes = int(os.path.getsize(path))
         except OSError:
@@ -593,6 +571,17 @@ class LlamaCppEngine:
             "tokenizer_sha256": tokenizer_sha256,
             "layer_weight_bytes": layer_weight_bytes,
             "component_weight_bytes": component_weight_bytes,
+            # Payload totals describe the inspected file, excluding GGUF header
+            # and alignment. Only declared MTP blocks are absent from the
+            # executable decoder budget; retain their exact bytes for audit.
+            "source_weight_bytes": selection.source_weight_bytes,
+            "pipeline_weight_bytes": selection.selected_weight_bytes,
+            "runtime_ignored_components": ["mtp"] if nextn else [],
+            "runtime_ignored_component_bytes": {
+                "mtp": sum(selection.excluded_mtp_tensor_bytes.values()),
+            } if nextn else {},
+            "runtime_ignored_tensor_bytes": selection.excluded_mtp_tensor_bytes,
+            "indexed_tensor_count": len(tensor_bytes),
             "quant_type": str(getattr(self, "_quant_type", "") or ""),
             "inspection_mode": "gguf_header",
             "weight_bytes": weight_bytes,

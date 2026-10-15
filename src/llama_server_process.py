@@ -54,6 +54,10 @@ class ServerSpec:
     spec_type: str = ""
     chat_template_kwargs: dict | None = None
     mmproj_path: str = ""
+    #: 推理开关片段，由 `inference_switches.server_argv_args()` 生成
+    #: （`--threads` / `--cache-type-k` / `--cache-type-v` / `--flash-attn`）。
+    #: 默认空 ⇒ 命令行在本字段引入前后逐字一致。
+    inference_args: list[str] = field(default_factory=list)
     extra_args: list[str] = field(default_factory=list)
 
     def to_argv(self, *, host: str, port: int) -> list[str]:
@@ -65,6 +69,7 @@ class ServerSpec:
             "--host", str(host),
             "--port", str(int(port)),
         ]
+        argv += [str(a) for a in self.inference_args]
         if self.mmproj_path:
             argv += ["--mmproj", str(self.mmproj_path)]
         if self.cpu_moe:

@@ -323,3 +323,39 @@ def apply_to_load_kwargs(switches: InferenceSwitches, load_kwargs: Dict[str, Any
         load_kwargs["flash_attn"] = True
     if switches.n_threads and "n_threads" not in load_kwargs:
         load_kwargs["n_threads"] = switches.n_threads
+
+
+def server_argv_args(switches: InferenceSwitches) -> List[str]:
+    """把开关翻成 `llama-server` 命令行片段；默认档位返回**空列表**。
+
+    参数名以本机 `llama-server --help` 实测为准：`--threads N`、
+    `--cache-type-k TYPE`、`--cache-type-v TYPE`、`--flash-attn [on|off|auto]`。
+    flash-attn 只在**显式覆盖**时才出现 —— 不传等于 server 自己的默认 `auto`，
+    这样「未介入」与「显式关闭」在命令行上可区分。
+    """
+    args: List[str] = []
+    if switches.n_threads:
+        args += ["--threads", str(int(switches.n_threads))]
+    if switches.kv_cache_type_k:
+        args += ["--cache-type-k", str(switches.kv_cache_type_k)]
+    if switches.kv_cache_type_v:
+        args += ["--cache-type-v", str(switches.kv_cache_type_v)]
+    if "flash_attn" in switches.overrides:
+        args += ["--flash-attn", "on" if switches.flash_attn else "off"]
+    return args
+
+
+def resolve_from_device_profile() -> InferenceSwitches:
+    """从本进程设备画像解析开关；画像不可用或异常时退回默认档位。
+
+    两条推理路径（`llama_engine` 的绑定、`llama_server_engine` 的子进程）共用本
+    入口，同一台设备得到同一张映射，而不是各自读一套默认值。
+    """
+    profile = None
+    try:
+        from device_profiler import get_profile
+
+        profile = get_profile().to_dict()
+    except Exception as exc:  # pragma: no cover - 画像属可选事实
+        logger.debug("设备画像不可用，推理开关按默认档位继续: %s", exc)
+    return resolve_inference_switches(profile)

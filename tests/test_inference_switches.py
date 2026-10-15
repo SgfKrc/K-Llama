@@ -20,6 +20,7 @@ from inference_switches import (
     apply_to_load_kwargs,
     parse_engine_isa,
     resolve_inference_switches,
+    server_argv_args,
 )
 
 #: 真实绑定输出样例（本机 llama-cpp-python，CPU-only 轮子：有 AVX2/FMA，无 AVX512/VNNI）。
@@ -131,6 +132,41 @@ class TestApplyToLoadKwargs:
         kwargs: dict = {}
         apply_to_load_kwargs(switches, kwargs)
         assert kwargs == {"type_k": "q4_0", "type_v": "q4_0"}
+
+
+class TestServerArgTranslation:
+    """`llama-server` 命令行翻译：默认档位不产出参数，显式覆盖才产出。
+
+    参数名以本机 `llama-server --help` 实测为准（`-t/--threads`、
+    `-ctk/--cache-type-k`、`-ctv/--cache-type-v`、`-fa/--flash-attn [on|off|auto]`）。
+    """
+
+    def test_default_emits_no_server_args(self, monkeypatch):
+        _clean_env(monkeypatch)
+        switches = resolve_inference_switches(None, env={}, engine_isa={})
+        assert server_argv_args(switches) == []
+
+    def test_explicit_switches_become_server_args(self, monkeypatch):
+        _clean_env(monkeypatch)
+        switches = resolve_inference_switches(
+            None,
+            env={ENV_KV_CACHE: "q8_0", ENV_FLASH_ATTN: "0", ENV_THREADS: "6"},
+            engine_isa={},
+        )
+        assert server_argv_args(switches) == [
+            "--threads", "6",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0",
+            "--flash-attn", "off",
+        ]
+
+    def test_flash_attn_absent_until_explicitly_overridden(self, monkeypatch):
+        """不传 `--flash-attn` 即沿用 server 自身的 auto；显式关闭才写 `off`。"""
+        _clean_env(monkeypatch)
+        switches = resolve_inference_switches(None, env={ENV_KV_CACHE: "q4_0"}, engine_isa={})
+        args = server_argv_args(switches)
+        assert args == ["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"]
+        assert "--flash-attn" not in args
 
 
 class TestObservability:
