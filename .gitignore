@@ -278,3 +278,6 @@ scripts/*
 runtime-master*.log
 surface-ssh*.log
 .gitignore_bak
+
+# 本地一次性迁移备份（DSH→Reasonix 桥接迁移的 UI 资源快照），不入库
+dsh-migration-backup-*/
