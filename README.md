@@ -229,8 +229,8 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 ### 1. 获取代码和子模块
 
 ```bash
-git clone https://github.com/SgfKrc/LEDS_BJTU.git
-cd LEDS_BJTU
+git clone https://github.com/SgfKrc/K-Llama.git
+cd K-Llama
 git submodule update --init --recursive     # 只拉 4 个子模块
 ```
 

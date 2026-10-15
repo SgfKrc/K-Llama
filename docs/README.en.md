@@ -230,8 +230,8 @@ The main project keeps no image-generation runtime or assets; image generation b
 ### 1. Get the code and submodules
 
 ```bash
-git clone https://github.com/SgfKrc/LEDS_BJTU.git
-cd LEDS_BJTU
+git clone https://github.com/SgfKrc/K-Llama.git
+cd K-Llama
 git submodule update --init --recursive     # fetches the 4 submodules
 ```
 
