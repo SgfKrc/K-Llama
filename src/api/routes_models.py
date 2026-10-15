@@ -241,7 +241,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         _api_module.logger.error(f"模型加载失败: {e}", exc_info=True)
         raise _api_module.HTTPException(500, f"模型加载失败: {str(e)}")
 
-async def _prepare_pipeline_model_resolution(resolution, *, operation_id=""):
+async def _prepare_pipeline_model_resolution(resolution, *, operation_id="", capacity_evidence=None):
     resolved_model_path = resolution.model_path
     quant = resolution.quant_type
     if not operation_id:
@@ -256,6 +256,19 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id=""):
             selected_path = worker.selected_model_path()
             if selected is not None and selected_path is not None and Path(resolved_model_path).resolve() == Path(selected_path).resolve():
                 operation_id = selected["manifest"]["operation_id"]
+    if operation_id and capacity_evidence is None:
+        # Direct prepare of the current supplied asset enters the same owner
+        # and fresh-budget barrier as the supply/intent endpoint.
+        supply = _api_module.scheduler._model_supply
+        from model_supply import ModelSupplyError
+        try:
+            with supply.prepare_guard(operation_id):
+                evidence = await _api_module.run_in_threadpool(
+                    supply.prepare_capacity_evidence, operation_id)
+                return await _prepare_pipeline_model_resolution(
+                    resolution, operation_id=operation_id, capacity_evidence=evidence)
+        except ModelSupplyError as exc:
+            raise _api_module.coded_http_error(409, exc.code, exc.message) from exc
     candidate_id = f"modeltxn_{_api_module.uuid.uuid4().hex}"
     candidate_prepared = False
     transaction_started = False
@@ -309,6 +322,7 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id=""):
                 require_distributed=True,
                 on_commit=_after_commit,
                 operation_id=operation_id,
+                **({"capacity_evidence": capacity_evidence} if capacity_evidence is not None else {}),
             )
         )
         if not capacity_plan.get("admitted") or capacity_plan.get(
@@ -355,16 +369,18 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id=""):
                     exc_info=True,
                 )
         _api_module.logger.error("准备流水线模型失败: %s", exc, exc_info=True)
+        from model_supply import ModelSupplyError
         error_code = (
+            exc.code if isinstance(exc, ModelSupplyError) else
             "SUPPLY_PREPARE_CANCELLED"
             if getattr(exc, "code", "") == "SUPPLY_PREPARE_CANCELLED"
             else "MODEL_TXN_CONFLICT"
             if "MODEL_TXN_CONFLICT" in str(exc)
             else "MODEL_TXN_PREPARE_FAILED"
         )
-        status_code = 409 if error_code in {"MODEL_TXN_CONFLICT", "SUPPLY_PREPARE_CANCELLED"} else 400
+        status_code = 409 if isinstance(exc, ModelSupplyError) or error_code in {"MODEL_TXN_CONFLICT", "SUPPLY_PREPARE_CANCELLED"} else 400
         raise _api_module.coded_http_error(
-            status_code, error_code, f"准备流水线模型失败: {exc}"
+            status_code, error_code, exc.message if isinstance(exc, ModelSupplyError) else f"准备流水线模型失败: {exc}"
         ) from exc
 
 
@@ -709,7 +725,9 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
         _api_module.write_manifest(manifest_root, manifest)
     except ValueError as exc:
         raise _api_module.HTTPException(status_code=400, detail=f"model preflight failed: {exc}") from exc
+    from model_registry_validation import manifest_external_files
     config = {
+        "manifest_external_files": manifest_external_files(manifest_root, artifact["files"]),
         "model_id": req.model_id,
         "name": req.name,
         "model_type": req.model_type,

@@ -183,3 +183,25 @@ def test_profile_default_paths_resolve_to_existing_files():
     has_dir = bool(paths["model_path"]) and os.path.isdir(paths["model_path"])
     has_gguf = bool(paths["gguf_path"]) and os.path.isfile(paths["gguf_path"])
     assert has_dir or has_gguf, f"默认模型的路径都不存在：{paths}"
+
+
+def test_registered_builtin_override_is_shared_by_catalog_and_execution(monkeypatch, tmp_path):
+    builtin = mc.get_builtin_model("qwen3-0.6b")
+    row = {"model_id": builtin.model_id, "model_type": "gguf", "model_path": "",
+           "gguf_path": str(tmp_path / "updated.gguf"), "name": "User verified source"}
+    monkeypatch.setattr(mc, "is_cuda_available", lambda: True)
+    resolved = mc.get_model_config(builtin.model_id, [row])
+    catalog = next(m for m in mc.get_all_model_configs([row]) if m.model_id == builtin.model_id)
+    visible = next(m for m in mc.get_visible_models([row]) if m.model_id == builtin.model_id)
+    assert resolved == catalog == visible
+    assert resolved.name == row["name"]
+    assert resolved.gguf_path == row["gguf_path"] and resolved.model_path == ""
+    assert resolved.max_context == builtin.max_context
+    assert resolved.is_experimental == builtin.is_experimental
+
+
+def test_invalid_registered_builtin_never_silently_uses_old_artifact():
+    mid = "qwen3-0.6b"
+    row = {"model_id": mid, "model_path": ["invalid"]}
+    assert mc.get_model_config(mid, [row]) is None
+    assert mid not in {m.model_id for m in mc.get_all_model_configs([row])}

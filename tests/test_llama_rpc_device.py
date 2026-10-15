@@ -116,7 +116,7 @@ def fake_injector(monkeypatch):
     lc_module = types.ModuleType("llama_cpp.llama_cpp")
     lc_module.llama_backend_init = lambda: None
     lc_module.llama_model_load_from_file = lambda path, params: "orig-model"
-    sys.modules["llama_cpp.llama_cpp"] = lc_module
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", lc_module)
     return RpcBackendInjector(lib_dir=".")
 
 
@@ -152,7 +152,7 @@ def test_attach_falls_back_to_rpc_reg_then_fails_closed_without_add_server(monke
     monkeypatch.setitem(sys.modules, "llama_cpp", types.ModuleType("llama_cpp"))
     lc_module = types.ModuleType("llama_cpp.llama_cpp")
     lc_module.llama_backend_init = lambda: None
-    sys.modules["llama_cpp.llama_cpp"] = lc_module
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", lc_module)
 
     injector = RpcBackendInjector(lib_dir=".")
     with pytest.raises(RpcInjectionError, match="add_server"):
@@ -171,7 +171,7 @@ def test_attach_fail_closed_when_add_server_returns_null(monkeypatch):
     monkeypatch.setitem(sys.modules, "llama_cpp", types.ModuleType("llama_cpp"))
     lc_module = types.ModuleType("llama_cpp.llama_cpp")
     lc_module.llama_backend_init = lambda: None
-    sys.modules["llama_cpp.llama_cpp"] = lc_module
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", lc_module)
 
     injector = RpcBackendInjector(lib_dir=".")
     with pytest.raises(RpcInjectionError, match="add_server"):
@@ -393,7 +393,7 @@ def _cpu_plus_rpc_api(monkeypatch):
     lc_module = types.ModuleType("llama_cpp.llama_cpp")
     lc_module.llama_backend_init = lambda: None
     lc_module.llama_model_load_from_file = lambda path, params: "orig-model"
-    sys.modules["llama_cpp.llama_cpp"] = lc_module
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", lc_module)
     return RpcBackendInjector(lib_dir=".")
 
 

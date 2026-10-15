@@ -367,3 +367,541 @@ def test_real_scheduler_recovers_only_explicit_test_lifecycle():
     assert restarted._pipeline_recovery_pending is True
     assert restarted._pipeline_recovery_failure == "pipeline_recovery_pending"
     assert restarted._pipeline_recovery_state == record
+
+
+@pytest.mark.parametrize("workers", [0, 4])
+def test_backend_thread_after_fixture_teardown_uses_session_store(
+    pytester, monkeypatch, workers,
+):
+    """Release a real supervisor thread only after all function fixtures unwind."""
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    _isolated_suite(pytester, audit_teardown=False)
+    pytester.makepyfile(
+        tui_backend=(_REPO / "src" / "tui_backend.py").read_text(encoding="utf-8"),
+    )
+    inherited = pytester.path / "inherited-user.sqlite3"
+    user_state = pytester.path / "user-state"
+    user_state.mkdir()
+    default_store = user_state / "qlh-control.sqlite3"
+    identity = {
+        "version": 1, "mac_addresses": ["aabbccddeeff"], "bound_at": "user-owned",
+    }
+    for store in (inherited, default_store):
+        with sqlite3.connect(store) as connection:
+            connection.execute(
+                "CREATE TABLE cluster_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO cluster_settings VALUES (?, ?, ?)",
+                ("master_identity_v1", json.dumps(identity), "user-owned"),
+            )
+    before = {store: store.read_bytes() for store in (inherited, default_store)}
+    monkeypatch.setenv("QLH_SQLITE_PATH", str(inherited))
+    config_file = pytester.path / "config.py"
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8") + f"\nSTATE_DIR = {str(user_state)!r}\n",
+        encoding="utf-8",
+    )
+    pytester.makepyfile(late_backend="""
+        import os
+        import sys
+        import threading
+        from pathlib import Path
+        from types import SimpleNamespace
+        import local_store
+        from tui_backend import BackendSupervisor
+
+        release = threading.Event()
+        entered = threading.Event()
+        errors = []
+        connections = []
+        supervisors = []
+        function_path = None
+        session_path = None
+
+        def audit_connection(event, args):
+            if event == "sqlite3.connect" and threading.current_thread().name == "qlh-tui-backend":
+                path = Path(args[0]).resolve()
+                connections.append(path)
+                if path != session_path:
+                    # Catch a regression before it can open ANY durable store.
+                    raise AssertionError("late backend SQLite escaped session isolation: " + str(path))
+
+        sys.addaudithook(audit_connection)
+
+        class FakeServer:
+            def __init__(self, config):
+                self.should_exit = False
+
+            def run(self):
+                entered.set()
+                try:
+                    assert release.wait(timeout=10), "teardown did not release backend"
+                    local_store.set_local_master_identity(["001122334455"])
+                except BaseException as exc:
+                    errors.append(exc)
+
+        def start(monkeypatch):
+            global function_path, session_path
+            # Read the session fallback from the actual copied conftest.
+            import conftest
+            function_path = Path(local_store._sqlite_path()).resolve()
+            session_path = Path(conftest._session_store_dir, "local-store.sqlite3").resolve()
+            assert function_path != session_path
+            release.clear()
+            entered.clear()
+            errors.clear()
+            connections.clear()
+            monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(
+                Config=lambda *args, **kwargs: None, Server=FakeServer,
+            ))
+            import api_server
+            monkeypatch.setattr(api_server, "app", object(), raising=False)
+            supervisor = BackendSupervisor()
+            probes = iter([False, True])
+            monkeypatch.setattr(supervisor, "probe", lambda **kwargs: next(probes))
+            monkeypatch.setattr(supervisor, "_silence_console_logging", lambda: None)
+            supervisors.append(supervisor)
+            assert supervisor.ensure_ready() is True
+            assert entered.wait(timeout=5)
+            assert supervisor.thread.is_alive()
+            assert not connections
+
+        def finish_after_teardown():
+            if not supervisors:
+                return
+            supervisor = supervisors.pop()
+            try:
+                # At this point monkeypatch and _isolate_local_store are gone.
+                assert Path(os.environ["QLH_SQLITE_PATH"]).resolve() == session_path
+                assert Path(local_store._sqlite_path()).resolve() == session_path
+            finally:
+                release.set()
+                supervisor.thread.join(timeout=5)
+                supervisor.stop()
+            assert not supervisor.thread.is_alive(), "backend leaked past teardown audit"
+            assert not errors, errors
+            assert connections and set(connections) == {session_path}
+            assert local_store.get_local_master_identity()["mac_addresses"] == ["001122334455"]
+            assert not function_path.exists(), "late write landed in the finished test's store"
+    """)
+    conftest_file = pytester.path / "conftest.py"
+    conftest_file.write_text(
+        conftest_file.read_text(encoding="utf-8") + """
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    yield
+    from late_backend import finish_after_teardown
+    finish_after_teardown()
+""",
+        encoding="utf-8",
+    )
+    for index in range(4):
+        pytester.makepyfile(**{f"test_late_backend_{index}": """
+            import pytest
+            from late_backend import start
+
+            @pytest.mark.parametrize("iteration", range(2))
+            def test_delayed_backend_identity_write(monkeypatch, iteration):
+                start(monkeypatch)
+        """})
+    result = pytester.runpytest_subprocess(
+        "-n", str(workers), "--dist=loadfile", timeout=60,
+    )
+    result.assert_outcomes(passed=8)
+    for store, original_bytes in before.items():
+        assert store.read_bytes() == original_bytes
+        with sqlite3.connect(store) as connection:
+            value = connection.execute(
+                "SELECT value FROM cluster_settings WHERE key = 'master_identity_v1'",
+            ).fetchone()[0]
+        assert json.loads(value) == identity
+
+
+
+def _node_isolated_suite(pytester):
+    """Real bootstrap/credentials/journal, with lightweight runtime consumers."""
+    _isolated_suite(pytester, audit_teardown=False)
+    for name in ("node_config", "node_runtime", "local_secret_store", "network_address",
+                 "release_contract", "task_journal"):
+        pytester.makepyfile(**{name: (_REPO / "src" / f"{name}.py").read_text(encoding="utf-8")})
+    pytester.makefile(".json", **{
+        "release-contract": (_REPO / "release-contract.json").read_text(encoding="utf-8"),
+    })
+    config_file = pytester.path / "config.py"
+    config_file.write_text(config_file.read_text(encoding="utf-8") + """
+import os
+NODE_ID = "baseline-node"
+NODE_ROLE = "master"
+CLUSTER_SECRET = ""
+CLUSTER_SECRET_EPOCH = 1
+CLIENT_MASTER_HOST = ""
+CLIENT_MASTER_PORT = 8888
+SERVER_PORT = 8888
+HEARTBEAT_INTERVAL = 10
+_NODE_CONFIG = {"node": {"role": "master"}, "cluster": {"epochs": [1]}}
+STATE_DIR = os.environ["QLH_STATE_DIR"]
+TASK_GRAPH_JOURNAL_PATH = os.path.join(STATE_DIR, "task-graph.sqlite3")
+JOURNAL_REPLICATION_REPLICA_PATH = os.environ["QLH_JOURNAL_REPLICATION_REPLICA_PATH"]
+KV_COLD_CACHE_ROOT = os.environ["QLH_KV_COLD_CACHE_ROOT"]
+""", encoding="utf-8")
+    pytester.makepyfile(
+        scheduler="from config import NODE_ID, NODE_ROLE, SERVER_PORT",
+        tcp_comm="from config import SERVER_PORT, HEARTBEAT_INTERVAL",
+        runtime_probe="""
+            import os
+            from copy import deepcopy
+            import api_server
+            import config
+            import node_config
+            import node_runtime
+            import scheduler
+            import tcp_comm
+
+            runtime = node_runtime.node_runtime
+            cache = config._NODE_CONFIG
+            cache_before = deepcopy(cache)
+            aliases = [(module, name, getattr(module, name)) for module, names in (
+                (scheduler, ("NODE_ID", "NODE_ROLE", "SERVER_PORT")),
+                (api_server, ("NODE_ID", "NODE_ROLE", "SERVER_PORT")),
+                (tcp_comm, ("SERVER_PORT", "HEARTBEAT_INTERVAL")),
+            ) for name in names]
+            environment = {k: v for k, v in os.environ.items() if k.startswith("QLH_")}
+
+            def assert_runtime_clean():
+                assert config.NODE_ROLE == "master"
+                assert config.CLUSTER_SECRET == ""
+                assert config.CLUSTER_SECRET_EPOCH == 1
+                assert config._NODE_CONFIG is cache
+                assert cache == cache_before
+                assert node_runtime.node_runtime is runtime
+                assert runtime.get_node_id() == "baseline-node"
+                assert runtime.get_node_role() == "master"
+                for module, name, value in aliases:
+                    assert getattr(module, name) == value, (module.__name__, name)
+                assert "isolation-probe" not in node_config._ROLE_ALIASES
+
+            def assert_environment_clean():
+                assert {k: v for k, v in os.environ.items() if k.startswith("QLH_")} == environment
+        """,
+    )
+    api_file = pytester.path / "api_server.py"
+    api_file.write_text(api_file.read_text(encoding="utf-8") + """
+from config import NODE_ID, NODE_ROLE, SERVER_PORT, TASK_GRAPH_JOURNAL_PATH
+""", encoding="utf-8")
+    return pytester.path / "conftest.py"
+
+
+@pytest.mark.parametrize("workers", [0, 4])
+def test_bootstrap_restores_runtime_aliases_environment_and_config_cache(pytester, workers):
+    conftest_file = _node_isolated_suite(pytester)
+    conftest_file.write_text(conftest_file.read_text(encoding="utf-8") + """
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    yield
+    from runtime_probe import assert_runtime_clean, assert_environment_clean
+    assert_runtime_clean()
+    assert_environment_clean()
+""", encoding="utf-8")
+    sequence = """
+        import os
+        import pytest
+        import api_server
+        import config
+        import node_config
+        import node_runtime
+        import scheduler
+        import tcp_comm
+        from runtime_probe import assert_runtime_clean
+
+        @pytest.fixture
+        def teardown_bootstrap():
+            yield
+            # A function fixture finalizer can perform a final bootstrap sync.
+            node_config.apply_runtime_config({"node": {"node_id": "late-client", "role": "client"}})
+
+        def test_01_bootstrap_without_monkeypatch(teardown_bootstrap):
+            assert_runtime_clean()
+            node_config.apply_runtime_config({
+                "node": {"node_id": "joined-client", "role": "client"},
+                "cluster": {"cluster_secret": "probe-secret", "cluster_secret_epoch": 3},
+            })
+            # Real runtime sync deliberately leaves the static role unchanged.
+            assert config.NODE_ROLE == "master"
+            assert scheduler.NODE_ROLE == "client"
+            assert node_runtime.node_runtime.get_node_role() == "client"
+            api_server.NODE_ROLE = "client"
+            api_server.NODE_ID = "polluted-api"
+            scheduler.SERVER_PORT = 1234
+            tcp_comm.SERVER_PORT = 1234
+            config._NODE_CONFIG["cluster"]["epochs"].append(99)
+            node_config._ROLE_ALIASES["isolation-probe"] = "client"
+            os.environ["QLH_ISOLATION_TEMP_PROJECTION"] = "leaked"
+            os.environ.pop("QLH_MASTER_API_PORT", None)
+
+        def test_02_observer_and_replaced_cache():
+            assert_runtime_clean()
+            config._NODE_CONFIG = {"replacement": True}
+            from node_runtime import NodeRuntime
+            node_runtime.node_runtime = NodeRuntime()
+            node_runtime.node_runtime.set_node_id("replacement")
+
+        def test_03_observe_restored_cache():
+            assert_runtime_clean()
+    """
+    for index in range(4):
+        pytester.makepyfile(**{f"test_runtime_{index}": sequence})
+    result = pytester.runpytest_subprocess("-n", str(workers), "--dist=loadfile", timeout=90)
+    result.assert_outcomes(passed=12)
+
+
+@pytest.mark.parametrize("workers", [0, 4])
+def test_node_config_credentials_and_journal_exclude_shared_runner_state(
+    pytester, monkeypatch, workers,
+):
+    _node_isolated_suite(pytester)
+    shared = pytester.path / "inherited-runner-state"
+    shared.mkdir()
+    files = {name: shared / name for name in (
+        "node_config.json", "node_secrets.json", "node_secrets.json.key",
+        "task-graph.sqlite3", "journal-replica.sqlite3",
+    )}
+    for name, path in files.items():
+        path.write_bytes(("user-owned-" + name).encode())
+    before = {path: path.read_bytes() for path in files.values()}
+    monkeypatch.setenv("QLH_STATE_DIR", str(shared))
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(files["node_config.json"]))
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(files["node_secrets.json"]))
+    monkeypatch.setenv("QLH_JOURNAL_REPLICATION_REPLICA_PATH", str(files["journal-replica.sqlite3"]))
+    pytester.makepyfile(test_persistence=f"""
+        import os
+        from pathlib import Path
+        import pytest
+        import api_server
+        import config
+        import node_config
+        from task_journal import SQLiteTaskJournal
+
+        @pytest.mark.parametrize("iteration", range(12))
+        def test_bootstrap_and_journal_are_per_test(iteration, tmp_path):
+            assert node_config.load_node_config() == {{}}
+            assert not node_config.get_node_secret_store_path().exists()
+            assert Path(config.STATE_DIR) == tmp_path / "state"
+            assert api_server.TASK_GRAPH_JOURNAL_PATH == config.TASK_GRAPH_JOURNAL_PATH
+            assert not Path(config.TASK_GRAPH_JOURNAL_PATH).exists()
+            response = {{
+                "node": {{"node_id": "node-" + str(iteration), "role": "client"}},
+                "cluster": {{"cluster_secret": "secret-" + str(iteration)}},
+            }}
+            path = node_config.persist_bootstrap_response(response)
+            assert path == tmp_path / "node_config.json"
+            assert node_config.get_local_cluster_secret() == "secret-" + str(iteration)
+            assert node_config.load_node_config()["node"]["node_id"] == "node-" + str(iteration)
+            assert node_config.get_node_secret_store_path().with_suffix(".json.key").is_file()
+            for path in (config.TASK_GRAPH_JOURNAL_PATH, config.JOURNAL_REPLICATION_REPLICA_PATH):
+                assert not Path(path).is_relative_to(Path({str(shared)!r}))
+                journal = SQLiteTaskJournal(path)
+                journal.close()
+
+        def test_platform_fallback_and_legacy_root_are_safe(monkeypatch, tmp_path):
+            # Deleting overrides must still use a private home/LocalAppData.
+            monkeypatch.delenv("QLH_NODE_CONFIG_PATH")
+            monkeypatch.delenv("QLH_NODE_SECRET_STORE_PATH")
+            assert node_config.get_node_config_path().is_relative_to(tmp_path)
+            assert node_config.get_node_secret_store_path().is_relative_to(tmp_path)
+            assert node_config.load_node_config() == {{}}
+    """)
+    result = pytester.runpytest_subprocess("-n", str(workers), timeout=90)
+    result.assert_outcomes(passed=13)
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("workers", [0, 4])
+def test_late_bootstrap_and_journal_thread_uses_session_fallback(pytester, workers):
+    conftest_file = _node_isolated_suite(pytester)
+    pytester.makepyfile(late_persistence="""
+        import os
+        import threading
+        from pathlib import Path
+        import api_server
+        import config
+        import node_config
+        from task_journal import SQLiteTaskJournal
+
+        pending = []
+
+        def start(tmp_path):
+            release = threading.Event()
+            errors = []
+            function_root = tmp_path.resolve()
+
+            def write():
+                try:
+                    assert release.wait(10)
+                    import conftest
+                    session = Path(conftest._session_store_dir).resolve()
+                    for path in (node_config.get_node_config_path(),
+                                 node_config.get_node_secret_store_path(),
+                                 Path(config.STATE_DIR), Path(config.TASK_GRAPH_JOURNAL_PATH),
+                                 Path(api_server.TASK_GRAPH_JOURNAL_PATH)):
+                        assert path.resolve().is_relative_to(session), str(path)
+                        assert not path.resolve().is_relative_to(function_root)
+                    node_config.persist_bootstrap_response({
+                        "node": {"node_id": "late-session-client", "role": "client"},
+                        "cluster": {"cluster_secret": "late-session-secret"},
+                    })
+                    journal = SQLiteTaskJournal(api_server.TASK_GRAPH_JOURNAL_PATH)
+                    journal.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=write, daemon=True)
+            thread.start()
+            pending.append((thread, release, errors))
+
+        def finish():
+            if not pending:
+                return
+            thread, release, errors = pending.pop()
+            environment = {k: v for k, v in os.environ.items() if k.startswith("QLH_")}
+            release.set()
+            thread.join(10)
+            try:
+                assert not thread.is_alive()
+                assert not errors, errors
+                assert node_config.get_local_cluster_secret() == "late-session-secret"
+            finally:
+                # This probe deliberately writes after the fixture boundary.
+                # Retire its session data and direct env projection ourselves.
+                for path in (node_config.get_node_config_path(), node_config.get_node_secret_store_path(),
+                             node_config.get_node_secret_store_path().with_suffix(".json.key")):
+                    path.unlink(missing_ok=True)
+                for name in list(os.environ):
+                    if name.startswith("QLH_") and name not in environment:
+                        del os.environ[name]
+                os.environ.update(environment)
+    """)
+    conftest_file.write_text(conftest_file.read_text(encoding="utf-8") + """
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    yield
+    from late_persistence import finish
+    finish()
+""", encoding="utf-8")
+    for index in range(4):
+        pytester.makepyfile(**{f"test_late_persistence_{index}": """
+            import pytest
+            from late_persistence import start
+
+            @pytest.mark.parametrize("iteration", range(2))
+            def test_late_thread(tmp_path, iteration):
+                start(tmp_path)
+        """})
+    result = pytester.runpytest_subprocess("-n", str(workers), "--dist=loadfile", timeout=90)
+    result.assert_outcomes(passed=8)
+
+
+def test_scheduler_runtime_role_keeps_client_management_denied(monkeypatch):
+    """Exercise the production guard even if static Config still says master."""
+    import config
+    import scheduler
+
+    monkeypatch.setattr(config, "NODE_ROLE", "master")
+    monkeypatch.setattr(scheduler, "NODE_ROLE", "client")
+    instance = scheduler.Scheduler()
+    assert instance._effective_role() == "client"
+    assert instance.manual_register_node("test-only-edge")["status"] == "denied"
+    assert instance.delete_node("test-only-edge")["status"] == "denied"
+
+
+_seen_default_journals = []
+
+
+@pytest.mark.parametrize("iteration", range(2))
+def test_default_task_graph_journal_has_a_test_lifetime(monkeypatch, tmp_path, iteration):
+    import api_server
+    import config
+
+    for previous in _seen_default_journals:
+        assert previous._closed is True
+    coordinator = api_server.task_graph_coordinator
+    assert type(coordinator) is api_server._LazyTaskGraphCoordinator
+    assert coordinator._is_materialized() is False
+    monkeypatch.setattr(api_server, "TASK_GRAPH_ENABLED", True)
+    status = coordinator.journal_status()
+    assert status["available"] is True
+    assert status["backend"] == "sqlite"
+    assert Path(status["path"]) == Path(config.TASK_GRAPH_JOURNAL_PATH)
+    assert Path(status["path"]).is_relative_to(tmp_path)
+    _seen_default_journals.append(vars(coordinator)["_coordinator"]._journal)
+
+
+
+def test_runtime_alias_isolation_preserves_module_fixture_baselines(pytester):
+    _node_isolated_suite(pytester)
+    pytester.makepyfile(test_scoped_runtime="""
+        import pytest
+        import config
+        import node_runtime
+        import scheduler
+        import api_server
+        import tcp_comm
+
+        @pytest.fixture(scope="module", autouse=True)
+        def scoped_runtime():
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(scheduler, "NODE_ROLE", "client")
+                patch.setattr(api_server, "NODE_ROLE", "auto")
+                patch.setattr(tcp_comm, "SERVER_PORT", 9999)
+                patch.setattr(config, "_NODE_CONFIG", {"scoped": [1]})
+                patch.setattr(node_runtime.node_runtime, "_node_id", "scoped-node")
+                patch.setattr(node_runtime.node_runtime, "_node_role", "client")
+                yield
+                assert_scoped()
+
+        def assert_scoped():
+            assert config.NODE_ROLE == "master"
+            assert scheduler.NODE_ROLE == "client"
+            assert api_server.NODE_ROLE == "auto"
+            assert tcp_comm.SERVER_PORT == 9999
+            assert config._NODE_CONFIG == {"scoped": [1]}
+            assert node_runtime.node_runtime.get_node_id() == "scoped-node"
+            assert node_runtime.node_runtime.get_node_role() == "client"
+
+        def test_01_scoped_mutation():
+            assert_scoped()
+            scheduler.NODE_ROLE = "master"
+            api_server.NODE_ROLE = "client"
+            tcp_comm.SERVER_PORT = 1234
+            config._NODE_CONFIG["scoped"].append(2)
+            node_runtime.node_runtime.set_node_id("function-node")
+            node_runtime.node_runtime.set_node_role("master")
+
+        def test_02_scoped_observer():
+            assert_scoped()
+    """)
+    result = pytester.runpytest_subprocess("-n", "0", timeout=60)
+    result.assert_outcomes(passed=2)
+
+
+def test_bootstrap_runtime_isolation_restores_after_failure(pytester):
+    _node_isolated_suite(pytester)
+    pytester.makepyfile(test_failed_bootstrap="""
+        import node_config
+        import config
+        from runtime_probe import assert_runtime_clean
+
+        def test_01_bootstrap_then_failure():
+            node_config.apply_runtime_config({"node": {"node_id": "failed-join", "role": "client"}})
+            config._NODE_CONFIG["cluster"]["epochs"].append(99)
+            raise RuntimeError("intentional bootstrap isolation failure")
+
+        def test_02_after_failure():
+            assert_runtime_clean()
+    """)
+    result = pytester.runpytest_subprocess("-n", "0", timeout=60)
+    result.assert_outcomes(failed=1, passed=1)

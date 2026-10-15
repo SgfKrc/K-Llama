@@ -2784,11 +2784,12 @@ def test_peer_client_no_heavy_imports():
 # 17.5 scheduler-svc HTTP 壳（§4.2 透传路径契约，阶段 2 起点实现）
 # ----------------------------------------------------------------------
 @pytest.fixture()
-def sched_http_client():
+def sched_http_client(monkeypatch):
     """真实 Scheduler 实例 + HTTP 壳应用（不启动 TCP，TestClient 直连）。"""
     import scheduler as sched_mod
     import scheduler_svc_http as http_mod
 
+    monkeypatch.setattr(sched_mod, "NODE_ROLE", "master")
     sched = sched_mod.Scheduler()
     app = http_mod.build_scheduler_app(sched)
     yield TestClient(app), sched

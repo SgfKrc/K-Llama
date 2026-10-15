@@ -238,95 +238,150 @@ def test_retry_delays_is_bounded_exponential_backoff():
         smoke.retry_delays(-1)
 
 
-def test_connect_with_retry_recovers_against_real_socket_and_processes():
-    """★ 用**真 socket + 真子进程**验证重试：前两个 worker 故意不回连，第三个才连上。
+@pytest.fixture
+def controlled_retry_workers():
+    """Keep real subprocess/socket coverage independent of startup latency."""
+    import queue
+    import subprocess
+    import sys
+    import threading
 
-    直接针对 §26 的失败点 —— `accept()` 干等超时：**短超时 + 重试**必须能恢复，
-    且失败那两次起的进程要被回收（真进程，不是 mock）。
-    """
-    import socket as _socket
-    import subprocess as _subprocess
-    import sys as _sys
+    processes = []
+    readers = []
+    worker_code = r"""
+import socket
+import sys
+print("ready", flush=True)
+if sys.stdin.readline().strip() == "connect":
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as conn:
+        conn.sendall(b"ready\n")
+        print("connected", flush=True)
+        sys.stdin.readline()
+"""
 
-    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    port = int(listener.getsockname()[1])
-    spawned: list = []
-
-    def start_worker():
-        if len(spawned) < 2:
-            # 模拟"SSH 建连失败"：进程起了但从不回连（丢包链路上的常见结局）
-            code = "import time; time.sleep(30)"
-        else:
-            code = (
-                "import socket, time\n"
-                "time.sleep(0.05)\n"
-                f"conn = socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
-                "conn.sendall(b'ready\\n')\n"
-                "time.sleep(0.5)\n"
-            )
-        process = _subprocess.Popen([_sys.executable, "-c", code])
-        spawned.append(process)
-        return process
-
-    try:
-        process, connection = smoke._connect_with_retry(
-            listener, start_worker, attempts=3, first_frame_timeout_s=0.6)
-        with connection:
-            assert connection.recv(16) == b"ready\n"
-        assert len(spawned) == 3
-        assert spawned[0].poll() is not None and spawned[1].poll() is not None   # 失败者已回收
-        assert process is spawned[2] and process.poll() is None                  # 成功者仍在
-    finally:
-        for process in spawned:
-            try:
-                process.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        listener.close()
-
-
-def test_connect_with_retry_recovers_after_slow_client():
-    """反向情形：首个 worker 回连慢于首超时、第二个才连上 ⇒ 仍成功（重试窗口真的起作用）。"""
-    import socket as _socket
-    import subprocess as _subprocess
-    import sys as _sys
-
-    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(4)
-    port = int(listener.getsockname()[1])
-    spawned: list = []
-
-    def start_worker():
-        delay = 0.45 if not spawned else 0.05      # 第一次刻意慢于 0.3 s 的首超时
-        code = (
-            "import socket, time\n"
-            f"time.sleep({delay})\n"
-            f"conn = socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
-            "conn.sendall(b'late\\n')\n"
-            "time.sleep(0.5)\n"
+    def start(port, *, connect):
+        # The retry helper must kill the failed worker before spawning another.
+        if processes:
+            assert processes[-1].wait(timeout=5) is not None
+        process = subprocess.Popen(
+            [sys.executable, "-B", "-u", "-c", worker_code, str(port)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
         )
-        process = _subprocess.Popen([_sys.executable, "-c", code])
-        spawned.append(process)
+        processes.append(process)
+        lines = queue.Queue()
+
+        def read_lines():
+            for line in process.stdout:
+                lines.put(line.strip())
+
+        reader = threading.Thread(target=read_lines, daemon=True)
+        readers.append(reader)
+        reader.start()
+        assert lines.get(timeout=15) == "ready", "retry worker did not become ready"
+        if connect:
+            process.stdin.write("connect\n")
+            process.stdin.flush()
+            # TCP is queued before the helper starts its accept timeout. A
+            # failed attempt stays gated, regardless of process/CPU speed.
+            assert lines.get(timeout=15) == "connected"
         return process
 
     try:
-        _process, connection = smoke._connect_with_retry(
-            listener, start_worker, attempts=3, first_frame_timeout_s=0.3)
-        with connection:
-            assert connection.recv(16) == b"late\n"
-        assert len(spawned) == 2                   # 第一个超时被放弃，第二个成功
+        yield SimpleNamespace(start=start, processes=processes)
     finally:
-        for process in spawned:
-            try:
+        for process in processes:
+            if process.poll() is None:
                 process.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        listener.close()
+            process.wait(timeout=5)
+        for reader in readers:
+            reader.join(timeout=5)
+            assert not reader.is_alive(), "retry worker reader leaked"
+        for process in processes:
+            process.stdin.close()
+            process.stdout.close()
+
+
+def test_connect_with_retry_recovers_against_real_socket_and_processes(controlled_retry_workers):
+    """Two gated workers time out; the third really connects and stays alive."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        slept = []
+
+        def start_worker():
+            return controlled_retry_workers.start(
+                port, connect=len(controlled_retry_workers.processes) == 2,
+            )
+
+        process, connection = smoke._connect_with_retry(
+            listener, start_worker, attempts=3, first_frame_timeout_s=0.1,
+            sleeper=slept.append,
+        )
+        with connection:
+            connection.settimeout(5)
+            assert connection.recv(16) == b"ready\n"
+        spawned = controlled_retry_workers.processes
+        assert len(spawned) == 3
+        assert all(worker.poll() is not None for worker in spawned[:-1])
+        assert process is spawned[-1] and process.poll() is None
+        assert slept == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("failed_attempts", [1, 2])
+def test_connect_with_retry_recovers_after_slow_client(controlled_retry_workers, failed_attempts):
+    """A client held past accept timeout is reaped; the next client succeeds."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        slept = []
+
+        def start_worker():
+            return controlled_retry_workers.start(
+                port, connect=len(controlled_retry_workers.processes) == failed_attempts,
+            )
+
+        process, connection = smoke._connect_with_retry(
+            listener, start_worker, attempts=3, first_frame_timeout_s=0.1,
+            sleeper=slept.append,
+        )
+        with connection:
+            connection.settimeout(5)
+            assert connection.recv(16) == b"ready\n"
+        spawned = controlled_retry_workers.processes
+        assert len(spawned) == failed_attempts + 1
+        assert all(worker.poll() is not None for worker in spawned[:-1])
+        assert process is spawned[-1] and process.poll() is None
+        assert slept == [0.5, 1.0][:failed_attempts]
+
+
+@pytest.mark.parametrize("attempts", [1, 3])
+def test_connect_with_retry_real_workers_exhausted(controlled_retry_workers, attempts):
+    """Exhaustion keeps only the last worker for caller diagnostics/cleanup."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        slept = []
+        with pytest.raises(smoke.PhysicalSmokeError, match="worker_connect_retry_exhausted") as failure:
+            smoke._connect_with_retry(
+                listener,
+                lambda: controlled_retry_workers.start(listener.getsockname()[1], connect=False),
+                attempts=attempts, first_frame_timeout_s=0.1, sleeper=slept.append,
+            )
+        spawned = controlled_retry_workers.processes
+        assert len(spawned) == attempts
+        assert all(worker.poll() is not None for worker in spawned[:-1])
+        assert failure.value.process is spawned[-1]
+        assert spawned[-1].poll() is None
+        assert slept == [0.5, 1.0][:attempts - 1]
 
 
 def test_ssh_works_retries_with_backoff_until_success():

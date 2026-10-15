@@ -307,6 +307,13 @@ class TestMasterNodeManagement:
 
     _registered_ids: set = set()
 
+    @pytest.fixture
+    def scheduler(self, monkeypatch):
+        import scheduler as scheduler_module
+
+        monkeypatch.setattr(scheduler_module, "NODE_ROLE", "master")
+        return Scheduler()
+
     @pytest.fixture(autouse=True)
     def _node_cleanup(self, scheduler):
         """测试后清理本测试类注册的节点（内存 + 数据库）。"""

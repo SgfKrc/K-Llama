@@ -9,6 +9,11 @@ from model_supply import ModelSupplyError
 from model_intent import ModelIntentCoordinator
 from model_intent_gateway import get_binding, forward_intent
 from model_intent_access import require_model_intent_source
+import model_config as mc
+from model_pipeline_availability import (
+    ModelPipelineAvailabilityError, model_pipeline_catalog_payload,
+    require_model_pipeline_available,
+)
 
 router = APIRouter()
 _api_module = None
@@ -29,14 +34,19 @@ def _retirement_identity(scheduler):
         return tuple(None if not state else (
             state.get("config_id"), state.get("generation"), state.get("candidate_id"),
             state.get("phase", state.get("transaction_phase")),
-        ) for state in (scheduler._pipeline_load_transaction, scheduler._active_pipeline_capacity_plan))
+        ) for state in (
+            scheduler._pipeline_load_transaction,
+            scheduler._active_pipeline_capacity_plan,
+            (getattr(scheduler, "_pipeline_recovery_state", None)
+             if getattr(scheduler, "_pipeline_recovery_pending", False) else None),
+        ))
 
 
 async def _retire_native_plan():
     api = _api_module
     scheduler = api.scheduler
     expected = _retirement_identity(scheduler)
-    if expected == (None, None):
+    if not any(expected):
         # Only cleanup debt remains. Never issue another unload after retirement.
         return
 
@@ -85,9 +95,12 @@ async def catalog(request: Request):
     allowed = {"model_id", "name", "description", "model_type", "is_builtin", "is_experimental",
                "is_available", "unavailable_reason", "available_formats", "has_safetensors", "has_gguf",
                "preferred_engine", "supported_engines", "quant_types", "default_quant_type", "max_context",
-               "recommended_vram_gb"}
+               "recommended_vram_gb", "pipeline_engine_availability",
+               "pipeline_auto_engine", "pipeline_auto_unavailable_reason"}
     models = await run_in_threadpool(lambda: [
-        {key: value for key, value in _api_module._model_api_payload(entry).items() if key in allowed}
+        {key: value for key, value in model_pipeline_catalog_payload(
+            entry, _api_module._model_api_payload(entry),
+        ).items() if key in allowed}
         for entry in _api_module._get_all_model_configs()
     ])
     current = coordinator().current()
@@ -112,13 +125,21 @@ async def connect(request: Request):
     return get_binding(scheduler, _api_module.API_PORT)
 
 
+def _preflight_selection(intent):
+    model = mc.get_model_config(intent.model_id, _api_module._get_registered_experimental_models())
+    require_model_pipeline_available(model, intent.engine)
+
+
 async def create(intent: ModelSupplyIntent, request: Request):
     require_model_intent_source(request, _api_module.scheduler)
     if not _master():
         return await forward_intent(_api_module.scheduler, request, "", intent.model_dump())
     try:
+        # Reject only definite local incompatibility, before create can retire
+        # the active native plan. Acquisition and content proof stay with supply.
+        await run_in_threadpool(_preflight_selection, intent)
         return await coordinator().create(intent.model_dump())
-    except ModelSupplyError as exc:
+    except (ModelSupplyError, ModelPipelineAvailabilityError) as exc:
         raise _error(exc) from exc
 
 

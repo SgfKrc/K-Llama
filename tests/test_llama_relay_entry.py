@@ -5,8 +5,8 @@
 2026-09-19 在 `src/llama_engine.py` 新增 `forward_layers_from_hidden()`：把上游 hidden 注入
 `llama_batch.embd`，只跑本模型（裁层 GGUF）的层、返回末位 logits —— 使「上下游都走主仓引擎」成立。
 
-⚠️ 真模型用例依赖**裁层 GGUF 工件**（在 gitignored 的 `build/` 下）⇒ **缺工件时条件跳过**
-（与本仓既有做法一致），但**形状/错误路径**的用例用**离线构造**保证总是能跑。
+Real-model cases use the explicit real_model channel and skip missing cut GGUF artifacts.
+Offline error paths and constructor restoration assertions run without native DLLs or weights.
 """
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ import hashlib
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -24,17 +26,72 @@ sys.path.insert(0, str(ROOT / "src"))
 CUT_GGUF = ROOT / "build" / "cross-framework-layer-poc" / "out" / "qwen25-05b-f16-cut-k12.gguf"
 
 
-def _engine_or_skip():
+def _require_real_model_opt_in():
+    if os.environ.get("QLH_RUN_PHYSICAL_TESTS") != "1" and os.environ.get("QLH_RUN_REAL_MODEL_SMOKE") != "1":
+        pytest.skip("real_model requires QLH_RUN_PHYSICAL_TESTS=1 or QLH_RUN_REAL_MODEL_SMOKE=1")
+
+
+def _engine_or_skip(**load_kwargs):
+    _require_real_model_opt_in()
+    if not CUT_GGUF.is_file():
+        pytest.skip(f"missing cut GGUF artifact: {CUT_GGUF.relative_to(ROOT)}")
     from llama_engine import LlamaCppEngine
 
-    if not CUT_GGUF.is_file():
-        pytest.skip(f"需要裁层 GGUF 工件（{CUT_GGUF.relative_to(ROOT)}），本机缺失")
+    eng = LlamaCppEngine()
     try:
-        eng = LlamaCppEngine()
-        eng.load_model(model_path=str(CUT_GGUF), n_ctx=512, n_threads=4)
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"llama.cpp 不可用或加载失败: {type(exc).__name__}")
+        eng.load_model(
+            model_path=str(CUT_GGUF),
+            **{"n_ctx": 512, "n_threads": 4, **load_kwargs},
+        )
+    except Exception:
+        eng.unload()
+        raise  # Explicit native smoke must expose binding/load failures.
     return eng
+
+
+@contextmanager
+def _isolated_llama_binding():
+    """Install a coherent stub package and restore the entire prior family."""
+    names = [name for name in sys.modules if name == "llama_cpp" or name.startswith("llama_cpp.")]
+    originals = {name: sys.modules[name] for name in names}
+    package = ModuleType("llama_cpp")
+    package.__path__ = []
+    low_level = ModuleType("llama_cpp.llama_cpp")
+    low_level.llama_context_default_params = lambda: SimpleNamespace(n_seq_max=1)
+    package.llama_cpp = low_level
+    seen = []
+    binding = SimpleNamespace(package=package, low_level=low_level, seen=seen, fail=False)
+
+    class ConstructorFailure(RuntimeError):
+        pass
+
+    binding.ConstructorFailure = ConstructorFailure
+
+    def construct(**kwargs):
+        params = low_level.llama_context_default_params()
+        seen.append((dict(kwargs), params.n_seq_max))
+        if binding.fail:
+            raise ConstructorFailure("controlled constructor failure")
+        return SimpleNamespace(kwargs=kwargs, n_seq_max=params.n_seq_max)
+
+    package.Llama = construct
+    try:
+        for name in names:
+            del sys.modules[name]
+        sys.modules["llama_cpp"] = package
+        sys.modules["llama_cpp.llama_cpp"] = low_level
+        yield binding
+    finally:
+        for name in list(sys.modules):
+            if name == "llama_cpp" or name.startswith("llama_cpp."):
+                del sys.modules[name]
+        sys.modules.update(originals)
+
+
+@pytest.fixture
+def fake_llama_binding():
+    with _isolated_llama_binding() as binding:
+        yield binding
 
 
 class TestNotLoaded:
@@ -245,8 +302,26 @@ class TestNotLoaded:
             eng._find_layer_artifact(0, 8)
 
 
+@pytest.mark.real_model
 class TestWithRealModel:
     """需要裁层 GGUF 的用例（缺工件则整类跳过）。"""
+
+    @pytest.fixture(autouse=True)
+    def _release_engines(self, monkeypatch):
+        engines = []
+        original = _engine_or_skip
+
+        def tracked_engine(**kwargs):
+            engine = original(**kwargs)
+            engines.append(engine)
+            return engine
+
+        monkeypatch.setattr(sys.modules[__name__], "_engine_or_skip", tracked_engine)
+        try:
+            yield
+        finally:
+            for engine in engines:
+                engine.unload()
 
     @pytest.fixture(autouse=True)
     def _allow_normed_upstream(self, monkeypatch):
@@ -346,45 +421,75 @@ class TestMultiSequence:
     """
 
     @pytest.fixture(autouse=True)
+    def _release_engines(self, monkeypatch):
+        engines = []
+        original = _engine_or_skip
+
+        def tracked_engine(**kwargs):
+            engine = original(**kwargs)
+            engines.append(engine)
+            return engine
+
+        monkeypatch.setattr(sys.modules[__name__], "_engine_or_skip", tracked_engine)
+        try:
+            yield
+        finally:
+            for engine in engines:
+                engine.unload()
+
+    @pytest.fixture(autouse=True)
     def _allow_normed_upstream(self, monkeypatch):
         """同 `TestWithRealModel`：本类直接覆盖 `forward_layers_to_hidden`，需显式放行
         （该函数的 embeddings 通道自 #35 加固起默认 fail-closed）。"""
         monkeypatch.setenv("QLH_ALLOW_NORMED_UPSTREAM", "1")
 
-    def test_default_path_unchanged(self, monkeypatch):
-        """`n_seq_max=None`（默认）时不得改动 llama.cpp 的全局默认 params 函数。"""
-        import llama_cpp.llama_cpp as M
-
-        before = M.llama_context_default_params
+    @pytest.mark.parametrize("constructor_fails", [False, True])
+    def test_default_path_unchanged(self, fake_llama_binding, constructor_fails):
+        """Default construction preserves kwargs and the original params API."""
         from llama_engine import _new_llama_with_seq_max
 
-        # None ⇒ 直接构造路径；用不存在的 model_path 触发异常即可，重点是不留副作用
-        with pytest.raises(Exception):
-            _new_llama_with_seq_max({"model_path": "___no_such_model___.gguf"}, None)
-        assert M.llama_context_default_params is before, "默认路径不应改动全局函数"
+        binding = fake_llama_binding
+        before = binding.low_level.llama_context_default_params
+        binding.fail = constructor_fails
+        kwargs = {"model_path": "offline-stub.gguf", "n_ctx": 512, "verbose": False}
+        if constructor_fails:
+            with pytest.raises(binding.ConstructorFailure, match="controlled"):
+                _new_llama_with_seq_max(kwargs, None)
+        else:
+            model = _new_llama_with_seq_max(kwargs, None)
+            assert model.n_seq_max == 1
+            assert model.kwargs == kwargs
+        assert binding.seen == [(kwargs, 1)]
+        assert binding.low_level.llama_context_default_params is before
+        assert kwargs == {"model_path": "offline-stub.gguf", "n_ctx": 512, "verbose": False}
 
-    def test_seq_max_is_restored_after_load(self):
-        """构造后必须恢复全局 `llama_context_default_params`（`finally` 保证）。"""
-        import llama_cpp.llama_cpp as M
-
-        before = M.llama_context_default_params
+    @pytest.mark.parametrize("constructor_fails", [False, True])
+    @pytest.mark.parametrize("requested, expected", [(4, 4), (0, 1)])
+    def test_seq_max_is_restored_after_load(self, fake_llama_binding, constructor_fails, requested, expected):
+        """The constructor sees the raised limit; success/error both restore it."""
         from llama_engine import _new_llama_with_seq_max
 
-        with pytest.raises(Exception):
-            _new_llama_with_seq_max({"model_path": "___no_such_model___.gguf"}, 4)
-        assert M.llama_context_default_params is before, "必须恢复全局函数，不能泄漏 patch"
+        binding = fake_llama_binding
+        before = binding.low_level.llama_context_default_params
+        binding.fail = constructor_fails
+        kwargs = {"model_path": "offline-stub.gguf", "n_ctx": 512}
+        if constructor_fails:
+            with pytest.raises(binding.ConstructorFailure, match="controlled"):
+                _new_llama_with_seq_max(kwargs, requested)
+        else:
+            model = _new_llama_with_seq_max(kwargs, requested)
+            assert model.n_seq_max == expected
+            assert model.kwargs == kwargs
+        assert binding.seen == [(kwargs, expected)]
+        assert binding.low_level.llama_context_default_params is before
+        assert before().n_seq_max == 1
 
+    @pytest.mark.real_model
     def test_multi_sequence_decode_matches_single(self):
         """多序列（`seq_id>0`）能解码，且与单序列结果逐位一致 —— 数值判据。"""
         import numpy as np
 
-        cut = CUT_GGUF
-        if not cut.is_file():
-            pytest.skip(f"需要裁层 GGUF 工件（{cut.relative_to(ROOT)}），本机缺失")
-        from llama_engine import LlamaCppEngine
-
-        eng = LlamaCppEngine()
-        eng.load_model(model_path=str(cut), n_ctx=1024, n_threads=4, n_seq_max=4)
+        eng = _engine_or_skip(n_ctx=1024, n_seq_max=4)
         import llama_cpp.llama_cpp as M
 
         n_embd = int(M.llama_model_n_embd_inp(eng._model._model.model))
@@ -408,6 +513,7 @@ class TestMultiSequence:
             "多序列与单序列的 argmax 必须相同，实得 "
             f"{single.argmax(axis=-1)} vs {lg.argmax(axis=-1)}")
 
+    @pytest.mark.real_model
     def test_roundtrip_hidden_width_matches_downstream(self):
         """★ 对称性：上游出的 hidden 宽度 == 下游入口接受的宽度（两端可直连）。"""
         eng = _engine_or_skip()
@@ -415,3 +521,81 @@ class TestMultiSequence:
         eng._model._ctx.kv_cache_clear()
         lg = eng.forward_layers_from_hidden(h, n_past=0)
         assert lg is not None, "上游 hidden 应能被下游入口直接接受"
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_fake_binding_restores_preexisting_orphan_child(monkeypatch, failure):
+    """A stub leftover from another unit cannot force native import or leak."""
+    from llama_engine import _new_llama_with_seq_max
+
+    for name in list(sys.modules):
+        if name == "llama_cpp" or name.startswith("llama_cpp."):
+            monkeypatch.delitem(sys.modules, name)
+    orphan = ModuleType("llama_cpp.llama_cpp")
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", orphan)
+    with _isolated_llama_binding() as binding:
+        binding.fail = failure
+        if failure:
+            with pytest.raises(binding.ConstructorFailure):
+                _new_llama_with_seq_max({"model_path": "offline.gguf"}, 4)
+        else:
+            assert _new_llama_with_seq_max({"model_path": "offline.gguf"}, 4).n_seq_max == 4
+        assert sys.modules["llama_cpp.llama_cpp"] is binding.low_level
+    assert "llama_cpp" not in sys.modules
+    assert sys.modules["llama_cpp.llama_cpp"] is orphan
+
+
+def test_real_model_paths_require_opt_in_and_keep_their_marks(monkeypatch):
+    monkeypatch.delenv("QLH_RUN_PHYSICAL_TESTS", raising=False)
+    monkeypatch.delenv("QLH_RUN_REAL_MODEL_SMOKE", raising=False)
+    # Stop before even constructing an engine or checking an existing GGUF.
+    with pytest.raises(pytest.skip.Exception, match="requires"):
+        _engine_or_skip()
+    assert any(mark.name == "real_model" for mark in TestWithRealModel.pytestmark)
+    for name in ("test_multi_sequence_decode_matches_single", "test_roundtrip_hidden_width_matches_downstream"):
+        assert any(mark.name == "real_model" for mark in getattr(TestMultiSequence, name).pytestmark)
+    for name in ("test_default_path_unchanged", "test_seq_max_is_restored_after_load"):
+        assert not any(mark.name == "real_model" for mark in getattr(TestMultiSequence, name).pytestmark)
+
+
+@pytest.mark.parametrize("flag", ["QLH_RUN_PHYSICAL_TESTS", "QLH_RUN_REAL_MODEL_SMOKE"])
+def test_real_model_gate_accepts_explicit_switch(monkeypatch, flag):
+    monkeypatch.delenv("QLH_RUN_PHYSICAL_TESTS", raising=False)
+    monkeypatch.delenv("QLH_RUN_REAL_MODEL_SMOKE", raising=False)
+    monkeypatch.setenv(flag, "1")
+    assert _require_real_model_opt_in() is None
+
+
+@pytest.mark.parametrize("load_fails", [False, True])
+def test_explicit_model_load_exposes_failures_and_forwards_options(monkeypatch, tmp_path, load_fails):
+    """Exercise the smoke helper using an offline engine, never real weights."""
+    import llama_engine
+
+    artifact = tmp_path / "stub.gguf"
+    artifact.write_bytes(b"offline-helper-test")
+    monkeypatch.setattr(sys.modules[__name__], "CUT_GGUF", artifact)
+    monkeypatch.setenv("QLH_RUN_REAL_MODEL_SMOKE", "1")
+    calls = []
+    unloaded = []
+
+    class BindingFailure(RuntimeError):
+        pass
+
+    class FakeEngine:
+        def load_model(self, **kwargs):
+            calls.append(kwargs)
+            if load_fails:
+                raise BindingFailure("binding load failed")
+
+        def unload(self):
+            unloaded.append(self)
+
+    monkeypatch.setattr(llama_engine, "LlamaCppEngine", FakeEngine)
+    if load_fails:
+        with pytest.raises(BindingFailure, match="binding load failed"):
+            _engine_or_skip(n_ctx=1024, n_seq_max=4)
+        assert len(unloaded) == 1
+    else:
+        assert isinstance(_engine_or_skip(n_ctx=1024, n_seq_max=4), FakeEngine)
+        assert not unloaded
+    assert calls == [{"model_path": str(artifact), "n_ctx": 1024, "n_threads": 4, "n_seq_max": 4}]

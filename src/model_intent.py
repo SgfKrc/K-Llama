@@ -13,6 +13,10 @@ from pathlib import Path
 import threading
 import time
 
+from fastapi import HTTPException
+
+from api_errors import error_code_from_exception
+from atomic_json import atomic_write_json
 from model_supply import ModelSupplyError
 
 TERMINAL = {"ready", "failed", "cancelled", "superseded"}
@@ -40,14 +44,13 @@ class ModelIntentCoordinator:
         return Path(self._root) if self._root else self.scheduler._model_supply.root
 
     def _persist(self, record):
-        directory = self.root / record["operation_id"]
-        directory.mkdir(parents=True, exist_ok=True)
-        tmp = directory / "intent.json.tmp"
-        tmp.write_text(json.dumps(record), encoding="utf-8")
-        tmp.replace(directory / "intent.json")
-        pointer = self.root / "current-intent.json.tmp"
-        pointer.write_text(json.dumps({"operation_id": self._current}), encoding="utf-8")
-        pointer.replace(self.root / "current-intent.json")
+        # Record and current pointer share the owner lock through all retries;
+        # a late write must not overwrite cancellation or a newer selection.
+        with self._lock:
+            directory = self.root / record["operation_id"]
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(directory / "intent.json", record)
+            atomic_write_json(self.root / "current-intent.json", {"operation_id": self._current})
 
     def _record(self, operation_id):
         # The supply owner validates the identifier before any path access.
@@ -243,12 +246,21 @@ class ModelIntentCoordinator:
         self.scheduler._model_supply._check_master()
 
     def _retirement_state(self):
+        # Match native candidate admission; offline debts remain owned by the
+        # cleanup ledger and become blockers again when their nodes reconnect.
+        connected_for_cleanup = set(self.scheduler._connected_client_ids())
         with self.scheduler._layer_config_lock:
             transaction = self.scheduler._pipeline_load_transaction or {}
             plan = self.scheduler._active_pipeline_capacity_plan or {}
-            published = transaction.get("phase") == "ready" or plan.get("transaction_phase") == "ready"
+            published = (transaction.get("phase") == "ready"
+                         or plan.get("transaction_phase") == "ready"
+                         or bool(getattr(self.scheduler, "_pipeline_recovery_pending", False)))
             ledger = getattr(self.scheduler, "_pipeline_model_cleanup_ledger", None)
-            return published, None if ledger is None else bool(ledger)
+            pending = None if ledger is None else any(
+                record.get("node_id") == "master" or record.get("node_id") in connected_for_cleanup
+                for record in ledger.values()
+            )
+            return published, pending
 
     async def _retire_before_supply(self):
         if self._retire_task is None:
@@ -406,8 +418,13 @@ class ModelIntentCoordinator:
             raise
         except Exception as exc:
             detail = getattr(exc, "detail", None)
-            code = detail.get("code", "INTENT_PREPARE_FAILED") if isinstance(detail, dict) else getattr(exc, "code", "INTENT_PREPARE_FAILED")
+            code = (
+                error_code_from_exception(exc) if isinstance(exc, HTTPException)
+                else getattr(exc, "code", "")
+            ) or "INTENT_PREPARE_FAILED"
+            # Raw HTTP strings and unexpected exception text stay in diagnostics.
             reason = detail.get("message", "Model preparation failed") if isinstance(detail, dict) else getattr(exc, "message", "Model preparation failed; inspect master diagnostics")
+            logger.exception("event=model_intent_prepare_failed operation_id=%s reason_code=%s", operation_id, code)
             self._fail(operation_id, code, reason)
         finally:
             if prepare_task is not None:
