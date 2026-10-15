@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts import torch_cpu_jitter_diagnosis as diag
 
 
@@ -23,6 +25,10 @@ def test_stats_reports_population_cv_and_spread():
     assert spread["spread_pct"] == 40.0
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="脚本的 CPU 亲和性只实现 Windows（_set_affinity 对非 win32 直接返回 False）",
+)
 def test_single_mode_applies_affinity_and_emits_json():
     """`--mode single` 必须**真的报告**亲和性结果并输出 JSON。
 
