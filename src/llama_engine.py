@@ -448,8 +448,10 @@ class LlamaCppEngine:
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
         if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
-        local_total_layers = int(info.get("n_layer", 0) or 0)
-        if local_total_layers <= 0:
+        local_total_layers = info.get("n_layer")
+        hidden_size = info.get("n_embd")
+        if (type(local_total_layers) is not int or local_total_layers <= 0
+                or type(hidden_size) is not int or hidden_size <= 0):
             return {}
         # ★ 2026-10-11（三机实测 / total_layers 缺口，用户裁定「不能加载整模，这是接力的初衷」）：
         #   裁层工件的 GGUF 头只含**本段**层（head=16），而容量求解器的区间判据要的是
@@ -503,7 +505,9 @@ class LlamaCppEngine:
             logger.warning("GGUF pipeline tensor budget rejected: %s", exc)
             return {}
         layer_weight_bytes = [0] * total_layers
-        layer_weight_bytes[segment_start:segment_start + local_total_layers] = selection.layer_weight_bytes
+        layer_weight_bytes[segment_start:segment_start + local_total_layers] = (
+            selection.layer_weight_bytes
+        )
         component_weight_bytes = selection.component_weight_bytes
         try:
             weight_bytes = int(os.path.getsize(path))
@@ -567,7 +571,7 @@ class LlamaCppEngine:
             ),
             "model_type": model_type,
             "total_layers": total_layers,
-            "hidden_size": int(info.get("n_embd", 0) or 0),
+            "hidden_size": hidden_size,
             "tokenizer_sha256": tokenizer_sha256,
             "layer_weight_bytes": layer_weight_bytes,
             "component_weight_bytes": component_weight_bytes,

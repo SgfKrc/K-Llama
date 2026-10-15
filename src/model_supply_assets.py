@@ -26,6 +26,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from gguf_tensor_selection import GgufTensorSelection, select_gguf_tensors
+
 from gguf_metadata_contract import (
     normalize_gguf_metadata, project_gguf_metadata, verify_gguf_metadata,
 )
@@ -1029,23 +1031,33 @@ def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: i
 
 
 
-def _selected_gguf_weight_bytes(tensors: dict, start_layer: int, end_layer: int) -> int:
-    return sum(entry[1] for name, entry in tensors.items()
-               if not name.startswith("blk.")
-               or start_layer <= int(name.split(".")[1]) < end_layer)
+def _gguf_tensor_selection(tensors: dict, metadata: dict,
+                           start_layer: int, end_layer: int) -> GgufTensorSelection:
+    arch = metadata.get("general.architecture")
+    try:
+        return select_gguf_tensors(
+            {name: entry[1] for name, entry in tensors.items()},
+            block_count=metadata.get(f"{arch}.block_count"),
+            nextn_predict_layers=metadata.get(f"{arch}.nextn_predict_layers", 0),
+            start_layer=start_layer, end_layer=end_layer,
+        )
+    except ValueError as exc:
+        raise SupplyError("invalid_gguf", str(exc)) from exc
 
 
 def gguf_segment_disk_weight_bytes(source: Path, start_layer: int, end_layer: int) -> int:
     """Header-only weight budget using the builder's exact selection rule.
 
-    MTP blk entries outside the decoder range are excluded even when a runtime
-    descriptor groups their bytes into its 'other' component.
+    Budgeting, source descriptors and post-cut verification share the same
+    decoder/MTP tensor selection; unknown non-block tensors remain included.
     """
     metadata, tensors = _gguf_table(Path(source))
     _, total_layers, _ = _gguf_layers(metadata)
-    if not 0 <= start_layer < end_layer <= total_layers or end_layer - start_layer == total_layers:
+    if (type(start_layer) is not int or type(end_layer) is not int
+            or not 0 <= start_layer < end_layer <= total_layers
+            or end_layer - start_layer == total_layers):
         _fail("invalid_range", "distributed disk budget requires proper decoder segments")
-    return _selected_gguf_weight_bytes(tensors, start_layer, end_layer)
+    return _gguf_tensor_selection(tensors, metadata, start_layer, end_layer).selected_weight_bytes
 
 
 def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
@@ -1075,7 +1087,8 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         _fail("layer_range_mismatch", "source GGUF layer count differs from assignment")
     if read_gguf_tokenizer_sha256(source) != tokenizer_sha256:
         _fail("tokenizer_digest_mismatch", "source GGUF tokenizer fingerprint mismatch")
-    layer_bytes = _layer_sizes(tensors, total_layers, start_layer, end_layer)
+    selection = _gguf_tensor_selection(tensors, metadata, start_layer, end_layer)
+    layer_bytes = selection.layer_weight_bytes
     try:
         source_metadata = normalize_gguf_metadata(metadata)
         expected_metadata = project_gguf_metadata(source_metadata, start_layer, end_layer)
@@ -1104,7 +1117,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                                     gguf_source_metadata=source_metadata)
     if rebound:
         return rebound
-    selected_size = _selected_gguf_weight_bytes(tensors, start_layer, end_layer)
+    selected_size = selection.selected_weight_bytes
     _ensure_space(root, selected_size + len(tensors) * 32 + _MAX_HEADER)
     stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
     try:
@@ -1143,19 +1156,8 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         )
         if _gguf_layers(out_metadata) != (arch, end_layer - start_layer, hidden):
             _fail("layer_range_mismatch", "cut GGUF header differs from assignment")
-        expected = {}
-        for name, entry in tensors.items():
-            if name.startswith("blk."):
-                match = re.match(r"blk\.(\d+)\.(.+)", name)
-                if not match:
-                    _fail("invalid_gguf", "source GGUF has malformed layer names")
-                index = int(match[1])
-                if not start_layer <= index < end_layer:
-                    continue
-                target = f"blk.{index - start_layer}.{match[2]}"
-            else:
-                target = name
-            expected[target] = entry
+        expected = {target: tensors[source_name]
+                    for target, source_name in selection.tensor_sources.items()}
         if set(expected) != set(out_tensors):
             _fail("layer_range_mismatch", "cut GGUF tensor set differs from source range")
         for name, entry in expected.items():
