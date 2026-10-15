@@ -197,6 +197,9 @@ class DeviceProfile:
     # TP 孤岛聚合能力段（网关节点专用，随注册 device_info 上报主节点；
     # None = 非孤岛网关节点，旧版本节点无感）
     island: Optional[Dict[str, Any]] = None
+    # 推理开关映射（票 20 `DEVICE-AWARE-INFER-01`）：画像 → llama.cpp 开关的
+    # 显式化结果，含每条映射的实测依据；None = 未解析（如映射模块不可用）。
+    inference_switches: Optional[Dict[str, Any]] = None
 
 
 # ============================================================
@@ -469,6 +472,17 @@ class DeviceProfiler:
             runtime_profile=detect_runtime_profile(),
             island=detect_island_profile(),
         )
+
+        # 推理开关映射（票 20 `DEVICE-AWARE-INFER-01`）：把「画像 → 开关」显式化，
+        # 关闭态同样可观测。惰性 import：本模块刻意保持零项目内部依赖。
+        try:
+            import inference_switches
+
+            profile.inference_switches = inference_switches.resolve_inference_switches(
+                _dataclass_to_dict(profile)
+            ).to_dict()
+        except Exception:  # pragma: no cover - 画像异常不得拖垮设备画像本身
+            profile.inference_switches = None
 
         # 生成建议
         profile.recommendations = self._generate_recommendations()

@@ -152,6 +152,36 @@ def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
     )
 
 
+def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
+    """按设备画像与环境覆盖挂上推理开关（就地修改 `load_kwargs`）。
+
+    映射表与实测依据见 `src/inference_switches.py`。**默认档位不新增任何键** ⇒
+    未设置 `QLH_INFER_*` 时加载路径与本函数引入前逐字一致；每次都记一行日志，
+    使「关闭态」同样可观测（便于回滚与对拍）。
+    """
+    try:
+        import inference_switches
+    except Exception as exc:  # pragma: no cover - 模块缺失属异常部署
+        logger.warning("推理开关模块不可用，按默认档位继续: %s", exc)
+        return
+
+    profile = None
+    try:
+        from device_profiler import get_profile
+
+        profile = get_profile().to_dict()
+    except Exception as exc:
+        logger.debug("设备画像不可用，推理开关按默认档位继续: %s", exc)
+
+    try:
+        switches = inference_switches.resolve_inference_switches(profile)
+        inference_switches.apply_to_load_kwargs(switches, load_kwargs)
+    except Exception as exc:
+        logger.warning("推理开关解析失败，按默认档位继续: %s", exc)
+        return
+    logger.info("推理开关: %s", switches.describe())
+
+
 def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
     """构造 `llama_cpp.Llama`，可选地把 context 的 `n_seq_max` 抬到指定值。
 
@@ -948,6 +978,10 @@ class LlamaCppEngine:
             elif model_path and "qwen-1_8b" in os.path.basename(model_path).lower():
                 # Qwen-1.8B GGUF metadata is not always detected reliably.
                 load_kwargs["chat_format"] = "chatml"
+
+            # 推理开关（设备画像 → KV 量化 / flash-attn / 线程）：默认档位不新增键，
+            # 紧随其后的显式 kwargs 仍然优先（见 src/inference_switches.py）。
+            _apply_inference_switches(load_kwargs)
 
             load_kwargs.update(kwargs)
             # n-gram 自投机（绑定路径 / 无 CUDA 边缘）：默认关闭；
