@@ -281,3 +281,12 @@ surface-ssh*.log
 
 # 本地一次性迁移备份（DSH→Reasonix 桥接迁移的 UI 资源快照），不入库
 dsh-migration-backup-*/
+
+# Ticket 13: real product evidence validation and explicit physical capture.
+!scripts/product_relay_gate.py
+!scripts/run_product_relay_gate.py
+
+# Required core quality/dependency gates (referenced by tracked tests).
+!scripts/experiment_gemma_quality_unit.py
+!scripts/experiment_quality_production_gate.py
+!scripts/llama_dependency_contract.py

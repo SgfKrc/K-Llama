@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# Owned by the independent qlh-docagent workspace, not the main repository CI.
+# Legacy local run: QLH_INCLUDE_WORKSPACE_TOOL_TESTS=1 python -m pytest <this file>.
+# Keep imports strict: opting in requires the actual workspace tool sources.
+
 import copy
 import json
 import subprocess

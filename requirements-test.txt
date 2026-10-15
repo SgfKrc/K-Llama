@@ -1,4 +1,7 @@
-# Complete test environment: runtime dependencies plus test tooling.
+# Core test environment: tracked runtime dependencies plus test tooling.
+# packaging/android are source submodules checked out by CI, not pip packages.
+# Independent tools/docagent and docs/agent_tool suites are owned by qlh-docagent;
+# do not install those local workspaces as core CI dependencies.
 # Install through scripts/setup_test_env.py; never install into system Python.
 -r requirements.txt
 cryptography>=42.0.0,<47.0.0

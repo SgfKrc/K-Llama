@@ -15,3 +15,10 @@ qlh.bat text eol=crlf
 # git 钩子必须是 LF：这些是带 `#!/bin/sh` shebang 的 shell 脚本，CRLF 会让解释器
 # 把 `\r` 当成命令的一部分而在 Windows 检出后直接执行失败（core.hooksPath 指向它们）。
 .githooks/* text eol=lf
+
+# These byte-addressed quality fixtures have existing CRLF SHA-256 locks.
+# Pin checkout bytes on Linux as well as Windows; do not rewrite their locks.
+fixtures/prompt_sets/ps-qwen3-nothink/prompts.jsonl text eol=crlf
+fixtures/quality_rubrics/llm-objective-ps-v1-v2.json text eol=crlf
+fixtures/quality_rubrics/gemma-judge-counts-v1.json text eol=crlf
+fixtures/quality_reports/gemma-judge-counts-fixture-v1.json text eol=crlf

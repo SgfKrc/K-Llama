@@ -9,6 +9,11 @@
 覆盖 —— 既不再依赖本机 `models/`，也不靠"条件分支永不进入"来假装通过。
 """
 
+# Owned by the retired MF-MEM benchmark workspace; its one-off harness was
+# removed from the main repo in aa889bcb (see .gitignore, scripts policy).
+# Legacy local run: QLH_INCLUDE_WORKSPACE_TOOL_TESTS=1 python -m pytest <this file>.
+# Opting in requires the real harness; keep missing imports fatal.
+
 import json
 import sys
 from pathlib import Path

@@ -1,5 +1,10 @@
 """MF-MEM-N2 pager lifecycle and correctness tests."""
 
+# Owned by the retired MF-MEM benchmark workspace; its one-off harness was
+# removed from the main repo in aa889bcb (see .gitignore, scripts policy).
+# Legacy local run: QLH_INCLUDE_WORKSPACE_TOOL_TESTS=1 python -m pytest <this file>.
+# Opting in requires the real harness; keep missing imports fatal.
+
 import json
 import sys
 from pathlib import Path

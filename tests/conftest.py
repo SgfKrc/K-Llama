@@ -30,6 +30,25 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# Workspace-only suites: independent qlh-docagent, retired MF-MEM benchmarks,
+# and external offline-asset release tooling (aa889bcb / module ownership docs).
+# Their sources are intentionally absent from the main repo. Keep ownership
+# stable even on developer checkouts; opt-in imports must still fail normally.
+# Core EX-N3 quality infrastructure and dependency contracts remain collected.
+collect_ignore_glob = (
+    [
+        "test_docagent_*.py", "test_doc_maintenance_*.py",
+        "test_model_fleet_explicit_layer_pager.py",
+        "test_model_fleet_memory_transport.py",
+        "test_model_fleet_n2f_fixed_tile.py",
+        "test_model_fleet_n2r_artifact_gate.py",
+        "test_model_fleet_n2r_compare.py",
+        "test_offline_bundle.py",
+    ]
+    if os.environ.get("QLH_INCLUDE_WORKSPACE_TOOL_TESTS") != "1"
+    else []
+)
+
 # Install a distinct fallback in every worker before collection imports config.
 # Function fixtures restore these paths; a late backend thread can still persist
 # safely after its test ends. Never inherit the runner's shared node config,
