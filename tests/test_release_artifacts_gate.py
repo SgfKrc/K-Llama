@@ -257,3 +257,84 @@ def test_cuda_is_explicitly_deferred_by_default(tmp_path, monkeypatch):
     assert gate.main(["--platforms", "windows", "--dist", str(tmp_path)]) == 1
     assert seen["windows_variants"] == ["cpu", "launcher"]
     assert seen["linux_variants"] == ["cpu"]
+
+
+def _device_smoke_commands(tmp_path, apk, monkeypatch):
+    """A bounded fake device; no actual package install is performed by this test."""
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[-3:] == ['pm', 'path', 'com.qlh.inference']:
+            seen = sum(call[-3:] == ['pm', 'path', 'com.qlh.inference'] for call in calls)
+            return command('' if seen == 1 else 'package:/data/app/accepted/base.apk\n')
+        if 'pull' in args:
+            shutil.copyfile(apk, Path(args[-1]))
+            return command('1 file pulled')
+        if 'install' in args or 'uninstall' in args:
+            return command('Success\n')
+        if 'am' in args:
+            return command('Status: ok\n')
+        if 'pidof' in args:
+            return command('123\n')
+        if args[-3:] == ['dumpsys', 'activity', 'activities']:
+            return command('mResumedActivity: com.qlh.inference/.MainActivity\n')
+        raise AssertionError(args)
+    monkeypatch.setattr(gate, 'run_command', run)
+    monkeypatch.setattr(gate.time, 'sleep', lambda _: None)
+    return calls
+
+
+def test_fresh_apk_role_and_native_acceptance_requires_real_runtime_observation(tmp_path, monkeypatch):
+    apk = make_apk(tmp_path/'accepted.apk')
+    calls = _device_smoke_commands(tmp_path, apk, monkeypatch)
+    observed = {}
+    def observe(**kwargs):
+        observed.update(kwargs)
+        return {'passed': True, 'observation': {'role': 'client'}, 'attempts': [{'nonce': 'n'}]}
+    monkeypatch.setattr(gate, 'observe_runtime', observe)
+    report = gate.Report('android')
+    gate.android_device_smoke(report, adb='adb', serial='Y700', apk=apk, work=tmp_path, env={},
+                              version_name='0.1.8.3', version_code=6)
+    checks = {item['check']: item for item in report.items}
+    assert all(checks['android.'+name]['passed'] for name in ('startup','roles','native-runtime','cleanup'))
+    assert observed['require_idle'] is True and observed['version_name'] == '0.1.8.3' and observed['version_code'] == 6
+    assert checks['android.native-runtime']['evidence']['artifact_sha256'] == gate.sha256(apk)
+    assert calls[-1][-2:] == ['uninstall', 'com.qlh.inference']
+
+
+def test_resumed_activity_does_not_override_native_probe_failure(tmp_path, monkeypatch):
+    apk = make_apk(tmp_path/'accepted.apk')
+    calls = _device_smoke_commands(tmp_path, apk, monkeypatch)
+    monkeypatch.setattr(gate, 'observe_runtime', lambda **_: {'passed': False, 'attempts': [{'error':'JNI missing'}]})
+    report = gate.Report('android')
+    gate.android_device_smoke(report, adb='adb', serial='Y700', apk=apk, work=tmp_path, env={})
+    checks = {item['check']: item for item in report.items}
+    assert checks['android.startup']['passed'] is True
+    assert checks['android.roles']['passed'] is False and checks['android.native-runtime']['passed'] is False
+    assert checks['android.cleanup']['passed'] is True and report.as_dict()['passed'] is False
+    assert calls[-1][-2:] == ['uninstall', 'com.qlh.inference']
+
+
+def test_installed_apk_mismatch_never_observes_or_launches_runtime(tmp_path, monkeypatch):
+    apk = make_apk(tmp_path/'accepted.apk')
+    calls = _device_smoke_commands(tmp_path, apk, monkeypatch)
+    fake_run = gate.run_command
+    def tampered(args, **kwargs):
+        result = fake_run(args, **kwargs)
+        if 'pull' in args:
+            Path(args[-1]).write_bytes(b'another apk')
+        return result
+    monkeypatch.setattr(gate, 'run_command', tampered)
+    monkeypatch.setattr(gate, 'observe_runtime', lambda **_: pytest.fail('APK mismatch must stop before runtime observation'))
+    report = gate.Report('android')
+    gate.android_device_smoke(report, adb='adb', serial='Y700', apk=apk, work=tmp_path, env={})
+    assert not report.as_dict()['passed']
+    assert not any('am' in call for call in calls)
+    assert calls[-1][-2:] == ['uninstall', 'com.qlh.inference']
+
+
+def test_dirty_authenticated_build_cannot_claim_release_revision():
+    report = gate.Report('android')
+    assert gate.check_revision(report, 'android.revision',
+        {'schema_version':1,'source_revision':REVISION,'source_dirty':True}, authenticated=True, required=REVISION) is None
+    assert report.as_dict()['passed'] is False
