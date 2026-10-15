@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -108,21 +109,11 @@ def _publish_json(path: Path, payload: dict) -> None:
 
 def _registered(model_id: str) -> tuple[ModelConfig, dict]:
     rows = local_store.get_local_experimental_models()
+    row = next((item for item in rows if item.get("model_id") == model_id), {})
     cfg = mc.get_model_config(model_id, rows)
     if cfg is None:
-        _fail("SUPPLY_MODEL_NOT_REGISTERED", "Select a registered model")
-    row = next((item for item in rows if item.get("model_id") == model_id), {})
-    # get_model_config historically prefers builtins. Download/import records
-    # contain the verified local locations, including updates of builtin IDs.
-    fields = {key: row[key] for key in ("model_path", "gguf_path", "model_type", "huggingface_id")
-              if key in row}
-    if any(not isinstance(value, str) for value in fields.values()):
-        _fail("SUPPLY_REGISTRY_INVALID", "Registered source fields must be strings")
-    cfg = replace(cfg, **fields)
-    try:
-        mrv.normalize_model_type(cfg.model_type)
-    except ValueError as exc:
-        raise ModelSupplySourceError("SUPPLY_REGISTRY_INVALID", "Registered model format is invalid") from exc
+        code = "SUPPLY_REGISTRY_INVALID" if row else "SUPPLY_MODEL_NOT_REGISTERED"
+        _fail(code, "Registered model configuration is invalid" if row else "Select a registered model")
     return cfg, row
 
 
@@ -297,13 +288,63 @@ def _gguf_metadata(path: Path) -> dict:
     return {"artifact_sha256": report["sha256"], "tokenizer_sha256": tokenizer}
 
 
-def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool]) -> dict:
+def _registered_external_files(cfg: ModelConfig, row: dict) -> dict[str, Path]:
+    bindings = row.get("manifest_external_files", {})
+    if not isinstance(bindings, dict):
+        _fail("SUPPLY_REGISTRY_INVALID", "External manifest bindings must be an object")
+    bindings = dict(bindings)
+    # Legacy v1 both registrations recorded external/<name> without the map.
+    # Recover only the explicitly registered GGUF, never an adjacent candidate.
+    registered = _path(cfg.gguf_path)
+    if registered is not None:
+        bindings.setdefault("external/" + registered.name, str(registered))
+    result = {}
+    for alias, value in bindings.items():
+        if (not isinstance(alias, str) or not alias.startswith("external/")
+                or len(Path(alias).parts) != 2 or not isinstance(value, str) or not value):
+            _fail("SUPPLY_REGISTRY_INVALID", "External manifest binding is invalid")
+        path = _path(value)
+        if path is None or path.name != Path(alias).name:
+            _fail("SUPPLY_REGISTRY_INVALID", "External manifest binding filename differs")
+        path = _existing(path, directory=False)
+        if path is not None:
+            result[alias] = path
+    return result
+
+
+def _registered_manifest_identity(row: dict) -> dict[str, str]:
+    """Recover the pinned source identity without trusting a replacement file."""
+    manifest = row.get("manifest")
+    if manifest is not None and not isinstance(manifest, dict):
+        _fail("SUPPLY_REGISTRY_INVALID", "Registered source manifest must be an object")
+    expected = {}
+    for field in ("artifact_sha256", "manifest_sha256"):
+        digests = []
+        for value in (row.get(field), (manifest or {}).get(field)):
+            if value is None or value == "":
+                continue
+            if not isinstance(value, str) or not jobs._SHA256_RE.fullmatch(value.lower()):
+                _fail("SUPPLY_REGISTRY_INVALID", "Registered source identity is invalid")
+            digests.append(value.lower())
+        if len(set(digests)) > 1:
+            _fail("SUPPLY_REGISTRY_INVALID", "Registered source identities disagree")
+        if digests:
+            expected[field] = digests[0]
+    return expected
+
+
+def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool],
+                   *, external_files: dict[str, Path] | None = None,
+                   expected_identity: dict[str, str] | None = None,
+                   require_hf_metadata: bool = True) -> dict:
     """Rehash declared core identity without redefining an existing source.
 
     Extra runtime support files (chat_template.jinja, merges/vocab, etc.) are
     bound by the downstream supply manifest, not folded into this old identity.
     """
     manifest = _json(root / "model.manifest.json")
+    if any(manifest.get(field) != digest for field, digest in (expected_identity or {}).items()):
+        raise ValueError("source manifest differs from its registered identity")
     entries = manifest.get("files")
     if not isinstance(entries, list) or not entries:
         raise ValueError("invalid source manifest files")
@@ -316,9 +357,14 @@ def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool
         if relative in names:
             raise ValueError("duplicate source manifest path")
         names.add(relative)
-        path = root / relative
-        path.resolve().relative_to(root.resolve())
-        if _linked(path) or not path.is_file():
+        if relative.startswith("external/"):
+            path = (external_files or {}).get(relative)
+            if path is None:
+                raise ValueError("external source manifest file is not explicitly registered")
+        else:
+            path = root / relative
+            path.resolve().relative_to(root.resolve())
+        if any(_linked(item) for item in (path, *path.parents)) or not path.is_file():
             raise ValueError("source manifest file missing or unsafe")
         size = entry.get("size_bytes")
         digest = entry.get("sha256")
@@ -329,7 +375,8 @@ def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool
             raise ValueError("source manifest content changed")
         lines.append(f"{relative}\0{entry['size_bytes']}\0{entry['sha256']}")
     required = {item.relative_to(root).as_posix() for item in weights}
-    required.update({"config.json", "tokenizer_config.json"})
+    if require_hf_metadata:
+        required.update({"config.json", "tokenizer_config.json"})
     if not required <= names:
         raise ValueError("source manifest does not bind all weights and metadata")
     unsigned = {key: value for key, value in manifest.items()
@@ -341,9 +388,12 @@ def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool
     return manifest
 
 
-def _proof(root: Path, weights: list[Path], cancelled: Callable[[], bool]) -> tuple[dict, Path]:
+def _proof(root: Path, weights: list[Path], cancelled: Callable[[], bool],
+           *, external_files: dict[str, Path] | None = None,
+           expected_identity: dict[str, str] | None = None) -> tuple[dict, Path]:
     try:
-        _live_manifest(root, weights, cancelled)
+        _live_manifest(root, weights, cancelled, external_files=external_files,
+                       expected_identity=expected_identity)
         identity = descriptor.cross_format_pipeline_identity(root)
         if not identity:
             raise ValueError("missing cross-format identity")
@@ -457,13 +507,17 @@ def _remote_inventory(spec: dict) -> int:
     return sum(selected.values())
 
 
-def _save(cfg: ModelConfig, row: dict, **evidence: Any) -> None:
-    if not local_store.save_local_experimental_model(cfg.model_id, {**row, **asdict(cfg), **evidence}):
-        _fail("SUPPLY_REGISTER_FAILED", "Verified model source could not be registered")
+def _save(cfg: ModelConfig, row: dict, *, registry_snapshot: dict | None,
+          **evidence: Any) -> None:
+    if not local_store.save_local_experimental_model_cas(
+            cfg.model_id, {**row, **asdict(cfg), **evidence}, expected=registry_snapshot):
+        _fail("SUPPLY_REGISTRY_CHANGED", "Model registration changed during source preparation")
 
 
 def _download(cfg: ModelConfig, row: dict, operation: Path,
               cancelled: Callable[[], bool], progress: Callable | None) -> ModelConfig:
+    registry_snapshot = deepcopy(row) if row else None
+    expected_identity = _registered_manifest_identity(registry_snapshot or {})
     spec = _download_spec(cfg, row)
     target = _path(cfg.model_path) if cfg.model_type != "gguf" else None
     if target is None:
@@ -488,6 +542,7 @@ def _download(cfg: ModelConfig, row: dict, operation: Path,
     staging = None
     published = False
     registered = False
+    registry_changed = False
     try:
         _notify(progress, "resolving", job_id=job_id)
         _check(cancelled)
@@ -549,6 +604,8 @@ def _download(cfg: ModelConfig, row: dict, operation: Path,
         manifest = mrv.build_manifest(staging, artifact["files"],
                                       model_type=artifact["model_type"],
                                       revision=spec["revision"], source=spec["source"])
+        if any(manifest.get(field) != digest for field, digest in expected_identity.items()):
+            _fail("SUPPLY_DOWNLOAD_METADATA_INVALID", "Downloaded source differs from its registered identity")
         mrv.write_manifest(staging, manifest)
         _check(cancelled)
         _disk(staging, _DISK_RESERVE)
@@ -562,7 +619,8 @@ def _download(cfg: ModelConfig, row: dict, operation: Path,
         published = True
         updated = replace(cfg, model_path="" if selector else str(target),
                           gguf_path=str(target / selector) if selector else cfg.gguf_path)
-        _save(updated, row, manifest=manifest, artifact_sha256=manifest["artifact_sha256"],
+        _save(updated, row, registry_snapshot=registry_snapshot,
+              manifest=manifest, artifact_sha256=manifest["artifact_sha256"],
               manifest_sha256=manifest["manifest_sha256"], revision=spec["revision"],
               supply_download_job_id=job_id)
         registered = True
@@ -571,6 +629,7 @@ def _download(cfg: ModelConfig, row: dict, operation: Path,
         _notify(progress, "ready", job_id=job_id)
         return updated
     except Exception as exc:
+        registry_changed = getattr(exc, "code", "") == "SUPPLY_REGISTRY_CHANGED"
         code = str(getattr(exc, "code", "SUPPLY_DOWNLOAD_FAILED"))
         if not code.startswith("SUPPLY_"):
             code = "SUPPLY_" + code.upper() if code.startswith("DOWNLOAD_") else "SUPPLY_DOWNLOAD_" + code.upper()
@@ -583,7 +642,9 @@ def _download(cfg: ModelConfig, row: dict, operation: Path,
         raise ModelSupplySourceError(code, "Model source download or verification failed") from exc
     finally:
         # Delete only this call's staging/publication, after resolved confinement.
-        cleanup = target if published and not registered else staging if not published else None
+        # A newer registration may have adopted the published source. A CAS
+        # conflict cannot authorize deleting that source out from under it.
+        cleanup = target if published and not registered and not registry_changed else staging if not published else None
         if cleanup is not None and cleanup.exists():
             cleanup.resolve().relative_to(target.parent.resolve())
             if cleanup.resolve() == target.parent.resolve() or _linked(cleanup):
@@ -598,19 +659,26 @@ def _conversion_error(report: dict) -> None:
 
 
 def _convert(cfg: ModelConfig, row: dict, hf: Path, weights: list[Path], operation: Path,
-             cancelled: Callable[[], bool], progress: Callable | None) -> tuple[ModelConfig, dict, Path]:
+             cancelled: Callable[[], bool], progress: Callable | None,
+             *, registry_snapshot: dict | None) -> tuple[ModelConfig, dict, Path]:
     convert = _model_tools("gguf_convert")
     _check(cancelled)
     manifest_path = hf / "model.manifest.json"
+    external_files = _registered_external_files(cfg, row)
+    expected_identity = _registered_manifest_identity(registry_snapshot or {})
     try:
-        if manifest_path.exists():
-            manifest = _live_manifest(hf, weights, cancelled)
+        if expected_identity or manifest_path.exists() or _linked(manifest_path):
+            manifest = _live_manifest(hf, weights, cancelled, external_files=external_files,
+                                      expected_identity=expected_identity)
         else:
             manifest = mrv.build_manifest(hf, weights, model_type="safetensors",
                                           revision=str(row.get("revision") or ""),
                                           source=cfg.huggingface_id)
             _publish_json(manifest_path, manifest)
         source_identity = descriptor._source_manifest_identity(hf)
+        manifest_identity = {field: manifest[field] for field in ("artifact_sha256", "manifest_sha256")}
+        if any(source_identity[field] != digest for field, digest in manifest_identity.items()):
+            raise ValueError("source identity changed during inspection")
     except ModelSupplySourceError:
         raise
     except Exception as exc:
@@ -679,7 +747,8 @@ def _convert(cfg: ModelConfig, row: dict, hf: Path, weights: list[Path], operati
             or any(item.get("status") != "passed" for item in stages)):
         _fail("SUPPLY_CONVERSION_EVIDENCE_INVALID", "Converter returned incomplete execution evidence")
     try:
-        _live_manifest(hf, weights, cancelled)
+        _live_manifest(hf, weights, cancelled, external_files=external_files,
+                       expected_identity=manifest_identity)
         if _sha(converter, cancelled) != converter_sha or _sha(quantizer, cancelled) != quantizer_sha:
             raise ValueError("conversion tools changed during execution")
         target_identity = _gguf_metadata(target)
@@ -691,7 +760,8 @@ def _convert(cfg: ModelConfig, row: dict, hf: Path, weights: list[Path], operati
         proof["provenance_sha256"] = _canonical(proof)
         _check(cancelled)
         _publish_json(hf / PROVENANCE, proof)
-        proof, target = _proof(hf, weights, cancelled)
+        proof, target = _proof(hf, weights, cancelled, external_files=external_files,
+                               expected_identity=manifest_identity)
     except ModelSupplySourceError:
         raise
     except Exception as exc:
@@ -702,14 +772,17 @@ def _convert(cfg: ModelConfig, row: dict, hf: Path, weights: list[Path], operati
     Path(evidence_name).write_text(json.dumps(evidence, ensure_ascii=True, sort_keys=True,
                                             indent=2) + "\n", encoding="utf-8")
     updated = replace(cfg, model_type="both", model_path=str(hf), gguf_path=str(target))
-    _save(updated, row, manifest=manifest, supply_conversion_evidence=evidence_name,
+    _save(updated, row, registry_snapshot=registry_snapshot,
+          manifest=manifest, artifact_sha256=manifest["artifact_sha256"],
+          manifest_sha256=manifest["manifest_sha256"], supply_conversion_evidence=evidence_name,
           cross_format_provenance_sha256=proof["provenance_sha256"])
     _notify(progress, "ready")
     return updated, proof, target
 
 
 def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: bool,
-                              cancelled: Callable[[], bool], progress: Callable | None = None) -> dict:
+                              cancelled: Callable[[], bool], progress: Callable | None = None,
+                              require_cross_format: bool = False) -> dict:
     """Return verified registered sources, downloading/converting only if absent.
 
     Result keys are ``model_config``, ``hf``, ``gguf`` and ``conversion_proof``.
@@ -720,28 +793,37 @@ def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: 
     _check(cancelled)
     _notify(progress, "resolving")
     cfg, row = _registered(model_id)
+    registry_snapshot = deepcopy(row) if row else None
+    expected_identity = _registered_manifest_identity(registry_snapshot or {})
     operation = Path(operation_dir).absolute()
     if any(_linked(item) for item in (operation, *operation.parents)):
         _fail("SUPPLY_SOURCE_INVALID", "Operation directory cannot traverse a filesystem link")
     operation.mkdir(parents=True, exist_ok=True)
     hf = _existing(_path(cfg.model_path), directory=True)
     gguf = _existing(_path(cfg.gguf_path), directory=False)
+    if cfg.model_path and expected_identity and hf is None and gguf is not None:
+        _fail("SUPPLY_SOURCE_METADATA_INVALID", "Registered HF source manifest is unavailable")
     if hf is None and gguf is None:
         cfg = _download(cfg, row, operation, cancelled, progress)
         # Reload persisted download evidence while retaining builtin metadata.
         cfg, row = _registered(model_id)
+        registry_snapshot = deepcopy(row) if row else None
         hf = _existing(_path(cfg.model_path), directory=True)
         gguf = _existing(_path(cfg.gguf_path), directory=False)
     weights: list[Path] = []
     proof = None
+    external_files = _registered_external_files(cfg, row)
+    expected_identity = _registered_manifest_identity(registry_snapshot or {})
     if hf is not None:
         proof_present = (hf / PROVENANCE).exists() or _linked(hf / PROVENANCE)
         try:
             weights = _hf_metadata(hf, cancelled)
             if proof_present:
-                proof, gguf = _proof(hf, weights, cancelled)
-            elif (hf / "model.manifest.json").exists():
-                _live_manifest(hf, weights, cancelled)
+                proof, gguf = _proof(hf, weights, cancelled, external_files=external_files,
+                                     expected_identity=expected_identity)
+            elif expected_identity or (hf / "model.manifest.json").exists() or _linked(hf / "model.manifest.json"):
+                _live_manifest(hf, weights, cancelled, external_files=external_files,
+                               expected_identity=expected_identity)
         except ModelSupplySourceError:
             raise
         except Exception as exc:
@@ -749,14 +831,24 @@ def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: 
             raise ModelSupplySourceError(code, "Registered HF source failed metadata/content verification") from exc
     if gguf is not None:
         try:
+            if hf is None and expected_identity:
+                _live_manifest(gguf.parent, [gguf], cancelled, external_files=external_files,
+                               expected_identity=expected_identity, require_hf_metadata=False)
             _gguf_metadata(gguf)
         except Exception as exc:
             raise ModelSupplySourceError("SUPPLY_SOURCE_METADATA_INVALID",
                                         "Registered GGUF source failed metadata/content verification") from exc
     _check(cancelled)
-    if want_gguf and gguf is None and hf is not None:
+    needs_proof = require_cross_format and proof is None
+    if want_gguf and hf is not None and (gguf is None or needs_proof):
+        if gguf is not None and needs_proof:
+            # The old GGUF remains a verified member of the old source manifest.
+            # Convert to a distinct managed target instead of overwriting it.
+            row = {**row, "manifest_external_files": {key: str(value) for key, value in external_files.items()}}
+            cfg = replace(cfg, gguf_path="")
         try:
-            cfg, proof, gguf = _convert(cfg, row, hf, weights, operation, cancelled, progress)
+            cfg, proof, gguf = _convert(cfg, row, hf, weights, operation, cancelled, progress,
+                                        registry_snapshot=registry_snapshot)
         except ModelSupplySourceError:
             raise
         except Exception as exc:

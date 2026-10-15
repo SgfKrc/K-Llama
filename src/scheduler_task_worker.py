@@ -778,8 +778,9 @@ class SchedulerTaskWorkerMixin:
 
     def _send_task_worker_hello(
         self, client=None, refresh_generation: int = 0,
+        registration_owner: tuple | None = None,
     ) -> bool:
-        """Send the TC-N2.0 hello after authenticated TCP registration."""
+        """Send hello for exactly one authenticated client/epoch/socket owner."""
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
@@ -787,44 +788,73 @@ class SchedulerTaskWorkerMixin:
         ):
             return False
         target = client or getattr(self, "_tcp_client", None)
-        if not target or not getattr(target, "is_registered", False):
+        if not target:
             return False
+        message = None
+        phase = "capabilities"
         try:
             from transport_port import MessageType
 
-            message = self._task_worker_control.begin_worker_hello(
-                node_id=self.get_effective_node_id(),
-                capabilities=self._task_worker_capabilities(),
-            )
-            if message is None:
+            if registration_owner is None:
+                registration_owner = target.capture_registration_owner()
+            if registration_owner is None:
                 return False
+            # Hashing artifacts must never hold either the registration lock or
+            # the scheduler lock shared with client replacement and cleanup.
+            capabilities = self._task_worker_capabilities()
+            node_id = self.get_effective_node_id()
+            phase = "begin"
             with self._task_worker_refresh_lock:
+                if getattr(self, "_tcp_client", None) is not target:
+                    return False
+
+                def begin():
+                    return self._task_worker_control.begin_worker_hello(
+                        node_id=node_id, capabilities=capabilities,
+                        registration_owner=registration_owner,
+                    )
+
+                message = target.run_if_registration_owner(registration_owner, begin)
+                if message is None:
+                    return False
                 self._task_worker_refresh_requested = bool(
                     self._task_worker_refresh_generation > refresh_generation
                 )
-            target.send_data(message.snapshot(), MessageType.TASK_WORKER)
+            phase = "send"
+            target.send_data(
+                message.snapshot(), MessageType.TASK_WORKER,
+                connection_sock=registration_owner[2],
+            )
             advertised_layers = [
                 (artifact.get("layer_range"), len(artifact.get("layer_weight_bytes") or []))
                 for artifact in message.payload["capabilities"].get("layer_artifacts", [])
             ]
             logger.info(
-                "event=task_worker_hello_sent node_id=%s version=%s artifact_byte_layers=%s",
-                self.get_effective_node_id(), message.version, advertised_layers,
+                "event=task_worker_hello_sent node_id=%s registration_epoch=%s "
+                "hello_id=%s version=%s artifact_byte_layers=%s",
+                node_id, registration_owner[1], message.message_id,
+                message.version, advertised_layers,
             )
             return True
         except Exception as exc:
-            self._task_worker_control.disconnect_coordinator()
+            cleared = False
+            if message is not None:
+                cleared = self._task_worker_control.disconnect_coordinator(
+                    owner=(*registration_owner, message.message_id),
+                )
             logger.warning(
-                "event=task_worker_hello_failed node_id=%s error=%s",
-                self.get_effective_node_id(),
-                getattr(exc, "code", type(exc).__name__),
-                exc_info=True,
+                "event=task_worker_hello_%s_failed registration_epoch=%s "
+                "hello_id=%s coordinator_cleared=%s error=%s",
+                phase,
+                registration_owner[1] if registration_owner is not None else None,
+                message.message_id if message is not None else None,
+                cleared, getattr(exc, "code", type(exc).__name__), exc_info=True,
             )
             return False
 
 
     def refresh_task_worker_capabilities(self) -> bool:
-        """Refresh hello asynchronously after a local full-model change."""
+        """Schedule a hello bound to the registration requesting this refresh."""
         client = getattr(self, "_tcp_client", None)
         if (
             not self.get_distributed_inference_enabled()
@@ -834,13 +864,18 @@ class SchedulerTaskWorkerMixin:
             or not getattr(client, "is_registered", False)
         ):
             return False
+        registration_owner = client.capture_registration_owner()
+        if registration_owner is None:
+            return False
         with self._task_worker_refresh_lock:
+            if getattr(self, "_tcp_client", None) is not client:
+                return False
             self._task_worker_refresh_requested = True
             self._task_worker_refresh_generation += 1
             refresh_generation = self._task_worker_refresh_generation
         threading.Thread(
             target=self._send_task_worker_hello,
-            args=(client, refresh_generation),
+            args=(client, refresh_generation, registration_owner),
             name="task-worker-capability-refresh",
             daemon=True,
         ).start()
@@ -855,9 +890,18 @@ class SchedulerTaskWorkerMixin:
             raise ConnectionError("task worker TCP server is unavailable")
         from transport_port import MessageType
 
-        server.send_to_client(
-            node_id, message.snapshot(), MessageType.TASK_WORKER,
+        send_options = {}
+        epoch_getter = getattr(server, "get_authenticated_peer_epoch", None)
+        if callable(epoch_getter):
+            epoch = epoch_getter(node_id)
+            if epoch is None:
+                raise ConnectionError("task worker registration is no longer current")
+            send_options["registration_epoch"] = epoch
+        sent = server.send_to_client(
+            node_id, message.snapshot(), MessageType.TASK_WORKER, **send_options,
         )
+        if sent is False:
+            raise ConnectionError("task worker message was not delivered")
 
 
     def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
@@ -867,6 +911,132 @@ class SchedulerTaskWorkerMixin:
         from transport_port import MessageType
 
         client.send_data(message.snapshot(), MessageType.TASK_WORKER)
+
+
+    def _task_worker_hello_followup_owner_current(self, node_id, work) -> bool:
+        server, generation, _received_at, _changed = work
+        return bool(
+            self._running
+            and not self._startup_cancel_event.is_set()
+            and self._effective_role() == "master"
+            and self.get_distributed_inference_enabled()
+            and self._tcp_server is server
+            and server is not None and getattr(server, "_running", False)
+            and generation > 0
+            and self._assignment_connection_generation(node_id) == generation
+            and node_id not in self._task_worker_control.pending_worker_ids()
+        )
+
+    def _task_worker_hello_followup_current(self, node_id, work) -> bool:
+        return bool(
+            self._task_worker_hello_followup_owner_current(node_id, work)
+            and self._task_worker_control.worker_snapshot(node_id).get(
+                "hello_received_at"
+            ) == work[2]
+        )
+
+    def _queue_task_worker_hello_followup(self, node_id, server, generation):
+        snapshot = self._task_worker_control.worker_snapshot(node_id)
+        work = (server, generation, snapshot.get("hello_received_at"),
+                snapshot.get("capabilities_changed", True))
+        # This is a bounded wakeup list, not another worker/connection registry.
+        # All decisions below come from the live control and transport owners.
+        with self._task_worker_refresh_lock:
+            if not self._task_worker_hello_followup_current(node_id, work):
+                return
+            pending = getattr(self, "_task_worker_hello_followups", None)
+            if pending is None:
+                pending = self._task_worker_hello_followups = {}
+            previous = pending.get(node_id)
+            for peer, item in list(pending.items()):
+                if not self._task_worker_hello_followup_owner_current(peer, item):
+                    pending.pop(peer, None)
+            if previous is not None and previous[:2] == work[:2]:
+                # An identical refresh must not erase an earlier changed hello
+                # that the monitor has not yet applied.
+                work = (*work[:3], previous[3] or work[3])
+            if node_id not in pending and len(pending) >= self._max_nodes:
+                logger.warning("task worker hello followup bound reached node=%s", node_id)
+                return
+            pending[node_id] = work
+        self._start_layer_config_retry_monitor()
+
+    def _start_layer_config_retry_monitor(self):
+        # Serialize starts from both hello and ordinary configuration publishes.
+        # Reuse the one daemon and its existing _running/stop lifecycle.
+        with self._task_worker_refresh_lock:
+            super()._start_layer_config_retry_monitor()
+
+    def _retry_pending_layer_configs(self, now=None) -> int:
+        self._drain_task_worker_hello_followups()
+        return super()._retry_pending_layer_configs(now=now)
+
+    def _drain_task_worker_hello_followups(self):
+        with self._task_worker_refresh_lock:
+            pending = getattr(self, "_task_worker_hello_followups", {})
+            items = list(pending.items())
+        for node_id, work in items:
+            if not self._task_worker_hello_followup_current(node_id, work):
+                with self._task_worker_refresh_lock:
+                    # A same-owner HELLO may have updated the control snapshot
+                    # before reaching its ACK/queue edge. Keep changed intent
+                    # for that successor to merge; only retire an expired owner.
+                    if (pending.get(node_id) is work
+                            and not self._task_worker_hello_followup_owner_current(node_id, work)):
+                        pending.pop(node_id, None)
+                continue
+            # Never park the retry monitor behind GC, either. Recheck ownership
+            # *after* acquiring the execution lock, before creating a provider.
+            if not self._task_worker_stage_lock.acquire(blocking=False):
+                continue
+            try:
+                if not self._task_worker_hello_followup_current(node_id, work):
+                    continue
+                snapshot = self._task_worker_control.worker_snapshot(node_id)
+                if snapshot.get("accepted"):
+                    self._ensure_remote_task_worker_provider(node_id)
+            finally:
+                self._task_worker_stage_lock.release()
+            try:
+                self._apply_task_worker_hello_followup(node_id, work)
+            except Exception:
+                # One failed publish must not kill the shared retry monitor.
+                logger.warning("task worker hello followup failed node=%s", node_id,
+                               exc_info=True)
+                continue
+            with self._task_worker_refresh_lock:
+                if (pending.get(node_id) is work
+                        and (self._task_worker_hello_followup_current(node_id, work)
+                             or not self._task_worker_hello_followup_owner_current(node_id, work))):
+                    pending.pop(node_id, None)
+
+    def _apply_task_worker_hello_followup(self, node_id, work):
+        def current():
+            return self._task_worker_hello_followup_current(node_id, work)
+
+        if not current():
+            return
+        snapshot = self._task_worker_control.worker_snapshot(node_id)
+        accepted = snapshot.get("accepted")
+        capabilities = snapshot.get("capabilities") or {}
+        cleanup_pending = bool(self._pending_pipeline_model_cleanup_for_node(node_id))
+        if accepted and cleanup_pending and current():
+            self._replay_pipeline_model_cleanup_for_node(node_id)
+        recovery_sync = bool(accepted and self._pipeline_recovery_pending)
+        if not cleanup_pending and not recovery_sync and work[3] and current():
+            self.push_layer_config_to_clients()
+        if recovery_sync and not cleanup_pending and current():
+            self.request_authoritative_layer_sync(require_distributed=True)
+        is_layer_worker = bool(
+            "layer_forward" in capabilities.get("stage_types", [])
+            and capabilities.get("layer_ranges")
+        )
+        if (accepted and capabilities.get("models") and not is_layer_worker
+                and not capabilities.get("layer_worker", False)
+                and not self._is_relay_host(node_id) and current()):
+            self._handle_layer_worker_opt_out(
+                node_id, {"data": {"node_id": node_id}}, hello_work=work,
+            )
 
 
     def _ensure_remote_task_worker_provider(
@@ -1303,6 +1473,9 @@ class SchedulerTaskWorkerMixin:
     def _cleanup_task_worker_prepare(self, reason_code, *, client=None, close=False):
         if client is not None and getattr(self, "_tcp_client", None) is not client:
             return
+        if client is None:
+            with self._task_worker_refresh_lock:
+                getattr(self, "_task_worker_hello_followups", {}).clear()
         with self._task_worker_stage_lock:
             for attempt in self._task_worker_active_attempts.values():
                 attempt.cancel_reason = reason_code
@@ -1679,11 +1852,13 @@ class SchedulerTaskWorkerMixin:
                     #   ⇒ worker 侧只看到"连上又断开"，master 侧**一行日志都没有**，
                     #   排查只能靠猜（实测：Y700 每 30s 重连一次、只知道
                     #   `task_worker_handshake_pending`，定位花了好几轮）。
+                    hello_connection_generation = self._assignment_connection_generation(client_id)
                     try:
                         ack = self._task_worker_control.receive_on_coordinator(
                             client_id,
                             raw,
                             coordinator_node_id=self.get_effective_node_id(),
+                            connection_generation=hello_connection_generation,
                         )
                     except Exception:
                         logger.error(
@@ -1708,77 +1883,19 @@ class SchedulerTaskWorkerMixin:
                     # hello and a definitive rejection.  A rejected hello is
                     # no longer negotiating the task-worker path, so legacy
                     # scheduling can be recomputed for that connection.
-                    self._task_worker_control.resolve_worker_connection_pending(client_id)
-                    # ★ 幂等 hello（#28）：**只有 capabilities 真的变了**才重推层配置。
-                    #   此前无条件 push，配合层段路径补 refresh 会形成
-                    #   `hello → push → load_layer_range → refresh → hello` 自激环（每次 push
-                    #   都取新 generation ⇒ worker 端永远判成"新配置"）。
-                    #   字段缺失时按"变了"处理（保守：多重推一次总好过永远不推）。
-                    worker_snapshot = self._task_worker_control.worker_snapshot(client_id)
-                    # Recovery must use one authoritative publish. A normal
-                    # capability push here would create a second generation.
-                    recovery_sync = bool(
-                        ack.payload["accepted"] and self._pipeline_recovery_pending
-                    )
-                    if not recovery_sync and worker_snapshot.get(
-                        "capabilities_changed", True
+                    if not self._task_worker_control.resolve_worker_connection_pending(
+                        client_id, connection_generation=hello_connection_generation,
                     ):
-                        self.push_layer_config_to_clients()
-                    # ★ 2026-10-05（DIST-1 三机重启实测）：权威重发此前**只在请求路径**
-                    #   触发，而请求会被恢复闸门自身拒绝 ⇒ 没有任何路径去产生「新代际」
-                    #   ⇒ 闸门永不解除（实测：三机全部在线、TCP 已重连、hello
-                    #   accepted=True，请求仍返回 `pipeline_recovery_pending`；
-                    #   readiness 停在 `layer_status=not_configured`，且准入名单在
-                    #   同一次会话内由非空变为空）。
-                    #   worker 重新 hello 是「这个节点回来了」的权威信号，恢复期就在
-                    #   此刻补一次**权威重发**：`require_distributed=True` 的语义是
-                    #   「按当前在线能力重算一份新计划」，而不是重放持久化的旧计划
-                    #   （见 `push_layer_config_to_clients_locked` 里对
-                    #   `_pipeline_recovery_pending` 的处理）。
-                    if recovery_sync:
-                        logger.info(
-                            "重启恢复期收到 worker hello，触发权威重发: node=%s",
-                            client_id,
-                        )
-                        self.request_authoritative_layer_sync(require_distributed=True)
-                    if ack.payload["accepted"]:
-                        self._ensure_remote_task_worker_provider(client_id)
-                        # A node that has just advertised a complete model is
-                        # a Full Worker, not a layer partition.  Registration
-                        # may have pushed a layer config before the hello
-                        # arrived; release that reservation so the two roles
-                        # cannot race and make the Worker reject its Stage.
-                        advertised_models = (
-                            message.payload.get("capabilities", {}).get("models", [])
-                            if isinstance(message.payload, dict)
-                            else []
-                        )
-                        is_layer_stage_worker = bool(
-                            isinstance(advertised_capabilities, dict)
-                            and "layer_forward" in advertised_capabilities.get(
-                                "stage_types", []
-                            )
-                            and advertised_capabilities.get("layer_ranges")
-                        )
-                        # Layer/relay workers deliberately advertise no full
-                        # model identity.  Do not turn their hello into an
-                        # opt-out: the layer-config handshake is their role.
-                        # ★ relay 宿主是第三类角色，判据唯一的出处在 `_is_relay_host()`：
-                        #   它不能声明 `forward_layers`（声明了就会拒绝 legacy 层配置，而
-                        #   relay 委派正是走那条通道），但它要的恰恰就是那份 legacy 配置，
-                        #   因此不能被当 Full Worker 释放预留。
-                        if (advertised_models
-                                and not self._is_relay_host(client_id)
-                                and not is_layer_stage_worker
-                                and not bool(
-                                    advertised_capabilities.get(
-                                        "layer_worker", False
-                                    )
-                                )):
-                            self._handle_layer_worker_opt_out(
-                                client_id,
-                                {"data": {"node_id": client_id}},
-                            )
+                        # A new REGISTER superseded this hello after its ACK.
+                        # The old callback must not open the successor's fence.
+                        return
+                    # ACK and the registration fence belong to the receive
+                    # thread. Provider admission and scheduling can wait behind
+                    # supply GC's stage lock; leave them to the existing retry
+                    # monitor so this socket can keep processing heartbeats.
+                    self._queue_task_worker_hello_followup(
+                        client_id, self._tcp_server, hello_connection_generation,
+                    )
                     logger.info(
                         "event=task_worker_hello_acked node_id=%s accepted=%s version=%s",
                         client_id,

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import logging
@@ -26,10 +27,19 @@ class BackendSupervisor:
         host: str = "127.0.0.1",
         port: int = 8000,
         *,
+        bind_host: Optional[str] = None,
         probe_timeout: float = 1.0,
         startup_timeout: float = 30.0,
     ) -> None:
         self.host = str(host or "127.0.0.1")
+        # host is the client/probe destination; only bind_host configures the
+        # listener. Preserve the local IPv6 loopback default without exposing
+        # any non-loopback interface unless explicitly configured.
+        default_bind = "::1" if self.host == "::1" else "127.0.0.1"
+        configured_bind = (
+            os.environ.get("QLH_BACKEND_HOST") if bind_host is None else bind_host
+        )
+        self.bind_host = str(configured_bind or "").strip() or default_bind
         self.port = int(port)
         self.probe_timeout = max(0.2, float(probe_timeout))
         # A refused local connection should not hold the splash screen for the
@@ -90,7 +100,7 @@ class BackendSupervisor:
 
         config = uvicorn.Config(
             api_server.app,
-            host=self.host,
+            host=self.bind_host,
             port=self.port,
             log_level="warning",
             log_config=None,

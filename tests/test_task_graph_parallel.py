@@ -260,19 +260,34 @@ def test_parallel_failure_waits_for_other_future_and_releases_all_slots():
 
 
 def test_parallel_cancellation_reaches_all_providers_and_releases_slots():
-    start_barrier = threading.Barrier(3)
-    never_release = threading.Event()
+    class CancellationGate(threading.Event):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.allow_observation = threading.Event()
+
+        def wait(self, timeout=None):
+            self.entered.set()
+            assert self.allow_observation.wait(20), "provider gate not released"
+            return super().wait(timeout)
+
+    class CompletionTrackedFakeProvider(DeterministicFakeProvider):
+        def __init__(self, provider_id, **kwargs):
+            self.execution_finished = threading.Event()
+            super().__init__(provider_id, **kwargs)
+
+        def execute(self, attempt, reservation, cancel_event):
+            try:
+                return super().execute(attempt, reservation, cancel_event)
+            finally:
+                # super().execute has finalized the fake record and active attempt.
+                self.execution_finished.set()
+
+    gates = [CancellationGate(), CancellationGate()]
     registry = ProviderRegistry()
-    candidate_a = DeterministicFakeProvider(
-        "fake_a",
-        start_barrier=start_barrier,
-        block_event=never_release,
-    )
-    candidate_b = DeterministicFakeProvider(
-        "fake_b",
-        start_barrier=start_barrier,
-        block_event=never_release,
-    )
+    candidate_a = CompletionTrackedFakeProvider("fake_a", block_event=gates[0])
+    candidate_b = CompletionTrackedFakeProvider("fake_b", block_event=gates[1])
+    providers = (candidate_a, candidate_b)
     registry.register(candidate_a)
     registry.register(candidate_b)
     registry.register(InProcessWorkerProvider(
@@ -298,26 +313,47 @@ def test_parallel_cancellation_reaches_all_providers_and_releases_slots():
 
     thread = threading.Thread(target=run_workflow)
     thread.start()
-    start_barrier.wait(timeout=5)
-    coordinator.cancel("wf_parallelcancel")
-    # 并行负载（-n auto）下取消传播可能超过 5s（T-1 实测 flaky），
-    # 放宽等待上限；取消语义不变（随后断言状态与释放）。
-    thread.join(20)
+    try:
+        for gate in gates:
+            assert gate.entered.wait(20), "provider did not reach execution gate"
+        requested = coordinator.cancel("wf_parallelcancel")
+        assert requested["cancel_requested"] is True
+        thread.join(20)
 
-    assert not thread.is_alive()
-    assert isinstance(errors[0], WorkflowCancelled)
-    snapshot = coordinator.get("wf_parallelcancel")
-    assert snapshot["state"] == "cancelled"
-    assert {
-        stage["state"] for stage in snapshot["stages"][:2]
-    } == {"cancelled"}
-    assert all(
-        item["active_reservations"] == 0
-        for item in coordinator.provider_status()
-    )
-    assert candidate_a.call_records()[0]["state"] == "cancelled"
-    assert candidate_b.call_records()[0]["state"] == "cancelled"
-    coordinator.close()
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], WorkflowCancelled)
+        snapshot = coordinator.get("wf_parallelcancel")
+        assert snapshot["state"] == "cancelled"
+        assert {
+            stage["state"] for stage in snapshot["stages"][:2]
+        } == {"cancelled"}
+        assert all(
+            item["active_reservations"] == 0
+            for item in coordinator.provider_status()
+        )
+        # A terminal workflow acknowledges cancellation without waiting for the
+        # provider execution thread. Force that ordering before allowing either
+        # fake to observe cancellation and finalize its call record.
+        for provider in providers:
+            assert not provider.execution_finished.is_set()
+            assert provider.call_records()[0]["state"] == "running"
+        for gate in gates:
+            gate.allow_observation.set()
+        for provider in providers:
+            assert provider.execution_finished.wait(20), "provider did not finish"
+            record = provider.call_records()[0]
+            assert record["state"] == "cancelled"
+            assert record["finished_at"] is not None
+    finally:
+        for gate in gates:
+            gate.allow_observation.set()
+        coordinator.cancel("wf_parallelcancel")
+        thread.join(20)
+        coordinator.close()
+        for provider, gate in zip(providers, gates):
+            if gate.entered.is_set():
+                assert provider.execution_finished.wait(20)
 
 
 def test_parallel_journal_sequence_is_contiguous(tmp_path):

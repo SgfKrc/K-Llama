@@ -548,7 +548,7 @@ GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5
 #:   调整（默认仍是 120，既有行为不变）。
 PIPELINE_TIMEOUT = _env_int("QLH_PIPELINE_TIMEOUT", 120)   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
 PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
-    "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
+    "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 180.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK
 # ⚠️ **未接线**（全仓仅此一处定义、**无消费者**）：它只说明「D 档层流水线是串行的」，
 # 真正的串行由 `src/scheduler.py` 的 `_pipeline_lock` 保证。多请求交叠落地后再接线

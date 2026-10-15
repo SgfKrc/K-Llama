@@ -133,16 +133,23 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
             for _ in range(int(n_kv)):
                 key = _gguf_read_string(handle)
                 (value_type,) = struct.unpack("<I", handle.read(4))
-                if key == "general.architecture" and value_type == _GGUF_TYPE_STRING:
+                if key == "general.architecture":
+                    if arch is not None or value_type != _GGUF_TYPE_STRING:
+                        return None
                     arch = _gguf_read_string(handle)
                     continue
-                # 只留流水线合同需要的整数标量；浮点/字符串没有用还占地方。
+                # Preserve original scalar types. A present invalid value must
+                # not become an absent/default value or a coerced integer.
                 if key.endswith((
                     ".block_count", ".nextn_predict_layers", ".embedding_length",
                 )):
-                    value = _gguf_read_scalar(handle, value_type)
-                    if isinstance(value, int):
-                        scalars[key] = value
+                    if key in scalars:
+                        return None
+                    if value_type in _GGUF_SCALAR_TYPES:
+                        scalars[key] = _gguf_read_scalar(handle, value_type)
+                    else:
+                        _gguf_skip_value(handle, value_type)
+                        scalars[key] = None
                     continue
                 _gguf_skip_value(handle, value_type)
     except (OSError, ValueError, struct.error, UnicodeDecodeError):
@@ -151,16 +158,23 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     if not arch:
         return None
     block_count = scalars.get(f"{arch}.block_count")
-    if not isinstance(block_count, int) or block_count <= 0:
+    if type(block_count) is not int or block_count <= 0:
         return None
-    nextn = scalars.get(f"{arch}.nextn_predict_layers") or 0
-    n_embd = scalars.get(f"{arch}.embedding_length") or 0
+    nextn = scalars.get(f"{arch}.nextn_predict_layers", 0)
+    if type(nextn) is not int or not 0 <= nextn < block_count:
+        return None
+    embedding_key = f"{arch}.embedding_length"
+    n_embd = scalars.get(embedding_key, 0)
+    if embedding_key in scalars and (type(n_embd) is not int or n_embd <= 0):
+        return None
+    # Missing embedding metadata remains explicit as 0 for layer-only
+    # diagnostics. Executable descriptors/builders must require a positive size.
     return {
         "architecture": arch,
         "block_count": block_count,
-        "nextn_predict_layers": int(nextn),
-        "n_layer": max(0, block_count - int(nextn)),
-        "n_embd": max(0, int(n_embd)),
+        "nextn_predict_layers": nextn,
+        "n_layer": block_count - nextn,
+        "n_embd": n_embd,
     }
 
 

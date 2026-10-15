@@ -869,27 +869,64 @@ def set_local_master_identity(mac_addresses: list[str]) -> dict:
     return value
 
 
+def _write_model_registry_row(connection: sqlite3.Connection, model_id: str,
+                              config: dict, now: str) -> None:
+    connection.execute(
+        """
+        INSERT INTO model_registry
+          (model_id, name, model_path, gguf_path, quantization, sha256, payload, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(model_id) DO UPDATE SET
+          name=excluded.name, model_path=excluded.model_path, gguf_path=excluded.gguf_path,
+          quantization=excluded.quantization, sha256=excluded.sha256,
+          payload=excluded.payload, updated_at=excluded.updated_at
+        """,
+        (
+            str(model_id), str(config.get("name", "")), str(config.get("model_path", "")),
+            str(config.get("gguf_path", "")), str(config.get("quantization", "")),
+            str(config.get("sha256", "")), json.dumps(config, ensure_ascii=False), now, now,
+        ),
+    )
+
+
 def save_local_experimental_model(model_id: str, config_json: str) -> bool:
     """Persist a user-registered model configuration in the main-node SQLite."""
     config = json.loads(config_json) if isinstance(config_json, str) else dict(config_json)
-    now = _now()
     with _write_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO model_registry
-              (model_id, name, model_path, gguf_path, quantization, sha256, payload, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(model_id) DO UPDATE SET
-              name=excluded.name, model_path=excluded.model_path, gguf_path=excluded.gguf_path,
-              quantization=excluded.quantization, sha256=excluded.sha256,
-              payload=excluded.payload, updated_at=excluded.updated_at
-            """,
-            (
-                str(model_id), str(config.get("name", "")), str(config.get("model_path", "")),
-                str(config.get("gguf_path", "")), str(config.get("quantization", "")),
-                str(config.get("sha256", "")), json.dumps(config, ensure_ascii=False), now, now,
-            ),
-        )
+        _write_model_registry_row(connection, model_id, config, _now())
+    return True
+
+
+def save_local_experimental_model_cas(model_id: str, config_json: str | dict,
+                                      *, expected: dict | None) -> bool:
+    """Save only while the complete registry payload still matches its snapshot.
+
+    ``expected=None`` permits insertion only when the ID has no registry row.
+    Comparison and publication share one BEGIN IMMEDIATE transaction, including
+    protection against writers using another SQLite connection or process.
+    """
+    config = json.loads(config_json) if isinstance(config_json, str) else dict(config_json)
+    # Compare JSON values, independent of persisted whitespace and key order.
+    expected_payload = (json.dumps(expected, ensure_ascii=True, sort_keys=True,
+                                   separators=(",", ":")) if expected is not None else None)
+    with _write_connection() as connection:
+        current = connection.execute(
+            "SELECT payload FROM model_registry WHERE model_id = ?", (str(model_id),),
+        ).fetchone()
+        if expected is None:
+            if current is not None:
+                return False
+        else:
+            if current is None:
+                return False
+            try:
+                current_payload = json.dumps(json.loads(current["payload"]), ensure_ascii=True,
+                                             sort_keys=True, separators=(",", ":"))
+            except (TypeError, ValueError):
+                return False
+            if current_payload != expected_payload:
+                return False
+        _write_model_registry_row(connection, model_id, config, _now())
     return True
 
 

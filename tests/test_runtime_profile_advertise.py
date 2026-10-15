@@ -9,15 +9,37 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "packaging" / "packaging"))
+import pytest
 
-import device_profiler as dp  # noqa: E402
-from scheduler_types import NodeInfo, NodeState  # noqa: E402
+import device_profiler as dp
+from scheduler_types import NodeInfo, NodeState
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_GUARD = ROOT / "packaging" / "packaging" / "runtime_guard.py"
+
+
+def _load_runtime_guard(path: Path, monkeypatch):
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Required packaging contract is missing: {path}. "
+            "Run git submodule update --init --depth 1 packaging."
+        )
+    name = "_qlh_packaging_runtime_guard_contract"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses resolves annotations through sys.modules during exec_module.
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_detect_runtime_profile_accepts_each_declared_value(monkeypatch):
@@ -39,11 +61,29 @@ def test_detect_runtime_profile_falls_back_to_unspecified(monkeypatch):
     assert dp.detect_runtime_profile() == dp.RUNTIME_PROFILE_UNSPECIFIED
 
 
-def test_runtime_profile_set_matches_packaging_contract():
+def test_runtime_profile_set_matches_packaging_contract(monkeypatch):
     """src 与打包侧的 profile 集合是同一份合同，任一侧新增必须同时改另一侧。"""
-    import runtime_guard
+    runtime_guard = _load_runtime_guard(RUNTIME_GUARD, monkeypatch)
 
+    assert Path(runtime_guard.__file__).resolve() == RUNTIME_GUARD.resolve()
     assert dp.RUNTIME_PROFILES == runtime_guard.RUNTIME_PROFILES
+
+
+def test_packaging_contract_requires_the_checked_out_source(tmp_path, monkeypatch):
+    # An unrelated installed module must never make a missing submodule pass.
+    monkeypatch.setitem(sys.modules, "runtime_guard", SimpleNamespace(
+        RUNTIME_PROFILES=dp.RUNTIME_PROFILES,
+    ))
+    with pytest.raises(FileNotFoundError, match="git submodule update --init"):
+        _load_runtime_guard(tmp_path / "missing" / "runtime_guard.py", monkeypatch)
+
+
+def test_packaging_contract_does_not_reuse_an_installed_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, "runtime_guard", SimpleNamespace(
+        RUNTIME_PROFILES=("unrelated_installed_profile",),
+    ))
+    guard = _load_runtime_guard(RUNTIME_GUARD, monkeypatch)
+    assert guard.RUNTIME_PROFILES == dp.RUNTIME_PROFILES
 
 
 def test_device_profile_dict_carries_runtime_profile(monkeypatch):
@@ -87,3 +127,58 @@ def test_pc_task_worker_hello_exposes_runtime_profile(monkeypatch):
     capabilities = scheduler._task_worker_capabilities()
 
     assert capabilities["runtime_profile"] == "llama_cpp_only"
+
+
+@pytest.mark.parametrize(
+    ("include_tools", "missing_core", "expected_code"),
+    [(False, False, 0), (True, False, 2), (False, True, 2)],
+    ids=["core-stays-collected", "tool-opt-in-keeps-import-errors", "core-import-errors-stay-fatal"],
+)
+def test_workspace_tool_collection_ownership(
+    tmp_path, include_tools, missing_core, expected_code,
+):
+    shutil.copyfile(ROOT / "tests" / "conftest.py", tmp_path / "conftest.py")
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (tmp_path / "test_core.py").write_text(
+        "def test_core_contract(): assert True\n", encoding="utf-8",
+    )
+    for name in (
+        "test_docagent_gate.py", "test_doc_maintenance_audit.py",
+        "test_model_fleet_explicit_layer_pager.py", "test_model_fleet_memory_transport.py",
+        "test_model_fleet_n2f_fixed_tile.py", "test_model_fleet_n2r_artifact_gate.py",
+        "test_model_fleet_n2r_compare.py", "test_offline_bundle.py",
+    ):
+        (tmp_path / name).write_text(
+            "raise ImportError('external tool source required')\n", encoding="utf-8",
+        )
+    core_contracts = (
+        "test_model_fleet_core_dependency.py", "test_experiment_gemma_quality_unit.py",
+        "test_experiment_production_quality.py", "test_llama_dependency_contract.py",
+    )
+    if missing_core:
+        for name in core_contracts:
+            (tmp_path / name).write_text(
+                "raise ImportError('core dependency required')\n", encoding="utf-8",
+            )
+    env = os.environ.copy()
+    env.pop("QLH_INCLUDE_WORKSPACE_TOOL_TESTS", None)
+    if include_tools:
+        env["QLH_INCLUDE_WORKSPACE_TOOL_TESTS"] = "1"
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", str(tmp_path), "--collect-only",
+         "-q", "-c", str(tmp_path / "pytest.ini"), "--confcutdir", str(tmp_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=90,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == expected_code, output
+    assert "test_core.py::test_core_contract" in output, output
+    if include_tools:
+        assert "external tool source required" in output
+    elif missing_core:
+        assert "core dependency required" in output
+        assert all(name in output for name in core_contracts)
+    else:
+        assert "1 test collected" in output
+        assert "skipped" not in output

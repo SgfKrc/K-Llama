@@ -7,7 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
+from api_errors import CodedHTTPException, ERROR_CODE_HEADER
 from model_intent import ModelIntentCoordinator
 from model_supply import ModelSupplyCoordinator, ModelSupplyError
 from worker_assignment_state import WorkerAssignmentRegistry, PHASE_READY
@@ -54,7 +56,8 @@ def setup(tmp_path, prepare, *, retire=None, retire_timeout=300):
                                 _pipeline_load_transaction=None, _active_pipeline_capacity_plan=None,
                                 _pipeline_model_cleanup_ledger={}, _worker_assignments=WorkerAssignmentRegistry(),
                                 _effective_role=lambda: "master", get_distributed_inference_enabled=lambda: True,
-                                _assignment_connection_generation=lambda node: 11)
+                                _assignment_connection_generation=lambda node: 11,
+                                _connected_client_ids=lambda: {"tail", "worker"})
     # Explicit owner evidence, using the production native readiness predicate.
     scheduler._worker_prepare_assignment_loaded = WorkerPrepareCoordinatorMixin._worker_prepare_assignment_loaded.__get__(scheduler)
     supply.scheduler = scheduler
@@ -235,6 +238,10 @@ def native_intent(stage_case, monkeypatch):
     # the actual lookup, cancellation events, and selected-asset prepare guard.
     monkeypatch.setattr(supply, "get", lambda op: ModelSupplyCoordinator.get(supply, op))
     monkeypatch.setattr(supply, "_run", lambda op: None)  # No actual supply/network work.
+    # Native lifecycle tests replace capacity planning below; its fresh network
+    # inventory shares that boundary. Keep a snapshot marker through admission.
+    capacity_evidence = SimpleNamespace()
+    monkeypatch.setattr(supply, "prepare_capacity_evidence", lambda _op: capacity_evidence)
     monkeypatch.setattr(supply.scheduler._model_supply_worker, "selected_model_path", lambda: case.model_path)
     case.master._tcp_server.get_client_info = lambda node: {"connected_at": 11} if node in case.connected else None
     from tests.test_pipeline_retirement import _Manager
@@ -262,6 +269,112 @@ async def wait_until(predicate):
         while not predicate():
             await asyncio.sleep(0.001)
     await asyncio.wait_for(wait(), timeout=3)
+
+
+@pytest.mark.parametrize("error,expected_code,expected_reason", [
+    pytest.param(CodedHTTPException(409, "MODEL_TXN_CONFLICT", {
+        "code": "LEGACY_IGNORED", "message": "Another model transaction is active",
+        "model_path": "/private/master/segment.gguf",
+    }), "MODEL_TXN_CONFLICT", "Another model transaction is active", id="coded-attribute-precedes-detail"),
+    pytest.param(HTTPException(409, {"code": "LEGACY_IGNORED", "message": "Worker capacity is stale"},
+        headers={ERROR_CODE_HEADER: "pipeline_remote_capacity_stale"}),
+        "pipeline_remote_capacity_stale", "Worker capacity is stale", id="header-precedes-detail"),
+    pytest.param(HTTPException(409, {"code": "SUPPLY_OPERATION_STALE", "message": "Selected asset changed"}),
+        "SUPPLY_OPERATION_STALE", "Selected asset changed", id="legacy-detail-code"),
+    pytest.param(HTTPException(409, {"reason_code": "SUPPLY_WORKER_DISCONNECTED", "message": "Worker disconnected"}),
+        "SUPPLY_WORKER_DISCONNECTED", "Worker disconnected", id="legacy-detail-reason-code"),
+    pytest.param(ModelSupplyError("SUPPLY_PREPARE_CANCELLED", "Model preparation cancelled by user"),
+        "SUPPLY_PREPARE_CANCELLED", "Model preparation cancelled by user", id="supply-error"),
+    pytest.param(CodedHTTPException(400, "MODEL_TXN_PREPARE_FAILED",
+        "Native prepare failed at C:/private/master/segment.gguf; token=private-token"),
+        "MODEL_TXN_PREPARE_FAILED", "Model preparation failed; inspect master diagnostics", id="coded-string-private"),
+    pytest.param(HTTPException(409, "Worker capacity is stale",
+        headers={ERROR_CODE_HEADER: "pipeline_remote_capacity_stale"}),
+        "pipeline_remote_capacity_stale", "Model preparation failed; inspect master diagnostics", id="header-string"),
+    pytest.param(HTTPException(500, "Cannot open /private/master/segment.gguf; token=private-token"),
+        "INTENT_PREPARE_FAILED", "Model preparation failed; inspect master diagnostics", id="uncoded-string-private"),
+    pytest.param(RuntimeError("Cannot open /private/master/segment.gguf; token=private-token"),
+        "INTENT_PREPARE_FAILED", "Model preparation failed; inspect master diagnostics", id="unexpected-error-private"),
+    pytest.param(HTTPException(409, {"code": "", "reason_code": "SUPPLY_OPERATION_STALE", "message": "Selected asset changed"}),
+        "SUPPLY_OPERATION_STALE", "Selected asset changed", id="empty-code-uses-reason-code"),
+    pytest.param(HTTPException(500, {"code": "", "model_path": "/private/master/segment.gguf"}),
+        "INTENT_PREPARE_FAILED", "Model preparation failed", id="empty-code-fallback"),
+])
+def test_prepare_exception_preserves_code_and_safe_terminal_reason(native_intent, error, expected_code, expected_reason):
+    async def scenario():
+        case = native_intent
+        c, supply = case.coordinator, case.supply
+        calls = []
+        async def prepare(operation_id):
+            calls.append(operation_id)
+            raise error
+        c.prepare = prepare
+        try:
+            op = (await c.create(case.intent))["operation_id"]
+            task = c._tasks[op]
+            case.available(op)
+            await asyncio.wait_for(task, timeout=3)
+            assert calls == [op] and not c._tasks
+            assert supply._events[op].is_set() and not supply._preparing
+            with pytest.raises(ModelSupplyError) as cancelled:
+                supply.ensure_prepare_not_cancelled(op)
+            assert cancelled.value.code == "SUPPLY_PREPARE_CANCELLED"
+            persisted = json.loads((c.root / op / "intent.json").read_text(encoding="utf-8"))
+            recovered = ModelIntentCoordinator(case.master, prepare)
+            for result in (c.get(op), c.current(), persisted, recovered.current()):
+                assert result["status"] == "failed"
+                assert result["reason_code"] == expected_code
+                assert result["reason"] == expected_reason
+                public = json.dumps(result)
+                assert "private/master" not in public and "private-token" not in public
+                assert "master_model_path" not in public
+            assert c.get(op)["loaded_ready"] is False
+            assert calls == [op] and not recovered._tasks
+        finally:
+            await c.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure,expected_code", [
+    ("capacity_rejected", "pipeline_remote_capacity_stale"),
+    ("native_prepare", "MODEL_TXN_PREPARE_FAILED"),
+])
+def test_real_prepare_route_failure_keeps_code_without_private_details(native_intent, monkeypatch, failure, expected_code):
+    async def scenario():
+        case = native_intent
+        c, supply, master = case.coordinator, case.supply, case.master
+        if failure == "capacity_rejected":
+            monkeypatch.setattr(master, "get_pipeline_capacity_plan", lambda *_args, **_kwargs: {
+                "admitted": False, "status": "rejected", "assignments": [],
+                "reason_code": expected_code, "reason": "Worker capacity is stale; retry the selection",
+            })
+        else:
+            from tests.test_pipeline_retirement import _Manager
+            def broken_prepare(_manager, **_kwargs):
+                raise OSError("Cannot open C:/private/master/segment.gguf; token=private-token")
+            monkeypatch.setattr(_Manager, "prepare_pipeline_model", broken_prepare)
+        try:
+            op = (await c.create(case.intent))["operation_id"]
+            task = c._tasks[op]
+            case.available(op)
+            await asyncio.wait_for(task, timeout=3)
+            assert case.managers  # The real route entered the candidate owner.
+            if failure == "capacity_rejected":
+                assert master._pipeline_load_transaction["phase"] == "rejected"
+                assert case.host.pipeline_candidate_status()["phase"] == "aborted"
+            assert master._active_pipeline_capacity_plan is None
+            assert supply._events[op].is_set() and not supply._preparing and not c._tasks
+            persisted = json.loads((c.root / op / "intent.json").read_text(encoding="utf-8"))
+            for result in (c.get(op), c.current(), persisted):
+                assert result["status"] == "failed"
+                assert result["reason_code"] == expected_code
+                assert result["reason"] == "Model preparation failed; inspect master diagnostics"
+                public = json.dumps(result)
+                assert "private/master" not in public and "private-token" not in public
+            assert c.get(op)["loaded_ready"] is False
+        finally:
+            await c.close()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("failed_file", ["intent.json", "current-intent.json"])
@@ -657,6 +770,128 @@ def retire_local(case):
     case.scheduler._worker_assignments.clear()
 
 
+@pytest.mark.parametrize("retirement", ["recovered", "during_selection"])
+def test_two_node_selection_preserves_offline_native_release_debt(native_intent, retirement):
+    from tests.test_worker_prepare_coordinator import ack, prepare_both
+
+    async def scenario():
+        case = native_intent
+        c, master, supply = case.coordinator, case.master, case.supply
+        try:
+            old = (await c.create(case.intent))["operation_id"]
+            task = c._tasks[old]
+            case.available(old)
+            await wait_until(lambda: master._pipeline_load_transaction is not None)
+            prepare_both(case)
+            ack(master, "worker", "commit")
+            ack(master, "android", "commit")
+            await task
+            for record in list(master._pipeline_model_cleanup_ledger.values()):
+                master._handle_worker_prepare_ack(record["node_id"], {
+                    "action": "ack", "phase": "finalize", "status": "finalized", "loaded": True,
+                    "identity": record["payload"]["worker_prepare_identity"], "cleanup_id": record["cleanup_id"],
+                })
+            assert not master._pipeline_model_cleanup_ledger
+            # Only the new healthy peer remains; both old native workers are offline.
+            case.connected.clear()
+            case.connected.add("rog")
+            debts = {}
+            retire_calls = []
+
+            async def retire():
+                retire_calls.append(old)
+                if master._pipeline_load_transaction is None:
+                    return
+                assert case.unload()["unloaded"] is True
+                debts.update(deepcopy(master._pipeline_model_cleanup_ledger))
+                assert {record["node_id"] for record in debts.values()} == {"worker", "android"}
+                assert all(record["action"] == "release" for record in debts.values())
+
+            c.retire = retire
+            c.retire_timeout = 0.03
+            if retirement == "recovered":
+                await retire()
+            fresh = await c.create({**case.intent, "model_id": "two-node-replacement"})
+            assert fresh["operation_id"] != old and len(supply._operations) == 2
+            assert supply.get(fresh["operation_id"])["wait_for_nodes"] is True
+            assert master._connected_client_ids() | {"master"} == {"master", "rog"}
+            assert master._pipeline_model_cleanup_ledger == debts
+            assert retire_calls == [old] and c._retire_task is None
+            assert not c.get(old)["loaded_ready"]
+            c.cancel(fresh["operation_id"])
+        finally:
+            await c.close()
+
+    asyncio.run(scenario())
+
+
+def test_reconnected_native_debt_blocks_both_gates_until_exact_release_ack(stage_case, monkeypatch):
+    from tests.test_worker_prepare_coordinator import publish
+
+    case = stage_case
+    master = case.master
+    publish(case)
+    for record in list(master._pipeline_model_cleanup_ledger.values()):
+        master._handle_worker_prepare_ack(record["node_id"], {
+            "action": "ack", "phase": "finalize", "status": "finalized", "loaded": True,
+            "identity": record["payload"]["worker_prepare_identity"], "cleanup_id": record["cleanup_id"],
+        })
+    master._invalidate_pipeline_load_transaction("test_two_node_retirement")
+    debts = deepcopy(master._pipeline_model_cleanup_ledger)
+    assert {record["action"] for record in debts.values()} == {"release"}
+    case.connected.clear()
+    case.connected.add("rog")
+    c = ModelIntentCoordinator(master, lambda op: None)
+    assert c._retirement_state() == (False, False)
+    assert master._pipeline_model_cleanup_ledger == debts
+
+    case.connected.add("worker")
+    returning = next(record for record in debts.values() if record["node_id"] == "worker")
+    assert master._replay_pipeline_model_cleanup_for_node("worker") is True
+    assert case.sent[-1][1] == {
+        "action": "release", "identity": returning["payload"]["worker_prepare_identity"],
+        "cleanup_id": returning["cleanup_id"],
+    }
+    assert c._retirement_state() == (False, True)
+
+    def assert_blocked():
+        blocked = master.start_pipeline_model_transaction(
+            candidate_id="after-reconnect", descriptor={}, model_path=str(case.model_path), quant_type="fp16")
+        assert blocked["admitted"] is False and blocked["reason_code"] == "MODEL_TXN_CLEANUP_PENDING"
+        assert c._retirement_state() == (False, True)
+        assert master._pipeline_model_cleanup_ledger == debts
+
+    assert_blocked()
+    exact = {"action": "ack", "phase": "release", "status": "released", "loaded": False,
+             "identity": returning["payload"]["worker_prepare_identity"], "cleanup_id": returning["cleanup_id"]}
+    for field, value in (("artifact_sha256", "f" * 64), ("generation", exact["identity"]["generation"] - 1),
+                         ("operation_id", "supply_stale"), ("assignment_id", "stale-assignment")):
+        wrong = deepcopy(exact)
+        wrong["identity"][field] = value
+        master._handle_worker_prepare_ack("worker", wrong)
+        assert_blocked()
+    for change in ({"cleanup_id": "stale-cleanup"}, {"loaded": True}):
+        master._handle_worker_prepare_ack("worker", {**exact, **change})
+        assert_blocked()
+    master._handle_layer_config_ack("worker", {"data": {**returning["payload"], "status": "released"}})
+    assert_blocked()
+
+    master._handle_worker_prepare_ack("worker", exact)
+    remaining = {key: record for key, record in debts.items() if record["node_id"] == "android"}
+    assert remaining and master._pipeline_model_cleanup_ledger == remaining
+    assert c._retirement_state() == (False, False)
+    # Exercise native admission after the fence without starting another model load.
+    admitted = []
+    def start_next(**kwargs):
+        admitted.append(kwargs["candidate"]["candidate_id"])
+        return {"admitted": True}
+    monkeypatch.setattr(master, "_push_layer_config_to_clients_locked", start_next)
+    result = master.start_pipeline_model_transaction(
+        candidate_id="after-reconnect", descriptor={}, model_path=str(case.model_path), quant_type="fp16")
+    assert result["admitted"] is True and admitted == ["after-reconnect"]
+    assert master._pipeline_model_cleanup_ledger == remaining
+
+
 def test_selection_waits_real_owner_cleanup_before_new_inventory_and_serializes_requests(ready_intent):
     async def scenario():
         case = ready_intent
@@ -667,7 +902,7 @@ def test_selection_waits_real_owner_cleanup_before_new_inventory_and_serializes_
             entered.set()
             await released.wait()
             retire_local(case)
-            case.scheduler._pipeline_model_cleanup_ledger["remote-release"] = {"state": "await_reconnect"}
+            case.scheduler._pipeline_model_cleanup_ledger["remote-release"] = {"node_id": "tail", "state": "await_reconnect"}
             local_free.set()
         case.c.retire = retire
         intent = {"model_id": "new"}
@@ -709,7 +944,7 @@ def test_retirement_failure_is_named_and_never_creates_supply(ready_intent, fail
             if failure == "missing_ledger":
                 del case.scheduler._pipeline_model_cleanup_ledger
             if failure == "pending_ack":
-                case.scheduler._pipeline_model_cleanup_ledger["release"] = {"state": "sent"}
+                case.scheduler._pipeline_model_cleanup_ledger["release"] = {"node_id": "master", "state": "sent"}
         if failure != "no_callback":
             case.c.retire = retire
         with pytest.raises(ModelSupplyError) as error:
@@ -793,7 +1028,12 @@ def test_late_unload_is_joined_before_explicit_retry_can_create_supply(ready_int
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("state,expected", [(None, None), ({}, False), ({"cleanup": {}}, True)])
+@pytest.mark.parametrize("state,expected", [
+    (None, None), ({}, False), ({"cleanup": {"node_id": "master"}}, True),
+    ({"cleanup": {"node_id": "tail", "state": "await_reconnect"}}, True),
+    ({"cleanup": {"node_id": "offline", "state": "await_reconnect"}}, False),
+    ({"cleanup": {"node_id": "offline", "state": "pending"}}, False),
+])
 def test_retirement_state_projects_cleanup_ledger_without_exporting_owner_dict(ready_intent, state, expected):
     case = ready_intent
     case.scheduler._pipeline_model_cleanup_ledger = state

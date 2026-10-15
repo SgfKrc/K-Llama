@@ -202,8 +202,15 @@ class TailRunner:
         return int(np.asarray(logits)[-1].argmax())
 
     def request_token_seq(self, hidden_bytes: bytes, *, n_tokens: int,
-                          meta: dict[str, object]) -> int:
-        """Tail variant with explicit per-token sequence positions."""
+                          meta: dict[str, object]):
+        """★ 2026-10-14（PIPE-COMM-01）：多位置回程 —— 返回 **每个位置各一个 argmax token**。
+
+        返回 `list[int]` 时，`serve_relay_connection` 会走 `TOKEN_SEQ` 帧一次回 γ 个 token
+        （见 `RelayFrameKind.TOKEN_SEQ` 的说明）。历史实现返回 int 仍被支持（单 token 回程）。
+
+        ⚠️ 本路径的逐位置 argmax **不保证与逐 token 顺序推进等价**（各位置只依赖其之前的
+        上下文），只用于验证 RTT 摊薄的物理收益。
+        """
         import numpy as np  # noqa: PLC0415
 
         count = int(n_tokens)
@@ -216,7 +223,14 @@ class TailRunner:
         )
         if logits is None:
             return -1
-        return int(np.asarray(logits)[-1].argmax())
+        arr = np.asarray(logits)
+        # `all_logits=True` ⇒ 形状 [n_tokens, vocab]；每行是该位置的 logits。
+        if arr.ndim >= 2 and arr.shape[0] == count:
+            return [int(row.argmax()) for row in arr]
+        # 形状不符（例如只给了末位）⇒ 如实退化，不冒充多位置结果。
+        if arr.ndim == 1:
+            return -1
+        return -1
 
     def close(self) -> None:
         self.reset()
@@ -340,8 +354,15 @@ class ShimTailRunner:
         return int(token)
 
     def request_token_seq(self, hidden_bytes: bytes, *, n_tokens: int,
-                          meta: dict[str, object]) -> int:
-        """Tail variant with explicit per-token sequence positions."""
+                          meta: dict[str, object]):
+        """★ 2026-10-14（PIPE-COMM-01）：多位置回程（keep-head 通道）。
+
+        `forward_hidden_to_token` 每次只回一个位置 ⇒ 对 γ 个位置**逐位调用**（每次只喂
+        `incoming[i:i+1]` 与 `positions=[pos_i]`），最后把 γ 个 token 作为 `list` 一次交回。
+        注意：**网络往返仍只有一次** —— 这正是"摊薄 RTT"的机制所在。
+
+        ⚠️ 逐位置 argmax 不保证与逐 token 顺序推进等价（各位置只依赖其之前的上下文）。
+        """
         import numpy as np  # noqa: PLC0415
 
         count = int(n_tokens)
@@ -350,11 +371,18 @@ class ShimTailRunner:
             raise ValueError(
                 f"tail hidden bytes={len(hidden_bytes)} expected={expected}")
         incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
-        return int(self._upstream.forward_hidden_to_token(
-            incoming,
-            seq_ids=meta.get("seq_ids"),
-            positions=meta.get("positions"),
-        ))
+        seq_ids = meta.get("seq_ids")
+        positions = meta.get("positions")
+        out: list[int] = []
+        for index in range(count):
+            seq_i = None if seq_ids is None else [seq_ids[index]]
+            pos_i = None if positions is None else [positions[index]]
+            out.append(int(self._upstream.forward_hidden_to_token(
+                incoming[index:index + 1],
+                seq_ids=seq_i,
+                positions=pos_i,
+            )))
+        return out
 
     def close(self) -> None:
         self.reset()

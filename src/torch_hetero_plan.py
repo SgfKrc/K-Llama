@@ -472,6 +472,12 @@ class ContinuousLayerBaseline:
     prefill_tokens: int
     decode_tokens: int
     non_split_bytes: int = 0
+    #: ⚠️ 2026-10-14（22c 缺口②）：这里的默认 1 只适用于**合成输入**的实验场景 ——
+    #: 本类是 `torch_hetero_plan` 的合成基线，**没有源 GGUF 路径**，无法自动读
+    #: `<arch>.full_attention_interval`。**真实入口**（`scripts/relay_cut_plan.py:116-127`）
+    #: 已在缺省时自动从 `--src-gguf` 读（`cut_multiple_from_gguf`，见 `#67`）。
+    #: ⇒ 对 hybrid（如 Qwen3.5，`full_attention_interval=4`），**用本类时必须显式传
+    #:   `cut_multiple`**，否则切点整体错位、llama.cpp 报 `missing tensor`。
     cut_multiple: int = 1
     minimum_layers_per_segment: int = 1
     minimum_fit_r2: float = 0.9

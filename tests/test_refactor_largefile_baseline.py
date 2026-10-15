@@ -26,6 +26,8 @@ from api import (  # noqa: E402
     routes_device,
     routes_health,
     routes_logs,
+    routes_model_intent,
+    routes_model_supply,
     routes_models,
     routes_sessions,
     routes_system,
@@ -350,9 +352,15 @@ def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
         routes_health: 4,
         routes_device: 3,
         # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate
-        #   （OpenAPI 路径 126->127、operation 147->148，见 fixtures 快照）
+        #   （OpenAPI 路径 126->127、operation 147->148）
         routes_cluster: 68,
-        routes_models: 23,
+        # ★ 票 12d MODEL-INTENT-UX-01：/api/models/intent 一族来自
+        #   routes_model_intent（6 条），既有 routes_models 从 23 增至 24；
+        #   供给意图端点落在 routes_model_supply（5 条）。见 fixtures 快照
+        #   （路径 127->137、operation 148->160）。
+        routes_models: 24,
+        routes_model_supply: 5,
+        routes_model_intent: 6,
         routes_auth: 12,
         routes_sessions: 10,
         routes_tasks: 6,
@@ -364,8 +372,12 @@ def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
     for module, count in expected.items():
         assert module._api_module is api_server
         assert len(module.router.routes) == count
-        for route in module.router.routes:
-            assert getattr(api_server, route.endpoint.__name__) is route.endpoint
+        # ★ 票 12 / 12d：路由模块用 exported_handlers() 显式声明对 facade 导出的 handler。
+        #   routes_model_supply 与 routes_model_intent 返回空字典 ⇒ 这些端点只经 router
+        #   暴露，不进 api_server 命名空间（create / get / current / connect 这类泛名
+        #   会污染 facade）。因此断言改为按各模块自报的导出名单核对。
+        for name, handler in module.exported_handlers().items():
+            assert getattr(api_server, name) is handler
 
     assert api_server.health is routes_health.health
     assert api_server.get_status is routes_health.get_status
@@ -400,7 +412,8 @@ def test_api_routers_cover_every_openapi_operation() -> None:
         for method in operations
     )
     # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate ⇒ 147 -> 148
-    assert sum(routed.values()) == 148
+    # ★ 票 12d MODEL-INTENT-UX-01 新增 /api/models/intent 一族 ⇒ 148 -> 160
+    assert sum(routed.values()) == 160
     assert routed == openapi
 
 

@@ -140,6 +140,11 @@ def test_cold_start_subprocess_import_does_not_claim_production_journal_lock(
 
             sys.path.insert(0, {str(src_root)!r})
 
+            # This fresh interpreter does not load pytest's conftest. Keep
+            # import-time API logging private without changing the journal
+            # path whose real writer lock the parent currently owns.
+            import config
+            config.LOG_DIR = {str(tmp_path / "logs")!r}
             import api_server
 
             cold = api_server.task_graph_coordinator

@@ -167,6 +167,10 @@ def test_layer_stage_offer_reaches_provider_when_peer_declares_chunks():
         raise AssertionError("分片路径：预检放行后应触碰 provider")
 
     sched._ensure_remote_task_worker_provider = _provider  # type: ignore[assignment]
+    # ★ 票 12 WORKER-PREPARE-01：层段 offer 要求 assignment 的 worker native prepare
+    #   已就绪（`scheduler_pipeline.py:2500`，否则抛 RuntimeError）。本用例只验证帧预算
+    #   预检放行与分片路径，故把 prepare 就绪判据直接置为通过。
+    sched._worker_prepare_assignment_loaded = lambda node_id, assignment: (True, "")  # type: ignore[assignment]
     sched._task_worker_control = type("_Control", (), {
         "status": lambda self, role="master": {
             "workers": [{
@@ -181,7 +185,19 @@ def test_layer_stage_offer_reaches_provider_when_peer_declares_chunks():
     with pytest.raises(AssertionError):
         sched._execute_layer_stage_offer(
             node_id="worker-b",
-            assignment={"start_layer": 2, "end_layer": 4},
+            assignment={
+                "start_layer": 2,
+                "end_layer": 4,
+                # ★ 票 12 WORKER-PREPARE-01：阶段转发前会用 `stage_identity()` 校验
+                #   （worker_prepare_contract.py STAGE_IDENTITY_FIELDS 五个字段齐全才通过）。
+                "worker_prepare_identity": {
+                    "operation_id": "op-framebudget02",
+                    "config_id": "cfg-framebudget02",
+                    "generation": 1,
+                    "assignment_id": "asg-framebudget02",
+                    "artifact_sha256": "a" * 64,
+                },
+            },
             hidden_states=hidden,
             model_identity=object(),
             workflow_id="wf_framebudget02",

@@ -63,6 +63,20 @@ def test_argv_omits_optional_flags_when_unset():
     assert "--cpu-moe" not in argv
     assert "--spec-type" not in argv
     assert "--chat-template-kwargs" not in argv
+    # 推理开关默认档位同样不产出任何参数（票 20：未介入 == 命令行逐字不变）
+    assert "--threads" not in argv
+    assert "--cache-type-k" not in argv
+    assert "--cache-type-v" not in argv
+    assert "--flash-attn" not in argv
+
+
+def test_inference_switch_args_are_forwarded():
+    """显式开关片段原样进入命令行，且位置在 `--port` 之后。"""
+    spec = _spec(inference_args=["--cache-type-k", "q8_0", "--flash-attn", "off"])
+    argv = spec.to_argv(host="127.0.0.1", port=4321)
+    assert argv[argv.index("--cache-type-k") + 1] == "q8_0"
+    assert argv[argv.index("--flash-attn") + 1] == "off"
+    assert argv.index("--port") < argv.index("--cache-type-k")
 
 
 def test_missing_exe_raises_before_spawning():

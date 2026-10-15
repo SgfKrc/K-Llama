@@ -196,6 +196,7 @@ scripts/*
 !scripts/cut_layers_pipeline.py
 !scripts/model_tools.py
 !scripts/android_validation.py
+!scripts/edge_bench.py
 !scripts/edge_preflight.py
 !scripts/experiment_core/
 !scripts/experiment_gemma_judge_real.py
@@ -219,6 +220,7 @@ scripts/*
 !scripts/run_simulation.py
 !scripts/startup_matrix.py
 !scripts/test_classification_report.py
+!scripts/summarize_test_channels.py
 !scripts/edge_sim_setup.sh
 !scripts/cut_layers.py
 !scripts/quantize_model.py
@@ -276,3 +278,15 @@ scripts/*
 runtime-master*.log
 surface-ssh*.log
 .gitignore_bak
+
+# 本地一次性迁移备份（DSH→Reasonix 桥接迁移的 UI 资源快照），不入库
+dsh-migration-backup-*/
+
+# Ticket 13: real product evidence validation and explicit physical capture.
+!scripts/product_relay_gate.py
+!scripts/run_product_relay_gate.py
+
+# Required core quality/dependency gates (referenced by tracked tests).
+!scripts/experiment_gemma_quality_unit.py
+!scripts/experiment_quality_production_gate.py
+!scripts/llama_dependency_contract.py

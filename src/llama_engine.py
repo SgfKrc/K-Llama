@@ -152,6 +152,28 @@ def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
     )
 
 
+def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
+    """按设备画像与环境覆盖挂上推理开关（就地修改 `load_kwargs`）。
+
+    映射表与实测依据见 `src/inference_switches.py`。**默认档位不新增任何键** ⇒
+    未设置 `QLH_INFER_*` 时加载路径与本函数引入前逐字一致；每次都记一行日志，
+    使「关闭态」同样可观测（便于回滚与对拍）。
+    """
+    try:
+        import inference_switches
+    except Exception as exc:  # pragma: no cover - 模块缺失属异常部署
+        logger.warning("推理开关模块不可用，按默认档位继续: %s", exc)
+        return
+
+    try:
+        switches = inference_switches.resolve_from_device_profile()
+        inference_switches.apply_to_load_kwargs(switches, load_kwargs)
+    except Exception as exc:
+        logger.warning("推理开关解析失败，按默认档位继续: %s", exc)
+        return
+    logger.info("推理开关: %s", switches.describe())
+
+
 def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
     """构造 `llama_cpp.Llama`，可选地把 context 的 `n_seq_max` 抬到指定值。
 
@@ -426,8 +448,10 @@ class LlamaCppEngine:
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
         if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
-        local_total_layers = int(info.get("n_layer", 0) or 0)
-        if local_total_layers <= 0:
+        local_total_layers = info.get("n_layer")
+        hidden_size = info.get("n_embd")
+        if (type(local_total_layers) is not int or local_total_layers <= 0
+                or type(hidden_size) is not int or hidden_size <= 0):
             return {}
         # ★ 2026-10-11（三机实测 / total_layers 缺口，用户裁定「不能加载整模，这是接力的初衷」）：
         #   裁层工件的 GGUF 头只含**本段**层（head=16），而容量求解器的区间判据要的是
@@ -467,36 +491,24 @@ class LlamaCppEngine:
         tensor_bytes = read_gguf_tensor_bytes(path)
         if not tensor_bytes:
             return {}
-        layer_weight_bytes = [0] * total_layers
-        component_weight_bytes = {
-            "embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0,
-        }
-        block_prefix = re.compile(r"^blk\.(\d+)\.")
-        for tensor_name, size in tensor_bytes.items():
-            block = block_prefix.match(tensor_name)
-            if block:
-                # 工件内的 blk 索引是**本段局部**的（0..local_total_layers-1），
-                # 要按 manifest 的 source_layer_range 平移到源模型坐标系。
-                index = segment_start + int(block.group(1))
-                if index < total_layers:
-                    layer_weight_bytes[index] += size
-                    continue
-            if tensor_name.startswith("token_embd."):
-                component_weight_bytes["embedding"] += size
-            elif tensor_name.startswith("output_norm."):
-                component_weight_bytes["final_norm"] += size
-            elif tensor_name.startswith("output."):
-                component_weight_bytes["lm_head"] += size
-            else:
-                component_weight_bytes["other"] += size
-        # 只要求**本段**覆盖到字节：其它层属于别的段（远端执行），不是"缺失"。
-        segment_span = (segment_start, segment_start + local_total_layers)
-        if any(
-            size <= 0
-            for index, size in enumerate(layer_weight_bytes)
-            if segment_span[0] <= index < segment_span[1]
-        ):
+        from gguf_tensor_selection import select_gguf_tensors
+
+        nextn = info.get("nextn_predict_layers", 0)
+        try:
+            block_count = info.get("block_count", local_total_layers + nextn)
+            selection = select_gguf_tensors(
+                tensor_bytes, block_count=block_count, nextn_predict_layers=nextn,
+            )
+            if len(selection.layer_weight_bytes) != local_total_layers:
+                raise ValueError("GGUF decoder count differs from layer metadata")
+        except (TypeError, ValueError) as exc:
+            logger.warning("GGUF pipeline tensor budget rejected: %s", exc)
             return {}
+        layer_weight_bytes = [0] * total_layers
+        layer_weight_bytes[segment_start:segment_start + local_total_layers] = (
+            selection.layer_weight_bytes
+        )
+        component_weight_bytes = selection.component_weight_bytes
         try:
             weight_bytes = int(os.path.getsize(path))
         except OSError:
@@ -559,10 +571,21 @@ class LlamaCppEngine:
             ),
             "model_type": model_type,
             "total_layers": total_layers,
-            "hidden_size": int(info.get("n_embd", 0) or 0),
+            "hidden_size": hidden_size,
             "tokenizer_sha256": tokenizer_sha256,
             "layer_weight_bytes": layer_weight_bytes,
             "component_weight_bytes": component_weight_bytes,
+            # Payload totals describe the inspected file, excluding GGUF header
+            # and alignment. Only declared MTP blocks are absent from the
+            # executable decoder budget; retain their exact bytes for audit.
+            "source_weight_bytes": selection.source_weight_bytes,
+            "pipeline_weight_bytes": selection.selected_weight_bytes,
+            "runtime_ignored_components": ["mtp"] if nextn else [],
+            "runtime_ignored_component_bytes": {
+                "mtp": sum(selection.excluded_mtp_tensor_bytes.values()),
+            } if nextn else {},
+            "runtime_ignored_tensor_bytes": selection.excluded_mtp_tensor_bytes,
+            "indexed_tensor_count": len(tensor_bytes),
             "quant_type": str(getattr(self, "_quant_type", "") or ""),
             "inspection_mode": "gguf_header",
             "weight_bytes": weight_bytes,
@@ -948,6 +971,10 @@ class LlamaCppEngine:
             elif model_path and "qwen-1_8b" in os.path.basename(model_path).lower():
                 # Qwen-1.8B GGUF metadata is not always detected reliably.
                 load_kwargs["chat_format"] = "chatml"
+
+            # 推理开关（设备画像 → KV 量化 / flash-attn / 线程）：默认档位不新增键，
+            # 紧随其后的显式 kwargs 仍然优先（见 src/inference_switches.py）。
+            _apply_inference_switches(load_kwargs)
 
             load_kwargs.update(kwargs)
             # n-gram 自投机（绑定路径 / 无 CUDA 边缘）：默认关闭；
@@ -2304,7 +2331,7 @@ class LlamaCppEngine:
         #   且都对应 `[0,16)` 层段的输出 —— `rel_err=7.169e-02`、**`cos=0.988463`**；
         #   该 rel_err 量级是 GGUF Q4_K_M 量化 vs HF fp32 的正常差异。
         #   ⇒ 判据已过时（会**误拒** qwen3.5 的 llama 上游），故移除。
-        #   详见 `docs/已知问题记录.md` #54 与 `docs/真三机产品路径攻坚-2026-10-07.md` §4.2。
+        #   详见 `docs/已知问题记录.md` #54 与 `docs/archive/distributed/真三机产品路径攻坚-2026-10-07.md` §4.2。
         try:
             from llama_keep_head import KeepHeadCleanupError, KeepHeadUpstream
 

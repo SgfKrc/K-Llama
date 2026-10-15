@@ -65,7 +65,23 @@ class WorkerPrepareCoordinatorMixin:
 
     def _send_pipeline_worker_config(self, node_id, config):
         """One send path for first delivery, retries, commit and terminal cleanup."""
+        send_options = {}
+        epoch_getter = getattr(self._tcp_server, "get_authenticated_peer_epoch", None)
+        if callable(epoch_getter):
+            epoch = epoch_getter(node_id)
+            if epoch is None:
+                return False
+            send_options["registration_epoch"] = epoch
+        # All first sends, retries and terminal cleanup share this barrier.
+        # Keep cleanup debt durable until the current connection has received
+        # HELLO_ACK; a REGISTER ACK alone never authorizes MODEL_PREPARE.
+        if node_id in self._task_worker_control.pending_worker_ids():
+            return False
         identity = config.get("worker_prepare_identity")
+        if isinstance(identity, dict):
+            worker = self._task_worker_control.worker_snapshot(node_id)
+            if worker and not (worker.get("connected") and worker.get("accepted")):
+                return False
         if isinstance(identity, dict) and not config.get("cleanup_action") and not config.get("release"):
             with self._layer_config_lock:
                 transaction = self._pipeline_load_transaction
@@ -74,7 +90,7 @@ class WorkerPrepareCoordinatorMixin:
                         or transaction.get("expected", {}).get(node_id, {}).get("phase") != config.get("phase")):
                     return False
         if not isinstance(identity, dict):
-            return self._tcp_server.send_layer_config(node_id, config)
+            return self._tcp_server.send_layer_config(node_id, config, **send_options)
         from transport_port import MessageType
         from worker_prepare_contract import validate_command
         action = config.get("cleanup_action") or ("release" if config.get("release") else config.get("phase", "prepare"))
@@ -83,7 +99,7 @@ class WorkerPrepareCoordinatorMixin:
             command.update(context_size=4096, middle_channel="keep_head_layer_out")
         if action in {"abort", "finalize"} or (action == "release" and config.get("cleanup_action")):
             command["cleanup_id"] = config["config_id"]
-        return self._tcp_server.send_to_client(node_id, validate_command(command), MessageType.MODEL_PREPARE)
+        return self._tcp_server.send_to_client(node_id, validate_command(command), MessageType.MODEL_PREPARE, **send_options)
 
     def _handle_worker_prepare_ack(self, node_id, payload):
         payload = {key: value for key, value in payload.items() if key != "control_certificate"}

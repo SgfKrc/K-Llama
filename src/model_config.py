@@ -654,96 +654,70 @@ def is_cuda_available() -> bool:
         return False
 
 
+def model_config_from_registry(entry: dict, builtin: Optional[ModelConfig] = None) -> Optional[ModelConfig]:
+    """Apply one authoritative registry row, retaining only omitted defaults.
+
+    Empty artifact paths are intentional overrides. Invalid rows never fall
+    back to a different builtin artifact under the same model identifier.
+    """
+    if not isinstance(entry, dict):
+        return None
+    mid = entry.get("model_id")
+    if not isinstance(mid, str) or not mid:
+        return None
+    base = builtin or ModelConfig(model_id=mid, name=mid, is_experimental=True, location="external")
+    fields = {name: entry.get(name, getattr(base, name)) for name in (
+        "name", "model_type", "model_path", "gguf_path", "huggingface_id", "description",
+    )}
+    if any(not isinstance(value, str) for value in fields.values()):
+        return None
+    if fields["model_type"] not in {"safetensors", "gguf", "both"}:
+        return None
+    quants = entry.get("quant_types", base.quant_types)
+    if not isinstance(quants, list) or any(not isinstance(value, str) or not value for value in quants):
+        return None
+    try:
+        vram = float(entry.get("recommended_vram_gb", base.recommended_vram_gb))
+        context = int(entry.get("max_context", base.max_context))
+        import math
+        if not math.isfinite(vram) or vram < 0 or context <= 0:
+            return None
+        return ModelConfig(model_id=mid, **fields, recommended_vram_gb=vram,
+                           max_context=context, quant_types=list(quants),
+                           is_experimental=base.is_experimental,
+                           location="external")
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def get_all_model_configs(db_experimental_models: Optional[list[dict]] = None) -> list[ModelConfig]:
+    """Resolve the catalog using the same registry precedence as execution."""
+    rows = {entry.get("model_id"): entry for entry in (db_experimental_models or [])
+            if isinstance(entry, dict) and isinstance(entry.get("model_id"), str)}
+    result = []
+    for builtin in get_builtin_models():
+        entry = rows.pop(builtin.model_id, None)
+        resolved = model_config_from_registry(entry, builtin) if entry is not None else builtin
+        if resolved is not None:
+            result.append(resolved)
+    for entry in rows.values():
+        resolved = model_config_from_registry(entry)
+        if resolved is not None:
+            result.append(resolved)
+    return result
+
+
 def get_visible_models(db_experimental_models: Optional[list[dict]] = None) -> list[ModelConfig]:
-    """返回当前环境可见的模型列表。
-
-    - 始终包含默认模型
-    - 实验模型仅在 CUDA 可用时包含
-    - 合并内置实验模型 + DB 中用户注册的实验模型
-
-    Args:
-        db_experimental_models: 从 DB cluster_config 读取的实验模型 dict 列表。
-                                每个 dict 的字段与 ModelConfig 兼容。
-
-    Returns:
-        可见模型配置列表，默认模型排在第一位。
-    """
-    models: list[ModelConfig] = []
+    """Resolve registered overrides before applying the legacy CUDA visibility gate."""
     cuda_ok = is_cuda_available()
-
-    for m in BUILTIN_MODELS:
-        if not m.is_experimental:
-            models.append(m)
-        elif cuda_ok:
-            models.append(m)
-
-    # 合并 DB 注册的实验模型
-    if cuda_ok and db_experimental_models:
-        builtin_ids = {m.model_id for m in models}
-        for entry in db_experimental_models:
-            mid = entry.get("model_id", "")
-            if not mid or mid in builtin_ids:
-                continue
-            try:
-                mc = ModelConfig(
-                    model_id=mid,
-                    name=entry.get("name", mid),
-                    model_type=entry.get("model_type", "safetensors"),
-                    model_path=entry.get("model_path", ""),
-                    gguf_path=entry.get("gguf_path", ""),
-                    recommended_vram_gb=float(entry.get("recommended_vram_gb", 8.0)),
-                    max_context=int(entry.get("max_context", 4096)),
-                    is_experimental=True,
-                    huggingface_id=entry.get("huggingface_id", ""),
-                    quant_types=entry.get("quant_types", ["int4"]),
-                    description=entry.get("description", ""),
-                    location="external",
-                )
-                models.append(mc)
-            except (TypeError, ValueError):
-                continue
-
-    return models
+    return [model for model in get_all_model_configs(db_experimental_models)
+            if not model.is_experimental or cuda_ok]
 
 
-def get_model_config(
-    model_id: str,
-    db_experimental_models: Optional[list[dict]] = None,
-) -> Optional[ModelConfig]:
-    """按 model_id 查找模型配置（内置 + DB 注册）。
-
-    Args:
-        model_id: 模型唯一标识。
-        db_experimental_models: DB 注册模型列表（可选）。
-
-    Returns:
-        ModelConfig 或 None（未找到时）。
-    """
-    # 先查内置
+def get_model_config(model_id: str, db_experimental_models: Optional[list[dict]] = None) -> Optional[ModelConfig]:
+    """Use a registered row before the builtin default for every execution path."""
     builtin = get_builtin_model(model_id)
-    if builtin is not None:
-        return builtin
-
-    # 再查 DB 注册
-    if db_experimental_models:
-        for entry in db_experimental_models:
-            if entry.get("model_id") == model_id:
-                try:
-                    return ModelConfig(
-                        model_id=model_id,
-                        name=entry.get("name", model_id),
-                        model_type=entry.get("model_type", "safetensors"),
-                        model_path=entry.get("model_path", ""),
-                        gguf_path=entry.get("gguf_path", ""),
-                        recommended_vram_gb=float(entry.get("recommended_vram_gb", 8.0)),
-                        max_context=int(entry.get("max_context", 4096)),
-                        is_experimental=True,
-                        huggingface_id=entry.get("huggingface_id", ""),
-                        quant_types=entry.get("quant_types", ["int4"]),
-                        description=entry.get("description", ""),
-                        location="external",
-                    )
-                except (TypeError, ValueError):
-                    return None
-
-    return None
+    for entry in db_experimental_models or []:
+        if isinstance(entry, dict) and entry.get("model_id") == model_id:
+            return model_config_from_registry(entry, builtin)
+    return builtin

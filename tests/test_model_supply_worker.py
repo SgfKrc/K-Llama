@@ -59,7 +59,9 @@ def segment(directory, operation="op-one", node="worker-one", fmt="gguf", source
         native = {"artifact": "segment.gguf", "mode": "middle", "source_layer_range": [1, 3], "n_layer": 4,
                   "source_model_id": "source-one", "source_model_sha256": source_sha,
                   "tokenizer_sha256": tokenizer, "artifact_sha256": assets.sha256_file(model),
-                  "hidden_size": 2, "kept_block_count": 2}
+                  "hidden_size": 2, "kept_block_count": 2,
+                  "gguf_metadata": {"block_count": 2, "head_count_kv": None,
+                                    "key_length": None, "full_attention_interval": None}}
         write_json(directory / "segment.manifest.json", native)
         kinds = {"segment.gguf": "weights", "segment.manifest.json": "manifest"}
     else:
@@ -212,6 +214,7 @@ def test_receive_register_and_cached_selection(setup, tmp_path, monkeypatch):
     reply = client.wait()
     finish(worker)
     assert reply == {"action": "result", "operation_id": "op-one", "node_id": "worker-one",
+                     "strategy": "distribute", "strategy_reason_code": "SUPPLY_DISTRIBUTE_REQUESTED",
                      "status": "available", "reason_code": "", "manifest_sha256": manifest["manifest_sha256"],
                      "artifact_sha256": manifest["artifact_sha256"], "layer_range": [1, 3], "source_model_sha256": "a" * 64,
                      "downloaded_bytes": 16, "actual_downloaded_bytes": 16, "reused_bytes": 0, "resumed_bytes": 0}

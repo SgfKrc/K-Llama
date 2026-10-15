@@ -10,9 +10,26 @@
 强制为 True（内存/显存开销上升），因此**默认关闭**。
 """
 
+import sys
+from types import ModuleType
+from unittest.mock import Mock
+
 import pytest
 
 from llama_engine import _apply_ngram_draft_model
+
+
+@pytest.fixture(autouse=True)
+def spec_binding(monkeypatch):
+    """Isolate the binding contract from native imports and prior module mocks."""
+    package = ModuleType("llama_cpp")
+    package.__path__ = []
+    speculative = ModuleType("llama_cpp.llama_speculative")
+    speculative.LlamaPromptLookupDecoding = Mock(name="LlamaPromptLookupDecoding")
+    package.llama_speculative = speculative
+    monkeypatch.setitem(sys.modules, "llama_cpp", package)
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_speculative", speculative)
+    return speculative
 
 
 def test_disabled_by_default(monkeypatch):
@@ -22,7 +39,7 @@ def test_disabled_by_default(monkeypatch):
     assert "draft_model" not in kwargs
 
 
-def test_injects_when_enabled_with_configured_params(monkeypatch):
+def test_injects_when_enabled_with_configured_params(monkeypatch, spec_binding):
     monkeypatch.setattr("config.NGRAM_SPEC_ENABLED", True, raising=True)
     monkeypatch.setattr("config.NGRAM_SPEC_MAX_NGRAM", 3, raising=True)
     monkeypatch.setattr("config.NGRAM_SPEC_NUM_PRED", 12, raising=True)
@@ -30,8 +47,10 @@ def test_injects_when_enabled_with_configured_params(monkeypatch):
     _apply_ngram_draft_model(kwargs)
     draft = kwargs.get("draft_model")
     assert draft is not None, "启用时必须注入 draft_model"
-    assert draft.max_ngram_size == 3
-    assert draft.num_pred_tokens == 12
+    assert draft is spec_binding.LlamaPromptLookupDecoding.return_value
+    spec_binding.LlamaPromptLookupDecoding.assert_called_once_with(
+        max_ngram_size=3, num_pred_tokens=12
+    )
 
 
 def test_caller_supplied_draft_model_is_not_overwritten(monkeypatch):
@@ -42,12 +61,10 @@ def test_caller_supplied_draft_model_is_not_overwritten(monkeypatch):
     assert kwargs["draft_model"] is sentinel
 
 
-def test_missing_binding_class_does_not_raise(monkeypatch):
+def test_missing_binding_class_does_not_raise(monkeypatch, spec_binding):
     """旧绑定可能没有 LlamaPromptLookupDecoding —— 必须降级而不是崩。"""
     monkeypatch.setattr("config.NGRAM_SPEC_ENABLED", True, raising=True)
-    import llama_cpp.llama_speculative as spec_mod
-
-    monkeypatch.delattr(spec_mod, "LlamaPromptLookupDecoding", raising=False)
+    monkeypatch.delattr(spec_binding, "LlamaPromptLookupDecoding", raising=True)
     kwargs: dict = {}
     _apply_ngram_draft_model(kwargs)
     assert "draft_model" not in kwargs

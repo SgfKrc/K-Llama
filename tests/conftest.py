@@ -17,14 +17,92 @@ transformers 5.x 下无法导入，而 transformers 5.x 的 `dynamic_module_util
 """
 from __future__ import annotations
 
+import atexit
 import os
 import random
+import shutil
 import sys
+import tempfile
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+# Workspace-only suites: independent qlh-docagent, retired MF-MEM benchmarks,
+# and external offline-asset release tooling (aa889bcb / module ownership docs).
+# Their sources are intentionally absent from the main repo. Keep ownership
+# stable even on developer checkouts; opt-in imports must still fail normally.
+# Core EX-N3 quality infrastructure and dependency contracts remain collected.
+collect_ignore_glob = (
+    [
+        "test_docagent_*.py", "test_doc_maintenance_*.py",
+        "test_model_fleet_explicit_layer_pager.py",
+        "test_model_fleet_memory_transport.py",
+        "test_model_fleet_n2f_fixed_tile.py",
+        "test_model_fleet_n2r_artifact_gate.py",
+        "test_model_fleet_n2r_compare.py",
+        "test_offline_bundle.py",
+    ]
+    if os.environ.get("QLH_INCLUDE_WORKSPACE_TOOL_TESTS") != "1"
+    else []
+)
+
+# Install a distinct fallback in every worker before collection imports config.
+# Function fixtures restore these paths; a late backend thread can still persist
+# safely after its test ends. Never inherit the runner's shared node config,
+# credential store or journal (nor a real user's platform-default directories).
+_session_store_dir = tempfile.mkdtemp(prefix="qlh-pytest-store-")
+
+
+def _persistence_environment(root):
+    root = Path(root)
+    return {
+        "QLH_SQLITE_PATH": str(root / "local-store.sqlite3"),
+        "QLH_STATE_DIR": str(root / "state"),
+        "QLH_NODE_CONFIG_PATH": str(root / "node_config.json"),
+        "QLH_NODE_SECRET_STORE_PATH": str(root / "node_secrets.json"),
+        "QLH_KV_COLD_CACHE_ROOT": str(root / "state" / "kv-cold"),
+        "QLH_JOURNAL_REPLICATION_REPLICA_PATH": str(root / "journal-replica.sqlite3"),
+        "LOCALAPPDATA": str(root / "user-local"),
+        "APPDATA": str(root / "user-roaming"),
+        "USERPROFILE": str(root / "user-home"),
+        "HOME": str(root / "user-home"),
+        "XDG_CONFIG_HOME": str(root / "user-config"),
+        "XDG_STATE_HOME": str(root / "user-state"),
+    }
+
+
+os.environ.update(_persistence_environment(_session_store_dir))
+atexit.register(shutil.rmtree, _session_store_dir, True)
+
+# Legacy discovery can migrate/delete checkout/node_config.json even when the
+# primary path is isolated. Keep the real implementation for temporary frozen
+# installations used by bootstrap migration tests; redirect user/install roots.
+try:
+    import node_config as _session_node_config
+
+    _node_app_root = _session_node_config.get_app_root
+
+    def _test_node_app_root():
+        root = _node_app_root().resolve()
+        if root.is_relative_to(Path(tempfile.gettempdir()).resolve()):
+            return root
+        return Path(os.environ.get("QLH_STATE_DIR", _session_store_dir)) / "legacy"
+
+    _session_node_config.get_app_root = _test_node_app_root
+except ImportError:
+    pass  # Dependency-light pytester suites may omit node_config entirely.
+
+# config paths are evaluated on import, and api_server opens logging at
+# collection time. Install the safe log path before any test imports that API.
+try:
+    import config as _session_config
+
+    _session_config.LOG_DIR = str(Path(_session_store_dir) / "logs")
+except ImportError:
+    pass
 
 
 def pytest_addoption(parser) -> None:
@@ -90,7 +168,7 @@ def pytest_runtest_setup(item) -> None:  # noqa: ARG001 - 需要 item 签名
 
 
 def _is_config_setting(name: str) -> bool:
-    return name.isupper() and not name.startswith("_")
+    return (name.isupper() and not name.startswith("_")) or name == "_NODE_CONFIG"
 
 
 def _restore_mutable_value(original, snapshot):
@@ -126,19 +204,41 @@ def _clear_chat_state(api_server) -> None:
 
 @pytest.fixture(autouse=True)
 def _isolate_local_store(tmp_path):
-    """Keep lifecycle/identity state and legacy imports out of the user's store.
+    """Isolate every durable state path, retaining real persistence semantics."""
+    # Bootstrap writes os.environ directly, outside the monkeypatch ledger.
+    # Capture the scoped baseline before our overrides and restore after undo.
+    environment = {k: v for k, v in os.environ.items() if k.startswith("QLH_")}
+    try:
+        with pytest.MonkeyPatch.context() as isolation:
+            for name, value in _persistence_environment(tmp_path).items():
+                isolation.setenv(name, value)
+            import local_store
+            import config
 
-    Use the real SQLite implementation with a separate path for every test and
-    worker. Test fixtures may still override the path or persistence functions
-    to exercise recovery; do not suppress lifecycle reads or model restoration.
-    """
-    with pytest.MonkeyPatch.context() as isolation:
-        isolation.setenv("QLH_SQLITE_PATH", str(tmp_path / "local-store.sqlite3"))
-        import local_store
-
-        isolation.setattr(local_store, "_legacy_store_dir", lambda: str(tmp_path / "legacy"))
-        isolation.setattr(local_store, "_initialized_paths", set())
-        yield
+            isolation.setattr(local_store, "_legacy_store_dir", lambda: str(tmp_path / "legacy"))
+            isolation.setattr(local_store, "_initialized_paths", set())
+            paths = {
+                "STATE_DIR": str(tmp_path / "state"),
+                "TASK_GRAPH_JOURNAL_PATH": str(tmp_path / "state" / "task-graph.sqlite3"),
+                "JOURNAL_REPLICATION_REPLICA_PATH": str(tmp_path / "journal-replica.sqlite3"),
+                "KV_COLD_CACHE_ROOT": str(tmp_path / "state" / "kv-cold"),
+                "LOG_DIR": str(tmp_path / "logs"),
+            }
+            for name, value in paths.items():
+                if hasattr(config, name):
+                    isolation.setattr(config, name, value)
+                # Imported path aliases must follow the test, too. Do not
+                # synthesize settings in lightweight child-suite stubs.
+                for module_name in ("scheduler", "api_server", "tcp_comm"):
+                    module = sys.modules.get(module_name)
+                    if module is not None and name in vars(module):
+                        isolation.setattr(module, name, value)
+            yield
+    finally:
+        for name in list(os.environ):
+            if name.startswith("QLH_") and name not in environment:
+                del os.environ[name]
+        os.environ.update(environment)
 
 
 @pytest.fixture(autouse=True)
@@ -170,6 +270,36 @@ def _reset_process_wide_chat_state(_isolate_local_store):
     )
     config_snapshot = deepcopy(config_originals)
 
+    # Each module owns its runtime alias. Restoring Config alone leaves
+    # scheduler._effective_role() on a bootstrap-written client role. Snapshot
+    # aliases independently, preserving module-scoped fixture overrides.
+    aliases = {}
+    for module_name in ("scheduler", "api_server", "tcp_comm", "node_config"):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        originals = {
+            name: value for name, value in vars(module).items()
+            if name in config_originals or (module_name == "node_config" and name.isupper())
+        }
+        aliases[module_name] = (module, originals, deepcopy(originals))
+
+    runtime_module = sys.modules.get("node_runtime")
+    runtime = vars(runtime_module).get("node_runtime") if runtime_module is not None else None
+    runtime_snapshot = (
+        (runtime.get_node_id(), runtime.get_node_role()) if runtime is not None else None
+    )
+
+    # A lazy coordinator caches its first journal path. Give the default proxy
+    # a test lifetime so a later test cannot keep writing the earlier journal.
+    # Explicit scoped coordinator fixtures retain their own lifecycle.
+    original_coordinator = vars(api_server).get("task_graph_coordinator") if api_server is not None else None
+    lazy_coordinator_type = vars(api_server).get("_LazyTaskGraphCoordinator") if api_server is not None else None
+    test_coordinator = None
+    if lazy_coordinator_type is not None and type(original_coordinator) is lazy_coordinator_type:
+        test_coordinator = lazy_coordinator_type(vars(original_coordinator)["_factory"])
+        api_server.task_graph_coordinator = test_coordinator
+
     # Inspect the instance dictionary and lazy slot directly. getattr/hasattr on
     # ModelHost or _LazyModelManager can otherwise construct a real ModelManager.
     host_module = sys.modules.get("model_host")
@@ -193,6 +323,14 @@ def _reset_process_wide_chat_state(_isolate_local_store):
         try:
             _clear_chat_state(api_server)
         finally:
+            if test_coordinator is not None:
+                current_coordinator = vars(api_server).get("task_graph_coordinator")
+                try:
+                    if current_coordinator is not None and current_coordinator not in (original_coordinator, test_coordinator):
+                        current_coordinator.close()
+                    test_coordinator.close()
+                finally:
+                    api_server.task_graph_coordinator = original_coordinator
             if host is not None:
                 if lazy_instance is not missing:
                     object.__setattr__(manager, "_instance", lazy_instance)
@@ -209,3 +347,33 @@ def _reset_process_wide_chat_state(_isolate_local_store):
                 restored = deepcopy(config_snapshot)
                 for name, original in config_originals.items():
                     namespace[name] = _restore_mutable_value(original, restored[name])
+
+            for module_name in ("scheduler", "api_server", "tcp_comm", "node_config"):
+                module = sys.modules.get(module_name)
+                if module is None:
+                    continue
+                baseline = aliases.get(module_name)
+                if baseline is None:
+                    # A first import during the test may have consumed polluted
+                    # Config; restore only its configuration aliases.
+                    originals = {name: value for name, value in config_originals.items()
+                                 if name in vars(module)}
+                    snapshot = deepcopy(config_snapshot)
+                else:
+                    original_module, originals, snapshot = baseline
+                    sys.modules[module_name] = original_module
+                    module = original_module
+                restored = deepcopy(snapshot)
+                for name, original in originals.items():
+                    vars(module)[name] = _restore_mutable_value(original, restored[name])
+            current_runtime_module = sys.modules.get("node_runtime")
+            if current_runtime_module is not None:
+                if runtime is not None:
+                    current_runtime_module.node_runtime = runtime
+                    runtime.set_node_id(runtime_snapshot[0])
+                    runtime.set_node_role(runtime_snapshot[1])
+                else:
+                    current_runtime = vars(current_runtime_module).get("node_runtime")
+                    if current_runtime is not None:
+                        current_runtime.set_node_id(str(config_originals.get("NODE_ID", "master")))
+                        current_runtime.set_node_role(str(config_originals.get("NODE_ROLE", "client")))

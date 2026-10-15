@@ -503,6 +503,7 @@ class TestComputeLayerAssignment:
             "runtime_multiplier": 2.0,
             "execution_device": "cpu",
             "capacity_source": "memory.available_bytes",
+            "engine": "llama_cpp",
             "score": records[0]["score"],
         }]
 
@@ -2402,7 +2403,10 @@ class TestAndroidNodeManagement:
     """测试 Android 节点注册与离线删除能力。"""
 
     @pytest.fixture
-    def sched(self):
+    def sched(self, monkeypatch):
+        import scheduler as scheduler_module
+
+        monkeypatch.setattr(scheduler_module, "NODE_ROLE", "master")
         s = Scheduler()
         yield s
         # 清理测试节点（内存 + 数据库）
@@ -2987,6 +2991,8 @@ class TestPipelineReadiness:
             "assignment_id": "",
             "generation": 3,
             "action": "finalize",
+            # ★ 票 12 WORKER-PREPARE-01 起 cleanup ledger 条目带 legacy_identity 标记。
+            "legacy_identity": False,
             "created_at": cleanup["created_at"],
             "payload": cleanup["payload"],
         }]
@@ -3382,8 +3388,8 @@ class TestPipelineReadiness:
             "get_authenticated_peer_epoch": lambda self, node_id: (
                 37 if node_id == "client1" else 0
             ),
-            "send_layer_config": lambda self, node_id, payload: sent.append(
-                (node_id, dict(payload))
+            "send_layer_config": lambda self, node_id, payload, *, registration_epoch: sent.append(
+                (node_id, dict(payload), registration_epoch)
             ),
         })()
         monkeypatch.setattr(
@@ -3401,6 +3407,8 @@ class TestPipelineReadiness:
         assert state is not None
         assert state.connection_generation == 37
         assert sent[0][1]["assignment_id"] == state.assignment_id
+
+        assert sent[0][2] == 37
 
     def test_readiness_reports_worker_layer_load_error(self, sched, monkeypatch):
         """在线不等于可计算，层加载错误必须成为明确的阻塞原因。"""
@@ -4637,9 +4645,10 @@ class TestPipelineMessageDispatch:
         sent = []
         sched._tcp_server = MagicMock()
         sched._tcp_server._running = True
+        sched._tcp_server.get_authenticated_peer_epoch.return_value = 11
         sched._tcp_server.get_client_ids.return_value = ["client1"]
         sched._tcp_server.send_layer_config.side_effect = (
-            lambda node_id, data: sent.append((node_id, data))
+            lambda node_id, data, *, registration_epoch: sent.append((node_id, data, registration_epoch))
         )
         expected = _install_layer_assignment(sched, "client1", {
             "node_id": "client1",
@@ -4653,7 +4662,7 @@ class TestPipelineMessageDispatch:
         }
 
         assert sched._retry_pending_layer_configs(now=10.0) == 1
-        assert sent == [("client1", expected)]
+        assert sent == [("client1", expected, 11)]
         assert sent[0][1]["config_id"] == "cfg-same"
 
     def test_duplicate_ready_config_only_resends_cached_ack(self, sched, monkeypatch):
@@ -7249,6 +7258,7 @@ class TestChainTopology:
     def test_invalid_worker_config_revokes_ready_and_resends(self, sched):
         sched._tcp_server = MagicMock()
         sched._tcp_server._running = True
+        sched._tcp_server.get_authenticated_peer_epoch.return_value = 11
         expected = {
             "node_id": "client1",
             "config_id": "cfg-invalid",
@@ -7288,7 +7298,7 @@ class TestChainTopology:
         assert "client1" not in sched._layer_config_pushed
         assert _layer_ack(sched, "client1")["status"] == "error"
         sched._tcp_server.send_layer_config.assert_called_once_with(
-            "client1", expected,
+            "client1", expected, registration_epoch=11,
         )
 
     def test_chain_info_built_in_run_pipeline(self, sched):

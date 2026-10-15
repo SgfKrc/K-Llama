@@ -110,6 +110,11 @@ class LlamaServerEngine:
         if not model_path:
             raise RuntimeError("LlamaServerEngine 需要显式 model_path（整模 GGUF）")
 
+        # 推理开关：与绑定路径共用同一张显式映射；默认档位不产出任何参数，
+        # 因此命令行与接线前逐字一致（参数名以本机 llama-server --help 为准）。
+        from inference_switches import resolve_from_device_profile, server_argv_args
+
+        switches = resolve_from_device_profile()
         spec = ServerSpec(
             model_path=str(model_path),
             exe=str(exe),
@@ -120,6 +125,7 @@ class LlamaServerEngine:
             spec_type=self._spec_type if spec_type is None else str(spec_type),
             chat_template_kwargs=self._chat_template_kwargs,
             mmproj_path=str(mmproj_path or ""),
+            inference_args=server_argv_args(switches),
         )
         self.server = LlamaServerProcess(
             spec, host=self._host, port=int(port), log_path=log_path,
@@ -137,6 +143,7 @@ class LlamaServerEngine:
             "本机 llama-server 引擎就绪：%s（cpu_moe=%s, spec_type=%s）",
             self.server.base_url, spec.cpu_moe, spec.spec_type or "无",
         )
+        logger.info("推理开关: %s", switches.describe())
 
     # ------------------------------------------------------------------ state
     @property

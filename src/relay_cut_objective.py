@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -39,6 +39,44 @@ RISK_BANDWIDTH_MBPS_FLOOR = 5.0
 RISK_RTT_MS_CEIL = 50.0
 RISK_THERMAL_PENALTY = 0.25
 RISK_ARTIFACT_PENALTY = 0.5
+
+
+def rtt_ms_from_heartbeat(
+    samples: Sequence[float],
+    *,
+    percentile: float = 0.5,
+) -> float:
+    """★ 2026-10-14（22c 缺口①）：把**在线心跳 RTT 样本**折算成 `SegmentProfile.rtt_ms`。
+
+    动机：切点求解的往返税项是 `STAGE_ROUND_TRIPS * rtt_ms`（`docs/已知问题记录.md` #71 判据
+    `n·c_master > 2·RTT + n·c_D` 的核心），但此前 `rtt_ms` 只有两个来源 —— 人工常量
+    `MEASURED_*_RTT_MS` 与手工 `--rtt-ms`。而**集群在线 RTT 本就有独立链路**：
+    `src/tcp_comm.py:2134` 的 `avg_rtt_ms`（EWMA，`:2736` `avg = 0.9*avg + 0.1*rtt`）、
+    `src/network_path.py` 的 `HeartbeatQualityWindow`（`rtt_ms_p50/p95/jitter`）、
+    `src/scheduler.py:1687-1690` 落库 —— **此前没有任何地方把它们接进切点求解**
+    （`grep avg_rtt_ms` 在本模块零命中）。
+
+    本函数只做「样本 → 数值」的**纯计算**，**不 import 任何网络模块** ⇒ 保持本模块
+    **不在产品执行路径上**的干净性（它仍是纯函数库，由调用方喂数据）。
+
+    ⚠️ `#71` 要求「**RTT 必须按段取**」（PC↔PC=3ms、PC↔Y700=19~43ms），所以每个段应各自
+    喂自己的样本，不要共用一条全局中位。
+
+    口径：线性插值分位（显式写清以便与实测对拍）；`percentile=0.5` 即中位（默认），
+    尾值场景可传 `0.95`。空样本返回 `0.0`（与既有"缺字段如实置 0，不猜"一致）。
+    """
+    values = sorted(float(x) for x in samples if float(x) >= 0.0)
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    q = min(1.0, max(0.0, float(percentile)))
+    pos = q * (len(values) - 1)
+    low = int(math.floor(pos))
+    high = int(math.ceil(pos))
+    if low == high:
+        return values[low]
+    return values[low] + (values[high] - values[low]) * (pos - low)
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -92,6 +130,20 @@ class SegmentProfile:
     artifacts_ready: bool = True
     source: str = "declared"
 
+    def with_rtt(self, rtt_ms: float, *, source: str | None = None) -> "SegmentProfile":
+        """★ 2026-10-14（22c 缺口①）：返回一个只替换 `rtt_ms`（与可选 `source`）的副本。
+
+        本类是 `frozen=True`，所以用 `dataclasses.replace` 而不是原地赋值。
+        典型用法：先 `from_device_profile(...)` 拿画像，再用**该段的在线心跳 RTT**
+        （见 `rtt_ms_from_heartbeat`）覆盖人工默认值 —— 这就是"把在线 RTT 接进切点求解"。
+
+        ⚠️ `#71`：RTT 必须**按段**取，不要用一个全局中位覆盖所有段。
+        """
+        replacement: dict[str, Any] = {"rtt_ms": float(max(0.0, rtt_ms))}
+        if source is not None:
+            replacement["source"] = str(source)
+        return replace(self, **replacement)
+
     @classmethod
     def from_device_profile(
         cls,
@@ -115,7 +167,14 @@ class SegmentProfile:
             "ms_per_layer_prefill": _number(data.get("ms_per_layer_prefill")),
             "ms_fixed_decode": _number(data.get("ms_fixed_decode")),
             "ms_fixed_prefill": _number(data.get("ms_fixed_prefill")),
-            "rtt_ms": _number(data.get("rtt_ms", net.get("rtt_ms"))),
+            # ★ 2026-10-14（22c 缺口①）：除 `rtt_ms` 外，也认 `network_path.HeartbeatQualityWindow`
+            #   风格的分位字段 —— 取 `rtt_ms_p50`（典型值）优先，再退到 p95。
+            "rtt_ms": _number(
+                data.get(
+                    "rtt_ms",
+                    net.get("rtt_ms", net.get("rtt_ms_p50", net.get("rtt_ms_p95"))),
+                )
+            ),
             "bandwidth_mbps": _number(data.get("bandwidth_mbps", net.get("bandwidth_mbps"))),
             "thermal_throttled": _bool(data.get("thermal_throttled"), False),
             "retry_rate": _number(data.get("retry_rate")),

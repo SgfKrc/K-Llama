@@ -1,0 +1,200 @@
+name: release-acceptance
+
+# Explicit lab opt-in only. Ordinary PR CI never installs packages on a device.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful build run containing qlh-final-* and qlh-product-relay-evidence artifacts'
+        required: true
+        type: string
+      revision:
+        description: 'Full 40-character Git SHA of that build and all tested nodes'
+        required: true
+        type: string
+      physical_opt_in:
+        description: 'Verify final artifacts and real physical DL/LL evidence'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      EXPECTED_REVISION: ${{ inputs.revision }}
+      PHYSICAL_OPT_IN: ${{ inputs.physical_opt_in }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Require explicit opt-in and matching completed build
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess
+          assert os.environ['PHYSICAL_OPT_IN'] == 'true', 'physical acceptance was not opted in'
+          revision = os.environ['EXPECTED_REVISION']
+          run_id = os.environ['BUILD_RUN_ID']
+          assert re.fullmatch(r'[0-9a-f]{40}', revision), 'full revision required'
+          assert re.fullmatch(r'[0-9]+', run_id), 'numeric build run ID required'
+          run = json.loads(subprocess.check_output([
+              'gh', 'api', f"repos/{os.environ['GH_REPO']}/actions/runs/{run_id}"
+          ], text=True))
+          assert run['head_sha'] == revision, 'build artifacts belong to another source revision'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success', 'build was not successful'
+          PY
+
+  final-artifacts:
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: '["self-hosted", "Windows", "qlh-release"]'
+          - platform: linux
+            runner: '["self-hosted", "Linux", "qlh-release"]'
+          - platform: android
+            runner: '["self-hosted", "Linux", "qlh-release-android"]'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      GIT_LFS_SKIP_SMUDGE: '1'
+      QLH_RELEASE_GATE_LAUNCH_PROBE: '1'
+      QLH_RUN_PHYSICAL_TESTS: '1'
+      ANDROID_RELEASE_CERT_SHA256: ${{ vars.ANDROID_RELEASE_CERT_SHA256 }}
+      QLH_RELEASE_ANDROID_SERIAL: ${{ vars.QLH_RELEASE_ANDROID_SERIAL }}
+      GATE_PLATFORM: ${{ matrix.platform }}
+      EXPECTED_REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          lfs: false
+          submodules: false
+      - name: Fetch signed packaging contracts (no recursive vendor/model checkout)
+        run: git submodule update --init --depth 1 packaging
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install gate signature verifier
+        run: python -m pip install cryptography
+      - uses: actions/download-artifact@v4
+        with:
+          name: qlh-final-${{ matrix.platform }}
+          path: build/final-artifacts
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Execute final artifact gate
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys
+          platform = os.environ['GATE_PLATFORM']
+          args = [sys.executable, '-B', 'scripts/package_contract/release_artifacts_gate.py',
+                  '--platforms', platform, '--dist', 'build/final-artifacts',
+                  '--work-dir', 'build/release-probe', '--json', f'build/gate-results/{platform}.json',
+                  '--require-revision', os.environ['EXPECTED_REVISION']]
+          if platform == 'linux':
+              args += ['--linux-variants', 'cpu']
+          if platform == 'android':
+              args += ['--android-cert-sha256', os.environ['ANDROID_RELEASE_CERT_SHA256'],
+                       '--android-serial', os.environ['QLH_RELEASE_ANDROID_SERIAL'], '--android-device-probe']
+          raise SystemExit(subprocess.call(args))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-gate-${{ matrix.platform }}
+          path: |
+            build/gate-results
+            build/release-probe
+          if-no-files-found: error
+
+  product-evidence:
+    needs: provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: qlh-product-relay-evidence
+          path: build/product-evidence
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Require current-source physical DL and LL with two remote nodes
+        env:
+          EXPECTED_REVISION: ${{ inputs.revision }}
+        run: python -B scripts/product_relay_gate.py --bundle build/product-evidence/bundle.json --require-revision "$EXPECTED_REVISION" --json build/product-result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-product-result
+          path: build/product-result.json
+          if-no-files-found: error
+
+  acceptance:
+    if: always()
+    needs: [provenance, final-artifacts, product-evidence]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Every required job must have succeeded
+        env:
+          REQUIRED_JOBS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['REQUIRED_JOBS'])
+          assert set(jobs) == {'provenance', 'final-artifacts', 'product-evidence'}
+          assert all(job['result'] == 'success' for job in jobs.values()), jobs
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-gate-*
+          path: build/reports
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: qlh-product-relay-evidence
+          path: build/product-evidence
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Require all platform checks and revalidate raw product evidence
+        env:
+          EXPECTED_REVISION: ${{ inputs.revision }}
+        run: |
+          python -B scripts/package_contract/release_acceptance.py \
+            --report windows=build/reports/gate-results/windows.json \
+            --report linux=build/reports/gate-results/linux.json \
+            --report android=build/reports/gate-results/android.json \
+            --bundle build/product-evidence/bundle.json \
+            --require-revision "$EXPECTED_REVISION" \
+            --json build/release-acceptance.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-acceptance
+          path: build/release-acceptance.json
+          if-no-files-found: error

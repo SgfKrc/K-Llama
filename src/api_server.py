@@ -1167,6 +1167,11 @@ def _run_exclusive_model_change(
                         scheduler._active_layer_config = None
                         scheduler._last_layer_config_ack_payload = None
                         scheduler._local_pipeline_steps.clear()
+                    retire_recovery = getattr(
+                        scheduler, "retire_pipeline_recovery_for_model_change", None,
+                    )
+                    if callable(retire_recovery):
+                        retire_recovery()
                     if release_worker_reservation:
                         release = getattr(
                             scheduler,
@@ -5434,39 +5439,13 @@ def _cuda_gate():
 
 
 def _db_entry_to_model_config(entry: dict) -> Optional[mc.ModelConfig]:
-    """Convert a DB model entry into ModelConfig; invalid rows are ignored."""
-    mid = entry.get("model_id", "")
-    if not mid:
-        return None
-    try:
-        return mc.ModelConfig(
-            model_id=mid,
-            name=entry.get("name", mid),
-            model_type=entry.get("model_type", "safetensors"),
-            model_path=entry.get("model_path", ""),
-            gguf_path=entry.get("gguf_path", ""),
-            recommended_vram_gb=float(entry.get("recommended_vram_gb", 8.0)),
-            max_context=int(entry.get("max_context", 4096)),
-            is_experimental=True,
-            huggingface_id=entry.get("huggingface_id", ""),
-            quant_types=entry.get("quant_types", ["int4"]),
-            description=entry.get("description", ""),
-            location="external",
-        )
-    except (TypeError, ValueError):
-        return None
+    """Use the shared registry parser; catalog and execution share precedence."""
+    return mc.model_config_from_registry(entry, mc.get_builtin_model(entry.get("model_id", "")))
 
 
 def _get_all_model_configs() -> list[mc.ModelConfig]:
-    """Return builtin + DB-registered models without hiding unavailable entries."""
-    models = mc.get_builtin_models()
-    seen = {m.model_id for m in models}
-    for entry in _get_registered_experimental_models():
-        model = _db_entry_to_model_config(entry)
-        if model and model.model_id not in seen:
-            models.append(model)
-            seen.add(model.model_id)
-    return models
+    """Return resolved builtin and registered models, including unavailable files."""
+    return mc.get_all_model_configs(_get_registered_experimental_models())
 
 
 def _public_model_path(value: str) -> str:
@@ -5599,6 +5578,7 @@ def _model_profile_payload(
 def _public_registry_payload(entry: dict[str, Any]) -> dict[str, Any]:
     """Project registry rows without exposing persisted server paths."""
     payload = dict(entry)
+    payload.pop("manifest_external_files", None)
     for field in ("model_path", "gguf_path"):
         if field in payload:
             payload[field] = _public_model_path(str(payload[field] or ""))

@@ -49,6 +49,19 @@ def host_target_id(*, platform_name: str | None = None, architecture: str | None
     return f"{normalize_platform(platform_name)}-{normalize_architecture(architecture)}"
 
 
+def expected_source_revision(lock: dict[str, Any]) -> str:
+    """The source HEAD pin differs from the upstream baseline for committed patches."""
+    upstream = lock.get("upstream")
+    if not isinstance(upstream, dict):
+        raise LlamaQuantizeToolchainError("invalid llama-quantize upstream contract")
+    revision = upstream.get("revision")
+    local = lock.get("revision_local")
+    for value in (revision, local) if "revision_local" in lock else (revision,):
+        if not isinstance(value, str) or len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+            raise LlamaQuantizeToolchainError("invalid pinned llama.cpp source revision")
+    return local if "revision_local" in lock else revision
+
+
 def load_lock(path: Path = LOCK_PATH) -> dict[str, Any]:
     try:
         lock = json.loads(path.read_text(encoding="utf-8"))
@@ -60,9 +73,7 @@ def load_lock(path: Path = LOCK_PATH) -> dict[str, Any]:
     targets = lock.get("targets")
     if not isinstance(upstream, dict) or not isinstance(targets, dict):
         raise LlamaQuantizeToolchainError("invalid llama-quantize lock structure")
-    revision = upstream.get("revision")
-    if not isinstance(revision, str) or len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
-        raise LlamaQuantizeToolchainError("invalid pinned llama.cpp revision")
+    expected_source_revision(lock)
     for target_id, target in targets.items():
         if not isinstance(target_id, str) or not isinstance(target, dict):
             raise LlamaQuantizeToolchainError("invalid llama-quantize target")
@@ -130,6 +141,10 @@ def verify_managed_package(
         except (OSError, ValueError, json.JSONDecodeError):
             fail("manifest_invalid", "managed package manifest is invalid")
 
+    revision: str | None = None
+    source_dirty: bool | None = None
+    source_identity = "unproven"
+    expected_revision = expected_source_revision(lock)
     target = lock["targets"].get(target_id)
     if target is None:
         fail("target_unsupported", "managed package target is not supported by the lock")
@@ -141,6 +156,47 @@ def verify_managed_package(
         upstream = manifest.get("upstream")
         if not isinstance(upstream, dict) or upstream.get("repository") != lock["upstream"]["repository"] or upstream.get("revision") != lock["upstream"]["revision"]:
             fail("revision_mismatch", "managed package llama.cpp revision does not match the lock")
+        if "source_revision" not in manifest:
+            if "revision_local" in lock:
+                fail("source_revision_missing", "managed package lacks the locked committed-patch source identity; rebuild it")
+            elif isinstance(upstream, dict) and upstream.get("revision") == expected_revision:
+                # Legacy schema 1 recorded HEAD in upstream only. Dirty/patch facts
+                # were not recorded, so never synthesize them from the current lock.
+                revision = upstream["revision"]
+                source_identity = "legacy_upstream_only"
+        else:
+            observed = manifest.get("source_revision")
+            if isinstance(observed, str) and len(observed) == 40 and all(char in "0123456789abcdef" for char in observed):
+                revision = observed
+            if revision != expected_revision:
+                fail("source_revision_mismatch", "managed package source HEAD does not match the lock")
+            dirty = manifest.get("source_dirty")
+            if type(dirty) is not bool:
+                fail("source_contract_invalid", "managed package source dirty fact is missing or invalid")
+            else:
+                source_dirty = dirty
+                if "revision_local" in lock and dirty:
+                    fail("source_contract_invalid", "locked committed-patch source must not contain worktree patches")
+            receipts = manifest.get("source_patches")
+            expected_patches = {
+                item.get("id") or item["path"]: item["sha256"].lower()
+                for item in lock.get("patches", [])
+            }
+            observed_patches = {}
+            states = []
+            if isinstance(receipts, list):
+                for item in receipts:
+                    if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                            or item["id"] in observed_patches or item.get("state") not in {"applied", "applied_committed"}):
+                        fail("source_patches_invalid", "managed package patch receipt is invalid")
+                        continue
+                    observed_patches[item["id"]] = item.get("patch_sha256")
+                    states.append(item["state"])
+            if not isinstance(receipts, list) or observed_patches != expected_patches:
+                fail("source_patches_invalid", "managed package patch identities differ from the lock")
+            if type(dirty) is bool and dirty != any(state == "applied" for state in states):
+                fail("source_contract_invalid", "managed package patch states disagree with source dirty fact")
+            source_identity = "explicit_source"
         if target is not None and manifest.get("executable") != target["executable"]:
             fail("executable_mismatch", "managed package executable does not match the lock")
         smoke = manifest.get("smoke")
@@ -200,7 +256,11 @@ def verify_managed_package(
         "status": "verified" if not errors else "invalid",
         "package": package_dir.name,
         "target_id": target_id,
-        "revision": lock["upstream"]["revision"],
+        "revision": revision,
+        "upstream_revision": manifest.get("upstream", {}).get("revision") if isinstance(manifest.get("upstream"), dict) else None,
+        "expected_revision": expected_revision,
+        "source_dirty": source_dirty,
+        "source_identity": source_identity,
         "executable": executable_name,
         "sha256": executable_record.get("sha256"),
         "size_bytes": executable_record.get("size_bytes"),
@@ -295,6 +355,9 @@ def resolve_quantizer(
             "provenance": "managed_package",
             "verification": "verified",
             "revision": verification["revision"],
+            "upstream_revision": verification["upstream_revision"],
+            "source_dirty": verification["source_dirty"],
+            "source_identity": verification["source_identity"],
             "sha256": verification["sha256"],
             "size_bytes": verification["size_bytes"],
             "target_id": target_id,
@@ -319,6 +382,7 @@ __all__ = [
     "ROOT",
     "default_package_root",
     "file_sha256",
+    "expected_source_revision",
     "host_target_id",
     "load_lock",
     "llama_cpp_source",

@@ -31,7 +31,9 @@ def _usage() -> str:
         "QLH core TUI\n"
         "  qlh                         进入交互外壳（Textual；本机后端自动启动）\n"
         "  qlh [options]               同上；选项直通（--port/--route/--host/--thinking/--log-token…）\n"
-        "  qlh chat [--host URL] [--route auto|local_only|distributed_preferred|distributed_required]\n"
+        "  qlh chat [--host URL] [--backend-host ADDRESS] [--route auto|local_only|distributed_preferred|distributed_required]\n"
+        "    --host                   客户端连接目标；远程目标不自动启动后端\n"
+        "    --backend-host           本机后端监听地址（默认 loopback；也可用 QLH_BACKEND_HOST）\n"
         "  qlh chat --fixture PATH     离线回放 SSE fixture（不联网、不依赖 UI）\n"
         "  qlh status|models|nodes|queue|device|logs|help\n"
         "                              单命令模式（只读、不启动后端、无 UI 依赖）\n"
@@ -82,7 +84,7 @@ def _chat_args(args: list[str]) -> list[str]:
         if value == "--fixture":
             # Fixture mode is intentionally independent of the backend.
             return ["--fixture", args[i + 1]]
-        if value in {"--host", "--route", "--timeout", "--port", "--interval", "--tui-engine", "--log-token"}:
+        if value in {"--host", "--backend-host", "--route", "--timeout", "--port", "--interval", "--tui-engine", "--log-token"}:
             if i + 1 >= len(args):
                 raise ValueError("%s 缺少参数" % value)
             item = args[i + 1]
@@ -113,7 +115,7 @@ def _chat_args(args: list[str]) -> list[str]:
     if "--host" in translated:
         host = translated[translated.index("--host") + 1].lower()
         if host not in {"127.0.0.1", "localhost", "::1"}:
-            translated.remove("--auto-start")
+            translated = [item for item in translated if item != "--auto-start"]
     return translated
 
 
@@ -123,6 +125,7 @@ def _shell_options(translated: list[str]) -> dict:
 
     return {
         "host": value_of("--host", "127.0.0.1"),
+        "bind_host": value_of("--backend-host", None),
         "port": int(value_of("--port", 8000)),
         "route": value_of("--route", "auto"),
         "interval": float(value_of("--interval", 5.0)),
@@ -146,7 +149,9 @@ def _run_textual_shell(args: list[str]) -> int:
     if options["auto_start"]:
         from tui_backend import BackendSupervisor
 
-        supervisor = BackendSupervisor(host=options["host"], port=options["port"])
+        supervisor = BackendSupervisor(
+            host=options["host"], port=options["port"], bind_host=options["bind_host"],
+        )
 
     from tui_textual import run as run_textual
 
@@ -196,10 +201,11 @@ def main(argv: list[str] | None = None) -> int:
     if command == "chat":
         if args and args[0] in {"-h", "--help"}:
             print(
-                "qlh chat [--host URL] [--port PORT] [--interval SECONDS] "
+                "qlh chat [--host URL] [--backend-host ADDRESS] [--port PORT] [--interval SECONDS] "
                 "[--route auto|local_only|distributed_preferred|distributed_required] "
                 "[--thinking] [--log-token TOKEN]\n"
-                "qlh chat --fixture PATH"
+                "qlh chat --fixture PATH\n"
+                "--host 是客户端目标；--backend-host / QLH_BACKEND_HOST 配置本机监听（默认 loopback）"
             )
             return 0
         try:

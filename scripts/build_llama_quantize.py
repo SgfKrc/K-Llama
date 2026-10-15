@@ -18,22 +18,26 @@ if __package__:
     from .model_tools.llama_quantize_toolchain import (
         ROOT,
         default_package_root,
+        expected_source_revision,
         file_sha256,
         host_target_id,
         llama_cpp_source,
         load_lock,
         verify_managed_package,
     )
+    from .model_tools.sync_llama_cpp import _contract as source_lock_contract, SyncError
 else:
     from model_tools.llama_quantize_toolchain import (
         ROOT,
         default_package_root,
+        expected_source_revision,
         file_sha256,
         host_target_id,
         llama_cpp_source,
         load_lock,
         verify_managed_package,
     )
+    from model_tools.sync_llama_cpp import _contract as source_lock_contract, SyncError
 
 
 class BuildError(RuntimeError):
@@ -54,6 +58,7 @@ def _run(command: list[str], *, cwd: Path, timeout: float, accepted_codes: set[i
             timeout=timeout,
             check=False,
             shell=False,
+            env={key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BuildError("toolchain command failed to start or timed out") from exc
@@ -86,17 +91,24 @@ def find_cmake(project_root: Path, explicit: Path | None = None) -> tuple[Path, 
     found = shutil.which("cmake")
     if found:
         candidates.append(Path(found))
+    sdk_bins: list[Path] = []
     for sdk_root in _android_sdk_roots(project_root):
         cmake_root = sdk_root / "cmake"
         if cmake_root.is_dir():
             versions = sorted((item for item in cmake_root.iterdir() if item.is_dir()), reverse=True)
-            executable = "cmake.exe" if os.name == "nt" else "cmake"
-            candidates.extend(version / "bin" / executable for version in versions)
+            sdk_bins.extend(version / "bin" for version in versions)
+    executable = "cmake.exe" if os.name == "nt" else "cmake"
+    candidates.extend(directory / executable for directory in sdk_bins)
     for candidate in candidates:
         if candidate.is_file():
+            # The first CMake on PATH need not be the SDK installation that
+            # supplies Ninja. Find the build tool independently of that choice.
             ninja_name = "ninja.exe" if os.name == "nt" else "ninja"
-            adjacent_ninja = candidate.parent / ninja_name
-            ninja = adjacent_ninja if adjacent_ninja.is_file() else (Path(value) if (value := shutil.which("ninja")) else None)
+            ninja_candidates = [candidate.parent / ninja_name]
+            if found_ninja := shutil.which("ninja"):
+                ninja_candidates.append(Path(found_ninja))
+            ninja_candidates.extend(directory / ninja_name for directory in sdk_bins)
+            ninja = next((item.absolute() for item in ninja_candidates if item.is_file()), None)
             return candidate.absolute(), ninja
     raise BuildError("cmake was not found; pass --cmake or install CMake")
 
@@ -120,6 +132,54 @@ def _compiler_pair(c_compiler: Path | None, cxx_compiler: Path | None) -> tuple[
     if not cc or not cxx:
         raise BuildError("no supported Linux C/C++ compiler was found")
     return Path(cc), Path(cxx), "gnu"
+
+
+def _configured_toolchain(build_dir: Path, cc: Path | None, cxx: Path | None,
+                          ninja: Path | None, compiler_family: str,
+                          cmake_version: str) -> dict[str, Any]:
+    """Check CMake's generated compiler facts, not only user-supplied cache values."""
+    try:
+        lines = (build_dir / "CMakeCache.txt").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise BuildError("CMake did not produce a readable toolchain cache") from exc
+    cache: dict[str, str] = {}
+    for line in lines:
+        if line and not line.startswith(("#", "//")) and "=" in line:
+            key, value = line.split("=", 1)
+            cache[key.split(":", 1)[0]] = value
+    generator = cache.get("CMAKE_GENERATOR")
+    if not generator or (ninja is not None and generator != "Ninja"):
+        raise BuildError("CMake's actual generator differs from the selected toolchain")
+    version = re.fullmatch(r"cmake version ([0-9]+\.[0-9]+\.[0-9]+[^\s/\\]*)", cmake_version)
+    if version is None:
+        raise BuildError("CMake version could not be identified")
+    configurations = cache.get("CMAKE_CONFIGURATION_TYPES", "").split(";")
+    multi_configuration = any(configurations)
+    if (multi_configuration and "Release" not in configurations
+            or not multi_configuration and cache.get("CMAKE_BUILD_TYPE") != "Release"):
+        raise BuildError("CMake's actual configuration does not support the selected Release build")
+    compiler_info = {}
+    for language, requested in (("C", cc), ("CXX", cxx)):
+        # Visual Studio can leave -D...COMPILER in the cache while using its
+        # own compiler. These generated files describe the compiler it uses.
+        info_path = build_dir / "CMakeFiles" / version[1] / f"CMake{language}Compiler.cmake"
+        try:
+            text = info_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise BuildError("CMake did not produce readable compiler identity") from exc
+        values = dict(re.findall(r'^set\((CMAKE_[A-Z_]+) "([^"\n]*)"\)$', text, re.MULTILINE))
+        actual = values.get(f"CMAKE_{language}_COMPILER")
+        identity = values.get(f"CMAKE_{language}_COMPILER_ID")
+        release = values.get(f"CMAKE_{language}_COMPILER_VERSION")
+        if not actual or not identity or not release:
+            raise BuildError("CMake's actual compiler identity is incomplete")
+        if requested is not None and Path(actual).resolve() != requested.resolve():
+            raise BuildError(f"CMake's actual CMAKE_{language}_COMPILER differs from the selected compiler")
+        if (identity == "MSVC") != (compiler_family == "msvc"):
+            raise BuildError("CMake's actual compiler family differs from the selected toolchain")
+        compiler_info[language] = f"{identity} {release}"
+    return {"generator": generator, "compiler": compiler_info["CXX"],
+            "multi_configuration": multi_configuration}
 
 
 def cmake_definitions(target_id: str, compiler_family: str) -> list[str]:
@@ -150,8 +210,47 @@ def cmake_definitions(target_id: str, compiler_family: str) -> list[str]:
 
 
 def _source_revision(source: Path, project_root: Path) -> str:
+    actual_root = _run(["git", "-C", str(source), "rev-parse", "--show-toplevel"], cwd=project_root, timeout=30)
+    if Path(actual_root.stdout.strip()).resolve() != source.resolve():
+        raise BuildError("llama.cpp source is not its own Git checkout")
     result = _run(["git", "-C", str(source), "rev-parse", "HEAD"], cwd=project_root, timeout=30)
     return result.stdout.strip()
+
+
+def _source_contract(source: Path, project_root: Path, lock: dict[str, Any]) -> dict[str, Any]:
+    revision = _source_revision(source, project_root)
+    if revision != expected_source_revision(lock):
+        raise BuildError("llama.cpp source HEAD does not match the lock's source revision")
+    # Reuse the existing source lock parser. Its marker description is not a
+    # literal source marker, so committed identity is proven by HEAD + clean Git
+    # status; the worktree-patch form is checked by git apply --reverse --check.
+    try:
+        expected, patches = source_lock_contract()
+    except SyncError as exc:
+        raise BuildError(f"llama.cpp source patch contract failed: {exc}") from exc
+    if expected != revision:
+        raise BuildError("llama.cpp source lock changed during verification")
+    status = _run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+                  cwd=project_root, timeout=30).stdout
+    if "revision_local" in lock and status.strip():
+        raise BuildError("llama.cpp committed-patch source has worktree patches or unrelated changes")
+    changed = {line[3:].strip() for line in status.splitlines() if line}
+    allowed = {target for item in patches for target in item["targets"]}
+    if changed - allowed:
+        raise BuildError("llama.cpp source has changes outside locked patch targets")
+    receipts = []
+    for item in patches:
+        patch = (project_root / item["path"]).resolve()
+        if not patch.is_relative_to(project_root.resolve()) or not patch.is_file():
+            raise BuildError("llama.cpp managed patch is missing or unsafe")
+        if file_sha256(patch) != item["sha256"].lower():
+            raise BuildError("llama.cpp managed patch digest does not match the lock")
+        if "revision_local" not in lock:
+            _run(["git", "-C", str(source), "apply", "--reverse", "--check", str(patch)],
+                 cwd=project_root, timeout=30)
+        receipts.append({"id": item["id"], "patch_sha256": item["sha256"].lower(),
+                         "state": "applied" if changed.intersection(item["targets"]) else "applied_committed"})
+    return {"source_revision": revision, "source_dirty": bool(changed), "source_patches": receipts}
 
 
 def _version_line(command: list[str], project_root: Path) -> str:
@@ -232,12 +331,14 @@ def build_and_package(
     source = llama_cpp_source(project_root)
     if not source.is_dir() or source.is_symlink():
         raise BuildError("pinned llama.cpp submodule is missing or unsafe")
-    revision = _source_revision(source, project_root)
-    if revision != lock["upstream"]["revision"]:
-        raise BuildError("llama.cpp submodule revision does not match the lock")
+    source_contract = _source_contract(source, project_root, lock)
+    revision = source_contract["source_revision"]
 
     cmake_path, ninja_path = find_cmake(project_root, cmake)
     cc, cxx, compiler_family = _compiler_pair(c_compiler, cxx_compiler)
+    if target_id.startswith("windows-") and compiler_family == "gnu" and ninja_path is None:
+        raise BuildError("Ninja is required for Windows GNU builds; install Ninja or an Android SDK CMake toolchain")
+    cmake_version = _version_line([str(cmake_path), "--version"], project_root)
     output_root = (output_root or default_package_root(project_root)).absolute()
     build_dir = (build_dir or output_root / "work" / target_id).absolute()
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -248,22 +349,29 @@ def build_and_package(
         configure.extend([f"-DCMAKE_C_COMPILER={cc.as_posix()}", f"-DCMAKE_CXX_COMPILER={cxx.as_posix()}"])
     configure.extend(cmake_definitions(target_id, compiler_family))
     _run(configure, cwd=project_root, timeout=timeout_seconds)
+    toolchain = _configured_toolchain(build_dir, cc, cxx, ninja_path, compiler_family, cmake_version)
     _run(
-        [str(cmake_path), "--build", str(build_dir), "--target", lock["cmake_target"], "--parallel", str(jobs)],
+        [str(cmake_path), "--build", str(build_dir), "--config", "Release",
+         "--target", lock["cmake_target"], "--parallel", str(jobs)],
         cwd=project_root,
         timeout=timeout_seconds,
     )
 
     executable_name = target["executable"]
-    executable_candidates = [build_dir / "bin" / executable_name, build_dir / "bin" / "Release" / executable_name]
-    executable = next((item for item in executable_candidates if item.is_file() and not item.is_symlink()), None)
-    if executable is None:
+    binary_dir = build_dir / "bin"
+    if toolchain["multi_configuration"]:
+        binary_dir /= "Release"
+    executable = binary_dir / executable_name
+    if not executable.is_file() or executable.is_symlink():
         raise BuildError("llama-quantize build did not produce the locked executable")
     smoke_result = _run([str(executable), "--help"], cwd=project_root, timeout=30, accepted_codes={0, 1})
     smoke_text = smoke_result.stdout
     if "allowed quantization types" not in smoke_text or "Q4_K_M" not in smoke_text:
         raise BuildError("llama-quantize help smoke did not expose Q4_K_M")
     runtime_dependencies = _runtime_dependencies(executable, cxx, target_id, project_root)
+
+    if _source_contract(source, project_root, lock) != source_contract:
+        raise BuildError("llama.cpp source contract changed during the build")
 
     packages_root = output_root / "packages"
     packages_root.mkdir(parents=True, exist_ok=True)
@@ -296,12 +404,13 @@ def build_and_package(
                 "schema_version": 1,
                 "tool": lock["tool"],
                 "target_id": target_id,
-                "upstream": {"repository": lock["upstream"]["repository"], "revision": revision},
+                "upstream": {"repository": lock["upstream"]["repository"], "revision": lock["upstream"]["revision"]},
+                **source_contract,
                 "executable": executable_name,
                 "build": {
                     "configuration": "Release",
-                    "cmake": _version_line([str(cmake_path), "--version"], project_root),
-                    "compiler": _version_line([str(cxx), "--version"], project_root) if cxx is not None else "MSVC environment",
+                    **toolchain,
+                    "cmake": cmake_version,
                     "shared_libraries": False,
                     "cuda": False,
                     "native_optimizations": False,
@@ -331,6 +440,8 @@ def build_and_package(
         "valid": True,
         "target_id": target_id,
         "revision": revision,
+        "upstream_revision": lock["upstream"]["revision"],
+        **source_contract,
         "package": package_dir.name,
         "executable": verification["executable"],
         "executable_size_bytes": verification["size_bytes"],

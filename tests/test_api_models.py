@@ -2087,3 +2087,24 @@ class TestParseThinkingResponseNative:
         assert answer is not None
         # 清理后不应有【思考】标记
         assert "【思考】" not in answer
+
+
+def test_api_catalog_and_load_resolution_use_registered_builtin_override(tmp_path, monkeypatch):
+    gguf = tmp_path / "replacement.gguf"
+    gguf.write_bytes(b"existing")
+    mid = "qwen3-0.6b"
+    row = {"model_id": mid, "name": "Verified replacement", "model_type": "gguf",
+           "model_path": "", "gguf_path": str(gguf)}
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [row])
+    model = next(m for m in api_server._get_all_model_configs() if m.model_id == mid)
+    assert model == mc.get_model_config(mid, [row])
+    payload = api_server._model_api_payload(model)
+    assert payload["supported_engines"] == ["llama_cpp"]
+    assert payload["name"] == row["name"]
+    assert payload["has_safetensors"] is False
+
+
+def test_registry_public_payload_hides_external_manifest_server_paths():
+    payload = api_server._public_registry_payload({"model_id": "fixture",
+        "manifest_external_files": {"external/private.gguf": "/private/weights/private.gguf"}})
+    assert "manifest_external_files" not in payload

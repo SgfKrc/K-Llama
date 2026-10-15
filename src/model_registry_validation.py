@@ -89,6 +89,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def manifest_external_files(root: Path, files: Iterable[Path]) -> dict[str, str]:
+    """Bind v1 external aliases to explicitly registered files, never guessed paths."""
+    root = _path(root)
+    result: dict[str, str] = {}
+    for item in files:
+        item = _path(item)
+        if item.is_relative_to(root):
+            continue
+        alias = f"external/{item.name}"
+        if alias in result and result[alias] != str(item):
+            raise ValueError("ambiguous external manifest filename")
+        result[alias] = str(item)
+    return result
+
+
 def build_manifest(
     root: Path,
     files: Iterable[Path],
@@ -105,6 +120,7 @@ def build_manifest(
         candidate = root / name
         if candidate.is_file():
             selected.add(candidate)
+    manifest_external_files(root, selected)
     entries: list[dict[str, Any]] = []
     for item in sorted(selected, key=lambda value: str(value).lower()):
         item = item.absolute().resolve(strict=False)
@@ -134,8 +150,8 @@ def write_manifest(root: Path, manifest: dict[str, Any], filename: str = "model.
     root = _path(root)
     root.mkdir(parents=True, exist_ok=True)
     destination = root / filename
-    temporary = destination.with_name(destination.name + ".part")
-    payload = json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
-    temporary.write_text(payload, encoding="utf-8")
-    os.replace(temporary, destination)
+    from atomic_json import atomic_write_json
+
+    atomic_write_json(destination, manifest, ensure_ascii=True, sort_keys=True,
+                      indent=2, trailing_newline=True)
     return destination

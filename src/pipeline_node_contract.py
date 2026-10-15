@@ -471,21 +471,33 @@ def pipeline_layout_from_capacity_plan(
         selected_artifact = assignment.get("layer_artifact")
         if not isinstance(selected_artifact, Mapping):
             selected_artifact = {}
-        artifact_kind = str(
-            meta.get("artifact_kind")
-            or ("gguf_segment" if selected_artifact else "safetensors_assignment")
+        # A selected GGUF or an explicit assignment engine describes this
+        # execution, whereas node metadata may describe a previous model.
+        engine = _canonical_engine(
+            "llama_cpp" if selected_artifact
+            else assignment.get("engine") or meta.get("engine") or default_engine,
+            "engine",
         )
-        artifact_value = meta.get("artifact") or PipelineArtifactRef(
+        inferred_kind = (
+            "gguf_segment" if engine == "llama_cpp" else "safetensors_assignment"
+        )
+        artifact_kind = str(
+            "gguf_segment" if selected_artifact
+            else inferred_kind if assignment.get("engine")
+            else meta.get("artifact_kind") or inferred_kind
+        )
+        assignment_owned = bool(selected_artifact or assignment.get("engine"))
+        artifact_value = (None if assignment_owned else meta.get("artifact")) or PipelineArtifactRef(
             # The layout-wide identity remains the logical source model.  A
             # Route-A worker can execute a format-specific GGUF segment whose
             # byte digest is intentionally different from the master's model.
             model_sha256=model_sha256,
             artifact_kind=artifact_kind,
             artifact_sha256=str(
-                meta.get("artifact_sha256")
-                or selected_artifact.get("artifact_sha256", "")
+                selected_artifact.get("artifact_sha256", "")
+                if assignment_owned else meta.get("artifact_sha256") or ""
             ),
-            manifest_sha256=str(meta.get("manifest_sha256") or ""),
+            manifest_sha256=str("" if assignment_owned else meta.get("manifest_sha256") or ""),
             architecture=str(meta.get("architecture") or architecture),
             source_layer_range=(start, end),
         )
@@ -493,13 +505,7 @@ def pipeline_layout_from_capacity_plan(
             node_id=node_id,
             kind=str(meta.get("kind") or ("local" if is_local else "remote_pipeline")),
             layer_range=(start, end),
-            # A selected layer_artifact is the exact GGUF segment executed by
-            # Route A.  Node-level metadata may describe a co-located PyTorch
-            # full model, which must not overwrite this assignment identity.
-            engine=(
-                "llama_cpp" if artifact_kind == "gguf_segment"
-                else str(meta.get("engine") or default_engine)
-            ),
+            engine="llama_cpp" if artifact_kind == "gguf_segment" else engine,
             location=str(meta.get("location") or ("local" if is_local else f"node:{node_id}")),
             capacity=PipelineNodeCapacity(
                 capacity_bytes=assignment.get("capacity_bytes", 0),

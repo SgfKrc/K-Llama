@@ -27,11 +27,14 @@ jobs:
     env:
       # 仓库里有中文文件名/中文文档；显式 UTF-8 避免平台差异带来的解码问题
       PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           # 文档检查不需要 LFS 大文件，跳过 smudge 以加快速度
           lfs: false
+          submodules: false
 
       # `docs/` 里有若干引用指向 `android/` 子模块内的文档（如 Android 验证替代路径）。
       # actions/checkout 默认不检出子模块，缺了它那些链接会全部误报为死链。
@@ -45,4 +48,4 @@ jobs:
 
       # 两条检查均只用标准库 ⇒ 无依赖安装步骤
       - name: Run documentation checks
-        run: python scripts/run_doc_checks.py
+        run: python -B scripts/run_doc_checks.py

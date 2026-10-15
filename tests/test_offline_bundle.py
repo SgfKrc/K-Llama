@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# Owned by the external release/offline-asset tooling workspace (module
+# ownership decision, 2026-09-14); the local builder is not a main-repo source.
+# Legacy local run: QLH_INCLUDE_WORKSPACE_TOOL_TESTS=1 python -m pytest <this file>.
+# Opting in requires the real builder; keep missing imports fatal.
+
+
 import json
 import sys
 import zipfile

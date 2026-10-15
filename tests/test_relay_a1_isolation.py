@@ -1,6 +1,6 @@
 """DIST-NEXT-7 回归：A1 relay 必须被隔离在生产状态机之外。
 
-判据来自 `docs/DIST后续核心链路缺陷审计-2026-10-07.md` 的「设计债务与遗留隔离」：
+判据来自 `docs/archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md` 的「设计债务与遗留隔离」：
 
 1. **默认不可被 scheduler assignment 选中**（`PIPELINE_RELAY_PROBE_ONLY` 默认 1）；
 2. 门只有一个（`relay_a1_legacy.a1_production_enabled`），生产供给只经它；

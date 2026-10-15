@@ -378,4 +378,4 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 - LMSYS blog（AMX kernel 21.3 TFLOPS / NUMA +63% / CUDA Graph / Expert Deferral +1.45×）
 - SOSP'25 论文摘要与 madsys 论文页
 - QLH 侧：[跨框架接力-当前有效基线与后续优化计划](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)、
-  [分布式推理并行与跨框架路线调研汇总](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)、`README.md`
+  [分布式推理并行与跨框架路线调研汇总](archive/relay/分布式推理并行与跨框架路线调研汇总-2026-09-15.md)、`README.md`

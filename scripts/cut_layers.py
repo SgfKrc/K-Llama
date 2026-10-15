@@ -44,6 +44,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from gguf_metadata_contract import (
+    project_gguf_metadata, read_gguf_metadata,
+    verify_gguf_metadata,
+)
+
 _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -89,23 +94,15 @@ def _require_gguf():
 
 def _read_identity(reader, source_path: Path) -> dict:
     """读取裁层所需的源工件元数据（与 relay_contract.RelayModelIdentity 对齐）。"""
-    fields = reader.fields
-    arch = fields["general.architecture"].contents()
-    block_count = int(fields[f"{arch}.block_count"].contents())
-    interval_field = fields.get(f"{arch}.full_attention_interval")
-    interval = int(interval_field.contents()) if interval_field is not None else None
-    nextn_field = fields.get(f"{arch}.nextn_predict_layers")
-    nextn = int(nextn_field.contents()) if nextn_field is not None else 0
-    n_embd_field = fields.get(f"{arch}.embedding_length")
-    n_embd = int(n_embd_field.contents()) if n_embd_field is not None else 0
+    metadata = read_gguf_metadata(source_path)
+    nextn = metadata["nextn_predict_layers"] or 0
     return {
         "source": str(source_path),
-        "architecture": arch,
-        "block_count": block_count,
-        "n_layer": max(0, block_count - nextn),
+        **metadata,
+        "n_layer": max(0, metadata["block_count"] - nextn),
         "nextn_predict_layers": nextn,
-        "n_embd": n_embd,
-        "full_attention_interval": interval,
+        "n_embd": metadata["n_embd"] or 0,
+        "gguf_metadata": metadata,
     }
 
 
@@ -358,6 +355,11 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
         "first_local_layer_maps_to": first_local,
         "artifact_sha256": _sha256(dst) if dst.exists() else "",
     }
+    if "gguf_metadata" in identity:
+        lo = source_layer_range[0]
+        result["gguf_metadata"] = project_gguf_metadata(
+            identity["gguf_metadata"], lo, lo + kept_block_count,
+        )
     if source_model_id and tokenizer_sha256:
         result.update({
             "source_model_id": source_model_id,
@@ -405,7 +407,10 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
 
 #: llama.cpp 要求**长度等于层数**的"按层数组"KV —— 裁层后必须同步裁剪，否则加载失败。
 #: （`#67` 缺口 ⑩：`_copy_kv` 对 ARRAY 是原样复制，长度不符会 throw。）
-_PER_LAYER_ARRAY_SUFFIXES = ("attention.recurrent_layers",)
+_PER_LAYER_ARRAY_SUFFIXES = (
+    "attention.recurrent_layers", "attention.head_count", "attention.head_count_kv",
+    "attention.key_length", "full_attention_interval",
+)
 
 
 def _per_layer_array_overrides(reader, identity: dict, *, k: int | None = None,
@@ -420,22 +425,29 @@ def _per_layer_array_overrides(reader, identity: dict, *, k: int | None = None,
     overrides: dict = {}
     problems: list[str] = []
     n_layer = int(identity.get("n_layer") or 0)
+    block_count = int(identity.get("block_count") or n_layer)
     if keep_head is not None:
         lo, hi = 0, int(keep_head)
     else:
         lo = int(k or 0)
-        hi = int(end) if end is not None else n_layer
+        hi = int(end) if end is not None else block_count
     for name, field in reader.fields.items():
         if not any(name.endswith(suffix) for suffix in _PER_LAYER_ARRAY_SUFFIXES):
             continue
         try:
-            value = list(field.contents())
+            contents = field.contents()
+            if type(contents) is not list and not hasattr(contents, "__iter__"):
+                if name.endswith("attention.recurrent_layers"):
+                    raise ValueError("recurrent_layers must be an array")
+                continue  # Scalar head counts are shared by every layer.
+            value = list(contents)
         except Exception as exc:  # noqa: BLE001 - 统一收成 problem
             problems.append(f"按层数组 KV {name} 读取失败: {exc}")
             continue
-        if len(value) != n_layer:
+        expected_length = n_layer if name.endswith("attention.recurrent_layers") else block_count
+        if len(value) != expected_length:
             problems.append(
-                f"按层数组 KV {name} 长度={len(value)} ≠ 源模型层数 n_layer={n_layer}"
+                f"按层数组 KV {name} 长度={len(value)} ≠ 源模型层数 n_layer={expected_length}"
                 " —— llama.cpp 要求两者相等；原样复制到裁层工件会导致加载失败（源不可信）"
             )
             continue
@@ -556,15 +568,20 @@ def main() -> int:
         print(f"FAIL: 源文件不存在: {src}")
         return 2
 
-    gguf = _require_gguf()
-    reader = gguf.GGUFReader(str(src))
-    identity = _read_identity(reader, src)
-
     # ---------------- 校验模式 ----------------
     if args.verify_manifest:
+        try:
+            actual_metadata = read_gguf_metadata(src)
+        except (OSError, ValueError) as exc:
+            print(f"FAIL: {exc}")
+            return 1
+        identity = actual_metadata
         manifest = json.loads(Path(args.verify_manifest).read_text(encoding="utf-8"))
         expected = int(manifest.get("kept_block_count", -1))
-        ok = True
+        problems = verify_gguf_metadata(actual_metadata, manifest.get("gguf_metadata", {}))
+        for problem in problems:
+            print(f"FAIL: gguf_metadata {problem}")
+        ok = not problems
         if identity["block_count"] != expected:
             print(f"FAIL: block_count={identity['block_count']} ≠ manifest.kept_block_count={expected}")
             ok = False
@@ -579,6 +596,10 @@ def main() -> int:
             print(f"OK: block_count={identity['block_count']}")
         print(f"     artifact_sha256={digest[:16]}…")
         return 0 if ok else 1
+
+    gguf = _require_gguf()
+    reader = gguf.GGUFReader(str(src))
+    identity = _read_identity(reader, src)
 
     if args.end is not None and args.k is None:
         print("FAIL: --end 只能与 --k 同用（中段工件）")
@@ -687,6 +708,12 @@ def main() -> int:
                          kept_names=[new_name for _, new_name in keep],
                          source_model_id=source_model_id,
                          tokenizer_sha256=tokenizer_sha256)
+    actual_metadata = read_gguf_metadata(dst)
+    metadata_problems = verify_gguf_metadata(actual_metadata, manifest["gguf_metadata"])
+    if metadata_problems:
+        for problem in metadata_problems:
+            print(f"FAIL: gguf_metadata {problem}")
+        return 2
     if args.manifest:
         Path(args.manifest).write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                        encoding="utf-8")

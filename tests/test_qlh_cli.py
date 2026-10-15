@@ -1,4 +1,8 @@
 import os
+import sys
+from types import SimpleNamespace
+
+import pytest
 
 import qlh
 
@@ -132,3 +136,74 @@ def test_windows_launchers_are_ascii_only():
     for name in ("qlh.bat", "koakuma.bat", "start_tui.bat", "bjtu.bat", "start_backend.bat"):
         content = (root / name).read_text(encoding="utf-8")
         assert all(ord(char) < 128 for char in content), name
+
+
+@pytest.mark.parametrize("command", [[], ["chat"], ["tui"], ["ui"]])
+@pytest.mark.parametrize(
+    "environment_bind, cli_bind, expected_bind",
+    [
+        (None, None, "127.0.0.1"),
+        ("0.0.0.0", None, "0.0.0.0"),
+        (None, "0.0.0.0", "0.0.0.0"),
+        ("0.0.0.0", "127.0.0.1", "127.0.0.1"),
+        (None, "::", "::"),
+    ],
+)
+def test_shell_keeps_client_destination_separate_from_backend_bind(
+    monkeypatch, command, environment_bind, cli_bind, expected_bind,
+):
+    seen = {}
+    if environment_bind is None:
+        monkeypatch.delenv("QLH_BACKEND_HOST", raising=False)
+    else:
+        monkeypatch.setenv("QLH_BACKEND_HOST", environment_bind)
+    monkeypatch.setattr(qlh, "_textual_available", lambda: True)
+
+    def fake_textual(host, port, **options):
+        seen.update(host=host, port=port, **options)
+        return 0
+
+    monkeypatch.setitem(sys.modules, "tui_textual", SimpleNamespace(run=fake_textual))
+    arguments = [*command, "--host", "http://127.0.0.1:18000"]
+    if cli_bind is not None:
+        arguments.extend(["--backend-host", cli_bind])
+    assert qlh.main(arguments) == 0
+    assert (seen["host"], seen["port"]) == ("127.0.0.1", 18000)
+    supervisor = seen["supervisor"]
+    assert supervisor.host == "127.0.0.1"
+    assert supervisor.bind_host == expected_bind
+    assert supervisor.health_url == "http://127.0.0.1:18000/api/health"
+
+
+@pytest.mark.parametrize("command", [[], ["chat"], ["tui"], ["ui"]])
+def test_remote_shell_does_not_autostart_even_with_explicit_bind(monkeypatch, command):
+    seen = {}
+    monkeypatch.setattr(qlh, "_textual_available", lambda: True)
+    monkeypatch.setenv("QLH_BACKEND_HOST", "0.0.0.0")
+    monkeypatch.setitem(
+        sys.modules, "tui_textual",
+        SimpleNamespace(run=lambda host, port, **options: (seen.update(options), 0)[1]),
+    )
+    assert qlh.main([
+        *command, "--host", "http://192.0.2.10:18000",
+        "--backend-host", "0.0.0.0", "--auto-start", "--auto-start",
+    ]) == 0
+    assert seen["supervisor"] is None
+
+
+def test_missing_backend_host_is_reported_before_start(monkeypatch, capsys):
+    def unexpected_start(*args):
+        pytest.fail("invalid bind arguments must not start the shell")
+
+    monkeypatch.setattr(qlh, "_run_unified", unexpected_start)
+    assert qlh.main(["chat", "--backend-host"]) == 2
+    assert "--backend-host 缺少参数" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("arguments", [["--help"], ["chat", "--help"]])
+def test_help_explains_backend_bind_configuration(arguments, capsys):
+    assert qlh.main(arguments) == 0
+    output = capsys.readouterr().out
+    assert "--backend-host" in output
+    assert "QLH_BACKEND_HOST" in output
+    assert "客户端" in output

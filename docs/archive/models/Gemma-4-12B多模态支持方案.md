@@ -184,7 +184,7 @@ set QLH_EXTERNAL_REASONING_EFFORT=none   :: 避免 thinking 占满短回复预�
 set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 ```
 
-对应实现:`src/config.py:211-229`;端点健康检查、故障回退、流式等均已支持(`docs/外部推理服务Provider接入指南.md`)。
+对应实现:`src/config.py:211-229`;端点健康检查、故障回退、流式等均已支持(`docs/archive/misc/外部推理服务Provider接入指南.md`)。
 
 ### 4.3 图像消息管线（G4.1 Completed）
 
@@ -400,5 +400,5 @@ fixture 以 `0.8/0.6` 穿过预注册的 `0.70/0.50` advisory 阈值，仅证明
 - Ollama 官方库 `gemma4:12b`：https://ollama.com/library/gemma4
 - 模型基线约定:`myheretic:latest` 为私人微调版,不具备通用能力,仅作架构可行性参考,不作为实验模型
 - 项目 vendored llama.cpp 仅作为 G4.3 候选证据，不代表当前 Python 运行时已支持
-- 外部 Provider 接入:`docs/外部推理服务Provider接入指南.md`
+- 外部 Provider 接入:`docs/archive/misc/外部推理服务Provider接入指南.md`
 - 多模态远期规划:`docs/一键模型部署与自治集群远期计划.md`(:309,:340,:958-963)

@@ -21,15 +21,25 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from atomic_json import atomic_write_json
 from pipeline_capacity import solve_pipeline_capacity
 
 logger = logging.getLogger(__name__)
 
 
+_STRATEGY_REASON_CODES = frozenset({
+    "SUPPLY_CACHE_REUSED", "SUPPLY_LOCAL_CUT_PREFERRED", "SUPPLY_DISTRIBUTE_REQUESTED",
+    "SUPPLY_LOCAL_SOURCE_UNAVAILABLE", "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
+    "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT", "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
+    "SUPPLY_LOCAL_CUT_UNSUPPORTED", "SUPPLY_NODE_CUTTER_UNAVAILABLE",
+})
+
+
 class ModelSupplyError(ValueError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, diagnostic: dict | None = None):
         super().__init__(message)
         self.code, self.message = code, message
+        self.diagnostic = copy.deepcopy(diagnostic)
 
 
 def _digest(value: Any) -> str:
@@ -151,9 +161,19 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                "component_weight_bytes": {"embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0},
                "runtime_ignored_components": []}
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
-                                    require_distributed=True, prefer_all_workers=True)
+                                    require_distributed=True, prefer_all_workers=True,
+                                    required_node_id="master")
+    if result.get("reason_code") == "pipeline_required_node_unavailable":
+        result = {**result, "reason_code": "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
+                  "reason": "主节点当前可用容量不足以执行接力的首段。"}
     if not result.get("admitted"):
-        return {**result, "total_layers": total, "loaded_ready": False, "supply_only": True}
+        from model_supply_diagnostics import explain_supply_capacity
+        diagnostic = explain_supply_capacity(
+            result, grouped_descriptor=grouped, projected_nodes=projected,
+            alignment=alignment, total_layers=total, safety_margin=safety_margin,
+        )
+        return {**result, "total_layers": total, "loaded_ready": False, "supply_only": True,
+                "capacity_diagnostic": diagnostic}
     assignments = []
     for raw in result["assignments"]:
         item = dict(raw)
@@ -192,6 +212,7 @@ class ModelSupplyCoordinator:
         self._active = ""
         self._preparing = ""
         self._prepare_cancelled = False
+        self._capacity_queries: dict[str, dict] = {}
 
     @property
     def root(self) -> Path:
@@ -247,7 +268,8 @@ class ModelSupplyCoordinator:
             operation = {"operation_id": op_id, "intent": copy.deepcopy(intent),
                          "status": "queued", "reason_code": "", "created_at": time.time(),
                          "updated_at": time.time(), "loaded_ready": False, "nodes": {},
-                         "plan": None, "requires_prepare": True, "wait_for_nodes": wait_for_nodes}
+                         "plan": None, "capacity_diagnostic": None,
+                         "requires_prepare": True, "wait_for_nodes": wait_for_nodes}
             self._operations[op_id] = operation
             self._events[op_id] = threading.Event()
             self._active = op_id
@@ -261,11 +283,12 @@ class ModelSupplyCoordinator:
             return copy.deepcopy(operation)
 
     def _persist(self, operation):
-        directory = self.root / operation["operation_id"]
-        directory.mkdir(parents=True, exist_ok=True)
-        temp = directory / "operation.json.tmp"
-        temp.write_text(json.dumps(operation, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(directory / "operation.json")
+        # Keep the owner lock through backoff so a delayed write cannot land
+        # after a newer update or cancellation.
+        with self._condition:
+            directory = self.root / operation["operation_id"]
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(directory / "operation.json", operation, ensure_ascii=False, indent=2)
 
     def get(self, op_id: str) -> dict:
         with self._condition:
@@ -313,7 +336,12 @@ class ModelSupplyCoordinator:
             terminal = op["status"] in self.TERMINAL
             self._events.setdefault(op_id, threading.Event()).set()
             if not terminal:
-                op.update(status="cancelled", reason_code="SUPPLY_CANCELLED", updated_at=time.time())
+                op.update(status="cancelled", reason_code="SUPPLY_CANCELLED",
+                          reason="Supply operation cancelled", updated_at=time.time())
+                # Preserve a marked historical snapshot for intent deadlines.
+                # Current cause/status still decide what consumers may display.
+                if isinstance(op.get("capacity_diagnostic"), dict):
+                    op["capacity_diagnostic"] = {**op["capacity_diagnostic"], "historical": True}
             # Revocation cannot depend on a successful disk write. Repeated
             # cancellation retries a previously failed save and receiver cleanup.
             for key in list(self._leases):
@@ -365,6 +393,9 @@ class ModelSupplyCoordinator:
         if action not in {"inventory_result", "result", "progress"}:
             return
         with self._condition:
+            from model_supply_capacity import handle_capacity_inventory
+            if handle_capacity_inventory(self, node_id, payload):
+                return
             op = self._operations.get(op_id)
             if not op or op["status"] in self.TERMINAL or node_id not in op["nodes"]:
                 return
@@ -384,6 +415,10 @@ class ModelSupplyCoordinator:
                 if payload.get("phase") in {"receiving", "downloading", "building", "verifying", "registering",
                                             "download", "verify", "build"}:
                     allowed["phase"] = payload["phase"]
+                if payload.get("strategy") in {"distribute", "local_cut", "reuse"}:
+                    allowed["strategy"] = payload["strategy"]
+                if payload.get("strategy_reason_code") in _STRATEGY_REASON_CODES:
+                    allowed["strategy_reason_code"] = payload["strategy_reason_code"]
                 op["nodes"][node_id].update(allowed)
             else:
                 self._responses[(op_id, node_id, action)] = copy.deepcopy(payload)
@@ -485,7 +520,8 @@ class ModelSupplyCoordinator:
                     raise ModelSupplyError("SUPPLY_WORKER_TIMEOUT", f"Worker {node_id} did not return {action}")
                 self._condition.wait(min(remaining, 0.5))
 
-    def _extend_auto_inventory(self, op_id, intent, worker_ids, nodes, inventories, deadline, *, wait_for_new=False):
+    def _extend_auto_inventory(self, op_id, intent, worker_ids, nodes, inventories, deadline, *,
+                               wait_for_new=False, capacity_diagnostic=None):
         """Extend only the unpublished automatic pool, using the live join owners."""
         expanded = False
         while True:
@@ -501,7 +537,7 @@ class ModelSupplyCoordinator:
                 return expanded
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if wait_for_new and not pending:
+                if wait_for_new and (capacity_diagnostic is not None or not pending):
                     return expanded
                 raise ModelSupplyError("SUPPLY_WORKERS_TIMEOUT", "No joined supply workers before the operation deadline")
             if added and not pending:
@@ -513,7 +549,8 @@ class ModelSupplyCoordinator:
                     self._check(op_id)
                     self._check_receivers(op_id)
                     nodes.update({node_id: {"status": "inventory"} for node_id in added})
-                    self._update(op_id, status="inventory", nodes=nodes, reason_code="", reason="")
+                    self._update(op_id, status="inventory", nodes=nodes, reason_code="", reason="",
+                                 capacity_diagnostic=None)
                 for node_id in added:
                     self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
                                                "source_model_sha256": ""})
@@ -531,8 +568,18 @@ class ModelSupplyCoordinator:
                 # Inventory/source inspection can take long enough for another
                 # peer to register. Drain new joined peers before planning once.
                 continue
-            self._update(op_id, status="waiting_nodes", reason_code="SUPPLY_WAITING_NODES",
-                         reason="Waiting for additional distributed workers to finish joining")
+            if wait_for_new and capacity_diagnostic is not None:
+                diagnostic = copy.deepcopy(capacity_diagnostic)
+                diagnostic["pending_node_ids"] = sorted(
+                    node_id for node_id, info in connections.items() if info and node_id not in ready
+                )
+                self._update(op_id, status="waiting_nodes",
+                             reason_code=diagnostic["reason_code"], reason=diagnostic["reason"],
+                             capacity_diagnostic=diagnostic)
+            else:
+                self._update(op_id, status="waiting_nodes", reason_code="SUPPLY_WAITING_NODES",
+                             reason="Waiting for additional distributed workers to finish joining",
+                             capacity_diagnostic=None)
             self._events[op_id].wait(min(remaining, 0.25))
 
     def authorize_file(self, op_id, node_id, filename, token):
@@ -560,7 +607,8 @@ class ModelSupplyCoordinator:
         from model_supply_sources import ensure_registered_sources
         source_result = ensure_registered_sources(
             model_id, operation_dir=self.root / op_id / "source",
-            want_gguf=want_gguf, cancelled=lambda: self._events[op_id].is_set(),
+            want_gguf=want_gguf, require_cross_format=intent.get("engine") != "llama_cpp",
+            cancelled=lambda: self._events[op_id].is_set(),
             progress=lambda value: self._update(op_id, source_progress=value),
         )
         cfg = source_result["model_config"]
@@ -625,7 +673,8 @@ class ModelSupplyCoordinator:
                 cancelled = self._events[op_id].is_set()
                 self._events[op_id].set()
             self._update(op_id, status="cancelled" if cancelled else "failed",
-                         reason_code="SUPPLY_CANCELLED" if cancelled else code, reason=message)
+                         reason_code="SUPPLY_CANCELLED" if cancelled else code, reason=message,
+                         capacity_diagnostic=None if cancelled else getattr(exc, "diagnostic", None))
             self._cancel_receivers(op_id, list(self.get(op_id)["nodes"]))
 
     def _execute(self, op_id):
@@ -694,7 +743,8 @@ class ModelSupplyCoordinator:
                 self._check(op_id)
                 self._check_receivers(op_id)
             self._update(op_id, status="planning", source_model_sha256=sources["source_model_sha256"],
-                         tokenizer_sha256=sources["tokenizer_sha256"], reason_code="", reason="")
+                         tokenizer_sha256=sources["tokenizer_sha256"], reason_code="", reason="",
+                         capacity_diagnostic=None)
             capacity = self.scheduler._get_pipeline_capacity_nodes(set(worker_ids) | {"master"})
             capacity_by_id = {record["node_id"]: record for record in capacity}
             records = []
@@ -754,26 +804,59 @@ class ModelSupplyCoordinator:
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
                 )
                 if not runtime_host_ranges[node_id]:
-                    raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage a proper source segment in RAM")
+                    from model_supply_diagnostics import explain_host_capacity
+                    diagnostic = explain_host_capacity(
+                        projection, node_id=node_id,
+                        available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                        reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                        safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                    )
+                    raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
+                                           diagnostic=diagnostic)
             from model_supply_plan_reuse import plan_segment_supply_reuse
-            def capacity_plan(*, preferred_ranges):
+            def capacity_plan(*, preferred_ranges, constrain_host=True):
                 return plan_segment_supply(sources["descriptors"], records,
                     master_engine=sources["master_engine"], alignment=sources["alignment"],
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                     runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
-                    runtime_host_ranges=runtime_host_ranges)
+                    runtime_host_ranges=runtime_host_ranges if constrain_host else None)
             plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
                 planner=capacity_plan, source_model_id=sources["source_model_id"],
                 source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
                 engine_by_node={record["node_id"]:record["engine"] for record in records},
                 alignment=sources["alignment"])
             if not plan.get("admitted"):
-                code = str(plan.get("reason_code", "SUPPLY_CAPACITY_INSUFFICIENT"))
-                if (auto_pool and code in {"pipeline_distributed_capacity_insufficient", "SUPPLY_CAPACITY_INSUFFICIENT"}
-                        and self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline,
-                                                        wait_for_new=True)):
+                diagnostic = plan["capacity_diagnostic"]
+                # A host range is a staging constraint, not an absent artifact.
+                # Prove its effect with the same runtime solver before naming it.
+                if runtime_host_ranges:
+                    unconstrained = capacity_plan(preferred_ranges={}, constrain_host=False)
+                    if unconstrained.get("admitted"):
+                        from model_supply_diagnostics import explain_host_capacity
+                        shortages = []
+                        for assignment in unconstrained["assignments"]:
+                            node_id = assignment["node_id"]
+                            if node_id not in runtime_host_descriptors:
+                                continue
+                            explanation = explain_host_capacity(
+                                runtime_host_descriptors[node_id], node_id=node_id,
+                                available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                                layer_range=[assignment["start_layer"], assignment["end_layer"]],
+                            )
+                            shortages.extend(item for item in explanation["nodes"] if item.get("deficit_bytes", 0) > 0)
+                        if shortages:
+                            diagnostic = {**explanation, "nodes": shortages,
+                                          "origin_reason_code": plan.get("reason_code", ""),
+                                          "origin_reason": plan.get("reason", ""),
+                                          "reason": "当前节点的显存可形成接力计划，但主机 RAM 不足以暂存该候选计划的源权重。"}
+                code = str(diagnostic["reason_code"])
+                if (auto_pool and self._extend_auto_inventory(
+                        op_id, intent, worker_ids, nodes, inventories, deadline,
+                        wait_for_new=True, capacity_diagnostic=diagnostic)):
                     continue
-                raise ModelSupplyError(code, "No feasible segment supply plan")
+                raise ModelSupplyError(code, diagnostic["reason"], diagnostic=diagnostic)
             if auto_pool and self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline):
                 continue
             # CUDA still needs host source mappings. Gate the selected segment's
@@ -790,7 +873,16 @@ class ModelSupplyCoordinator:
                 reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
                 required = math.ceil(source_bytes * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
                 if required > int(inventories[node_id].get("memory_available_bytes", 0)):
-                    raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", f"Worker {node_id} cannot stage its selected source tensors in RAM")
+                    from model_supply_diagnostics import explain_host_capacity
+                    diagnostic = explain_host_capacity(
+                        projection, node_id=node_id,
+                        available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                        reserve_bytes=reserve, safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                        alignment=sources["alignment"],
+                        layer_range=[assignment["start_layer"], assignment["end_layer"]],
+                    )
+                    raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
+                                           diagnostic=diagnostic)
                 assignment.update(host_source_bytes=source_bytes, host_required_bytes=required,
                                   runtime_target_element_size=projection["runtime_target_element_size"])
             break
@@ -798,7 +890,7 @@ class ModelSupplyCoordinator:
             self._check(op_id)
             self._check_receivers(op_id)
             self._update(op_id, status="building", plan=plan)
-        from model_supply_assets import build_gguf_segment, build_safetensors_segment
+        from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
         pending_receipts = []
         for assignment in plan["assignments"]:
             self._check(op_id)
@@ -812,19 +904,26 @@ class ModelSupplyCoordinator:
             disk_descriptor = sources["descriptors"][assignment["engine"]]
             estimated = _segment_disk_weight_bytes(disk_descriptor, assignment, src)
             free = shutil.disk_usage(directory).free
-            if free < max(estimated * 2, 64 * 1024**2):
+            identity = {"node_id": node_id, "source_model_id": sources["source_model_id"],
+                "source_model_sha256": sources["source_model_sha256"],
+                "tokenizer_sha256": sources["tokenizer_sha256"], "total_layers": plan["total_layers"],
+                "layer_range": [assignment["start_layer"], assignment["end_layer"]],
+                "segment_mode": "head" if assignment["start_layer"] == 0 else
+                                "tail" if assignment["end_layer"] == plan["total_layers"] else "middle",
+                "format": "gguf" if assignment["engine"] == "llama_cpp" else "safetensors",
+                "conversion_proof": sources["conversion_proof"]}
+            if free < max(estimated * 2, 64 * 1024**2) and not segment_cache_hint(self.root, identity):
                 raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
             manifest = builder(src, directory, source_model_id=sources["source_model_id"],
                                source_model_sha256=sources["source_model_sha256"],
                                tokenizer_sha256=sources["tokenizer_sha256"],
                                start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
                                total_layers=plan["total_layers"], operation_id=op_id, node_id=node_id,
-                               conversion_proof=sources["conversion_proof"])
+                               conversion_proof=sources["conversion_proof"], reuse_root=self.root)
             self._check(op_id)
+            reused_bytes = manifest.pop("_reused_bytes", 0)
             files = manifest.pop("local_files")
             total_bytes = sum(int(item["size_bytes"]) for item in manifest["files"])
-            if int(inventories[node_id].get("disk_free_bytes", 0)) < total_bytes * 2 + 64 * 1024**2:
-                raise ModelSupplyError("SUPPLY_WORKER_DISK_INSUFFICIENT", f"Worker {node_id} staging disk is insufficient")
             with self._condition:
                 nodes[node_id] = {"status": "supplying", "layer_range": manifest["layer_range"],
                                   "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
@@ -839,23 +938,38 @@ class ModelSupplyCoordinator:
                 if result.get("status") != "available":
                     raise ModelSupplyError(str(result.get("reason_code") or "SUPPLY_LOCAL_REGISTRATION_FAILED"), "Master could not register its segment")
                 with self._condition:
-                    nodes[node_id].update(status="available", strategy="local_build")
+                    nodes[node_id].update(status="available", strategy="reuse" if reused_bytes else "local_build",
+                                          actual_downloaded_bytes=0, reused_bytes=reused_bytes)
                     self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
                 continue
             available_sources = inventories[node_id].get("sources") or []
-            can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and any(
-                entry.get("source_model_sha256") == sources["source_model_sha256"] for entry in available_sources)
+            matching_source = any(
+                entry.get("source_model_sha256") == sources["source_model_sha256"]
+                and entry.get("tokenizer_sha256", sources["tokenizer_sha256"]) == sources["tokenizer_sha256"]
+                for entry in available_sources)
+            can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
             requested = intent.get("strategy", "auto")
             if requested == "local_cut" and not can_cut:
                 raise ModelSupplyError("SUPPLY_LOCAL_CUT_UNAVAILABLE", f"Worker {node_id} lacks the verified source or cutter")
             strategy = "local_cut" if can_cut and requested != "distribute" else "distribute"
+            reason = ("SUPPLY_LOCAL_CUT_PREFERRED" if strategy == "local_cut" else
+                      "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
+                      "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
+                      "SUPPLY_NODE_CUTTER_UNAVAILABLE")
+            # Do not attempt a new local cut when its staging reserve is already
+            # known infeasible; the receiver can still reuse its cached files.
+            if (strategy == "local_cut" and requested == "auto" and
+                    int(inventories[node_id].get("disk_free_bytes", 0)) < total_bytes + 64 * 1024**2):
+                strategy, reason = "distribute", "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT"
             token = secrets.token_urlsafe(32)
             with self._condition:
                 self._leases[(op_id, node_id)] = {"token": token, "files": files}
             with self._condition:
-                nodes[node_id]["strategy"] = strategy
+                nodes[node_id].update(strategy=strategy, strategy_reason_code=reason)
             self._send(op_id, node_id, {"action": "ensure", "node_id": node_id, "strategy": strategy,
-                                     "manifest": manifest, "api_port": int(API_PORT), "token": token})
+                                     "manifest": manifest, "api_port": int(API_PORT), "token": token,
+                                     "allow_fallback": requested == "auto", "strategy_reason_code": reason,
+                                     "local_cut_timeout_seconds": max(1, min(300, int((deadline - time.monotonic()) / 3)))})
             pending_receipts.append((node_id, manifest, total_bytes, strategy, time.monotonic()))
         # All receivers pull from the master concurrently. File availability
         # is published only after every assignment returns its exact identity.
@@ -869,14 +983,49 @@ class ModelSupplyCoordinator:
                     raise ModelSupplyError("SUPPLY_RECEIPT_MISMATCH", f"Worker {node_id} returned a different segment identity")
             with self._condition:
                 nodes[node_id].update(status="available", downloaded_bytes=total_bytes if strategy == "distribute" else 0)
+                if result.get("strategy") in {"distribute", "local_cut", "reuse"}:
+                    nodes[node_id]["strategy"] = result["strategy"]
+                if result.get("strategy_reason_code") in _STRATEGY_REASON_CODES:
+                    nodes[node_id]["strategy_reason_code"] = result["strategy_reason_code"]
                 for counter in ("actual_downloaded_bytes", "reused_bytes", "resumed_bytes"):
                     if type(result.get(counter)) is int and result[counter] >= 0:
                         nodes[node_id][counter] = result[counter]
                 self._leases.pop((op_id, node_id), None)
                 self._update(op_id, nodes=nodes)
         self._check(op_id)
+        self._collect_garbage(op_id)
+        self._check(op_id)
         self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
                      loaded_ready=False, requires_prepare=True)
+
+    def _collect_garbage(self, op_id):
+        collector = getattr(self.scheduler._model_supply_worker, "collect_garbage", None)
+        if not callable(collector):
+            return
+        # Snapshot under the condition; live SHA can take minutes on slow
+        # storage and must leave status, progress and cancellation responsive.
+        # The receiver holds native owner admission throughout collection.
+        with self._condition:
+            protected = [self.root / op_id]
+            preparing = self._preparing
+            event = self._events[op_id]
+            if preparing:
+                protected.append(self.root / preparing)
+            leased = frozenset(path for lease in self._leases.values()
+                               for path in lease["files"].values())
+            protected.extend(Path(path) for path in leased)
+
+        def invalidated():
+            # New selection/prepare/lease ownership invalidates this snapshot.
+            # The collector checks this during hashing and before deletion.
+            with self._condition:
+                return (event.is_set() or self._active != op_id
+                        or self._preparing != preparing
+                        or any(path not in leased for lease in self._leases.values()
+                               for path in lease["files"].values()))
+
+        report = collector(root=self.root, protected_paths=protected, cancelled=invalidated)
+        self._update(op_id, retention=report)
 
     @contextmanager
     def prepare_guard(self, op_id):
@@ -907,6 +1056,10 @@ class ModelSupplyCoordinator:
             if self._active and self._active != op_id:
                 raise ModelSupplyError("SUPPLY_OPERATION_STALE", "Model preparation was superseded")
         self._check_master()
+
+    def prepare_capacity_evidence(self, op_id):
+        from model_supply_capacity import prepare_capacity_evidence
+        return prepare_capacity_evidence(self, op_id)
 
     def prepared_source(self, op_id) -> dict:
         self._check_master()
