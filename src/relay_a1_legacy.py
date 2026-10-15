@@ -1,6 +1,6 @@
 """A1 relay（legacy 探针）的**隔离边界**。
 
-背景（`docs/DIST后续核心链路缺陷审计-2026-10-07.md` 的设计债务一节）
+背景（`docs/archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md` 的设计债务一节）
 --------------------------------------------------------------------
 A1 relay 已从产品调度入口剔除：`PIPELINE_RELAY_PROBE_ONLY` 默认 1 ⇒
 `scheduler_pipeline._relay_segment_for_worker()` 直接返回 `None`，生产请求走 A3

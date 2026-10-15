@@ -62,7 +62,7 @@ shim 新增有限 logits 检查和可查询的 guard／词表能力；NaN／Inf 
 
 Evidence root: `build/edge-bench-20261015/`. Counts overlap and must not be summed. The failed first full run is preserved separately; the final full run completed with unchanged source hashes and unchanged master identity. `round-changes.patch` is relative to the start of this round, so prior uncommitted work is distinguishable. `final-acceptance.json` binds the final reports and checks.
 
-本轮验收的是可重复的层段标定和供给 metadata 校验，不把它计作新增三机 DL／LL 产品 E2E。Surface、Y700 离线，Android 真机安装与接收仍需设备恢复后补测；其他平台的 native 标定也未实跑。整模单机基线、重启自动拉起继续按用户要求后置。 本轮没有证明聚合容量不可替代；[上一轮容量验收](capacity-freshness-rog-acceptance-2026-10-15.md) 已记录该 9B 配置的单节点整模候选包含 master，不能把“使用两个 proper segment”直接等同于“单机装不下”。星状拓扑、master 协调和 DL／LL 连续层段接力均未改变。
+本轮验收的是可重复的层段标定和供给 metadata 校验，不把它计作新增三机 DL／LL 产品 E2E。Surface、Y700 离线，Android 真机安装与接收仍需设备恢复后补测；其他平台的 native 标定也未实跑。整模单机基线、重启自动拉起继续按用户要求后置。 本轮没有证明聚合容量不可替代；[上一轮容量验收](../runtime/capacity-freshness-rog-acceptance-2026-10-15.md) 已记录该 9B 配置的单节点整模候选包含 master，不能把“使用两个 proper segment”直接等同于“单机装不下”。星状拓扑、master 协调和 DL／LL 连续层段接力均未改变。
 
 ## 下一票顺序及票 13 复核
 

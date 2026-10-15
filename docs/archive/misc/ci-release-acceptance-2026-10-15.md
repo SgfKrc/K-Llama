@@ -8,11 +8,11 @@
 
 测试通道记录预期 run 集合和生命周期，摘要同时核对退出码与真实 JUnit testcase。空 runs、缺文件、损坏 XML／JSON、失败但 exit 0、全 skip、重复使用 XML、越界路径与中断不会通过。物理授权、尝试、实际执行和通过分别记录；`--require-physical` 强制 external／smoke 每次重复都有实际物理用例通过。
 
-[产品证据门](产品接力证据门-CI-RELEASE-01.md)要求 DL／LL 两档各有两个不同远端、连续有序完整层段、实际 completed handoff、required route、显式 fallback=false、同一模型操作／配置／精确代际、完整 OS 星状连接及每节点 proper native segment。master 发起前的 dispatch 日志不能作完成证据；新完成日志仅在远端结果校验后写入。EOS 最后一轮虽未进入可见 token steps，仍必须有完整远端完成记录。
+[产品证据门](../../产品接力证据门-CI-RELEASE-01.md)要求 DL／LL 两档各有两个不同远端、连续有序完整层段、实际 completed handoff、required route、显式 fallback=false、同一模型操作／配置／精确代际、完整 OS 星状连接及每节点 proper native segment。master 发起前的 dispatch 日志不能作完成证据；新完成日志仅在远端结果校验后写入。EOS 最后一轮虽未进入可见 token steps，仍必须有完整远端完成记录。
 
 真实 Textual 采集入口用 Pilot 创建专用会话、设置路由并发题，旁录真实 SSE，保留真实 widget 截图／正文和原生观测附件。采集器不加载整模、不指定各节点层段；已准备节点不足时在发题前失败。DL／LL 合并保持各自采集窗口，不能通过扩大联合时间窗拼接旧观测。
 
-[发行物门](发行物门-RELEASE-ARTIFACTS.md)改为检查最终产物和真实执行。Windows 核对签名深校验、发行合同和构建 revision，运行自有隔离进程并核对就绪／实际角色；Linux 在禁网独立容器中安装最终 `.deb` 并检查已安装运行时；Android 检查 release APK 内版本／native ELF／证书签名，显式设备探针属于 opt-in。缺少产物、工具或实际执行面时保留 failed／unverified，退出非零。CUDA 包继续遵循票 15d 延后裁定，默认发行面为 CPU 与 Launcher，CUDA 为显式选项。
+[发行物门](../../发行物门-RELEASE-ARTIFACTS.md)改为检查最终产物和真实执行。Windows 核对签名深校验、发行合同和构建 revision，运行自有隔离进程并核对就绪／实际角色；Linux 在禁网独立容器中安装最终 `.deb` 并检查已安装运行时；Android 检查 release APK 内版本／native ELF／证书签名，显式设备探针属于 opt-in。缺少产物、工具或实际执行面时保留 failed／unverified，退出非零。CUDA 包继续遵循票 15d 延后裁定，默认发行面为 CPU 与 Launcher，CUDA 为显式选项。
 
 新增 `.github/workflows/release-acceptance.yml` 通过显式 dispatch 接收同一成功构建 run 的最终发行附件，核对构建 revision。三个平台及真实 DL／LL 证据都必需；总汇总再次核对每个必验面、版本合同和认证源码身份。普通 PR 流水线不会安装 APK 或发起物理推理。
 
@@ -38,7 +38,7 @@
 
 ## 保留的验收缺口
 
-只读探活 `physical-preflight.json` 确认 master 与 `rog-5060` 两节点在线，当前意图 ready，master `model_loaded=false`。本轮未发起模型推理。Surface 离线、Y700 无电时，缺少第二个远端；两机不能替代三机容量／DL／LL 产品门。历史三机验收继续保留于 [模型意图产品验收](model-intent-ux-acceptance-2026-10-13.md)，不改写为当前 revision 的新完成证据。
+只读探活 `physical-preflight.json` 确认 master 与 `rog-5060` 两节点在线，当前意图 ready，master `model_loaded=false`。本轮未发起模型推理。Surface 离线、Y700 无电时，缺少第二个远端；两机不能替代三机容量／DL／LL 产品门。历史三机验收继续保留于 [模型意图产品验收](../distributed/model-intent-ux-acceptance-2026-10-13.md)，不改写为当前 revision 的新完成证据。
 
 本机新发行门已实际执行，退出 **1**，见 `local-release-artifacts.json` 与 `release-probe/` 原始输出：Windows CPU 包缺 `version.txt`／签名清单，Launcher 版本正确但当前信任库拒绝其 `release-20260809` 签名；Linux 没有最终 `.deb`，且 Docker CLI 虽存在，Linux daemon pipe 不存在；Android SDK 工具可找到，但没有最终 release APK。未启动未认证程序、未安装 APK。旧 Linux／Android PASS 结论已在发行文档撤销。
 

@@ -2304,7 +2304,7 @@ class LlamaCppEngine:
         #   且都对应 `[0,16)` 层段的输出 —— `rel_err=7.169e-02`、**`cos=0.988463`**；
         #   该 rel_err 量级是 GGUF Q4_K_M 量化 vs HF fp32 的正常差异。
         #   ⇒ 判据已过时（会**误拒** qwen3.5 的 llama 上游），故移除。
-        #   详见 `docs/已知问题记录.md` #54 与 `docs/真三机产品路径攻坚-2026-10-07.md` §4.2。
+        #   详见 `docs/已知问题记录.md` #54 与 `docs/archive/distributed/真三机产品路径攻坚-2026-10-07.md` §4.2。
         try:
             from llama_keep_head import KeepHeadCleanupError, KeepHeadUpstream
 

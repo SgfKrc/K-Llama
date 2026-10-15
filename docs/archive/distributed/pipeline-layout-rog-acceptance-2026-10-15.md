@@ -102,4 +102,4 @@ master API 的普通整模状态为 `loaded=false`，`pipeline_prepared=true, se
 
 ## 2026-10-15 后续：实时预算与两机 9B 已闭环
 
-本文件“9B 未通过／后续修复要求”描述的是本轮结束时的历史现场。后续已修复 prepare 读取缓存画像、供给工件 hello 竞态、迟到 hello 越过 deadline 及 intent 原错误码丢失。最终源码重新经产品意图入口自动得到 master `[0,28)`、ROG `[28,32)`，Qwen3.5-9B native prepare／commit、两问正常停止及前后所有进程本段映射均通过，无整模加载。最终定向520 passed，完整 unit 6500 passed, 16 skipped, 426.05s，真实身份和源码无漂移。新的范围、完整证据和容量价值限制见 [实时预算与9B验收](capacity-freshness-rog-acceptance-2026-10-15.md)。本轮历史记录与失败证据保留。
+本文件“9B 未通过／后续修复要求”描述的是本轮结束时的历史现场。后续已修复 prepare 读取缓存画像、供给工件 hello 竞态、迟到 hello 越过 deadline 及 intent 原错误码丢失。最终源码重新经产品意图入口自动得到 master `[0,28)`、ROG `[28,32)`，Qwen3.5-9B native prepare／commit、两问正常停止及前后所有进程本段映射均通过，无整模加载。最终定向520 passed，完整 unit 6500 passed, 16 skipped, 426.05s，真实身份和源码无漂移。新的范围、完整证据和容量价值限制见 [实时预算与9B验收](../runtime/capacity-freshness-rog-acceptance-2026-10-15.md)。本轮历史记录与失败证据保留。

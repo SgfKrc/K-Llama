@@ -56,7 +56,7 @@ ROG worker 采样文件 SHA 为 `de58e8af4e81f8350cd35369a0222ad6e32c02b4fb60709
 
 本轮证明两节点随在线拓扑自动选段、供给、native LL 接力以及 9B 全程按段执行。Surface／Y700 两条历史 release 债务仍保留，不伪造离线 ACK，也不阻塞当前两节点。
 
-本轮没有新增 DL 真机结果，历史三机 DL／LL 结果仍按 [票16–18记录](tickets16-18-acceptance-2026-10-14.md) 的原范围保留。自动拉起和单机整模基线仍按用户裁决后置。供给 metadata 仍列 master 为 `single_node_full_model_candidates=['master']`，因此不能把本次 9B 成功宣称为“聚合容量不可替代”或实测单机装不下；当前通过的是两端均未加载整模的 9B 层段接力。
+本轮没有新增 DL 真机结果，历史三机 DL／LL 结果仍按 [票16–18记录](../distributed/tickets16-18-acceptance-2026-10-14.md) 的原范围保留。自动拉起和单机整模基线仍按用户裁决后置。供给 metadata 仍列 master 为 `single_node_full_model_candidates=['master']`，因此不能把本次 9B 成功宣称为“聚合容量不可替代”或实测单机装不下；当前通过的是两端均未加载整模的 9B 层段接力。
 
 易用性上，本轮只提交一次模型意图即可等待系统完成，复用工件无新增传输；完整自动流程约 175.51 秒。源校验与缓存回收仍占据准备阶段，尚非性能标定，不把这两次短问答当作票19–22的吞吐结论。
 
