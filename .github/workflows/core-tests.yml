@@ -110,6 +110,9 @@ jobs:
           QLH_NODE_CONFIG_PATH: ${{ runner.temp }}/qlh-core-ci/node_config.json
           QLH_NODE_SECRET_STORE_PATH: ${{ runner.temp }}/qlh-core-ci/node_secrets.json
           QLH_JOURNAL_REPLICATION_REPLICA_PATH: ${{ runner.temp }}/qlh-core-ci/journal-replica.sqlite3
+          # 测试专用的集群密钥：缺它时注册/握手用例会把"未初始化"当成注册失败
+          # 而误报（本机开发环境已自行设置，CI 必须显式给出）。
+          QLH_CLUSTER_SECRET: "qlh-ci-test-cluster-secret-0123456789abcdef"
         run: |
           python -B scripts/run_test_channels.py \
             --channel all \
