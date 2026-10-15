@@ -1,0 +1,7 @@
+﻿# Provision explicitly before running the offline gate. Use a Python version
+# compatible with the final .deb's bundled venv. No host source is installed.
+FROM python:3.12-slim-bookworm
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv libgomp1 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT []
