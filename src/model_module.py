@@ -820,6 +820,23 @@ def _serialized_model_stream(method):
     return wrapper
 
 
+def _resolve_pytorch_flash_attn() -> bool:
+    """PyTorch 侧 flash-attn 开关：读同一张设备映射，**默认 False**（=接线前行为）。
+
+    与 llama.cpp 的两条路径（绑定、`llama-server` 子进程）共用
+    `src/inference_switches.py` 的显式映射；只有显式覆盖
+    （`QLH_INFER_FLASH_ATTN=1`）才打开。映射或画像不可用时保持 False，
+    即本函数引入前的硬编码值。
+    """
+    try:
+        from inference_switches import resolve_from_device_profile
+
+        return bool(resolve_from_device_profile().flash_attn)
+    except Exception as exc:  # pragma: no cover - 依赖缺失时保持既有行为
+        logger.warning("推理开关不可用，PyTorch flash-attn 保持关闭: %s", exc)
+        return False
+
+
 CHATML_STOP_SEQUENCES = [
     "<|im_end|>",
     "<|im_start|>",
@@ -2285,7 +2302,9 @@ class ModelManager:
         config.bf16 = False
         config.fp16 = use_cuda
         config.fp32 = not use_cuda
-        config.use_flash_attn = False
+        # flash-attn 由推理开关显式决定（票 20）：默认关闭等于接线前行为，
+        # 只有显式覆盖才打开；与 llama.cpp 两条路径共用同一张映射。
+        config.use_flash_attn = _resolve_pytorch_flash_attn()
 
         old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
         keep_tokenizer = self.tokenizer if old_path == os.path.abspath(model_path) else None
