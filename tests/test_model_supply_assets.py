@@ -46,12 +46,19 @@ def _model_sha(root):
     return digest.hexdigest()
 
 
-def _make_gguf(path, *, mtp=False, hybrid=False):
+def _make_gguf(path, *, mtp=False, hybrid=False, head_count_kv=None, key_length=None):
     gguf = pytest.importorskip("gguf")
     np = pytest.importorskip("numpy")
     writer = gguf.GGUFWriter(str(path), "qwen2")
     writer.add_block_count(4 + int(mtp))
     writer.add_embedding_length(8)
+    for suffix, value in (("head_count_kv", head_count_kv), ("key_length", key_length)):
+        if value is not None:
+            if isinstance(value, list):
+                writer.add_key_value(f"qwen2.attention.{suffix}", value,
+                                     gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT32)
+            else:
+                writer.add_key_value(f"qwen2.attention.{suffix}", value, gguf.GGUFValueType.UINT32)
     if mtp:
         writer.add_key_value("qwen2.nextn_predict_layers", 1, gguf.GGUFValueType.UINT32)
     if hybrid:
@@ -872,11 +879,13 @@ def test_cross_operation_receipt_reuses_live_assets_without_http(tmp_path, forma
     assert events[-1]["completed_bytes"] == total
     for entry in second["files"]:
         assert sha256_file(received["local_files"][entry["path"]]) == entry["sha256"]
-    # Copying gives the new publication independent bytes, even when the old
-    # inventory is modified after reuse (hardlinks would corrupt both).
+    # Immutable publications share an inode where hardlinks are supported;
+    # corruption must still be rejected by fresh verification of either receipt.
     weight = next(entry for entry in second["files"] if entry["kind"] == "weights")
-    Path(old["local_files"][weight["path"]]).write_bytes(b"mutated old asset")
-    assert sha256_file(received["local_files"][weight["path"]]) == weight["sha256"]
+    assert os.path.samefile(old["local_files"][weight["path"]], received["local_files"][weight["path"]])
+    Path(old["local_files"][weight["path"]]).write_bytes(b"mutated cached asset")
+    with pytest.raises(SupplyError):
+        assets._reuse(Path(received["manifest_path"]).parent, received["manifest"])
 
 
 def test_cross_operation_downloads_only_corrupt_cached_file_with_preserved_stat(gguf_segment, tmp_path):
@@ -1021,7 +1030,7 @@ def test_cross_operation_cancelled_local_copy_leaves_old_publication_intact(gguf
     with _server(gguf_segment) as (url, _):
         old = _receive(gguf_segment, root, url)
     second = _next_operation(gguf_segment)
-    stop_during_copy = lambda: bool(list(root.rglob(".supply-copy-*.part")))
+    stop_during_copy = lambda: bool(list(root.glob(".supply-receive-*/segment.gguf")))
     with _server(second) as (url, state):
         with pytest.raises(SupplyError) as exc:
             _receive(second, root, url, cancelled=stop_during_copy)
@@ -1371,3 +1380,163 @@ def test_gguf_disk_budget_matches_actual_cropped_tensor_inventory_and_excludes_m
     _, actual = assets._gguf_table(Path(manifest["local_files"]["segment.gguf"]))
     assert estimate == sum(entry[1] for entry in actual.values()) == 352
     assert not any(name.startswith("blk.2.nextn") for name in actual)
+
+
+# Ticket 19: source-authoritative metadata and immutable legacy migration.
+def _rewrite_native_declaration(manifest, edit, *, marker=False):
+    native_path = Path(manifest["local_files"]["segment.manifest.json"])
+    native = json.loads(native_path.read_text(encoding="utf-8"))
+    edit(native)
+    native_path.write_bytes(_canonical(native))
+    public = validate_supply_manifest(manifest)
+    for entry in public["files"]:
+        if entry["path"] == "segment.manifest.json":
+            entry.update(size_bytes=native_path.stat().st_size, sha256=sha256_file(native_path))
+    public = _sign(public)
+    if marker:
+        (native_path.parent / "supply.manifest.json").write_bytes(_canonical(public))
+    return {**public, "local_files": dict(manifest["local_files"])}
+
+
+@pytest.mark.parametrize("span", [(0, 2), (1, 3), (2, 4)])
+def test_gguf_metadata_preserves_and_crops_integer_head_arrays(tmp_path, span):
+    from gguf_metadata_contract import read_gguf_metadata
+    source = tmp_path / "array-heads.gguf"
+    _make_gguf(source, head_count_kv=[1, 2, 3, 4], key_length=256)
+    result = build_gguf_segment(source, tmp_path / "out", **_kwargs(source, *span))
+    raw, _ = assets._gguf_table(Path(result["local_files"]["segment.gguf"]))
+    actual = read_gguf_metadata(result["local_files"]["segment.gguf"])
+    assert raw["qwen2.attention.head_count_kv"] == [1, 2, 3, 4][span[0]:span[1]]
+    native = json.loads(Path(result["local_files"]["segment.manifest.json"]).read_text())
+    assert native["gguf_metadata"] == actual
+    assert native["gguf_metadata"]["block_count"] == span[1] - span[0]
+    assert native["gguf_metadata"]["key_length"] == 256
+    assert native["gguf_metadata"]["full_attention_interval"] is None
+    assert native["block_count"] == 4
+    assert "gguf_metadata" not in validate_supply_manifest(result)
+
+
+@pytest.mark.parametrize("field", ["block_count", "head_count_kv", "key_length", "full_attention_interval"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_gguf_receive_and_same_generation_reuse_enforce_all_metadata(gguf_segment, tmp_path, field, missing):
+    def edit(native):
+        if missing:
+            native["gguf_metadata"].pop(field)
+        else:
+            native["gguf_metadata"][field] = 999
+    changed = _rewrite_native_declaration(gguf_segment, edit, marker=True)
+    expected_code = "gguf_metadata_missing" if missing else "gguf_metadata_mismatch"
+    native_root = Path(changed["local_files"]["segment.gguf"]).parent
+    with pytest.raises(SupplyError, match=field) as error:
+        assets._reuse(native_root, validate_supply_manifest(changed))
+    assert error.value.code == expected_code
+    root = tmp_path / "received"
+    with _server(changed) as (url, _):
+        with pytest.raises(SupplyError, match=field) as error:
+            _receive(changed, root, url)
+    assert error.value.code == expected_code
+    assert not list(root.rglob("supply.manifest.json"))
+
+
+@pytest.mark.parametrize("same_operation", [True, False])
+@pytest.mark.parametrize("mtp", [False, True])
+def test_legacy_gguf_cache_upgrades_from_known_source_without_touching_old_ready(tmp_path, monkeypatch, same_operation, mtp):
+    from gguf_metadata_contract import read_gguf_metadata
+    source = tmp_path / "source.gguf"
+    _make_gguf(source, mtp=mtp, head_count_kv=4, key_length=256, hybrid=True)
+    out = tmp_path / "out"
+    args = _kwargs(source, 2, 4)
+    first = build_gguf_segment(source, out, **args)
+    legacy = _rewrite_native_declaration(first, lambda native: native.pop("gguf_metadata"), marker=True)
+    old_root = Path(legacy["local_files"]["segment.gguf"]).parent
+    before = {name: (old_root / name).read_bytes() for name in ("segment.manifest.json", "supply.manifest.json")}
+    with pytest.raises(SupplyError) as error:
+        assets._reuse(old_root, validate_supply_manifest(legacy))
+    assert error.value.code == "gguf_metadata_missing"
+    monkeypatch.setattr(assets, "_run_cut", lambda *a, **k: pytest.fail("known-source migration must reuse weights"))
+    if not same_operation:
+        args["operation_id"] = "op-2"
+    upgraded = build_gguf_segment(source, out, **args)
+    new_root = Path(upgraded["local_files"]["segment.gguf"]).parent
+    assert new_root != old_root
+    assert upgraded["manifest_sha256"] != legacy["manifest_sha256"]
+    for name, data in before.items():
+        assert (old_root / name).read_bytes() == data
+    native = json.loads((new_root / "segment.manifest.json").read_text())
+    assert native["gguf_metadata"] == read_gguf_metadata(new_root / "segment.gguf")
+    assert native["gguf_metadata"]["block_count"] == 2
+    assert native["gguf_metadata"]["nextn_predict_layers"] == (0 if mtp else None)
+    assert native["gguf_metadata"]["head_count_kv"] == 4
+    assert native["gguf_metadata"]["key_length"] == 256
+    assert native["gguf_metadata"]["full_attention_interval"] == 2
+    assert native["block_count"] == 4 + int(mtp)
+    assert native["nextn_predict_layers"] == int(mtp)
+    again = build_gguf_segment(source, out, **args)
+    assert again["local_files"] == upgraded["local_files"]
+    assert again["manifest_sha256"] == upgraded["manifest_sha256"]
+    assets._verify_files(new_root, validate_supply_manifest(upgraded))
+
+
+@pytest.mark.parametrize("field", ["block_count", "head_count_kv", "key_length", "full_attention_interval"])
+@pytest.mark.parametrize("same_operation", [False, True])
+def test_legacy_declared_mismatch_is_never_overwritten_from_source(gguf_segment, tmp_path, monkeypatch, field, same_operation):
+    def edit(native):
+        native["gguf_metadata"] = {field: 999}
+    changed = _rewrite_native_declaration(gguf_segment, edit, marker=True)
+    root = Path(changed["local_files"]["segment.gguf"]).parent
+    old_native = (root / "segment.manifest.json").read_bytes()
+    monkeypatch.setattr(assets, "_run_cut", lambda *a, **k: pytest.fail("declared mismatch must fail"))
+    args = _kwargs(tmp_path / "source.gguf")
+    # The fixture and source share tmp_path; cover same-final recovery and rebind.
+    if not same_operation:
+        args["operation_id"] = "op-2"
+    with pytest.raises(SupplyError, match=field) as error:
+        build_gguf_segment(tmp_path / "source.gguf", root.parent, **args)
+    assert error.value.code == "gguf_metadata_mismatch"
+    assert (root / "segment.manifest.json").read_bytes() == old_native
+
+
+def test_cut_actual_metadata_must_match_source_even_with_legacy_declaration(tmp_path, monkeypatch):
+    source = tmp_path / "source.gguf"
+    _make_gguf(source, key_length=256)
+    original = assets._run_cut
+    def wrong_cut(*args, **kwargs):
+        original(*args, **kwargs)
+        artifact, native_path = args[1:3]
+        data = artifact.read_bytes()
+        key = b"qwen2.attention.key_length"
+        needle = struct.pack("<Q", len(key)) + key + struct.pack("<II", 4, 256)
+        assert data.count(needle) == 1
+        artifact.write_bytes(data.replace(needle, needle[:-4] + struct.pack("<I", 128)))
+        native = json.loads(native_path.read_text(encoding="utf-8"))
+        native.pop("gguf_metadata")
+        native["artifact_sha256"] = sha256_file(artifact)
+        native_path.write_bytes(_canonical(native))
+    monkeypatch.setattr(assets, "_run_cut", wrong_cut)
+    with pytest.raises(SupplyError, match="key_length") as error:
+        build_gguf_segment(source, tmp_path / "out", **_kwargs(source))
+    assert error.value.code == "gguf_metadata_mismatch"
+    assert not list((tmp_path / "out").glob("segment-*"))
+
+
+def test_supply_metadata_reuse_and_verification_never_import_native(gguf_segment, gguf_source, monkeypatch):
+    import builtins
+    root = Path(gguf_segment["local_files"]["segment.gguf"]).parent
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        assert name.split(".")[0] not in {"gguf", "llama_cpp", "numpy", "torch"}
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    reused = build_gguf_segment(gguf_source, root.parent, **_kwargs(gguf_source))
+    assert reused == gguf_segment
+    assets._verify_segment(root, validate_supply_manifest(reused))
+
+
+def test_native_kept_block_count_cannot_disagree_with_metadata(gguf_segment):
+    def edit(native):
+        native["kept_block_count"] = 3
+    changed = _rewrite_native_declaration(gguf_segment, edit, marker=True)
+    root = Path(changed["local_files"]["segment.gguf"]).parent
+    with pytest.raises(SupplyError, match="block_count") as error:
+        assets._reuse(root, validate_supply_manifest(changed))
+    assert error.value.code == "gguf_metadata_mismatch"

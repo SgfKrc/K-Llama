@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -24,6 +25,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+from gguf_metadata_contract import (
+    normalize_gguf_metadata, project_gguf_metadata, verify_gguf_metadata,
+)
 
 MANIFEST_KIND = "qlh.segment_supply.v1"
 _MARKER = "supply.manifest.json"
@@ -160,7 +165,12 @@ def _relative(value: Any) -> str:
 
 
 def _link(path: Path) -> bool:
-    return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+    # Refuse every Windows reparse type, including cloud placeholders.
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
 
 
 def _safe_path(root: Path, relative: str) -> Path:
@@ -348,11 +358,16 @@ def _verify_files(root: Path, payload: dict, *, cancelled=None) -> None:
         if _hash_file(path, cancelled) != item["sha256"]:
             _fail("file_digest_mismatch", "segment file digest mismatch")
     expected = {item["path"] for item in payload["files"]} | {_MARKER}
+    directories = {parent.as_posix() for name in expected
+                   for parent in Path(name).parents if parent != Path(".")}
     for path in root.rglob("*"):
         if _link(path):
             _fail("unsafe_path", "segment directory contains a filesystem link")
-        if path.is_file() and path.relative_to(root).as_posix() not in expected:
-            _fail("unexpected_file", "segment directory contains an unlisted file")
+        relative = path.relative_to(root).as_posix()
+        if ((path.is_file() and relative not in expected)
+                or (path.is_dir() and relative not in directories)
+                or not (path.is_file() or path.is_dir())):
+            _fail("unexpected_file", "segment directory contains an unlisted member")
 
 
 def _storage_root(value: str | Path) -> Path:
@@ -386,6 +401,469 @@ def _reuse(final: Path, identity: dict, *, cancelled=None) -> dict | None:
     return _attach_local(payload, final)
 
 
+# Cache hints are bounded and private. Names never establish identity.
+_CACHE_SCAN_LIMIT = 512
+_CACHE_GENERATION_LIMIT = 128
+
+
+def _segment_candidates(root: Path, cancelled=lambda: False):
+    root = Path(root).absolute()
+    if not root.is_dir() or any(_link(p) for p in (root, *root.parents)):
+        return
+    pending = [(root, 0)]
+    examined = generations = 0
+    while pending and examined < _CACHE_SCAN_LIMIT:
+        directory, depth = pending.pop(0)
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    _cancelled(cancelled)
+                    examined += 1
+                    if examined > _CACHE_SCAN_LIMIT:
+                        break
+                    path = Path(entry.path)
+                    if _link(path) or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if re.fullmatch(r"segment-[0-9a-f]{64}", entry.name):
+                        generations += 1
+                        yield path
+                        if generations >= _CACHE_GENERATION_LIMIT:
+                            return
+                    elif depth < 2 and _ID.fullmatch(entry.name) and not entry.name.startswith("."):
+                        # Supports receiver/local-cut and operation/node layouts.
+                        pending.append((path, depth + 1))
+        except OSError:
+            continue
+
+
+def _candidate_layout(root: Path, directory: Path, manifest: dict) -> bool:
+    parts = directory.relative_to(Path(root).resolve()).parts
+    return (len(parts) == 1 or
+            (len(parts) == 2 and re.fullmatch(r"local-[0-9a-f]{32}", parts[0]) is not None) or
+            (len(parts) == 3 and parts[:2] == (manifest["operation_id"], manifest["node_id"])))
+
+
+def _same_segment(left: dict, right: dict, *, same_node=True) -> bool:
+    keys = ("node_id", "source_model_id", "source_model_sha256", "tokenizer_sha256",
+            "total_layers", "layer_range", "segment_mode", "format", "conversion_proof")
+    return all(left.get(key) == right.get(key) for key in keys if same_node or key != "node_id")
+
+
+def _link_verified(source: Path, target: Path, entry: dict, cancelled) -> bool:
+    if any(_link(p) for p in (source, *source.parents)) or not source.is_file():
+        return False
+    before = source.stat()
+    if before.st_size != entry["size_bytes"] or _hash_file(source, cancelled) != entry["sha256"]:
+        return False
+    _cancelled(cancelled)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _safe_path(target.parent, target.name)
+    try:
+        os.link(source, target)
+    except OSError:
+        # Never mutate a published source; copy if hardlinks are unsupported.
+        shutil.copyfile(source, target)
+    after = source.stat()
+    stamp = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    if (stamp(before) != stamp(after) or _hash_file(target, cancelled) != entry["sha256"]
+            or any(_link(p) for p in (source, *source.parents))):
+        target.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: Path,
+                           cancelled=lambda: False, support_files=None,
+                           gguf_metadata=None, gguf_source_metadata=None) -> dict | None:
+    for candidate in _segment_candidates(reuse_root, cancelled):
+        if candidate == final:
+            continue
+        stage = None
+        try:
+            marker = candidate / _MARKER
+            if _link(marker):
+                continue
+            old = validate_supply_manifest(_read_json(marker))
+            if not _candidate_layout(reuse_root, candidate, old) or not _same_segment(old, identity):
+                continue
+            if support_files is not None:
+                support = {e["path"]: e for e in old["files"] if e["kind"] == "support"}
+                support.pop("model.safetensors.index.json", None)
+                if set(support) != set(support_files) or any(
+                        path.stat().st_size != support[name]["size_bytes"]
+                        or _hash_file(path, cancelled) != support[name]["sha256"]
+                        for name, path in support_files.items()):
+                    continue
+            _verify_files(candidate, old, cancelled=cancelled)
+            upgraded_native = None
+            if gguf_metadata is not None:
+                weight = next(e for e in old["files"] if e["kind"] == "weights")
+                native_name = Path(weight["path"]).with_suffix(".manifest.json").as_posix()
+                native = _read_json(_safe_path(candidate, native_name))
+                raw, _ = _gguf_table(_safe_path(candidate, weight["path"]))
+                declaration = _native_gguf_metadata(
+                    raw, native, source_expected=gguf_metadata,
+                    source_metadata=gguf_source_metadata, upgrade=True,
+                )
+                if native.get("gguf_metadata") != declaration:
+                    upgraded_native = {**native, "gguf_metadata": declaration}
+                else:
+                    # A complete declaration needs no migration. Preserve its
+                    # immutable file identity and count all live reused bytes.
+                    _verify_segment(candidate, old)
+            else:
+                _verify_segment(candidate, old)
+            payload = dict(old)
+            payload["operation_id"] = identity["operation_id"]
+            payload.pop("manifest_sha256")
+            stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
+            for entry in old["files"]:
+                if upgraded_native is not None and entry["path"] == native_name:
+                    # Never modify a hard-linked native manifest in the cache.
+                    _write_json(_safe_path(stage, native_name), upgraded_native)
+                    continue
+                if not _link_verified(_safe_path(candidate, entry["path"]),
+                                      _safe_path(stage, entry["path"]), entry, cancelled):
+                    _fail("file_digest_mismatch", "cache changed while rebinding")
+            result = _finish(stage, final, payload, {e["path"]: e["kind"] for e in old["files"]})
+            result["_reused_bytes"] = sum(e["size_bytes"] for e in old["files"]
+                                          if upgraded_native is None or e["path"] != native_name)
+            return result
+        except (OSError, SupplyError) as exc:
+            if isinstance(exc, SupplyError) and exc.code == "cancelled":
+                raise
+            if (gguf_metadata is not None and isinstance(exc, SupplyError)
+                    and exc.code == "gguf_metadata_mismatch"):
+                raise
+            # A corrupt hint is never a receipt. Build from verified source.
+            continue
+        finally:
+            if stage is not None:
+                _remove_stage(stage, root)
+    return None
+
+
+def segment_cache_hint(root: Path, identity: dict) -> bool:
+    """Metadata hint only: the builder must still verify all live bytes."""
+    for directory in _segment_candidates(root):
+        try:
+            marker = directory / _MARKER
+            if _link(marker):
+                continue
+            payload = validate_supply_manifest(_read_json(marker))
+            if _candidate_layout(root, directory, payload) and _same_segment(payload, identity):
+                return True
+        except (SupplyError, OSError):
+            continue
+    return False
+
+
+def reuse_segment(manifest: dict, destination_root: Path, *, cancelled=lambda: False) -> dict | None:
+    """Rebind an exact verified local inventory to a fresh operation receipt."""
+    payload = validate_supply_manifest(manifest)
+    root = _storage_root(destination_root)
+    final = root / ("segment-" + payload["manifest_sha256"])
+    existing = _reuse(final, payload, cancelled=cancelled)
+    if existing:
+        return _received_result(payload, final, reused=True,
+                                reused_bytes=sum(e["size_bytes"] for e in payload["files"]))
+    for candidate in _segment_candidates(root, cancelled):
+        stage = None
+        try:
+            marker = candidate / _MARKER
+            if _link(marker):
+                continue
+            old = validate_supply_manifest(_read_json(marker))
+            if (not _candidate_layout(root, candidate, old)
+                    or not _same_segment(old, payload, same_node=False)
+                    or old["files"] != payload["files"]):
+                continue
+            _verify_files(candidate, old, cancelled=cancelled)
+            _verify_segment(candidate, old)
+            stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
+            for entry in payload["files"]:
+                if not _link_verified(_safe_path(candidate, entry["path"]),
+                                      _safe_path(stage, entry["path"]), entry, cancelled):
+                    _fail("file_digest_mismatch", "cache changed while rebinding")
+            _verify_segment(stage, payload)
+            _write_json(stage / _MARKER, payload)
+            _cancelled(cancelled)
+            os.replace(stage, final)
+            return _received_result(payload, final, reused=True,
+                                    reused_bytes=sum(e["size_bytes"] for e in payload["files"]))
+        except (SupplyError, OSError) as exc:
+            if isinstance(exc, SupplyError) and exc.code == "cancelled":
+                raise
+        finally:
+            if stage is not None:
+                _remove_stage(stage, root)
+    return None
+
+
+def _collect_covered_partials(root: Path, protected, *, max_remove, max_hash_bytes, cancelled):
+    """Retire checkpoints only under the receiver's exclusive execution owner.
+
+    A validated, live complete copy must cover every byte in the old staging
+    inventory. Incomplete/unowned data stays resumable. Directory age is never
+    ownership evidence, and partial files are never hardlinked.
+    """
+    report = {"removed": 0, "partial_removed": 0, "reclaimed_bytes": 0,
+              "hashed_bytes": 0, "examined": 0, "skipped": {}}
+    def skip(reason):
+        report["skipped"][reason] = report["skipped"].get(reason, 0) + 1
+    def pinned(directory):
+        return any(path == directory or path.is_relative_to(directory)
+                   or directory.is_relative_to(path) for path in protected)
+    def stamp(path):
+        if any(_link(p) for p in (path, *path.parents)):
+            _fail("unsafe_path", "retirement member is a filesystem link")
+        value = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(value.st_mode):
+            _fail("unsafe_path", "retirement member is not a regular file")
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns,
+                value.st_ctime_ns, value.st_nlink)
+    def inventory(stage, manifest):
+        allowed = {_RESUME_MARKER}
+        for entry in manifest["files"]:
+            allowed.update((entry["path"], entry["path"] + ".part"))
+        directories = {parent.as_posix() for name in allowed
+                       for parent in Path(name).parents if parent != Path(".")}
+        result = {}
+        pending = [stage]
+        examined = 0
+        while pending:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    _cancelled(cancelled)
+                    examined += 1
+                    if examined > 4096:
+                        _fail("invalid_artifact", "partial member bound exceeded")
+                    path = Path(entry.path)
+                    relative = path.relative_to(stage).as_posix()
+                    if _link(path):
+                        _fail("unsafe_path", "partial contains a filesystem link")
+                    if entry.is_dir(follow_symlinks=False) and relative in directories:
+                        pending.append(path)
+                    elif entry.is_file(follow_symlinks=False) and relative in allowed:
+                        result[relative] = stamp(path)
+                    else:
+                        _fail("unexpected_file", "partial contains an unowned member")
+        return result
+    candidates = list(_segment_candidates(root, cancelled))
+    verified = {}
+    with os.scandir(root) as entries:
+        for ordinal, entry in enumerate(entries):
+            _cancelled(cancelled)
+            if ordinal >= _CACHE_SCAN_LIMIT or report["removed"] >= max_remove:
+                break
+            if not re.fullmatch(r"\.supply-receive-[0-9a-f]{64}", entry.name):
+                continue
+            stage = Path(entry.path)
+            report["examined"] += 1
+            if pinned(stage):
+                skip("partial_referenced")
+                continue
+            try:
+                if _link(stage) or not entry.is_dir(follow_symlinks=False) or stage.resolve().parent != root:
+                    _fail("unsafe_path", "partial staging is outside storage")
+                marker = stage / _RESUME_MARKER
+                if not marker.is_file() or marker.stat().st_size > 4 * 1024**2:
+                    _fail("invalid_artifact", "partial checkpoint is unavailable")
+                journal = _read_resume_journal(stage)
+                old = journal["manifest"]
+                before = inventory(stage, old)
+                records = {record["path"]: record for record in journal["prefixes"]}
+                if any(record["path"] + ".part" not in before for record in records.values()):
+                    _fail("invalid_artifact", "recorded partial is absent")
+                sizes = 0
+                for member in old["files"]:
+                    name = member["path"]
+                    if name in before and name + ".part" in before:
+                        _fail("invalid_artifact", "partial has ambiguous completed members")
+                    if name + ".part" in before:
+                        length = before[name + ".part"][2]
+                        if (name not in records or not records[name]["prefix_bytes"] <= length <= member["size_bytes"]
+                                or before[name + ".part"][5] != 1):
+                            _fail("invalid_artifact", "partial prefix has no bounded owner record")
+                        sizes += 2 * length
+                    elif name in before:
+                        if before[name][2] != member["size_bytes"]:
+                            _fail("file_size_mismatch", "completed staging member has wrong size")
+                        sizes += member["size_bytes"]
+                witness = None
+                witness_stamp = None
+                for directory in candidates:
+                    if any(_link(path) for path in (directory, directory / _MARKER)):
+                        continue
+                    complete = validate_supply_manifest(_read_json(directory / _MARKER))
+                    if (not _candidate_layout(root, directory, complete)
+                            or not _same_segment(old, complete) or old["files"] != complete["files"]):
+                        continue
+                    key = str(directory)
+                    snapshots = {e["path"]: stamp(_safe_path(directory, e["path"])) for e in complete["files"]}
+                    snapshots[_MARKER] = stamp(directory / _MARKER)
+                    cost = 0 if verified.get(key) == snapshots else sum(e["size_bytes"] for e in complete["files"])
+                    if report["hashed_bytes"] + cost + sizes > max_hash_bytes:
+                        continue
+                    if cost:
+                        report["hashed_bytes"] += cost
+                        _verify_files(directory, complete, cancelled=cancelled)
+                        _verify_segment(directory, complete)
+                        if snapshots != {name: stamp(directory / name) for name in snapshots}:
+                            _fail("file_digest_mismatch", "complete witness changed during verification")
+                        verified[key] = snapshots
+                    witness, witness_stamp = directory, snapshots
+                    break
+                if witness is None:
+                    skip("partial_uncovered_or_budget")
+                    continue
+                report["hashed_bytes"] += sizes
+                for member in old["files"]:
+                    name = member["path"]
+                    if name in before:
+                        if _hash_file(_safe_path(stage, name), cancelled) != member["sha256"]:
+                            _fail("file_digest_mismatch", "completed partial member changed")
+                    elif name + ".part" in before:
+                        record = records[name]
+                        remaining = before[name + ".part"][2]
+                        prefix_remaining = record["prefix_bytes"]
+                        digest = hashlib.sha256()
+                        with _safe_partial(stage, name).open("rb") as partial, _safe_path(witness, name).open("rb") as complete:
+                            while remaining:
+                                _cancelled(cancelled)
+                                data = partial.read(min(_CHUNK, remaining))
+                                if not data or complete.read(len(data)) != data:
+                                    _fail("file_digest_mismatch", "partial bytes differ from completed copy")
+                                digest.update(data[:prefix_remaining])
+                                prefix_remaining = max(0, prefix_remaining - len(data))
+                                remaining -= len(data)
+                        if digest.hexdigest() != record["prefix_sha256"]:
+                            _fail("file_digest_mismatch", "retired checkpoint digest changed")
+                _cancelled(cancelled)
+                if (pinned(stage) or any(_link(path) for path in (stage, *stage.parents))
+                        or before != inventory(stage, old) or journal != _read_resume_journal(stage)
+                        or witness_stamp != {name: stamp(witness / name) for name in witness_stamp}):
+                    _fail("file_digest_mismatch", "retirement proof changed before deletion")
+                freed = sum(value[2] for value in before.values() if value[5] == 1)
+                # The checked absolute target is a direct child of root. Both
+                # receive and prefix-donor access are excluded by the caller.
+                if stage.resolve().parent != root:
+                    _fail("unsafe_path", "retirement target changed")
+                _cancelled(cancelled)
+                shutil.rmtree(stage)
+                report["removed"] += 1
+                report["partial_removed"] += 1
+                report["reclaimed_bytes"] += freed
+            except (OSError, SupplyError) as exc:
+                if isinstance(exc, SupplyError) and exc.code == "cancelled":
+                    raise
+                skip(exc.code if isinstance(exc, SupplyError) else "artifact_io_error")
+    return report
+
+
+def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None,
+                            keep=1, max_remove=16, max_hash_bytes=16 * 1024**3,
+                            cancelled=lambda: False, receive_idle=False) -> dict:
+    """Collect only verified generations while the caller holds owner admission.
+
+    None is an unavailable native ownership proof, rather than an empty proof.
+    All deletion targets are checked within root, with exact manifest members,
+    live SHA and no reparse at any level. Work is bounded in directories/bytes.
+    """
+    report = {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
+    def skip(reason):
+        report["skipped"][reason] = report["skipped"].get(reason, 0) + 1
+    if native_paths is None:
+        skip("native_references_unknown")
+        return report
+    if type(keep) is not int or keep < 0 or type(max_remove) is not int or not 0 <= max_remove <= 32:
+        _fail("invalid_retention", "invalid segment retention bound")
+    root = Path(root).absolute()
+    if any(_link(path) for path in (root, *root.parents)):
+        skip("unsafe_path")
+        return report
+    root = root.resolve()
+    protected = [Path(path).absolute().resolve() for path in (*protected_paths, *native_paths)]
+    def pinned(directory):
+        return any(path == directory or path.is_relative_to(directory)
+                   or directory.is_relative_to(path) for path in protected)
+    if receive_idle:
+        partials = _collect_covered_partials(root, protected, max_remove=max_remove,
+            max_hash_bytes=max_hash_bytes, cancelled=cancelled)
+        report.update({key: partials[key] for key in ("removed", "reclaimed_bytes", "examined", "partial_removed")})
+        for reason, count in partials["skipped"].items():
+            report["skipped"][reason] = report["skipped"].get(reason, 0) + count
+        hashed = partials["hashed_bytes"]
+    else:
+        hashed = 0
+    candidates = sorted(_segment_candidates(root, cancelled),
+                        key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    retained = 0
+    for directory in candidates:
+        _cancelled(cancelled)
+        report["examined"] += 1
+        if pinned(directory):
+            skip("referenced")
+            continue
+        if retained < keep:
+            retained += 1
+            continue
+        if report["removed"] >= max_remove:
+            skip("removal_budget")
+            break
+        try:
+            # Resolve before entering or removing any candidate, never rmtree a
+            # computed destination that has not been checked under the root.
+            if any(_link(path) for path in (directory, *directory.parents)):
+                skip("unsafe_path")
+                continue
+            resolved = directory.resolve()
+            if not resolved.is_relative_to(root) or resolved == root:
+                skip("unsafe_path")
+                continue
+            marker = directory / _MARKER
+            if _link(marker):
+                skip("unsafe_path")
+                continue
+            manifest = validate_supply_manifest(_read_json(marker))
+            if not _candidate_layout(root, directory, manifest):
+                skip("unowned_layout")
+                continue
+            if len(manifest["files"]) > 1024:
+                skip("member_budget")
+                continue
+            size = sum(entry["size_bytes"] for entry in manifest["files"])
+            if hashed + size > max_hash_bytes:
+                skip("hash_budget")
+                break
+            hashed += size
+            _verify_files(directory, manifest, cancelled=cancelled)
+            _verify_segment(directory, manifest)
+            _cancelled(cancelled)
+            # Recheck all members after hashing. Owner locks prevent another
+            # legitimate prepare/receive from acquiring new references here.
+            if pinned(resolved) or directory.resolve() != resolved:
+                skip("referenced")
+                continue
+            if any(_link(path) for path in (directory, *directory.parents)) or any(
+                    _link(path) for path in directory.rglob("*")):
+                skip("unsafe_path")
+                continue
+            # Hardlinks share storage; removing an extra receipt does not free
+            # its linked payload yet. Report only files losing their last link.
+            freed = sum(path.stat().st_size for path in directory.rglob("*")
+                        if path.is_file() and path.stat().st_nlink == 1)
+            _cancelled(cancelled)
+            shutil.rmtree(directory)
+            report["removed"] += 1
+            report["reclaimed_bytes"] += freed
+        except (OSError, SupplyError) as exc:
+            if isinstance(exc, SupplyError) and exc.code == "cancelled":
+                raise
+            skip(exc.code if isinstance(exc, SupplyError) else "artifact_io_error")
+    return report
+
+
 def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str]) -> dict:
     for name in names:
         with _safe_path(stage, name).open("r+b") as handle:
@@ -395,6 +873,7 @@ def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str]) -> d
         next(item["sha256"] for item in payload["files"] if item["kind"] == "weights")
         if payload["format"] == "gguf" else _weight_digest(payload["files"])
     )
+    payload.pop("manifest_sha256", None)
     payload["manifest_sha256"] = _digest(payload)
     payload = validate_supply_manifest(payload)
     _verify_segment(stage, payload)
@@ -421,79 +900,55 @@ def _remove_stage(stage: Path, root: Path) -> None:
 
 def _gguf_table(path: Path) -> tuple[dict, dict[str, tuple[int, int, tuple, int]]]:
     """Read bounded metadata and tensor ranges, never tensor payloads."""
-    from relay_segment_info import _GGML_TYPE_SIZES, _GGUF_SCALAR_TYPES
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        def read(count):
-            if count < 0 or handle.tell() + count > size:
-                _fail("invalid_gguf", "GGUF header is truncated")
-            data = handle.read(count)
-            if len(data) != count:
-                _fail("invalid_gguf", "GGUF header is truncated")
-            return data
+    from gguf_metadata_contract import read_gguf_header
+    try:
+        return read_gguf_header(path)
+    except (ValueError, struct.error, UnicodeError) as exc:
+        raise SupplyError("invalid_gguf", str(exc)) from exc
 
-        def unpack(fmt):
-            return struct.unpack(fmt, read(struct.calcsize(fmt)))[0]
 
-        def string():
-            count = unpack("<Q")
-            if count > _MAX_HEADER:
-                _fail("invalid_gguf", "GGUF string exceeds metadata limit")
-            return read(count).decode("utf-8")
+def _require_gguf_metadata(actual: dict, expected: dict) -> None:
+    problems = verify_gguf_metadata(actual, expected)
+    if problems:
+        code = "gguf_metadata_missing" if any("missing" in item for item in problems) else "gguf_metadata_mismatch"
+        _fail(code, "GGUF metadata: " + "; ".join(problems))
 
-        def value(kind, depth=0):
-            if depth > 2:
-                _fail("invalid_gguf", "GGUF arrays are nested too deeply")
-            if kind == 8:
-                return string()
-            if kind == 9:
-                subtype, count = unpack("<I"), unpack("<Q")
-                if count > 10_000_000:
-                    _fail("invalid_gguf", "GGUF array exceeds metadata limit")
-                for _ in range(count):
-                    value(subtype, depth + 1)
-                return None
-            if kind not in _GGUF_SCALAR_TYPES:
-                _fail("invalid_gguf", "GGUF metadata type is unsupported")
-            return unpack(_GGUF_SCALAR_TYPES[kind][0])
 
-        if read(4) != b"GGUF" or unpack("<I") not in {2, 3}:
-            _fail("invalid_gguf", "source is not a supported GGUF")
-        count, metadata_count = unpack("<Q"), unpack("<Q")
-        if count > 1_000_000 or metadata_count > 100_000:
-            _fail("invalid_gguf", "GGUF header exceeds metadata limits")
-        metadata = {}
-        for _ in range(metadata_count):
-            key = string()
-            if key in metadata:
-                _fail("invalid_gguf", "GGUF contains duplicate metadata")
-            metadata[key] = value(unpack("<I"))
-        alignment = metadata.get("general.alignment", 32)
-        if type(alignment) is not int or alignment <= 0 or alignment > _MAX_HEADER:
-            _fail("invalid_gguf", "GGUF alignment is invalid")
-        tensors = {}
-        for _ in range(count):
-            name, dimensions = string(), unpack("<I")
-            if name in tensors or not 1 <= dimensions <= 4:
-                _fail("invalid_gguf", "GGUF tensor name or dimensions are invalid")
-            shape = tuple(unpack("<Q") for _ in range(dimensions))
-            kind, offset = unpack("<I"), unpack("<Q")
-            if kind not in _GGML_TYPE_SIZES or any(dim <= 0 for dim in shape):
-                _fail("invalid_gguf", "GGUF tensor type or shape is unsupported")
-            block, width = _GGML_TYPE_SIZES[kind]
-            elements = math.prod(shape)
-            if elements % block or offset % alignment:
-                _fail("invalid_gguf", "GGUF tensor has invalid block alignment")
-            tensors[name] = (offset, elements // block * width, shape, kind)
-        data_start = (handle.tell() + alignment - 1) // alignment * alignment
-        last_end = data_start
-        for name, (offset, length, shape, kind) in sorted(tensors.items(), key=lambda item: item[1][0]):
-            absolute = data_start + offset
-            if absolute < last_end or absolute + length > size:
-                _fail("invalid_gguf", "GGUF tensor range overlaps or is truncated")
-            tensors[name] = (absolute, length, shape, kind)
-            last_end = absolute + length
-    return metadata, tensors
+def _native_gguf_metadata(metadata: dict, native: dict, *, source_expected=None,
+                          source_metadata=None, upgrade=False) -> dict:
+    """Verify declarations before using weights; only a known source can fill gaps."""
+    actual = normalize_gguf_metadata(metadata)
+    if source_expected is not None:
+        _require_gguf_metadata(actual, source_expected)
+    declared = native.get("gguf_metadata", {})
+    if not isinstance(declared, dict):
+        _fail("gguf_metadata_missing", "native gguf_metadata must declare block_count, head_count_kv, key_length, full_attention_interval")
+    if upgrade:
+        if source_expected is None:
+            _fail("gguf_metadata_missing", "legacy GGUF metadata requires an authoritative source")
+        declared = {**source_expected, **declared}
+    _require_gguf_metadata(actual, declared)
+    if "kept_block_count" in native:
+        _require_gguf_metadata(actual, {**declared, "block_count": native["kept_block_count"]})
+    # Existing top-level block_count describes the SOURCE. Never compare it
+    # against the crop's kept count. Other legacy declarations still bind.
+    legacy = dict(declared)
+    for key in ("architecture", "head_count_kv", "key_length", "full_attention_interval"):
+        if key in native:
+            legacy[key] = native[key]
+    _require_gguf_metadata(actual, legacy)
+    if source_metadata is not None and "block_count" in native:
+        if (type(native["block_count"]) is not int
+                or native["block_count"] != source_metadata["block_count"]):
+            _fail("gguf_metadata_mismatch", "GGUF block_count: native source declaration differs from source")
+    if "block_count" in native:
+        source_nextn = native.get("nextn_predict_layers", 0)
+        source_layers = native.get("n_layer")
+        if (type(source_nextn) is not int or type(source_layers) is not int
+                or type(native["block_count"]) is not int
+                or native["block_count"] != source_layers + source_nextn):
+            _fail("gguf_metadata_mismatch", "GGUF block_count: native source block_count differs from n_layer + nextn_predict_layers")
+    return declared
 
 
 def _gguf_layers(metadata: dict) -> tuple[str, int, int]:
@@ -541,7 +996,7 @@ def _range_hash(path: Path, offset: int, length: int) -> str:
     return digest.hexdigest()
 
 
-def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: int) -> None:
+def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: int, *, timeout_seconds=3600) -> None:
     args = ["--src", str(source), "--dst", str(artifact), "--manifest", str(native),
             "--source-model-id", payload["source_model_id"],
             "--tokenizer-sha256", payload["tokenizer_sha256"]]
@@ -560,7 +1015,7 @@ def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: i
             _fail("cut_tool_unavailable", "GGUF cutting tool is unavailable")
         command = [sys.executable, str(script), *args]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=3600,
+        result = subprocess.run(command, capture_output=True, timeout=timeout_seconds,
                                 encoding="utf-8", errors="replace",
                                 creationflags=(subprocess.CREATE_NO_WINDOW
                                                if sys.platform == "win32" else 0))
@@ -596,7 +1051,8 @@ def gguf_segment_disk_weight_bytes(source: Path, start_layer: int, end_layer: in
 def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                        source_model_sha256, tokenizer_sha256, start_layer,
                        end_layer, total_layers, operation_id, node_id,
-                       conversion_proof: dict | None = None) -> dict:
+                       conversion_proof: dict | None = None, reuse_root: Path | None = None,
+                       cut_timeout_seconds: int | None = None) -> dict:
     payload = _base_manifest(
         source_model_id=source_model_id, source_model_sha256=source_model_sha256,
         tokenizer_sha256=tokenizer_sha256, start_layer=start_layer, end_layer=end_layer,
@@ -620,11 +1076,34 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
     if read_gguf_tokenizer_sha256(source) != tokenizer_sha256:
         _fail("tokenizer_digest_mismatch", "source GGUF tokenizer fingerprint mismatch")
     layer_bytes = _layer_sizes(tensors, total_layers, start_layer, end_layer)
+    try:
+        source_metadata = normalize_gguf_metadata(metadata)
+        expected_metadata = project_gguf_metadata(source_metadata, start_layer, end_layer)
+        _require_gguf_metadata(source_metadata, source_metadata)
+    except ValueError as exc:
+        if isinstance(exc, SupplyError):
+            raise
+        raise SupplyError("gguf_metadata_mismatch", str(exc)) from exc
     root = _storage_root(destination_dir)
     final = _generation(root, payload)
-    reused = _reuse(final, payload)
+    try:
+        reused = _reuse(final, payload)
+    except SupplyError as exc:
+        if exc.code != "gguf_metadata_missing":
+            raise
+        # Keep the old ready generation intact. Publish a separate contract
+        # generation so a legacy receipt cannot permanently block rebuilding.
+        final = _generation(root, {**payload, "_gguf_metadata_contract": 1})
+        reused = _reuse(final, payload)
     if reused:
+        raw, _ = _gguf_table(Path(reused["local_files"]["segment.gguf"]))
+        _require_gguf_metadata(normalize_gguf_metadata(raw), expected_metadata)
         return reused
+    rebound = _rebind_cached_segment(root, final, payload, reuse_root or root,
+                                    gguf_metadata=expected_metadata,
+                                    gguf_source_metadata=source_metadata)
+    if rebound:
+        return rebound
     selected_size = _selected_gguf_weight_bytes(tensors, start_layer, end_layer)
     _ensure_space(root, selected_size + len(tensors) * 32 + _MAX_HEADER)
     stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
@@ -632,7 +1111,12 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         artifact = stage / "segment.gguf"
         native = stage / "segment.manifest.json"
         nextn = metadata.get(f"{arch}.nextn_predict_layers", 0)
-        _run_cut(source, artifact, native, payload, nextn)
+        if cut_timeout_seconds is None:
+            _run_cut(source, artifact, native, payload, nextn)
+        else:
+            if type(cut_timeout_seconds) is not int or not 1 <= cut_timeout_seconds <= 3600:
+                _fail("cut_timeout", "local cutter budget is exhausted")
+            _run_cut(source, artifact, native, payload, nextn, timeout_seconds=cut_timeout_seconds)
         generated = _read_json(native)
         if (generated.get("source_layer_range") != payload["layer_range"]
                 or generated.get("n_layer") != total_layers
@@ -653,6 +1137,10 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         if generated.get("mode") != payload["segment_mode"] and not decoder_only_tail:
             _fail("cut_manifest_mismatch", "cut manifest role differs from assignment")
         out_metadata, out_tensors = _gguf_table(artifact)
+        generated["gguf_metadata"] = _native_gguf_metadata(
+            out_metadata, generated, source_expected=expected_metadata,
+            source_metadata=source_metadata, upgrade=True,
+        )
         if _gguf_layers(out_metadata) != (arch, end_layer - start_layer, hidden):
             _fail("layer_range_mismatch", "cut GGUF header differs from assignment")
         expected = {}
@@ -916,7 +1404,7 @@ def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_
 def build_safetensors_segment(source: Path, destination_dir: Path, *, source_model_id,
                               source_model_sha256, tokenizer_sha256, start_layer,
                               end_layer, total_layers, operation_id, node_id,
-                              conversion_proof: dict | None = None) -> dict:
+                              conversion_proof: dict | None = None, reuse_root: Path | None = None) -> dict:
     """Repack selected tensors; source is a HF directory (or its shard).
 
     Source SHA is model_sync's aggregate recipe, or a full GGUF target identity
@@ -982,6 +1470,10 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
                if Path(relative).name not in {
                    "model.manifest.json", "cross_format.provenance.json", ".qlh-model-asset.json",
                }]
+    rebound = _rebind_cached_segment(root, final, payload, reuse_root or root,
+        support_files={name: _safe_path(root_source, name) for name in ["config.json", *support]})
+    if rebound:
+        return rebound
     support_bytes = sum(_safe_path(root_source, name).stat().st_size for name in support)
     _ensure_space(root, selected_bytes + support_bytes + _MAX_HEADER)
     stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
@@ -1042,6 +1534,10 @@ def _verify_segment(root: Path, payload: dict) -> None:
         weight = next(item for item in payload["files"] if item["kind"] == "weights")
         path = _safe_path(root, weight["path"])
         metadata, tensors = _gguf_table(path)
+        native_name = Path(weight["path"]).with_suffix(".manifest.json").as_posix()
+        native = _read_json(_safe_path(root, native_name))
+        _check_public(native)
+        _native_gguf_metadata(metadata, native)
         arch, actual_layers, hidden = _gguf_layers(metadata)
         if actual_layers != end - start or hidden != payload["hidden_size"] or arch != payload.get("model_type", arch):
             _fail("layer_range_mismatch", "received GGUF header differs from assignment")
@@ -1049,9 +1545,6 @@ def _verify_segment(root: Path, payload: dict) -> None:
             _fail("layer_bytes_mismatch", "GGUF layer bytes differ from manifest")
         if read_gguf_tokenizer_sha256(path) != payload["tokenizer_sha256"]:
             _fail("tokenizer_digest_mismatch", "GGUF tokenizer differs from manifest")
-        native_name = Path(weight["path"]).with_suffix(".manifest.json").as_posix()
-        native = _read_json(_safe_path(root, native_name))
-        _check_public(native)
         for field, expected in {
             "source_layer_range": payload["layer_range"], "n_layer": total,
             "source_model_sha256": payload["source_model_sha256"],
@@ -1121,105 +1614,47 @@ def _cancelled(callback: Callable[[], bool]) -> None:
         _fail("cancelled", "segment reception was cancelled")
 
 
-def _published_file_inventory(root: Path, cancelled: Callable[[], bool]) -> dict:
-    """Index valid published markers within the receiver's safe storage root.
+def _published_file_inventory(root: Path, cancelled: Callable[[], bool], identity: dict | None = None) -> dict:
+    """Bounded published-marker hints inside one node's private receiver root.
 
-    Only direct segment-* generations and the worker's one-level
-    local-<uuid>/segment-* layout are searched. Request metadata never supplies
-    lookup paths. Inventory is a candidate hint: each reused file is hashed
-    from live bytes during copying, and damaged candidates fall back to HTTP.
+    Node labels may change when rebinding; this root is the physical node
+    boundary. Source/range/role/proof and every individual file digest still
+    have to match. Changed optional support never invalidates reusable weights.
     """
     inventory = {}
-    locations = [root]
-    for directory in sorted(root.iterdir()):
-        _cancelled(cancelled)
-        if (re.fullmatch(r"local-[0-9a-f]{32}", directory.name)
-                and not _link(directory) and directory.is_dir()
-                and directory.resolve().parent == root):
-            locations.append(directory)
-    for location in locations:
-        _cancelled(cancelled)
-        if _link(location) or not location.is_dir():
+    for generation in _segment_candidates(root, cancelled):
+        marker = generation / _MARKER
+        if _link(marker) or not marker.is_file():
             continue
-        for generation in sorted(location.iterdir()):
-            _cancelled(cancelled)
-            if not re.fullmatch(r"segment-[0-9a-f]{64}", generation.name):
+        try:
+            published = validate_supply_manifest(_read_json(marker))
+            if not _candidate_layout(root, generation, published):
                 continue
-            if _link(generation) or not generation.is_dir():
-                continue
-            marker = generation / _MARKER
-            if _link(marker) or not marker.is_file():
-                continue
-            try:
-                resolved = generation.resolve()
-                if resolved.parent != location.resolve() or not resolved.is_relative_to(root):
-                    continue
-                published = validate_supply_manifest(_read_json(marker))
-                for item in published["files"]:
-                    _safe_path(generation, item["path"])
-            except (SupplyError, OSError):
+            if identity is not None and not _same_segment(published, identity, same_node=False):
                 continue
             for item in published["files"]:
-                key = (item["sha256"], item["size_bytes"], item["kind"])
-                inventory.setdefault(key, []).append((generation, item["path"]))
+                _safe_path(generation, item["path"])
+        except (SupplyError, OSError):
+            continue
+        for item in published["files"]:
+            key = (item["sha256"], item["size_bytes"], item["kind"])
+            inventory.setdefault(key, []).append((generation, item["path"]))
     return inventory
 
 
 def _copy_published_file(inventory: dict, entry: dict, target: Path,
                          cancelled: Callable[[], bool]) -> bool:
-    """Copy exact live bytes from an inventoried generation, with no hardlinks."""
+    """Reuse live verified immutable bytes, hardlinking where supported."""
     key = (entry["sha256"], entry["size_bytes"], entry["kind"])
     for generation, relative in inventory.get(key, []):
         _cancelled(cancelled)
         try:
-            if _link(generation.parent):
-                continue
-            source = _safe_path(generation, relative)
-            if not source.is_file() or source.stat().st_size != entry["size_bytes"]:
-                continue
-            reader = source.open("rb")
+            if _link_verified(_safe_path(generation, relative), target, entry, cancelled):
+                return True
         except (SupplyError, OSError) as exc:
+            target.unlink(missing_ok=True)
             if isinstance(exc, SupplyError) and exc.code == "cancelled":
                 raise
-            continue
-        temporary = None
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with reader, tempfile.NamedTemporaryFile(
-                mode="wb", prefix=".supply-copy-", suffix=".part",
-                dir=target.parent, delete=False,
-            ) as writer:
-                temporary = Path(writer.name)
-                digest = hashlib.sha256()
-                remaining = entry["size_bytes"]
-                while remaining:
-                    _cancelled(cancelled)
-                    chunk = reader.read(min(_CHUNK, remaining))
-                    if not chunk:
-                        break
-                    writer.write(chunk)
-                    digest.update(chunk)
-                    remaining -= len(chunk)
-                valid = not remaining and not reader.read(1) and digest.hexdigest() == entry["sha256"]
-                if valid:
-                    writer.flush()
-                    os.fsync(writer.fileno())
-            if not valid:
-                continue
-            _cancelled(cancelled)
-            # Resolve again before publication; paths may have changed during
-            # copying. The new file has its own inode and cannot modify the old.
-            _safe_path(target.parent, target.name)
-            os.replace(temporary, target)
-            temporary = None
-            return True
-        except OSError as exc:
-            code = "insufficient_disk" if exc.errno == 28 else "artifact_io_error"
-            raise SupplyError(code, "cached supply file could not be copied") from exc
-        finally:
-            reader.close()
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
     return False
 
 
@@ -1627,7 +2062,7 @@ def receive_segment(manifest: dict, destination_root: Path, *, base_url: str, to
               f"{urllib.parse.quote(payload['operation_id'], safe='')}/files/"
               f"{urllib.parse.quote(payload['node_id'], safe='')}/")
     journal = _ResumeJournal(stage, payload)
-    inventory = _published_file_inventory(root, cancelled)
+    inventory = _published_file_inventory(root, cancelled, payload)
     prefix_inventory = _partial_file_inventory(root, cancelled)
     completed = actual_downloaded_bytes = reused_bytes = resumed_bytes = 0
     for entry in payload["files"]:

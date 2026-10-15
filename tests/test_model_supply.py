@@ -91,7 +91,12 @@ def worker_hello(scheduler, node_id, *, acknowledge=True):
     # The transport fake uses the actual control/ACK owner, even before it has
     # any model or layer-range capabilities. Supply must install those first.
     control = scheduler._task_worker_control
-    control.mark_worker_connection_pending(node_id)
+    generations = getattr(scheduler, "_hello_test_generations", {})
+    generation = generations.get(node_id, 0) + 1
+    generations[node_id] = generation
+    scheduler._hello_test_generations = generations
+    scheduler._tcp_server.clients[node_id]["registration_epoch"] = generation
+    control.mark_worker_connection_pending(node_id, connection_generation=generation)
     worker = TaskWorkerControlPlane()
     hello = worker.begin_worker_hello(node_id=node_id,
         capabilities={"stage_types": ["layer_forward"], "engines": ["llama_cpp"], "models": [], "max_concurrency": 1})
@@ -642,7 +647,9 @@ def test_default_no_wait_requires_current_handshake_owner_evidence(inventory_cas
     control = scheduler._task_worker_control
     if proof == "hello_pending":
         control.disconnect_worker("worker")
-        control.mark_worker_connection_pending("worker")
+        control.mark_worker_connection_pending(
+            "worker", connection_generation=scheduler._tcp_server.clients["worker"]["registration_epoch"] + 1,
+        )
     elif proof == "ack_pending":
         worker_hello(scheduler, "worker", acknowledge=False)
     elif proof == "register_pending":
@@ -665,7 +672,8 @@ def test_default_no_wait_requires_current_handshake_owner_evidence(inventory_cas
 
 def test_supply_inventory_rechecks_hello_pending_at_dispatch_boundary(inventory_case):
     case = inventory_case
-    case.scheduler._task_worker_control.mark_worker_connection_pending("worker")
+    epoch = case.scheduler._tcp_server.clients["worker"]["registration_epoch"] + 1
+    case.scheduler._task_worker_control.mark_worker_connection_pending("worker", connection_generation=epoch)
     with pytest.raises(ModelSupplyError) as error:
         case.c._send(case.op, "worker", {"action": "inventory", "model_id": "fixture"})
     assert error.value.code == "SUPPLY_WORKERS_UNAVAILABLE"
@@ -883,6 +891,45 @@ def _assert_startup_available(case, runner, expected):
     return result
 
 
+@pytest.mark.parametrize("requested,free,expected,reason", [
+    (None, 10**12, "local_cut", "SUPPLY_LOCAL_CUT_PREFERRED"),
+    ("distribute", 10**12, "distribute", "SUPPLY_DISTRIBUTE_REQUESTED"),
+    (None, 1, "distribute", "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT"),
+])
+def test_default_local_cut_precedence_and_named_distribution(startup_pool_case, monkeypatch,
+                                                             requested, free, expected, reason):
+    case = startup_pool_case
+    if requested is not None:
+        case.c._operations[case.op]["intent"]["strategy"] = requested
+    server = case.scheduler._tcp_server
+    original = server.send_to_client
+    def send(node_id, payload, message_type):
+        if payload["action"] == "inventory":
+            case.c.handle(node_id, {"action": "inventory_result", "operation_id": case.op,
+                "node_id": node_id, "distributed": True, "engines": ["llama_cpp"],
+                "memory_available_bytes": 10**4, "disk_free_bytes": free, "local_cut": True,
+                "sources": [{"source_model_sha256": "a" * 64, "tokenizer_sha256": "b" * 64}]})
+        else:
+            original(node_id, payload, message_type)
+    monkeypatch.setattr(server, "send_to_client", send)
+    observed = []
+    def collect(**kwargs):
+        observed.append(kwargs)
+        return {"removed": 1, "reclaimed_bytes": 7, "skipped": {}, "examined": 2}
+    case.scheduler._model_supply_worker.collect_garbage = collect
+    case.release_source.set()
+    runner = case.start()
+    result = _assert_startup_available(case, runner, {"master", "worker"})
+    ensured = next(payload for node_id, payload, _ in server.sent if payload["action"] == "ensure")
+    assert ensured["strategy"] == expected and ensured["strategy_reason_code"] == reason
+    assert ensured["allow_fallback"] is (requested is None)
+    assert 1 <= ensured["local_cut_timeout_seconds"] <= 300
+    assert result["nodes"]["worker"]["strategy_reason_code"] == reason
+    assert all(call["reuse_root"] == case.c.root for call in case.build_calls)
+    assert observed and case.c.root / case.op in observed[0]["protected_paths"]
+    assert result["retention"]["removed"] == 1
+
+
 def test_source_window_new_android_waits_pending_ack_then_enters_three_node_plan(startup_pool_case):
     case = startup_pool_case
     runner = case.start()
@@ -1097,3 +1144,74 @@ def test_late_android_gguf_requirement_reuses_source_owner_and_provenance(startu
         assert [call["node_id"] for call in case.build_calls].count("android") == 1
     assert case.source_calls == [False, True]
     assert case.inventory_nodes == ["worker", "android"]
+
+
+def test_gc_blocked_collector_leaves_status_and_cancel_responsive(tmp_path):
+    c, op_id, file = coordinator(tmp_path)
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    captured, results, failures = {}, {}, []
+
+    def collect(**kwargs):
+        captured.update(kwargs)
+        entered.set()
+        if not release.wait(5):
+            raise AssertionError("test did not release collector")
+        return {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
+
+    def run_gc():
+        try:
+            c._collect_garbage(op_id)
+        except BaseException as exc:
+            failures.append(exc)
+
+    def control():
+        try:
+            results["status"] = c.get(op_id)
+            results["cancel"] = c.cancel(op_id)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            completed.set()
+
+    c.scheduler._model_supply_worker.collect_garbage = collect
+    collector = threading.Thread(target=run_gc)
+    observer = threading.Thread(target=control)
+    collector.start()
+    try:
+        assert entered.wait(2)
+        assert c.root / op_id in captured["protected_paths"]
+        assert file in captured["protected_paths"]
+        assert not captured["cancelled"]()
+        observer.start()
+        assert completed.wait(1), "status/cancel blocked behind GC disk IO"
+        assert results["status"]["status"] == "supplying"
+        assert results["cancel"]["status"] == "cancelled"
+        assert captured["cancelled"]()
+    finally:
+        release.set()
+        collector.join(2)
+        if observer.ident is not None:
+            observer.join(2)
+    assert not collector.is_alive() and not observer.is_alive()
+    assert not failures
+    assert c.get(op_id)["status"] == "cancelled"
+    assert "retention" not in c.get(op_id)
+
+
+@pytest.mark.parametrize("change", ["active", "preparing", "lease"])
+def test_gc_snapshot_fence_rejects_new_operation_prepare_or_lease(tmp_path, change):
+    c, op_id, _ = coordinator(tmp_path)
+    def collect(**kwargs):
+        assert not c._condition._is_owned()
+        assert not kwargs["cancelled"]()
+        with c._condition:
+            if change == "active":
+                c._active = "supply_" + "b" * 32
+            elif change == "preparing":
+                c._preparing = "supply_" + "b" * 32
+            else:
+                c._leases[(op_id, "new-worker")] = {"files": {"weight": str(tmp_path / "new-weight")}}
+        assert kwargs["cancelled"]()
+        return {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
+    c.scheduler._model_supply_worker.collect_garbage = collect
+    c._collect_garbage(op_id)

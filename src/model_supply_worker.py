@@ -6,7 +6,7 @@ itself. ``current.json`` points at a verified public manifest, not engine state.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
@@ -26,6 +26,12 @@ _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,256}")
 _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_CANCELLED_OPERATIONS = 256
 _TRANSFER_COUNTERS = ("downloaded_bytes", "actual_downloaded_bytes", "reused_bytes", "resumed_bytes")
+_STRATEGY_REASONS = frozenset({
+    "SUPPLY_CACHE_REUSED", "SUPPLY_LOCAL_CUT_PREFERRED", "SUPPLY_DISTRIBUTE_REQUESTED",
+    "SUPPLY_LOCAL_SOURCE_UNAVAILABLE", "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
+    "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT", "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
+    "SUPPLY_LOCAL_CUT_UNSUPPORTED", "SUPPLY_NODE_CUTTER_UNAVAILABLE",
+})
 _SELECTION_CACHE_LOCK = threading.Lock()
 _SELECTION_CACHE: dict[str, tuple[tuple, dict]] = {}
 _SELECTION_OWNERS_LOCK = threading.Lock()
@@ -322,6 +328,9 @@ class _Operation:
     generation: Any = None
     manifest: dict = field(default_factory=dict)
     strategy: str = "distribute"
+    strategy_reason_code: str = ""
+    allow_fallback: bool = False
+    cut_timeout_seconds: int = 300
     token: str = field(default="", repr=False)
     api_port: int = 8000
     local: bool = False
@@ -337,9 +346,9 @@ class _Operation:
 class ModelSupplyWorker:
     def __init__(self, scheduler, root: Path | None = None):
         self.scheduler = scheduler
-        self.root = (Path(root) if root is not None else _default_root()).resolve()
+        self.root = (Path(root) if root is not None else _default_root()).absolute()
         self._lock = threading.Lock()
-        self._execution_lock = threading.Lock()
+        self._execution_lock = threading.RLock()
         self._inventory_lock = threading.Lock()
         self._active: _Operation | None = None
         self._pending: _Operation | None = None
@@ -440,6 +449,8 @@ class ModelSupplyWorker:
             span = []
         return {"action": "result", "operation_id": op.operation_id, "node_id": op.node_id,
                 "status": status, "reason_code": code, "layer_range": span,
+                "strategy": op.strategy if op.strategy in {"distribute", "local_cut", "reuse"} else "",
+                "strategy_reason_code": op.strategy_reason_code if op.strategy_reason_code in _STRATEGY_REASONS else "",
                 **hashes, **op.transfer_counts}
 
     def handle(self, payload: dict, client=None) -> None:
@@ -475,6 +486,12 @@ class ModelSupplyWorker:
         # fields cannot reach a later operation, manifest or response.
         op.manifest = deepcopy(payload.get("manifest", {}))
         op.strategy = payload.get("strategy", "")
+        reason = payload.get("strategy_reason_code")
+        if reason in _STRATEGY_REASONS:
+            op.strategy_reason_code = reason
+        op.allow_fallback = payload.get("allow_fallback") is True
+        budget = payload.get("local_cut_timeout_seconds", 300)
+        op.cut_timeout_seconds = budget if type(budget) is int and 1 <= budget <= 3600 else 300
         token = payload.get("token", "")
         op.token = token if isinstance(token, str) else ""
         op.api_port = payload.get("api_port", 8000)
@@ -558,11 +575,6 @@ class ModelSupplyWorker:
                 pass
         if torch_available():
             engines.append("pytorch")
-        try:
-            import psutil
-            available_memory = int(psutil.virtual_memory().available)
-        except (ImportError, OSError):
-            available_memory = 0
         existing = self.root
         while not existing.exists() and existing != existing.parent:
             existing = existing.parent
@@ -611,6 +623,11 @@ class ModelSupplyWorker:
             local_cut = False
         role = getattr(self.scheduler, "_effective_role", None)
         node_id = "master" if callable(role) and role() == "master" else str(self.scheduler.get_effective_node_id())
+        try:
+            import psutil
+            available_memory = int(psutil.virtual_memory().available)
+        except (ImportError, OSError):
+            available_memory = 0
         runtime = None
         if "pytorch" in engines:
             try:
@@ -654,6 +671,10 @@ class ModelSupplyWorker:
         phase = data.get("phase", data.get("stage"))
         if isinstance(phase, str) and phase in {"receiving", "building", "verifying", "registering", "download", "verify", "build"}:
             result["phase"] = phase
+        if op.strategy in {"distribute", "local_cut", "reuse"}:
+            result["strategy"] = op.strategy
+        if op.strategy_reason_code in _STRATEGY_REASONS:
+            result["strategy_reason_code"] = op.strategy_reason_code
         self._send(op, result)
 
     def _run(self) -> None:
@@ -708,66 +729,49 @@ class ModelSupplyWorker:
             except ImportError:
                 raise SupplyError("supply_assets_unavailable") from None
             self.root.mkdir(parents=True, exist_ok=True)
-            if op.strategy == "distribute":
-                if not isinstance(op.token, str) or not op.token or type(op.api_port) is not int or not 1 <= op.api_port <= 65535:
-                    raise SupplyError("invalid_authorization")
-                from network_address import build_url
-                host = getattr(op.client, "server_host", "")
-                if not isinstance(host, str) or not host or any(char in host for char in "/\\@?#\r\n"):
-                    raise SupplyError("invalid_master_endpoint")
-                base_url = build_url("http", host, op.api_port)
-                stage = "transfer_failed"
-                result = assets.receive_segment(manifest, self.root, base_url=base_url, token=op.token,
-                                                cancelled=lambda: self._cancelled(op),
-                                                progress=lambda value=None, **kw: self._progress(op, value, **kw))
-                # Returned totals are authoritative, even if the receiver did
-                # not emit a final event. Failure replies retain earlier counts.
-                self._record_transfer_counts(op, result)
-                directory = self._directory(result, self.root / manifest["manifest_sha256"])
-                directory = _within(directory, self.root)
-                if isinstance(result, dict) and _manifest(result.get("manifest", result)) != manifest:
-                    raise SupplyError("manifest_identity_mismatch")
+            if op.strategy == "local_cut":
+                # A cached exact inventory wins before source hashing/cutting.
+                cached = assets.reuse_segment(manifest, self.root,
+                    cancelled=lambda: self._cancelled(op))
+                if cached is not None:
+                    result = cached
+                    op.strategy = "reuse"
+                    op.strategy_reason_code = "SUPPLY_CACHE_REUSED"
+                    self._record_transfer_counts(op, cached)
+                    directory = _within(self._directory(cached, self.root), self.root)
+                else:
+                    stage = "local_cut_failed"
+                    op.strategy_reason_code = "SUPPLY_LOCAL_CUT_PREFERRED"
+                    try:
+                        directory = self._local_cut(op, assets)
+                    except Exception as exc:
+                        fallback = {
+                            "local_source_unavailable": "SUPPLY_LOCAL_SOURCE_UNAVAILABLE",
+                            "cut_tool_unavailable": "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
+                            "insufficient_disk": "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT",
+                            "cut_timeout": "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
+                            "unsupported_local_cut": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
+                            "unsupported_range": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
+                        }.get(_error_code(exc, stage))
+                        if not op.allow_fallback or fallback is None:
+                            raise
+                        self._check(op)
+                        op.strategy = "distribute"
+                        op.strategy_reason_code = fallback
+                        stage = "transfer_failed"
+                        self._progress(op, {"phase": "receiving"})
+                        directory = self._receive(op, assets)
             else:
-                key = tuple(manifest[item] for item in ("source_model_id", "source_model_sha256", "tokenizer_sha256"))
-                with self._lock:
-                    source = self._sources.get(key)
-                    if source is None:
-                        # Peers can register the same verified source bytes
-                        # under different local model IDs. Content is identity.
-                        source = next((path for (_, sha, tokenizer), path in self._sources.items()
-                                       if sha == key[1] and tokenizer == key[2]), None)
-                if source is None:
-                    raise SupplyError("local_source_unavailable")
-                stage = "local_cut_failed"
-                if _file_sha(source, lambda: self._cancelled(op)) != manifest["source_model_sha256"]:
-                    raise SupplyError("source_model_sha256_mismatch")
-                from relay_segment_info import read_gguf_layer_info, read_gguf_tokenizer_sha256
-                info = read_gguf_layer_info(source)
-                if not info or info["n_layer"] != manifest["total_layers"]:
-                    raise SupplyError("source_model_metadata_mismatch")
-                if read_gguf_tokenizer_sha256(source) != manifest["tokenizer_sha256"]:
-                    raise SupplyError("tokenizer_sha256_mismatch")
-                directory = self.root / ("local-" + uuid.uuid4().hex)
-                directory.mkdir()
-                if manifest["format"] != "gguf":
-                    raise SupplyError("unsupported_local_cut")
-                self._progress(op, {"phase": "building"})
-                self._check(op)
-                result = assets.build_gguf_segment(
-                    source, directory, source_model_id=manifest["source_model_id"],
-                    source_model_sha256=manifest["source_model_sha256"],
-                    tokenizer_sha256=manifest["tokenizer_sha256"],
-                    start_layer=manifest["layer_range"][0], end_layer=manifest["layer_range"][1],
-                    total_layers=manifest["total_layers"], operation_id=op.operation_id, node_id=op.node_id,
-                    conversion_proof=manifest.get("conversion_proof"))
-                if _manifest(result) != manifest:
-                    raise SupplyError("manifest_identity_mismatch")
-                directory = _within(self._directory(result, directory), directory)
+                if not op.strategy_reason_code:
+                    op.strategy_reason_code = "SUPPLY_DISTRIBUTE_REQUESTED"
+                stage = "transfer_failed"
+                directory = self._receive(op, assets)
             self._check(op)
             stage = "registration_failed"
             self._progress(op, {"phase": "verifying"})
             self._register(op, directory)
             self._send(op, self._reply(op, "available"))
+            self.collect_garbage()
         except Exception as exc:
             code = _error_code(exc, stage)
             try:
@@ -778,6 +782,209 @@ class ModelSupplyWorker:
         finally:
             op.token = ""
             op.finished = True
+
+    def _receive(self, op: _Operation, assets) -> Path:
+        if not isinstance(op.token, str) or not op.token or type(op.api_port) is not int or not 1 <= op.api_port <= 65535:
+            raise SupplyError("invalid_authorization")
+        from network_address import build_url
+        host = getattr(op.client, "server_host", "")
+        if not isinstance(host, str) or not host or any(char in host for char in "/\\@?#\r\n"):
+            raise SupplyError("invalid_master_endpoint")
+        result = assets.receive_segment(op.manifest, self.root,
+            base_url=build_url("http", host, op.api_port), token=op.token,
+            cancelled=lambda: self._cancelled(op),
+            progress=lambda value=None, **kw: self._progress(op, value, **kw))
+        self._record_transfer_counts(op, result)
+        if isinstance(result, dict) and _manifest(result.get("manifest", result)) != op.manifest:
+            raise SupplyError("manifest_identity_mismatch")
+        return _within(self._directory(result, self.root), self.root)
+
+    def _local_cut(self, op: _Operation, assets) -> Path:
+        manifest = op.manifest
+        if manifest["format"] != "gguf":
+            raise SupplyError("unsupported_local_cut")
+        key = tuple(manifest[item] for item in ("source_model_id", "source_model_sha256", "tokenizer_sha256"))
+        with self._lock:
+            source = self._sources.get(key)
+            if source is None:
+                source = next((path for (_, sha, tokenizer), path in self._sources.items()
+                               if sha == key[1] and tokenizer == key[2]), None)
+        if source is None:
+            raise SupplyError("local_source_unavailable")
+        if _file_sha(source, lambda: self._cancelled(op)) != manifest["source_model_sha256"]:
+            raise SupplyError("source_model_sha256_mismatch")
+        from relay_segment_info import read_gguf_layer_info, read_gguf_tokenizer_sha256
+        info = read_gguf_layer_info(source)
+        if not info or info["n_layer"] != manifest["total_layers"]:
+            raise SupplyError("source_model_metadata_mismatch")
+        if read_gguf_tokenizer_sha256(source) != manifest["tokenizer_sha256"]:
+            raise SupplyError("tokenizer_sha256_mismatch")
+        self._progress(op, {"phase": "building"})
+        self._check(op)
+        # Stable root allows disk-backed lookup after worker restart.
+        result = assets.build_gguf_segment(source, self.root,
+            source_model_id=manifest["source_model_id"],
+            source_model_sha256=manifest["source_model_sha256"],
+            tokenizer_sha256=manifest["tokenizer_sha256"],
+            start_layer=manifest["layer_range"][0], end_layer=manifest["layer_range"][1],
+            total_layers=manifest["total_layers"], operation_id=op.operation_id, node_id=op.node_id,
+            conversion_proof=manifest.get("conversion_proof"), reuse_root=self.root,
+            cut_timeout_seconds=op.cut_timeout_seconds)
+        if _manifest(result) != manifest:
+            raise SupplyError("manifest_identity_mismatch")
+        op.transfer_counts["reused_bytes"] = int(result.get("_reused_bytes", 0))
+        return _within(self._directory(result, self.root), self.root)
+
+    @contextmanager
+    def _native_gc_paths(self, root: Path):
+        """Hold the actual native owners while proving their file references.
+
+        Reading __dict__/slots avoids ModelHost's lazy manager creation. Unknown
+        hosts/providers disable deletion; a current supply pointer is not proof
+        that an older native runtime has released its mappings.
+        """
+        host = getattr(self.scheduler, "_host", None)
+        if host is None or type(host).__module__ != "model_host":
+            yield None
+            return
+        refs, identities = [], set()
+        seen = set()
+        class UnknownOwner(Exception):
+            pass
+        def path(value):
+            if value:
+                if not isinstance(value, (str, Path)):
+                    raise UnknownOwner()
+                refs.append(Path(value))
+        def manager(owner):
+            if owner is None or id(owner) in seen:
+                return
+            seen.add(id(owner))
+            module = type(owner).__module__
+            if module == "model_host" and type(owner).__name__ == "_LazyModelManager":
+                manager(object.__getattribute__(owner, "_instance"))
+                return
+            if module not in {"model_module", "llama_engine", "llama_server_engine",
+                              "llama_keep_head", "gemma4_pipeline_sidecar"}:
+                raise UnknownOwner()
+            state = vars(owner)
+            for name in ("model_path", "_model_path", "_full_model_path", "_mmproj_path"):
+                path(state.get(name))
+            descriptor = state.get("_pipeline_descriptor") or {}
+            path(descriptor.get("loaded_artifact"))
+            key = state.get("_keep_head_key")
+            if key:
+                path(key[0])
+            for name in ("_llama_engine", "_island_engine", "_keep_head", "_gemma4_runtime"):
+                manager(state.get(name))
+        with ExitStack() as locks:
+            proof = True
+            try:
+                state = vars(host)
+                candidate_lock = state.get("_pipeline_candidate_lock")
+                if candidate_lock is None or "_manager" not in state:
+                    raise UnknownOwner()
+                locks.enter_context(candidate_lock)
+                manager(state["_manager"])
+                path(state.get("model_path"))
+                transaction = state.get("_pipeline_candidate_transaction")
+                if transaction is not None:
+                    path(transaction.model_path)
+                    manager(transaction.manager)
+                    manager(transaction.previous_manager)
+                    previous = transaction.previous_host_state or {}
+                    mirror = previous.get("mirrors", {}).get("model_path")
+                    if mirror and mirror[0]:
+                        path(mirror[1])
+                controller = getattr(self.scheduler, "_worker_prepare", None)
+                if controller is not None:
+                    if type(controller).__module__ != "worker_prepare":
+                        raise UnknownOwner()
+                    # Snapshot queued/current prepare identities. Native work
+                    # needs full_chat_execution_lock, already held by admission.
+                    with controller._lock:
+                        commands = [controller._current, *controller._queue]
+                        for command in commands:
+                            payload = getattr(command, "payload", None) or {}
+                            digest = payload.get("identity", {}).get("manifest_sha256")
+                            if digest:
+                                identities.add(digest)
+                        runtime = controller._runtime
+                    if runtime is not None:
+                        if type(runtime).__module__ != "inference_service.engine_host":
+                            raise UnknownOwner()
+                        locks.enter_context(runtime._worker_layer_lock())
+                        # Includes active, prepared candidate, previous and
+                        # partially closed orphan ownership, not just loaded.
+                        owned = [runtime._capture_worker_runtime(),
+                                 getattr(runtime, "_worker_runtime_candidate", None),
+                                 getattr(runtime, "_worker_runtime_previous", None),
+                                 *getattr(runtime, "_worker_runtime_orphans", [])]
+                        for item in owned:
+                            if item is None:
+                                continue
+                            selected = item.selected or {}
+                            path(selected.get("model_path"))
+                            path(selected.get("manifest_path"))
+                            manager(item.manager)
+                            if item.upstream is not None:
+                                path(item.upstream.model_path)
+                if identities:
+                    from model_supply_assets import _segment_candidates, _read_json
+                    for directory in _segment_candidates(root):
+                        if _read_json(directory / "supply.manifest.json").get("manifest_sha256") in identities:
+                            refs.append(directory)
+            except (UnknownOwner, AttributeError, TypeError, ValueError, OSError):
+                proof = False
+            yield refs if proof else None
+
+    def collect_garbage(self, *, root: Path | None = None, protected_paths=(),
+                        cancelled=lambda: False) -> dict:
+        """Owner entry: supply completion invokes this under execution admission."""
+        from model_supply_assets import collect_supply_segments
+        root = Path(root) if root is not None else self.root
+        protected = list(protected_paths)
+        # Reentrant for completion on the receiver thread; nonblocking for an
+        # external maintenance caller. Excludes both writers and prefix donors.
+        if not self._execution_lock.acquire(blocking=False):
+            return {"removed": 0, "reclaimed_bytes": 0,
+                    "skipped": {"receiver_busy": 1}, "examined": 0}
+        try:
+            with self._admission():
+                if (getattr(self.scheduler, "_task_worker_active_attempts", {})
+                        or getattr(self.scheduler, "_active_pipeline_task_ids", set())):
+                    raise SupplyError("SUPPLY_WORKER_BUSY")
+                with self._lock:
+                    active, pending = self._active, self._pending
+                def invalidated():
+                    if cancelled():
+                        return True
+                    with self._lock:
+                        return (self._active is not active or self._pending is not pending
+                                or (active is not None and active.cancelled.is_set()))
+                if active is not None:
+                    self._assert_idle(active)
+                    if active.manifest.get("manifest_sha256"):
+                        protected.append(self.root / (".supply-receive-" + active.manifest["manifest_sha256"]))
+                    if active.previous_pointer:
+                        old = json.loads(active.previous_pointer)
+                        protected.append(self.root.parent / old["directory"])
+                pointer = self.root / "current.json"
+                from model_supply_assets import _link
+                if _link(pointer):
+                    raise SupplyError("unsafe_path")
+                if pointer.is_file():
+                    protected.append(self.root.parent / _json(pointer)["directory"])
+                with self._native_gc_paths(root) as native:
+                    return collect_supply_segments(root, protected_paths=protected,
+                        native_paths=native, keep=0, cancelled=invalidated, receive_idle=True)
+        except Exception:
+            # Retention is maintenance, never a second terminal supply result.
+            return {"removed": 0, "reclaimed_bytes": 0,
+                    "skipped": {"owner_admission_unavailable": 1}, "examined": 0}
+
+        finally:
+            self._execution_lock.release()
 
     @contextmanager
     def _admission(self):

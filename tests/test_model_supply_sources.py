@@ -204,7 +204,7 @@ def test_local_store_location_overrides_builtin_stale_path(tmp_path, monkeypatch
     _register(tmp_path, root=hf)
     monkeypatch.setattr(jobs, "_download", _unexpected)
     assert _ensure(tmp_path)["hf"] == hf
-    assert _ensure(tmp_path)["model_config"].name == "Builtin"
+    assert _ensure(tmp_path)["model_config"].name == "Source fixture"
 
 
 def test_builtin_without_db_source_is_reused(tmp_path, monkeypatch):
@@ -372,7 +372,10 @@ def test_queued_existing_job_is_not_stolen(tmp_path, fake_download):
 
 def test_register_failure_removes_only_this_download(tmp_path, monkeypatch, fake_download):
     cfg = _register(tmp_path, repo="owner/repo")
-    monkeypatch.setattr(local_store, "save_local_experimental_model", lambda *a, **kw: False)
+    def unavailable(*args, **kwargs):
+        raise sources.ModelSupplySourceError("SUPPLY_REGISTER_FAILED", "Fixture persistence failure")
+
+    monkeypatch.setattr(local_store, "save_local_experimental_model_cas", unavailable)
     _assert_code("SUPPLY_REGISTER_FAILED", lambda: _ensure(tmp_path))
     assert not Path(cfg.model_path).exists()
     assert jobs.list_jobs()[0]["status"] == "failed"
@@ -788,3 +791,354 @@ def test_application_mapping_does_not_allow_link_inside_model(tmp_path, monkeypa
     finally:
         for link in (nested, alias):
             link.rmdir() if __import__("os").name == "nt" else link.unlink()
+
+
+def _both_registered(tmp_path, *, legacy=False):
+    hf = _hf(tmp_path / "models" / "hf")
+    gguf = _gguf(hf.parent / "registered.gguf")
+    manifest = mrv.build_manifest(hf, [hf / "model.safetensors", gguf], model_type="both")
+    mrv.write_manifest(hf, manifest)
+    fields = {} if legacy else {"manifest_external_files": mrv.manifest_external_files(hf, [gguf])}
+    _register(tmp_path, root=hf, gguf=gguf, model_type="both", **fields)
+    return hf, gguf
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_both_source_external_manifest_uses_only_explicit_registered_file(tmp_path, monkeypatch, legacy):
+    hf, gguf = _both_registered(tmp_path, legacy=legacy)
+    before = (hf / "model.manifest.json").read_bytes()
+    monkeypatch.setattr(jobs, "_download", _unexpected)
+    monkeypatch.setattr(convert, "execute_conversion", _unexpected)
+    result = _ensure(tmp_path, want_gguf=True)
+    assert result["hf"] == hf and result["gguf"] == gguf
+    assert (hf / "model.manifest.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("tamper", ["content", "missing", "unregistered"])
+def test_external_manifest_binding_does_not_bypass_live_validation(tmp_path, tamper):
+    hf, gguf = _both_registered(tmp_path, legacy=True)
+    if tamper == "content":
+        data = gguf.read_bytes()
+        gguf.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+    elif tamper == "missing":
+        gguf.unlink()
+    else:
+        cfg = mc.get_model_config("fixture", local_store.get_local_experimental_models())
+        local_store.save_local_experimental_model("fixture", {**asdict(cfg), "gguf_path": ""})
+    _assert_code("SUPPLY_SOURCE_METADATA_INVALID", lambda: _ensure(tmp_path, want_gguf=True))
+
+
+def test_mixed_both_without_proof_converts_once_preserving_original_source(tmp_path, fake_conversion):
+    hf, original_gguf = _both_registered(tmp_path, legacy=True)
+    original = original_gguf.read_bytes()
+    manifest_bytes = (hf / "model.manifest.json").read_bytes()
+    options = dict(operation_dir=tmp_path / "first", want_gguf=True,
+                   cancelled=lambda: False, require_cross_format=True)
+    first = sources.ensure_registered_sources("fixture", **options)
+    assert first["gguf"] != original_gguf
+    assert first["conversion_proof"]
+    assert len(fake_conversion.calls) == 1
+    assert original_gguf.read_bytes() == original
+    assert (hf / "model.manifest.json").read_bytes() == manifest_bytes
+    row = local_store.get_local_experimental_models()[0]
+    assert row["manifest_external_files"]["external/registered.gguf"] == str(original_gguf)
+    options["operation_dir"] = tmp_path / "second"
+    second = sources.ensure_registered_sources("fixture", **options)
+    assert second["gguf"] == first["gguf"]
+    assert second["conversion_proof"] == first["conversion_proof"]
+    assert len(fake_conversion.calls) == 1
+
+
+def test_external_manifest_alias_collision_fails_registration(tmp_path):
+    a = _gguf(tmp_path / "a" / "same.gguf")
+    b = _gguf(tmp_path / "b" / "same.gguf")
+    with pytest.raises(ValueError, match="ambiguous external"):
+        mrv.build_manifest(tmp_path / "hf", [a, b], model_type="both")
+
+
+def _register_manifest_identity(tmp_path, hf, manifest, *, storage="both", gguf=None):
+    fields = {}
+    if storage in {"flat", "both"}:
+        fields.update(artifact_sha256=manifest["artifact_sha256"],
+                      manifest_sha256=manifest["manifest_sha256"])
+    if storage in {"nested", "both"}:
+        fields["manifest"] = manifest
+    if gguf is not None:
+        fields["model_type"] = "both"
+    return _register(tmp_path, root=hf, gguf=gguf, **fields)
+
+
+@pytest.mark.parametrize("storage", ["flat", "nested", "both"])
+@pytest.mark.parametrize("tamper", ["delete", "rewrite_weights", "rewrite_metadata"])
+@pytest.mark.parametrize("want_gguf", [False, True])
+def test_registered_manifest_identity_cannot_be_deleted_or_resigned(
+    tmp_path, monkeypatch, storage, tamper, want_gguf,
+):
+    hf = _hf(tmp_path / "models" / "source", manifest=True)
+    manifest = json.loads((hf / "model.manifest.json").read_text(encoding="utf-8"))
+    _register_manifest_identity(tmp_path, hf, manifest, storage=storage)
+    registered = local_store.get_local_experimental_models()
+    if tamper == "delete":
+        (hf / "model.manifest.json").unlink()
+    else:
+        if tamper == "rewrite_weights":
+            weight = hf / "model.safetensors"
+            data = bytearray(weight.read_bytes())
+            data[-1] ^= 1  # Valid Safetensors layout; only the tensor payload changes.
+            weight.write_bytes(data)
+        replacement = mrv.build_manifest(hf, [hf / "model.safetensors"],
+                                         model_type="safetensors",
+                                         source="changed" if tamper == "rewrite_metadata" else "")
+        mrv.write_manifest(hf, replacement)
+        # The replacement is self-consistent and hashes its actual files.
+        sources._live_manifest(hf, [hf / "model.safetensors"], lambda: False)
+    monkeypatch.setattr(jobs, "_download", _unexpected)
+    monkeypatch.setattr(convert, "execute_conversion", _unexpected)
+    _assert_code("SUPPLY_SOURCE_METADATA_INVALID",
+                 lambda: _ensure(tmp_path, want_gguf=want_gguf))
+    assert local_store.get_local_experimental_models() == registered
+    assert not (hf / sources.PROVENANCE).exists()
+    if tamper == "delete":
+        assert not (hf / "model.manifest.json").exists()
+
+
+@pytest.mark.parametrize("storage", ["flat", "nested", "both"])
+def test_pinned_mixed_source_stays_usable_across_two_operations(tmp_path, fake_conversion, storage):
+    hf, original = _both_registered(tmp_path, legacy=True)
+    manifest_bytes = (hf / "model.manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    _register_manifest_identity(tmp_path, hf, manifest, storage=storage, gguf=original)
+    original_bytes = original.read_bytes()
+    first = sources.ensure_registered_sources(
+        "fixture", operation_dir=tmp_path / "first-pinned", want_gguf=True,
+        require_cross_format=True, cancelled=lambda: False,
+    )
+    row = local_store.get_local_experimental_models()[0]
+    assert row["manifest_external_files"]["external/registered.gguf"] == str(original)
+    assert row["manifest_sha256"] == manifest["manifest_sha256"]
+    assert row["artifact_sha256"] == manifest["artifact_sha256"]
+    assert first["gguf"] != original
+    second = sources.ensure_registered_sources(
+        "fixture", operation_dir=tmp_path / "second-pinned", want_gguf=True,
+        require_cross_format=True, cancelled=lambda: False,
+    )
+    assert second["conversion_proof"] == first["conversion_proof"]
+    assert second["gguf"] == first["gguf"]
+    assert len(fake_conversion.calls) == 1
+    assert local_store.get_local_experimental_models()[0] == row
+    assert original.read_bytes() == original_bytes
+    assert (hf / "model.manifest.json").read_bytes() == manifest_bytes
+
+
+@pytest.mark.parametrize("builtin_without_row", [False, True])
+def test_conversion_reregistration_cannot_be_overwritten_by_old_snapshot(
+    tmp_path, monkeypatch, fake_conversion, builtin_without_row,
+):
+    hf = _hf(tmp_path / "models" / "old", manifest=True)
+    manifest_bytes = (hf / "model.manifest.json").read_bytes()
+    if builtin_without_row:
+        builtin = ModelConfig(model_id="fixture", name="Builtin", model_path=str(hf))
+        monkeypatch.setattr(mc, "get_builtin_model", lambda mid: builtin if mid == "fixture" else None)
+        assert local_store.get_local_experimental_models() == []
+    else:
+        # A legacy mixed source adds external bindings to its local working row.
+        original = _gguf(hf.parent / "old-original.gguf")
+        manifest = mrv.build_manifest(hf, [hf / "model.safetensors", original], model_type="both")
+        mrv.write_manifest(hf, manifest)
+        manifest_bytes = (hf / "model.manifest.json").read_bytes()
+        _register_manifest_identity(tmp_path, hf, manifest, gguf=original)
+    replacement = _hf(tmp_path / "models" / "new", manifest=True)
+    replacement_manifest = json.loads((replacement / "model.manifest.json").read_text(encoding="utf-8"))
+    captured = {}
+
+    def execute(**options):
+        report = fake_conversion.execute(**options)
+        _register_manifest_identity(tmp_path, replacement, replacement_manifest)
+        captured["row"] = local_store.get_local_experimental_models()[0]
+        return report
+
+    monkeypatch.setattr(convert, "execute_conversion", execute)
+    _assert_code("SUPPLY_REGISTRY_CHANGED", lambda: sources.ensure_registered_sources(
+        "fixture", operation_dir=tmp_path / "stale-conversion", want_gguf=True,
+        require_cross_format=True, cancelled=lambda: False,
+    ))
+    assert len(fake_conversion.calls) == 1
+    assert local_store.get_local_experimental_models() == [captured["row"]]
+    assert captured["row"]["model_path"] == str(replacement)
+    assert (hf / "model.manifest.json").read_bytes() == manifest_bytes
+    assert _ensure(tmp_path)["hf"] == replacement
+
+
+def test_builtin_without_registry_row_converts_then_reuses_inserted_identity(
+    tmp_path, monkeypatch, fake_conversion,
+):
+    hf = _hf(tmp_path / "models" / "builtin")
+    builtin = ModelConfig(model_id="fixture", name="Builtin", model_path=str(hf))
+    monkeypatch.setattr(mc, "get_builtin_model", lambda mid: builtin if mid == "fixture" else None)
+    assert local_store.get_local_experimental_models() == []
+    first = _ensure(tmp_path, want_gguf=True)
+    row = local_store.get_local_experimental_models()[0]
+    assert row["manifest_sha256"] == first["conversion_proof"]["source"]["manifest_sha256"]
+    assert row["artifact_sha256"] == first["conversion_proof"]["source"]["artifact_sha256"]
+    assert _ensure(tmp_path, want_gguf=True)["gguf"] == first["gguf"]
+    assert len(fake_conversion.calls) == 1
+
+
+@pytest.mark.parametrize("tamper", ["delete", "resign"])
+def test_existing_proof_remains_bound_to_registered_manifest(tmp_path, fake_conversion, tamper):
+    hf = _hf(tmp_path / "models" / "source")
+    _register(tmp_path, root=hf)
+    first = _ensure(tmp_path, want_gguf=True)
+    row = local_store.get_local_experimental_models()[0]
+    if tamper == "delete":
+        (hf / "model.manifest.json").unlink()
+    else:
+        manifest = json.loads((hf / "model.manifest.json").read_text(encoding="utf-8"))
+        manifest["source"] = "resigned"
+        manifest["manifest_sha256"] = sources._canonical({
+            key: value for key, value in manifest.items()
+            if key not in {"manifest_sha256", "artifact_sha256"}
+        })
+        mrv.write_manifest(hf, manifest)
+        proof = first["conversion_proof"]
+        proof["source"]["manifest_sha256"] = manifest["manifest_sha256"]
+        proof["provenance_sha256"] = sources._canonical({
+            key: value for key, value in proof.items() if key != "provenance_sha256"
+        })
+        (hf / sources.PROVENANCE).write_text(json.dumps(proof), encoding="utf-8")
+        assert descriptor.cross_format_pipeline_identity(hf)  # Self-consistent, but not the registered identity.
+    _assert_code("SUPPLY_CONVERSION_PROOF_INVALID", lambda: _ensure(tmp_path, want_gguf=True))
+    assert local_store.get_local_experimental_models() == [row]
+    assert len(fake_conversion.calls) == 1
+
+
+@pytest.mark.parametrize("tamper", ["delete", "resign"])
+def test_manifest_changed_between_validation_and_conversion_is_not_recreated(
+    tmp_path, monkeypatch, fake_conversion, tamper,
+):
+    hf = _hf(tmp_path / "models" / "source", manifest=True)
+    manifest = json.loads((hf / "model.manifest.json").read_text(encoding="utf-8"))
+    _register_manifest_identity(tmp_path, hf, manifest)
+    original_convert = sources._convert
+
+    def changed_before_convert(*args, **kwargs):
+        if tamper == "delete":
+            (hf / "model.manifest.json").unlink()
+        else:
+            mrv.write_manifest(hf, mrv.build_manifest(hf, [hf / "model.safetensors"],
+                                                     model_type="safetensors", source="changed"))
+        return original_convert(*args, **kwargs)
+
+    monkeypatch.setattr(sources, "_convert", changed_before_convert)
+    _assert_code("SUPPLY_CONVERSION_PROOF_UNAVAILABLE", lambda: _ensure(tmp_path, want_gguf=True))
+    assert not fake_conversion.calls
+    assert not (hf / sources.PROVENANCE).exists()
+    if tamper == "delete":
+        assert not (hf / "model.manifest.json").exists()
+
+
+def test_legacy_manifest_rewritten_during_conversion_cannot_publish_proof(
+    tmp_path, monkeypatch, fake_conversion,
+):
+    hf = _hf(tmp_path / "models" / "source")
+    _register(tmp_path, root=hf)
+
+    def execute(**options):
+        report = fake_conversion.execute(**options)
+        mrv.write_manifest(hf, mrv.build_manifest(hf, [hf / "model.safetensors"],
+                                                 model_type="safetensors", source="changed"))
+        return report
+
+    monkeypatch.setattr(convert, "execute_conversion", execute)
+    _assert_code("SUPPLY_CONVERSION_PROOF_UNAVAILABLE", lambda: _ensure(tmp_path, want_gguf=True))
+    assert not (hf / sources.PROVENANCE).exists()
+
+
+def test_download_cas_conflict_preserves_source_adopted_by_new_registration(
+    tmp_path, fake_download,
+):
+    cfg = _register(tmp_path, repo="owner/repo")
+    captured = {}
+
+    def progress(value):
+        if value["phase"] == "registering":
+            local_store.save_local_experimental_model("fixture", {
+                **asdict(cfg), "name": "Concurrent registration adopted this source",
+            })
+            captured["row"] = local_store.get_local_experimental_models()[0]
+
+    _assert_code("SUPPLY_REGISTRY_CHANGED", lambda: _ensure(tmp_path, progress=progress))
+    assert local_store.get_local_experimental_models() == [captured["row"]]
+    assert Path(cfg.model_path).is_dir()
+    assert jobs.list_jobs()[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_download_rebuild_is_bound_to_existing_registered_identity(tmp_path, fake_download, changed):
+    manifest = mrv.build_manifest(fake_download.template,
+                                  [fake_download.template / "model.safetensors"],
+                                  model_type="safetensors", revision="a" * 40, source="owner/repo")
+    cfg = _register(tmp_path, repo="owner/repo", manifest=manifest,
+                    artifact_sha256=manifest["artifact_sha256"],
+                    manifest_sha256=manifest["manifest_sha256"])
+    before = local_store.get_local_experimental_models()
+    if changed:
+        weight = fake_download.template / "model.safetensors"
+        data = bytearray(weight.read_bytes())
+        data[-1] ^= 1
+        weight.write_bytes(data)
+        _assert_code("SUPPLY_DOWNLOAD_METADATA_INVALID", lambda: _ensure(tmp_path))
+        assert local_store.get_local_experimental_models() == before
+        assert not Path(cfg.model_path).exists()
+    else:
+        first = _ensure(tmp_path)
+        second = _ensure(tmp_path)
+        assert first["hf"] == second["hf"] == Path(cfg.model_path)
+        assert local_store.get_local_experimental_models()[0]["manifest_sha256"] == manifest["manifest_sha256"]
+        assert len(fake_download.calls) == 1
+
+
+def test_pinned_hf_tree_cannot_disappear_and_degrade_to_unproven_gguf(tmp_path, monkeypatch):
+    hf, gguf = _both_registered(tmp_path, legacy=True)
+    manifest = json.loads((hf / "model.manifest.json").read_text(encoding="utf-8"))
+    _register_manifest_identity(tmp_path, hf, manifest, gguf=gguf)
+    shutil.rmtree(hf)
+    monkeypatch.setattr(jobs, "_download", _unexpected)
+    monkeypatch.setattr(convert, "execute_conversion", _unexpected)
+    _assert_code("SUPPLY_SOURCE_METADATA_INVALID", lambda: _ensure(tmp_path, want_gguf=True))
+    assert gguf.is_file()
+
+
+def test_conflicting_flat_and_nested_source_identity_fails_closed(tmp_path):
+    hf = _hf(tmp_path / "models" / "source", manifest=True)
+    manifest = json.loads((hf / "model.manifest.json").read_text(encoding="utf-8"))
+    _register(tmp_path, root=hf, manifest=manifest, manifest_sha256="a" * 64)
+    _assert_code("SUPPLY_REGISTRY_INVALID", lambda: _ensure(tmp_path))
+
+
+@pytest.mark.parametrize("tamper", [None, "delete", "resign"])
+def test_gguf_only_registration_is_bound_to_live_manifest(tmp_path, monkeypatch, tamper):
+    gguf = _gguf(tmp_path / "models" / "gguf" / "registered.gguf")
+    manifest = mrv.build_manifest(gguf.parent, [gguf], model_type="gguf")
+    mrv.write_manifest(gguf.parent, manifest)
+    _register(tmp_path, gguf=gguf, model_path="", model_type="gguf", manifest=manifest,
+              artifact_sha256=manifest["artifact_sha256"], manifest_sha256=manifest["manifest_sha256"])
+    row = local_store.get_local_experimental_models()[0]
+    manifest_bytes = (gguf.parent / "model.manifest.json").read_bytes()
+    monkeypatch.setattr(jobs, "_download", _unexpected)
+    monkeypatch.setattr(convert, "execute_conversion", _unexpected)
+    if tamper == "delete":
+        (gguf.parent / "model.manifest.json").unlink()
+    elif tamper == "resign":
+        data = bytearray(gguf.read_bytes())
+        data[-1] ^= 1
+        gguf.write_bytes(data)
+        sources._gguf_metadata(gguf)  # Structure-valid GGUF with a new payload.
+        mrv.write_manifest(gguf.parent, mrv.build_manifest(gguf.parent, [gguf], model_type="gguf"))
+    if tamper:
+        _assert_code("SUPPLY_SOURCE_METADATA_INVALID", lambda: _ensure(tmp_path, want_gguf=True))
+    else:
+        assert _ensure(tmp_path, want_gguf=True)["gguf"] == gguf
+        assert _ensure(tmp_path, want_gguf=True)["gguf"] == gguf
+        assert (gguf.parent / "model.manifest.json").read_bytes() == manifest_bytes
+    assert local_store.get_local_experimental_models() == [row]

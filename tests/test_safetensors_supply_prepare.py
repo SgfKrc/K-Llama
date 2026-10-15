@@ -76,6 +76,7 @@ class _Worker(SchedulerPipelineMixin):
         self._local_pipeline_steps = {}
         self._local_device_profile = {"ram": {"available_gb": 1}}
         self._tcp_client = None  # Matching supply must work without a master URL.
+        self._pipeline_recovery_validated = True
         self._pipeline_recovery_pending = False
         self._pipeline_recovery_state = None
         self._pipeline_recovery_failure = ""

@@ -1,0 +1,225 @@
+"""Fresh operation-scoped budgets over the existing authenticated inventory channel.
+
+The supply coordinator owns query/reply ordering. Discovery profiles are never
+mutated, and a budget snapshot grants neither an assignment nor loaded-ready.
+A new wire operation id correlates each inventory query even with older Android
+workers; inventory does not change their active supplied asset.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+import logging
+import time
+import uuid
+
+logger = logging.getLogger(__name__)
+MAX_BUDGET_AGE_SECONDS = 30.0
+
+
+def _error(code, message):
+    from model_supply import ModelSupplyError
+    return ModelSupplyError(code, message)
+
+
+def _connection(coordinator, node_id):
+    server = coordinator.scheduler._tcp_server
+    info = server.get_client_info(node_id) if server else None
+    if not coordinator._worker_handshake_ready(node_id, info):
+        raise _error("SUPPLY_RUNTIME_WORKER_UNAVAILABLE", f"Worker {node_id} has no current authenticated handshake")
+    return (info.get("connected_at"), server.get_authenticated_peer_epoch(node_id))
+
+
+def _validate(coordinator, query, *, check_age=True):
+    coordinator.ensure_prepare_not_cancelled(query["operation_id"])
+    if coordinator._preparing != query["operation_id"]:
+        raise _error("SUPPLY_OPERATION_STALE", "Runtime budget no longer belongs to the entering model operation")
+    coordinator._check_receivers(query["operation_id"])
+    if coordinator._operations[query["operation_id"]].get("plan") != query["plan"]:
+        raise _error("SUPPLY_OPERATION_STALE", "Supplied assignment changed during runtime admission")
+    for node_id, identity in query["connections"].items():
+        if _connection(coordinator, node_id) != identity:
+            raise _error("SUPPLY_RUNTIME_CONNECTION_CHANGED", f"Worker {node_id} changed registration during runtime admission")
+    if check_age and time.monotonic() - query["started_monotonic"] > MAX_BUDGET_AGE_SECONDS:
+        raise _error("SUPPLY_RUNTIME_BUDGET_EXPIRED", "Runtime budget expired before model admission")
+
+
+def _assignment_capability_matches(capabilities, assignment, query):
+    """Bind a received hello/projection to the supplied segment, never its alias."""
+    node_id, engine = assignment["node_id"], assignment["engine"]
+    layer_range = [assignment["start_layer"], assignment["end_layer"]]
+    expected_sha = query["artifacts"][node_id]
+    artifacts = capabilities.get("layer_artifacts") or []
+    models = capabilities.get("models") or []
+    if layer_range not in (capabilities.get("layer_ranges") or []):
+        return False
+    for artifact in artifacts:
+        if (artifact.get("layer_range") != layer_range
+                or artifact.get("artifact_sha256") != expected_sha
+                or artifact.get("source_model_sha256") != query["source_model_sha256"]
+                or artifact.get("tokenizer_sha256") != query["tokenizer_sha256"]):
+            continue
+        if any(model.get("model_id") == artifact.get("model_id")
+               and model.get("sha256") == expected_sha and model.get("engine") == engine
+               and model.get("format") == ("gguf" if engine == "llama_cpp" else "safetensors")
+               for model in models):
+            return True
+    return False
+
+
+def _supplied_capabilities_ready(coordinator, query):
+    control = coordinator.scheduler._task_worker_control
+    return all(_assignment_capability_matches(
+        control.worker_snapshot(a["node_id"]).get("capabilities") or {}, a, query)
+        for a in query["plan"]["assignments"] if a["node_id"] != "master")
+
+
+def handle_capacity_inventory(coordinator, node_id, payload):
+    """Called under the coordinator condition; consume only a pending query id."""
+    query_id = payload.get("operation_id")
+    if not isinstance(query_id, str):
+        return False
+    query = coordinator._capacity_queries.get(query_id)
+    if query is None:
+        return False
+    if (payload.get("action") != "inventory_result" or payload.get("node_id") != node_id
+            or node_id not in query["connections"]):
+        return True
+    try:
+        _validate(coordinator, query)
+    except Exception:
+        # Wake the waiter so it reports the authoritative cancellation/epoch
+        # error. A stale packet must not replace a current budget.
+        coordinator._condition.notify_all()
+        return True
+    query["replies"].setdefault(node_id, deepcopy(payload))
+    query["received_at"].setdefault(node_id, time.time())
+    coordinator._condition.notify_all()
+    return True
+
+
+class SupplyCapacityEvidence:
+    """One immutable inventory snapshot, validated again at the solve boundary."""
+    def __init__(self, coordinator, query, inventories):
+        self._coordinator = coordinator
+        self._query = deepcopy(query)
+        self._inventories = deepcopy(inventories)
+
+    def project(self, records):
+        c, query = self._coordinator, self._query
+        with c._condition:
+            _validate(c, query)
+            # A selection change must not reuse a budget for another manifest.
+            operation = c._operations[query["operation_id"]]
+            if not _supplied_capabilities_ready(c, query):
+                raise _error("SUPPLY_RUNTIME_CAPABILITY_CHANGED", "Worker segment capabilities changed before runtime admission")
+        by_id = {record["node_id"]: record for record in records}
+        result, provenance = [], []
+        for assignment in query["plan"]["assignments"]:
+            node_id, engine = assignment["node_id"], assignment["engine"]
+            if node_id not in by_id:
+                raise _error("SUPPLY_RUNTIME_NODE_UNAVAILABLE", f"Selected node {node_id} is no longer eligible")
+            if node_id != "master" and not _assignment_capability_matches(by_id[node_id], assignment, query):
+                raise _error("SUPPLY_RUNTIME_CAPABILITY_CHANGED", "Worker capacity projection does not match the supplied segment")
+            inventory = self._inventories[node_id]
+            engines = inventory.get("engines")
+            if (inventory.get("distributed") is not True or not isinstance(engines, list)
+                    or engine not in engines):
+                raise _error("SUPPLY_RUNTIME_ENGINE_UNAVAILABLE", f"Selected runtime on {node_id} is no longer available")
+            available, device = inventory.get("memory_available_bytes"), "cpu"
+            if engine == "pytorch":
+                runtime = inventory.get("pytorch_runtime")
+                if (not isinstance(runtime, dict) or runtime.get("execution_device") not in {"cpu", "cuda"}
+                        or type(runtime.get("target_element_size")) is not int
+                        or runtime["target_element_size"] not in {2, 4}):
+                    raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no current budget")
+                available, device = runtime.get("available_bytes"), runtime["execution_device"]
+            if type(available) is not int or available <= 0:
+                raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no positive free-memory sample")
+            source = "inventory.cuda.mem_get_info" if device == "cuda" else "inventory.ram.available_bytes_live"
+            record = {**deepcopy(by_id[node_id]), "capacity_bytes": available,
+                      "capacity_source": source, "execution_device": device,
+                      "runtime_multiplier": 1.0 if device == "cuda" else 2.0, "engine": engine}
+            # Preserve advertised ranges/artifact contracts and the configured
+            # reserve. Only the selected runtime's memory authority changes.
+            result.append(record)
+            item = {"node_id": node_id, "engine": engine, "execution_device": device,
+                    "capacity_bytes": available, "capacity_source": source,
+                    "requested_at": query["requested_at"], "received_at": query["received_at"][node_id],
+                    "registration_epoch": query["connections"].get(node_id, (None, None))[1],
+                    "operation_id": query["operation_id"], "query_id": query["query_id"],
+                    "layer_range": [assignment["start_layer"], assignment["end_layer"]],
+                    "artifact_sha256": operation["nodes"][node_id].get("artifact_sha256", "")}
+            provenance.append(item)
+            logger.info("event=pipeline_runtime_budget operation=%s query=%s node=%s engine=%s device=%s capacity_bytes=%s capacity_source=%s reserve_bytes=%s multiplier=%s registration_epoch=%s layer_ranges=%s",
+                        query["operation_id"], query["query_id"], node_id, engine, device, available, source,
+                        record.get("reserve_bytes"), record["runtime_multiplier"], item["registration_epoch"], record.get("layer_ranges"))
+        return result, provenance
+
+
+def prepare_capacity_evidence(coordinator, operation_id):
+    """Refresh each selected worker; old replies cannot satisfy this new query."""
+    c = coordinator
+    with c._condition:
+        c.ensure_prepare_not_cancelled(operation_id)
+        if c._preparing != operation_id:
+            raise _error("SUPPLY_PREPARE_REQUIRED", "Runtime budget refresh requires the selected prepare owner")
+        operation = c.get(operation_id)
+        plan = deepcopy(operation["plan"])
+        if operation["status"] != "available" or not isinstance(plan, dict) or not plan.get("assignments"):
+            raise _error("SUPPLY_ASSETS_NOT_AVAILABLE", "Runtime admission requires supplied assignments")
+        worker_ids = [a["node_id"] for a in plan["assignments"] if a["node_id"] != "master"]
+        if not worker_ids:
+            raise _error("SUPPLY_WORKERS_UNAVAILABLE", "Distributed admission requires supplied workers")
+        query_id = "supply_" + uuid.uuid4().hex
+        query = {"operation_id": operation_id, "query_id": query_id, "plan": plan,
+                 "connections": {node: _connection(c, node) for node in worker_ids},
+                 "replies": {}, "received_at": {}, "started_monotonic": time.monotonic(),
+                 "requested_at": time.time(),
+                 "source_model_sha256": operation.get("source_model_sha256"),
+                 "tokenizer_sha256": operation.get("tokenizer_sha256"),
+                 "artifacts": {a["node_id"]: operation["nodes"][a["node_id"]]["artifact_sha256"]
+                               for a in plan["assignments"]}}
+        c._capacity_queries[query_id] = query
+    try:
+        from transport_port import MessageType
+        with c._condition:
+            # Registration publishes available before its asynchronous hello
+            # refresh necessarily reaches the coordinator. Wait for this exact
+            # segment without holding the condition or accepting old ranges.
+            handshake_deadline = time.monotonic() + MAX_BUDGET_AGE_SECONDS
+            while True:
+                _validate(c, query, check_age=False)
+                remaining = handshake_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _error("SUPPLY_RUNTIME_CAPABILITY_TIMEOUT", "Worker did not advertise the supplied segment before runtime admission")
+                if _supplied_capabilities_ready(c, query):
+                    break
+                c._condition.wait(min(remaining, 0.25))
+            query["started_monotonic"], query["requested_at"] = time.monotonic(), time.time()
+            _validate(c, query)
+            for node in worker_ids:
+                try:
+                    sent = c.scheduler._tcp_server.send_to_client(node, {
+                        "action": "inventory", "operation_id": query_id,
+                        "model_id": "", "source_model_sha256": "",
+                    }, MessageType.MODEL_SUPPLY)
+                except OSError as exc:
+                    raise _error("SUPPLY_RUNTIME_WORKER_UNAVAILABLE", f"Worker {node} could not be queried") from exc
+                if sent is False:
+                    raise _error("SUPPLY_RUNTIME_WORKER_UNAVAILABLE", f"Worker {node} could not be queried")
+        # An empty selection queries resources without hashing model sources.
+        # Existing PC/Android inventory handlers already support this request.
+        # The local inventory uses the identical runtime sampling path.
+        local = c.scheduler._model_supply_worker.inventory(model_id="")
+        with c._condition:
+            query["received_at"]["master"] = time.time()
+            while True:
+                _validate(c, query)
+                if all(node in query["replies"] for node in worker_ids):
+                    inventories = {"master": local, **query["replies"]}
+                    return SupplyCapacityEvidence(c, query, inventories)
+                remaining = MAX_BUDGET_AGE_SECONDS - (time.monotonic() - query["started_monotonic"])
+                c._condition.wait(min(remaining, 0.25))
+    finally:
+        with c._condition:
+            c._capacity_queries.pop(query_id, None)
