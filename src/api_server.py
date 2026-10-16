@@ -36,6 +36,10 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Optional, cast
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Opt-in evidence must capture bytes before importing the business runtime.
+import runtime_source as _product_runtime_source
+_product_runtime_source.initialize()
+
 from release_contract import (
     FIXED_RELEASE_ENV,
     PRODUCT_VERSION,
@@ -1665,6 +1669,36 @@ class FirstConnectBootstrapRequest(BaseModel):
 # ============================================================
 # 辅助函数
 # ============================================================
+
+@app.get("/api/diagnostics/product-runtime")
+def product_runtime_observation(request: Request, nonce: str):
+    """Explicit lab observation over the existing loopback API and auth boundary."""
+    import ipaddress
+    enabled = os.environ.get("QLH_PRODUCT_OBSERVATION") == "1"
+    try:
+        address = ipaddress.ip_address(request.client.host if request.client else "")
+        local = bool(address.is_loopback or (getattr(address, "ipv4_mapped", None)
+                                            and address.ipv4_mapped.is_loopback))
+    except ValueError:
+        local = False
+    if not enabled or not local:
+        raise HTTPException(404, "Not found")
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise HTTPException(422, "Invalid observation nonce")
+    from product_runtime_receipt import capture_runtime
+    import psutil
+    process = psutil.Process(os.getpid())
+    role = "master" if scheduler._effective_role() == "master" else "pc"
+    # The helper reads the existing runtime owners with their established locks;
+    # source rehash happens separately and never constructs a model manager.
+    try:
+        runtime = capture_runtime(sys.modules[__name__])
+        source = _product_runtime_source.observe_source(role)
+    except ValueError as exc:
+        raise HTTPException(409, {"code": "PRODUCT_OBSERVATION_UNAVAILABLE", "message": str(exc)}) from exc
+    return {"nonce": nonce, "pid": process.pid, "created_at": process.create_time(),
+            "captured_at": time.time(), "runtime": runtime, "source": source, "errors": []}
+
 
 def _peek_model_manager():
     """Return an existing manager instance without warming a lazy proxy."""

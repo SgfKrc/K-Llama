@@ -30,6 +30,8 @@ import re
 import threading
 import time
 from functools import wraps
+from dataclasses import replace
+from product_runtime_receipt import LayerMaterializationProof, TensorMaterialization
 from typing import Tuple, Optional, Dict, Any, List, Union
 
 
@@ -457,6 +459,7 @@ class _LayerRangeLoadTracker:
         self.selected_prefixes = tuple(selected_prefixes)
         self.target_element_size = torch.empty((), dtype=target_dtype).element_size()
         self.loaded_keys = set()
+        self._tensor_metadata = {}
         self.loaded_layers = set()
         self.source_tensor_bytes = 0
         self.materialized_tensor_bytes = 0
@@ -483,7 +486,7 @@ class _LayerRangeLoadTracker:
     def is_selected(self, key: str) -> bool:
         return any(key.startswith(prefix) for prefix in self.selected_prefixes)
 
-    def materialize(self, handle: Any, key: str) -> torch.Tensor:
+    def materialize(self, handle: Any, key: str, source_file: str = "") -> torch.Tensor:
         # Check before get_tensor so post-load pruning cannot hide an
         # accidental full-model materialization by a future adapter.
         if not self.is_selected(key):
@@ -491,7 +494,15 @@ class _LayerRangeLoadTracker:
                 "层流水线拒绝物化未分配权重: "
                 f"architecture={self.architecture}, key={key}"
             )
+        if key in self.loaded_keys:
+            raise RuntimeError(f"duplicate tensor materialization: {key}")
         tensor = handle.get_tensor(key)
+        self._tensor_metadata[key] = TensorMaterialization(
+            name=key, shape=tuple(int(n) for n in tensor.shape),
+            element_size=int(self.target_element_size),
+            source_element_size=int(tensor.element_size()),
+            source_file=os.path.abspath(source_file) if source_file else "",
+        )
         self.loaded_keys.add(key)
         self.source_tensor_bytes += tensor.numel() * tensor.element_size()
         self.materialized_tensor_bytes += tensor.numel() * self.target_element_size
@@ -525,6 +536,16 @@ class _LayerRangeLoadTracker:
         rss_baseline = self._baseline["rss_bytes"]
         cuda_baseline = self._baseline["cuda_allocated_bytes"]
         return {
+            "materialization_proof": LayerMaterializationProof(
+                layer_range=(self.start_layer, self.end_layer),
+                decoder_prefix=self.layer_prefix,
+                tensors=tuple(self._tensor_metadata[key] for key in sorted(self._tensor_metadata)),
+                materialized_bytes=self.materialized_tensor_bytes,
+                allowed_boundary_prefixes=tuple(
+                    prefix for prefix in self.selected_prefixes
+                    if not prefix.startswith(self.layer_prefix)
+                ),
+            ),
             "mode": self.MODE,
             "architecture": self.architecture,
             "layer_range": (self.start_layer, self.end_layer),
@@ -1988,6 +2009,13 @@ class ModelManager:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         self._layer_load_metrics = load_tracker.finish()
+        descriptor = self._pipeline_descriptor or {}
+        self._layer_load_metrics["materialization_proof"] = replace(
+            self._layer_load_metrics["materialization_proof"],
+            artifact_path=os.path.abspath(path),
+            artifact_sha256=str(descriptor.get("model_sha256", "") or ""),
+            total_layers=actual_total,
+        )
         logger.info(
             "层流水线加载观测: mode=%s, tensors=%s, source_bytes=%s, "
             "materialized_bytes=%s, rss_peak_delta_bytes=%s, "
@@ -2191,7 +2219,7 @@ class ModelManager:
             shard_path = os.path.join(model_path, filename)
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
-                    tensor = load_tracker.materialize(handle, key)
+                    tensor = load_tracker.materialize(handle, key, source_file=shard_path)
                     # ★ A3：写入模型时用归一化后的「属性 key」（见 model_key_of）
                     set_module_tensor_to_device(
                         model,
@@ -2385,7 +2413,7 @@ class ModelManager:
             shard_path = os.path.join(model_path, filename)
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
-                    tensor = load_tracker.materialize(handle, key)
+                    tensor = load_tracker.materialize(handle, key, source_file=shard_path)
                     set_module_tensor_to_device(
                         model,
                         key,
@@ -4424,6 +4452,9 @@ class ModelManager:
         }
         if self._layer_load_metrics is not None:
             info["layer_load_metrics"] = dict(self._layer_load_metrics)
+            proof = info["layer_load_metrics"].get("materialization_proof")
+            if isinstance(proof, LayerMaterializationProof):
+                info["layer_load_metrics"]["materialization_proof"] = proof.as_dict()
         if self.load_fingerprint:
             info["load_fingerprint"] = self.load_fingerprint
             info["load_fingerprint_schema"] = 1
