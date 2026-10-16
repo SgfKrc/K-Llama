@@ -116,8 +116,8 @@ def check_revision(report: Report, check: str, info: dict | None, *, authenticat
     if required and revision != required:
         report.fail(check, f"artifact source_revision {revision} != required {required}", **evidence)
         return None
-    if "source_dirty" in info and info["source_dirty"] is not False:
-        report.fail(check, "artifact was built from modified or unverifiable source", **evidence)
+    if info.get("source_dirty") is not False:
+        report.fail(check, "artifact requires explicit source_dirty=false; source is modified or unverifiable", **evidence)
         return None
     report.ok(check, "source revision authenticated with artifact", source_revision=revision,
               revision_verified=True, **evidence)
