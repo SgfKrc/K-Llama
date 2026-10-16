@@ -619,6 +619,14 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   的 dispatch 前预检负责拒绝超预算请求）。两侧必须同时放行。
     if "stage_chunked_input" in capabilities:
         expected_fields.add("stage_chunked_input")
+    # ★ 票 21a（COMM-WIRE-01）：层段 hidden 的**二进制帧**接收能力（可选，默认关）。
+    #   声明 `binary_hidden == true` 的对端，才可能收到 `format:"binary"` 的帧
+    #   （见 `build_message` 的 `binary_body`）；未声明者继续走 base64 内联，
+    #   字节与旧行为一致。与其余可选键同样按「出现才允许」处理 —— 两侧
+    #   （主仓这里与 android `TaskWorkerProtocol`）必须**同时**放行，只改一边
+    #   会让对端 hello 自校验失败（`segment_mode` 那次实测的静默断连坑）。
+    if "binary_hidden" in capabilities:
+        expected_fields.add("binary_hidden")
     _require_exact_fields(
         capabilities,
         expected_fields,

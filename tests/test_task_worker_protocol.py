@@ -274,6 +274,30 @@ def test_hello_capabilities_may_advertise_layer_budget(golden):
     assert layers_error.value.code == "invalid_integer"
 
 
+def test_hello_capabilities_may_advertise_binary_hidden(golden):
+    """★ 票 21a（COMM-WIRE-01）：`binary_hidden` 是**可选**能力键（向后兼容）。
+
+    声明它表示该节点能收 `format:"binary"` 的帧（`build_message(binary_body=...)`）；
+    未声明者继续走 base64 内联 ⇒ 旧对端永不收到二进制帧。两侧键集必须对称
+    （主仓 `_validate_capabilities` 与 android `TaskWorkerProtocol`）。
+    """
+    # 1) 未声明：向后兼容，允许（旧 hello 逐字节不变）
+    decode_message(copy.deepcopy(golden["messages"][0]))
+
+    # 2) 声明 true / false 都允许（值本身不是布尔判据的落点）
+    for value in (True, False):
+        hello = copy.deepcopy(golden["messages"][0])
+        hello["payload"]["capabilities"]["binary_hidden"] = value
+        decode_message(hello)
+
+    # 3) 拼错/未知键仍必须被拒（不能因为放行新键而放松精确字段校验）
+    typo = copy.deepcopy(golden["messages"][0])
+    typo["payload"]["capabilities"]["binary_hiddne"] = True
+    with pytest.raises(WorkerProtocolError) as typo_error:
+        decode_message(typo)
+    assert typo_error.value.code == "invalid_fields"
+
+
 def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
     hello = copy.deepcopy(golden["messages"][0])
     capabilities = hello["payload"]["capabilities"]
