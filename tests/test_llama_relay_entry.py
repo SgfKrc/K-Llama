@@ -216,6 +216,42 @@ class TestNotLoaded:
         }), encoding="utf-8")
         assert engine._find_layer_artifact(0, 4) == ""
 
+    @pytest.mark.parametrize("legacy_exists", [False, True])
+    def test_supplied_segment_is_authoritative_over_legacy_artifact_directory(
+        self, monkeypatch, tmp_path, legacy_exists,
+    ):
+        from llama_engine import LlamaCppEngine
+        import model_supply_worker
+
+        selected_dir = tmp_path / "supply"
+        selected_dir.mkdir()
+        head = selected_dir / "segment.gguf"
+        head.write_bytes(b"newly-built-head-twelve")
+        source_sha = hashlib.sha256(b"unloaded-source").hexdigest()
+        info = {
+            "source_layer_range": [0, 12],
+            "source_model_sha256": source_sha,
+            "artifact_sha256": hashlib.sha256(head.read_bytes()).hexdigest(),
+        }
+        manifest = head.with_suffix(".manifest.json")
+        manifest.write_text(json.dumps(info), encoding="utf-8")
+        legacy = tmp_path / "legacy"
+        if legacy_exists:
+            legacy.mkdir()
+        monkeypatch.setenv("QLH_LAYER_ARTIFACT_DIR", str(legacy))
+        monkeypatch.setattr(model_supply_worker, "selected_gguf_path", lambda: str(head))
+        engine = LlamaCppEngine()
+        engine._model_path = str(head)
+        engine._pipeline_descriptor = {
+            "model_path": str(head), "source_model_sha256": source_sha,
+        }
+        assert engine._find_layer_artifact(0, 12) == str(head)
+        assert engine._find_layer_artifact(0, 4) == ""
+        # A selected receipt still needs its precise range/source/payload proof.
+        info["artifact_sha256"] = "f" * 64
+        manifest.write_text(json.dumps(info), encoding="utf-8")
+        assert engine._find_layer_artifact(0, 12) == ""
+
     def test_layer_artifact_selection_rejects_digest_mismatch(
         self, monkeypatch, tmp_path,
     ):

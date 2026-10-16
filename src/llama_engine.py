@@ -728,12 +728,23 @@ class LlamaCppEngine:
         from pathlib import Path as _Path
         from relay_segment_info import read_artifact_manifest
 
-        configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
-        directory = (
-            _Path(configured)
-            if configured
-            else _Path(str(getattr(self, "_model_path", "") or "")).parent
-        )
+        from model_supply_worker import selected_gguf_path
+
+        supplied = selected_gguf_path()
+        if supplied:
+            # The verified supply registration owns this segment. A leftover
+            # legacy directory must not veto it before its manifest is checked.
+            supplied_path = _Path(supplied)
+            directory = supplied_path.parent
+            candidates = [supplied_path.with_suffix(".manifest.json")]
+        else:
+            configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
+            directory = (
+                _Path(configured)
+                if configured
+                else _Path(str(getattr(self, "_model_path", "") or "")).parent
+            )
+            candidates = sorted(directory.glob("*.manifest.json"))
         if not directory.is_dir():
             return ""
         descriptor = dict(getattr(self, "_pipeline_descriptor", None) or {})
@@ -756,13 +767,6 @@ class LlamaCppEngine:
             raise RuntimeError("无法确定预切 GGUF 的源整模摘要，拒绝按层区间猜测工件")
 
         wanted = [int(start), int(end)]
-        from model_supply_worker import selected_gguf_path
-        supplied = selected_gguf_path()
-        candidates = sorted(directory.glob("*.manifest.json"))
-        if supplied:
-            supplied_path = _Path(supplied)
-            candidates = [supplied_path.with_suffix(".manifest.json")]
-            directory = supplied_path.parent
         matches: list[str] = []
         for manifest in candidates:
             info = read_artifact_manifest(manifest)
