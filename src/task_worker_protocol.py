@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -1478,6 +1479,93 @@ def hidden_wire_bytes(
         )
     raw_bytes = tokens * embd * HIDDEN_DTYPE_BYTES[dtype]
     return _base64_wire_length(raw_bytes)
+
+
+#: ★ 票 21a（COMM-WIRE-01）：内联 hidden 在消息里的**唯一**两个落点，按消息类型推导。
+#: 因此二进制体**不需要任何新协议字段** —— raw 的位置由「帧 `format:"binary"` + 消息
+#: 类型」共同确定，逐位完整性仍由既有的 `hidden_sha256` / `hidden_out_sha256` 承担。
+BINARY_HIDDEN_PATHS = {
+    "stage_offer": ("root_input", "hidden_f32"),
+    "stage_result": ("output", "hidden_out_f32"),
+}
+
+
+def inline_hidden_path(message_type: str) -> "tuple[str, str] | None":
+    """该消息类型里内联 hidden 的 `(容器键, 字段名)`；不承载内联 hidden 则 `None`。"""
+    return BINARY_HIDDEN_PATHS.get(str(message_type))
+
+
+def split_inline_hidden(
+    message: Mapping[str, Any], *, enabled: bool,
+) -> "tuple[dict[str, Any], bytes | None]":
+    """★ 票 21a：把内联 base64 hidden 抽成**帧的二进制体**（能力位开启时）。
+
+    返回 `(snapshot, raw)`：
+
+    * `enabled` 为假、该消息类型不承载内联 hidden、值是 `hidden_ref`（已走分片）、
+      或值不是合法 base64 ⇒ `raw is None` 且结果与输入**逐字段相同**
+      （零行为变化：旧路径的帧字节完全不变）；
+    * 否则 `raw` = `base64.b64decode(hidden_f32)` 的原始字节，并把该字段从 JSON 里
+      **删除** —— 同一份数据不能同帧两份，否则体积比 base64 还大。
+    """
+    snapshot = {key: value for key, value in message.items()}
+    if not enabled:
+        return snapshot, None
+    path = inline_hidden_path(snapshot.get("message_type", ""))
+    if path is None:
+        return snapshot, None
+    container_key, field_key = path
+    payload = snapshot.get("payload")
+    if not isinstance(payload, Mapping):
+        return snapshot, None
+    container = payload.get(container_key)
+    if not isinstance(container, Mapping):
+        return snapshot, None
+    encoded = container.get(field_key)
+    if not isinstance(encoded, str):
+        # `hidden_ref`（已分片）或缺失 —— 分片路径尚未接二进制，原样保留。
+        return snapshot, None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:  # noqa: BLE001 - 非法 base64 交给既有协议校验报错
+        return snapshot, None
+    if not raw:
+        return snapshot, None
+    new_container = {key: value for key, value in container.items()}
+    new_container.pop(field_key, None)
+    new_payload = {key: value for key, value in payload.items()}
+    new_payload[container_key] = new_container
+    snapshot["payload"] = new_payload
+    return snapshot, raw
+
+
+def restore_inline_hidden(
+    message: Mapping[str, Any], raw: bytes | None,
+) -> dict[str, Any]:
+    """★ 票 21a：把帧的二进制体放回 JSON 内联 hidden（`split_inline_hidden` 的逆）。
+
+    位置同样按消息类型推导；`raw` 为 `None` 时结果与输入逐字段相同（零行为变化）。
+    放回的是 base64 字符串 ⇒ **下游代码完全不必知道二进制路径存在**。
+    """
+    snapshot = {key: value for key, value in message.items()}
+    if raw is None:
+        return snapshot
+    path = inline_hidden_path(snapshot.get("message_type", ""))
+    if path is None:
+        return snapshot
+    container_key, field_key = path
+    payload = snapshot.get("payload")
+    if not isinstance(payload, Mapping):
+        return snapshot
+    container = payload.get(container_key)
+    if not isinstance(container, Mapping):
+        return snapshot
+    new_container = {key: value for key, value in container.items()}
+    new_container[field_key] = base64.b64encode(raw).decode("ascii")
+    new_payload = {key: value for key, value in payload.items()}
+    new_payload[container_key] = new_container
+    snapshot["payload"] = new_payload
+    return snapshot
 
 
 def stage_payload_budget_bytes(

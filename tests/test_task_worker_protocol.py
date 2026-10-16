@@ -16,6 +16,8 @@ from task_worker_protocol import (
     canonical_message_bytes,
     decode_message,
     negotiate_protocol_version,
+    restore_inline_hidden,
+    split_inline_hidden,
     worker_protocol_status,
 )
 
@@ -680,3 +682,77 @@ def test_stage_cancel_does_not_accept_execution_state():
         )
     assert captured.value.code == "invalid_fields"
     assert captured.value.field == "payload"
+
+
+def test_split_and_restore_inline_hidden_are_bit_identical():
+    """★ 票 21a（COMM-WIRE-01）：二进制抽取/放回**逐位无损**，且关能力位零行为变化。"""
+    import base64 as _base64
+
+    hidden = bytes(range(32))
+    encoded = _base64.b64encode(hidden).decode("ascii")
+    offer = {
+        "message_type": "stage_offer",
+        "payload": {
+            "root_input": {"hidden_f32": encoded, "other": 1},
+            "input_sha256": "x",
+        },
+    }
+
+    # 1) 关能力位 ⇒ 逐字段相同、不抽体（旧路径字节不变）
+    same, raw = split_inline_hidden(offer, enabled=False)
+    assert raw is None
+    assert same == offer
+
+    # 2) 开能力位 ⇒ 抽出原始字节，并从 JSON 里删掉该字段（避免同帧两份）
+    split, raw = split_inline_hidden(offer, enabled=True)
+    assert raw == hidden
+    assert "hidden_f32" not in split["payload"]["root_input"]
+    assert split["payload"]["root_input"]["other"] == 1
+    assert split["payload"]["input_sha256"] == "x"
+
+    # 3) 放回 ⇒ 与原消息逐字段相同（下游不必知道二进制路径存在）
+    assert restore_inline_hidden(split, raw) == offer
+    # 4) 未带体 ⇒ 逐字段相同
+    assert restore_inline_hidden(split, None) == split
+
+    # 5) 回程位置（stage_result.output.hidden_out_f32）同理
+    result = {
+        "message_type": "stage_result",
+        "payload": {"output": {"hidden_out_f32": encoded}, "attempt_id": "a"},
+    }
+    r_split, r_raw = split_inline_hidden(result, enabled=True)
+    assert r_raw == hidden
+    assert "hidden_out_f32" not in r_split["payload"]["output"]
+    assert restore_inline_hidden(r_split, r_raw) == result
+
+
+def test_split_inline_hidden_leaves_ref_bad_base64_and_other_types_untouched():
+    """已分片（`hidden_ref`）、非法 base64、不承载内联 hidden 的类型都原样返回。"""
+    # hidden_ref —— 分片路径尚未接二进制，原样保留
+    chunked = {
+        "message_type": "stage_offer",
+        "payload": {
+            "root_input": {"hidden_ref": {"total_bytes": 4, "payload_sha256": "x"}},
+        },
+    }
+    same, raw = split_inline_hidden(chunked, enabled=True)
+    assert raw is None
+    assert same == chunked
+
+    # 非法 base64 —— 交给既有协议校验报错，helper 不改写
+    bad = {
+        "message_type": "stage_offer",
+        "payload": {"root_input": {"hidden_f32": "not base64!!"}},
+    }
+    same, raw = split_inline_hidden(bad, enabled=True)
+    assert raw is None
+    assert same == bad
+
+    # 不承载内联 hidden 的消息类型
+    hello = {
+        "message_type": "hello",
+        "payload": {"root_input": {"hidden_f32": "AAAA"}},
+    }
+    same, raw = split_inline_hidden(hello, enabled=True)
+    assert raw is None
+    assert same == hello
