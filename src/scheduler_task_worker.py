@@ -35,6 +35,8 @@ from task_worker_protocol import (
     canonical_message_bytes as task_worker_message_bytes,
     canonical_sha256 as task_worker_sha256,
     decode_message as decode_task_worker_message,
+    restore_inline_hidden as restore_task_worker_hidden,
+    split_inline_hidden as split_task_worker_hidden,
     worker_protocol_status,
 )
 from torch_runtime import torch_available
@@ -713,6 +715,15 @@ class SchedulerTaskWorkerMixin:
             #   （实测 `route_a_stage_frame_too_large:…:wire=24160940:budget=8126464`）。
             #   非层段 worker 不接收 hidden，故按 `layer_worker` 保守声明。
             "stage_chunked_input": bool(layer_worker),
+            # ★ 票 21a（COMM-WIRE-01）：声明**能收发二进制 hidden 帧**
+            #   （`tcp_comm.build_message(binary_body=...)`，见 `split_inline_hidden`）。
+            #   声明后本节点与主节点之间的层段 hidden 走 raw 字节：省掉 base64 的 33%
+            #   膨胀与编解码，并顺带让单帧容量 +33%（预算判据按 base64 后体积算）。
+            #   未声明者（含所有旧对端与 Android）继续走 base64 内联，字节与旧行为
+            #   一致 —— 主节点只在看到该键时才使用二进制帧，故关掉即天然回退。
+            #   与 `stage_chunked_input` 同样按 `layer_worker` 保守声明：非层段 worker
+            #   不承载 hidden。
+            "binary_hidden": bool(layer_worker),
             "relay_middle": bool(
                 layer_worker
                 and active_layer_config
@@ -897,8 +908,32 @@ class SchedulerTaskWorkerMixin:
             if epoch is None:
                 raise ConnectionError("task worker registration is no longer current")
             send_options["registration_epoch"] = epoch
+        # ★ 票 21a（COMM-WIRE-01）：对端声明 `binary_hidden` 时，把内联 hidden 抽成
+        #   帧的二进制体（省 base64 的 33% 膨胀与编解码开销）；未声明者逐字段走旧
+        #   路径、字节不变。能力位来自该 worker 的 hello 自荐。
+        peer_capabilities = (
+            self._task_worker_control.worker_snapshot(node_id).get("capabilities") or {}
+        )
+        binary_enabled = (
+            isinstance(peer_capabilities, dict)
+            and peer_capabilities.get("binary_hidden") is True
+        )
+        body_message, binary_body = split_task_worker_hidden(
+            message.snapshot(), enabled=binary_enabled,
+        )
+        if binary_body is not None:
+            logger.debug(
+                "event=task_worker_binary_hidden_sent node_id=%s message_type=%s bytes=%d",
+                node_id, body_message.get("message_type"), len(binary_body),
+            )
+        # ★ 票 21a：无二进制体时**连调用形状都不变**（不传 `binary_body`）——
+        #   否则既有 send_to_client 的替身/包装会因多一个关键字参数而失败
+        #   （实测：三处测试替身报 unexpected keyword argument）。
+        send_kwargs = dict(send_options)
+        if binary_body is not None:
+            send_kwargs["binary_body"] = binary_body
         sent = server.send_to_client(
-            node_id, message.snapshot(), MessageType.TASK_WORKER, **send_options,
+            node_id, body_message, MessageType.TASK_WORKER, **send_kwargs,
         )
         if sent is False:
             raise ConnectionError("task worker message was not delivered")
@@ -1800,6 +1835,18 @@ class SchedulerTaskWorkerMixin:
                 client_id,
             )
             return
+        # ★ 票 21a（COMM-WIRE-01）：帧的二进制体**必须在 decode 之前**放回内联 hidden。
+        #   精确字段校验会以 `invalid_fields` 拒绝顶层未知键 ⇒ `binary` 段绝不能随消息
+        #   进 `decode_message`。放回的是 base64 字符串，因此其后所有既有代码
+        #   （含 `_handle_task_worker_stage_offer`）都不必知道二进制路径存在。
+        binary_body = msg.get("binary")
+        if isinstance(binary_body, (bytes, bytearray)):
+            raw = restore_task_worker_hidden(raw, bytes(binary_body))
+            logger.debug(
+                "event=task_worker_binary_hidden_received peer=%s "
+                "message_type=%s bytes=%d",
+                client_id, raw.get("message_type"), len(binary_body),
+            )
         try:
             message = decode_task_worker_message(raw)
             if self._effective_role() == "master":
