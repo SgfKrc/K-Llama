@@ -1456,13 +1456,24 @@ def _base64_wire_length(raw_bytes: int) -> int:
     return 4 * (-(-count // 3))
 
 
-def hidden_wire_bytes(
-    n_tokens: int, n_embd: int, dtype: str = "float32",
-) -> int:
-    """层段 hidden 在 JSON 帧里占用的字节数（raw + base64 膨胀）。
+#: ★ 票 21a（COMM-WIRE-01）：二进制体的长度头字节数（`tcp_comm.pack_data` 的
+#: 4 字节大端长度前缀）。二进制帧 = `[meta 长度][meta JSON]` + `[本长度][raw 字节]`。
+_BINARY_BODY_HEADER_BYTES = 4
 
-    ★ 2026-10-07（DIST-NEXT-2）：dispatch 前的**唯一** wire 大小来源。协议两侧
+
+def hidden_wire_bytes(
+    n_tokens: int, n_embd: int, dtype: str = "float32", *,
+    binary: bool = False,
+) -> int:
+    """层段 hidden 在帧里占用的字节数。
+
+    默认（`binary=False`）按 **JSON + base64** 计（raw 的 `4×ceil(n/3)`）；协议两侧
     （主仓 Python 与 `android` 的 `TaskWorkerProtocol`）用同一公式与同一余量常量。
+
+    ★ 票 21a（COMM-WIRE-01）：`binary=True` 表示该帧走 `format:"binary"` 的**原始
+    字节体** ⇒ 只有 `raw` 加一个 4 字节长度头，省掉 33% 膨胀（同样预算下单帧容量
+    +≈33%）。**只有对端声明了 `binary_hidden` 才能传 True** —— 否则实际发出的仍是
+    base64 帧，会以 `message_too_large` 失败。
     """
     if dtype not in HIDDEN_DTYPE_BYTES:
         raise _error(
@@ -1478,6 +1489,8 @@ def hidden_wire_bytes(
             "hidden_spec.n_tokens/n_embd must be positive",
         )
     raw_bytes = tokens * embd * HIDDEN_DTYPE_BYTES[dtype]
+    if binary:
+        return raw_bytes + _BINARY_BODY_HEADER_BYTES
     return _base64_wire_length(raw_bytes)
 
 
@@ -1624,11 +1637,17 @@ def hidden_fits_stage_frame(
     dtype: str = "float32",
     *,
     max_message_bytes: int = MAX_MESSAGE_BYTES,
+    binary: bool = False,
 ) -> bool:
-    """该 hidden 能否装进单帧（不装得下就必须在 dispatch 前拒绝）。"""
-    return hidden_wire_bytes(n_tokens, n_embd, dtype) <= stage_payload_budget_bytes(
-        max_message_bytes=max_message_bytes,
-    )
+    """该 hidden 能否装进单帧（不装得下就必须在 dispatch 前拒绝）。
+
+    `binary=True` 表示该帧会走 `format:"binary"` 的原始字节体 ⇒ 同样预算能多装
+    ≈33%（去 base64 膨胀）。**调用方必须先确认对端确实声明了 `binary_hidden`**，
+    否则判据与实际发帧方式不一致，帧会在发送时以 `message_too_large` 失败。
+    """
+    return hidden_wire_bytes(
+        n_tokens, n_embd, dtype, binary=binary,
+    ) <= stage_payload_budget_bytes(max_message_bytes=max_message_bytes)
 
 
 def max_hidden_tokens(
@@ -1636,6 +1655,7 @@ def max_hidden_tokens(
     dtype: str = "float32",
     *,
     max_message_bytes: int = MAX_MESSAGE_BYTES,
+    binary: bool = False,
 ) -> int:
     """给定额度下每帧可承载的最大 token 数（诊断与日志用）。"""
     if dtype not in HIDDEN_DTYPE_BYTES:
@@ -1650,7 +1670,12 @@ def max_hidden_tokens(
             "invalid_hidden_spec", "hidden_spec.n_embd",
             "hidden_spec.n_embd must be positive",
         )
-    per_token = embd * HIDDEN_DTYPE_BYTES[dtype] * _BASE64_EXPANSION
+    per_token_raw = embd * HIDDEN_DTYPE_BYTES[dtype]
+    per_token = (
+        per_token_raw + _BINARY_BODY_HEADER_BYTES
+        if binary
+        else per_token_raw * _BASE64_EXPANSION
+    )
     return int(stage_payload_budget_bytes(
         max_message_bytes=max_message_bytes,
     ) // per_token)

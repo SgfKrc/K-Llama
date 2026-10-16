@@ -964,6 +964,17 @@ class RemoteFullWorkerProvider:
             return False
         return capabilities.get("stage_chunked_input") is True
 
+    def _supports_binary_hidden(self) -> bool:
+        """★ 票 21a（COMM-WIRE-01）：对端是否声明能收 `format:"binary"` 的帧（默认否）。
+
+        对端自荐 ⇒ 帧体走原始字节，单帧容量 +≈33%（判据见 `hidden_fits_stage_frame`
+        的 `binary` 参数）。未声明者继续走 base64 / 分片，行为不变。
+        """
+        capabilities = (self._snapshot() or {}).get("capabilities")
+        if not isinstance(capabilities, dict):
+            return False
+        return capabilities.get("binary_hidden") is True
+
     def _maybe_send_stage_chunks(self, attempt: StageAttempt) -> dict[str, Any]:
         """★ 2026-10-07（DIST-NEXT-2b）：超预算的层段 hidden 先分片发出，返回改写后的 root_input。
 
@@ -986,6 +997,14 @@ class RemoteFullWorkerProvider:
         if n_tokens < 1 or n_embd < 1:
             return root_input
         if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+            return root_input
+        # ★ 票 21a（COMM-WIRE-01）：base64 判不下、但走二进制体就装得下 ⇒ 不必分片
+        #   （单帧容量 +≈33%）。判据必须与发送侧一致：`_send_task_worker_to_node` 只在
+        #   同一个 `binary_hidden` 能力下才抽体，否则这里会"以为能内联"却发出超限的
+        #   base64 帧。
+        if self._supports_binary_hidden() and hidden_fits_stage_frame(
+            n_tokens, n_embd, dtype, binary=True,
+        ):
             return root_input
         if not self._supports_stage_chunked_input():
             # 对端不支持 ⇒ 维持内联路径（超限由 dispatch 前的预检负责拒绝）。

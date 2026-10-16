@@ -756,3 +756,36 @@ def test_split_inline_hidden_leaves_ref_bad_base64_and_other_types_untouched():
     same, raw = split_inline_hidden(hello, enabled=True)
     assert raw is None
     assert same == hello
+
+
+def test_binary_budget_trades_base64_expansion_for_a_header():
+    """★ 票 21a：二进制帧的 wire = raw + 4 字节头；默认（base64）行为逐值不变。"""
+    import task_worker_protocol as proto
+
+    n_embd = 4096  # 与 qwen3-5-9b 的 hidden 同量级
+    budget = proto.stage_payload_budget_bytes()
+
+    # 1) 二进制 wire 恰好是 raw + 4；base64 仍是 4×ceil(n/3)
+    for n_tokens in (1, 4):
+        raw = n_tokens * n_embd * 4
+        assert proto.hidden_wire_bytes(n_tokens, n_embd, "float32") == 4 * (-(-raw // 3))
+        assert proto.hidden_wire_bytes(n_tokens, n_embd, "float32", binary=True) == raw + 4
+
+    # 2) 默认参数与旧行为逐值一致（零回归）
+    assert proto.hidden_fits_stage_frame(1, n_embd, "float32") == (
+        proto.hidden_wire_bytes(1, n_embd, "float32") <= budget
+    )
+    assert proto.max_hidden_tokens(n_embd, "float32") == int(
+        budget / (n_embd * 4 * proto._BASE64_EXPANSION)
+    )
+
+    # 3) 二进制下每帧能多装 ≈33%（容量比 = 4/3，扣掉 4 字节头后略低）
+    base64_tokens = proto.max_hidden_tokens(n_embd, "float32")
+    binary_tokens = proto.max_hidden_tokens(n_embd, "float32", binary=True)
+    assert binary_tokens > base64_tokens
+    assert 1.30 <= binary_tokens / base64_tokens <= 1.34
+
+    # 4) 存在「base64 判不下、二进制判得下」的区间 —— 这正是本次放宽的收益区
+    edge = base64_tokens + 1
+    assert not proto.hidden_fits_stage_frame(edge, n_embd, "float32")
+    assert proto.hidden_fits_stage_frame(edge, n_embd, "float32", binary=True)
