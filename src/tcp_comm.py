@@ -2157,6 +2157,9 @@ class TCPClient:
         self._registration_epoch = 0
         self._registered = False
         self.last_register_error: str = ""
+        # 注册确认等待期间，本代连接可能被别的线程（上一代心跳/接收的收尾，或显式
+        # disconnect()）关闭或置换。那种情况这一代已经作废，不是一次注册失败。
+        self._last_registration_interrupted = False
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
         self._last_heartbeat_ack_send: float = 0.0
@@ -2366,6 +2369,7 @@ class TCPClient:
                 with self._disconnect_callback_lock:
                     self._registered = False
                 self.last_register_error = ""
+                self._last_registration_interrupted = False
 
             # 所有可能较慢的注册准备必须在建立 TCP 连接前完成。首次模型
             # 摘要和 Windows 网络检测都可能超过服务端的注册等待超时。
@@ -2443,30 +2447,59 @@ class TCPClient:
                         "model_sha256": model_sha256,
                         "auth": build_auth_signature(self.client_id),
                     }
+                    # 本代连接自证：等待注册确认期间，self.sock 可能被别的线程置换
+                    # 或关闭（disconnect()／上一代传输收尾）。必须能识别「这一代已作废」，
+                    # 而不是当成一次注册失败 —— 否则一次正常断线会被放大成
+                    # worker_reconnect_exhausted（2026-10-16 ROG 实测 WinError 10038）。
+                    with self._disconnect_callback_lock:
+                        register_sock = self.sock
+                        register_generation = self._connection_generation
                     self.send_data(reg_data, MessageType.REGISTER)
 
                     # 等待注册确认
                     register_reason = "未收到注册确认"
                     registered = False
-                    try:
-                        ack_msg = self.recv_data()
-                        if ack_msg and ack_msg.get("type") == "register":
-                            ack_data = ack_msg.get("data", {})
-                            if ack_data.get("status") == "registered":
-                                registered = True
-                                logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
+                    registration_interrupted = False
+                    if register_sock is None or not self._running:
+                        # 连接在发送 REGISTER 前后就被置换/关闭了：不在这条已作废的
+                        # 连接上继续等待。
+                        registration_interrupted = True
+                        register_reason = "注册被中断（连接已由其他线程关闭）"
+                    else:
+                        try:
+                            ack_msg = self.recv_data()
+                            if ack_msg and ack_msg.get("type") == "register":
+                                ack_data = ack_msg.get("data", {})
+                                if ack_data.get("status") == "registered":
+                                    registered = True
+                                    logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
+                                else:
+                                    status = ack_data.get("status") or "unknown"
+                                    reason = ack_data.get("reason") or ack_data.get("message") or status
+                                    register_reason = f"注册被拒绝: {reason}"
+                            elif ack_msg:
+                                register_reason = f"注册确认类型异常: {ack_msg.get('type')}"
+                        except (socket.timeout, OSError) as e:
+                            with self._disconnect_callback_lock:
+                                displaced = (
+                                    self.sock is not register_sock
+                                    or self._connection_generation != register_generation
+                                )
+                            registration_interrupted = displaced or not self._running
+                            if registration_interrupted:
+                                register_reason = "注册被中断（连接已由其他线程关闭）"
+                                logger.info(
+                                    "注册确认等待被中断: client=%s generation=%s→%s",
+                                    self.client_id, register_generation,
+                                    self._connection_generation,
+                                )
                             else:
-                                status = ack_data.get("status") or "unknown"
-                                reason = ack_data.get("reason") or ack_data.get("message") or status
-                                register_reason = f"注册被拒绝: {reason}"
-                        elif ack_msg:
-                            register_reason = f"注册确认类型异常: {ack_msg.get('type')}"
-                    except (socket.timeout, OSError) as e:
-                        register_reason = f"注册确认等待失败: {e}"
-                        logger.warning(f"注册确认等待超时: {e}", exc_info=True)
+                                register_reason = f"注册确认等待失败: {e}"
+                                logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
                     if not registered:
                         self.last_register_error = register_reason
+                        self._last_registration_interrupted = registration_interrupted
                         # Fence worker threads before closing a failed
                         # registration socket. Otherwise an old heartbeat can
                         # write to the closed descriptor and surface WinError
@@ -2493,6 +2526,10 @@ class TCPClient:
                             self.client_id, self.server_host, self.server_port,
                             register_reason,
                         )
+                        if registration_interrupted:
+                            # 本代连接已被别的线程置换或关闭：在同一批重试里再连一次
+                            # 没有意义，交给上层按正常重连节奏安排下一次，且不计失败。
+                            return False
                         return False
 
                     # Publish REGISTER and start its loops under the intent lock.
@@ -2503,6 +2540,7 @@ class TCPClient:
                             return False
                         with self._disconnect_callback_lock:
                             self._registered = True
+                            self._last_registration_interrupted = False
                             self._registration_epoch += 1
                             self._connection_generation += 1
                             connection_generation = self._connection_generation
@@ -2945,6 +2983,18 @@ class TCPClient:
                     self.reconnect_state = "ready"
                     self.last_reconnect_error = ""
                     logger.info("重连主节点成功: client=%s intent_epoch=%s", self.client_id, epoch)
+                elif self._last_registration_interrupted:
+                    # 连接在注册等待期间被主动置换或关闭：这不是一次注册失败，
+                    # 不计入 reconnect_failure_count —— 计进去会把一次正常断线放大成
+                    # worker_reconnect_exhausted（2026-10-16 ROG 实测：failures 累到 8
+                    # 后进入每分钟一次的低频重试）。
+                    # 但这一代确实作废了，必须自己安排下一次重连：中断路径不会发布
+                    # 连接，lost_published_connection 恒为 False，不能指望那条兜底。
+                    retry = True
+                    self.reconnect_state = "backing_off"
+                    self.last_reconnect_error = "registration_interrupted"
+                    logger.info("重连未完成（注册被中断）: client=%s reason=%s",
+                                self.client_id, self.last_register_error)
                 else:
                     self.reconnect_failure_count += 1
                     retry = self.reconnect_failure_count < self.MAX_RECONNECT_FAILURES
