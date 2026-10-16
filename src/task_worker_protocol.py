@@ -1481,18 +1481,54 @@ def hidden_wire_bytes(
     return _base64_wire_length(raw_bytes)
 
 
-#: ★ 票 21a（COMM-WIRE-01）：内联 hidden 在消息里的**唯一**两个落点，按消息类型推导。
+#: ★ 票 21a（COMM-WIRE-01）：内联 hidden 在消息里的**唯一**落点，按消息类型推导。
 #: 因此二进制体**不需要任何新协议字段** —— raw 的位置由「帧 `format:"binary"` + 消息
-#: 类型」共同确定，逐位完整性仍由既有的 `hidden_sha256` / `hidden_out_sha256` 承担。
+#: 类型」共同确定，逐位完整性仍由既有的摘要字段承担（`hidden_sha256` /
+#: `hidden_out_sha256` / 分片自己的 `payload_sha256`）。
+#:
+#: 容器键为 `None` 表示**载荷就在 `payload` 顶层**（分片路径：`payload_b64` 本身就是
+#: 那一段 raw 字节的 base64）。入程 `stage_chunk` 与回程 `stage_result_chunk` 共用同一
+#: 形状，所以这里一条定义覆盖两个方向。
 BINARY_HIDDEN_PATHS = {
     "stage_offer": ("root_input", "hidden_f32"),
     "stage_result": ("output", "hidden_out_f32"),
+    "stage_chunk": (None, "payload_b64"),
+    "stage_result_chunk": (None, "payload_b64"),
 }
 
 
 def inline_hidden_path(message_type: str) -> "tuple[str, str] | None":
-    """该消息类型里内联 hidden 的 `(容器键, 字段名)`；不承载内联 hidden 则 `None`。"""
+    """该消息类型里内联 hidden 的 `(容器键, 字段名)`；不承载内联 hidden 则 `None`。
+
+    容器键为 `None` 表示载荷就在 `payload` 顶层（分片路径）。
+    """
     return BINARY_HIDDEN_PATHS.get(str(message_type))
+
+
+def _split_field(container: Mapping[str, Any], field_key: str):
+    """把 `container[field_key]`（base64 字符串）抽成 raw 字节并删除该字段。
+
+    返回 `(新容器, raw)`；不可抽（非字符串 / 非法 base64 / 空）则返回 `None`。
+    """
+    encoded = container.get(field_key)
+    if not isinstance(encoded, str):
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:  # noqa: BLE001 - 非法 base64 交给既有协议校验报错
+        return None
+    if not raw:
+        return None
+    new_container = {key: value for key, value in container.items()}
+    new_container.pop(field_key, None)
+    return new_container, raw
+
+
+def _restore_field(container: Mapping[str, Any], field_key: str, raw: bytes):
+    """`_split_field` 的逆：把 raw 以 base64 放回 `field_key`。"""
+    new_container = {key: value for key, value in container.items()}
+    new_container[field_key] = base64.b64encode(raw).decode("ascii")
+    return new_container
 
 
 def split_inline_hidden(
@@ -1518,25 +1554,24 @@ def split_inline_hidden(
     payload = snapshot.get("payload")
     if not isinstance(payload, Mapping):
         return snapshot, None
+    if container_key is None:
+        # 分片路径：载荷就在 `payload` 顶层（`payload_b64` 自身即那一段 raw）。
+        result = _split_field(payload, field_key)
+        if result is None:
+            return snapshot, None
+        snapshot["payload"] = result[0]
+        return snapshot, result[1]
     container = payload.get(container_key)
     if not isinstance(container, Mapping):
         return snapshot, None
-    encoded = container.get(field_key)
-    if not isinstance(encoded, str):
-        # `hidden_ref`（已分片）或缺失 —— 分片路径尚未接二进制，原样保留。
+    result = _split_field(container, field_key)
+    if result is None:
+        # `hidden_ref`（已分片）或缺失 ⇒ 原样保留（该路径由分片消息自己承载）。
         return snapshot, None
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except Exception:  # noqa: BLE001 - 非法 base64 交给既有协议校验报错
-        return snapshot, None
-    if not raw:
-        return snapshot, None
-    new_container = {key: value for key, value in container.items()}
-    new_container.pop(field_key, None)
     new_payload = {key: value for key, value in payload.items()}
-    new_payload[container_key] = new_container
+    new_payload[container_key] = result[0]
     snapshot["payload"] = new_payload
-    return snapshot, raw
+    return snapshot, result[1]
 
 
 def restore_inline_hidden(
@@ -1557,13 +1592,15 @@ def restore_inline_hidden(
     payload = snapshot.get("payload")
     if not isinstance(payload, Mapping):
         return snapshot
+    if container_key is None:
+        # 分片路径：载荷就在 `payload` 顶层。
+        snapshot["payload"] = _restore_field(payload, field_key, raw)
+        return snapshot
     container = payload.get(container_key)
     if not isinstance(container, Mapping):
         return snapshot
-    new_container = {key: value for key, value in container.items()}
-    new_container[field_key] = base64.b64encode(raw).decode("ascii")
     new_payload = {key: value for key, value in payload.items()}
-    new_payload[container_key] = new_container
+    new_payload[container_key] = _restore_field(container, field_key, raw)
     snapshot["payload"] = new_payload
     return snapshot
 

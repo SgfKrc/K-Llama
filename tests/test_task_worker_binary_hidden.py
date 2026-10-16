@@ -121,6 +121,40 @@ def test_unadvertised_peer_keeps_the_old_base64_frame():
     assert restore_inline_hidden(meta["data"], received) == offer
 
 
+def test_binary_hidden_chunk_roundtrip_is_bit_identical():
+    """分片：`stage_chunk` / `stage_result_chunk` 的 `payload_b64` 也走二进制。
+
+    载荷就在 `payload` 顶层，所以路径表用容器键 `None` 表示；入程与回程分片共用
+    同一形状（`build_stage_chunk` 的 `message_type` 参数），因此一条定义覆盖两个方向。
+    """
+    chunk = bytes(range(64))
+    for message_type in ("stage_chunk", "stage_result_chunk"):
+        message = {
+            "message_type": message_type,
+            "payload": {
+                "payload_b64": base64.b64encode(chunk).decode("ascii"),
+                "chunk_index": 0,
+                "chunk_count": 1,
+            },
+        }
+
+        # 抽体：字段从 JSON 删除，raw 走独立数据段
+        snapshot, body = split_inline_hidden(message, enabled=True)
+        assert body == chunk
+        assert "payload_b64" not in snapshot["payload"]
+        assert snapshot["payload"]["chunk_index"] == 0
+
+        meta, received = _recv_frame(_wire(snapshot, body))
+        assert received == chunk
+        # 还原 ⇒ 与原分片消息逐字段相同
+        assert restore_inline_hidden(meta["data"], received) == message
+
+        # 未声明 ⇒ 原样返回，帧与旧路径逐字节一致
+        same, none = split_inline_hidden(message, enabled=False)
+        assert none is None
+        assert same == message
+
+
 def test_binary_body_is_not_inlined_into_json_metadata():
     """体不进 JSON 元数据：元数据段远小于体，也不含 base64。"""
     offer = _make_offer()
