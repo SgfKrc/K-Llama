@@ -105,3 +105,22 @@ master／ROG／Y700 同时在线。用户提交 `qwen3-5-9b` 自动模型意图�
 **GitHub runner 注册、仓库签名变量／密钥是否已配置，本轮未独立查询，不能沿用原报告“runner 未注册／三项均未具备”的断言。** 最终仍需可信签名发行物、来源匹配、实际平台执行与严格证据包；不代持密钥、不用临时签名绕门。用户已允许最终发行物验收后置，本轮的 dirty／debug 运行不冒充最终门通过。
 
 下一步发行工作应围绕实际 artifact 生产上传、外部 runner／签名配置核实和最终产物执行门安排；无需再根据已经被复核推翻的 A／B 归因另立重复修复票。票 13 保持开放；重构票 14 仍按原先行为边界与独立分支裁决处理。
+
+## 6. 同 revision 三机严格 bundle：LL／DL 双档产品门 `passed=true`（2026-10-16 晚）
+
+§3 末尾留下的「收口版本未再执行三机 Textual／SSE 严格门」本轮已补齐，且三端来源同为 `b43b0a339ce899728fdb1cc024e9b649c074b5ae`（含本轮的 `tcp_comm` 注册中断修复）。
+
+| 项 | 结果 |
+| --- | --- |
+| 官方门判定 | `scripts/product_relay_gate.py --bundle … --require-revision b43b0a33…` ⇒ **`passed: true`，`errors: []`** |
+| 模式 | LL 与 DL 双档（`combine` 合并，门要求两者齐备） |
+| 节点 | `master`／`rog-5060`／`android-d83bf4d0`；三段连续 `[0,4)` → `[4,8)` → `[8,32)` |
+| 真实接力 | LL **7** 轮、DL **2** 轮 handoff；星状拓扑、`fallback=false`、required route |
+| 入口 | `Textual/SSE` 真实产品界面（Pilot 驱动），回答 2 |
+| revision 证据 | 每端 native 观测都声明 `source_revision=b43b0a33…`：master 取工作树 HEAD、ROG 取 `git archive` 同步并逐文件核对的树（197/197）、Y700 取 APK 内嵌 `build-info.json` |
+
+流程：建意图（`qwen3-5-9b`，LL 用 `llama_cpp`／DL 用 `pytorch`，`strategy=auto`）→ 等 `status=ready` 且 `loaded_ready` → **后台**起 `run_product_relay_gate.py capture --timeout 900 --observation-wait 600` → 在采集窗口内产快照 → `combine` 两档 → 官方门判定。
+
+**新增入库工具**：`scripts/build_product_snapshots.py`。门要求快照中 `raw_evidence` 是文件引用（含 SHA-256）、topology 顶层显式声明 `source=os_process_connections` 与 `complete`、native 每端给出 `source_revision`／`source=os_process_mappings`／`full_model_loaded=false`／与 plan 一致的 `engine` 与 `layer_range`，而仓库此前没有这些快照的生产者。脚本从三端真机取观测（master 本机 API + psutil；ROG 只读 runtime probe over ssh；Y700 `android_runtime_probe.py` over adb），按 mode 分目录写证（两档同目录会触发 `combine` 的 `conflicting attachment path`）。`source_dirty` 刻意不写：门把「省略」视为可接受的旧证据，显式值则必须恰为布尔 false，而三端载体本身并非 clean 发行物。
+
+**边界**：这是**开发级**证据 —— 三端载体分别是工作树、`git archive` 同步树与 debug APK，不含可信签名产物；§5 的发行门条件不变。bundle 与门结果保存在 `build/ci-release-followup2/bench-out/`（不入库）。
