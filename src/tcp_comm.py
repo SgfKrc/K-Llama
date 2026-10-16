@@ -1024,18 +1024,35 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
 # 消息构建与解析
 # ================================================================
 
-def build_message(msg_type: MessageType, data: Any = None) -> bytes:
+def build_message(msg_type: MessageType, data: Any = None,
+                  binary_body: Optional[bytes] = None) -> bytes:
     """
     构建通信消息。
 
     Args:
         msg_type: 消息类型
         data: 消息载荷（dict/str 用于JSON，torch.Tensor 用于张量）
+        binary_body: 可选二进制体（raw 字节，**不经 base64**）。与 `data` 同帧但
+            独立成段：帧 = [长度][JSON meta] + [长度][binary_body]。层段 hidden 这类
+            大块 f32 数据走此路径，省掉 base64 的 33% 膨胀与编解码开销；该帧的
+            JSON 元数据（layer_range / hidden_spec / 摘要）仍由 `data` 承载。
 
     Returns:
         封包后的字节流
     """
     meta = {"type": msg_type.value}
+
+    # ★ 票 21a（COMM-WIRE-01）：显式二进制体。与张量路径同一帧布局（元数据段 +
+    #   数据段），但不要求 torch、也不做反序列化 ⇒ Android 等无 torch 对端可解析。
+    #   未传 binary_body 时本分支不进入，逐字节与既有行为一致。
+    if binary_body is not None:
+        meta["format"] = "binary"
+        meta["binary_bytes"] = len(binary_body)
+        if data is not None:
+            meta["data"] = data
+        meta_bytes = json.dumps(meta).encode("utf-8")
+        # 组合: [meta长度(4B)] + [meta JSON] + [体长度(4B)] + [raw 字节]
+        return pack_data(meta_bytes) + pack_data(bytes(binary_body))
 
     if torch is not None and isinstance(data, torch.Tensor):
         meta["format"] = "tensor"
@@ -1060,13 +1077,18 @@ def parse_message(raw: bytes) -> dict:
         raw: 原始数据包
 
     Returns:
-        包含 type 和 data 的字典。张量消息额外包含 tensor 字段。
+        包含 type 和 data 的字典。张量消息额外包含 tensor 字段，
+        二进制消息额外包含 bytes 字段（均在后续段中，由调用方继续接收）。
     """
     meta = json.loads(raw.decode("utf-8"))
 
     if meta.get("format") == "tensor":
         # 张量数据在后续包中，由调用方继续接收
         meta["_needs_tensor"] = True
+    elif meta.get("format") == "binary":
+        # ★ 票 21a：二进制体在后续段中，由调用方继续接收（与张量同一模式，
+        #   但不做反序列化 —— 调用方拿到的是 raw 字节）。
+        meta["_needs_binary"] = True
     return meta
 
 
@@ -1521,6 +1543,21 @@ class TCPServer:
                         break
                     msg["tensor"] = deserialize_tensor(tensor_data)
                     del msg["_needs_tensor"]
+                # ★ 票 21a：二进制体（raw 字节，不做反序列化）。
+                elif msg.get("_needs_binary"):
+                    binary_header = recv_exact(conn, HEADER_LEN, mid_frame=True)
+                    if binary_header is None:
+                        break
+                    binary_len = unpack_header(binary_header)
+                    if binary_len <= 0 or binary_len > MAX_PACKET_SIZE:
+                        logger.warning(
+                            f"非法二进制包长度: {binary_len}，断开 {addr}"
+                        )
+                        break
+                    msg["binary"] = recv_exact(conn, binary_len, mid_frame=True)
+                    if msg["binary"] is None:
+                        break
+                    del msg["_needs_binary"]
 
                 msg_type = msg.get("type", "")
                 registration_pending = False
@@ -1907,7 +1944,8 @@ class TCPServer:
 
     def send_to_client(self, client_id: str, data: Any,
                        msg_type: MessageType = MessageType.TENSOR,
-                       *, registration_epoch: int | None = None) -> None:
+                       *, registration_epoch: int | None = None,
+                       binary_body: Optional[bytes] = None) -> None:
         """
         向指定从节点发送数据。
 
@@ -1915,12 +1953,13 @@ class TCPServer:
             client_id: 从节点ID（"client1" / "client2"）
             data: 发送数据（dict / torch.Tensor）
             msg_type: 消息类型
+            binary_body: 可选二进制体（raw 字节，见 `build_message`）。
         """
         conn = self._get_client(client_id)
         if conn is None:
             raise ConnectionError(f"从节点 {client_id} 未连接")
         data = _decorate_control_payload(data, msg_type, self._control_fence)
-        packet = build_message(msg_type, data)
+        packet = build_message(msg_type, data, binary_body=binary_body)
         try:
             # 心跳 ACK、控制消息和大张量会由不同线程发送，必须保持完整帧原子写入。
             with conn.send_lock:
@@ -2695,10 +2734,11 @@ class TCPClient:
                 logger.debug("客户端断连回调异常: %s", exc, exc_info=True)
 
     def send_data(self, data: Any, msg_type: MessageType = MessageType.TENSOR,
-                  connection_sock: socket.socket = None) -> None:
+                  connection_sock: socket.socket = None,
+                  binary_body: Optional[bytes] = None) -> None:
         """向主节点发送数据"""
         data = _decorate_control_payload(data, msg_type, self._control_fence)
-        packet = build_message(msg_type, data)
+        packet = build_message(msg_type, data, binary_body=binary_body)
         self._transport_runtime_call(
             "observe_legacy_send",
             packet,
@@ -2761,6 +2801,21 @@ class TCPClient:
                 return None
             msg["tensor"] = deserialize_tensor(tensor_data)
             del msg["_needs_tensor"]
+        # ★ 票 21a：二进制体在同一帧的后续段里（raw 字节，不做反序列化）。
+        elif msg.get("_needs_binary"):
+            binary_header = recv_exact(active_sock, HEADER_LEN, mid_frame=True)
+            if binary_header is None:
+                return None
+            binary_len = unpack_header(binary_header)
+            if binary_len <= 0 or binary_len > MAX_PACKET_SIZE:
+                raise ConnectionError(
+                    f"invalid binary packet length: {binary_len}"
+                )
+            binary_data = recv_exact(active_sock, binary_len, mid_frame=True)
+            if binary_data is None:
+                return None
+            msg["binary"] = binary_data
+            del msg["_needs_binary"]
 
         return msg
 

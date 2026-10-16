@@ -602,6 +602,114 @@ class TestBuildMessage:
 
 
 # ================================================================
+# ★ 票 21a（COMM-WIRE-01）：二进制帧
+# ================================================================
+
+class TestBinaryFrame:
+    """`binary_body` 路径：元数据段 + 原始字节段（不经 base64）。
+
+    旧对端不传 `binary_body` 时逐字节回旧路径，因此本类同时钉住「零回归」。
+    """
+
+    @staticmethod
+    def _split(packet):
+        """拆出 (meta dict, body bytes|None)。"""
+        meta_len = unpack_header(packet[:HEADER_LEN])
+        meta = json.loads(packet[HEADER_LEN:HEADER_LEN + meta_len].decode("utf-8"))
+        rest = packet[HEADER_LEN + meta_len:]
+        body = None
+        if rest:
+            body_len = unpack_header(rest[:HEADER_LEN])
+            body = rest[HEADER_LEN:HEADER_LEN + body_len]
+        return meta, body
+
+    def test_binary_frame_roundtrip(self):
+        """二进制体逐位还原，元数据仍走 JSON。"""
+        raw = struct.pack("<8f", *[i + 0.5 for i in range(8)])
+        meta_in = {
+            "layer_range": [0, 4],
+            "hidden_spec": {"n_tokens": 1, "n_embd": 8, "dtype": "float32"},
+        }
+        packet = build_message(MessageType.LAYER_FORWARD, meta_in, binary_body=raw)
+        meta, body = self._split(packet)
+
+        assert meta["format"] == "binary"
+        assert meta["binary_bytes"] == len(raw)
+        assert meta["data"] == meta_in
+        assert body == raw
+        assert struct.unpack("<8f", body) == struct.unpack("<8f", raw)
+
+    def test_parse_message_flags_binary_body(self):
+        """`parse_message` 标出还需继续接收字节体。"""
+        raw = b"\x01\x02\x03\x04"
+        packet = build_message(MessageType.LAYER_RESULT, {"a": 1}, binary_body=raw)
+        meta_len = unpack_header(packet[:HEADER_LEN])
+        parsed = tcp_comm_mod.parse_message(packet[HEADER_LEN:HEADER_LEN + meta_len])
+
+        assert parsed["_needs_binary"] is True
+        assert parsed["binary_bytes"] == 4
+        # 二进制路径不得误标成张量（否则接收侧会走反序列化）
+        assert "_needs_tensor" not in parsed
+
+    def test_binary_body_none_keeps_json_bytes_identical(self):
+        """不传 binary_body 时 JSON 帧逐字节不变（零回归）。"""
+        payload = {"action": "register", "node_id": "client1"}
+        assert build_message(MessageType.REGISTER, payload) == pack_data(
+            json.dumps(
+                {"type": "register", "format": "json", "data": payload}
+            ).encode("utf-8")
+        )
+        # 无 data 的心跳同样不变
+        assert build_message(MessageType.HEARTBEAT) == pack_data(
+            json.dumps({"type": "heartbeat", "format": "json"}).encode("utf-8")
+        )
+
+    def test_binary_body_none_keeps_tensor_path(self):
+        """不传 binary_body 时张量仍走 TNR 序列化路径。"""
+        tensor = torch.randn(2, 3)
+        meta, body = self._split(build_message(MessageType.TENSOR, tensor))
+
+        assert meta["format"] == "tensor"
+        assert "binary_bytes" not in meta
+        assert torch.equal(deserialize_tensor(body), tensor)
+
+    def test_binary_frame_saves_a_quarter_over_base64(self):
+        """体积：去掉 base64 膨胀后省 ≈25%（票 21a 完成定义）。"""
+        import base64
+
+        tokens, embd = 4, 4096
+        values = [0.25] * (tokens * embd)
+        raw = struct.pack(f"<{tokens * embd}f", *values)
+        encoded = base64.b64encode(raw)
+
+        # base64 自身把 raw 撑大 33.3%
+        assert len(encoded) == 4 * (-(-len(raw) // 3))
+        savings = (len(encoded) - len(raw)) / len(encoded)
+        assert 0.24 <= savings <= 0.26, savings
+
+        # 二进制帧的字节体就是 raw 本身（外加一个固定 4 字节长度头）
+        _, body = self._split(
+            build_message(MessageType.LAYER_FORWARD, {"n": 1}, binary_body=raw)
+        )
+        assert len(body) == len(raw)
+
+    def test_binary_frame_rejects_oversized_body_at_receiver(self):
+        """长度头自洽：接收侧据 `binary_bytes` 判定，超 MAX_PACKET_SIZE 即拒。"""
+        raw = b"\x00" * 16
+        packet = build_message(MessageType.LAYER_FORWARD, None, binary_body=raw)
+        meta, body = self._split(packet)
+
+        assert meta["binary_bytes"] == 16
+        assert len(body) == 16
+        assert not body is None and body != b"\x00" * 15  # 长度精确
+        # 10.5MB 之上的体不得被内联进 JSON 元数据
+        big = b"\x00" * (11 * 1024 * 1024)
+        big_packet = build_message(MessageType.LAYER_FORWARD, {"n": 1}, binary_body=big)
+        big_meta_len = unpack_header(big_packet[:HEADER_LEN])
+        assert big_meta_len < 4096, big_meta_len
+
+
+# ================================================================
 # serialize_tensor / deserialize_tensor 测试
 # ================================================================
 
