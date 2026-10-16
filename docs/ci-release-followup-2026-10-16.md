@@ -219,3 +219,18 @@ Qwen3.5-9B 经正式模型意图入口自动分配 `[0,4) → [4,8) → [8,32)`�
 新原件为 `dl-mapped/`、`ll-mapped/` 的 API、Textual/SSE、完成回执与 `product-capture/*-nodes/`；总索引 `physical-runtime-mapped-final-summary.json`，其 scope 明确为开发事实，strict_product_gate_passed=false。六份新 raw 均无 collection_errors；两个 `producer-result.json` 仍正确返回 1：master／Android 为 dirty 来源，ROG 原始远端窗口超出 SSH 时间窗口。未改时间、未写 topology／native 绿快照，历史 bundle SHA 仍为 `1249cdf8bb8a5fe013f1635f582467685ccba57079c44113f2c4ab12db9be817`。临时 logcat 采集已退出，`adb-final-devices.txt` 确认 HA26PYZQ 仍为 device。
 
 票 13 的剩余关闭条件为：冻结并部署 clean 目标来源、建立有效的实验台时间同步后重新取得严格 DL／LL bundle，再构建可信签名的三平台最终产物并完成实际执行总门。当前保留清洁度、时钟和发行物的真实拒绝结果，票 14 尚未启动。
+
+## 10. 「就地重采」的冻结来源尝试与四条硬约束（2026-10-16 晚）
+
+借当前设备窗口（master／ROG／Y700 三端在线）尝试就地重采严格三机 bundle。**冻结树机制本身可用**，但以下四条使「就地重采出通过结果」在本机不可行。记录供 §9 末条「冻结并部署 clean 目标来源」参考。
+
+冻结树做法（已验证）：`git clone --branch dev --single-branch <repo> G:\qlh-frozen` ⇒ 只含 tracked 文件（1087 项、**20 MB**、`git status` 零改动、HEAD 即目标 revision）。master 从该树启动后，`GET /api/diagnostics/product-runtime` 正确报出 `source_revision=c7e085d1…` 且 `runtime.errors=[]` —— 即**路径与 revision 都能对上**，运行时收据机制本身工作正常。
+
+四条硬约束：
+
+1. **`source_dirty` 不能靠改判据解决。** `src/runtime_source.py:123` 的判据是 `bool(git status) or not set(names).issubset(tracked)`，而 `_inventory`（:76-93）用 `os.walk` 收 `src/`＋`scripts/` 下**所有** `.py`（含 git-ignored）。`scripts/` 是白名单制（`.gitignore:187 scripts/*`），磁盘上仍有 32 个一次性实验脚本 ⇒ 从工作树启动**恒为 dirty**。而且 `tests/test_runtime_source.py:153 test_ignored_executable_source_still_dirties_startup_manifest` **明确断言**该行为（配合 :121 注释「Broad ignore rules must never hide executable Python from cleanliness」）⇒ 这是**设计**，不是 bug。
+2. **供给源拒绝穿越文件系统链接。** `models/` 用 junction 接入时供给直接失败：`SUPPLY_SOURCE_INVALID: Registered source cannot traverse a filesystem link`（`src/model_supply_sources.py`）⇒ 冻结树里 `models/` 必须是**真实文件**。
+3. **真实文件装不下。** `H:\qlh_models` 全量 **215.8 GB**，而可用盘位不足（G 盘剩 34 GB）。按注册表子集复制 9B 目录（10.9 GB）＋顶层有源 gguf 后仍不够。
+4. **源是「配置」而非「文件」。** 最终卡在 `SUPPLY_SOURCE_MISSING: No executable pinned or configured download source` —— 它要的是 pinned／configured 下载源；现有供给记录（state 内）大概率绑定**原路径** `G:\C\PYT\qlh\models\…`，与冻结树路径不一致。
+
+⇒ 结论：**「冻结并部署 clean 目标来源」不只是换一个干净 checkout，还要迁移 215.8 GB 模型并重绑源配置／state 路径**，属容量规划与状态迁移。本轮不改判据、不降门、不动现有部署：冻结树与复制物已删除（删除前确认 junction 数为 0，删后复核 `H:\qlh_models` 53 个条目与 639,446,688 字节探针文件完好、G 盘可用空间回到 45 GB），master 已退回工作树运行。
