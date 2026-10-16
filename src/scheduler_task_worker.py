@@ -813,6 +813,12 @@ class SchedulerTaskWorkerMixin:
             # Hashing artifacts must never hold either the registration lock or
             # the scheduler lock shared with client replacement and cleanup.
             capabilities = self._task_worker_capabilities()
+            # ★ 票 21a（COMM-WIRE-01）：记下本进程是否声明了二进制 hidden，供**回程**
+            #   发送时作判据。`_task_worker_capabilities()` 会重算工件摘要（注释明确
+            #   不能持锁调用），因此不能每条出站消息都重算一次。
+            self._task_worker_binary_hidden_advertised = bool(
+                capabilities.get("binary_hidden")
+            )
             node_id = self.get_effective_node_id()
             phase = "begin"
             with self._task_worker_refresh_lock:
@@ -945,7 +951,24 @@ class SchedulerTaskWorkerMixin:
             raise ConnectionError("task worker is not connected to its master")
         from transport_port import MessageType
 
-        client.send_data(message.snapshot(), MessageType.TASK_WORKER)
+        # ★ 票 21a（COMM-WIRE-01）：本进程**声明了** `binary_hidden` 时，回程的
+        #   `stage_result.output.hidden_out_f32` 也走帧的二进制体。声明之后仍能握手
+        #   成功，就说明对端（主节点）认识这个键 ⇒ 支持二进制帧 —— 旧主节点会以
+        #   `invalid_fields` 拒绝 hello，连接根本建立不起来。判据用 hello 时的缓存，
+        #   不重算工件摘要。
+        snapshot, binary_body = split_task_worker_hidden(
+            message.snapshot(),
+            enabled=getattr(self, "_task_worker_binary_hidden_advertised", False),
+        )
+        if binary_body is None:
+            # 未声明 ⇒ 连调用形状都不变（不传 `binary_body`）。
+            client.send_data(snapshot, MessageType.TASK_WORKER)
+            return
+        logger.debug(
+            "event=task_worker_binary_hidden_sent_to_master message_type=%s bytes=%d",
+            snapshot.get("message_type"), len(binary_body),
+        )
+        client.send_data(snapshot, MessageType.TASK_WORKER, binary_body=binary_body)
 
 
     def _task_worker_hello_followup_owner_current(self, node_id, work) -> bool:
