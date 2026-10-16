@@ -210,6 +210,8 @@ scripts/*
 !scripts/torch_lan_echo_probe.py
 !scripts/torch_cpu_jitter_diagnosis.py
 !scripts/torch_layer_profile.py
+# 三机产品门的 bench 侧快照生产者（run_product_relay_gate capture 的 --topology/--native）
+!scripts/build_product_snapshots.py
 !scripts/setup_envs.py
 !scripts/setup_test_env.py
 !scripts/setup_qwen3_sidecar_env.py
