@@ -3139,3 +3139,43 @@ def test_llama_unload_failure_preserves_manager_projection(release_method):
     assert manager.quant_type is None and manager.layer_range is None
     assert manager._pipeline_descriptor is None and not manager._pipeline_distributed_only
     assert manager._full_model_path is None and manager._load_fingerprint is None
+
+
+@pytest.mark.parametrize("release", ["unload_model", "abort_pipeline_materialization"])
+def test_retirement_releases_compiled_weight_owners_before_cuda_cache(monkeypatch, release):
+    """An unloaded projection must not leave compiled wrappers owning weights."""
+    import gc
+    import weakref
+
+    manager = ModelManager()
+    manager._pipeline_descriptor = {"model_id": "compiled-segment", "total_layers": 32}
+    manager._pipeline_distributed_only = True
+    manager._engine_type = "pytorch"
+    # OptimizedModule retains _orig_mod even without executing compiled code.
+    layer = nn.Linear(2, 2)
+    weight = weakref.ref(layer.weight)
+    manager._compiled_transformer = torch.compile(layer, backend="eager")
+    manager._compiled_layer_loop = torch.compile(nn.Sequential(layer), backend="eager")
+    del layer
+    manager.model = None
+    gc.collect()
+    assert weight() is not None, "compiled owners must reproduce the original retention"
+    calls = []
+
+    def empty_cache():
+        assert weight() is None, "live compiled weights cannot be released by empty_cache"
+        calls.append("empty_cache")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("synchronize"))
+    getattr(manager, release)()
+    assert weight() is None
+    assert manager._compiled_transformer is None
+    assert manager._compiled_layer_loop is None
+    assert calls == ["empty_cache", "synchronize"]
+    if release == "abort_pipeline_materialization":
+        assert manager.is_pipeline_prepared
+        assert manager.get_pipeline_descriptor()["model_id"] == "compiled-segment"
+    else:
+        assert not manager.is_pipeline_prepared

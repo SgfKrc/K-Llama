@@ -1398,6 +1398,10 @@ class ModelManager:
                 close()
             self._llama_engine = None
 
+        # Compiled wrappers own the original parameters independently of self.model.
+        # Drop every owner before GC/empty_cache, including an already-unloaded projection.
+        self._compiled_transformer = None
+        self._compiled_layer_loop = None
         # --- PyTorch 引擎清理 ---
         if self.model is not None:
             self.model = None
@@ -1558,6 +1562,8 @@ class ModelManager:
         """Release a committed segment while preserving distributed metadata."""
         if not self._pipeline_descriptor or not self._pipeline_distributed_only:
             return
+        self._compiled_transformer = None
+        self._compiled_layer_loop = None
         self.model = None
         self.tokenizer = None
         self.layer_range = None
@@ -3104,6 +3110,7 @@ class ModelManager:
             def _release_compiled() -> None:  # pragma: no cover - 退出期路径
                 try:
                     self._compiled_transformer = None
+                    self._compiled_layer_loop = None
                     self.model = None
                     import gc
 
