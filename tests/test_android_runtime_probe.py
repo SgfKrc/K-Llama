@@ -171,3 +171,181 @@ def test_stub_backend_label_cannot_claim_native_readiness(field):
     value['native'][field] = 'test STUB backend'
     with pytest.raises(ValueError):
         validate(value)
+
+
+
+def product_observation():
+    value = observation()
+    value.update(probe_kind="product", role="worker")
+    value["worker"].update(process_running=True, connection_alive=True, connection="READY")
+    value["model"].update(loaded=True, layer_range=[24, 32], native_layer_count=8)
+    identity = {"pid": 123, "created_at": 1234500}
+    proc = {**identity, "parent_pid": 1, "identity_after": dict(identity), "command": ["fixture"], "cwd": "/data/fixture",
+            "task_ids": [123, 124], "child_pids": [], "children_complete": True,
+            "maps_complete": True, "model_mappings": ["/data/fixture/segment.gguf"], "native_mappings": [],
+            "connections_complete": True, "connections": [{"status": "ESTABLISHED", "local": ["127.0.0.1", 40000],
+                "remote": ["127.0.0.2", 8888]}], "errors": [], "connection_errors": []}
+    value["process"] = {"pid": 123, "created_at": identity["created_at"], "source": "android_proc_task_children",
+                        "identity_before": dict(identity), "identity_after": dict(identity), "complete": True,
+                        "processes": [proc], "errors": []}
+    value["runtime_receipt"] = {**identity, "schema_version": 1, "source": "committed_worker_prepare", "engine": "llama_cpp",
+        "operation_id": "supply_real", "config_id": "config_real", "generation": 1791800000000000013,
+        "node_id": "android_real", "assignment_id": "assignment_real", "package_name": PACKAGE,
+        "loader_pid": 123, "loaded": True, "full_model_loaded": False, "layer_range": [24, 32],
+        "source_layer_range": [24, 32], "range_source": "verified_loaded_native_manifest", "total_layers": 32,
+        "native_layer_count": 8, "captured_at": 100, "artifact": {
+            "path": "/data/fixture/segment.gguf", "load_path": "/proc/self/fd/42", "size_bytes": 4500000000,
+            "sha256": "b"*64, "rehashed_sha256": "b"*64, "native_manifest_sha256": "c"*64,
+            "layer_range": [24, 32], "decoder_layers": 8, "device": 259, "inode": 456}}
+    return value
+
+
+def test_product_receipt_retains_exact_generation_rehash_and_complete_os_tree():
+    value = product_observation()
+    result = validate(value, product=True)
+    assert result["runtime_receipt"]["generation"] == 1791800000000000013
+    assert result["runtime_receipt"]["artifact"]["size_bytes"] == 4500000000
+    assert result["process"]["processes"][0]["task_ids"] == [123, 124]
+
+
+@pytest.mark.parametrize("change", [
+    lambda v: v.pop("runtime_receipt"), lambda v: v.update(probe_kind="release"),
+    lambda v: v["runtime_receipt"].update(generation=True),
+    lambda v: v["runtime_receipt"].update(generation=0),
+    lambda v: v["runtime_receipt"].update(loader_pid=124),
+    lambda v: v["runtime_receipt"].update(created_at=1234501),
+    lambda v: v["runtime_receipt"].update(total_layers=8),
+    lambda v: v["runtime_receipt"].update(source_layer_range=[0, 32]),
+    lambda v: v["runtime_receipt"].update(native_layer_count=32),
+    lambda v: v["runtime_receipt"]["artifact"].update(rehashed_sha256="d"*64),
+    lambda v: v["runtime_receipt"]["artifact"].update(decoder_layers=32),
+    lambda v: v["runtime_receipt"]["artifact"].update(path="/data/fixture/segment.gguf (deleted)"),
+    lambda v: v["runtime_receipt"]["artifact"].update(inode=0),
+    lambda v: v["process"].update(complete=False),
+    lambda v: v["process"]["processes"][0].update(children_complete=False),
+    lambda v: v["process"]["processes"][0].update(maps_complete=False),
+    lambda v: v["process"]["processes"][0].update(connections_complete=False),
+    lambda v: v["process"]["processes"][0].update(child_pids=[999]),
+    lambda v: v["process"]["processes"][0]["identity_after"].update(created_at=1234501),
+    lambda v: v["process"]["processes"][0]["connections"][0].update(status="UNKNOWN"),
+])
+def test_product_rejects_missing_plan_only_stale_or_incomplete_receipts(change):
+    value = product_observation()
+    change(value)
+    with pytest.raises(ValueError):
+        validate(value, product=True)
+
+
+def test_idle_release_diagnostics_do_not_require_product_hash_or_complete_process_claim():
+    value = observation()
+    value["process"] = {"pid": 123, "maps_complete": True, "children_complete": False}
+    assert validate(value, require_idle=True)["model"]["loaded"] is False
+    with pytest.raises(ValueError):
+        validate(value, product=True)
+
+
+def test_product_poll_uses_same_nonce_and_does_not_reschedule_hash(tmp_path, monkeypatch):
+    calls, dumps = [], 0
+    def run(args, **kwargs):
+        nonlocal dumps
+        calls.append(args)
+        if "pidof" in args:
+            return execution("123")
+        dumps += 1
+        value = product_observation()
+        value.update(nonce=args[-1], captured_at=probe.time.time())
+        value["runtime_receipt"]["captured_at"] = probe.time.time()
+        if dumps <= 2:
+            value.update(error_code="PROBE_PENDING", runtime_receipt=None)
+        return execution(probe.PREFIX + json.dumps(value))
+    monkeypatch.setattr(probe, "run_command", run)
+    monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+    result = probe.observe_runtime(adb="adb", serial="Y700", package=PACKAGE, work=tmp_path,
+                                   env={"fixture":"1"}, product=True)
+    assert result["passed"] and dumps == 3 and len(result["attempts"]) == 3
+    assert len({attempt["nonce"] for attempt in result["attempts"]}) == 1
+    assert [a.get("pending", False) for a in result["attempts"]] == [True, True, False]
+    assert all("--qlh-product-probe" in args for args in calls if "dumpsys" in args)
+    assert not any(token in {"install", "start", "uninstall", "force-stop", "clear"} for call in calls for token in call)
+
+
+@pytest.mark.parametrize("failure", ["restart", "pending-nonce", "incomplete-tree"])
+def test_product_poll_never_accepts_restart_wrong_pending_or_permission_denial(tmp_path, monkeypatch, failure):
+    dumps = 0
+    def run(args, **kwargs):
+        nonlocal dumps
+        if "pidof" in args:
+            return execution("124" if failure == "restart" and dumps else "123")
+        dumps += 1
+        value = product_observation()
+        value.update(nonce=args[-1], captured_at=probe.time.time())
+        value["runtime_receipt"]["captured_at"] = probe.time.time()
+        if failure == "pending-nonce":
+            value.update(error_code="PROBE_PENDING", nonce="wrong")
+        if failure == "incomplete-tree":
+            value["process"].update(complete=False)
+        return execution(probe.PREFIX + json.dumps(value))
+    monkeypatch.setattr(probe, "run_command", run)
+    result = probe.observe_runtime(adb="adb", serial="Y700", package=PACKAGE, work=tmp_path,
+                                   env={"fixture":"1"}, product=True)
+    assert result["passed"] is False and result["observation"] is None and len(result["attempts"]) == 1
+    assert probe.PREFIX in result["attempts"][0]["executions"]["dump"]["output"]
+
+
+def uid_fallback_observation():
+    import copy
+    value = product_observation()
+    proc = value["process"]["processes"][0]
+    scan = {"visible_pids": [123, 222, 999], "owners": [
+        {"pid": 123, "uid": 10000}, {"pid": 222, "uid": 10000}, {"pid": 999, "uid": 20000}],
+        "roster": [{"pid": 123, "uid": 10000, "created_at": proc["created_at"], "parent_pid": 1},
+                   {"pid": 222, "uid": 10000, "created_at": 222000, "parent_pid": 1}],
+        "outside_uid": [{"pid": 999, "uid": 20000, "created_at": 999000, "parent_pid": 1}], "errors": []}
+    value["process"].update(source="android_proc_uid_ppid", enumeration={"method": "proc_uid_ppid",
+        "scope": "app_uid_descendants", "reason": "task_children_enoent", "uid": 10000,
+        "complete": True, "before": copy.deepcopy(scan), "after": copy.deepcopy(scan)})
+    return value
+
+
+def test_product_accepts_double_scanned_uid_ppid_fallback_with_unrelated_same_uid_process():
+    value = uid_fallback_observation()
+    assert validate(value, product=True)["process"]["source"] == "android_proc_uid_ppid"
+
+
+@pytest.mark.parametrize("change", [
+    lambda t: t.pop("enumeration"),
+    lambda t: t["enumeration"].update(complete=False),
+    lambda t: t["enumeration"].update(reason="permission_denied"),
+    lambda t: t["enumeration"].update(uid=True),
+    lambda t: t["enumeration"]["before"].update(errors=["123:stat_denied"]),
+    lambda t: t["enumeration"]["before"]["owners"].pop(),
+    lambda t: t["enumeration"]["before"]["roster"].pop(),
+    lambda t: t["enumeration"]["after"]["roster"][0].update(created_at=1234501),
+    lambda t: t["enumeration"]["after"]["roster"][1].update(parent_pid=123),
+    lambda t: t["enumeration"]["before"]["owners"][0].update(uid=20000),
+])
+def test_uid_fallback_rejects_missing_denied_omitted_or_racing_scan_proof(change):
+    value = uid_fallback_observation()
+    change(value["process"])
+    with pytest.raises(ValueError):
+        validate(value, product=True)
+
+
+def test_uid_fallback_rejects_stably_omitted_descendant_even_when_tree_says_complete():
+    value = uid_fallback_observation()
+    for scan in (value["process"]["enumeration"]["before"], value["process"]["enumeration"]["after"]):
+        scan["roster"][1]["parent_pid"] = 123
+    with pytest.raises(ValueError, match="omits a UID descendant"):
+        validate(value, product=True)
+
+
+@pytest.mark.parametrize("change", [
+    lambda s: s.pop("outside_uid"),
+    lambda s: s["outside_uid"].clear(),
+    lambda s: s["outside_uid"][0].update(parent_pid=123),
+])
+def test_uid_fallback_never_silently_omits_different_uid_child_or_unreadable_process(change):
+    value = uid_fallback_observation()
+    change(value["process"]["enumeration"]["before"])
+    with pytest.raises(ValueError):
+        validate(value, product=True)
