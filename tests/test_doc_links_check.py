@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +64,7 @@ def test_outside_repo_reference_is_skipped(tmp_path, monkeypatch) -> None:
     assert _probe(module, tmp_path, monkeypatch, body) == []
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="跨盘符是 Windows 语义（os.path.relpath 会抛 ValueError）")
 def test_outside_repo_skip_survives_other_drive(tmp_path, monkeypatch) -> None:
     """★ 跨盘符不能崩：Windows 上 `os.path.relpath` 对另一个盘会抛 ValueError。
 

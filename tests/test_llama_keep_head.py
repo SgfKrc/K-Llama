@@ -56,6 +56,7 @@ def _upstream_or_skip(**kwargs):
         pytest.skip(f"keep-head 不可用：{exc}")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="os.add_dll_directory 是 Windows 专有 API")
 def test_dll_directory_handles_are_retained(monkeypatch, tmp_path):
     dll_dir = tmp_path / "dll"
     dll_dir.mkdir()

@@ -14,6 +14,11 @@ from pathlib import Path
 import re
 import sys
 
+_OBSERVER_MODULES = Path(__file__).resolve().parent / "package_contract"
+if str(_OBSERVER_MODULES) not in sys.path:
+    sys.path.insert(0, str(_OBSERVER_MODULES))
+from product_observations import ObservationError, derive_node_observation
+
 COMPLETED_PREFIX = "Route-A stage completed: "
 SHA256 = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40}")
@@ -46,10 +51,10 @@ def require(condition: object, message: str) -> None:
 
 
 def clean_source(value: dict, name: str) -> None:
-    # Legacy evidence may omit this fact. An explicit value must be boolean false;
-    # falsy JSON values such as 0, null or an empty container do not prove clean.
-    require(value.get("source_dirty", False) is False,
-            f"{name}.source_dirty: explicit dirty or invalid source cannot prove clean release evidence")
+    # A missing fact is unknown, never proof that the executing source is clean.
+    # bool must be exact: 0, null and empty containers are not attestations.
+    require(value.get("source_dirty") is False,
+            f"{name}.source_dirty: explicit boolean false is required for clean release evidence")
 
 
 def integer(value: object, name: str, minimum: int = 0) -> int:
@@ -114,6 +119,33 @@ def _observation(value: dict, identity: tuple, started: float, finished: float) 
     require(_identity(value) == identity, "observation belongs to another model selection")
     captured = timestamp(value.get("captured_at"), "captured_at")
     require(started <= captured <= finished, "observation is outside capture window")
+
+
+def _derived_observation(base, observation, *, revision, node, identity, assignment,
+                         addresses, total, started, finished):
+    raw = _json(base, observation.get("raw_evidence"))
+    try:
+        runtime = object_value(object_value(raw.get("facts"), "raw facts").get("runtime"), "raw runtime")
+        require(integer(runtime.get("total_layers"), "observed total_layers", 2) == total,
+                "raw observed decoder total differs from model plan")
+        derived = derive_node_observation(
+            raw, expected_revision=revision, expected_node_id=node,
+            expected_identity=dict(zip(("operation_id", "config_id", "generation"), identity)),
+            expected_assignment=assignment, node_addresses=addresses)
+    except ObservationError as exc:
+        raise EvidenceError(f"{node}: raw observation invalid: {exc}") from exc
+    for section in derived.values():
+        require(started <= timestamp(section.get("observation_started_at"), "raw observation started_at")
+                <= timestamp(section.get("captured_at"), "raw captured_at")
+                <= timestamp(section.get("observation_finished_at"), "raw observation finished_at") <= finished,
+                f"{node}: raw observation is outside capture window")
+    return derived
+
+
+def _matches_raw(observation, derived, node, section):
+    for field, expected in derived.items():
+        require(type(observation.get(field)) is type(expected) and observation.get(field) == expected,
+                f"{node}: {section}.{field} differs from raw observation")
 
 
 def _validate_run(base: Path, run: dict, revision: str, started: float, finished: float) -> dict:
@@ -224,6 +256,9 @@ def _validate_run(base: Path, run: dict, revision: str, started: float, finished
     require(topology.get("complete") is True, "incomplete socket capture cannot prove star topology")
     observers = topology.get("nodes")
     require(isinstance(observers, list) and len(observers) == len(nodes), "missing per-node socket observations")
+    addresses = object_value(topology.get("node_addresses"), "topology node_addresses")
+    require(set(nodes) <= set(addresses), "missing assigned node address mapping")
+    derived_nodes = {}
     observed_nodes = set()
     for observation in observers:
         observation = object_value(observation, "node sockets")
@@ -236,10 +271,19 @@ def _validate_run(base: Path, run: dict, revision: str, started: float, finished
         require(len(peers) == len(set(peers)), "duplicate worker peer")
         require(set(peers) == (set(remote) if node == "master" else {"master"}),
                 "missing master edge or worker-to-worker connection present")
-        _file(base, observation.get("raw_evidence"))
+        assignment = dict(nodes[node], _total_layers=total)
+        prepared_node = (intent.get("nodes") or {}).get(node) or {}
+        assignment["artifact_sha256"] = (stage_identities[node][1] if node in stage_identities
+                                         else digest(prepared_node.get("artifact_sha256"), "master artifact_sha256"))
+        derived = _derived_observation(
+            base, observation, revision=revision, node=node, identity=identity,
+            assignment=assignment, addresses=addresses, total=total, started=started, finished=finished)
+        _matches_raw(observation, derived["topology"], node, "topology")
+        derived_nodes[node] = derived
 
     native = _json(base, run.get("native"))
     _observation(native, identity, started, finished)
+    require(native.get("node_addresses") == addresses, "native/topology node address mappings differ")
     loaded = native.get("nodes")
     require(isinstance(loaded, list) and len(loaded) == len(nodes), "missing native load observations")
     observed_nodes = set()
@@ -256,8 +300,12 @@ def _validate_run(base: Path, run: dict, revision: str, started: float, finished
         require(observation.get("engine") == nodes[node].get("engine"), "native engine differs from plan")
         require(_range(observation.get("layer_range"), total) == ranges[node], "native range differs from plan")
         require(observation.get("complete") is True, "native observation is incomplete")
-        # Retain the actual process/loader output, not just a self-asserted boolean.
-        _file(base, observation.get("raw_evidence"))
+        # Both summaries must refer to the same OS/native source, and each
+        # claimed value must be independently derived from that retained JSON.
+        top = next(item for item in observers if item["node_id"] == node)
+        require(observation.get("raw_evidence") == top.get("raw_evidence"),
+                "native/topology summaries reference different node observations")
+        _matches_raw(observation, derived_nodes[node]["native"], node, "native")
 
     ui = _json(base, run.get("ui"))
     require(ui.get("entry") in ("textual", "web", "android") and ui.get("done") is True,

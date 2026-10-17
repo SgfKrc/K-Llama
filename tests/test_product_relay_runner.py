@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.product_observation_fixtures import node_observation
+
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("product_relay_runner_tested", ROOT / "scripts/run_product_relay_gate.py")
 runner = importlib.util.module_from_spec(_spec)
@@ -43,6 +45,7 @@ def synthetic_bundle(base, mode, raw_name=None):
         "artifact_sha256": "b" * 64, "layer_range": [item["start_layer"], item["end_layer"]]}}
         for item in assignments[1:]]
     intent = {**selection, "status": "ready", "loaded_ready": True,
+              "nodes": {a["node_id"]: {"artifact_sha256": "b"*64} for a in assignments},
               "plan": {"admitted": True, "total_layers": 6, "assignments": assignments}}
     response = {"done": True, "response": "2", "metrics": {
         "distributed_used": True, "fallback": False, "fallback_reason": "",
@@ -63,26 +66,26 @@ def synthetic_bundle(base, mode, raw_name=None):
     topology_nodes, native_nodes = [], []
     for assignment in assignments:
         node = assignment["node_id"]
-        raw = put(base, raw_name or f"{mode}/raw/{node}.txt", f"synthetic {mode} " + ("shared" if raw_name else node) + " observation")
-        topology_nodes.append({"node_id": node, "complete": True, "raw_evidence": raw,
-                               "worker_peers": remotes if node == "master" else ["master"]})
-        native_nodes.append({"node_id": node, "complete": True, "raw_evidence": raw,
-                             "source_revision": REVISION, "source": "os_process_mappings",
-                             "full_model_loaded": False, "engine": assignment["engine"],
-                             "layer_range": [assignment["start_layer"], assignment["end_layer"]]})
+        raw_value, top, native_value, addresses = node_observation(
+            selection, assignment, assignments, REVISION, 6, captured_at=105.0)
+        raw = put(base, f"{mode}/raw/{node}.json", raw_value)
+        topology_nodes.append({**top, "raw_evidence": raw})
+        native_nodes.append({**native_value, "raw_evidence": raw})
     topology = {**selection, "captured_at": 105, "source": "os_process_connections",
-                "complete": True, "nodes": topology_nodes}
-    native = {**selection, "captured_at": 105, "nodes": native_nodes}
+                "complete": True, "node_addresses": addresses, "nodes": topology_nodes}
+    native = {**selection, "captured_at": 105, "node_addresses": addresses, "nodes": native_nodes}
     screen = put(base, f"{mode}/screen.svg", "<svg>synthetic screen fixture</svg>")
     ui = {"entry": "textual", "done": True, "request_id": f"http_{mode}", "submitted_message": runner.MESSAGE,
           "expected_response": "2", "rendered_response": "2", "status_text": "synthetic status",
           "captured_at": 106, "screen": screen}
-    run = {"mode": mode}
+    run = {"mode": mode, "source_dirty": False}
     for name, value in [("intent", intent), ("response", response), ("topology", topology), ("native", native), ("ui", ui)]:
         run[name] = put(base, f"{mode}/{name}.json", value)
     run["handoffs"] = put(base, f"{mode}/handoffs.log", "\n".join(logs))
     run["stream"] = put(base, f"{mode}/stream.jsonl", json.dumps(response) + "\n")
-    manifest = {"schema_version": 1, "source_revision": REVISION, "physical_opt_in": True,
+    if raw_name:
+        run["command_attachment"] = put(base, raw_name, f"synthetic {mode} differing bytes")
+    manifest = {"schema_version": 1, "source_revision": REVISION, "source_dirty": False, "physical_opt_in": True,
                 "capture_started_at": 100, "capture_finished_at": 110, "runs": [run]}
     path = base / "bundle.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -272,7 +275,7 @@ def test_combine_refuses_same_path_with_different_raw_bytes(tmp_path):
 
 def test_combine_does_not_overwrite_existing_destination_evidence(tmp_path, inputs):
     output = tmp_path / "existing" / "bundle.json"
-    bad = output.parent / "DL" / "raw" / "master.txt"
+    bad = output.parent / "DL" / "raw" / "master.json"
     bad.parent.mkdir(parents=True)
     bad.write_text("keep external evidence", encoding="utf-8")
     assert runner.main(combine_argv(inputs, output)) == 1

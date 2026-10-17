@@ -444,11 +444,11 @@ def capture(args):
         stream.write(raw_log)
     require(COMPLETED_PREFIX in raw_log.decode("utf-8-sig"), "no actual completed Route-A handoff log")
     require(source_revision(revision) == revision, "source revision changed during capture")
-    run = {"mode": args.mode, **{key: file_ref(attachments / ("handoffs.log" if key == "handoffs" else key + ".json"), base)
+    run = {"mode": args.mode, "source_dirty": False, **{key: file_ref(attachments / ("handoffs.log" if key == "handoffs" else key + ".json"), base)
                                  for key in EVIDENCE_KEYS}}
     run["stream"] = file_ref(attachments / "stream.jsonl", base)
     run["intent_before"] = file_ref(attachments / "intent-before.json", base)
-    bundle = {"schema_version": 1, "source_revision": revision, "physical_opt_in": True,
+    bundle = {"schema_version": 1, "source_revision": revision, "source_dirty": False, "physical_opt_in": True,
               "capture_started_at": started, "capture_finished_at": time.time(), "runs": [run]}
     write_json(args.output, bundle)
     return validate(validator, args.output, revision, (args.mode,))
@@ -486,7 +486,7 @@ def combine(args):
     copy_files(files, args.output.parent, reserved)
     # Original per-run windows are retained as additional provenance; snapshots
     # were validated in each original window before considering this union.
-    merged = {"schema_version": 1, "source_revision": revision, "physical_opt_in": True,
+    merged = {"schema_version": 1, "source_revision": revision, "source_dirty": False, "physical_opt_in": True,
               "capture_started_at": min(w[0] for w in windows), "capture_finished_at": max(w[1] for w in windows),
               "runs": sorted(runs, key=lambda run: run["mode"]),
               "input_windows": [{"mode": run["mode"], "capture_started_at": window[0],

@@ -20,21 +20,27 @@ from task_provider import (
     StageRequest as TaskProviderStageRequest,
     sanitize_result_metadata as sanitize_task_result_metadata,
 )
-from task_worker_adapter import RemoteFullWorkerProvider, remote_provider_id
+from task_worker_adapter import (
+    RemoteFullWorkerProvider, binary_hidden_transport_enabled, remote_provider_id,
+)
 from task_worker_chunks import (
     build_stage_chunk,
     plan_stage_payload_chunks,
     stage_chunk_ref,
 )
 from task_worker_protocol import (
+    MAX_BINARY_FRAME_BYTES,
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
     RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
     WorkerProtocolError,
+    binary_hidden_frame_bytes,
     build_message as build_task_worker_message,
     canonical_message_bytes as task_worker_message_bytes,
     canonical_sha256 as task_worker_sha256,
     decode_message as decode_task_worker_message,
+    restore_inline_hidden as restore_task_worker_hidden,
+    split_inline_hidden as split_task_worker_hidden,
     worker_protocol_status,
 )
 from torch_runtime import torch_available
@@ -116,6 +122,7 @@ def _task_worker_capability_log_summary(
     resource_gate = capabilities.get("resource_gate")
     return {
         "stage_types": list(capabilities.get("stage_types") or []),
+        "binary_hidden": capabilities.get("binary_hidden") is True,
         "layer_ranges": list(capabilities.get("layer_ranges") or []),
         "models": models,
         "layer_artifacts": artifact_summaries,
@@ -517,15 +524,30 @@ class SchedulerTaskWorkerMixin:
         `output_sha256` 仍按**原始完整 output** 计算（对端还原后可自行复核）。
         """
         now_ms = int(time.time() * 1000)
+        binary_hidden = self._task_worker_binary_hidden_enabled()
 
         def _result(payload: dict):
-            return build_task_worker_message(
+            message = build_task_worker_message(
                 "stage_result",
                 payload,
                 message_id=f"msg_result_{uuid.uuid4().hex}",
                 sent_at_ms=now_ms,
                 version=TASK_WORKER_PROTOCOL_VERSION,
+                binary_hidden=binary_hidden,
             )
+            # TCP adds its current control certificate after protocol validation.
+            # Include those exact bytes before choosing direct return or chunks.
+            client = getattr(self, "_tcp_client", None)
+            fence = getattr(client, "_control_fence", None)
+            if binary_hidden and fence is not None and fence.enabled:
+                snapshot, body = split_task_worker_hidden(message.snapshot(), enabled=True)
+                if body is not None and binary_hidden_frame_bytes(
+                    snapshot, len(body), control_certificate=fence.current_certificate(),
+                ) > MAX_BINARY_FRAME_BYTES:
+                    raise WorkerProtocolError(
+                        "message exceeds maximum size", code="message_too_large", field="message",
+                    )
+            return message
 
         output = result_payload.get("output")
         hidden = output.get("hidden_out_f32") if isinstance(output, Mapping) else None
@@ -720,6 +742,10 @@ class SchedulerTaskWorkerMixin:
                 == "relay_middle"
             ),
         }
+        # Old coordinators reject even an unknown optional capability set to
+        # false. The compatibility switch must omit the key entirely.
+        if layer_worker and binary_hidden_transport_enabled():
+            capabilities["binary_hidden"] = True
         if artifact is not None and artifact.get("segment_mode") in {
             "head", "middle", "tail",
         }:
@@ -897,11 +923,42 @@ class SchedulerTaskWorkerMixin:
             if epoch is None:
                 raise ConnectionError("task worker registration is no longer current")
             send_options["registration_epoch"] = epoch
+        # ★ 票 21a（COMM-WIRE-01）：对端声明 `binary_hidden` 时，把内联 hidden 抽成
+        #   帧的二进制体（省 base64 的 33% 膨胀与编解码开销）；未声明者逐字段走旧
+        #   路径、字节不变。能力位来自该 worker 的 hello 自荐。
+        peer = self._task_worker_control.worker_snapshot(node_id)
+        peer_capabilities = peer.get("capabilities") or {}
+        binary_enabled = (
+            peer.get("binary_hidden") is True
+            and isinstance(peer_capabilities, dict)
+            and peer_capabilities.get("binary_hidden") is True
+        )
+        body_message, binary_body = split_task_worker_hidden(
+            message.snapshot(), enabled=binary_enabled,
+        )
+        if binary_body is not None:
+            logger.debug(
+                "event=task_worker_binary_hidden_sent node_id=%s message_type=%s bytes=%d",
+                node_id, body_message.get("message_type"), len(binary_body),
+            )
+        # ★ 票 21a：无二进制体时**连调用形状都不变**（不传 `binary_body`）——
+        #   否则既有 send_to_client 的替身/包装会因多一个关键字参数而失败
+        #   （实测：三处测试替身报 unexpected keyword argument）。
+        send_kwargs = dict(send_options)
+        if binary_body is not None:
+            send_kwargs["binary_body"] = binary_body
         sent = server.send_to_client(
-            node_id, message.snapshot(), MessageType.TASK_WORKER, **send_options,
+            node_id, body_message, MessageType.TASK_WORKER, **send_kwargs,
         )
         if sent is False:
             raise ConnectionError("task worker message was not delivered")
+
+
+    def _task_worker_binary_hidden_enabled(self) -> bool:
+        client = getattr(self, "_tcp_client", None)
+        capture = getattr(client, "capture_registration_owner", None)
+        owner = capture() if callable(capture) else None
+        return self._task_worker_control.worker_binary_hidden_enabled(owner)
 
 
     def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
@@ -910,7 +967,23 @@ class SchedulerTaskWorkerMixin:
             raise ConnectionError("task worker is not connected to its master")
         from transport_port import MessageType
 
-        client.send_data(message.snapshot(), MessageType.TASK_WORKER)
+        capture = getattr(client, "capture_registration_owner", None)
+        owner = capture() if callable(capture) else None
+        snapshot, binary_body = split_task_worker_hidden(
+            message.snapshot(),
+            enabled=self._task_worker_control.worker_binary_hidden_enabled(owner),
+        )
+        if binary_body is None:
+            client.send_data(snapshot, MessageType.TASK_WORKER)
+            return
+        logger.debug(
+            "event=task_worker_binary_hidden_sent_to_master message_type=%s bytes=%d",
+            snapshot.get("message_type"), len(binary_body),
+        )
+        # A reconnect during serialization must not send the old result to a
+        # successor that has not negotiated binary hidden.
+        client.send_data(snapshot, MessageType.TASK_WORKER,
+                         connection_sock=owner[2], binary_body=binary_body)
 
 
     def _task_worker_hello_followup_owner_current(self, node_id, work) -> bool:
@@ -1122,7 +1195,9 @@ class SchedulerTaskWorkerMixin:
     def _replay_task_worker_responses(self, responses: list[dict]) -> None:
         for response in responses:
             self._send_task_worker_to_master(
-                decode_task_worker_message(response)
+                decode_task_worker_message(
+                    response, binary_hidden=self._task_worker_binary_hidden_enabled(),
+                )
             )
 
 
@@ -1800,8 +1875,39 @@ class SchedulerTaskWorkerMixin:
                 client_id,
             )
             return
+        # ★ 票 21a（COMM-WIRE-01）：帧的二进制体**必须在 decode 之前**放回内联 hidden。
+        #   精确字段校验会以 `invalid_fields` 拒绝顶层未知键 ⇒ `binary` 段绝不能随消息
+        #   进 `decode_message`。放回的是 base64 字符串，因此其后所有既有代码
+        #   （含 `_handle_task_worker_stage_offer`）都不必知道二进制路径存在。
+        binary_body = msg.get("binary")
+        binary_hidden = False
         try:
-            message = decode_task_worker_message(raw)
+            if binary_body is not None or msg.get("format") == "binary":
+                if self._effective_role() == "master":
+                    peer = self._task_worker_control.worker_snapshot(client_id)
+                    capabilities = peer.get("capabilities") or {}
+                    negotiated = (
+                        peer.get("binary_hidden") is True
+                        and isinstance(capabilities, dict)
+                        and capabilities.get("binary_hidden") is True
+                    )
+                else:
+                    negotiated = self._task_worker_binary_hidden_enabled()
+                if not negotiated:
+                    raise WorkerProtocolError(
+                        "binary hidden was not negotiated", code="binary_hidden_not_negotiated",
+                    )
+                if not isinstance(binary_body, (bytes, bytearray)):
+                    raise WorkerProtocolError(
+                        "binary hidden body is missing", code="invalid_binary_hidden",
+                    )
+                raw = restore_task_worker_hidden(raw, bytes(binary_body))
+                binary_hidden = True
+                logger.debug(
+                    "event=task_worker_binary_hidden_received peer=%s message_type=%s bytes=%d",
+                    client_id, raw.get("message_type"), len(binary_body),
+                )
+            message = decode_task_worker_message(raw, binary_hidden=binary_hidden)
             if self._effective_role() == "master":
                 if client_id == "master":
                     raise WorkerProtocolError(
@@ -1897,10 +2003,12 @@ class SchedulerTaskWorkerMixin:
                         client_id, self._tcp_server, hello_connection_generation,
                     )
                     logger.info(
-                        "event=task_worker_hello_acked node_id=%s accepted=%s version=%s",
+                        "event=task_worker_hello_acked node_id=%s accepted=%s version=%s "
+                        "binary_hidden_negotiated=%s",
                         client_id,
                         ack.payload["accepted"],
                         ack.payload["selected_version"],
+                        ack.payload.get("binary_hidden") is True,
                     )
                     # ★ 2026-10-07（DIST-NEXT-6）：把「哪些工件被判不可用、为什么」打到
                     #   master 日志 —— 否则节点被静默剔除时这里只剩
@@ -1944,7 +2052,10 @@ class SchedulerTaskWorkerMixin:
                             code="worker_not_admitted",
                             field="message_type",
                         )
-                    provider.handle_message(raw)
+                    if binary_hidden:
+                        provider.handle_message(raw, binary_hidden=True)
+                    else:
+                        provider.handle_message(raw)
                 else:
                     raise WorkerProtocolError(
                         "message is not valid in the N2.2 coordinator direction",
@@ -1959,12 +2070,35 @@ class SchedulerTaskWorkerMixin:
                         field="message_type",
                     )
                 if message.message_type == "hello_ack":
-                    accepted = self._task_worker_control.receive_on_worker(raw)
+                    from tcp_comm import TCPClient
+                    # Read TLS independently of the current client pointer: it
+                    # may be detached while the old receive callback is running.
+                    received_owner = TCPClient.received_registration_owner()
+                    client = getattr(self, "_tcp_client", None)
+                    if received_owner is None:
+                        # Direct in-process protocol consumers have no TCP callback.
+                        accepted = self._task_worker_control.receive_on_worker(raw)
+                    else:
+                        # Short state publication only: keep the same lock order
+                        # as hello begin, and never hold registration during I/O.
+                        with self._task_worker_refresh_lock:
+                            if client is None or self._tcp_client is not client:
+                                raise WorkerProtocolError("hello_ack owner changed", code="stale_hello_ack")
+                            accepted = client.run_if_registration_owner(
+                                received_owner,
+                                lambda: self._task_worker_control.receive_on_worker(
+                                    raw, registration_owner=received_owner,
+                                ),
+                            )
+                        if accepted is None:
+                            raise WorkerProtocolError("hello_ack owner retired", code="stale_hello_ack")
                     logger.info(
-                        "event=task_worker_hello_ack_received coordinator=%s accepted=%s version=%s",
+                        "event=task_worker_hello_ack_received coordinator=%s accepted=%s version=%s "
+                        "binary_hidden_negotiated=%s",
                         accepted.payload["coordinator_node_id"],
                         accepted.payload["accepted"],
                         accepted.payload["selected_version"],
+                        self._task_worker_binary_hidden_enabled(),
                     )
                     with self._task_worker_refresh_lock:
                         refresh_requested = self._task_worker_refresh_requested

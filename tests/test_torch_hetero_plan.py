@@ -9,6 +9,13 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# 证据工件只存在于本机（`local_docs/evidence/`，不入库）；缺它按约定跳过。
+_EVIDENCE = ROOT / "local_docs" / "evidence"
+pytestmark = pytest.mark.skipif(
+    not (_EVIDENCE / "torch-hetero-plan").exists() or not (_EVIDENCE / "torch-op-profile").exists(),
+    reason="缺本机证据工件 local_docs/evidence/{torch-hetero-plan,torch-op-profile}",
+)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

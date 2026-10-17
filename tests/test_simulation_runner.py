@@ -1,7 +1,12 @@
 import json
 import os
+from pathlib import Path
+
+import pytest
 
 from scripts import run_simulation
+
+_VENV_TEST = Path(__file__).resolve().parents[1] / ".venv-test"
 
 
 def test_simulation_runner_profiles_are_fixed_and_layered():
@@ -68,6 +73,7 @@ def test_simulation_runner_default_stdout_is_parseable_json(capsys, monkeypatch)
     assert summary["pytest"]["counts"]["passed"] == 1
 
 
+@pytest.mark.skipif(not _VENV_TEST.exists(), reason="缺本机 .venv-test 虚拟环境（CI 用系统解释器）")
 def test_pytest_python_prefers_venv_test_when_called_from_system_python(monkeypatch):
     """系统 Python 调用时优先返回 .venv-test 解释器（环境分割铁律）。"""
     monkeypatch.setattr(run_simulation.sys, "prefix", "C:/Python312")

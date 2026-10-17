@@ -1024,18 +1024,36 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
 # 消息构建与解析
 # ================================================================
 
-def build_message(msg_type: MessageType, data: Any = None) -> bytes:
+def build_message(msg_type: MessageType, data: Any = None,
+                  binary_body: Optional[bytes] = None) -> bytes:
     """
     构建通信消息。
 
     Args:
         msg_type: 消息类型
         data: 消息载荷（dict/str 用于JSON，torch.Tensor 用于张量）
+        binary_body: 可选二进制体（raw 字节，**不经 base64**）。与 `data` 同帧但
+            独立成段：帧 = [长度][JSON meta] + [长度][binary_body]。层段 hidden 这类
+            大块 f32 数据走此路径，省掉 base64 的 33% 膨胀与编解码开销；该帧的
+            JSON 元数据（layer_range / hidden_spec / 摘要）仍由 `data` 承载。
 
     Returns:
         封包后的字节流
     """
     meta = {"type": msg_type.value}
+
+    # ★ 票 21a（COMM-WIRE-01）：显式二进制体。与张量路径同一帧布局（元数据段 +
+    #   数据段），但不要求 torch、也不做反序列化 ⇒ Android 等无 torch 对端可解析。
+    #   未传 binary_body 时本分支不进入，逐字节与既有行为一致。
+    if binary_body is not None:
+        meta["format"] = "binary"
+        meta["binary_bytes"] = len(binary_body)
+        if data is not None:
+            meta["data"] = data
+        meta_bytes = json.dumps(meta).encode("utf-8")
+        _validate_binary_length(meta, len(binary_body), len(meta_bytes))
+        # 组合: [meta长度(4B)] + [meta JSON] + [体长度(4B)] + [raw 字节]
+        return pack_data(meta_bytes) + pack_data(bytes(binary_body))
 
     if torch is not None and isinstance(data, torch.Tensor):
         meta["format"] = "tensor"
@@ -1052,6 +1070,19 @@ def build_message(msg_type: MessageType, data: Any = None) -> bytes:
         return pack_data(json.dumps(meta).encode("utf-8"))
 
 
+def _validate_binary_length(meta: dict, body_length: int, meta_length: int) -> None:
+    """Reject a bad declaration or oversized task-worker frame before body I/O."""
+    declared = meta.get("binary_bytes")
+    if (type(declared) is not int or declared != body_length
+            or not 0 < body_length <= MAX_PACKET_SIZE):
+        raise ConnectionError("invalid binary packet length")
+    if meta.get("type") == MessageType.TASK_WORKER.value:
+        from task_worker_protocol import MAX_BINARY_FRAME_BYTES
+
+        if meta_length + HEADER_LEN + body_length > MAX_BINARY_FRAME_BYTES:
+            raise ConnectionError("task worker binary message exceeds maximum size")
+
+
 def parse_message(raw: bytes) -> dict:
     """
     解析通信消息。
@@ -1060,13 +1091,21 @@ def parse_message(raw: bytes) -> dict:
         raw: 原始数据包
 
     Returns:
-        包含 type 和 data 的字典。张量消息额外包含 tensor 字段。
+        包含 type 和 data 的字典。张量消息额外包含 tensor 字段，
+        二进制消息额外包含 bytes 字段（均在后续段中，由调用方继续接收）。
     """
     meta = json.loads(raw.decode("utf-8"))
 
     if meta.get("format") == "tensor":
         # 张量数据在后续包中，由调用方继续接收
         meta["_needs_tensor"] = True
+    elif meta.get("format") == "binary":
+        declared = meta.get("binary_bytes")
+        if type(declared) is not int or not 0 < declared <= MAX_PACKET_SIZE:
+            raise ConnectionError("invalid binary packet length")
+        # ★ 票 21a：二进制体在后续段中，由调用方继续接收（与张量同一模式，
+        #   但不做反序列化 —— 调用方拿到的是 raw 字节）。
+        meta["_needs_binary"] = True
     return meta
 
 
@@ -1521,6 +1560,17 @@ class TCPServer:
                         break
                     msg["tensor"] = deserialize_tensor(tensor_data)
                     del msg["_needs_tensor"]
+                # ★ 票 21a：二进制体（raw 字节，不做反序列化）。
+                elif msg.get("_needs_binary"):
+                    binary_header = recv_exact(conn, HEADER_LEN, mid_frame=True)
+                    if binary_header is None:
+                        break
+                    binary_len = unpack_header(binary_header)
+                    _validate_binary_length(msg, binary_len, payload_len)
+                    msg["binary"] = recv_exact(conn, binary_len, mid_frame=True)
+                    if msg["binary"] is None:
+                        break
+                    del msg["_needs_binary"]
 
                 msg_type = msg.get("type", "")
                 registration_pending = False
@@ -1907,7 +1957,8 @@ class TCPServer:
 
     def send_to_client(self, client_id: str, data: Any,
                        msg_type: MessageType = MessageType.TENSOR,
-                       *, registration_epoch: int | None = None) -> None:
+                       *, registration_epoch: int | None = None,
+                       binary_body: Optional[bytes] = None) -> None:
         """
         向指定从节点发送数据。
 
@@ -1915,12 +1966,13 @@ class TCPServer:
             client_id: 从节点ID（"client1" / "client2"）
             data: 发送数据（dict / torch.Tensor）
             msg_type: 消息类型
+            binary_body: 可选二进制体（raw 字节，见 `build_message`）。
         """
         conn = self._get_client(client_id)
         if conn is None:
             raise ConnectionError(f"从节点 {client_id} 未连接")
         data = _decorate_control_payload(data, msg_type, self._control_fence)
-        packet = build_message(msg_type, data)
+        packet = build_message(msg_type, data, binary_body=binary_body)
         try:
             # 心跳 ACK、控制消息和大张量会由不同线程发送，必须保持完整帧原子写入。
             with conn.send_lock:
@@ -2111,6 +2163,9 @@ class TCPServer:
 # TCP 客户端（从节点）
 # ================================================================
 
+_CLIENT_RECEIVE_CONTEXT = threading.local()
+
+
 class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
@@ -2157,6 +2212,9 @@ class TCPClient:
         self._registration_epoch = 0
         self._registered = False
         self.last_register_error: str = ""
+        # 注册确认等待期间，本代连接可能被别的线程（上一代心跳/接收的收尾，或显式
+        # disconnect()）关闭或置换。那种情况这一代已经作废，不是一次注册失败。
+        self._last_registration_interrupted = False
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
         self._last_heartbeat_ack_send: float = 0.0
@@ -2176,6 +2234,11 @@ class TCPClient:
         self.last_reconnect_error = ""
         self.next_reconnect_at = 0.0
         self._control_fence: ControlFence | None = None
+
+    @staticmethod
+    def received_registration_owner() -> tuple | None:
+        """Return the owner of this thread's current TCP callback, if any."""
+        return getattr(_CLIENT_RECEIVE_CONTEXT, "owner", None)
 
     def capture_registration_owner(self) -> tuple | None:
         """Capture an authenticated (client, epoch, socket) under its publish lock."""
@@ -2366,6 +2429,7 @@ class TCPClient:
                 with self._disconnect_callback_lock:
                     self._registered = False
                 self.last_register_error = ""
+                self._last_registration_interrupted = False
 
             # 所有可能较慢的注册准备必须在建立 TCP 连接前完成。首次模型
             # 摘要和 Windows 网络检测都可能超过服务端的注册等待超时。
@@ -2443,30 +2507,59 @@ class TCPClient:
                         "model_sha256": model_sha256,
                         "auth": build_auth_signature(self.client_id),
                     }
+                    # 本代连接自证：等待注册确认期间，self.sock 可能被别的线程置换
+                    # 或关闭（disconnect()／上一代传输收尾）。必须能识别「这一代已作废」，
+                    # 而不是当成一次注册失败 —— 否则一次正常断线会被放大成
+                    # worker_reconnect_exhausted（2026-10-16 ROG 实测 WinError 10038）。
+                    with self._disconnect_callback_lock:
+                        register_sock = self.sock
+                        register_generation = self._connection_generation
                     self.send_data(reg_data, MessageType.REGISTER)
 
                     # 等待注册确认
                     register_reason = "未收到注册确认"
                     registered = False
-                    try:
-                        ack_msg = self.recv_data()
-                        if ack_msg and ack_msg.get("type") == "register":
-                            ack_data = ack_msg.get("data", {})
-                            if ack_data.get("status") == "registered":
-                                registered = True
-                                logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
+                    registration_interrupted = False
+                    if register_sock is None or not self._running:
+                        # 连接在发送 REGISTER 前后就被置换/关闭了：不在这条已作废的
+                        # 连接上继续等待。
+                        registration_interrupted = True
+                        register_reason = "注册被中断（连接已由其他线程关闭）"
+                    else:
+                        try:
+                            ack_msg = self.recv_data()
+                            if ack_msg and ack_msg.get("type") == "register":
+                                ack_data = ack_msg.get("data", {})
+                                if ack_data.get("status") == "registered":
+                                    registered = True
+                                    logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
+                                else:
+                                    status = ack_data.get("status") or "unknown"
+                                    reason = ack_data.get("reason") or ack_data.get("message") or status
+                                    register_reason = f"注册被拒绝: {reason}"
+                            elif ack_msg:
+                                register_reason = f"注册确认类型异常: {ack_msg.get('type')}"
+                        except (socket.timeout, OSError) as e:
+                            with self._disconnect_callback_lock:
+                                displaced = (
+                                    self.sock is not register_sock
+                                    or self._connection_generation != register_generation
+                                )
+                            registration_interrupted = displaced or not self._running
+                            if registration_interrupted:
+                                register_reason = "注册被中断（连接已由其他线程关闭）"
+                                logger.info(
+                                    "注册确认等待被中断: client=%s generation=%s→%s",
+                                    self.client_id, register_generation,
+                                    self._connection_generation,
+                                )
                             else:
-                                status = ack_data.get("status") or "unknown"
-                                reason = ack_data.get("reason") or ack_data.get("message") or status
-                                register_reason = f"注册被拒绝: {reason}"
-                        elif ack_msg:
-                            register_reason = f"注册确认类型异常: {ack_msg.get('type')}"
-                    except (socket.timeout, OSError) as e:
-                        register_reason = f"注册确认等待失败: {e}"
-                        logger.warning(f"注册确认等待超时: {e}", exc_info=True)
+                                register_reason = f"注册确认等待失败: {e}"
+                                logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
                     if not registered:
                         self.last_register_error = register_reason
+                        self._last_registration_interrupted = registration_interrupted
                         # Fence worker threads before closing a failed
                         # registration socket. Otherwise an old heartbeat can
                         # write to the closed descriptor and surface WinError
@@ -2493,6 +2586,10 @@ class TCPClient:
                             self.client_id, self.server_host, self.server_port,
                             register_reason,
                         )
+                        if registration_interrupted:
+                            # 本代连接已被别的线程置换或关闭：在同一批重试里再连一次
+                            # 没有意义，交给上层按正常重连节奏安排下一次，且不计失败。
+                            return False
                         return False
 
                     # Publish REGISTER and start its loops under the intent lock.
@@ -2503,6 +2600,7 @@ class TCPClient:
                             return False
                         with self._disconnect_callback_lock:
                             self._registered = True
+                            self._last_registration_interrupted = False
                             self._registration_epoch += 1
                             self._connection_generation += 1
                             connection_generation = self._connection_generation
@@ -2564,13 +2662,22 @@ class TCPClient:
         try:
             while self._running and connection_sock:
                 with self._disconnect_callback_lock:
-                    if (connection_generation is not None
-                            and connection_generation != self._connection_generation):
+                    if ((connection_generation is not None
+                         and connection_generation != self._connection_generation)
+                            or self.sock is not connection_sock):
                         break
+                    received_owner = (self, self._registration_epoch, connection_sock)
                 try:
                     msg = self.recv_data(connection_sock)
                     if msg is None:
                         break  # 连接断开
+                    # The socket may have been replaced while recv_data blocked.
+                    with self._disconnect_callback_lock:
+                        if (self.sock is not connection_sock
+                                or self._registration_epoch != received_owner[1]
+                                or (connection_generation is not None
+                                    and connection_generation != self._connection_generation)):
+                            break
                     self._transport_runtime_call(
                         "observe_legacy_receive",
                         msg,
@@ -2586,10 +2693,14 @@ class TCPClient:
                         logger.warning("TCP control frame rejected code=%s type=%s", exc.code, msg.get("type"))
                         continue
                     if self.on_message:
+                        previous_owner = getattr(_CLIENT_RECEIVE_CONTEXT, "owner", None)
+                        _CLIENT_RECEIVE_CONTEXT.owner = received_owner
                         try:
                             self.on_message(msg)
                         except Exception as e:
                             logger.error(f"消息回调异常: {e}", exc_info=True)
+                        finally:
+                            _CLIENT_RECEIVE_CONTEXT.owner = previous_owner
                 except socket.timeout:
                     continue
                 except (ConnectionError, OSError) as e:
@@ -2657,10 +2768,11 @@ class TCPClient:
                 logger.debug("客户端断连回调异常: %s", exc, exc_info=True)
 
     def send_data(self, data: Any, msg_type: MessageType = MessageType.TENSOR,
-                  connection_sock: socket.socket = None) -> None:
+                  connection_sock: socket.socket = None,
+                  binary_body: Optional[bytes] = None) -> None:
         """向主节点发送数据"""
         data = _decorate_control_payload(data, msg_type, self._control_fence)
-        packet = build_message(msg_type, data)
+        packet = build_message(msg_type, data, binary_body=binary_body)
         self._transport_runtime_call(
             "observe_legacy_send",
             packet,
@@ -2723,6 +2835,18 @@ class TCPClient:
                 return None
             msg["tensor"] = deserialize_tensor(tensor_data)
             del msg["_needs_tensor"]
+        # ★ 票 21a：二进制体在同一帧的后续段里（raw 字节，不做反序列化）。
+        elif msg.get("_needs_binary"):
+            binary_header = recv_exact(active_sock, HEADER_LEN, mid_frame=True)
+            if binary_header is None:
+                return None
+            binary_len = unpack_header(binary_header)
+            _validate_binary_length(msg, binary_len, payload_len)
+            binary_data = recv_exact(active_sock, binary_len, mid_frame=True)
+            if binary_data is None:
+                return None
+            msg["binary"] = binary_data
+            del msg["_needs_binary"]
 
         return msg
 
@@ -2945,6 +3069,18 @@ class TCPClient:
                     self.reconnect_state = "ready"
                     self.last_reconnect_error = ""
                     logger.info("重连主节点成功: client=%s intent_epoch=%s", self.client_id, epoch)
+                elif self._last_registration_interrupted:
+                    # 连接在注册等待期间被主动置换或关闭：这不是一次注册失败，
+                    # 不计入 reconnect_failure_count —— 计进去会把一次正常断线放大成
+                    # worker_reconnect_exhausted（2026-10-16 ROG 实测：failures 累到 8
+                    # 后进入每分钟一次的低频重试）。
+                    # 但这一代确实作废了，必须自己安排下一次重连：中断路径不会发布
+                    # 连接，lost_published_connection 恒为 False，不能指望那条兜底。
+                    retry = True
+                    self.reconnect_state = "backing_off"
+                    self.last_reconnect_error = "registration_interrupted"
+                    logger.info("重连未完成（注册被中断）: client=%s reason=%s",
+                                self.client_id, self.last_register_error)
                 else:
                     self.reconnect_failure_count += 1
                     retry = self.reconnect_failure_count < self.MAX_RECONNECT_FAILURES

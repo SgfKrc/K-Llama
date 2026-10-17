@@ -255,6 +255,10 @@ def test_quality_compare_rule_uses_baseline_rates(tmp_path):
     assert "baseline*0.9" in " ".join(record["quality_gate"]["criteria"])
 
 
+@pytest.mark.skipif(
+    not (SCRIPTS_DIR / "experiment_quality_calibrate.py").exists(),
+    reason="缺 scripts/experiment_quality_calibrate.py（scripts 白名单未放行的实验脚本）",
+)
 def test_calibration_summarizer_requires_three_rounds_and_never_edits_plan(tmp_path):
     records = tmp_path / "records.jsonl"
     series = "ex-n3-test-series-v1"

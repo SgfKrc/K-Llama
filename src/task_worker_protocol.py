@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -24,6 +25,9 @@ MIN_PROTOCOL_VERSION = 1
 #: `unsupported_stage_type` 拒绝（fail-closed，不做静默降级）。
 MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+# Match SocketTaskWorkerTransport: outer metadata + body length + raw bytes;
+# the first metadata length prefix is excluded. Legacy JSON remains 8 MiB inside.
+MAX_BINARY_FRAME_BYTES = MAX_MESSAGE_BYTES + 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
 #: ★ 2026-10-07（DIST-NEXT-2）：层段 hidden 的 **wire 预算**。
@@ -619,6 +623,14 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   的 dispatch 前预检负责拒绝超预算请求）。两侧必须同时放行。
     if "stage_chunked_input" in capabilities:
         expected_fields.add("stage_chunked_input")
+    # ★ 票 21a（COMM-WIRE-01）：层段 hidden 的**二进制帧**接收能力（可选，默认关）。
+    #   声明 `binary_hidden == true` 的对端，才可能收到 `format:"binary"` 的帧
+    #   （见 `build_message` 的 `binary_body`）；未声明者继续走 base64 内联，
+    #   字节与旧行为一致。与其余可选键同样按「出现才允许」处理 —— 两侧
+    #   （主仓这里与 android `TaskWorkerProtocol`）必须**同时**放行，只改一边
+    #   会让对端 hello 自校验失败（`segment_mode` 那次实测的静默断连坑）。
+    if "binary_hidden" in capabilities:
+        expected_fields.add("binary_hidden")
     _require_exact_fields(
         capabilities,
         expected_fields,
@@ -830,6 +842,10 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             capabilities["stage_chunked_input"],
             "payload.capabilities.stage_chunked_input",
         )
+    if "binary_hidden" in capabilities:
+        _require_bool(
+            capabilities["binary_hidden"], "payload.capabilities.binary_hidden",
+        )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines:
         raise _error(
@@ -1023,6 +1039,8 @@ def _validate_payload(
         and isinstance(payload, Mapping)
     ):
         required = required | (_STAGE_CANCELLED_OPTIONAL_FIELDS & set(payload))
+    if message_type == "hello_ack" and "binary_hidden" in payload:
+        required = required | {"binary_hidden"}
     _require_exact_fields(payload, required, "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
@@ -1049,6 +1067,13 @@ def _validate_payload(
             payload["reason_code"], "payload.reason_code", pattern=_SAFE_CODE,
             allow_empty=True, max_length=64,
         )
+        if "binary_hidden" in payload:
+            binary_hidden = _require_bool(payload["binary_hidden"], "payload.binary_hidden")
+            if binary_hidden and (not accepted or version < 3 or selected < 3):
+                raise _error(
+                    "invalid_negotiation_result", "payload.binary_hidden",
+                    "binary hidden requires an accepted v3 hello",
+                )
         if accepted and selected != version:
             raise _error(
                 "invalid_selected_version", "payload.selected_version",
@@ -1301,7 +1326,29 @@ def _validate_payload(
                 )
 
 
-def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
+def binary_hidden_frame_bytes(
+    message: Mapping[str, Any], raw_bytes: int, *,
+    control_certificate: Mapping[str, Any] | None = None,
+) -> int:
+    """Exact TCP binary frame budget, excluding the first metadata length header.
+
+    Match tcp_comm.build_message's default json.dumps encoding, including spaces
+    and ASCII escaping. Canonical inner JSON is smaller and is not a wire budget.
+    Callers can include the certificate that TCP appends before serializing data.
+    """
+    data = dict(message)
+    if control_certificate is not None and "control_certificate" not in data:
+        data["control_certificate"] = dict(control_certificate)
+    meta = {
+        "type": "task_worker", "format": "binary",
+        "binary_bytes": raw_bytes, "data": data,
+    }
+    return len(json.dumps(meta).encode("utf-8")) + _BINARY_BODY_HEADER_BYTES + raw_bytes
+
+
+def validate_message(
+    value: Mapping[str, Any], *, binary_hidden: bool = False,
+) -> WorkerMessage:
     if not isinstance(value, Mapping):
         raise _error("invalid_envelope", "message", "message must be an object")
     _require_exact_fields(value, _ENVELOPE_FIELDS, "message")
@@ -1344,12 +1391,18 @@ def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
         _payload_json=canonical_json(payload),
     )
     try:
-        message_size = len(canonical_message_bytes(message))
+        wire_snapshot, body = split_inline_hidden(
+            message.snapshot(), enabled=binary_hidden,
+        )
+        message_size = len(canonical_json(wire_snapshot).encode("utf-8"))
+        if body is not None:
+            message_size = binary_hidden_frame_bytes(wire_snapshot, len(body))
     except UnicodeEncodeError as exc:
         raise _error(
             "invalid_encoding", "message", "message must be valid UTF-8"
         ) from exc
-    if message_size > MAX_MESSAGE_BYTES:
+    message_limit = MAX_BINARY_FRAME_BYTES if body is not None else MAX_MESSAGE_BYTES
+    if message_size > message_limit:
         raise _error(
             "message_too_large", "message", "message exceeds maximum size"
         )
@@ -1363,6 +1416,7 @@ def build_message(
     message_id: str,
     sent_at_ms: int,
     version: int = PROTOCOL_VERSION,
+    binary_hidden: bool = False,
 ) -> WorkerMessage:
     return validate_message({
         "protocol": PROTOCOL_NAME,
@@ -1371,12 +1425,19 @@ def build_message(
         "message_id": message_id,
         "sent_at_ms": sent_at_ms,
         "payload": dict(payload),
-    })
+    }, binary_hidden=binary_hidden)
 
 
-def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
+def decode_message(
+    raw: bytes | str | Mapping[str, Any], *, binary_hidden: bool = False,
+) -> WorkerMessage:
+    # Restored hidden is base64 in memory, but only an explicitly binary frame
+    # may use the larger representation. validate_message checks its wire size.
+    representation_limit = (
+        _base64_wire_length(MAX_BINARY_FRAME_BYTES) if binary_hidden else MAX_MESSAGE_BYTES
+    )
     if isinstance(raw, bytes):
-        if len(raw) > MAX_MESSAGE_BYTES:
+        if len(raw) > representation_limit:
             raise _error(
                 "message_too_large", "message", "message exceeds maximum size"
             )
@@ -1393,7 +1454,7 @@ def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
             raise _error(
                 "invalid_encoding", "message", "message must be valid UTF-8"
             ) from exc
-        if raw_size > MAX_MESSAGE_BYTES:
+        if raw_size > representation_limit:
             raise _error(
                 "message_too_large", "message", "message exceeds maximum size"
             )
@@ -1405,7 +1466,7 @@ def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
         decoded = raw
     if not isinstance(decoded, Mapping):
         raise _error("invalid_envelope", "message", "message must be an object")
-    return validate_message(decoded)
+    return validate_message(decoded, binary_hidden=binary_hidden)
 
 
 def canonical_message_bytes(message: WorkerMessage) -> bytes:
@@ -1447,13 +1508,24 @@ def _base64_wire_length(raw_bytes: int) -> int:
     return 4 * (-(-count // 3))
 
 
-def hidden_wire_bytes(
-    n_tokens: int, n_embd: int, dtype: str = "float32",
-) -> int:
-    """层段 hidden 在 JSON 帧里占用的字节数（raw + base64 膨胀）。
+#: ★ 票 21a（COMM-WIRE-01）：二进制体的长度头字节数（`tcp_comm.pack_data` 的
+#: 4 字节大端长度前缀）。二进制帧 = `[meta 长度][meta JSON]` + `[本长度][raw 字节]`。
+_BINARY_BODY_HEADER_BYTES = 4
 
-    ★ 2026-10-07（DIST-NEXT-2）：dispatch 前的**唯一** wire 大小来源。协议两侧
+
+def hidden_wire_bytes(
+    n_tokens: int, n_embd: int, dtype: str = "float32", *,
+    binary: bool = False,
+) -> int:
+    """层段 hidden 在帧里占用的字节数。
+
+    默认（`binary=False`）按 **JSON + base64** 计（raw 的 `4×ceil(n/3)`）；协议两侧
     （主仓 Python 与 `android` 的 `TaskWorkerProtocol`）用同一公式与同一余量常量。
+
+    ★ 票 21a（COMM-WIRE-01）：`binary=True` 表示该帧走 `format:"binary"` 的**原始
+    字节体** ⇒ 只有 `raw` 加一个 4 字节长度头，省掉 33% 膨胀（同样预算下单帧容量
+    +≈33%）。**只有对端声明了 `binary_hidden` 才能传 True** —— 否则实际发出的仍是
+    base64 帧，会以 `message_too_large` 失败。
     """
     if dtype not in HIDDEN_DTYPE_BYTES:
         raise _error(
@@ -1469,7 +1541,133 @@ def hidden_wire_bytes(
             "hidden_spec.n_tokens/n_embd must be positive",
         )
     raw_bytes = tokens * embd * HIDDEN_DTYPE_BYTES[dtype]
+    if binary:
+        return raw_bytes + _BINARY_BODY_HEADER_BYTES
     return _base64_wire_length(raw_bytes)
+
+
+#: ★ 票 21a（COMM-WIRE-01）：内联 hidden 在消息里的**唯一**落点，按消息类型推导。
+#: 因此二进制体**不需要任何新协议字段** —— raw 的位置由「帧 `format:"binary"` + 消息
+#: 类型」共同确定，逐位完整性仍由既有的摘要字段承担（`hidden_sha256` /
+#: `hidden_out_sha256` / 分片自己的 `payload_sha256`）。
+#:
+#: 容器键为 `None` 表示**载荷就在 `payload` 顶层**（分片路径：`payload_b64` 本身就是
+#: 那一段 raw 字节的 base64）。入程 `stage_chunk` 与回程 `stage_result_chunk` 共用同一
+#: 形状，所以这里一条定义覆盖两个方向。
+BINARY_HIDDEN_PATHS = {
+    "stage_offer": ("root_input", "hidden_f32"),
+    "stage_result": ("output", "hidden_out_f32"),
+    "stage_chunk": (None, "payload_b64"),
+    "stage_result_chunk": (None, "payload_b64"),
+}
+
+
+def inline_hidden_path(message_type: str) -> tuple[str | None, str] | None:
+    """该消息类型里内联 hidden 的 `(容器键, 字段名)`；不承载内联 hidden 则 `None`。
+
+    容器键为 `None` 表示载荷就在 `payload` 顶层（分片路径）。
+    """
+    return BINARY_HIDDEN_PATHS.get(str(message_type))
+
+
+def _split_field(container: Mapping[str, Any], field_key: str):
+    """把 `container[field_key]`（base64 字符串）抽成 raw 字节并删除该字段。
+
+    返回 `(新容器, raw)`；不可抽（非字符串 / 非法 base64 / 空）则返回 `None`。
+    """
+    encoded = container.get(field_key)
+    if not isinstance(encoded, str):
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:  # noqa: BLE001 - 非法 base64 交给既有协议校验报错
+        return None
+    if not raw or base64.b64encode(raw).decode("ascii") != encoded:
+        return None
+    new_container = {key: value for key, value in container.items()}
+    new_container.pop(field_key, None)
+    return new_container, raw
+
+
+def _restore_field(container: Mapping[str, Any], field_key: str, raw: bytes):
+    """`_split_field` 的逆：把 raw 以 base64 放回 `field_key`。"""
+    new_container = {key: value for key, value in container.items()}
+    new_container[field_key] = base64.b64encode(raw).decode("ascii")
+    return new_container
+
+
+def split_inline_hidden(
+    message: Mapping[str, Any], *, enabled: bool,
+) -> "tuple[dict[str, Any], bytes | None]":
+    """★ 票 21a：把内联 base64 hidden 抽成**帧的二进制体**（能力位开启时）。
+
+    返回 `(snapshot, raw)`：
+
+    * `enabled` 为假、该消息类型不承载内联 hidden、值是 `hidden_ref`（已走分片）、
+      或值不是合法 base64 ⇒ `raw is None` 且结果与输入**逐字段相同**
+      （零行为变化：旧路径的帧字节完全不变）；
+    * 否则 `raw` = `base64.b64decode(hidden_f32)` 的原始字节，并把该字段从 JSON 里
+      **删除** —— 同一份数据不能同帧两份，否则体积比 base64 还大。
+    """
+    snapshot = {key: value for key, value in message.items()}
+    if not enabled:
+        return snapshot, None
+    path = inline_hidden_path(snapshot.get("message_type", ""))
+    if path is None:
+        return snapshot, None
+    container_key, field_key = path
+    payload = snapshot.get("payload")
+    if not isinstance(payload, Mapping):
+        return snapshot, None
+    if container_key is None:
+        # 分片路径：载荷就在 `payload` 顶层（`payload_b64` 自身即那一段 raw）。
+        result = _split_field(payload, field_key)
+        if result is None:
+            return snapshot, None
+        snapshot["payload"] = result[0]
+        return snapshot, result[1]
+    container = payload.get(container_key)
+    if not isinstance(container, Mapping):
+        return snapshot, None
+    result = _split_field(container, field_key)
+    if result is None:
+        # `hidden_ref`（已分片）或缺失 ⇒ 原样保留（该路径由分片消息自己承载）。
+        return snapshot, None
+    new_payload = {key: value for key, value in payload.items()}
+    new_payload[container_key] = result[0]
+    snapshot["payload"] = new_payload
+    return snapshot, result[1]
+
+
+def restore_inline_hidden(
+    message: Mapping[str, Any], raw: bytes | None,
+) -> dict[str, Any]:
+    """★ 票 21a：把帧的二进制体放回 JSON 内联 hidden（`split_inline_hidden` 的逆）。
+
+    位置同样按消息类型推导；`raw` 为 `None` 时结果与输入逐字段相同（零行为变化）。
+    放回的是 base64 字符串 ⇒ **下游代码完全不必知道二进制路径存在**。
+    """
+    snapshot = {key: value for key, value in message.items()}
+    if raw is None:
+        return snapshot
+    path = inline_hidden_path(snapshot.get("message_type", ""))
+    payload = snapshot.get("payload")
+    if (not isinstance(raw, (bytes, bytearray)) or not raw
+            or path is None or not isinstance(payload, Mapping)):
+        raise _error("invalid_binary_hidden", "message", "binary hidden has no destination")
+    container_key, field_key = path
+    container = payload if container_key is None else payload.get(container_key)
+    ref_key = {"hidden_f32": "hidden_ref", "hidden_out_f32": "hidden_out_ref"}.get(field_key)
+    if (not isinstance(container, Mapping) or field_key in container
+            or (ref_key is not None and ref_key in container)):
+        raise _error("invalid_binary_hidden", "payload", "binary hidden destination is ambiguous")
+    if container_key is None:
+        snapshot["payload"] = _restore_field(container, field_key, raw)
+        return snapshot
+    new_payload = {key: value for key, value in payload.items()}
+    new_payload[container_key] = _restore_field(container, field_key, raw)
+    snapshot["payload"] = new_payload
+    return snapshot
 
 
 def stage_payload_budget_bytes(
@@ -1491,11 +1689,17 @@ def hidden_fits_stage_frame(
     dtype: str = "float32",
     *,
     max_message_bytes: int = MAX_MESSAGE_BYTES,
+    binary: bool = False,
 ) -> bool:
-    """该 hidden 能否装进单帧（不装得下就必须在 dispatch 前拒绝）。"""
-    return hidden_wire_bytes(n_tokens, n_embd, dtype) <= stage_payload_budget_bytes(
-        max_message_bytes=max_message_bytes,
-    )
+    """该 hidden 能否装进单帧（不装得下就必须在 dispatch 前拒绝）。
+
+    `binary=True` 表示该帧会走 `format:"binary"` 的原始字节体 ⇒ 同样预算能多装
+    ≈33%（去 base64 膨胀）。**调用方必须先确认对端确实声明了 `binary_hidden`**，
+    否则判据与实际发帧方式不一致，帧会在发送时以 `message_too_large` 失败。
+    """
+    return hidden_wire_bytes(
+        n_tokens, n_embd, dtype, binary=binary,
+    ) <= stage_payload_budget_bytes(max_message_bytes=max_message_bytes)
 
 
 def max_hidden_tokens(
@@ -1503,6 +1707,7 @@ def max_hidden_tokens(
     dtype: str = "float32",
     *,
     max_message_bytes: int = MAX_MESSAGE_BYTES,
+    binary: bool = False,
 ) -> int:
     """给定额度下每帧可承载的最大 token 数（诊断与日志用）。"""
     if dtype not in HIDDEN_DTYPE_BYTES:
@@ -1517,7 +1722,9 @@ def max_hidden_tokens(
             "invalid_hidden_spec", "hidden_spec.n_embd",
             "hidden_spec.n_embd must be positive",
         )
-    per_token = embd * HIDDEN_DTYPE_BYTES[dtype] * _BASE64_EXPANSION
-    return int(stage_payload_budget_bytes(
-        max_message_bytes=max_message_bytes,
-    ) // per_token)
+    per_token_raw = embd * HIDDEN_DTYPE_BYTES[dtype]
+    budget = stage_payload_budget_bytes(max_message_bytes=max_message_bytes)
+    if binary:
+        # The body has one length header per frame, not one per token.
+        return max(0, budget - _BINARY_BODY_HEADER_BYTES) // per_token_raw
+    return int(budget // (per_token_raw * _BASE64_EXPANSION))

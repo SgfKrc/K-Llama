@@ -67,9 +67,20 @@ def test_shell_boots_then_switches_to_main():
             status = str(splash.query_one("#splash-status", Static).render())
             assert "少女祈祷中" in status, "启动行应以「少女祈祷中：」开头"
             subtitle = splash.query_one("#splash-subtitle", Static)
-            assert str(subtitle.render()) != "Lightweight Edge Distributed Inference System"
-            await pilot.pause(0.45)
-            assert str(subtitle.render()) == "Lightweight Edge Distributed Inference System"
+            # 打字机是「前缀逐步变长」的动画：并行/慢 runner 上第一帧就可能已经
+            # 打完，断言「此刻还没打完」必然偶发失败（2026-10-16 CI 实测）。
+            # 不变量：任意时刻都是完整文案的前缀，且最终等于完整文案。
+            # 这里只轮询到打完为止 —— 等久了启动条会先走完并把画面切到主界面，
+            # 后面的 #splash-bar 断言就会 NoMatches。
+            partial = str(subtitle.render())
+            assert SPLASH_SUBTITLE.startswith(partial), (
+                f"副标题必须是完整文案的前缀，实际 {partial!r}")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if str(subtitle.render()) == SPLASH_SUBTITLE:
+                    break
+                await pilot.pause(0.05)
+            assert str(subtitle.render()) == SPLASH_SUBTITLE
             bar = str(splash.query_one("#splash-bar", Static).render())
             assert "█" in bar and "░" in bar, "标题下方应有跑马灯启动条"
             app.show_main()
@@ -712,7 +723,11 @@ def test_models_table_cursor_is_preserved_across_refresh():
     }
 
     async def _main():
-        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=3)
+        # 周期性后台刷新（action_reload）会在慢 runner 上抢在断言前用 stub 的
+        # /models 冷数据覆盖下面注入的 registry（2026-10-16 CI 实测：表里出现
+        # 只有一项的 qwen-1_8b）。本用例只关心「刷新后光标保留」，所以关掉定时器，
+        # 由显式的 fill_models 触发刷新。
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=3600)
         app.api = _StubApi()
         async with app.run_test(size=(120, 40)) as pilot:
             app.show_main()

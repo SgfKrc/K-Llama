@@ -2,7 +2,7 @@
 
 > 状态：现行；三平台真实发行验收仍有缺口。
 >
-> 更新日期：2026-10-15
+> 更新日期：2026-10-16
 
 本门检查已构建的最终发行物。源码合同、脚本存在、`--help` 返回 0 和进程存活都不能替代实际启动就绪。任何声明平台出现 failed 或 unverified，CLI 都返回非零。
 
@@ -53,9 +53,25 @@ Activity smoke 后必须执行现有非导出 `InferenceService` 的只读 dumps
 
 探针不加载／卸载模型，不修改模式或凭据；JNI 查询使用有界单 worker，避免超时后持续创建线程。进程 socket 与模型映射是附加 OS 事实，拒绝或不完整时如实记录。它没有增加网络入口或 exported 组件。通过可信 APK 与运行进程的上述核对后，`android.roles`／`android.native-runtime` 才能通过；只有 Activity 或 pidof 不足以通过。
 
-Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.json` 纳入 APK。生成器从主仓与固定子模块 Git 图及实际源码字节计算身份，记录 `source_dirty` 与源码树摘要，不接受环境变量指定 revision。生成任务每次重算；所有 APK variant 在 package 动作前用 `--verify` 逐字段、逐类型核对构建前快照，原快照不刷新；缺仓库、缺子模块或并发源码变化均失败。发行门拒绝明确 dirty 的来源。debug 包可以用于开发真机验证，但不能充当同 revision 的可信发行包。
+Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.json` 纳入 APK。生成器从主仓与固定子模块 Git 图及实际源码字节计算身份，记录 `source_dirty` 与源码树摘要，不接受环境变量指定 revision。生成任务每次重算；所有 APK variant 在 package 动作前用 `--verify` 逐字段、逐类型核对构建前快照，原快照不刷新；缺仓库、缺子模块或并发源码变化均失败。发行门要求显式布尔 `source_dirty=false`；dirty、缺字段、null、0 和字符串均拒绝。debug 包可以用于开发真机验证，但不能充当同 revision 的可信发行包。
 
 ## CI 与总门
+
+新增 `.github/workflows/release-build.yml` 作为最终附件的生产入口；它只允许 manual dispatch，输入完整 revision 必须等于该 run 的 `github.sha`。Windows／Linux／Android runner 标签与验收工作流一致，Windows 使用预置外部 packaging venv，Android 使用实验台预置发行 keystore 配置，不生成或替换签名密钥。
+
+实验台需配置以下仓库变量；路径必须指向对应 self-hosted runner 已有资源，密钥字节不放入变量或仓库：
+
+| 变量 | 用途 |
+| --- | --- |
+| `QLH_RELEASE_SIGNING_KEY_PATH` | 当前 packaging 信任库认可的既有 Ed25519 私钥文件路径 |
+| `QLH_RELEASE_WINDOWS_VENV` | 外部已预备的 Windows packaging venv 绝对路径 |
+| `QLH_RELEASE_ANDROID_KEYSTORE_PROPERTIES` | checkout 外既有 Android keystore.properties 路径；storeFile 为绝对路径 |
+| `ANDROID_RELEASE_CERT_SHA256` | 独立配置的 Android 发行证书公开 pin |
+| `QLH_RELEASE_PRODUCT_BUNDLE` | Linux 实验台上同 revision 的严格 DL／LL bundle.json 绝对路径及完整相对附件 |
+
+工作流先用产品门校验已有 lab bundle，复制声明引用的完整附件，再校验复制结果；缺项或 dirty 时在构建矩阵之前失败。构建调用既有 Windows CPU／Launcher batch、Linux CPU build-deb、Android assembleRelease。`scripts/package_contract/release_build.py` 的 preflight 拒绝旧输出并保存 canonical 来源快照；stage 核对签名信任、版本、发行合同与原 build-info，只上传认证文件集合。Windows 真实构建输出来自 `packaging/dist/`。来源变化或错误签名不能通过事后重贴身份补救。
+
+同一成功 run 上传 `qlh-final-windows`、`qlh-final-linux`、`qlh-final-android`、`qlh-product-relay-evidence`，与下游消费名称一一对应。build 阶段的静态认证不替代安装／启动；本轮仅完成接线与离线回归，尚未 dispatch、实际构建或上传。严格产品采集的运行端缺项见 [产品接力证据门](产品接力证据门-CI-RELEASE-01.md)。
 
 `.github/workflows/release-acceptance.yml` 通过显式 dispatch 接收成功构建 run id、完整 revision 和物理 opt-in。它从同一 run 下载 `qlh-final-windows`、`qlh-final-linux`、`qlh-final-android`、`qlh-product-relay-evidence`；缺附件立即失败。实验台的 self-hosted runner 需准备平台工具、Linux 镜像，Android 需配置独立验收 serial 及可信证书 pin。
 
@@ -79,3 +95,6 @@ Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.
 上述首次失败记录保留。后续复核见 `build/ci-release-followup-20261015/final-artifact-result.json`：Linux daemon 已能应答，但仍无最终 `.deb`；Windows 现有 CPU／Launcher 的失败条件未解除；Android 仍无最终 release APK，签名配置缺失。Android 角色／native 探针代码已补齐并在保数据更新的 Y700 debug 包上获得本次 nonce／PID 的真实 JNI 观测，其最终 release 验收仍待可信签名包。没有为通过门替换信任库或复用 debug 签名。
 
 2026-10-15 后续复核已预备 Linux 验收镜像，并在禁网容器确认环境；最终 `.deb` 仍缺失。量化工具已完成真实 Windows GNU／Ninja Release 构建，补丁来源与运行依赖验证通过。最新三平台门仍退出 1，见 `build/ci-release-followup-20261015/final-artifact-retry-result.json`；具体构建修复与测试见 [票 13 续验](ci-release-followup-2026-10-15.md#构建来源与量化工具闭环)。
+
+
+2026-10-16 的构建接线、Linux 禁网只读容器和当前发行物门实测见 [运行环境记录](ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)；打包路径修复、观测合同及最终软件组合结果见 [工件身份记录](ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。当前 debug／dirty 设备实跑继续作为开发证据，最终签名三平台执行门保持开放。

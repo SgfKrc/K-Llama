@@ -408,7 +408,7 @@ def _layer_stage_result_to_pipeline_value(
 
 def _assert_layer_stage_offer_fits_frame(
     *, node_id: str, n_tokens: int, n_embd: int, dtype: str = "float32",
-    chunked_input: bool = False,
+    chunked_input: bool = False, binary_hidden: bool = False,
 ) -> None:
     """★ 2026-10-07（DIST-NEXT-2）：dispatch 前的层段 wire 大小预检。
 
@@ -420,10 +420,25 @@ def _assert_layer_stage_offer_fits_frame(
     再发 offer），而本预检在 provider **之前**，无条件拒绝会让分片路径**永远走不到**：
     实测 ≈2475 tokens 的 prompt 得到 `route_a_stage_frame_too_large:…:wire=24160940`
     而非分片。未声明分片的对端仍保持 fail-closed。
+
+    ★ 票 21a（COMM-WIRE-01）：`binary_hidden=True` 表示目标 worker 声明了
+    `binary_hidden` ⇒ 帧走原始字节体，同样预算多装 ≈33%。判据顺序因此是
+    **先按 base64 免费判**，只有超预算时才把二进制与分片两条放宽路径依次算进来 ——
+    与 `chunked_input` 同因：能力探测含全量 capabilities 深拷贝，不能每步每段都付。
     """
     wire_bytes = hidden_wire_bytes(n_tokens, n_embd, dtype)
     budget_bytes = stage_payload_budget_bytes()
     if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+        return
+    # ★ 票 21a：base64 判不下、但走二进制体就装得下 ⇒ 放行（provider 会抽出体发送）。
+    if binary_hidden and hidden_fits_stage_frame(n_tokens, n_embd, dtype, binary=True):
+        logger.debug(
+            "Route-A stage 帧超 base64 预算但声明 binary_hidden，改走二进制体: "
+            "node=%s wire=%dB binary_wire=%dB budget=%dB n_tokens=%d",
+            node_id, wire_bytes,
+            hidden_wire_bytes(n_tokens, n_embd, dtype, binary=True),
+            budget_bytes, n_tokens,
+        )
         return
     if chunked_input:
         # ★ 2026-10-08（DIST-NEXT-2b）：声明分片只放宽**单帧**预算。分片本身仍有总量上限
@@ -477,13 +492,32 @@ def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
     声明 ⇒ 超预算的 hidden 由 provider 切 `stage_chunk` 分片发送，预检不得提前拒绝；
     未声明（含查询失败）⇒ 返回 False，维持 fail-closed 的既有语义。
     """
+    return _node_capabilities(control, node_id).get("stage_chunked_input") is True
+
+
+def _node_declares_binary_hidden(control: Any, node_id: str) -> bool:
+    """★ 票 21a（COMM-WIRE-01）：该节点是否声明 `binary_hidden`。
+
+    声明 ⇒ 该节点能收 `format:"binary"` 的帧（帧体为原始字节），单帧容量 +≈33%；
+    未声明（含查询失败）⇒ False，维持 fail-closed（继续走 base64 或分片）。
+    """
+    return _node_capabilities(control, node_id).get("binary_hidden") is True
+
+
+def _node_capabilities(control: Any, node_id: str) -> dict:
+    """一次取回该节点的自荐能力字典；不可得 ⇒ `{}`。
+
+    ⚠️ `control.status(role="master")` 内含**全量 worker capabilities 深拷贝**
+    （见 :2521 的注释），因此**多个能力判据必须共用同一次查询** —— 分别调用
+    `_node_declares_*` 会各付一次深拷贝。
+    """
     if control is None:
-        return False
+        return {}
     try:
         status = control.status(role="master")
     except Exception:
-        logger.debug("查询 task worker 分片能力失败: node=%s", node_id, exc_info=True)
-        return False
+        logger.debug("查询 task worker 能力失败: node=%s", node_id, exc_info=True)
+        return {}
     worker_ids = [
         item.get("node_id")
         for item in ((status or {}).get("workers") or [])
@@ -493,7 +527,7 @@ def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
         if not isinstance(worker, dict) or worker.get("node_id") != node_id:
             continue
         capabilities = worker.get("capabilities")
-        declared = (
+        declared_chunked = (
             isinstance(capabilities, dict)
             and capabilities.get("stage_chunked_input") is True
         )
@@ -502,16 +536,22 @@ def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
         #   且分片真实生效（`task_worker_stage_chunks_sent chunks=18`）。
         logger.debug(
             "event=stage_chunked_probe node=%s declared=%s caps_keys=%s worker_ids=%s",
-            node_id, declared,
+            node_id, declared_chunked,
             sorted(capabilities.keys()) if isinstance(capabilities, dict) else None,
             worker_ids,
         )
-        return declared
-    logger.debug(
-        "event=stage_chunked_probe node=%s declared=False worker_ids=%s",
-        node_id, worker_ids,
-    )
-    return False
+        if not isinstance(capabilities, dict):
+            return {}
+        # Frame admission must use the same accepted ACK bit as the sender.
+        # A coordinator-wide disable still preserves the raw HELLO inventory.
+        return {
+            **capabilities,
+            "binary_hidden": (
+                worker.get("binary_hidden") is True
+                and capabilities.get("binary_hidden") is True
+            ),
+        }
+    return {}
 
 
 from worker_prepare_coordinator import WorkerPrepareCoordinatorMixin
@@ -2524,17 +2564,23 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         #   改为只在实际超预算时才查询；fits 时 `_assert_layer_stage_offer_fits_frame` 本就
         #   提前 return（不看该参数），故**语义完全等价**。
         _fits_single_frame = hidden_fits_stage_frame(n_tokens, n_embd, "float32")
+        # ★ 票 21a（COMM-WIRE-01）：只有 base64 判不下时才查能力（该查询含全量
+        #   capabilities 深拷贝），且**一次查询**同时取出分片与二进制两个键 ——
+        #   分别调 `_node_declares_*` 会各付一次深拷贝。
+        _worker_caps = (
+            {}
+            if _fits_single_frame
+            else _node_capabilities(
+                getattr(self, "_task_worker_control", None), str(node_id)
+            )
+        )
         _assert_layer_stage_offer_fits_frame(
             node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
+            # ★ 票 21a：对端声明 `binary_hidden` ⇒ 帧走原始字节体，单帧容量 +≈33%。
+            binary_hidden=_worker_caps.get("binary_hidden") is True,
             # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
             #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
-            chunked_input=(
-                False
-                if _fits_single_frame
-                else _node_declares_stage_chunked_input(
-                    getattr(self, "_task_worker_control", None), str(node_id),
-                )
-            ),
+            chunked_input=_worker_caps.get("stage_chunked_input") is True,
         )
         hidden_spec = {
             "n_tokens": n_tokens,

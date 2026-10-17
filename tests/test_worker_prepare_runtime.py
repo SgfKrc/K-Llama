@@ -47,9 +47,10 @@ def test_real_prepare_filters_only_segment_and_commit_never_reloads(tiny_supply,
     materialized = []
     original = model_module._LayerRangeLoadTracker.materialize
 
-    def track(tracker, handle, key):
+    def track(tracker, handle, key, **kwargs):
         materialized.append(key)
-        return original(tracker, handle, key)
+        assert kwargs.get("source_file"), "real loader must record the source shard"
+        return original(tracker, handle, key, **kwargs)
 
     def forbidden(*args, **kw):
         pytest.fail("worker prepare attempted whole-model loading")
@@ -366,9 +367,10 @@ def test_real_api_factory_and_layer_stage_share_single_runtime_through_retry_and
         created.append(host)
         return host
 
-    def materialize(tracker, handle, key):
+    def materialize(tracker, handle, key, **kwargs):
         loaded_keys.append(key)
-        return original_materialize(tracker, handle, key)
+        assert kwargs.get("source_file"), "real loader must record the source shard"
+        return original_materialize(tracker, handle, key, **kwargs)
 
     monkeypatch.setattr(engine_module, "EngineHost", construct)
     monkeypatch.setattr(model_module._LayerRangeLoadTracker, "materialize", materialize)

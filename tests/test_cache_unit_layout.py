@@ -66,6 +66,10 @@ def test_paged_cache_exposes_the_same_aligned_unit_contract():
     assert cache.cache_unit_boundaries() == (0, 4, 8)
 
 
+@pytest.mark.skipif(
+    not EXPERIMENT.exists(),
+    reason="缺 scripts/cache_unit_experiment.py（scripts 白名单未放行的实验脚本）",
+)
 def test_experiment_report_is_deterministic_and_machine_readable():
     result = subprocess.run(
         [sys.executable, str(EXPERIMENT)],

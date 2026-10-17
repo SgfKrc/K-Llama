@@ -39,7 +39,7 @@ def make_apk(path):
         for name, value in {"AndroidManifest.xml": b"fixture manifest", "classes.dex": b"fixture dex",
             "lib/arm64-v8a/libqlh_llama_jni.so": bytes(header),
             "lib/arm64-v8a/libc++_shared.so": bytes(header),
-            "assets/build-info.json": json.dumps({"schema_version": 1, "source_revision": REVISION}).encode()}.items():
+            "assets/build-info.json": json.dumps({"schema_version": 1, "source_revision": REVISION, "source_dirty": False}).encode()}.items():
             archive.writestr(name, value)
     return path
 
@@ -91,7 +91,7 @@ def test_success_json_cannot_override_verifier_process_failure(tmp_path, monkeyp
 ])
 def test_build_identity_requires_authenticated_matching_revision(authenticated, revision, required, expected):
     report = gate.Report("windows")
-    gate.check_revision(report, "windows.cpu.revision", {"schema_version": 1, "source_revision": revision},
+    gate.check_revision(report, "windows.cpu.revision", {"schema_version": 1, "source_revision": revision, "source_dirty": False},
                         authenticated=authenticated, required=required)
     assert report.items[0]["status"] == expected
 
@@ -338,3 +338,20 @@ def test_dirty_authenticated_build_cannot_claim_release_revision():
     assert gate.check_revision(report, 'android.revision',
         {'schema_version':1,'source_revision':REVISION,'source_dirty':True}, authenticated=True, required=REVISION) is None
     assert report.as_dict()['passed'] is False
+
+
+@pytest.mark.parametrize("dirty", [None, True, 0, 1, "false", [], {}])
+def test_authenticated_artifact_requires_explicit_boolean_clean_source(dirty):
+    report = gate.Report("android")
+    info = {"schema_version": 1, "source_revision": REVISION, "source_dirty": dirty}
+    assert gate.check_revision(report, "android.revision", info,
+                               authenticated=True, required=REVISION) is None
+    assert report.items[0]["status"] == "failed"
+
+
+def test_signed_artifact_missing_clean_source_fact_is_rejected():
+    report = gate.Report("windows")
+    info = {"schema_version": 1, "source_revision": REVISION}
+    assert gate.check_revision(report, "windows.cpu.revision", info,
+                               authenticated=True, required=REVISION) is None
+    assert report.items[0]["status"] == "failed"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,7 @@ def test_contract_requires_a_single_patch(tmp_path: Path):
         sync._contract(lock)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="基准路径用 Windows 盘符（G:/repo），Linux 上会退化成相对路径")
 def test_safe_relative_rejects_escape():
     with pytest.raises(sync.SyncError, match="escapes"):
         sync._safe_relative(Path("G:/repo"), "../outside.patch")

@@ -1,0 +1,144 @@
+name: release-build
+
+# Trusted lab prerequisites (paths only; no private keys in GitHub variables):
+# - QLH_RELEASE_SIGNING_KEY_PATH: existing Ed25519 file authorized by packaging/pubkeys.
+# - QLH_RELEASE_ANDROID_KEYSTORE_PROPERTIES: existing runner-owned properties file
+#   outside the checkout; storeFile is an absolute path to the provisioned keystore.
+# - ANDROID_RELEASE_CERT_SHA256: independent public release certificate pin.
+# - QLH_RELEASE_PRODUCT_BUNDLE: existing same-revision bundle.json with its full
+#   relative attachment closure on the Linux qlh-release lab. Missing/dirty or
+#   incomplete evidence fails; this workflow does not produce observations.
+# QLH_RELEASE_WINDOWS_VENV: absolute external pre-provisioned packaging venv.
+# Runners also need Python 3.12 + cryptography, Git Bash on Windows, Linux
+# native build tools, Android SDK/NDK/JDK, and private submodule read access.
+# The Windows venv link is created only in this disposable checkout.
+# Installation/startup/device gates belong to release-acceptance, not this build.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Full Git SHA; must equal the selected ref event github.sha'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+  GIT_LFS_SKIP_SMUDGE: '1'
+  EXPECTED_REVISION: ${{ inputs.revision }}
+
+jobs:
+  revision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bind build to this run head SHA
+        shell: python
+        run: |
+          import os, re
+          revision = os.environ['EXPECTED_REVISION']
+          if not re.fullmatch(r'[0-9a-f]{40}', revision) or revision != os.environ['GITHUB_SHA']:
+              raise SystemExit('revision must be the full event github.sha (run.head_sha)')
+
+  product-evidence:
+    needs: revision
+    runs-on: [self-hosted, Linux, qlh-release]
+    timeout-minutes: 15
+    env:
+      QLH_RELEASE_PRODUCT_BUNDLE: ${{ vars.QLH_RELEASE_PRODUCT_BUNDLE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          lfs: false
+          submodules: recursive
+          persist-credentials: false
+      - name: Validate and stage existing lab DL and LL evidence without altering facts
+        shell: bash
+        run: python -B scripts/package_contract/release_build.py product
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qlh-product-relay-evidence
+          path: build/release-build/${{ github.run_id }}-${{ github.run_attempt }}/product/stage/
+          if-no-files-found: error
+          include-hidden-files: true
+
+  artifacts:
+    needs: [revision, product-evidence]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: '["self-hosted", "Windows", "qlh-release"]'
+          - platform: linux
+            runner: '["self-hosted", "Linux", "qlh-release"]'
+          - platform: android
+            runner: '["self-hosted", "Linux", "qlh-release-android"]'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 120
+    env:
+      QLH_SIGNING_KEY: ${{ vars.QLH_RELEASE_SIGNING_KEY_PATH }}
+      QLH_RELEASE_WINDOWS_VENV: ${{ vars.QLH_RELEASE_WINDOWS_VENV }}
+      QLH_RELEASE_ANDROID_KEYSTORE_PROPERTIES: ${{ vars.QLH_RELEASE_ANDROID_KEYSTORE_PROPERTIES }}
+      ANDROID_RELEASE_CERT_SHA256: ${{ vars.ANDROID_RELEASE_CERT_SHA256 }}
+      QLH_CORE_ROOT: ${{ github.workspace }}
+      QLH_SHELL_ROOT: ${{ github.workspace }}/frontend_cybergothic
+      QLH_BUILD_PROFILE: llama_cpp_only
+      QLH_NONINTERACTIVE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          lfs: false
+          submodules: recursive
+          persist-credentials: false
+      - name: Link pre-provisioned Windows packaging environment
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $venv = $env:QLH_RELEASE_WINDOWS_VENV
+          $target = Join-Path $env:GITHUB_WORKSPACE 'packaging/.venv-packaging'
+          if (-not $venv -or -not [IO.Path]::IsPathRooted($venv) -or
+              -not (Test-Path -LiteralPath (Join-Path $venv 'Scripts/python.exe')) -or
+              (Test-Path -LiteralPath $target)) {
+            throw 'Provision an existing external packaging venv; stale target is rejected'
+          }
+          New-Item -ItemType Junction -Path $target -Target $venv | Out-Null
+      - name: Reject stale outputs and snapshot clean pinned sources
+        shell: bash
+        run: python -B scripts/package_contract/release_build.py preflight --platform "${{ matrix.platform }}"
+      - name: Build signed Windows CPU and standalone Launcher
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: |
+          call "%GITHUB_WORKSPACE%\packaging\packaging\build-cpu.bat" <NUL
+          if errorlevel 1 exit /b 1
+          call "%GITHUB_WORKSPACE%\packaging\packaging\build-launcher.bat" <NUL
+          if errorlevel 1 exit /b 1
+      - name: Build signed Linux CPU Debian package
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: bash packaging/packaging/linux/build-deb.sh cpu
+      - name: Build signed Android release APK
+        if: matrix.platform == 'android'
+        shell: bash
+        run: bash android/gradlew -p android :app:assembleRelease --console=plain
+      - name: Authenticate outputs and stage only the final files
+        shell: bash
+        run: python -B scripts/package_contract/release_build.py stage --platform "${{ matrix.platform }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qlh-final-${{ matrix.platform }}
+          path: build/release-build/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.platform }}/stage/
+          if-no-files-found: error
+          include-hidden-files: true

@@ -30,6 +30,8 @@ import re
 import threading
 import time
 from functools import wraps
+from dataclasses import replace
+from product_runtime_receipt import LayerMaterializationProof, TensorMaterialization
 from typing import Tuple, Optional, Dict, Any, List, Union
 
 
@@ -457,6 +459,7 @@ class _LayerRangeLoadTracker:
         self.selected_prefixes = tuple(selected_prefixes)
         self.target_element_size = torch.empty((), dtype=target_dtype).element_size()
         self.loaded_keys = set()
+        self._tensor_metadata = {}
         self.loaded_layers = set()
         self.source_tensor_bytes = 0
         self.materialized_tensor_bytes = 0
@@ -483,7 +486,7 @@ class _LayerRangeLoadTracker:
     def is_selected(self, key: str) -> bool:
         return any(key.startswith(prefix) for prefix in self.selected_prefixes)
 
-    def materialize(self, handle: Any, key: str) -> torch.Tensor:
+    def materialize(self, handle: Any, key: str, source_file: str = "") -> torch.Tensor:
         # Check before get_tensor so post-load pruning cannot hide an
         # accidental full-model materialization by a future adapter.
         if not self.is_selected(key):
@@ -491,7 +494,15 @@ class _LayerRangeLoadTracker:
                 "层流水线拒绝物化未分配权重: "
                 f"architecture={self.architecture}, key={key}"
             )
+        if key in self.loaded_keys:
+            raise RuntimeError(f"duplicate tensor materialization: {key}")
         tensor = handle.get_tensor(key)
+        self._tensor_metadata[key] = TensorMaterialization(
+            name=key, shape=tuple(int(n) for n in tensor.shape),
+            element_size=int(self.target_element_size),
+            source_element_size=int(tensor.element_size()),
+            source_file=os.path.abspath(source_file) if source_file else "",
+        )
         self.loaded_keys.add(key)
         self.source_tensor_bytes += tensor.numel() * tensor.element_size()
         self.materialized_tensor_bytes += tensor.numel() * self.target_element_size
@@ -525,6 +536,16 @@ class _LayerRangeLoadTracker:
         rss_baseline = self._baseline["rss_bytes"]
         cuda_baseline = self._baseline["cuda_allocated_bytes"]
         return {
+            "materialization_proof": LayerMaterializationProof(
+                layer_range=(self.start_layer, self.end_layer),
+                decoder_prefix=self.layer_prefix,
+                tensors=tuple(self._tensor_metadata[key] for key in sorted(self._tensor_metadata)),
+                materialized_bytes=self.materialized_tensor_bytes,
+                allowed_boundary_prefixes=tuple(
+                    prefix for prefix in self.selected_prefixes
+                    if not prefix.startswith(self.layer_prefix)
+                ),
+            ),
             "mode": self.MODE,
             "architecture": self.architecture,
             "layer_range": (self.start_layer, self.end_layer),
@@ -818,6 +839,23 @@ def _serialized_model_stream(method):
         with self._lock:
             yield from method(self, *args, **kwargs)
     return wrapper
+
+
+def _resolve_pytorch_flash_attn() -> bool:
+    """PyTorch 侧 flash-attn 开关：读同一张设备映射，**默认 False**（=接线前行为）。
+
+    与 llama.cpp 的两条路径（绑定、`llama-server` 子进程）共用
+    `src/inference_switches.py` 的显式映射；只有显式覆盖
+    （`QLH_INFER_FLASH_ATTN=1`）才打开。映射或画像不可用时保持 False，
+    即本函数引入前的硬编码值。
+    """
+    try:
+        from inference_switches import resolve_from_device_profile
+
+        return bool(resolve_from_device_profile().flash_attn)
+    except Exception as exc:  # pragma: no cover - 依赖缺失时保持既有行为
+        logger.warning("推理开关不可用，PyTorch flash-attn 保持关闭: %s", exc)
+        return False
 
 
 CHATML_STOP_SEQUENCES = [
@@ -1381,6 +1419,10 @@ class ModelManager:
                 close()
             self._llama_engine = None
 
+        # Compiled wrappers own the original parameters independently of self.model.
+        # Drop every owner before GC/empty_cache, including an already-unloaded projection.
+        self._compiled_transformer = None
+        self._compiled_layer_loop = None
         # --- PyTorch 引擎清理 ---
         if self.model is not None:
             self.model = None
@@ -1541,6 +1583,8 @@ class ModelManager:
         """Release a committed segment while preserving distributed metadata."""
         if not self._pipeline_descriptor or not self._pipeline_distributed_only:
             return
+        self._compiled_transformer = None
+        self._compiled_layer_loop = None
         self.model = None
         self.tokenizer = None
         self.layer_range = None
@@ -1965,6 +2009,13 @@ class ModelManager:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         self._layer_load_metrics = load_tracker.finish()
+        descriptor = self._pipeline_descriptor or {}
+        self._layer_load_metrics["materialization_proof"] = replace(
+            self._layer_load_metrics["materialization_proof"],
+            artifact_path=os.path.abspath(path),
+            artifact_sha256=str(descriptor.get("model_sha256", "") or ""),
+            total_layers=actual_total,
+        )
         logger.info(
             "层流水线加载观测: mode=%s, tensors=%s, source_bytes=%s, "
             "materialized_bytes=%s, rss_peak_delta_bytes=%s, "
@@ -2168,7 +2219,7 @@ class ModelManager:
             shard_path = os.path.join(model_path, filename)
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
-                    tensor = load_tracker.materialize(handle, key)
+                    tensor = load_tracker.materialize(handle, key, source_file=shard_path)
                     # ★ A3：写入模型时用归一化后的「属性 key」（见 model_key_of）
                     set_module_tensor_to_device(
                         model,
@@ -2285,7 +2336,9 @@ class ModelManager:
         config.bf16 = False
         config.fp16 = use_cuda
         config.fp32 = not use_cuda
-        config.use_flash_attn = False
+        # flash-attn 由推理开关显式决定（票 20）：默认关闭等于接线前行为，
+        # 只有显式覆盖才打开；与 llama.cpp 两条路径共用同一张映射。
+        config.use_flash_attn = _resolve_pytorch_flash_attn()
 
         old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
         keep_tokenizer = self.tokenizer if old_path == os.path.abspath(model_path) else None
@@ -2360,7 +2413,7 @@ class ModelManager:
             shard_path = os.path.join(model_path, filename)
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
-                    tensor = load_tracker.materialize(handle, key)
+                    tensor = load_tracker.materialize(handle, key, source_file=shard_path)
                     set_module_tensor_to_device(
                         model,
                         key,
@@ -3085,6 +3138,7 @@ class ModelManager:
             def _release_compiled() -> None:  # pragma: no cover - 退出期路径
                 try:
                     self._compiled_transformer = None
+                    self._compiled_layer_loop = None
                     self.model = None
                     import gc
 
@@ -4398,6 +4452,9 @@ class ModelManager:
         }
         if self._layer_load_metrics is not None:
             info["layer_load_metrics"] = dict(self._layer_load_metrics)
+            proof = info["layer_load_metrics"].get("materialization_proof")
+            if isinstance(proof, LayerMaterializationProof):
+                info["layer_load_metrics"]["materialization_proof"] = proof.as_dict()
         if self.load_fingerprint:
             info["load_fingerprint"] = self.load_fingerprint
             info["load_fingerprint_schema"] = 1

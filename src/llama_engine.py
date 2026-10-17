@@ -42,6 +42,7 @@ import sys
 import time
 from ctypes import byref
 from pathlib import Path
+from product_runtime_receipt import NativeLayerLoadProof
 from typing import Optional, Dict, Any, Iterator, List
 
 # ⚠️ **必须平铺导入**（与 `keep_head_shim` 同规）：`relay_precision` 带**进程级状态**
@@ -150,6 +151,32 @@ def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
         _cfg.NGRAM_SPEC_MAX_NGRAM,
         _cfg.NGRAM_SPEC_NUM_PRED,
     )
+
+
+def _default_n_ctx(model_path: str) -> int:
+    """未显式给 `n_ctx` 时的默认值：先用「每段 KV 预算」收窄，再回退既有常量。
+
+    票 20 完成定义第三条：`n_ctx` 应基于每段 KV 预算（层数 × 每层字节 × ctx），
+    而不是全局常量。这里**只往下收窄** —— 推导结果不会超过既有默认值，所以
+    无画像、读不到 GGUF 头或内存充足时，行为与从前逐字一致。
+    """
+    from config import MAX_SEQ_LEN
+
+    baseline = MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else 4096
+    try:
+        import inference_switches
+
+        suggested = inference_switches.suggest_n_ctx_from_gguf(model_path, max_ctx=baseline)
+    except Exception as exc:  # pragma: no cover - 预算属可选事实
+        logger.debug("KV 预算推导不可用，n_ctx 用既有默认 %s: %s", baseline, exc)
+        return baseline
+    if suggested and suggested != baseline:
+        logger.info(
+            "n_ctx 按每段 KV 预算收窄：%s → %s（预算 = 设备可用内存 × %s）",
+            baseline, suggested, inference_switches.KV_BUDGET_MEMORY_RATIO,
+        )
+        return suggested
+    return baseline
 
 
 def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
@@ -262,6 +289,7 @@ class LlamaCppEngine:
         self._n_threads: int = 4     # CPU 线程数
         self._loaded: bool = False
         self._pipeline_descriptor: Dict[str, Any] | None = None
+        self._layer_load_proof: NativeLayerLoadProof | None = None
         self._pipeline_sha_cache: Dict[str, Any] = {}
         self._pipeline_distributed_only: bool = False
         # RAG embedding is opt-in. A normal text-generation load is never
@@ -652,6 +680,7 @@ class LlamaCppEngine:
         self.active_model_id = str(model_id or "")
         self._quant_type = str(quant_type or "GGUF")
         self._pipeline_descriptor = None
+        self._layer_load_proof = None
         self._pipeline_sha_cache = {}
         descriptor = self.get_pipeline_descriptor()
         if not descriptor.get("pipeline_runtime_supported", False):
@@ -702,12 +731,23 @@ class LlamaCppEngine:
         from pathlib import Path as _Path
         from relay_segment_info import read_artifact_manifest
 
-        configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
-        directory = (
-            _Path(configured)
-            if configured
-            else _Path(str(getattr(self, "_model_path", "") or "")).parent
-        )
+        from model_supply_worker import selected_gguf_path
+
+        supplied = selected_gguf_path()
+        if supplied:
+            # The verified supply registration owns this segment. A leftover
+            # legacy directory must not veto it before its manifest is checked.
+            supplied_path = _Path(supplied)
+            directory = supplied_path.parent
+            candidates = [supplied_path.with_suffix(".manifest.json")]
+        else:
+            configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
+            directory = (
+                _Path(configured)
+                if configured
+                else _Path(str(getattr(self, "_model_path", "") or "")).parent
+            )
+            candidates = sorted(directory.glob("*.manifest.json"))
         if not directory.is_dir():
             return ""
         descriptor = dict(getattr(self, "_pipeline_descriptor", None) or {})
@@ -730,13 +770,6 @@ class LlamaCppEngine:
             raise RuntimeError("无法确定预切 GGUF 的源整模摘要，拒绝按层区间猜测工件")
 
         wanted = [int(start), int(end)]
-        from model_supply_worker import selected_gguf_path
-        supplied = selected_gguf_path()
-        candidates = sorted(directory.glob("*.manifest.json"))
-        if supplied:
-            supplied_path = _Path(supplied)
-            candidates = [supplied_path.with_suffix(".manifest.json")]
-            directory = supplied_path.parent
         matches: list[str] = []
         for manifest in candidates:
             info = read_artifact_manifest(manifest)
@@ -802,6 +835,26 @@ class LlamaCppEngine:
         # 就是这个语义）。换裁层 GGUF 之后 `_model_path` 指向段文件，若让描述器跟着变小，
         # 主节点会被判「模型已变化，请等待层配置重新同步」——实测卡在这里。
         # 所以：先留下整模描述器，加载段之后再装回去，只补层段标记。
+        # Retain the identity of the verified crop, independently of the source
+        # descriptor restored below. Observation failure never changes loading.
+        proof = None
+        proof_stat = None
+        try:
+            from relay_segment_info import read_artifact_manifest
+            before = os.stat(path)
+            digest = self._pipeline_file_sha256(path)
+            for marker in (Path(path).with_suffix(".manifest.json"), Path(str(path) + ".manifest.json")):
+                manifest = read_artifact_manifest(marker) or {}
+                total = manifest.get("n_layer")
+                if (manifest.get("source_layer_range") == [int(start_layer), int(end_layer)]
+                        and type(total) is int and 0 <= start_layer < end_layer <= total
+                        and manifest.get("artifact_sha256") == digest and re.fullmatch(r"[0-9a-f]{64}", digest)):
+                    proof = NativeLayerLoadProof(os.path.abspath(path), digest,
+                                                 (int(start_layer), int(end_layer)), total)
+                    proof_stat = (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino)
+                    break
+        except (OSError, ValueError, TypeError):
+            proof = None
         whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
         was_pipeline_prepared = self.is_pipeline_prepared
         self.load_model(path)
@@ -815,6 +868,14 @@ class LlamaCppEngine:
         whole["loaded_artifact"] = path
         self._pipeline_descriptor = whole
         self._pipeline_distributed_only = was_pipeline_prepared
+        self._layer_load_proof = None
+        if proof is not None:
+            try:
+                after = os.stat(path)
+                if proof_stat == (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino):
+                    self._layer_load_proof = proof
+            except OSError:
+                pass
         logger.info(
             "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
             int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
@@ -919,6 +980,7 @@ class LlamaCppEngine:
         # 换模型即失效：描述器与文件摘要都跟着 `_model_path` 走。不重置会拿旧模型的
         # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
         self._pipeline_descriptor = None
+        self._layer_load_proof = None
         self._pipeline_sha_cache = {}
         # KV 是新 context 的，占用计数跟着归零（见 `_kv_used_cells`）。
         self._kv_used = 0
@@ -938,7 +1000,7 @@ class LlamaCppEngine:
             self._quant_type = "GGUF"
 
         if n_ctx is None:
-            n_ctx = MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else 4096
+            n_ctx = _default_n_ctx(model_path)
         if n_threads is None:
             n_threads = self._auto_threads()
 
@@ -1399,6 +1461,7 @@ class LlamaCppEngine:
         self._thinking_controlled = False
         self._chat_template_kwargs = {}
         self._pipeline_descriptor = None
+        self._layer_load_proof = None
         self._pipeline_sha_cache = {}
         self._pipeline_distributed_only = False
         self._model_path = ""

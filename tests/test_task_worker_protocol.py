@@ -16,6 +16,8 @@ from task_worker_protocol import (
     canonical_message_bytes,
     decode_message,
     negotiate_protocol_version,
+    restore_inline_hidden,
+    split_inline_hidden,
     worker_protocol_status,
 )
 
@@ -272,6 +274,30 @@ def test_hello_capabilities_may_advertise_layer_budget(golden):
     with pytest.raises(WorkerProtocolError) as layers_error:
         decode_message(bad_layers)
     assert layers_error.value.code == "invalid_integer"
+
+
+def test_hello_capabilities_may_advertise_binary_hidden(golden):
+    """★ 票 21a（COMM-WIRE-01）：`binary_hidden` 是**可选**能力键（向后兼容）。
+
+    声明它表示该节点能收 `format:"binary"` 的帧（`build_message(binary_body=...)`）；
+    未声明者继续走 base64 内联 ⇒ 旧对端永不收到二进制帧。两侧键集必须对称
+    （主仓 `_validate_capabilities` 与 android `TaskWorkerProtocol`）。
+    """
+    # 1) 未声明：向后兼容，允许（旧 hello 逐字节不变）
+    decode_message(copy.deepcopy(golden["messages"][0]))
+
+    # 2) 声明 true / false 都允许（值本身不是布尔判据的落点）
+    for value in (True, False):
+        hello = copy.deepcopy(golden["messages"][0])
+        hello["payload"]["capabilities"]["binary_hidden"] = value
+        decode_message(hello)
+
+    # 3) 拼错/未知键仍必须被拒（不能因为放行新键而放松精确字段校验）
+    typo = copy.deepcopy(golden["messages"][0])
+    typo["payload"]["capabilities"]["binary_hiddne"] = True
+    with pytest.raises(WorkerProtocolError) as typo_error:
+        decode_message(typo)
+    assert typo_error.value.code == "invalid_fields"
 
 
 def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
@@ -656,3 +682,110 @@ def test_stage_cancel_does_not_accept_execution_state():
         )
     assert captured.value.code == "invalid_fields"
     assert captured.value.field == "payload"
+
+
+def test_split_and_restore_inline_hidden_are_bit_identical():
+    """★ 票 21a（COMM-WIRE-01）：二进制抽取/放回**逐位无损**，且关能力位零行为变化。"""
+    import base64 as _base64
+
+    hidden = bytes(range(32))
+    encoded = _base64.b64encode(hidden).decode("ascii")
+    offer = {
+        "message_type": "stage_offer",
+        "payload": {
+            "root_input": {"hidden_f32": encoded, "other": 1},
+            "input_sha256": "x",
+        },
+    }
+
+    # 1) 关能力位 ⇒ 逐字段相同、不抽体（旧路径字节不变）
+    same, raw = split_inline_hidden(offer, enabled=False)
+    assert raw is None
+    assert same == offer
+
+    # 2) 开能力位 ⇒ 抽出原始字节，并从 JSON 里删掉该字段（避免同帧两份）
+    split, raw = split_inline_hidden(offer, enabled=True)
+    assert raw == hidden
+    assert "hidden_f32" not in split["payload"]["root_input"]
+    assert split["payload"]["root_input"]["other"] == 1
+    assert split["payload"]["input_sha256"] == "x"
+
+    # 3) 放回 ⇒ 与原消息逐字段相同（下游不必知道二进制路径存在）
+    assert restore_inline_hidden(split, raw) == offer
+    # 4) 未带体 ⇒ 逐字段相同
+    assert restore_inline_hidden(split, None) == split
+
+    # 5) 回程位置（stage_result.output.hidden_out_f32）同理
+    result = {
+        "message_type": "stage_result",
+        "payload": {"output": {"hidden_out_f32": encoded}, "attempt_id": "a"},
+    }
+    r_split, r_raw = split_inline_hidden(result, enabled=True)
+    assert r_raw == hidden
+    assert "hidden_out_f32" not in r_split["payload"]["output"]
+    assert restore_inline_hidden(r_split, r_raw) == result
+
+
+def test_split_inline_hidden_leaves_ref_bad_base64_and_other_types_untouched():
+    """已分片（`hidden_ref`）、非法 base64、不承载内联 hidden 的类型都原样返回。"""
+    # hidden_ref —— 分片路径尚未接二进制，原样保留
+    chunked = {
+        "message_type": "stage_offer",
+        "payload": {
+            "root_input": {"hidden_ref": {"total_bytes": 4, "payload_sha256": "x"}},
+        },
+    }
+    same, raw = split_inline_hidden(chunked, enabled=True)
+    assert raw is None
+    assert same == chunked
+
+    # 非法 base64 —— 交给既有协议校验报错，helper 不改写
+    bad = {
+        "message_type": "stage_offer",
+        "payload": {"root_input": {"hidden_f32": "not base64!!"}},
+    }
+    same, raw = split_inline_hidden(bad, enabled=True)
+    assert raw is None
+    assert same == bad
+
+    # 不承载内联 hidden 的消息类型
+    hello = {
+        "message_type": "hello",
+        "payload": {"root_input": {"hidden_f32": "AAAA"}},
+    }
+    same, raw = split_inline_hidden(hello, enabled=True)
+    assert raw is None
+    assert same == hello
+
+
+def test_binary_budget_trades_base64_expansion_for_a_header():
+    """★ 票 21a：二进制帧的 wire = raw + 4 字节头；默认（base64）行为逐值不变。"""
+    import task_worker_protocol as proto
+
+    n_embd = 4096  # 与 qwen3-5-9b 的 hidden 同量级
+    budget = proto.stage_payload_budget_bytes()
+
+    # 1) 二进制 wire 恰好是 raw + 4；base64 仍是 4×ceil(n/3)
+    for n_tokens in (1, 4):
+        raw = n_tokens * n_embd * 4
+        assert proto.hidden_wire_bytes(n_tokens, n_embd, "float32") == 4 * (-(-raw // 3))
+        assert proto.hidden_wire_bytes(n_tokens, n_embd, "float32", binary=True) == raw + 4
+
+    # 2) 默认参数与旧行为逐值一致（零回归）
+    assert proto.hidden_fits_stage_frame(1, n_embd, "float32") == (
+        proto.hidden_wire_bytes(1, n_embd, "float32") <= budget
+    )
+    assert proto.max_hidden_tokens(n_embd, "float32") == int(
+        budget / (n_embd * 4 * proto._BASE64_EXPANSION)
+    )
+
+    # 3) 二进制下每帧能多装 ≈33%（容量比 = 4/3，扣掉 4 字节头后略低）
+    base64_tokens = proto.max_hidden_tokens(n_embd, "float32")
+    binary_tokens = proto.max_hidden_tokens(n_embd, "float32", binary=True)
+    assert binary_tokens > base64_tokens
+    assert 1.30 <= binary_tokens / base64_tokens <= 1.34
+
+    # 4) 存在「base64 判不下、二进制判得下」的区间 —— 这正是本次放宽的收益区
+    edge = base64_tokens + 1
+    assert not proto.hidden_fits_stage_frame(edge, n_embd, "float32")
+    assert proto.hidden_fits_stage_frame(edge, n_embd, "float32", binary=True)

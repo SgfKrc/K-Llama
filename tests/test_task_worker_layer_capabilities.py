@@ -57,6 +57,7 @@ def test_task_worker_capability_log_summary_is_bounded_and_exact():
 
     assert summary == {
         "stage_types": ["layer_forward"],
+        "binary_hidden": False,
         "layer_ranges": [[4, 24]],
         "models": [{
             "model_id": "q35-9b-local-mid4-24.gguf",
@@ -471,3 +472,12 @@ class TestLayerCapabilitiesSurviveProtocolValidation:
         from task_worker_protocol import PROTOCOL_VERSION, _validate_capabilities
 
         _validate_capabilities(caps, version=PROTOCOL_VERSION)
+
+
+def test_binary_hidden_compatibility_switch_omits_the_unknown_key(monkeypatch):
+    monkeypatch.setenv("QLH_TASK_WORKER_BINARY_HIDDEN", "0")
+    caps = _capabilities(active_layer_config={"layer_range": [4, 16]})
+    assert "binary_hidden" not in caps
+    assert caps["stage_chunked_input"] is True
+    monkeypatch.setenv("QLH_TASK_WORKER_BINARY_HIDDEN", "1")
+    assert _capabilities(active_layer_config={"layer_range": [4, 16]})["binary_hidden"] is True
