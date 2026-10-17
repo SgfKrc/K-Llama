@@ -25,6 +25,9 @@ MIN_PROTOCOL_VERSION = 1
 #: `unsupported_stage_type` 拒绝（fail-closed，不做静默降级）。
 MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+# Match SocketTaskWorkerTransport: outer metadata + body length + raw bytes;
+# the first metadata length prefix is excluded. Legacy JSON remains 8 MiB inside.
+MAX_BINARY_FRAME_BYTES = MAX_MESSAGE_BYTES + 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
 #: ★ 2026-10-07（DIST-NEXT-2）：层段 hidden 的 **wire 预算**。
@@ -839,6 +842,10 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             capabilities["stage_chunked_input"],
             "payload.capabilities.stage_chunked_input",
         )
+    if "binary_hidden" in capabilities:
+        _require_bool(
+            capabilities["binary_hidden"], "payload.capabilities.binary_hidden",
+        )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines:
         raise _error(
@@ -1032,6 +1039,8 @@ def _validate_payload(
         and isinstance(payload, Mapping)
     ):
         required = required | (_STAGE_CANCELLED_OPTIONAL_FIELDS & set(payload))
+    if message_type == "hello_ack" and "binary_hidden" in payload:
+        required = required | {"binary_hidden"}
     _require_exact_fields(payload, required, "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
@@ -1058,6 +1067,13 @@ def _validate_payload(
             payload["reason_code"], "payload.reason_code", pattern=_SAFE_CODE,
             allow_empty=True, max_length=64,
         )
+        if "binary_hidden" in payload:
+            binary_hidden = _require_bool(payload["binary_hidden"], "payload.binary_hidden")
+            if binary_hidden and (not accepted or version < 3 or selected < 3):
+                raise _error(
+                    "invalid_negotiation_result", "payload.binary_hidden",
+                    "binary hidden requires an accepted v3 hello",
+                )
         if accepted and selected != version:
             raise _error(
                 "invalid_selected_version", "payload.selected_version",
@@ -1310,7 +1326,29 @@ def _validate_payload(
                 )
 
 
-def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
+def binary_hidden_frame_bytes(
+    message: Mapping[str, Any], raw_bytes: int, *,
+    control_certificate: Mapping[str, Any] | None = None,
+) -> int:
+    """Exact TCP binary frame budget, excluding the first metadata length header.
+
+    Match tcp_comm.build_message's default json.dumps encoding, including spaces
+    and ASCII escaping. Canonical inner JSON is smaller and is not a wire budget.
+    Callers can include the certificate that TCP appends before serializing data.
+    """
+    data = dict(message)
+    if control_certificate is not None and "control_certificate" not in data:
+        data["control_certificate"] = dict(control_certificate)
+    meta = {
+        "type": "task_worker", "format": "binary",
+        "binary_bytes": raw_bytes, "data": data,
+    }
+    return len(json.dumps(meta).encode("utf-8")) + _BINARY_BODY_HEADER_BYTES + raw_bytes
+
+
+def validate_message(
+    value: Mapping[str, Any], *, binary_hidden: bool = False,
+) -> WorkerMessage:
     if not isinstance(value, Mapping):
         raise _error("invalid_envelope", "message", "message must be an object")
     _require_exact_fields(value, _ENVELOPE_FIELDS, "message")
@@ -1353,12 +1391,18 @@ def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
         _payload_json=canonical_json(payload),
     )
     try:
-        message_size = len(canonical_message_bytes(message))
+        wire_snapshot, body = split_inline_hidden(
+            message.snapshot(), enabled=binary_hidden,
+        )
+        message_size = len(canonical_json(wire_snapshot).encode("utf-8"))
+        if body is not None:
+            message_size = binary_hidden_frame_bytes(wire_snapshot, len(body))
     except UnicodeEncodeError as exc:
         raise _error(
             "invalid_encoding", "message", "message must be valid UTF-8"
         ) from exc
-    if message_size > MAX_MESSAGE_BYTES:
+    message_limit = MAX_BINARY_FRAME_BYTES if body is not None else MAX_MESSAGE_BYTES
+    if message_size > message_limit:
         raise _error(
             "message_too_large", "message", "message exceeds maximum size"
         )
@@ -1372,6 +1416,7 @@ def build_message(
     message_id: str,
     sent_at_ms: int,
     version: int = PROTOCOL_VERSION,
+    binary_hidden: bool = False,
 ) -> WorkerMessage:
     return validate_message({
         "protocol": PROTOCOL_NAME,
@@ -1380,12 +1425,19 @@ def build_message(
         "message_id": message_id,
         "sent_at_ms": sent_at_ms,
         "payload": dict(payload),
-    })
+    }, binary_hidden=binary_hidden)
 
 
-def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
+def decode_message(
+    raw: bytes | str | Mapping[str, Any], *, binary_hidden: bool = False,
+) -> WorkerMessage:
+    # Restored hidden is base64 in memory, but only an explicitly binary frame
+    # may use the larger representation. validate_message checks its wire size.
+    representation_limit = (
+        _base64_wire_length(MAX_BINARY_FRAME_BYTES) if binary_hidden else MAX_MESSAGE_BYTES
+    )
     if isinstance(raw, bytes):
-        if len(raw) > MAX_MESSAGE_BYTES:
+        if len(raw) > representation_limit:
             raise _error(
                 "message_too_large", "message", "message exceeds maximum size"
             )
@@ -1402,7 +1454,7 @@ def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
             raise _error(
                 "invalid_encoding", "message", "message must be valid UTF-8"
             ) from exc
-        if raw_size > MAX_MESSAGE_BYTES:
+        if raw_size > representation_limit:
             raise _error(
                 "message_too_large", "message", "message exceeds maximum size"
             )
@@ -1414,7 +1466,7 @@ def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
         decoded = raw
     if not isinstance(decoded, Mapping):
         raise _error("invalid_envelope", "message", "message must be an object")
-    return validate_message(decoded)
+    return validate_message(decoded, binary_hidden=binary_hidden)
 
 
 def canonical_message_bytes(message: WorkerMessage) -> bytes:
@@ -1510,7 +1562,7 @@ BINARY_HIDDEN_PATHS = {
 }
 
 
-def inline_hidden_path(message_type: str) -> "tuple[str, str] | None":
+def inline_hidden_path(message_type: str) -> tuple[str | None, str] | None:
     """该消息类型里内联 hidden 的 `(容器键, 字段名)`；不承载内联 hidden 则 `None`。
 
     容器键为 `None` 表示载荷就在 `payload` 顶层（分片路径）。
@@ -1530,7 +1582,7 @@ def _split_field(container: Mapping[str, Any], field_key: str):
         raw = base64.b64decode(encoded, validate=True)
     except Exception:  # noqa: BLE001 - 非法 base64 交给既有协议校验报错
         return None
-    if not raw:
+    if not raw or base64.b64encode(raw).decode("ascii") != encoded:
         return None
     new_container = {key: value for key, value in container.items()}
     new_container.pop(field_key, None)
@@ -1599,18 +1651,18 @@ def restore_inline_hidden(
     if raw is None:
         return snapshot
     path = inline_hidden_path(snapshot.get("message_type", ""))
-    if path is None:
-        return snapshot
-    container_key, field_key = path
     payload = snapshot.get("payload")
-    if not isinstance(payload, Mapping):
-        return snapshot
+    if (not isinstance(raw, (bytes, bytearray)) or not raw
+            or path is None or not isinstance(payload, Mapping)):
+        raise _error("invalid_binary_hidden", "message", "binary hidden has no destination")
+    container_key, field_key = path
+    container = payload if container_key is None else payload.get(container_key)
+    ref_key = {"hidden_f32": "hidden_ref", "hidden_out_f32": "hidden_out_ref"}.get(field_key)
+    if (not isinstance(container, Mapping) or field_key in container
+            or (ref_key is not None and ref_key in container)):
+        raise _error("invalid_binary_hidden", "payload", "binary hidden destination is ambiguous")
     if container_key is None:
-        # 分片路径：载荷就在 `payload` 顶层。
-        snapshot["payload"] = _restore_field(payload, field_key, raw)
-        return snapshot
-    container = payload.get(container_key)
-    if not isinstance(container, Mapping):
+        snapshot["payload"] = _restore_field(container, field_key, raw)
         return snapshot
     new_payload = {key: value for key, value in payload.items()}
     new_payload[container_key] = _restore_field(container, field_key, raw)
@@ -1671,11 +1723,8 @@ def max_hidden_tokens(
             "hidden_spec.n_embd must be positive",
         )
     per_token_raw = embd * HIDDEN_DTYPE_BYTES[dtype]
-    per_token = (
-        per_token_raw + _BINARY_BODY_HEADER_BYTES
-        if binary
-        else per_token_raw * _BASE64_EXPANSION
-    )
-    return int(stage_payload_budget_bytes(
-        max_message_bytes=max_message_bytes,
-    ) // per_token)
+    budget = stage_payload_budget_bytes(max_message_bytes=max_message_bytes)
+    if binary:
+        # The body has one length header per frame, not one per token.
+        return max(0, budget - _BINARY_BODY_HEADER_BYTES) // per_token_raw
+    return int(budget // (per_token_raw * _BASE64_EXPANSION))

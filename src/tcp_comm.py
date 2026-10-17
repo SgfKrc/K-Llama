@@ -1051,6 +1051,7 @@ def build_message(msg_type: MessageType, data: Any = None,
         if data is not None:
             meta["data"] = data
         meta_bytes = json.dumps(meta).encode("utf-8")
+        _validate_binary_length(meta, len(binary_body), len(meta_bytes))
         # 组合: [meta长度(4B)] + [meta JSON] + [体长度(4B)] + [raw 字节]
         return pack_data(meta_bytes) + pack_data(bytes(binary_body))
 
@@ -1067,6 +1068,19 @@ def build_message(msg_type: MessageType, data: Any = None,
         if data is not None:
             meta["data"] = data
         return pack_data(json.dumps(meta).encode("utf-8"))
+
+
+def _validate_binary_length(meta: dict, body_length: int, meta_length: int) -> None:
+    """Reject a bad declaration or oversized task-worker frame before body I/O."""
+    declared = meta.get("binary_bytes")
+    if (type(declared) is not int or declared != body_length
+            or not 0 < body_length <= MAX_PACKET_SIZE):
+        raise ConnectionError("invalid binary packet length")
+    if meta.get("type") == MessageType.TASK_WORKER.value:
+        from task_worker_protocol import MAX_BINARY_FRAME_BYTES
+
+        if meta_length + HEADER_LEN + body_length > MAX_BINARY_FRAME_BYTES:
+            raise ConnectionError("task worker binary message exceeds maximum size")
 
 
 def parse_message(raw: bytes) -> dict:
@@ -1086,6 +1100,9 @@ def parse_message(raw: bytes) -> dict:
         # 张量数据在后续包中，由调用方继续接收
         meta["_needs_tensor"] = True
     elif meta.get("format") == "binary":
+        declared = meta.get("binary_bytes")
+        if type(declared) is not int or not 0 < declared <= MAX_PACKET_SIZE:
+            raise ConnectionError("invalid binary packet length")
         # ★ 票 21a：二进制体在后续段中，由调用方继续接收（与张量同一模式，
         #   但不做反序列化 —— 调用方拿到的是 raw 字节）。
         meta["_needs_binary"] = True
@@ -1549,11 +1566,7 @@ class TCPServer:
                     if binary_header is None:
                         break
                     binary_len = unpack_header(binary_header)
-                    if binary_len <= 0 or binary_len > MAX_PACKET_SIZE:
-                        logger.warning(
-                            f"非法二进制包长度: {binary_len}，断开 {addr}"
-                        )
-                        break
+                    _validate_binary_length(msg, binary_len, payload_len)
                     msg["binary"] = recv_exact(conn, binary_len, mid_frame=True)
                     if msg["binary"] is None:
                         break
@@ -2150,6 +2163,9 @@ class TCPServer:
 # TCP 客户端（从节点）
 # ================================================================
 
+_CLIENT_RECEIVE_CONTEXT = threading.local()
+
+
 class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
@@ -2218,6 +2234,11 @@ class TCPClient:
         self.last_reconnect_error = ""
         self.next_reconnect_at = 0.0
         self._control_fence: ControlFence | None = None
+
+    @staticmethod
+    def received_registration_owner() -> tuple | None:
+        """Return the owner of this thread's current TCP callback, if any."""
+        return getattr(_CLIENT_RECEIVE_CONTEXT, "owner", None)
 
     def capture_registration_owner(self) -> tuple | None:
         """Capture an authenticated (client, epoch, socket) under its publish lock."""
@@ -2641,13 +2662,22 @@ class TCPClient:
         try:
             while self._running and connection_sock:
                 with self._disconnect_callback_lock:
-                    if (connection_generation is not None
-                            and connection_generation != self._connection_generation):
+                    if ((connection_generation is not None
+                         and connection_generation != self._connection_generation)
+                            or self.sock is not connection_sock):
                         break
+                    received_owner = (self, self._registration_epoch, connection_sock)
                 try:
                     msg = self.recv_data(connection_sock)
                     if msg is None:
                         break  # 连接断开
+                    # The socket may have been replaced while recv_data blocked.
+                    with self._disconnect_callback_lock:
+                        if (self.sock is not connection_sock
+                                or self._registration_epoch != received_owner[1]
+                                or (connection_generation is not None
+                                    and connection_generation != self._connection_generation)):
+                            break
                     self._transport_runtime_call(
                         "observe_legacy_receive",
                         msg,
@@ -2663,10 +2693,14 @@ class TCPClient:
                         logger.warning("TCP control frame rejected code=%s type=%s", exc.code, msg.get("type"))
                         continue
                     if self.on_message:
+                        previous_owner = getattr(_CLIENT_RECEIVE_CONTEXT, "owner", None)
+                        _CLIENT_RECEIVE_CONTEXT.owner = received_owner
                         try:
                             self.on_message(msg)
                         except Exception as e:
                             logger.error(f"消息回调异常: {e}", exc_info=True)
+                        finally:
+                            _CLIENT_RECEIVE_CONTEXT.owner = previous_owner
                 except socket.timeout:
                     continue
                 except (ConnectionError, OSError) as e:
@@ -2807,10 +2841,7 @@ class TCPClient:
             if binary_header is None:
                 return None
             binary_len = unpack_header(binary_header)
-            if binary_len <= 0 or binary_len > MAX_PACKET_SIZE:
-                raise ConnectionError(
-                    f"invalid binary packet length: {binary_len}"
-                )
+            _validate_binary_length(msg, binary_len, payload_len)
             binary_data = recv_exact(active_sock, binary_len, mid_frame=True)
             if binary_data is None:
                 return None

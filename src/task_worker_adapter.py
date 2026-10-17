@@ -7,6 +7,7 @@ import collections
 import hashlib
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -65,6 +66,13 @@ RELEASE_REASONS = (
     RELEASE_REASON_HEARTBEAT_STALE,
     RELEASE_REASON_SERVICE_RESTART,
 )
+
+
+def binary_hidden_transport_enabled() -> bool:
+    """One runtime switch for coordinator ACKs and worker advertisements."""
+    return os.environ.get("QLH_TASK_WORKER_BINARY_HIDDEN", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def remote_provider_id(node_id: str) -> str:
@@ -202,6 +210,7 @@ class TaskWorkerControlPlane:
                 "hello_sent_at": now_ms / 1000.0,
                 "last_transport_heartbeat": time.time(),
                 "reason_code": "negotiation_pending",
+                "binary_hidden": capabilities.get("binary_hidden") is True,
             }
             return message
 
@@ -268,6 +277,12 @@ class TaskWorkerControlPlane:
                     "accepted": accepted,
                     "selected_version": selected_version,
                     "reason_code": reason_code,
+                    # Legacy workers have an exact ACK schema. Only a worker
+                    # explicitly opting into binary hidden receives this field.
+                    **({"binary_hidden": (
+                        accepted and selected_version >= 3 and binary_hidden_transport_enabled()
+                    )}
+                       if payload["capabilities"].get("binary_hidden") is True else {}),
                 },
                 message_id=_message_id("helloack_"),
                 sent_at_ms=now_ms,
@@ -295,6 +310,7 @@ class TaskWorkerControlPlane:
                 "accepted": accepted,
                 "selected_version": selected_version,
                 "capabilities": payload["capabilities"],
+                "binary_hidden": ack.payload.get("binary_hidden") is True,
                 "capabilities_changed": capabilities_changed,
                 "connection_rebound": connection_rebound,
                 "hello_received_at": now,
@@ -307,11 +323,17 @@ class TaskWorkerControlPlane:
             return ack
 
     def receive_on_worker(
-        self, raw: bytes | str | Mapping[str, Any],
+        self, raw: bytes | str | Mapping[str, Any], *, registration_owner: tuple | None = None,
     ) -> WorkerMessage:
-        """Accept the coordinator's v2 hello acknowledgement."""
+        """Accept an acknowledgement belonging to the current worker hello."""
         message = decode_message(raw)
         with self._lock:
+            if registration_owner is not None and (
+                self._worker_hello_owner is None
+                or self._worker_hello_owner[:3] != registration_owner
+            ):
+                self._rejected_message_count += 1
+                raise self._reject("stale_hello_ack", "hello_ack belongs to a retired registration")
             duplicate = self._duplicate_response("coordinator", message)
             if duplicate is not None:
                 return duplicate
@@ -345,6 +367,10 @@ class TaskWorkerControlPlane:
                 "hello_ack_received_at": now,
                 "last_transport_heartbeat": now,
                 "reason_code": payload["reason_code"],
+                "binary_hidden": (
+                    accepted and self._coordinator.get("binary_hidden") is True
+                    and payload.get("binary_hidden") is True
+                ),
             }
             self._worker_hello_pending = False
             if not accepted:
@@ -483,6 +509,18 @@ class TaskWorkerControlPlane:
             snapshot = self._healthy_snapshot(worker, now)
             snapshot["provider_id"] = remote_provider_id(peer_id)
             return snapshot
+
+    def worker_binary_hidden_enabled(self, registration_owner: tuple | None) -> bool:
+        """Bind the advertised capability to an accepted hello on this socket."""
+        with self._lock:
+            return bool(
+                registration_owner is not None
+                and self._worker_hello_owner is not None
+                and self._worker_hello_owner[:3] == registration_owner
+                and self._coordinator.get("connected")
+                and self._coordinator.get("accepted")
+                and self._coordinator.get("binary_hidden") is True
+            )
 
     def coordinator_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -970,10 +1008,13 @@ class RemoteFullWorkerProvider:
         对端自荐 ⇒ 帧体走原始字节，单帧容量 +≈33%（判据见 `hidden_fits_stage_frame`
         的 `binary` 参数）。未声明者继续走 base64 / 分片，行为不变。
         """
-        capabilities = (self._snapshot() or {}).get("capabilities")
-        if not isinstance(capabilities, dict):
-            return False
-        return capabilities.get("binary_hidden") is True
+        snapshot = self._snapshot()
+        capabilities = snapshot.get("capabilities")
+        return bool(
+            snapshot.get("binary_hidden") is True
+            and isinstance(capabilities, dict)
+            and capabilities.get("binary_hidden") is True
+        )
 
     def _maybe_send_stage_chunks(self, attempt: StageAttempt) -> dict[str, Any]:
         """★ 2026-10-07（DIST-NEXT-2b）：超预算的层段 hidden 先分片发出，返回改写后的 root_input。
@@ -1421,6 +1462,7 @@ class RemoteFullWorkerProvider:
                 message_id=_message_id("offer_"),
                 sent_at_ms=sent_at_ms,
                 version=PROTOCOL_VERSION,
+                binary_hidden=self._supports_binary_hidden(),
         )
         try:
             self._send_message(offer)
@@ -1559,9 +1601,9 @@ class RemoteFullWorkerProvider:
         return result
 
     def handle_message(
-        self, raw: bytes | str | Mapping[str, Any],
+        self, raw: bytes | str | Mapping[str, Any], *, binary_hidden: bool = False,
     ) -> WorkerMessage:
-        message = decode_message(raw)
+        message = decode_message(raw, binary_hidden=binary_hidden)
         if message.message_type not in {
             "stage_accept", "stage_result", "stage_error", "stage_cancelled",
             # ★ 2026-10-11（三机实测）：**回程**分片，与输入方向的 `stage_chunk` 对称。

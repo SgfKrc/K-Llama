@@ -306,3 +306,156 @@ def test_current_send_failure_cleans_only_its_owner(monkeypatch, caplog):
     assert not worker._task_worker_control.coordinator_snapshot()["connected"]
     assert "event=task_worker_hello_send_failed" in caplog.text
     assert "coordinator_cleared=True" in caplog.text
+
+
+
+@pytest.mark.parametrize("new_binary", [False, True])
+def test_stale_capability_scan_cannot_overwrite_current_binary_negotiation(monkeypatch, new_binary):
+    worker = Worker()
+    entered, release = threading.Event(), threading.Event()
+    capabilities = worker._task_worker_capabilities
+
+    def advertised():
+        old = threading.current_thread().name == "old-hello"
+        return {**capabilities(), "binary_hidden": (not new_binary) if old else new_binary}
+
+    def node_id():
+        if threading.current_thread().name == "old-hello":
+            entered.set()
+            assert release.wait(5)
+        return "hello-owner-worker"
+
+    monkeypatch.setattr(worker, "_task_worker_capabilities", advertised)
+    monkeypatch.setattr(worker, "get_effective_node_id", node_id)
+    thread, outcome = start_sender(worker)
+    try:
+        assert entered.wait(5)
+        worker._tcp_client.disconnect()
+        publish_registration(worker._tcp_client)
+        assert worker._send_task_worker_hello()
+        accept_hello(worker)
+        assert worker._task_worker_binary_hidden_enabled() is new_binary
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert outcome == [False]
+    assert worker._task_worker_binary_hidden_enabled() is new_binary
+
+
+@pytest.mark.parametrize("race", ["read", "admit", "client"])
+def test_received_old_ack_cannot_accept_successor_hello(monkeypatch, race):
+    from tcp_comm import MessageType
+    worker = Worker()
+    original_caps = worker._task_worker_capabilities()
+    monkeypatch.setattr(worker, "_task_worker_capabilities", lambda: {**original_caps, "binary_hidden": True})
+    assert worker._send_task_worker_hello()
+    original = worker._tcp_client
+    old_sock = original.sock
+    generation = original._connection_generation
+    coordinator = TaskWorkerControlPlane()
+    ack = coordinator.receive_on_coordinator(
+        "hello-owner-worker", old_sock.packets[-1], coordinator_node_id="master",
+    )
+    replacement = []
+    seen = []
+
+    def replace():
+        if replacement:
+            return
+        if race == "client":
+            worker._tcp_client = TCPClient(client_id="hello-owner-worker")
+        fresh = worker._tcp_client
+        replacement.append(publish_registration(fresh))
+        assert worker._send_task_worker_hello()
+        seen.append(worker._task_worker_control._worker_hello_owner)
+
+    def receive(_sock):
+        if race == "read":
+            replace()
+        return {"type": MessageType.TASK_WORKER.value, "data": ack.snapshot()}
+
+    def admit(_frame):
+        if race != "read":
+            replace()
+
+    def dispatch(frame):
+        worker._handle_task_worker_message("master", frame)
+        # Replacing the complete client does not update the old instance's epoch.
+        original._running = False
+
+    monkeypatch.setattr(original, "recv_data", receive)
+    monkeypatch.setattr(original, "_admit_inbound_control", admit)
+    original.on_message = dispatch
+    original._recv_loop(generation, old_sock)
+    assert worker._task_worker_control._worker_hello_owner == seen[0]
+    assert worker._task_worker_control._worker_hello_pending is True
+    assert worker._task_worker_binary_hidden_enabled() is False
+    assert replacement[0].closed is False
+
+
+def test_receive_owner_guard_rejects_stale_ack_before_duplicate_mutation(monkeypatch):
+    from task_worker_protocol import WorkerProtocolError
+    worker = Worker()
+    assert worker._send_task_worker_hello()
+    original_owner = worker._tcp_client.capture_registration_owner()
+    coordinator = TaskWorkerControlPlane()
+    ack = coordinator.receive_on_coordinator(
+        "hello-owner-worker", worker._tcp_client.sock.packets[-1], coordinator_node_id="master",
+    )
+    publish_registration(worker._tcp_client)
+    assert worker._send_task_worker_hello()
+    with pytest.raises(WorkerProtocolError) as rejected:
+        worker._task_worker_control.receive_on_worker(ack.snapshot(), registration_owner=original_owner)
+    assert rejected.value.code == "stale_hello_ack"
+    assert worker._task_worker_control._worker_hello_pending is True
+
+
+def test_current_received_ack_keeps_exact_registration_owner(monkeypatch):
+    from tcp_comm import MessageType
+    worker = Worker()
+    assert worker._send_task_worker_hello()
+    client = worker._tcp_client
+    coordinator = TaskWorkerControlPlane()
+    ack = coordinator.receive_on_coordinator(
+        "hello-owner-worker", client.sock.packets[-1], coordinator_node_id="master",
+    )
+    accepted = []
+    def dispatch(frame):
+        worker._handle_task_worker_message("master", frame)
+        accepted.append(worker._task_worker_control.coordinator_snapshot()["accepted"])
+        client._running = False
+    client.on_message = dispatch
+    monkeypatch.setattr(client, "recv_data", lambda _: {"type": MessageType.TASK_WORKER.value, "data": ack.snapshot()})
+    client._recv_loop(client._connection_generation, client.sock)
+    assert accepted == [True]
+
+
+def test_old_ack_during_detached_client_window_cannot_accept_new_hello(monkeypatch):
+    from tcp_comm import MessageType
+    worker = Worker()
+    caps = worker._task_worker_capabilities()
+    monkeypatch.setattr(worker, "_task_worker_capabilities", lambda: {**caps, "binary_hidden": True})
+    assert worker._send_task_worker_hello()
+    original = worker._tcp_client
+    coordinator = TaskWorkerControlPlane()
+    ack = coordinator.receive_on_coordinator(
+        "hello-owner-worker", original.sock.packets[-1], coordinator_node_id="master",
+    )
+    successor = TCPClient(client_id="hello-owner-worker")
+    publish_registration(successor)
+    worker._tcp_client = successor
+    assert worker._send_task_worker_hello()
+    owner = worker._task_worker_control._worker_hello_owner
+    worker._tcp_client = None
+    def dispatch(frame):
+        worker._handle_task_worker_message("master", frame)
+        original._running = False
+    original.on_message = dispatch
+    monkeypatch.setattr(original, "recv_data", lambda _: {"type": MessageType.TASK_WORKER.value, "data": ack.snapshot()})
+    original._recv_loop(original._connection_generation, original.sock)
+    worker._tcp_client = successor
+    assert worker._task_worker_control._worker_hello_owner == owner
+    assert worker._task_worker_control._worker_hello_pending is True
+    assert worker._task_worker_binary_hidden_enabled() is False
+    assert successor.is_registered

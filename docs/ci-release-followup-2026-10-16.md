@@ -1,9 +1,9 @@
 # 票 13 续验与阻塞复核（2026-10-16）
 
-> 状态：票 13 开放；开发三机 DL／LL 与观测修复通过，清洁来源复采及可信三平台发行待验。
-> 更新日期：2026-10-16
+> 状态：票 13、21a 开放；2026-10-17 冻结开发来源三机 DL／LL 通过，清洁来源复采及可信签名三平台产物实际执行待验。
+> 更新日期：2026-10-17
 
-此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证和设备条件见 §8～§9。
+此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11。
 
 本记录复核此前同日的阻塞归因，保留原始证据于 `build/ci-release-followup-20261016/`；新证据独立存于 `build/ticket13-verify-20261016/`，不覆盖原始日志。§1～§5 是上午续验：当时主仓 HEAD `5f63b267c197dcf24af3905d12a33830f01a6ef2`、Android HEAD `07fcba305d5ac5ebd8e9497bab7aafbf6a78d409`，运行含未提交修改。这些改动已于 12:43 的一批提交入库；下午复核起点为干净主仓 `d657ca7f49365d6d50832b57c4fe1a0dde307c60`、Android `76a408a7f23dd1d5b332c9dac93273b8ab17f323`，新增修复与发行检查见 §6～§9。三端来源分别记录，不能仅以 HEAD 相同宣称最终同 revision 签名验收通过。
 
@@ -220,17 +220,58 @@ Qwen3.5-9B 经正式模型意图入口自动分配 `[0,4) → [4,8) → [8,32)`�
 
 票 13 的剩余关闭条件为：冻结并部署 clean 目标来源、建立有效的实验台时间同步后重新取得严格 DL／LL bundle，再构建可信签名的三平台最终产物并完成实际执行总门。当前保留清洁度、时钟和发行物的真实拒绝结果，票 14 尚未启动。
 
-## 10. 「就地重采」的冻结来源尝试与四条硬约束（2026-10-16 晚）
+## 10. 干净运行来源与模型存储绑定（2026-10-17 复核）
 
-借当前设备窗口（master／ROG／Y700 三端在线）尝试就地重采严格三机 bundle。**冻结树机制本身可用**，但以下四条使「就地重采出通过结果」在本机不可行。记录供 §9 末条「冻结并部署 clean 目标来源」参考。
+`runtime_source.checkout_manifest` 会将 ignored 的 `src/`、`scripts/` Python 文件计入来源；工作目录中的一次性脚本使来源带 dirty 标记。严格门继续要求真实 clean 来源。干净 checkout 可以导出观测 manifest，Gitless 运行目录由 `_export_manifest` 完整重算全部来源文件，使用原有模型存储和状态配置。
 
-冻结树做法（已验证）：`git clone --branch dev --single-branch <repo> G:\qlh-frozen` ⇒ 只含 tracked 文件（1087 项、**20 MB**、`git status` 零改动、HEAD 即目标 revision）。master 从该树启动后，`GET /api/diagnostics/product-runtime` 正确报出 `source_revision=c7e085d1…` 且 `runtime.errors=[]` —— 即**路径与 revision 都能对上**，运行时收据机制本身工作正常。
+`model_supply_sources._trusted_storage_path` 明确支持应用 `models` 根目录映射：只将该根的后续路径转换为真实存储路径，模型内容内部的链接仍由 `_existing` 和 `_hf_metadata` 拒绝。`ensure_registered_sources` 优先验证已登记本地源；完整有效源存在时不调用下载或转换。注册表支持相对应用目录和绝对路径，见 `model_config.resolve_model_path`。
 
-四条硬约束：
+`build/ticket13-resume-20261017/clean-source-storage-binding.json` 与 `clean-source-full-validation.json` 记录独立验证：从 clean HEAD `638365519d647b6bc626620861b180d8cab3c487` 导出 338 个运行来源文件，manifest SHA `2e7d5689be722bb66d48355bf1931c56eeac9cb469bd4c89e8cfbcbc825ca19f`、source_dirty=false。Gitless 目录的 `models` 根映射至原 `H:\qlh_models`，生产注册表以 SQLite query-only 方式读取，作为供给查找的只读快照。完整调用 `ensure_registered_sources(want_gguf=True, require_cross_format=True)` 成功验证 Qwen3.5-9B 的 Safetensors、原 manifest 和绑定 GGUF；模型复制字节为 0，无下载、转换、权重加载或生产注册表写入。该记录证明存储绑定和现有源合同，完整产品准备及发行仍分别验收。
 
-1. **`source_dirty` 不能靠改判据解决。** `src/runtime_source.py:123` 的判据是 `bool(git status) or not set(names).issubset(tracked)`，而 `_inventory`（:76-93）用 `os.walk` 收 `src/`＋`scripts/` 下**所有** `.py`（含 git-ignored）。`scripts/` 是白名单制（`.gitignore:187 scripts/*`），磁盘上仍有 32 个一次性实验脚本 ⇒ 从工作树启动**恒为 dirty**。而且 `tests/test_runtime_source.py:153 test_ignored_executable_source_still_dirties_startup_manifest` **明确断言**该行为（配合 :121 注释「Broad ignore rules must never hide executable Python from cleanliness」）⇒ 这是**设计**，不是 bug。
-2. **供给源拒绝穿越文件系统链接。** `models/` 用 junction 接入时供给直接失败：`SUPPLY_SOURCE_INVALID: Registered source cannot traverse a filesystem link`（`src/model_supply_sources.py`）⇒ 冻结树里 `models/` 必须是**真实文件**。
-3. **真实文件装不下。** `H:\qlh_models` 全量 **215.8 GB**，而可用盘位不足（G 盘剩 34 GB）。按注册表子集复制 9B 目录（10.9 GB）＋顶层有源 gguf 后仍不够。
-4. **源是「配置」而非「文件」。** 最终卡在 `SUPPLY_SOURCE_MISSING: No executable pinned or configured download source` —— 它要的是 pinned／configured 下载源；现有供给记录（state 内）大概率绑定**原路径** `G:\C\PYT\qlh\models\…`，与冻结树路径不一致。
+冻结来源的部署需求是保持目标模型的存储绑定、运行依赖和状态配置。当前协议修复含未提交修改，实际工作树服务和调试 APK 继续记录 dirty=true；严格同来源三机包与可信三平台最终发行仍待完成。
 
-⇒ 结论：**「冻结并部署 clean 目标来源」不只是换一个干净 checkout，还要迁移 215.8 GB 模型并重绑源配置／state 路径**，属容量规划与状态迁移。本轮不改判据、不降门、不动现有部署：冻结树与复制物已删除（删除前确认 junction 数为 0，删后复核 `H:\qlh_models` 53 个条目与 639,446,688 字节探针文件完好、G 盘可用空间回到 45 GB），master 已退回工作树运行。
+### 已推翻结论
+
+- “clean 来源部署必须迁移 215.8GB 模型、供给拒绝应用 models 根映射、必须配置下载源才能使用已有模型”：被 `_trusted_storage_path`、`ensure_registered_sources` 及上述真实完整验证推翻。此前失败原件保持原样。
+
+## 11. 票 21a 协议回归修复与设备窗口（2026-10-17）
+
+新 HEAD `63836551` 已包含 PC／Android 二进制 hidden 接线。`TaskWorkerControlPlane.receive_on_coordinator` 现仅对声明新能力的 worker 添加可选布尔 `hello_ack.payload.binary_hidden`；缺省或 false 均回到原 JSON 路径，旧 worker 保留原 ACK 字段集。PC 的 `worker_binary_hidden_enabled` 和 Android `SocketTaskWorkerTransport` 将启用状态绑定到当前接受 hello 的 socket；重连重新协商。`QLH_TASK_WORKER_BINARY_HIDDEN=0` 在 master 端令 ACK false，预检、provider 和收发共用协商结果；PC worker 端关闭时完全省略新能力键，以兼容旧 master 的精确白名单。
+
+`task_worker_protocol.validate_message`、provider、执行结果及缓存重放显式传递二进制预算上下文。还原后的内存 base64 表示继续参与原业务校验，帧大小按实际 metadata＋4 字节 body 长度头＋raw 判定，上限为 8 MiB＋1024；普通 JSON 保持原上限。PC／Android 均拒绝未协商二进制、非整数声明长度、长度冲突、超限或截断体，以及 body 与内联字段／分片引用同时存在。`max_hidden_tokens` 的 body 长度头按每帧一次计入。
+
+| 本地范围 | 结果 | 原件 |
+| --- | --- | --- |
+| 供给、模型意图、运行来源、产品门与 Textual 采集器，8 文件 | 722 passed，0 failed／error／skipped | `build/ticket13-resume-20261017/supply-product-integration.xml` |
+| PC 帧层、协议、provider、连接归属及层段相关，17 文件 | 436 passed | `build/ticket13-resume-20261017/protocol-final.xml`（边界补丁前） |
+| Android worker JVM | 208 passed，0 failed／error／skipped | `build/ticket13-resume-20261017/android-jvm-summary.json` |
+| Android debug Kotlin／ARM64 native／APK | assembleDebug 成功，来源快照 verified=true | `build/ticket13-resume-20261017/android-final-artifacts.json` |
+
+独立复核进一步发现旧接收线程的 ACK 归属及回程完整外层帧预算两个 P1。`TCPClient._recv_loop` 现于收帧后再次核对 socket／注册 epoch／连接代际，回调通过线程本地上下文携带原始归属；`receive_on_worker` 在修改去重或协商状态前校验 owner。scheduler 的 ACK 发布按原 hello 锁序原子验证，并直接读取回调 owner，覆盖当前 client 已替换或暂时为 null 的窗口。`receive-owner-red.xml` 保留修前 4 failed／1 passed，`detached-receive-red.xml` 保留 null 窗口修前失败，`receive-owner-green.xml` 为中间 131 passed。
+
+`binary_hidden_frame_bytes` 使用与 TCP 相同的外层 `json.dumps`（含空格、ASCII 转义和可选控制证书）计算真实长度，回程超限在发送前选择分片。新增回归包括 raw=8,389,080 bytes、ASCII／中文 metadata 的 limit−1／limit／limit+1、证书扩展和完整逐帧重组。追加 null 窗口回归后的最终组合为 **25 文件、1168 passed，0 failed／error／skipped，pytest 总耗时 91.97 秒**；JUnit 原件为 `build/ticket13-resume-20261017/source-final-detached-regression.xml`，总耗时见同名 `.log`。
+
+上述 Python 阶段组合与最终 25 文件组合存在重叠，分别记录用途，不累加为全仓测试数量。APK 为 25,851,393 bytes，SHA `b21cf35c52191912bc19a812ac46a573390c4f98f71dd0bbab9ef81a4a1f381a`，已通过 `adb install -r` 保数据安装；USB 模式、设备身份和 SAF 保持原配置。
+
+设备与供给证据根为 `build/ticket13-resume-20261017/`。Surface 的 Tailscale 已恢复，worker 沿用原节点 `TABLET-2TLUCNU8`，保留原 state、models 与凭据。Surface 已部署与 master 相同的 dirty 冻结运行 manifest：SHA256 `ed433021be9a161ae4c412f7895df4e6bebeb0a435e3b4eefdb57d0f7787e05d`，370 文件，源 HEAD `638365519d647b6bc626620861b180d8cab3c487`，`source_dirty=true`。部署与身份配置见 `surface-frozen-deployment.json`、`surface-identity-settings.json`，冻结来源见 `final-runtime-source-freeze.json`；`three-restored-nodes.json` 记录 master、Surface、Y700 三节点均在线。
+
+Qwen3.5-9B 由正式 `/api/models/intent`、`strategy=auto` 自动规划三段 **master `[0,4)` → Surface `[4,24)` → Y700 `[24,32)`**，DL／LL 均达到 `status=ready`、`loaded_ready=true`。未手填层段，容量倍率和安全余量沿用产品配置；`scripts/run_product_relay_gate.py` 的正式三节点 `preflight` 与真实 `drive_tui` 均执行成功。
+
+| 模式 | operation | 实际引擎／停止 | 产品入口与完成回执 |
+| --- | --- | --- | --- |
+| DL | `supply_4af7a565275b41989e832b70564cc7fe` | master PyTorch／CUDA，Surface／Y700 llama.cpp；EOS | API 2／6，Textual/SSE 2；12 条完成回执逐项通过 |
+| LL | `supply_edfa6155e2c34b8eb8d109cfd11e5019` | 三端 llama.cpp；text_stop | API 2／6，Textual/SSE 2；42 条完成回执逐项通过 |
+
+每档包含两个独立 API session 和一个真实 TUI session，均为 `distributed_required`、两个不同远端、`fallback=false`；操作／配置／整数 generation、阶段顺序、range／assignment／artifact SHA 与实际完成回执一致。原件分别存于 `dl-three-final/`、`ll-three-final/` 的 `api-chats.json`、`tui-development-three-node/`、`completed-handoffs-verified-v2.json` 和 `product-capture/`。总索引 `three-node-final-development-summary.json` 保存六份节点 raw 的 SHA，并核对最终源码仍等于冻结 manifest，既有两机证据 SHA 保持原值。
+
+六份节点 raw 的 `collection_errors` 均为空，递归进程树及其 children／maps／connections 均 complete，前后 PID／创建时间稳定。DL master 实际材料化 55 个张量、3,764,136,064 bytes，decoder 恰为 0–3；LL master 实际加载 4 层，Surface 与 Y700 在两档均实际加载 20／8 层。每端 loaded artifact 的独立重算 SHA 与供给身份一致，观测的 `full_model_loaded=false`；Surface 的旧临时映射名由正式 collector 的完整映射字节证明绑定到当前裁片。实际非 loopback 连接为 master 与两个 worker 的双向边，worker 各自只连接 master。
+
+`master-final.err.log` 记录 Surface 的 20 层、Y700 的 8 层 `layer_weight_bytes` 全为正数，双方 `binary_hidden_negotiated=True`；`binary-wire-final.log` 在两档均记录真实二进制 stage_offer、Surface 返回 stage_result 和 master 再转发 Y700。`ll-three-final/live-capacity.json` 的 `pipeline_layout` 三节点均为 `llama_cpp`，与实际运行回执一致，投影入口为 `Scheduler._attach_pipeline_node_contract`。
+
+DL 的 Surface 执行新本地裁切，`reused_bytes=0`、`actual_downloaded_bytes=0`；Y700 复用此前已验证尾段。LL 复用已验证工件，各端新增下载字节均为 0。容量口径分别保留：DL 的 `single_node_full_model_candidates=[]`，LL 的该字段含 master，因此 LL 记录验证多段执行及整模禁载，单机容量拒绝证据取 DL，见两档 `intent-latest.json`。
+
+两个 `producer-result.json` 均按原严格门返回 1，具体拒绝项为 master／Surface 的 dirty source manifest 和 Android 的真实 `source_dirty=true`。原始时间与失败结果保留，未生成 topology／native 绿色快照；这两档的来源口径为冻结 dirty 开发验收。
+
+为切换三机，原两机 `dl-final/` 操作 `supply_5b9994a78b8c4c4e944ca9831892e9c4` 已通过正式 DELETE 取消；`dl-final/cancellation-for-three-nodes.json` 记录 `status=cancelled`、`reason_code=INTENT_CANCELLED`。两机旧结果继续保留为开发证据。修复前 `ll-before-fix/` 记录正式模型意图自动得到 LL `[0,24) → [24,32)`、Y700 新本地裁切、API 回答 2／6、text_stop、distributed_used=true、fallback=false；此前 900 秒超时请求尚未生成层段计划，记录不足以归因于二进制前向。
+
+票 13 与票 21a 均保持开放。票 13 的严格验收继续要求 clean 来源、master 加两个不同远端的严格 DL／LL 证据，以及可信签名三平台最终产物的实际执行；当前 dirty 冻结部署按开发证据记录。票 21a 的 PC／Android 三端新格式接力已有上述证据，32-token 新旧线格式对拍、旧／新能力对端混跑与时延收益仍待验收。票 14 尚未启动。

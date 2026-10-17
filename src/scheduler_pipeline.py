@@ -540,7 +540,17 @@ def _node_capabilities(control: Any, node_id: str) -> dict:
             sorted(capabilities.keys()) if isinstance(capabilities, dict) else None,
             worker_ids,
         )
-        return capabilities if isinstance(capabilities, dict) else {}
+        if not isinstance(capabilities, dict):
+            return {}
+        # Frame admission must use the same accepted ACK bit as the sender.
+        # A coordinator-wide disable still preserves the raw HELLO inventory.
+        return {
+            **capabilities,
+            "binary_hidden": (
+                worker.get("binary_hidden") is True
+                and capabilities.get("binary_hidden") is True
+            ),
+        }
     return {}
 
 
