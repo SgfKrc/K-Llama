@@ -1,9 +1,9 @@
 # 票 13 续验与阻塞复核（2026-10-16）
 
-> 状态：票 13、21a 开放；ROG 免安装首启与三机 DL／LL API 已验，frozen 来源修复与严格重采继续；可信签名三平台实际发行执行后置为发布前门。
+> 状态：**现行**（票13产品验收收口；严格来源重采与可信签名发行实际执行为独立后置门，票21a剩余验收单列）
 > 更新日期：2026-10-18
 
-此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11；当前收口范围与干净构建见 §12，ROG 免安装续验及 frozen 来源合同见 §13。
+此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11，干净构建见 §12，ROG免安装续验及frozen来源合同见 §13；当前终态与重构基线见 §14。
 
 本记录复核此前同日的阻塞归因，保留原始证据于 `build/ci-release-followup-20261016/`；新证据独立存于 `build/ticket13-verify-20261016/`，不覆盖原始日志。§1～§5 是上午续验：当时主仓 HEAD `5f63b267c197dcf24af3905d12a33830f01a6ef2`、Android HEAD `07fcba305d5ac5ebd8e9497bab7aafbf6a78d409`，运行含未提交修改。这些改动已于 12:43 的一批提交入库；下午复核起点为干净主仓 `d657ca7f49365d6d50832b57c4fe1a0dde307c60`、Android `76a408a7f23dd1d5b332c9dac93273b8ab17f323`，新增修复与发行检查见 §6～§9。三端来源分别记录，不能仅以 HEAD 相同宣称最终同 revision 签名验收通过。
 
@@ -107,7 +107,7 @@ master／ROG／Y700 同时在线。用户提交 `qwen3-5-9b` 自动模型意图�
 
 **GitHub runner 注册、仓库签名变量／密钥是否已配置，本轮未独立查询，不能沿用原报告“runner 未注册／三项均未具备”的断言。** 最终仍需可信签名发行物、来源匹配、实际平台执行与严格证据包；不代持密钥、不用临时签名绕门。用户已允许最终发行物验收后置，本轮的 dirty／debug 运行不冒充最终门通过。
 
-下一步发行工作应围绕实际 artifact 生产上传、外部 runner／签名配置核实和最终产物执行门安排；无需再根据已经被复核推翻的 A／B 归因另立重复修复票。票 13 保持开放；重构票 14 仍按原先行为边界与独立分支裁决处理。
+发行后续围绕实际artifact生产上传、外部runner／签名配置及最终产物执行门安排；A／B被推翻的归因不重复立票。票13终态及独立重构分支见 §14。
 
 ## 6. 新提交与三机 bundle 的重新核实（2026-10-16 下午）
 
@@ -218,7 +218,7 @@ Qwen3.5-9B 经正式模型意图入口自动分配 `[0,4) → [4,8) → [8,32)`�
 
 新原件为 `dl-mapped/`、`ll-mapped/` 的 API、Textual/SSE、完成回执与 `product-capture/*-nodes/`；总索引 `physical-runtime-mapped-final-summary.json`，其 scope 明确为开发事实，strict_product_gate_passed=false。六份新 raw 均无 collection_errors；两个 `producer-result.json` 仍正确返回 1：master／Android 为 dirty 来源，ROG 原始远端窗口超出 SSH 时间窗口。未改时间、未写 topology／native 绿快照，历史 bundle SHA 仍为 `1249cdf8bb8a5fe013f1635f582467685ccba57079c44113f2c4ab12db9be817`。临时 logcat 采集已退出，`adb-final-devices.txt` 确认 HA26PYZQ 仍为 device。
 
-该次清洁度、时钟和发行物的原始拒绝结果保留。当前收口与后置发行范围见 §12，票 14 尚未启动。
+该次清洁度、时钟和发行物的原始拒绝结果保留。当前票13终态与后置发行范围见 §14。
 
 ## 10. 干净运行来源与模型存储绑定（2026-10-17 复核）
 
@@ -274,16 +274,16 @@ DL 的 Surface 执行新本地裁切，`reused_bytes=0`、`actual_downloaded_byt
 
 为切换三机，原两机 `dl-final/` 操作 `supply_5b9994a78b8c4c4e944ca9831892e9c4` 已通过正式 DELETE 取消；`dl-final/cancellation-for-three-nodes.json` 记录 `status=cancelled`、`reason_code=INTENT_CANCELLED`。两机旧结果继续保留为开发证据。修复前 `ll-before-fix/` 记录正式模型意图自动得到 LL `[0,24) → [24,32)`、Y700 新本地裁切、API 回答 2／6、text_stop、distributed_used=true、fallback=false；此前 900 秒超时请求尚未生成层段计划，记录不足以归因于二进制前向。
 
-票 13 与票 21a 均保持开放。上述 dirty 冻结部署按开发证据记录，票 13 的当前收口范围见 §12。票 21a 的 PC／Android 三端新格式接力已有上述证据，32-token 新旧线格式对拍、旧／新能力对端混跑与时延收益仍待验收。票 14 尚未启动。
+上述dirty冻结部署按开发证据记录，票13终态见 §14。票 21a 的 PC／Android 三端新格式接力已有上述证据，32-token 新旧线格式对拍、旧／新能力对端混跑与时延收益仍待验收。重构设计与当前阶段见 §14。
 
 
-## 12. 当前收口范围与干净来源（2026-10-18）
+## 12. 干净来源与Windows修复记录（2026-10-18）
 
-票 13 当前收口要求保留普通 CI、来源和发行合同检查，并以同一 clean revision 完成 master 加两个不同远端的严格 DL／LL 产品证据。真实 Textual/SSE、逐段完成回执、独立进程／连接／装载观测、proper segments 与容量预算继续按 `run_product_relay_gate.capture`、`product_relay_gate.validate_bundle` 和 `product_observations.derive_node_observation` 验收。
+普通CI、来源和发行合同检查继续保留；同clean revision的master加两个不同远端严格DL／LL证据转入 §14 的独立发布前门。真实 Textual/SSE、逐段完成回执、独立进程／连接／装载观测、proper segments 与容量预算继续按 `run_product_relay_gate.capture`、`product_relay_gate.validate_bundle` 和 `product_observations.derive_node_observation` 验收。
 
-可信签名 Windows／Linux／Android 最终产物的实际发行执行列为后置的发布前门；Linux 近期实机执行后置。这项范围划分允许产品链先行收口，`release_acceptance` 的签名、来源、产物执行要求及既有失败报告继续保留。Windows 免安装包可用于 Surface 隔离目录验收；需要清理现有仓库时先列 dry-run，保留模型、state、节点身份、凭据及可恢复路径。旧 Launcher 的治理、裁撤或合并排在 DL／LL 重采之后独立评估。
+可信签名 Windows／Linux／Android 最终产物的实际发行执行列为后置的发布前门；Linux 近期实机执行后置。这项范围划分允许产品链先行收口，`release_acceptance` 的签名、来源、产物执行要求及既有失败报告继续保留。Windows 免安装包可用于 Surface 隔离目录验收；需要清理现有仓库时先列 dry-run，保留模型、state、节点身份、凭据及可恢复路径。独立Launcher裁撤职责已纳入[重构设计](单一事实源重构设计-2026-10-18.md#10-裁撤与数据迁移)。
 
-后续开发顺序为：票 13 产品链收口后，另建独立分支处理票 19 至票 22，再审查票 14 的前置行为与生命周期边界。当前继续 `dev` 的票 13 验收，19～22 新分支及票 14 均尚未启动。
+当前先在独立分支完成事实归属与状态机设计，再按重构阶段迁移；19～22已有成果及剩余优化按[新设计依赖表](单一事实源重构设计-2026-10-18.md#11-分期排票与完成门)接入。
 
 干净基线为 `37c87c5c03fd7b453f307a96130f77bdab3c0469`，固定 Android `aaa5938879922143817fd2e3bdb5c866fb78376c` 及其余四个仓库 pin。隔离 detached checkout 的 Git 状态和真实文件 inventory 均经过验证；`runtime_source.main` 导出 338 个运行文件，`source_dirty=false`，canonical manifest SHA `bbc356970e1781ff959bda17faafd952011a60e0f00d84665d5d8cbf2354932d`。新证据根为 `build/ticket13-clean-20261018/`，旧 dirty raw 与原始时间、SHA、失败结果保持不变。
 
@@ -334,13 +334,9 @@ DL 的 `product-capture-addresses-r1/producer-result.json` 与 LL 的 `product-c
 
 修后 ZIP `windows-fixed/QLH-Edge-Inference-0.1.8.3-windows-x64-cpu-37c87c5c-dirty-fixed-unsigned-test.zip` 为 105,941,302 bytes，SHA `69eb2d1db4394f09a1de488d8c6e84d2d380fd020c84d6ae100189497244400e`。502 项逐文件解压往返的大小／SHA 通过，实际已测主 EXE 与包内、解压后字节一致；旧 clean 包及其证据 54 文件摘要保持，见 `result-summary.json`。PyInstaller 公共 `_internal` 的 ggml 别名为 pip 原字节，patched 字节仅留私有目录，核对见 `native-byte-isolation.json`。该 EXE 的四层验证范围为 native context ready／close，forward、middle 工件、完整接力仍分别按产品证据验收。实验进程均退出，隐藏桌面资源已关闭。
 
-### 剩余产品验收
+### 后置发布前验收
 
-- 修复入库后重新冻结同一 revision 和全部子模块 pin，构建与运行分别绑定真实来源。现有 clean37c87c5c、dirty Windows 修后试包与独立 native 实编三类原件保持各自口径。
-- Surface 完成保状态运行目录切换后，以两个不同远端重采严格 DL／LL；重采使用新目录，保持星状连接、proper segments、整模禁载和容量预算。实际切换因工具自动审批拒绝待操作者执行，交接条件见 `build/ticket13-clean-20261018/surface-verification-handoff.md`。
-- Windows 免安装包在 Surface 的真实 API 首启／入群仍待设备验证，可信签名三平台最终产物实际发行执行按后置发布前门安排。旧 Launcher 治理与后续独立分支顺序按本节开头执行。
-
-票 13 产品链验收保持开放，票 14 尚未启动。
+严格来源重采、可信签名实际执行和平台安装的现行边界统一见 §14。上述clean／dirty包及失败、成功原件各自保留。Surface窗口不足由ROG独立免安装与三机产品续验接续，实际结果见 §13。
 
 ## 13. ROG 免安装续验与 frozen 来源合同（2026-10-18）
 
@@ -377,7 +373,7 @@ clean5d 的 `runtime_source.initialize` 沿用源码 checkout 清单，frozen EX
 
 `product_observations._installed_exe_source` 和 `pc_product_observer.rehash_installed_exe` 增加独立的 installed_exe 合同，绑定 OS EXE／cwd、启动 manifest、完整程序库存、真实 build-info 字节 SHA 及 clean/full revision。独立复核重放曾发现纯门漏验 OS cwd，现已补规范化比较和前后漂移拒绝，原复现已转为明确拒绝。观测元数据用于证明来源字节一致性；可信发行认证继续由既有 release gate 验收。
 
-`api.routes_diagnostics.product_source_observation` 提供空载即可访问的 `/api/diagnostics/product-source`，共用 opt-in、真实 loopback peer、nonce 与现有 API 认证边界，不读取模型 manager；完整 runtime 入口保留模型事实要求。诊断 router 抽取和 OpenAPI 基线已由提交 `7d3390ad` 入库，其他来源修复保持工作树真实状态。
+`api.routes_diagnostics.product_source_observation` 提供空载即可访问的 `/api/diagnostics/product-source`，共用 opt-in、真实 loopback peer、nonce 与现有 API 认证边界，不读取模型 manager；完整 runtime 入口保留模型事实要求。诊断router抽取和OpenAPI基线由`7d3390ad`入库；其余来源修复及安装产物合同随后由`fb870d1d`入库。
 
 最终定向整合 **10 文件、489 passed、3 skipped、47.86 秒**，跳过项均为本机 Windows 符号链接创建权限限制，见 `frozen-source-fix/final-integration/`。独立 observer 的 cwd 补充组合 **633 passed、3 skipped**；CPU 接线及既有 packaging 合同 **71 passed**；API／router 专项 **50 passed**。组合存在重叠，分别记录用途。
 
@@ -387,9 +383,20 @@ clean5d 的 `runtime_source.initialize` 沿用源码 checkout 清单，frozen EX
 
 ROG 在独立 `QLH-Source-Observation-20261018` 目录、临时 state、single 模式和 API 8013 启动该真实 EXE。PID 14956 的 product-source 返回 200／installed_exe，560 个程序文件与独立外部 observer 的完整复算一致；PID／创建时间、OS EXE、安装根 cwd、清单和前后来源均绑定。实际观测约 3.66 秒，进程树没有模型映射；完整 product-runtime 因空载继续返回 409。严格 `_source` 明确拒绝 `source_dirty=true`。原件为 `source-only-independent-result.json`；实验实例已定向停止，默认 state 和 clean worker PID 20348 保持，见 `rog-source-only-stop-r2.json`。
 
-### 继续验收项
+### 后置验收项
 
-- 修复入库后冻结新的同一 clean revision，三机 DL／LL 重采 Textual/SSE、逐段完成回执及完整独立节点观测，生成正式严格证据包。
-- 可信签名三平台最终发行执行、近期 Linux 实机与旧 Launcher 治理沿用 §12 的后置安排。
+同clean revision完整严格重采与可信签名最终产物实际执行转入 §14 的独立发布前门。既有试包和观测保留原来源、时间、SHA及严格拒绝结果。
 
-票 13 产品链验收保持开放。
+## 14. 票13收口与重构基线（2026-10-18）
+
+票13按实际达到的产品易用性和稳定性范围关闭，结束继续追验。§13记录Windows免安装独立运行、同来源APK更新、自动供给及Qwen3.5-9B三机LL／DL的实际成功；来源修复已由`fb870d1d4ef2d1d2901db1c5e299ac387fc9597b`入库。严格来源重采、可信发行签名与完整三平台实际安装尚未全部验收，其判据和原始失败记录保持。
+
+剩余工作为独立发布前门：
+
+- 从同一clean revision及实际子模块pin构建最终包，重采真实Textual/SSE、逐段完成回执与完整独立节点观测，生成严格DL／LL证据包。
+- 可信签名最终产物的认证及实际执行分别验收，debug或dirty试包继续仅按实际用途记录。
+- Windows／Android优先安排目标环境实际安装；Linux完整产品执行随发行范围安排。ROG首启为独立程序环境验证，保留既有state及磁盘残留，不描述成全新操作系统。
+
+严格发布门继续由现有工具执行；产品收口不修改旧passed／failed值。后续产品不退化由重构R6承接，设备缺口按实际未执行登记。
+
+独立分支`refactor/ssot-design-20261018`从干净`fb870d1d`建立。功能证据见[当前功能与事实归属审计](当前功能与事实归属审计-2026-10-18.md)，目标设计与阶段见[单一事实源重构设计](单一事实源重构设计-2026-10-18.md)。生产实现迁移和代码裁撤尚未开始。
