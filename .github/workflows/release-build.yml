@@ -11,6 +11,11 @@ name: release-build
 # QLH_RELEASE_WINDOWS_VENV: absolute external pre-provisioned packaging venv.
 # Runners also need Python 3.12 + cryptography, Git Bash on Windows, Linux
 # native build tools, Android SDK/NDK/JDK, and private submodule read access.
+# Windows CPU native prerequisite: pre-provision x64 UCRT64 gcc.exe, g++.exe,
+# mingw32-make.exe and its four runtime DLLs in C:\msys64\ucrt64\bin (override
+# with QLH_KEEP_HEAD_TOOLCHAIN_BIN). Provision cmake.exe there, or set the runner's
+# QLH_KEEP_HEAD_CMAKE to its absolute path. No toolchain/source downloads occur
+# in build_keep_head_cpu.ps1; it compiles the committed pinned llama.cpp + shim.
 # The Windows venv link is created only in this disposable checkout.
 # Installation/startup/device gates belong to release-acceptance, not this build.
 on:

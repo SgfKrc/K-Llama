@@ -1,9 +1,9 @@
 # 票 13 续验与阻塞复核（2026-10-16）
 
-> 状态：票 13、21a 开放；2026-10-17 冻结开发来源三机 DL／LL 通过，清洁来源复采及可信签名三平台产物实际执行待验。
-> 更新日期：2026-10-17
+> 状态：票 13、21a 开放；干净来源已冻结，严格三机 DL／LL 待复采；可信签名三平台实际发行执行后置为发布前门。
+> 更新日期：2026-10-18
 
-此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11。
+此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11；当前收口范围与干净构建见 §12。
 
 本记录复核此前同日的阻塞归因，保留原始证据于 `build/ci-release-followup-20261016/`；新证据独立存于 `build/ticket13-verify-20261016/`，不覆盖原始日志。§1～§5 是上午续验：当时主仓 HEAD `5f63b267c197dcf24af3905d12a33830f01a6ef2`、Android HEAD `07fcba305d5ac5ebd8e9497bab7aafbf6a78d409`，运行含未提交修改。这些改动已于 12:43 的一批提交入库；下午复核起点为干净主仓 `d657ca7f49365d6d50832b57c4fe1a0dde307c60`、Android `76a408a7f23dd1d5b332c9dac93273b8ab17f323`，新增修复与发行检查见 §6～§9。三端来源分别记录，不能仅以 HEAD 相同宣称最终同 revision 签名验收通过。
 
@@ -155,7 +155,7 @@ master／ROG／Y700 同时在线。用户提交 `qwen3-5-9b` 自动模型意图�
 
 发行依赖于已有受信签名材料与实际平台执行。只读检查当前环境：Windows CPU 树缺版本／清单／合同／来源文件；旧 Launcher 使用不在当前公开信任库中的 release-20260809 且缺合同／来源；根 dist 无最终 Linux deb 与 Android release APK。Docker 与发行物门的后续实际检查见 §8。gh CLI 和常用认证接口未接入，GitHub runner／签名外部配置未独立核实；本机所需签名接口未配置不等于外部密钥不存在。
 
-票 13 保持开放。关闭顺序为：完成运行端接线验证 → 冻结目标 revision 与受信构建来源 → 新采严格三机 DL／LL → 生产可信三平台最终产物并取得实际执行报告 → 由 `release_acceptance` 总门裁定。星状拓扑、DL／LL 连续 proper segments、分布式禁止整模装载与容量安全预算保持原合同。
+票 13 的产品链收口与最终发行执行分别验收，当前范围见 §12。`release_acceptance` 继续按真实签名产物及三平台实际执行报告裁定发布总门。星状拓扑、DL／LL 连续 proper segments、分布式禁止整模装载与容量安全预算保持原合同。
 
 ## 8. 运行端回执与独立采集（2026-10-16）
 
@@ -218,7 +218,7 @@ Qwen3.5-9B 经正式模型意图入口自动分配 `[0,4) → [4,8) → [8,32)`�
 
 新原件为 `dl-mapped/`、`ll-mapped/` 的 API、Textual/SSE、完成回执与 `product-capture/*-nodes/`；总索引 `physical-runtime-mapped-final-summary.json`，其 scope 明确为开发事实，strict_product_gate_passed=false。六份新 raw 均无 collection_errors；两个 `producer-result.json` 仍正确返回 1：master／Android 为 dirty 来源，ROG 原始远端窗口超出 SSH 时间窗口。未改时间、未写 topology／native 绿快照，历史 bundle SHA 仍为 `1249cdf8bb8a5fe013f1635f582467685ccba57079c44113f2c4ab12db9be817`。临时 logcat 采集已退出，`adb-final-devices.txt` 确认 HA26PYZQ 仍为 device。
 
-票 13 的剩余关闭条件为：冻结并部署 clean 目标来源、建立有效的实验台时间同步后重新取得严格 DL／LL bundle，再构建可信签名的三平台最终产物并完成实际执行总门。当前保留清洁度、时钟和发行物的真实拒绝结果，票 14 尚未启动。
+该次清洁度、时钟和发行物的原始拒绝结果保留。当前收口与后置发行范围见 §12，票 14 尚未启动。
 
 ## 10. 干净运行来源与模型存储绑定（2026-10-17 复核）
 
@@ -228,7 +228,7 @@ Qwen3.5-9B 经正式模型意图入口自动分配 `[0,4) → [4,8) → [8,32)`�
 
 `build/ticket13-resume-20261017/clean-source-storage-binding.json` 与 `clean-source-full-validation.json` 记录独立验证：从 clean HEAD `638365519d647b6bc626620861b180d8cab3c487` 导出 338 个运行来源文件，manifest SHA `2e7d5689be722bb66d48355bf1931c56eeac9cb469bd4c89e8cfbcbc825ca19f`、source_dirty=false。Gitless 目录的 `models` 根映射至原 `H:\qlh_models`，生产注册表以 SQLite query-only 方式读取，作为供给查找的只读快照。完整调用 `ensure_registered_sources(want_gguf=True, require_cross_format=True)` 成功验证 Qwen3.5-9B 的 Safetensors、原 manifest 和绑定 GGUF；模型复制字节为 0，无下载、转换、权重加载或生产注册表写入。该记录证明存储绑定和现有源合同，完整产品准备及发行仍分别验收。
 
-冻结来源的部署需求是保持目标模型的存储绑定、运行依赖和状态配置。当前协议修复含未提交修改，实际工作树服务和调试 APK 继续记录 dirty=true；严格同来源三机包与可信三平台最终发行仍待完成。
+冻结来源的部署需求是保持目标模型的存储绑定、运行依赖和状态配置。2026-10-17 开发服务和调试 APK 记录 dirty=true；协议修复现已提交至 `37c87c5c03fd7b453f307a96130f77bdab3c0469`，新冻结来源与构建见 §12。
 
 ### 已推翻结论
 
@@ -274,4 +274,70 @@ DL 的 Surface 执行新本地裁切，`reused_bytes=0`、`actual_downloaded_byt
 
 为切换三机，原两机 `dl-final/` 操作 `supply_5b9994a78b8c4c4e944ca9831892e9c4` 已通过正式 DELETE 取消；`dl-final/cancellation-for-three-nodes.json` 记录 `status=cancelled`、`reason_code=INTENT_CANCELLED`。两机旧结果继续保留为开发证据。修复前 `ll-before-fix/` 记录正式模型意图自动得到 LL `[0,24) → [24,32)`、Y700 新本地裁切、API 回答 2／6、text_stop、distributed_used=true、fallback=false；此前 900 秒超时请求尚未生成层段计划，记录不足以归因于二进制前向。
 
-票 13 与票 21a 均保持开放。票 13 的严格验收继续要求 clean 来源、master 加两个不同远端的严格 DL／LL 证据，以及可信签名三平台最终产物的实际执行；当前 dirty 冻结部署按开发证据记录。票 21a 的 PC／Android 三端新格式接力已有上述证据，32-token 新旧线格式对拍、旧／新能力对端混跑与时延收益仍待验收。票 14 尚未启动。
+票 13 与票 21a 均保持开放。上述 dirty 冻结部署按开发证据记录，票 13 的当前收口范围见 §12。票 21a 的 PC／Android 三端新格式接力已有上述证据，32-token 新旧线格式对拍、旧／新能力对端混跑与时延收益仍待验收。票 14 尚未启动。
+
+
+## 12. 当前收口范围与干净来源（2026-10-18）
+
+票 13 当前收口要求保留普通 CI、来源和发行合同检查，并以同一 clean revision 完成 master 加两个不同远端的严格 DL／LL 产品证据。真实 Textual/SSE、逐段完成回执、独立进程／连接／装载观测、proper segments 与容量预算继续按 `run_product_relay_gate.capture`、`product_relay_gate.validate_bundle` 和 `product_observations.derive_node_observation` 验收。
+
+可信签名 Windows／Linux／Android 最终产物的实际发行执行列为后置的发布前门；Linux 近期实机执行后置。这项范围划分允许产品链先行收口，`release_acceptance` 的签名、来源、产物执行要求及既有失败报告继续保留。Windows 免安装包可用于 Surface 隔离目录验收；需要清理现有仓库时先列 dry-run，保留模型、state、节点身份、凭据及可恢复路径。旧 Launcher 的治理、裁撤或合并排在 DL／LL 重采之后独立评估。
+
+后续开发顺序为：票 13 产品链收口后，另建独立分支处理票 19 至票 22，再审查票 14 的前置行为与生命周期边界。当前继续 `dev` 的票 13 验收，19～22 新分支及票 14 均尚未启动。
+
+干净基线为 `37c87c5c03fd7b453f307a96130f77bdab3c0469`，固定 Android `aaa5938879922143817fd2e3bdb5c866fb78376c` 及其余四个仓库 pin。隔离 detached checkout 的 Git 状态和真实文件 inventory 均经过验证；`runtime_source.main` 导出 338 个运行文件，`source_dirty=false`，canonical manifest SHA `bbc356970e1781ff959bda17faafd952011a60e0f00d84665d5d8cbf2354932d`。新证据根为 `build/ticket13-clean-20261018/`，旧 dirty raw 与原始时间、SHA、失败结果保持不变。
+
+主节点已正式卸载旧模型后切换到 Gitless 新目录，继续使用生产 state 与映射至 `H:\qlh_models` 的应用模型根，模型复制 0 字节。Surface 现有 C 盘约 80.0 GB 可用，暂未执行仓库清理；已准备同 manifest 的新源码归档，原 worker、模型和身份保持原状。远端部署执行被自动审批拒绝，返回 `blocked by policy`，未给出具体原因；干净三机重采待 Surface 完成运行目录切换后执行。来源归档或本机 HEAD 不能替代运行端的 PID 绑定观测。
+
+### 已安装 APK 与三机产品回归
+
+从冻结来源真实编译 Android ARM64 native 和 debug APK，使用既有日常 debug 证书保持数据覆盖安装。设备端 `sha256sum` 与 pull 后重算均为 `fb648c7b7b285a72e448ab352374dd5d797c229f673ab9e3117d3b52a9bf35e3`，APK 25,858,915 bytes，包内 build-info 为 `37c87c5c`、`source_dirty=false`；UID 10324 保持，SAF、节点身份与凭据沿用。首次隔离构建证书不匹配的安装失败原件保留，随后以同一 APK 内容和已安装公开证书匹配的开发签名完成覆盖安装，见 `android-device-final/installation-result.json`、`installed-build-info.json`。签名口径为 debug 开发证书。
+
+正式 `/api/models/intent`、`strategy=auto` 对 Qwen3.5-9B 自动分配 master `[0,4)` → Surface `[4,24)` → Y700 `[24,32)`；两个不同远端与容量倍率、安全余量保持产品配置。主节点和 Y700 来源为 clean `37c87c5c`，Surface 仍为 `63836551`、dirty=true：
+
+| 模式 | operation | 产品入口与完成回执 | 实际装载 |
+| --- | --- | --- | --- |
+| DL | `supply_d13428369a8345108d9fce61f7030470` | API 2／6，真实 Textual/SSE 2；12 条完成回执逐项通过，EOS | master PyTorch／CUDA；55 个实际张量、3,764,136,064 bytes、decoder 0–3；Surface／Y700 native 20／8 层 |
+| LL | `supply_b36de85af7304785b23c29acf6df7b34` | API 2／6，真实 Textual/SSE 2；42 条完成回执逐项通过，text_stop | 三端 llama.cpp，native 4／20／8 层 |
+
+六份节点 raw 的递归进程树、children／maps／connections 均 complete，实际连接 peer 为 master 与两 worker 的双向星状边；各端 loaded=true、full_model_loaded=false，operation／config／整数 generation 与已发布计划一致，proper ranges 与装载引擎逐项一致。三次请求均 distributed_required、fallback=false。DL 的 `single_node_full_model_candidates=[]`；LL 的该字段含 master，单机容量拒绝证据取 DL。总索引 `physical-runtime-current-summary.json` 保存两档入口、逐条回执、六份 raw 与 SHA，scope 为混合来源产品回归。
+
+DL 的 `product-capture-addresses-r1/producer-result.json` 与 LL 的 `product-capture-time-r1/producer-result.json` 均严格拒绝 Surface 的 dirty source manifest，尚未生成 topology／native 绿快照。LL 首次采集还记录远端结束超出 SSH 窗口约 0.049 秒；Surface 实际执行 `w32tm /resync` 后，新采集时间窗检查通过。原失败时间与报告原样保留，时钟查询与校时记录见 `clock-verification.json`。DL 首次地址表类型错误保留，后续按节点对应 IP 列表的正式合同重采。
+
+`final-closure-evidence-check.json` 独立重算旧三机 20 份证据 SHA、冻结来源和主节点部署各 338 个运行文件，六个 checkout 状态保持 clean；旧 clean Windows 失败包和新安装 APK 的 SHA 另行核对。原 dirty／失败证据继续保留其原始语义。
+
+### Windows 免安装包的实际缺陷与修复
+
+冻结 clean `37c87c5c` 的正式 `qlh-edge.spec` 试包已真实构建为 102,382,673 bytes，ZIP SHA `9af62c661dcbafa9aa06e18e1d0ae9518266d0858a2353c2cb09b9bef9768f94`。五个程序入口、491 文件往返及 244 个 x64 PE 静态闭包完成验证；主程序实际首启暴露 `_prompt_tailscale_setup` 未定义 `owner_hwnd`，同时缺少 LL 首段／中段所需的 patched keep-head 组。原包及失败报告位于 `windows-package/`，其状态仍为首启验收失败。
+
+`packaging/packaging/launcher.py::_prompt_tailscale_setup` 现接收可选 owner，`_check_tailscale_requirement` 的两条路径显式传递。无控制台和无 Tailscale 的回归修前 1 failed，修后与已有启动门组合 31 passed；证据 `windows-startup-fix/`。这是当前主程序的首启修复，旧独立 Launcher 的治理顺序保持原计划。
+
+`src/keep_head_shim.py::default_shim_path` 在 frozen 模式解析 `_MEIPASS/keep_head/qlh_keep_head.dll`。`keep_head_resources.collect_keep_head_binaries` 静态验证九 DLL 的 x64、所需补丁导出、组内导入与依赖；`qlh-edge.spec` 将完整私有组直接加入 COLLECT，与 pip `llama_cpp/lib` 分目录保留，避免 Analysis 将同名 ggml 搬到公共目录。缺文件、补丁符号、依赖或错误 ABI 导入具名失败。定位、spec 和供给打包回归 96 passed，两次真实独立进程 native load／backend init／free 成功；最终与启动门联合验证 **6 文件、127 passed**，见 `windows-fixes-integration.xml`。独立只读复核未发现新的可复现 P0/P1，C header ABI 另以 frozen proper 裁片实际加载验收。
+
+上述 Windows 修复仍在工作树，原 clean `37c87c5c` 包与主节点冻结运行来源保持原字节。修后试包使用新的 dirty 来源与独立输出；原包的失败状态保留。
+
+### 干净 checkout 的 Windows 原生生产前置
+
+`scripts/model_tools/build_keep_head_cpu.ps1` 从锁定的 `android/app/src/main/cpp/llama.cpp` 干净 checkout 生成 x64 CPU llama／ggml，再调用既有 `build_keep_head_shim.ps1`；`packaging/packaging/build-cpu.bat` 的 llama_cpp_only 档在 PyInstaller 前执行，原签名门与精确失败退出码保留。脚本要求明确的 UCRT64 gcc／g++／make 和 CMake，支持 `QLH_KEEP_HEAD_TOOLCHAIN_BIN`、`QLH_KEEP_HEAD_CMAKE`；全新目录、固定源码、`GGML_NATIVE=OFF`、AVX512 关闭及 GPU／网络构建关闭均核查实际 cache，已有 cache 或输出具名拒绝，生产组保持原字节。
+
+`native-fresh/summary.json` 记录实际 Windows PowerShell 5.1 构建退出 0、约 62 秒；patched llama.cpp SHA `784cbbbbe03568727b9e02e64efda51d52bc8bbf`、前后 Git clean，九 DLL 通过真实 PE 合同。builder SHA `68c760237b8e1062b9aff329923082e87dd7d66fab4e363ee882498b537c388f` 与成功构建回执一致，完整命令、工具版本、pins、输入和输出摘要分别留证。本机默认工具目录缺 cmake.exe，成功构建使用显式 `-CMake`；缺工具与复用旧目录均退出 1，拒绝检查后的产物摘要保持。新增 16 项合同覆盖路径含空格、缺工具、缓存拒绝、工具与 shim 失败传播。
+
+最终将定位、私有闭包、原生构建、首启、供给打包、来源、签名及工作流合同联合以 `-n 4` 运行：**10 文件、261 passed、4 subtests passed，0 failed／error／skipped，56.30 秒**，原件 `windows-product-build-final.xml／.log`。前述 96、127、118、16 均与该最终组合重叠，分别记录用途。额外旧前端检查得到 118 passed／3 failed，原件 `windows-build-integration.xml`；三个失败均期待已不存在的 `api_server._resolve_frontend_dist`，当前 HEAD 源码与原测试均未改，核实见 `legacy-frontend-test-failure-audit.json`。该旧前端测试边界独立登记，保留失败结果，治理范围随后评估。
+
+### 修后 frozen EXE 的实际验证
+
+`windows-fixed/smoke-report.json` 记录无 Tailscale、无交互 stdin 的真实 frozen EXE 已成功执行弹窗“否”，进入 `--check-only` 的具名未配置模型拒绝（预期退出 1）。此前两次探针的隐藏桌面设置未传入 Win32 启动结构，程序停在 MessageBoxW；失败 JSON 与采样栈保留，新探针通过实际 CreateProcessW／STARTUPINFOW 的 lpDesktop 控制桌面，明确记录一次弹窗选择与进程退出。
+
+同一主 EXE 经 `--keephead-worker` 从包内私有组实际加载 Qwen3.5-9B 的 proper `[0,4)` GGUF，ready 报告 n_layer=4、n_embd=4096，关闭 ACK 后退出 0；前后模型 SHA `35349547f1bbe6eed52cc39c6cfe7c5bcf1f28732ec6300add35f9f5fd662169` 相同，模型复制 0 字节。pip 和 keep_head 两组各在独立进程用包内目录与 System32 搜索，实际模块路径分别归属对应目录。主 EXE SHA `c9aa43f063b3b032abdf57cc84f9ae4853b11108de0aa6c3c233b0aac5e90fc5`。产品自带 frozen Python，首启无需外部 Python／pip；实验控制器仍使用本机 Python。生产占用 UDP 29876，API 就绪与 Surface 上该包的实际执行尚未验收。
+
+修后试包的主程序由 dirty 修复 overlay 重新冻结，伴随程序和该试包的九 DLL 复用来源独立登记；全新九 DLL 的生产验证取上节，两个来源各有真实摘要。试包用途为隔离执行验证，可信发行签名仍按发布前门处理。
+
+修后 ZIP `windows-fixed/QLH-Edge-Inference-0.1.8.3-windows-x64-cpu-37c87c5c-dirty-fixed-unsigned-test.zip` 为 105,941,302 bytes，SHA `69eb2d1db4394f09a1de488d8c6e84d2d380fd020c84d6ae100189497244400e`。502 项逐文件解压往返的大小／SHA 通过，实际已测主 EXE 与包内、解压后字节一致；旧 clean 包及其证据 54 文件摘要保持，见 `result-summary.json`。PyInstaller 公共 `_internal` 的 ggml 别名为 pip 原字节，patched 字节仅留私有目录，核对见 `native-byte-isolation.json`。该 EXE 的四层验证范围为 native context ready／close，forward、middle 工件、完整接力仍分别按产品证据验收。实验进程均退出，隐藏桌面资源已关闭。
+
+### 剩余产品验收
+
+- 修复入库后重新冻结同一 revision 和全部子模块 pin，构建与运行分别绑定真实来源。现有 clean37c87c5c、dirty Windows 修后试包与独立 native 实编三类原件保持各自口径。
+- Surface 完成保状态运行目录切换后，以两个不同远端重采严格 DL／LL；重采使用新目录，保持星状连接、proper segments、整模禁载和容量预算。实际切换因工具自动审批拒绝待操作者执行，交接条件见 `build/ticket13-clean-20261018/surface-verification-handoff.md`。
+- Windows 免安装包在 Surface 的真实 API 首启／入群仍待设备验证，可信签名三平台最终产物实际发行执行按后置发布前门安排。旧 Launcher 治理与后续独立分支顺序按本节开头执行。
+
+票 13 产品链验收保持开放，票 14 尚未启动。
