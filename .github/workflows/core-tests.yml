@@ -100,6 +100,9 @@ jobs:
           git("apply", "--include=include/llama.h", str(patch_path))
           PY
 
+      - name: Run refactor import and write boundary gate
+        run: python -B scripts/check_refactor_boundaries.py
+
       - name: Run documentation checks
         run: python -B scripts/run_doc_checks.py
 

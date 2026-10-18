@@ -219,6 +219,8 @@ scripts/*
 !scripts/init-submodules.bat
 !scripts/init-submodules.sh
 !scripts/run_test_channels.py
+!scripts/check_refactor_boundaries.py
+!scripts/run_refactor_contracts.py
 !scripts/run_simulation.py
 !scripts/startup_matrix.py
 !scripts/test_classification_report.py
@@ -292,3 +294,6 @@ dsh-migration-backup-*/
 !scripts/experiment_gemma_quality_unit.py
 !scripts/experiment_quality_production_gate.py
 !scripts/llama_dependency_contract.py
+
+# R2 reviewed catalog migration entrypoint.
+!scripts/migrate_model_catalog.py

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "fb870d1d4ef2d1d2901db1c5e299ac387fc9597b",
+  "scope": "R0 software contracts; no devices, real weights or production migration",
+  "groups": {
+    "r0_contracts_and_target_defects": [
+      "tests/test_refactor_boundaries.py",
+      "tests/test_refactor_product_contract.py",
+      "tests/test_refactor_target_defects.py",
+      "tests/test_refactor_authority_defects.py"
+    ],
+    "star_transport_and_wire_identity": [
+      "tests/test_task_worker_wire_contract.py",
+      "tests/test_tcp_comm.py::TestTCPServerConnectionManagement::test_registration_rejects_legacy_pipeline_peer",
+      "tests/test_scheduler.py::TestChainTopology::test_chain_forward_from_worker_is_rejected",
+      "tests/test_scheduler.py::TestChainTopology::test_layer_forward_from_worker_is_rejected",
+      "tests/test_scheduler.py::TestChainTopology::test_master_relay_rejects_non_adjacent_target",
+      "tests/test_scheduler.py::TestChainTopology::test_master_relays_three_logical_segments_in_order"
+    ],
+    "segment_capacity_and_explicit_local_mode": [
+      "tests/test_node_inference_mode.py",
+      "tests/test_pipeline_capacity.py",
+      "tests/test_route_a_local_prepare.py",
+      "tests/test_route_a_local_ranges.py"
+    ],
+    "automatic_supply_intent_and_exact_runtime_receipts": [
+      "tests/test_api_model_intent.py",
+      "tests/test_worker_prepare.py",
+      "tests/test_worker_assignment_state.py",
+      "tests/test_route_a_completed_evidence.py"
+    ],
+    "authority_and_fencing": [
+      "tests/test_cluster_control_contract.py",
+      "tests/test_cluster_auto_role_watermark.py"
+    ],
+    "request_context_stopping_and_unique_terminal": [
+      "tests/test_request_deadline.py",
+      "tests/test_chat_context.py",
+      "tests/test_chat_interactive.py",
+      "tests/test_route_a_stopping.py"
+    ],
+    "source_authentication_before_business_side_effects": [
+      "tests/test_api_security_boundaries.py"
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "base_suite": "refactor_catalog_suite_v1.json",
+  "scope": "R3 operation, supply, deployment, persistent command and cleanup recovery; temporary state only",
+  "additional_targets": [
+    "tests/test_refactor_deployment_owner.py",
+    "tests/test_model_intent.py",
+    "tests/test_model_supply.py",
+    "tests/test_model_supply_worker.py",
+    "tests/test_model_supply_partial_gc.py",
+    "tests/test_model_supply_dedup.py",
+    "tests/test_model_supply_plan_reuse.py",
+    "tests/test_model_supply_runtime_capacity.py",
+    "tests/test_pipeline_retirement.py",
+    "tests/test_pipeline_recovery_retirement.py",
+    "tests/test_pc_worker_connection_recovery.py",
+    "tests/test_ha_recovery.py",
+    "tests/test_refactor_publication_cleanup.py"
+  ]
+}

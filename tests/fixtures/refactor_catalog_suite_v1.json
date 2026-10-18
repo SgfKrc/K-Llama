@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "base_suite": "refactor_bootstrap_suite_v1.json",
+  "scope": "R2 catalog, artifact, engine capability and pure capacity contracts; temporary state only",
+  "additional_targets": [
+    "tests/test_refactor_catalog_registry.py",
+    "tests/test_refactor_catalog_loading.py",
+    "tests/test_refactor_catalog_artifacts.py",
+    "tests/test_refactor_engine_registry.py",
+    "tests/test_refactor_capacity_load_spec.py",
+    "tests/test_local_store_registry_cas.py",
+    "tests/test_model_supply_sources.py",
+    "tests/test_model_download_jobs.py",
+    "tests/test_api_models.py",
+    "tests/test_model_tools.py",
+    "tests/test_model_load_resolver.py",
+    "tests/test_koakuma_engine.py",
+    "tests/test_task_worker_protocol.py",
+    "tests/test_task_worker_adapter.py",
+    "tests/test_pipeline_capacity_freshness.py",
+    "tests/test_worker_prepare_coordinator.py",
+    "tests/test_worker_prepare_handshake.py",
+    "tests/test_worker_prepare_races.py",
+    "tests/test_model_module.py",
+    "tests/test_scheduler.py::TestComputeLayerAssignment",
+    "tests/test_scheduler.py::TestLocalDeviceProfileSync",
+    "tests/test_scheduler.py::TestAndroidNodeManagement",
+    "tests/test_pipeline_execution_capacity.py",
+    "tests/test_safetensors_supply_worker.py",
+    "tests/test_safetensors_supply_prepare.py"
+  ]
+}
