@@ -386,6 +386,7 @@ class DurableJournalReplica:
         checkpoint: JournalCheckpoint | Mapping[str, Any],
         *,
         received_at: float | None = None,
+        permission_check=None,
     ) -> dict[str, Any]:
         """Atomically apply a checkpoint and return its durable watermark."""
 
@@ -405,6 +406,8 @@ class DurableJournalReplica:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                if permission_check is not None:
+                    permission_check()
                 existing_rows = connection.execute(
                     """
                     SELECT sequence, event_json, event_digest, previous_digest
@@ -512,6 +515,8 @@ class DurableJournalReplica:
                                 checkpoint.workflow_id,
                             ),
                         )
+                if permission_check is not None:
+                    permission_check()
                 connection.execute("COMMIT")
                 return {
                     "accepted": True,
@@ -535,6 +540,9 @@ class DurableJournalReplica:
                 except sqlite3.Error:
                     pass
                 raise JournalReplicationError(f"failed to apply journal checkpoint: {exc}") from exc
+            except BaseException:
+                connection.rollback()
+                raise
             finally:
                 connection.close()
 
@@ -545,6 +553,7 @@ class DurableJournalReplica:
         last_sequence: int,
         event_chain_head: str | None = None,
         received_at: float | None = None,
+        permission_check=None,
     ) -> dict[str, Any]:
         """Drop the **uncommitted tail**, leaving the durable prefix ending at the committed point.
 
@@ -569,6 +578,8 @@ class DurableJournalReplica:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                if permission_check is not None:
+                    permission_check()
                 if sequence > 0:
                     row = connection.execute(
                         "SELECT event_digest FROM replicated_events "
@@ -599,6 +610,8 @@ class DurableJournalReplica:
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                         (f"truncated:{workflow_id}", f"{sequence}@{int(arrival)}"),
                     )
+                if permission_check is not None:
+                    permission_check()
                 connection.execute("COMMIT")
                 return {
                     "accepted": True,
@@ -621,6 +634,9 @@ class DurableJournalReplica:
                 except sqlite3.Error:
                     pass
                 raise JournalReplicationError(f"failed to truncate journal replica: {exc}") from exc
+            except BaseException:
+                connection.rollback()
+                raise
             finally:
                 connection.close()
 

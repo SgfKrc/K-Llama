@@ -186,12 +186,14 @@ class AutoRoleController:
             if self._state == "stopped":
                 return self._transition("stopped", "stopped", accepted=False)
             generation = self._generation
+        from qlh_core.control.clock import operation_clock
+        read_clock = operation_clock(now_ms)
         try:
             proposed = self._proposed_commit_watermark()
             outcome = collector.acquire(
                 self.node_id,
                 available_voter_ids=tuple(available_voter_ids),
-                now_ms=now_ms,
+                now_ms=read_clock(),
                 lease_id=lease_id,
                 commit_watermark=proposed,
             )
@@ -206,7 +208,7 @@ class AutoRoleController:
             self._last_outcome = outcome
             if not outcome.accepted or outcome.certificate is None:
                 return self._transition("read_only", outcome.reason, accepted=False, outcome=outcome)
-            return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+        return self.consume_certificate(outcome.certificate, now_ms=read_clock(), outcome=outcome)
 
     def renew_lease(
         self,
@@ -222,12 +224,14 @@ class AutoRoleController:
                 return self._transition("stopped", "stopped", accepted=False)
             if self._state != "leader" or certificate is None or self.collector is None:
                 return self._transition("read_only", "quorum_unavailable", accepted=False)
+        from qlh_core.control.clock import operation_clock
+        read_clock = operation_clock(now_ms)
         try:
             # #93：续期时重新提议水位（提交点会前进）；提议失败 ⇒ 退回证书里的原承诺，
             # 绝不因为"读不到新水位"就把已有承诺降级掉。
             proposed = self._proposed_commit_watermark() or tuple(certificate.commit_watermark)
             outcome = self.collector.renew(
-                certificate, available_voter_ids=tuple(available_voter_ids), now_ms=now_ms,
+                certificate, available_voter_ids=tuple(available_voter_ids), now_ms=read_clock(),
                 commit_watermark=proposed,
             )
         except (ControlContractError, ValueError, RuntimeError):
@@ -237,9 +241,9 @@ class AutoRoleController:
                 return self._transition(self._state, "role_changed", accepted=False)
             if outcome is None or not outcome.accepted or outcome.certificate is None:
                 return self.on_quorum_loss(outcome.reason if outcome is not None else "quorum_unavailable")
-            return self.consume_certificate(outcome.certificate, now_ms=now_ms, outcome=outcome)
+        return self.consume_certificate(outcome.certificate, now_ms=read_clock(), outcome=outcome)
 
-    def _enforce_committed_prefix(self, certificate: QuorumCertificate | Mapping[str, Any]) -> None:
+    def _enforce_committed_prefix(self, certificate: QuorumCertificate | Mapping[str, Any], *, permit=None) -> None:
         """#93：接管前的「已提交前缀」核对（由部署注入的 ``committed_prefix_guard`` 执行）。
 
         约定：guard 正常返回 = 本地前缀与证书承诺一致（必要时它已经完成截断/追赶）；
@@ -252,7 +256,15 @@ class AutoRoleController:
         if not isinstance(certificate, QuorumCertificate):
             certificate = QuorumCertificate.from_dict(certificate)
         try:
-            guard(certificate)
+            import inspect
+            if permit is not None:
+                permit.check()
+            if permit is not None and "permit" in inspect.signature(guard).parameters:
+                guard(certificate, permit=permit)
+            else:
+                guard(certificate)
+            if permit is not None:
+                permit.check()
         except AutoRoleError:
             raise
         except Exception as exc:  # noqa: BLE001 - 一律 fail-closed
@@ -273,30 +285,42 @@ class AutoRoleController:
         with self._lock:
             if self._state == "stopped":
                 return self._transition("stopped", "stopped", accepted=False)
-            try:
-                # #93：安装证书**之前**，先用自己的复制副本核对「已提交前缀」：落后必须先
-                # 追赶、多出的未提交尾部必须先截断；核对不通过一律拒绝接管（fail-closed）。
-                self._enforce_committed_prefix(certificate)
-                if self.fence is not None:
-                    self.fence.install_certificate(certificate, now_ms=now_ms)
-                    current = self.fence.authority.current_certificate() if self.fence.authority else None
-                elif self.authority is not None:
-                    self.authority.install_certificate(certificate, now_ms=now_ms)
-                    current = self.authority.current_certificate()
-                else:
-                    raise AutoRoleError("authority_unavailable", "auto role has no control authority")
-                if current is None:
-                    raise AutoRoleError("certificate_missing", "certificate was not installed")
-            except (AutoRoleError, ControlContractError, TypeError, ValueError) as exc:
+            generation = self._generation
+        try:
+            # The authority issues recovery permission only after all pure
+            # certificate checks; no invalid proof can truncate a replica.
+            recovery = lambda permit: self._enforce_committed_prefix(permit.certificate, permit=permit)
+            if self.fence is not None:
+                self.fence.install_certificate(certificate, now_ms=now_ms, recovery=recovery)
+                current = self.fence.authority.current_certificate() if self.fence.authority else None
+            elif self.authority is not None:
+                self.authority.install_certificate(certificate, now_ms=now_ms, recovery=recovery)
+                current = self.authority.current_certificate()
+            else:
+                raise AutoRoleError("authority_unavailable", "auto role has no control authority")
+            if current is None:
+                raise AutoRoleError("certificate_missing", "certificate was not installed")
+        except (AutoRoleError, ControlContractError, TypeError, ValueError) as exc:
+            with self._lock:
+                if generation != self._generation:
+                    return AutoRoleDecision(False, self._state, "client", "role_changed")
                 reason = getattr(exc, "code", "control_certificate_invalid")
                 return self._transition("read_only", str(reason), accepted=False)
-            if outcome is not None:
-                self._last_outcome = outcome
-            self._certificate = current
-            self._reconnect_requires_new_quorum = False
-            if current.leader_id == self.node_id:
-                return self._transition("leader", "quorum_certificate_accepted", accepted=True)
-            return self._transition("follower", "valid_certificate_other_leader", accepted=True)
+        with self._lock:
+            if generation != self._generation or self._state == "stopped":
+                if self.authority is not None:
+                    self.authority.revoke_certificate(current)
+                return AutoRoleDecision(False, self._state, "client", "role_changed")
+            return self._accept_certificate(current, outcome)
+
+    def _accept_certificate(self, current, outcome):
+        if outcome is not None:
+            self._last_outcome = outcome
+        self._certificate = current
+        self._reconnect_requires_new_quorum = False
+        if current.leader_id == self.node_id:
+            return self._transition("leader", "quorum_certificate_accepted", accepted=True)
+        return self._transition("follower", "valid_certificate_other_leader", accepted=True)
 
     def on_quorum_loss(self, reason: str = "quorum_unavailable") -> AutoRoleDecision:
         """Drop write authority immediately when voter reachability is lost."""
@@ -391,6 +415,8 @@ class AutoRoleController:
         if state not in AUTO_ROLE_STATES:
             raise AutoRoleError("state_invalid", "unsupported auto role state")
         with self._lock:
+            if state in {"read_only", "stopped"} and self.authority is not None:
+                self.authority.cancel_recovery()
             if (
                 state in {"read_only", "stopped"}
                 and self.mode == "auto"

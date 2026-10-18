@@ -213,8 +213,8 @@ def test_cluster_secret_rotation_never_returns_secret_and_disconnects_peers(
         lambda principal, code, source: None,
     )
     monkeypatch.setattr(
-        node_config,
-        "rotate_local_cluster_secret",
+        api_server,
+        "_rotate_cluster_credential",
         lambda: ("new-secret-must-not-leak", 7),
     )
 

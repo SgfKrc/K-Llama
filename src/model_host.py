@@ -195,7 +195,7 @@ _PIPELINE_CANDIDATE_TERMINAL_PHASES = frozenset({"aborted", "finalized"})
 _OWN_ATTRS = {
     "_manager", "model_loaded", "generation_config", "current_quant",
     "full_chat_execution_lock", "scheduler_callbacks",
-    "_pipeline_candidate_lock", "_pipeline_candidate_transaction",
+    "_pipeline_candidate_lock", "_pipeline_candidate_transaction", "_catalog_prepare",
 }
 
 
@@ -205,7 +205,8 @@ class ModelHost:
     属性代理：未在 _OWN_ATTRS 中的属性读写转发给内部 ModelManager。
     """
 
-    def __init__(self, manager: Any = None):
+    def __init__(self, manager: Any = None, *, initial_quant: str | None = None, environment=None):
+        object.__setattr__(self, "_runtime_environment", None if environment is None else dict(environment))
         object.__setattr__(self, "_manager", manager if manager is not None else _LazyModelManager())
         object.__setattr__(self, "model_loaded", False)
         try:
@@ -213,7 +214,7 @@ class ModelHost:
             _initial_quant = str(getattr(_cfg, "QUANT_TYPE", "int4"))
         except Exception:
             _initial_quant = "int4"
-        object.__setattr__(self, "current_quant", _initial_quant)
+        object.__setattr__(self, "current_quant", initial_quant if initial_quant is not None else _initial_quant)
         object.__setattr__(self, "generation_config", {
             "max_new_tokens": 1024,          # laptop 档默认值
             "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
@@ -225,6 +226,7 @@ class ModelHost:
         object.__setattr__(self, "scheduler_callbacks", None)
         object.__setattr__(self, "_pipeline_candidate_lock", threading.RLock())
         object.__setattr__(self, "_pipeline_candidate_transaction", None)
+        object.__setattr__(self, "_catalog_prepare", None)
 
     @property
     def engine_type(self) -> str:
@@ -271,6 +273,23 @@ class ModelHost:
             island_base_url=island_base_url,
         )
 
+    def configure_catalog(self, catalog_prepare) -> None:
+        """Bind the owning runtime without materializing the lazy manager."""
+        object.__setattr__(self, "_catalog_prepare", catalog_prepare)
+        manager = self.peek_manager()
+        if manager is not None:
+            self._configure_manager_catalog(manager)
+
+    def _configure_manager_catalog(self, manager, *, model_id="") -> None:
+        prepare = object.__getattribute__(self, "_catalog_prepare")
+        if prepare is not None:
+            configure = getattr(manager, "configure_catalog", None)
+            if callable(configure):
+                configure(prepare, model_id=model_id)
+
+    def configure_runtime_environment(self, environment):
+        object.__setattr__(self, "_runtime_environment", dict(environment))
+
     def configure_scheduler_callbacks(self, callbacks: SchedulerCallbacks) -> None:
         """Install the scheduler's complete, typed callback contract atomically."""
 
@@ -294,9 +313,12 @@ class ModelHost:
         # stable proxy type name here instead of requiring that symbol remain a
         # class object.
         if type(manager).__name__ != "_LazyModelManager":
+            self._configure_manager_catalog(manager)
             return manager
         try:
-            return manager._get_instance()
+            instance = manager._get_instance()
+            self._configure_manager_catalog(instance)
+            return instance
         except ImportError as exc:
             raise RuntimeError(
                 "当前发行版没有 PyTorch，无法使用 torch ModelManager；"
@@ -603,6 +625,7 @@ class ModelHost:
                 from llama_engine import LlamaCppEngine
 
                 manager = LlamaCppEngine()
+                manager._environment = self._runtime_environment
             else:
                 lazy_manager = _LazyModelManager()
                 if type(lazy_manager).__name__ == "_LazyModelManager":
@@ -627,6 +650,7 @@ class ModelHost:
             )
             object.__setattr__(self, "_pipeline_candidate_transaction", transaction)
             try:
+                self._configure_manager_catalog(manager, model_id=model_id)
                 descriptor = manager.prepare_pipeline_model(
                     model_id=model_id,
                     model_path=resolved_path,
@@ -647,6 +671,26 @@ class ModelHost:
             transaction.phase = "prepared"
             return dict(transaction.descriptor)
 
+    def freeze_pipeline_candidate_assignment(self, transaction_id, assignment, *, config_id, generation):
+        from copy import deepcopy
+        from qlh_core.planning.load_spec import assignment_load_spec
+        transaction = self._require_pipeline_candidate(transaction_id)
+        native = getattr(transaction.manager, "engine_type", "pytorch") == "llama_cpp"
+        artifact_sha = transaction.model_sha256
+        if native:
+            path = transaction.manager._find_layer_artifact(int(assignment["start_layer"]), int(assignment["end_layer"]))
+            if not path:
+                raise ValueError("deployment_local_artifact_missing")
+            artifact_sha = transaction.manager._pipeline_file_sha256(path)
+        spec = assignment_load_spec(assignment, artifact_format="gguf" if native else "safetensors")
+        result = deepcopy(assignment)
+        result["load_spec"] = spec.to_dict()
+        result["identity"] = {"config_id": config_id, "generation": generation,
+            "assignment_id": "local-" + config_id, "node_id": "master",
+            "layer_range": [int(assignment["start_layer"]), int(assignment["end_layer"])],
+            "artifact_sha256": artifact_sha, "load_spec_digest": spec.digest}
+        return result
+
     def materialize_pipeline_candidate(
         self,
         transaction_id: str,
@@ -656,6 +700,7 @@ class ModelHost:
         has_lm_head: bool,
         total_layers: int = None,
         model_id: str = None,
+        load_assignment: dict | None = None,
     ) -> Any:
         """Materialize the candidate's assigned range while active stays live."""
 
@@ -681,6 +726,7 @@ class ModelHost:
                 bool(has_lm_head),
                 total_layers,
                 model_id or transaction.model_id,
+                load_assignment,
             )
             if transaction.materialization_key is not None:
                 if transaction.materialization_key != materialization_key:
@@ -711,10 +757,15 @@ class ModelHost:
                         has_embedding=bool(has_embedding),
                         has_lm_head=bool(has_lm_head),
                         model_path=transaction.model_path,
-                        quant_type=transaction.quant_type,
+                        quant_type=(load_assignment["load_spec"]["quant_type"] if load_assignment else transaction.quant_type),
                         total_layers=total_layers,
                         model_id=model_id or transaction.model_id,
+                        **({"load_spec": load_assignment["load_spec"]} if load_assignment else {}),
                     )
+                    if load_assignment:
+                        from qlh_core.adapters.runtime_observation import observe_runtime
+                        result = dict(result or {"success": True})
+                        result["runtime_receipt"] = observe_runtime(transaction.manager, load_assignment)
             except Exception as exc:
                 manager = transaction.manager
                 cleanup_error = self._abort_failed_pipeline_candidate(
@@ -875,6 +926,8 @@ class ModelHost:
                 if callable(unload):
                     unload()
             engine_obj = LlamaCppEngine()
+            engine_obj._environment = self._runtime_environment
+            self._configure_manager_catalog(engine_obj, model_id=model_id)
             descriptor = engine_obj.prepare_pipeline_model(
                 model_id=model_id,
                 model_path=resolved_path,
@@ -977,6 +1030,8 @@ class ModelHost:
         n_ctx = {"edge": 1024, "mobile": 512, "ultrabook": 2048}.get(tier, 4096)
 
         engine_obj = LlamaCppEngine()
+        engine_obj._environment = self._runtime_environment
+        self._configure_manager_catalog(engine_obj, model_id=resolved_id or "")
         engine_obj.load_model(
             model_path=gguf_path,
             n_ctx=n_ctx,
@@ -1064,7 +1119,7 @@ class ModelHost:
             for _name in ("_engine_type", "quant_type", "model_path",
                           "active_model_id", "_active_model_id"):
                 object.__getattribute__(self, "__dict__").pop(_name, None)
-            manager = self._manager
+            manager = self._materialize_manager()
         return manager.switch_model(
             model_id=model_id,
             quant_type=quant_type,
@@ -1100,6 +1155,14 @@ class ModelHost:
         mgr = object.__getattribute__(self, "_manager")
         if mgr is None:
             return None  # manager 缺失（测试注入 None）时模拟原 getattr(..., None) 语义
+        if type(mgr).__name__ == "_LazyModelManager":
+            try:
+                mgr = mgr._get_instance()
+            except ImportError as exc:
+                raise AttributeError(
+                    f"{name!r} 需要 PyTorch 引擎，但当前节点没有 torch: {exc}"
+                ) from None
+            self._configure_manager_catalog(mgr)
         return getattr(mgr, name)
 
     def __setattr__(self, name, value):

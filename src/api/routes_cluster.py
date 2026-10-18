@@ -275,19 +275,17 @@ async def rotate_cluster_secret(
         source=_api_module.auth_service.request_source(request),
     )
 
-    from node_config import rotate_local_cluster_secret
-
     try:
         tcp_server = getattr(_api_module.scheduler, "_tcp_server", None)
         if tcp_server is not None:
             rotation, disconnected = await _api_module.run_in_threadpool(
                 tcp_server.disconnect_all_clients,
                 "cluster credential rotation",
-                before_disconnect=rotate_local_cluster_secret,
+                before_disconnect=_api_module._rotate_cluster_credential,
             )
         else:
             rotation = await _api_module.run_in_threadpool(
-                rotate_local_cluster_secret,
+                _api_module._rotate_cluster_credential,
             )
             disconnected = 0
         _secret, epoch = rotation
@@ -408,14 +406,7 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         raise _api_module.HTTPException(400, "reserved node_id")
 
     from bootstrap_credentials import BootstrapCredentialError, seal_bootstrap_credential
-    from node_config import ensure_local_cluster_secret, get_local_cluster_secret_epoch
-    cluster_secret = ensure_local_cluster_secret()
-    cluster_secret_epoch = get_local_cluster_secret_epoch()
-    try:
-        import config as cfg
-        cfg.CLUSTER_SECRET = cluster_secret
-    except Exception:
-        pass
+    cluster_secret, cluster_secret_epoch = _api_module._bootstrap_cluster_credential()
 
     api_host = request.url.hostname or peer_host
     lan_ip = getattr(_api_module.scheduler, "_lan_ip", "") or ""
@@ -424,10 +415,11 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
 
     master_tcp_host = select_advertised_master_host(api_host, lan_ip)
     master_api_host = api_host or master_tcp_host
-    master_api_port = request.url.port or _api_module.API_PORT
-    master_tcp_port = _api_module.scheduler.tcp_server.port if _api_module.scheduler.tcp_server else _api_module.SERVER_PORT
+    runtime_config = _api_module._get_app_runtime().resolve_config()
+    master_api_port = request.url.port or runtime_config.api_port
+    master_tcp_port = _api_module.scheduler.tcp_server.port if _api_module.scheduler.tcp_server else runtime_config.server_port
 
-    cluster_id = _api_module.os.environ.get("QLH_CLUSTER_ID", "qlh-default")
+    cluster_id = runtime_config.environment_snapshot().get("QLH_CLUSTER_ID", "qlh-default")
     try:
         credential_envelope = seal_bootstrap_credential(
             public_key=req.credential_public_key,

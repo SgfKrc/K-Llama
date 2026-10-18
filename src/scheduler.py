@@ -40,6 +40,7 @@ from koakuma_engine import (
     backend_id_for,
     runtime_supports,
 )
+from task_worker_capabilities import node_supports_forward_layers
 from network_path import build_client_network_path_view
 from pipeline_capacity import PipelineCapacityError, solve_pipeline_capacity
 from pipeline_node_contract import (
@@ -222,10 +223,11 @@ def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
     picked = np.argmax(cumulative >= uniform, axis=-1)
     return int(order[0, picked[0]])
 
-def _bootstrap_api_port(default: int = 8000) -> int:
+def _bootstrap_api_port(default: int = 8000, *, environment=None) -> int:
     """Return the master API port used for first-connect bootstrap."""
+    environment = os.environ if environment is None else environment
     for name in ("QLH_BOOTSTRAP_API_PORT", "QLH_MASTER_API_PORT"):
-        raw = (os.environ.get(name) or "").strip()
+        raw = (environment.get(name) or "").strip()
         if not raw:
             continue
         try:
@@ -273,50 +275,9 @@ def _sync_runtime_node_config(node_id: str = None, node_role: str = None) -> Non
             node_runtime.set_node_role(NODE_ROLE)
 
 def _node_supports_forward_layers(node: "NodeInfo") -> bool:
-    """节点能否承担**层前向传播**（即作为层流水线的一段）。
+    """Admit layer work through the same concrete engine schema as hello."""
+    return node_supports_forward_layers(node)
 
-    ★ 2026-09-19：判据从「**平台**」改为「**能力**」。
-
-    原实现（Phase 4.1，位于 `validate_layer_override`）按 `node_type == "android"` 一律拒绝，
-    理由写作「Android 无 PyTorch 推理能力」。该判据**过宽**：**Android 不能跑 PyTorch，
-    但能跑 llama.cpp/GGUF 引擎**，而 llama.cpp 现在**也能做层前向**
-    （`LlamaCppEngine.forward_layers_from_hidden()` 当下游、`forward_layers_to_hidden()` 当上游，
-    且 `BackendId.LLAMA_CPP` 已声明 `Capability.FORWARD_LAYERS`）⇒ 有 GGUF 引擎的 Android
-    可以参与层流水线。
-
-    判定顺序（**保守、向后兼容**）：
-
-    1. `device_info["capabilities"]` 明确包含 `Capability.FORWARD_LAYERS` ⇒ **允许**
-       （节点自报能力，最权威）；
-    2. 否则若 `device_info["backend_id"]` 给出已知 backend ⇒ 按 `_BACKEND_CAPABILITIES` 判定；
-    3. **两者都未提供** ⇒ 退回旧行为：**仅 `node_type == "pc"` 允许** ⇒
-       **未声明能力的 Android 仍被拒绝**（不会因为本改动被无意放行）。
-    """
-    if isinstance(node, dict):
-        node_type = node.get("node_type", "pc")
-        info = node.get("device_info")
-    else:
-        node_type = getattr(node, "node_type", "pc")
-        info = getattr(node, "device_info", None)
-    if not isinstance(info, dict):
-        info = {}
-
-    reported = info.get("capabilities")
-    if isinstance(reported, (list, tuple, set, frozenset)):
-        if Capability.FORWARD_LAYERS in set(reported):
-            return True
-    elif isinstance(reported, str):
-        if reported == Capability.FORWARD_LAYERS:
-            return True
-
-    backend_id = info.get("backend_id") or info.get("engine")
-    if isinstance(backend_id, str) and backend_id:
-        # 用公开 API，不触碰私有表。
-        if backend_capabilities(backend_id).supports(Capability.FORWARD_LAYERS):
-            return True
-
-    # 兜底：保持旧语义（pc 可、android 不可），避免未上报能力的节点被无意放行。
-    return node_type == "pc"
 
 class PipelineQueue:
     """
@@ -971,6 +932,9 @@ class Scheduler(
         return super().set_distributed_inference_enabled(enabled)
 
     def _scheduler_facade_global(self, name: str):
+        snapshot = getattr(self, "_runtime_settings", None)
+        if snapshot is not None and name in snapshot:
+            return snapshot[name]
         return globals()[name]
 
     def _qwen3_multisidecar_factory(self):
@@ -980,7 +944,17 @@ class Scheduler(
         self,
         host: Optional["InferenceHost"] = None,
         callbacks: Optional["SchedulerCallbacks"] = None,
+        *, runtime_config=None,
     ):
+        self._runtime_config = runtime_config
+        self._runtime_settings = None if runtime_config is None else {
+            **runtime_config.legacy_settings(),
+            "NODE_ID": runtime_config.node_id, "NODE_ROLE": runtime_config.node_role,
+            "RUN_MODE": runtime_config.run_mode, "SERVER_IP": runtime_config.server_ip,
+            "SERVER_PORT": runtime_config.server_port,
+            "_configured_node_id": lambda: runtime_config.node_id,
+            "_bootstrap_api_port": lambda: _bootstrap_api_port(environment=runtime_config.environment_snapshot()),
+        }
         # 推理宿主默认使用全局单例；回调由 API composition root 以具名
         # Protocol bundle 注入，避免 scheduler 反向依赖 api_server。
         self._host = host if host is not None else get_model_host()
@@ -1014,12 +988,15 @@ class Scheduler(
         # 否则从未连接过主节点的实例在错误路径直接访问
         # self._tcp_client 会抛 AttributeError 而不是优雅返回 False
         self._tcp_client = None
+        from qlh_core.bootstrap.model_control import build_model_control
+        from qlh_core.adapters.local_store import RuntimeLocalStore
+        self._model_control = build_model_control(RuntimeLocalStore(runtime_config) if runtime_config is not None else None)
         from model_supply import ModelSupplyCoordinator
         from model_supply_worker import ModelSupplyWorker
-        self._model_supply_worker = ModelSupplyWorker(self)
+        self._model_supply_worker = ModelSupplyWorker(self, root=(Path(runtime_config.state_dir) / "model-supply/received") if runtime_config is not None else None)
         from worker_prepare import WorkerPrepareController
         self._worker_prepare = WorkerPrepareController(self)
-        self._model_supply = ModelSupplyCoordinator(self)
+        self._model_supply = ModelSupplyCoordinator(self, root=(Path(runtime_config.state_dir) / "model-supply/operations") if runtime_config is not None else None)
 
         # 从节点：等待主节点推理结果
         self._client_pending_results: dict = {}
@@ -1290,20 +1267,20 @@ class Scheduler(
         # P4.5 HA-ROLE-AUTO-01: construct and start the quorum-backed role
         # controller at the composition root. Missing key/peer configuration
         # is reduced to read-only instead of falling back to a static master.
-        if NODE_ROLE == "auto":
+        if self._scheduler_facade_global("NODE_ROLE") == "auto":
             runtime = getattr(self, "_auto_role_runtime", None)
             if getattr(self, "_auto_role_controller", None) is None:
                 try:
                     from cluster_auto_role_runtime import install_auto_role_controller
 
-                    runtime = install_auto_role_controller(self, self._control_fence)
+                    runtime = install_auto_role_controller(self, self._control_fence, **({"environment": self._runtime_config.environment_snapshot()} if self._runtime_config is not None else {}))
                 except Exception as exc:
                     from cluster_auto_role import AutoRoleController
 
                     authority = self._control_fence.authority if self._control_fence is not None else None
                     self.set_auto_role_controller(
                         AutoRoleController(
-                            str(NODE_ID or "auto-node"),
+                            str(self._scheduler_facade_global("NODE_ID") or "auto-node"),
                             mode="auto",
                             authority=authority,
                             fence=self._control_fence,
@@ -1324,6 +1301,7 @@ class Scheduler(
             if runtime is not None:
                 runtime.start_lease_renewal(self._auto_role_controller)
 
+        self._model_control.start()
         self.init_nodes()
         if self._effective_role() == "master":
             self._load_pipeline_recovery_state()
@@ -1350,12 +1328,12 @@ class Scheduler(
         self._master_identity_verified: bool = False
         self._master_identity_reason: str = ""
 
-        if RUN_MODE == "distributed":
+        if self._scheduler_facade_global("RUN_MODE") == "distributed":
             from transport_port import create_server
 
             # 绑定到 0.0.0.0 接受所有接口连接（而非占位符 192.168.x.x）
             bind_host = host or "0.0.0.0"
-            actual_port = SERVER_PORT if port is None else port
+            actual_port = self._scheduler_facade_global("SERVER_PORT") if port is None else port
 
             try:
                 server = create_server(bind_host, actual_port)
@@ -1453,7 +1431,7 @@ class Scheduler(
         else:
             logger.info("调度器已启动（单机模式）")
 
-        if RUN_MODE == "distributed" and self._effective_role() == "master":
+        if self._scheduler_facade_global("RUN_MODE") == "distributed" and self._effective_role() == "master":
             self._start_deferred_network_identity()
 
         # 启动流水线请求队列（仅主节点，FIFO 串行）
@@ -1633,7 +1611,7 @@ class Scheduler(
         node_config/bootstrap 会同步这个模块级值，不能回读启动时已经过期的
         config.NODE_ROLE。
         """
-        configured_role = NODE_ROLE
+        configured_role = self._scheduler_facade_global("NODE_ROLE")
         controller = getattr(self, "_auto_role_controller", None)
         if configured_role == "auto":
             return controller.runtime_role if controller is not None else "client"
@@ -4337,7 +4315,9 @@ class Scheduler(
                     if isinstance(device_info, dict) and device_info:
                         updated_info = dict(device_info)
                         previous_info = dict(self.nodes[client_id].device_info or {})
-                        for key in ("tcp_peer_addr", "tcp_advertised_addr"):
+                        # Keep the accepted hello contract across hardware-only
+                        # STATUS_RES refreshes; hello owns runtime capability changes.
+                        for key in ("tcp_peer_addr", "tcp_advertised_addr", "engine_capabilities"):
                             if key in previous_info and key not in updated_info:
                                 updated_info[key] = previous_info[key]
                         profile_changed = previous_info != updated_info

@@ -160,7 +160,7 @@ class _Command:
     fence: object
     authority: object
     certificate: object
-    certificate_digest: object
+    authority_identity: object
     epoch: int
     cancelled: threading.Event = field(default_factory=threading.Event)
     retirement: _Retirement | None = None
@@ -212,7 +212,7 @@ class WorkerPrepareController:
         current = authority.current_certificate() if authority is not None else None
         return _Command(payload, client, getattr(client, "registration_epoch", None),
                         getattr(client, "_connection_generation", None), fence, authority,
-                        deepcopy(certificate), current.digest() if current is not None else None,
+                        deepcopy(certificate), authority.authority_identity() if authority is not None else None,
                         self._epoch)
 
     def _valid(self, command, *, check_mode=True):
@@ -230,11 +230,8 @@ class WorkerPrepareController:
         if command.authority is not None:
             if getattr(command.fence, "authority", None) is not command.authority:
                 return False
-            current = command.authority.current_certificate()
-            if current is None or current.digest() != command.certificate_digest:
-                return False
             try:
-                command.authority.admit_control_write(current)
+                command.authority.admit_bound_identity(command.authority_identity)
             except Exception:
                 return False
         return True
@@ -311,6 +308,12 @@ class WorkerPrepareController:
         statuses = {"prepare": "prepared", "commit": "ready", "abort": "released", "finalize": "finalized", "release": "released"}
         ack = {"action": "ack", "phase": phase, "identity": deepcopy(identity),
                "status": "error" if error else statuses[phase], "loaded": loaded}
+        if not error and phase in {"prepare", "commit"} and "load_spec_digest" in identity:
+            observer = getattr(self._runtime, "worker_runtime_receipt", None)
+            receipt = observer(identity) if callable(observer) else None
+            if receipt is None:
+                raise WorkerPrepareError("prepare_runtime_receipt_missing")
+            ack["runtime_receipt"] = receipt
         if "cleanup_id" in command.payload:
             ack["cleanup_id"] = command.payload["cleanup_id"]
         if error:

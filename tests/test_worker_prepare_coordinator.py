@@ -56,6 +56,11 @@ def ack(master, node, phase, **changes):
     value = deepcopy(master._pipeline_load_transaction["expected"][node]["worker_prepare_identity"])
     payload = {"action": "ack", "phase": phase, "identity": value,
                "status": "prepared" if phase == "prepare" else "ready", "loaded": True}
+    expected = master._pipeline_load_transaction["expected"][node]
+    if "load_spec_digest" in value:
+        payload["runtime_receipt"] = {"load_spec": deepcopy(expected["load_spec"]), "materialized_bytes": 1,
+            "memory_scope": "weight_tensors", "layer_range": deepcopy(value["layer_range"]),
+            "artifact_sha256": value["artifact_sha256"]}
     payload.update(changes)
     master._handle_worker_prepare_ack(node, payload)
     return payload
@@ -201,7 +206,9 @@ def test_retirement_cleanup_survives_master_restart(stage_case, monkeypatch):
     restored._load_pipeline_recovery_state()
     records = list(restored._pipeline_model_cleanup_ledger.values())
     assert {record["action"] for record in records} == {"finalize", "release"}
-    assert all(record["payload"]["worker_prepare_identity"] for record in records)
+    assert all(record["payload"]["worker_prepare_identity"] for record in records if record["node_id"] != "master")
+    local, = [record for record in records if record["node_id"] == "master"]
+    assert restored._dispatch_pipeline_model_cleanup(local) is False
     assert restored._pipeline_recovery_failure != "pipeline_recovery_state_invalid"
 
 
@@ -235,6 +242,7 @@ def test_recovery_ledger_updates_preserve_model_identity_across_restarts(stage_c
     restored = case.new_master(case.host).master
     restored._running = True
     restored._load_pipeline_recovery_state()
+    persisted.append(restored._model_control.snapshot()["lifecycle"])
     assert persisted
     assert persisted[-1]["model_id"] == snapshot["model_id"]
     assert persisted[-1]["model_sha256"] == snapshot["model_sha256"]
@@ -245,7 +253,7 @@ def test_recovery_ledger_updates_preserve_model_identity_across_restarts(stage_c
             "cleanup_id": record["cleanup_id"], "status": "released", "loaded": False,
         })
     assert restored._pipeline_model_cleanup_ledger == {}
-    latest = persisted[-1]
+    latest = restored._model_control.snapshot()["lifecycle"]
     assert latest["cleanup_ledger"] == []
     assert latest["config_id"] == snapshot["config_id"]
     assert latest["assignments"] == snapshot["assignments"]

@@ -195,6 +195,8 @@ def first_connect(
     app_variant: str = "",
     capabilities: dict[str, Any] | None = None,
     timeout: float = 8.0,
+    *,
+    accept_bootstrap=None,
 ) -> dict[str, Any]:
     node_type = normalize_node_type(node_type)
     normalized_node_id = normalize_node_id(node_id, node_type)
@@ -249,6 +251,9 @@ def first_connect(
     data["cluster"] = cluster
     data.pop("credential_envelope", None)
 
-    persist_bootstrap_response(data)
-    apply_runtime_config(data)
+    if accept_bootstrap is not None:
+        accept_bootstrap(data)
+    else:
+        persist_bootstrap_response(data)
+        apply_runtime_config(data)
     return data

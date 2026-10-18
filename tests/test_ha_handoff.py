@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,18 @@ from cluster_quorum import (  # noqa: E402
     QuorumVoter,
     SQLiteVoterLedger,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fixed_handoff_operation_time(monkeypatch):
+    """Explicit times in these state transitions must not depend on SQLite IO.
+
+    Freeze only the operation clock's sources, leaving process timers intact.
+    Lease boundaries remain the explicit 1000/1101 ms used by each test.
+    """
+    from qlh_core.control import clock
+
+    monkeypatch.setattr(clock, "time", SimpleNamespace(time=lambda: 1.0, monotonic=lambda: 1.0))
 
 
 def _fixture(root: Path):

@@ -139,7 +139,7 @@ class TestNotLoaded:
         monkeypatch.setattr(eng, "_find_layer_artifact", lambda _start, _end: str(artifact))
         monkeypatch.setattr(
             eng,
-            "load_model",
+            "_load_model_runtime",
             lambda path: setattr(eng, "_model_path", str(path)),
         )
 

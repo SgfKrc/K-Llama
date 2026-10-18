@@ -45,7 +45,14 @@ class WorkerPrepareCoordinatorMixin:
             manifest_sha = receipt.get("manifest_sha256", "")
             if not manifest_sha:
                 raise WorkerPrepareError("prepare_supply_manifest_missing")
+        worker = self._task_worker_control.worker_snapshot(node)
+        if worker and (worker.get("capabilities") or {}).get("load_spec_version") != 1:
+            raise WorkerPrepareError("prepare_load_spec_not_negotiated")
+        from qlh_core.planning.load_spec import assignment_load_spec
+        spec = assignment_load_spec(result, artifact_format=model["format"])
+        result.update(load_spec=spec.to_dict(), context_size=spec.context_size)
         identity = validate_identity({
+            "load_spec_digest": spec.digest,
             "operation_id": operation_id or "prepare_" + config_id,
             "config_id": config_id, "generation": generation,
             "assignment_id": new_assignment_id(), "node_id": node,
@@ -96,10 +103,20 @@ class WorkerPrepareCoordinatorMixin:
         action = config.get("cleanup_action") or ("release" if config.get("release") else config.get("phase", "prepare"))
         command = {"action": action, "identity": deepcopy(identity)}
         if action == "prepare":
-            command.update(context_size=4096, middle_channel="keep_head_layer_out")
+            command.update(context_size=config.get("context_size", 4096), middle_channel="keep_head_layer_out")
+            if "load_spec" in config:
+                command["load_spec"] = deepcopy(config["load_spec"])
         if action in {"abort", "finalize"} or (action == "release" and config.get("cleanup_action")):
             command["cleanup_id"] = config["config_id"]
-        return self._tcp_server.send_to_client(node_id, validate_command(command), MessageType.MODEL_PREPARE, **send_options)
+        command = validate_command(command)
+        owner = getattr(self, "_model_control", None)
+        if owner is not None and not owner.authorize_command(node_id, command,
+                authority=self._model_control_authority(), connection_generation=self._assignment_connection_generation(node_id)):
+            return False
+        delivered = self._tcp_server.send_to_client(node_id, command, MessageType.MODEL_PREPARE, **send_options)
+        if owner is not None:
+            owner.note_delivery(node_id, command, delivered=delivered is not False)
+        return delivered
 
     def _handle_worker_prepare_ack(self, node_id, payload):
         payload = {key: value for key, value in payload.items() if key != "control_certificate"}
@@ -150,6 +167,18 @@ class WorkerPrepareCoordinatorMixin:
                 return
             if node_id in self._pipeline_worker_opt_out:
                 return
+            if ack["status"] != "error" and "load_spec_digest" in identity:
+                receipt = ack.get("runtime_receipt")
+                if receipt is None:
+                    return
+                from worker_prepare_contract import validate_runtime_receipt
+                try:
+                    validate_runtime_receipt(receipt, identity=identity)
+                except WorkerPrepareError:
+                    return
+                budget = expected.get("required_bytes", expected.get("capacity_bytes", 0))
+                if budget and receipt["materialized_bytes"] + receipt["load_spec"]["kv_cache_bytes"] > budget:
+                    ack.update(status="error", error="prepare_materialization_budget_exceeded")
             if ack["status"] == "error":
                 if phase == expected.get("phase") and transaction.get("phase") in {"preparing", "committing", "committing_global", "ready"}:
                     transaction.setdefault("acks", {})[node_id] = deepcopy(ack)
@@ -191,6 +220,11 @@ class WorkerPrepareCoordinatorMixin:
         identity = assignment.get("worker_prepare_identity")
         if not isinstance(identity, dict):
             return False, "worker_native_prepare_required"
+        owner = getattr(self, "_model_control", None)
+        if owner is not None and not owner.runnable(identity["config_id"],
+                authority=self._model_control_authority(), connections=self._model_control_connections(),
+                input_revisions=self._model_control_input_revisions(self._pipeline_load_transaction or {})):
+            return False, "deployment_not_published"
         with self._layer_config_lock:
             plan = self._active_pipeline_capacity_plan
             if (not isinstance(plan, dict) or plan.get("transaction_phase") != "ready"

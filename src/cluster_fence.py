@@ -69,8 +69,8 @@ class ControlFenceError(ControlContractError):
         self.action = action
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
+def _env_bool(name: str, default: bool = False, environment=None) -> bool:
+    value = (os.environ if environment is None else environment).get(name)
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off", ""}
@@ -142,12 +142,13 @@ class ControlFence:
             raise error
 
     @classmethod
-    def from_environment(cls) -> "ControlFence":
+    def from_environment(cls, environment=None) -> "ControlFence":
         """Build only from explicit configuration; never invent voter keys."""
-        required = _env_bool("QLH_CONTROL_FENCE_REQUIRED", False) or (
-            os.environ.get("QLH_NODE_ROLE", "").strip().lower() == "auto"
+        environment = dict(os.environ if environment is None else environment)
+        required = _env_bool("QLH_CONTROL_FENCE_REQUIRED", False, environment) or (
+            environment.get("QLH_NODE_ROLE", "").strip().lower() == "auto"
         )
-        raw_voters = os.environ.get("QLH_CONTROL_VOTER_SET", "").strip()
+        raw_voters = environment.get("QLH_CONTROL_VOTER_SET", "").strip()
         authority = None
         if raw_voters:
             try:
@@ -156,7 +157,7 @@ class ControlFence:
                 authority = ControlPlaneAuthority(
                     cluster_id=voter_set.cluster_id,
                     voter_set=voter_set,
-                    static_role=os.environ.get("NODE_ROLE", "unknown"),
+                    static_role=environment.get("QLH_NODE_ROLE") if environment.get("QLH_NODE_ROLE") in {"master", "client"} else "unknown",
                 )
                 # An explicit voter set is an explicit opt-in, even when the
                 # boolean switch was omitted.
@@ -175,6 +176,7 @@ class ControlFence:
         certificate: QuorumCertificate | Mapping[str, Any],
         *,
         now_ms: int | None = None,
+        recovery=None,
     ) -> dict[str, Any]:
         if self.authority is None:
             raise ControlFenceError(
@@ -182,7 +184,7 @@ class ControlFence:
                 "control fence has no configured voter set",
             )
         try:
-            validation = self.authority.install_certificate(certificate, now_ms=now_ms)
+            validation = self.authority.install_certificate(certificate, now_ms=now_ms, recovery=recovery)
         except ControlContractError as exc:
             error = ControlFenceError(exc.code, str(exc), action="certificate.install")
             self._audit("certificate.install", "runtime", "", error=error)

@@ -607,6 +607,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 "action": str(record.get("action", "") or ""),
                 "created_at": float(record.get("created_at", 0.0) or 0.0),
                 "payload": dict(payload) if isinstance(payload, dict) else {},
+                **({key: record[key] for key in ("process_boot_id", "process_id", "process_start_time") if key in record}),
             })
         if recovering:
             # Cleanup replay runs before a fresh transaction exists. Preserve
@@ -644,14 +645,81 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 if str(value)
             ),
             "assignments": assignments,
+            "local_assignment": transaction.get("local_assignment"),
+            "local_receipt": transaction.get("local_receipt"),
+            "candidate_id": transaction.get("candidate_id", ""),
+            "process_identity": transaction.setdefault("process_identity", self._model_control_process_identity()),
             "cleanup_ledger": cleanup_records,
             "updated_at": time.time(),
         }
 
+    def _model_control_process_identity(self):
+        import psutil
+        owner = getattr(self, "_model_control", None)
+        return {"process_boot_id": owner.boot_id if owner else "",
+                "process_id": os.getpid(), "process_start_time": psutil.Process(os.getpid()).create_time()}
+
+    def _model_control_authority(self):
+        fence = getattr(self, "_control_fence", None)
+        authority = getattr(fence, "authority", None)
+        if fence is not None and getattr(fence, "required", False):
+            certificate = authority.current_certificate() if authority is not None else None
+            fence.admit(certificate, action="model_deployment", source="scheduler")
+        identity = authority.authority_identity() if authority is not None else None
+        if identity is not None:
+            from dataclasses import asdict
+            return asdict(identity)
+        return {"mode": "static", "node_id": self.get_effective_node_id(), "role": self._effective_role()}
+
+    def _model_control_connections(self, transaction=None):
+        transaction = transaction or self._pipeline_load_transaction or {}
+        return {node: self._assignment_connection_generation(node)
+                for node in transaction.get("worker_ids", ())}
+
+    def _model_control_input_revisions(self, transaction):
+        from qlh_core.contracts.deployment import digest
+        plan = transaction.get("plan", {})
+        catalog = getattr(self, "_catalog", None)
+        model_id = plan.get("model_id", "")
+        catalog_revision = catalog.snapshot(model_id).registry_revision if catalog is not None and model_id else 0
+        capabilities = {}
+        for node in transaction.get("worker_ids", ()):
+            worker = self._task_worker_control.worker_snapshot(node) or {}
+            value = worker.get("capabilities") or {}
+            capabilities[node] = digest({key: value.get(key) for key in ("engine_capabilities", "load_spec_version", "engines")})
+        return {"catalog": catalog_revision, "capabilities": capabilities,
+                "resources": digest([{key: item.get(key) for key in ("node_id", "capacity_bytes", "required_bytes", "reserve_bytes", "execution_device", "capacity_source")}
+                                     for item in plan.get("assignments", [])])}
+
+    def _save_model_control_lifecycle(self, state):
+        transaction = self._pipeline_load_transaction or {}
+        owner = self._model_control
+        owner.start()
+        inputs = self._model_control_input_revisions(transaction)
+        frozen = transaction.setdefault("model_control_inputs", inputs)
+        if frozen != inputs and state.get("phase") not in {"aborted", "invalidated", "rejected"}:
+            raise RuntimeError("deployment_input_revision_changed")
+        state["input_revisions"] = frozen
+        expected = transaction.get("expected", {})
+        receipts = dict(transaction.get("acks", {}))
+        # Legacy transport stores validated receipts in its assignment registry.
+        # Copy exact current assignment observations into the durable owner.
+        for node in transaction.get("worker_ids", ()):
+            if not transaction.get("candidate_id") and node not in receipts:
+                item = self._worker_assignments.expected(node)
+                ack = self._worker_assignments.acknowledgement(node)
+                if item and ack:
+                    expected = {**expected, node: item}
+                    receipts[node] = ack
+        return owner.save_execution(state, expected=expected,
+            acknowledgements=receipts, authority=self._model_control_authority(),
+            connections=self._model_control_connections(transaction),
+            recovery_input=self._pipeline_load_transaction is None and bool(getattr(self, "_pipeline_recovery_state", None)))
+
     def _persist_pipeline_lifecycle_locked(self) -> None:
         """Persist lifecycle state while the transaction lock is held."""
         if (
-            not getattr(self, "_running", False)
+            (not getattr(self, "_running", False) and getattr(self, "_model_control", None) is None)
             or self._effective_role() != "master"
         ):
             return
@@ -666,7 +734,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         try:
             from local_store import set_local_setting
 
-            set_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, state)
+            if getattr(self, "_model_control", None) is not None:
+                self._save_model_control_lifecycle(state)
+            else:
+                set_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, state)
             self._pipeline_lifecycle_persist_ok = True
             if (self._pipeline_recovery_pending
                     and self._pipeline_recovery_failure == "pipeline_lifecycle_persist_failed"):
@@ -723,13 +794,20 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             "created_at": time.time(),
             "payload": wire_payload,
         }
+        if node_id == "master":
+            record.update(self._model_control_process_identity())
         ledger[cleanup_id] = record
         return record
 
     def _complete_pipeline_model_cleanup(
-        self, cleanup_id: str, *, persist: bool = True,
+        self, cleanup_id: str, *, persist: bool = True, evidence: dict | None = None,
     ) -> bool:
         with self._layer_config_lock:
+            debt = self._pipeline_model_cleanup_ledger.get(str(cleanup_id or ""))
+            owner = getattr(self, "_model_control", None)
+            if debt is not None and owner is not None:
+                owner.settle_cleanup(str(cleanup_id), evidence=evidence or {"kind": "receipt", "action": debt["action"],
+                    "identity": debt.get("payload", {}).get("worker_prepare_identity")})
             removed = self._pipeline_model_cleanup_ledger.pop(
                 str(cleanup_id or ""), None,
             )
@@ -747,7 +825,27 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         )
         if not cleanup_id or not node_id or not candidate_config_id:
             return False
+        owner = getattr(self, "_model_control", None)
+        if owner is not None and cleanup_id not in owner.snapshot()["cleanup"]:
+            return False
         if node_id == "master":
+            if owner is not None and record.get("process_boot_id") != owner.boot_id:
+                import psutil
+                if not all(record.get(key) for key in ("process_boot_id", "process_id", "process_start_time")):
+                    return False
+                try:
+                    old = psutil.Process(record["process_id"])
+                    ended = old.create_time() != record["process_start_time"]
+                except psutil.NoSuchProcess:
+                    ended = True
+                except (psutil.Error, OSError):
+                    return False
+                if not ended:
+                    return False
+                self._complete_pipeline_model_cleanup(cleanup_id, evidence={"kind": "process_ended",
+                    **{key: record[key] for key in ("process_boot_id", "process_id", "process_start_time")},
+                    "boot_id": record["process_boot_id"]})
+                return True
             method = getattr(
                 self._host,
                 (
@@ -876,6 +974,9 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     client_id, cleanup_id, action, candidate_config_id,
                 )
                 return False
+            owner = getattr(self, "_model_control", None)
+            if owner is not None:
+                owner.settle_cleanup(cleanup_id, evidence={"kind": "receipt", "identity": native_identity, "action": action})
             self._pipeline_model_cleanup_ledger.pop(cleanup_id, None)
             transaction = self._pipeline_load_transaction
             if isinstance(transaction, dict):
@@ -922,7 +1023,13 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         try:
             from local_store import get_local_setting
 
-            raw = get_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, None)
+            owner = getattr(self, "_model_control", None)
+            owned_state = owner.start() if owner is not None else None
+            raw = owned_state.get("lifecycle") if owned_state else None
+            if raw is None:
+                # One-way import of recovery evidence. Subsequent writes use only
+                # the model-control domain and never update the legacy setting.
+                raw = get_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, None)
         except Exception:
             self._pipeline_lifecycle_persist_ok = False
             self._pipeline_recovery_pending = True
@@ -959,9 +1066,11 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             action = str(item.get("action", "") or "")
             payload = item.get("payload")
             if node_id == "master":
-                # Recovery runs in a new master process. Its old in-memory
-                # candidate and previous runtime died with the prior process;
-                # remote candidates may still be alive and must be replayed.
+                if (not cleanup_id or not candidate_config_id or action not in {"abort", "finalize", "release"}
+                        or not isinstance(payload, dict)):
+                    invalid_cleanup = True
+                    break
+                restored_cleanup[cleanup_id] = {**item, "state": "unknown", "attempts": 0, "next_retry": 0.0}
                 continue
             if (
                 not cleanup_id
@@ -1097,6 +1206,17 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         generation=int(raw["generation"]), action=action,
                         assignment_id=identity["assignment_id"], payload=payload,
                     )
+        if (raw.get("local_assignment") and raw.get("candidate_id")
+                and (phase in {"committing_local", "committing", "committing_global", "ready"} or raw.get("published"))):
+            action = "release" if raw.get("published") or phase == "ready" else "abort"
+            with self._layer_config_lock:
+                old = next((item for item in self._pipeline_model_cleanup_ledger.values()
+                            if item.get("node_id") == "master" and item.get("candidate_config_id") == raw["candidate_id"]), None)
+                if old is None:
+                    record = self._record_pipeline_model_cleanup_locked(node_id="master",
+                        candidate_config_id=raw["candidate_id"], generation=int(raw.get("generation", 0)), action=action)
+                    for key in ("process_boot_id", "process_id", "process_start_time"):
+                        record[key] = (raw.get("process_identity") or {}).get(key)
         if phase in _PIPELINE_RECOVERY_PHASES:
             persisted_sha256 = str(raw.get("model_sha256", "") or "").lower()
             if (
@@ -2191,6 +2311,17 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             # prepare, commit, retry and promotion all retain one ID.
             for payload in configs.values():
                 payload.setdefault("assignment_id", new_assignment_id())
+        local_frozen = None
+        if capacity_plan is not None and candidate is not None:
+            local = next((item for item in capacity_plan.get("assignments", [])
+                          if item.get("node_id") in {"master", self.get_effective_node_id()}), None)
+            freeze = getattr(self._host, "freeze_pipeline_candidate_assignment", None)
+            if local is not None and callable(freeze):
+                try:
+                    local_frozen = freeze(candidate["candidate_id"], local, config_id=config_id, generation=generation)
+                except Exception as exc:
+                    return {"status": "rejected", "admitted": False, "reason_code": str(exc),
+                            "assignments": [], "transaction_phase": "rejected"}
         if capacity_plan is not None:
             if not assignments and not stage_assignments:
                 capacity_plan = dict(capacity_plan)
@@ -2240,6 +2371,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         for node in stage_assignments
                     },
                     "prepared_nodes": set(),
+                    "local_assignment": local_frozen,
+                    "local_receipt": None,
                     "candidate_id": (
                         str(candidate.get("candidate_id", "") or "")
                         if isinstance(candidate, dict) else ""
@@ -3068,6 +3201,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             }
             transaction["phase"] = "committing_local"
             self._persist_pipeline_lifecycle_locked()
+            if not self._pipeline_lifecycle_persist_ok:
+                return
 
         master_ids = {"master", self.get_effective_node_id()}
         local_assignment = next((
@@ -3094,7 +3229,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         model_id=str(plan.get("model_id", "") or ""),
                     )
                 else:
-                    materialize_candidate(
+                    local_result = materialize_candidate(
                         candidate_id,
                         start_layer=int(local_assignment["start_layer"]),
                         end_layer=int(local_assignment["end_layer"]),
@@ -3106,7 +3241,14 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         ),
                         total_layers=int(plan.get("total_layers", 0) or 0),
                         model_id=str(plan.get("model_id", "") or ""),
+                        **({"load_assignment": transaction["local_assignment"]}
+                           if transaction.get("local_assignment") else {}),
                     )
+                    if transaction.get("local_assignment"):
+                        from qlh_core.contracts.deployment import require_runtime_receipt
+                        receipt = local_result.get("runtime_receipt")
+                        require_runtime_receipt(transaction["local_assignment"], receipt)
+                        transaction["local_receipt"] = receipt
             else:
                 execution_lock = getattr(
                     legacy_host, "full_chat_execution_lock", self._layer_execution_lock,
@@ -3325,6 +3467,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         ):
                             raise RuntimeError("worker_native_ready_revoked_before_publication")
 
+                    if getattr(self, "_model_control", None) is not None:
+                        # Revalidate authority, inputs, and exact local/remote
+                        # commit observations before the irreversible epoch CAS.
+                        self._save_model_control_lifecycle(self._pipeline_lifecycle_snapshot_locked())
                     # Candidate commit is reversible until finalize.  Cross the
                     # reshard CAS only after the local runtime can be restored on
                     # failure; the coordinator has no reverse-epoch operation.
@@ -3361,6 +3507,24 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                                 generation=generation, action="release", assignment_id=identity["assignment_id"],
                                 payload={"worker_prepare_identity": identity, "release": True},
                             ))
+                    # Freeze all post-publication retirement obligations in the
+                    # same SQLite transaction as the active pointer. Native work
+                    # has completed; only committed publication grants admission.
+                    if candidate_id:
+                        self._record_pipeline_model_cleanup_locked(node_id="master",
+                            candidate_config_id=candidate_id, generation=generation, action="finalize")
+                    for node_id in worker_ids:
+                        self._record_pipeline_model_cleanup_locked(node_id=node_id,
+                            candidate_config_id=config_id, generation=generation, action="finalize",
+                            assignment_id=str(expected.get(node_id, {}).get("assignment_id", "")),
+                            payload={**({"worker_prepare_identity": expected[node_id]["worker_prepare_identity"]}
+                                      if expected.get(node_id, {}).get("worker_prepare_identity") else {}),
+                                     "finalize": True, "finalized_config_id": config_id})
+                    if getattr(self, "_model_control", None) is not None:
+                        publication = self._pipeline_lifecycle_snapshot_locked()
+                        publication.update(phase="ready", published=True)
+                        self._save_model_control_lifecycle(publication)
+
                     for node_id in worker_ids:
                         item = expected.get(node_id)
                         if not item:

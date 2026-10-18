@@ -377,6 +377,8 @@ def recover_journal_prefix(
     *,
     workflow_id: str,
     settings: JournalReplicationSettings | None = None,
+    mutation_guard=None,
+    permission_check=None,
 ) -> dict[str, Any]:
     """#93：让**落后的副本主动追赶** —— 从对端拉回一个已自洽的 checkpoint 并应用。
 
@@ -404,7 +406,9 @@ def recover_journal_prefix(
                 secret=resolved.secret_bytes,
                 timeout=resolved.timeout_s,
             )
-            result = replica.apply_checkpoint(checkpoint)
+            guarded = {"permission_check": permission_check} if permission_check is not None else {}
+            apply = lambda: replica.apply_checkpoint(checkpoint, **guarded)
+            result = mutation_guard(apply) if mutation_guard is not None else apply()
         except (JournalReplicationTransportError, JournalReplicationError, OSError) as exc:
             failures[label] = type(exc).__name__
             continue

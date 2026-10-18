@@ -276,7 +276,9 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
             pass
         doomed.close()
 
-        _wait_for(lambda: "注册被中断" in client.last_register_error,
+        # The next registration clears last_register_error on entry; the
+        # reconnect outcome persists until successful registration instead.
+        _wait_for(lambda: client.last_reconnect_error == "registration_interrupted",
                   "interrupted registration was not classified: "
                   f"{client.last_register_error!r}")
         assert client.last_reconnect_error == "registration_interrupted"

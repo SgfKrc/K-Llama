@@ -16,6 +16,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
@@ -28,6 +29,17 @@ _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _LEGACY_MIGRATION_KEY = "legacy_chat_history_json_v1"
 _MASTER_IDENTITY_KEY = "master_identity_v1"
+_runtime_path = ContextVar("qlh_local_store_path", default=None)
+
+
+@contextmanager
+def bind_local_store(path):
+    """Bind legacy operations to one runtime without changing process settings."""
+    token = _runtime_path.set(os.path.abspath(os.fspath(path)))
+    try:
+        yield
+    finally:
+        _runtime_path.reset(token)
 
 
 def _now() -> str:
@@ -64,6 +76,9 @@ def _legacy_store_dir() -> str:
 
 
 def _sqlite_path() -> str:
+    bound = _runtime_path.get()
+    if bound is not None:
+        return bound
     override = os.environ.get("QLH_SQLITE_PATH", "").strip()
     if override:
         return os.path.abspath(os.path.expanduser(override))
@@ -238,8 +253,8 @@ def _import_legacy_json(connection: sqlite3.Connection) -> None:
     )
 
 
-def initialize_local_store() -> str:
-    path = _sqlite_path()
+def initialize_local_store(path: str | None = None, *, migrate_legacy: bool = True) -> str:
+    path = _sqlite_path() if path is None else os.path.abspath(os.path.expanduser(path))
     if path in _initialized_paths and os.path.isfile(path):
         return path
     with _init_lock:
@@ -288,6 +303,12 @@ def initialize_local_store() -> str:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS model_registry_versions (
+                  model_id TEXT PRIMARY KEY,
+                  revision INTEGER NOT NULL CHECK(revision >= 0)
+                );
+                INSERT OR IGNORE INTO model_registry_versions(model_id, revision)
+                  SELECT model_id, 1 FROM model_registry;
                 CREATE TABLE IF NOT EXISTS model_download_jobs (
                   job_id TEXT PRIMARY KEY,
                   status TEXT NOT NULL,
@@ -337,7 +358,8 @@ def initialize_local_store() -> str:
                 pass
             connection.execute("BEGIN IMMEDIATE")
             try:
-                _import_legacy_json(connection)
+                if migrate_legacy:
+                    _import_legacy_json(connection)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -889,68 +911,94 @@ def _write_model_registry_row(connection: sqlite3.Connection, model_id: str,
     )
 
 
-def save_local_experimental_model(model_id: str, config_json: str) -> bool:
-    """Persist a user-registered model configuration in the main-node SQLite."""
+class _RegistryPayload(dict):
+    """Legacy dictionary projection carrying a non-serialized CAS token."""
+    def __init__(self, value, registry_revision):
+        super().__init__(value)
+        self.registry_revision = registry_revision
+
+
+def _catalog_service(connection=None):
+    from contextlib import nullcontext
+    from qlh_core.adapters.catalog_repository import SqliteCatalogRepository
+    from qlh_core.control.catalog import CatalogService
+    transaction = _write_connection if connection is None else lambda: nullcontext(connection)
+    return CatalogService(SqliteCatalogRepository(
+        connect=_connect, transaction=transaction, write_row=_write_model_registry_row, now=_now,
+    ))
+
+
+def get_local_model_registry_snapshot(model_id: str):
+    """Read the durable alias revision, including tombstones, in one snapshot."""
+    return _catalog_service().snapshot(str(model_id))
+
+
+def publish_local_model_registry(model_id: str, config_json: str | dict,
+                                 *, expected_revision: int) -> bool:
     config = json.loads(config_json) if isinstance(config_json, str) else dict(config_json)
-    with _write_connection() as connection:
-        _write_model_registry_row(connection, model_id, config, _now())
-    return True
+    return _catalog_service().publish(str(model_id), config, expected_revision=expected_revision)
+
+
+def save_local_experimental_model(model_id: str, config_json: str | dict,
+                                  *, expected_revision: int | None = None) -> bool:
+    """Compatibility insert; replacements require an explicit observed version."""
+    if expected_revision is None:
+        snapshot = get_local_model_registry_snapshot(model_id)
+        if snapshot.payload is not None:
+            return False
+        expected_revision = snapshot.registry_revision
+    return publish_local_model_registry(model_id, config_json, expected_revision=expected_revision)
 
 
 def save_local_experimental_model_cas(model_id: str, config_json: str | dict,
                                       *, expected: dict | None) -> bool:
-    """Save only while the complete registry payload still matches its snapshot.
+    """Legacy payload CAS, serialized with the catalog version commit.
 
-    ``expected=None`` permits insertion only when the ID has no registry row.
-    Comparison and publication share one BEGIN IMMEDIATE transaction, including
-    protection against writers using another SQLite connection or process.
+    Registry dictionary projections retain a hidden version token through
+    deepcopy. Plain dictionaries remain a payload-only compatibility input;
+    new writers use publish_local_model_registry with an explicit revision.
     """
     config = json.loads(config_json) if isinstance(config_json, str) else dict(config_json)
-    # Compare JSON values, independent of persisted whitespace and key order.
-    expected_payload = (json.dumps(expected, ensure_ascii=True, sort_keys=True,
-                                   separators=(",", ":")) if expected is not None else None)
     with _write_connection() as connection:
-        current = connection.execute(
-            "SELECT payload FROM model_registry WHERE model_id = ?", (str(model_id),),
-        ).fetchone()
-        if expected is None:
-            if current is not None:
-                return False
-        else:
-            if current is None:
-                return False
-            try:
-                current_payload = json.dumps(json.loads(current["payload"]), ensure_ascii=True,
-                                             sort_keys=True, separators=(",", ":"))
-            except (TypeError, ValueError):
-                return False
-            if current_payload != expected_payload:
-                return False
-        _write_model_registry_row(connection, model_id, config, _now())
-    return True
+        from qlh_core.adapters.catalog_repository import SqliteCatalogRepository
+        try:
+            current = SqliteCatalogRepository._read(connection, str(model_id))
+        except (TypeError, ValueError):
+            return False
+        expected_payload = None if isinstance(expected, _RegistryPayload) and not expected else expected
+        if current.as_payload() != expected_payload:
+            return False
+        expected_revision = getattr(expected, "registry_revision", current.registry_revision)
+        return _catalog_service(connection).publish(str(model_id), config, expected_revision=expected_revision)
 
 
 def get_local_experimental_models() -> list[dict]:
     connection = _connect()
     try:
-        rows = connection.execute("SELECT payload FROM model_registry ORDER BY model_id").fetchall()
+        connection.execute("BEGIN")
+        rows = connection.execute(
+            "SELECT r.payload, COALESCE(v.revision, 1) AS revision FROM model_registry r "
+            "LEFT JOIN model_registry_versions v ON v.model_id = r.model_id ORDER BY r.model_id",
+        ).fetchall()
         result = []
         for row in rows:
             try:
                 value = json.loads(row["payload"])
                 if isinstance(value, dict):
-                    result.append(value)
+                    result.append(_RegistryPayload(value, int(row["revision"])))
             except (TypeError, json.JSONDecodeError):
                 continue
         return result
     finally:
+        connection.rollback()
         connection.close()
 
 
-def delete_local_experimental_model(model_id: str) -> bool:
-    with _write_connection() as connection:
-        result = connection.execute("DELETE FROM model_registry WHERE model_id = ?", (str(model_id),))
-        return int(result.rowcount) > 0
+def delete_local_experimental_model(model_id: str, *, expected_revision: int | None = None) -> bool:
+    if expected_revision is None:
+        snapshot = get_local_model_registry_snapshot(model_id)
+        expected_revision = snapshot.registry_revision
+    return _catalog_service().remove(str(model_id), expected_revision=expected_revision)
 
 
 def upsert_local_review_ticket(ticket: dict) -> dict:

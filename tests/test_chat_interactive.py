@@ -268,7 +268,8 @@ class TestInteractiveContract:
         monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
         monkeypatch.setattr(
             api_server, "model_manager",
-            SimpleNamespace(is_loaded=True, _engine_type="pytorch"),
+            SimpleNamespace(is_loaded=True, engine_type="pytorch",
+                            runtime_kind="pytorch_cpu", native_abi="torch_module.v1"),
         )
         response = client.post("/api/chat/stream", json={
             "message": "hi",
@@ -385,7 +386,8 @@ class TestRoutingPreference:
         monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
         monkeypatch.setattr(
             api_server, "model_manager",
-            SimpleNamespace(is_loaded=True, _engine_type="pytorch"),
+            SimpleNamespace(is_loaded=True, engine_type="pytorch",
+                            runtime_kind="pytorch_cpu", native_abi="torch_module.v1"),
         )
         response = client.post("/api/chat/stream", json={
             "message": "hi", "streaming_mode": "interactive",
@@ -404,7 +406,8 @@ class TestRoutingPreference:
         monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
         monkeypatch.setattr(
             api_server, "model_manager",
-            SimpleNamespace(is_loaded=True, _engine_type="pytorch"),
+            SimpleNamespace(is_loaded=True, engine_type="pytorch",
+                            runtime_kind="pytorch_cpu", native_abi="torch_module.v1"),
         )
         response = client.post("/api/chat/stream", json={
             "message": "hi", "streaming_mode": "interactive",
@@ -438,7 +441,8 @@ class TestRoutingPreference:
         monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
         monkeypatch.setattr(
             api_server, "model_manager",
-            SimpleNamespace(is_loaded=True, _engine_type="pytorch"),
+            SimpleNamespace(is_loaded=True, engine_type="pytorch",
+                            runtime_kind="pytorch_cpu", native_abi="torch_module.v1"),
         )
         response = client.post("/api/chat/stream", json={
             "message": "hi", "streaming_mode": "interactive",

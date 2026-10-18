@@ -108,9 +108,12 @@ def _publish_json(path: Path, payload: dict) -> None:
 
 
 def _registered(model_id: str) -> tuple[ModelConfig, dict]:
-    rows = local_store.get_local_experimental_models()
-    row = next((item for item in rows if item.get("model_id") == model_id), {})
-    cfg = mc.get_model_config(model_id, rows)
+    try:
+        snapshot = local_store.get_local_model_registry_snapshot(model_id)
+    except (TypeError, ValueError):
+        _fail("SUPPLY_REGISTRY_INVALID", "Registered model configuration is invalid")
+    row = local_store._RegistryPayload(snapshot.as_payload() or {}, snapshot.registry_revision)
+    cfg = mc.get_model_config(model_id, [row] if row else [])
     if cfg is None:
         code = "SUPPLY_REGISTRY_INVALID" if row else "SUPPLY_MODEL_NOT_REGISTERED"
         _fail(code, "Registered model configuration is invalid" if row else "Select a registered model")
@@ -516,7 +519,7 @@ def _save(cfg: ModelConfig, row: dict, *, registry_snapshot: dict | None,
 
 def _download(cfg: ModelConfig, row: dict, operation: Path,
               cancelled: Callable[[], bool], progress: Callable | None) -> ModelConfig:
-    registry_snapshot = deepcopy(row) if row else None
+    registry_snapshot = deepcopy(row)
     expected_identity = _registered_manifest_identity(registry_snapshot or {})
     spec = _download_spec(cfg, row)
     target = _path(cfg.model_path) if cfg.model_type != "gguf" else None
@@ -793,7 +796,7 @@ def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: 
     _check(cancelled)
     _notify(progress, "resolving")
     cfg, row = _registered(model_id)
-    registry_snapshot = deepcopy(row) if row else None
+    registry_snapshot = deepcopy(row)
     expected_identity = _registered_manifest_identity(registry_snapshot or {})
     operation = Path(operation_dir).absolute()
     if any(_linked(item) for item in (operation, *operation.parents)):
@@ -807,7 +810,7 @@ def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: 
         cfg = _download(cfg, row, operation, cancelled, progress)
         # Reload persisted download evidence while retaining builtin metadata.
         cfg, row = _registered(model_id)
-        registry_snapshot = deepcopy(row) if row else None
+        registry_snapshot = deepcopy(row)
         hf = _existing(_path(cfg.model_path), directory=True)
         gguf = _existing(_path(cfg.gguf_path), directory=False)
     weights: list[Path] = []

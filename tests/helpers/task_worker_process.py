@@ -27,6 +27,15 @@ def main() -> int:
     parser.add_argument("--model-sha256", required=True)
     args = parser.parse_args()
 
+    # A process entry explicitly opens identity. Module import stays resource-free.
+    from qlh_core.bootstrap.runtime import AppRuntime
+    runtime = AppRuntime()
+    runtime.open_identity()
+    import config
+    settings = runtime.config.legacy_settings()
+    config.CLUSTER_SECRET = settings["CLUSTER_SECRET"]
+    config.CLUSTER_SECRET_EPOCH = settings["CLUSTER_SECRET_EPOCH"]
+
     capabilities = {
         "stage_types": ["full_inference", "aggregate"],
         "engines": ["pytorch"],
@@ -51,7 +60,7 @@ def main() -> int:
             "worker_node_id": args.node_id,
         }
 
-    scheduler = Scheduler()
+    scheduler = Scheduler(runtime_config=runtime.config)
     # The worker process receives an explicit scheduler callback bundle.
     scheduler._host = SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),

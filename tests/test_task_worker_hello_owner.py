@@ -59,6 +59,11 @@ class Worker(SchedulerTaskWorkerMixin):
     def get_effective_node_id(self):
         return "hello-owner-worker"
 
+    def _task_worker_engine_schema(self):
+        # This harness has no inference host. Its ownership/registration tests
+        # explicitly offer zero engine operations, independent of installed runtimes.
+        return {"schema_version": 1, "runtimes": []}
+
     def _task_worker_capabilities(self):
         return {"stage_types": ["aggregate"], "engines": ["pytorch"],
                 "models": [], "max_concurrency": 1}

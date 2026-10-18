@@ -41,6 +41,7 @@ import re
 import sys
 import time
 from ctypes import byref
+from functools import wraps
 from pathlib import Path
 from product_runtime_receipt import NativeLayerLoadProof
 from typing import Optional, Dict, Any, Iterator, List
@@ -277,6 +278,8 @@ class LlamaCppEngine:
             print(chunk, end="", flush=True)
     """
 
+    _environment = None
+
     def __init__(self):
         self._model = None           # llama_cpp.Llama 实例
         self._model_path: str = ""
@@ -427,6 +430,19 @@ class LlamaCppEngine:
         cache["value"] = value
         return value
 
+    def configure_catalog(self, catalog_prepare, *, model_id: str = "") -> None:
+        self._catalog_prepare = catalog_prepare
+        self._catalog_model_id = model_id
+
+    def _verify_catalog_artifact(self, model_id: str, model_path: str, *, expected=None):
+        prepare = getattr(self, "_catalog_prepare", None)
+        resolved = prepare(model_id, model_path) if prepare is not None else None
+        if expected is not None and resolved != expected:
+            from qlh_core.contracts.catalog import CatalogError
+            raise CatalogError("artifact_revision_mismatch", "source binding changed since pipeline preparation")
+        self._resolved_artifact = resolved
+        return resolved
+
     def get_pipeline_descriptor(self) -> dict:
         """流水线描述器：**零依赖**读 GGUF 头，不加载模型、不需要 torch。
 
@@ -470,7 +486,6 @@ class LlamaCppEngine:
         from pipeline_model_descriptor import (
             PIPELINE_RUNTIME_MODEL_TYPES,
             canonical_pipeline_model_type,
-            tokenizer_sha256_from_asset,
         )
 
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
@@ -555,28 +570,21 @@ class LlamaCppEngine:
                 if declared_tokenizer and declared_tokenizer != tokenizer_sha256:
                     return {}
                 break
+        # Tokenizer identity comes from these GGUF bytes or an explicitly
+        # verified conversion binding. A builtin display name cannot prove
+        # that a tokenizer from another directory belongs to this revision.
         if not tokenizer_sha256:
-            tokenizer_sha256 = tokenizer_sha256_from_asset(Path(path).parent)
-        if not tokenizer_sha256:
-            try:
-                from model_config import get_builtin_model, resolve_model_path
+            from qlh_core.contracts.catalog import ResolvedArtifact
 
-                registered = get_builtin_model(
-                    str(getattr(self, "active_model_id", "") or "")
-                )
-                registered_path = (
-                    resolve_model_path(str(getattr(registered, "model_path", "") or ""))
-                    if registered is not None else ""
-                )
-                if registered_path:
-                    tokenizer_sha256 = tokenizer_sha256_from_asset(
-                        Path(registered_path)
-                    )
-            except Exception:
-                logger.debug(
-                    "GGUF pipeline descriptor could not resolve tokenizer asset",
-                    exc_info=True,
-                )
+            resolved = getattr(self, "_resolved_artifact", None)
+            if isinstance(resolved, ResolvedArtifact):
+                if (resolved.location.kind == "disk"
+                        and Path(resolved.location.locator).resolve() == Path(path).resolve()
+                        and resolved.artifact.content_sha256 == model_sha256
+                        and any((proof.source_sha256 == model_sha256 and proof.source_format == "gguf")
+                                or (proof.target_sha256 == model_sha256 and proof.target_format == "gguf")
+                                for proof in resolved.revision.equivalence_proofs)):
+                    tokenizer_sha256 = resolved.revision.tokenizer_sha256
         descriptor = {
             "model_id": (
                 str(getattr(self, "active_model_id", "") or "")
@@ -632,6 +640,7 @@ class LlamaCppEngine:
     ) -> dict:
         """Prepare GGUF pipeline metadata without constructing llama.cpp."""
         resolved_path = os.path.abspath(model_path or "")
+        self._verify_catalog_artifact(model_id, resolved_path)
         if not resolved_path or not os.path.isfile(resolved_path):
             raise FileNotFoundError(f"GGUF 模型文件未找到: {resolved_path or '(未提供路径)'}")
         if layer_range is not None:
@@ -653,7 +662,8 @@ class LlamaCppEngine:
             declared: list[int] | None = None
             _bases = []
             from model_supply_worker import selected_gguf_path
-            _env_gguf = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
+            environment = os.environ if self._environment is None else self._environment
+            _env_gguf = selected_gguf_path() or environment.get("QLH_LAYER_GGUF", "").strip()
             if _env_gguf:
                 _bases.append(Path(_env_gguf))
             _bases.append(Path(resolved_path))
@@ -741,7 +751,8 @@ class LlamaCppEngine:
             directory = supplied_path.parent
             candidates = [supplied_path.with_suffix(".manifest.json")]
         else:
-            configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
+            environment = os.environ if self._environment is None else self._environment
+            configured = environment.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
             directory = (
                 _Path(configured)
                 if configured
@@ -823,6 +834,14 @@ class LlamaCppEngine:
         **失败**（`RuntimeError`），绝不静默退回整模 —— 那会让主节点跑着自己没被分配的
         层，下游段收到的 hidden 就从错误的层深取来，而链路看上去"成功"。
         """
+        descriptor = dict(self._pipeline_descriptor or {})
+        source_path = descriptor.get("model_path") or self._model_path or ""
+        prepared = getattr(self, "_resolved_artifact", None)
+        self._verify_catalog_artifact(
+            str(getattr(self, "_catalog_model_id", "") or getattr(self, "active_model_id", "") or ""),
+            source_path,
+            expected=prepared,
+        )
         path = self._find_layer_artifact(int(start_layer), int(end_layer))
         if not path:
             raise RuntimeError(
@@ -857,7 +876,31 @@ class LlamaCppEngine:
             proof = None
         whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
         was_pipeline_prepared = self.is_pipeline_prepared
-        self.load_model(path)
+        load_spec = kwargs.get("load_spec")
+        if load_spec is None:
+            self._runtime_load_spec = None
+            self._load_model_runtime(path)
+        else:
+            from qlh_core.contracts.load import RuntimeLoadSpec
+            from qlh_core.adapters.llama_vocabulary import LlamaVocabulary
+            spec = RuntimeLoadSpec.from_dict(load_spec)
+            components = {"layers"}
+            if has_embedding:
+                components.add("embedding")
+            if has_lm_head:
+                components.update(("final_norm", "lm_head"))
+            if (spec.device != "cpu" or spec.dtype != "artifact" or spec.quant_type != "artifact"
+                    or spec.kv_device != "cpu" or spec.kv_dtype != "float16" or spec.kv_policy != "preallocated"
+                    or spec.materialization != "gguf_segment" or set(spec.components) != components):
+                raise ValueError("deployment_local_policy_unsupported")
+            self.unload()
+            # Tokenization owns a vocabulary-only handle. Segment tensors and KV
+            # have exactly one owner, the observed keep-head runner below.
+            self._runtime_load_spec = spec
+            self._model = LlamaVocabulary(path)
+            self._model_path = path
+            self._n_ctx = spec.context_size
+            self._loaded = True
         # A stage worker may be created directly and load its first artifact
         # without ever having cached a full-model descriptor.  The artifact
         # itself is still partial; leaving the descriptor empty would let
@@ -880,6 +923,10 @@ class LlamaCppEngine:
             "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
             int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
         )
+        if load_spec is not None:
+            upstream = self._keep_head_upstream()
+            if upstream is None or not upstream.is_available:
+                raise ValueError("deployment_local_runtime_unavailable")
         return {
             "success": True,
             "engine": "llama_cpp",
@@ -893,7 +940,7 @@ class LlamaCppEngine:
     # 模型加载
     # ================================================================
 
-    def load_model(
+    def _load_model_runtime(
         self,
         model_path: str = None,
         n_ctx: int = None,
@@ -1123,6 +1170,14 @@ class LlamaCppEngine:
             # tensors must close before their RPC device/process retires.
             self.unload()
             raise
+
+    @wraps(_load_model_runtime)
+    def load_model(self, model_path=None, *args, **kwargs) -> None:
+        self._verify_catalog_artifact(
+            str(getattr(self, "_catalog_model_id", "") or getattr(self, "active_model_id", "") or ""),
+            model_path,
+        )
+        return self._load_model_runtime(model_path, *args, **kwargs)
 
     @staticmethod
     def _vram_free_bytes() -> Optional[int]:
@@ -2349,6 +2404,7 @@ class LlamaCppEngine:
         按「工件路径 + 层数」缓存：`load_layer_range` 换了工件就自动重建。
         """
         import os
+        environment = os.environ if self._environment is None else self._environment
         from pathlib import Path
 
         desc = getattr(self, "_pipeline_descriptor", None) or {}
@@ -2357,7 +2413,8 @@ class LlamaCppEngine:
         if not artifact or not rng or len(rng) != 2:
             return None
         cut_layer = int(rng[1]) - int(rng[0])
-        key = (str(artifact), cut_layer)
+        spec = getattr(self, "_runtime_load_spec", None)
+        key = (str(artifact), cut_layer, spec.digest if spec else "legacy")
         if (
             getattr(self, "_keep_head_key", None) == key
             and getattr(getattr(self, "_keep_head", None), "is_available", True)
@@ -2373,7 +2430,7 @@ class LlamaCppEngine:
         # ★ 2026-10-08（#53）：定位收敛到 `keep_head_shim.resolve_keep_head_shim()` ——
         #   与本模块此前内联的推导等价（环境变量 > 仓库默认构建产物），
         #   但**两侧共用同一事实源**，避免 worker 侧只读环境变量而 master 侧能推导。
-        shim = resolve_keep_head_shim()
+        shim = resolve_keep_head_shim(**({"environment": self._environment} if self._environment is not None else {}))
         if not shim:
             # shim 本体是 `qlh_keep_head.dll`（`qlh_kh_*` 入口在它里面）；同目录的
             # `libllama.dll` 只是它依赖的**带补丁** llama.cpp，不是 shim。
@@ -2409,11 +2466,13 @@ class LlamaCppEngine:
             #   放大到能容纳 4× 放大，并保留 `QLH_KEEP_HEAD_N_BATCH` 旋钮。
             self._keep_head = KeepHeadUpstream(
                 shim, str(artifact), mode="nextn",
-                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096),
-                n_batch=max(
+                n_ctx=spec.context_size if spec else int(getattr(self, "_n_ctx", 4096) or 4096),
+                n_batch=spec.batch_size if spec else max(
                     512,
-                    int(os.environ.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
-                ))
+                    int(environment.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
+                ),
+                **({"n_seq_max": spec.sequence_count} if spec else {}),
+                **({"environment": self._environment} if self._environment is not None else {}))
         except KeepHeadCleanupError as exc:
             self._keep_head = exc.cleanup_owner
             self._keep_head_key = None
@@ -2424,6 +2483,16 @@ class LlamaCppEngine:
                 "（docs/已知问题记录.md #35）", exc_info=True)
             self._keep_head = None
         return self._keep_head
+
+    def deployment_materialization_observation(self):
+        upstream = self._keep_head_upstream()
+        if upstream is None:
+            raise ValueError("deployment_local_runtime_unavailable")
+        observation = dict(upstream.materialization_observation())
+        descriptor = self._pipeline_descriptor or {}
+        artifact = descriptor.get("loaded_artifact") or self._model_path
+        observation["artifact_sha256"] = self._pipeline_file_sha256(artifact)
+        return observation
 
     def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
                                    all_positions: bool = False):

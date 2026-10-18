@@ -561,12 +561,15 @@ def _fallback_followups(history: list, existing: list[str]) -> list[str]:
 class EngineHost:
     """推理宿主：进程内模型托管 + 执行段宿主 + generation 取消注册表。"""
 
-    def __init__(self):
+    _environment = None
+
+    def __init__(self, *, environment=None):
+        self._environment = None if environment is None else dict(environment)
         # 延迟 import：保持模块顶层轻量（config 69ms 可接受，model_module 不在此触发）
         import config as runtime_config
         from model_host import ModelHost
 
-        self._host: ModelHost = ModelHost()
+        self._host: ModelHost = ModelHost(environment=self._environment)
         self._model_change_lock = threading.RLock()
         self._layers: List[str] = []  # 已加载层段（1.2 与 model 侧真实状态对齐）
         # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
@@ -611,7 +614,8 @@ class EngineHost:
         # 1.4 注入：scheduler-svc 客户端接口（None = 单机基线：分布式/流水线禁用）
         self._scheduler: Any = None
         self._run_mode: str = str(
-            getattr(runtime_config, "RUN_MODE", "standalone") or "standalone"
+            self._environment.get("QLH_RUN_MODE", "distributed") if self._environment is not None
+            else getattr(runtime_config, "RUN_MODE", "standalone") or "standalone"
         ).strip().lower()
         self._on_task_error = None  # 1.4 注入：任务失败回调
         self.role: str = "master"  # master / client（1.3 角色感知，1.5 peer 使用）
@@ -1036,6 +1040,9 @@ class EngineHost:
         self._task_graph_coordinator = None
         if coordinator is not None:
             coordinator.close()
+        unload = getattr(self._host, "unload_model", None)
+        if callable(unload):
+            unload()
 
     def current_model(self) -> Dict[str, Any]:
         """当前模型信息（/v1/models/current，对齐 api_server.py:2188-2207 完整字段）。"""
@@ -2612,13 +2619,31 @@ class EngineHost:
             if all(runtime is not old for old in orphans):
                 orphans.append(runtime)
 
-    def _build_supplied_layer_manager(self, selected, provider_cancel_event, runtime_owner=None):
-        from worker_prepare_contract import WorkerPrepareError
-        import config
+    def _build_supplied_layer_manager(self, selected, provider_cancel_event, runtime_owner=None,
+                                      *, load_spec=None):
+        from worker_prepare_contract import WorkerPrepareError, validate_load_spec
         from model_module import ModelManager
         manifest = selected["manifest"]
         start, end = manifest["layer_range"]
         model_id = "supply-" + manifest["artifact_sha256"][:24]
+        spec = validate_load_spec(load_spec) if load_spec is not None else None
+        if spec is None:
+            # Legacy commands use one deterministic compatibility policy.
+            # New deployments negotiate and require the complete frozen spec.
+            quant_type = "fp32"
+        else:
+            expected_components = {"layers", "final_norm"}
+            if manifest.get("has_embedding", start == 0):
+                expected_components.add("embedding")
+            if manifest.get("has_lm_head", end == manifest["total_layers"]):
+                expected_components.add("lm_head")
+            if (spec.materialization != "safetensors_key_filtered"
+                    or set(spec.components) != expected_components
+                    or spec.kv_policy != "dynamic" or spec.sequence_count != 1
+                    or spec.kv_device != spec.device or spec.kv_dtype != spec.dtype
+                    or spec.quant_type not in {"fp16", "fp32"}):
+                raise WorkerPrepareError("worker_prepare_load_spec_unsupported")
+            quant_type = spec.quant_type
         manager = ModelManager()
         if runtime_owner is not None:
             runtime_owner.manager = manager
@@ -2627,7 +2652,7 @@ class EngineHost:
                 raise WorkerPrepareError("worker_prepare_cancelled")
             manager.prepare_pipeline_model(
                 model_id=model_id, model_path=selected["directory"],
-                quant_type=config.QUANT_TYPE, layer_range=(start, end),
+                quant_type=quant_type, layer_range=(start, end),
                 model_sha256=manifest["artifact_sha256"],
             )
             if provider_cancel_event.is_set():
@@ -2636,13 +2661,27 @@ class EngineHost:
                 start_layer=start, end_layer=end,
                 has_embedding=manifest.get("has_embedding", start == 0),
                 has_lm_head=manifest.get("has_lm_head", end == manifest["total_layers"]),
-                model_path=selected["directory"], quant_type=config.QUANT_TYPE,
+                model_path=selected["directory"], quant_type=quant_type,
                 total_layers=manifest["total_layers"], model_id=model_id,
+                **({"load_spec": spec.to_dict()} if spec is not None else {}),
             )
             if provider_cancel_event.is_set():
                 raise WorkerPrepareError("worker_prepare_cancelled")
             if tuple(manager.layer_range or ()) != (start, end) or not manager.is_loaded:
                 raise WorkerPrepareError("worker_prepare_layer_range_mismatch")
+            if spec is not None:
+                model = getattr(manager, "model", None)
+                parameters = (list(model.parameters())
+                              if callable(getattr(model, "parameters", None)) else [])
+                floating = [parameter for parameter in parameters if parameter.is_floating_point()]
+                if (not floating or manager.quant_type != spec.quant_type
+                        or any(str(parameter.device) != spec.device
+                               or str(parameter.dtype).removeprefix("torch.") != spec.dtype
+                               for parameter in floating)):
+                    raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch")
+                # Internal policy snapshot only; actual materialization receipts
+                # and assignment budget reconciliation are a deployment concern.
+                manager.runtime_load_spec = spec
             return manager
         except Exception:
             if runtime_owner is None:
@@ -2658,25 +2697,47 @@ class EngineHost:
     def _build_worker_runtime(self, command, selected, cancel_event):
         from copy import deepcopy
         from worker_prepare import LayerRuntime, close_layer_runtime
-        from worker_prepare_contract import WorkerPrepareError
+        from worker_prepare_contract import WorkerPrepareError, validate_command, validate_load_spec
+        command = validate_command(command)
         identity = command["identity"]
+        spec = (validate_load_spec(command["load_spec"], identity=identity,
+                                   context_size=command["context_size"])
+                if "load_spec" in command else None)
         runtime = LayerRuntime(deepcopy(identity), deepcopy(selected))
+        if spec is not None:
+            runtime.load_spec = spec
         try:
             if cancel_event.is_set():
                 raise WorkerPrepareError("worker_prepare_cancelled")
             if identity["stage_model_identity"]["format"] == "safetensors":
-                runtime.manager = self._build_supplied_layer_manager(selected, cancel_event, runtime)
+                runtime.manager = self._build_supplied_layer_manager(
+                    selected, cancel_event, runtime, **({"load_spec": spec} if spec is not None else {}),
+                )
             else:
+                if spec is not None:
+                    expected_components = {"layers"}
+                    if identity["segment_mode"] == "head":
+                        expected_components.add("embedding")
+                    if identity["segment_mode"] == "tail":
+                        expected_components.update(("final_norm", "lm_head"))
+                    if (spec.materialization != "gguf_segment" or spec.device != "cpu"
+                            or spec.dtype != "artifact" or spec.quant_type != "artifact"
+                            or spec.kv_device != "cpu" or spec.kv_dtype != "float16"
+                            or spec.kv_policy != "preallocated"
+                            or set(spec.components) != expected_components):
+                        raise WorkerPrepareError("worker_prepare_load_spec_unsupported")
                 from keep_head_shim import resolve_keep_head_shim
                 from llama_keep_head import KeepHeadUpstream
                 import numpy as np
-                shim = resolve_keep_head_shim()
+                shim = resolve_keep_head_shim(**({"environment": self._environment} if self._environment is not None else {}))
                 if not shim:
                     raise WorkerPrepareError("worker_prepare_shim_unavailable")
                 runtime.upstream = KeepHeadUpstream(
                     shim, selected["model_path"], mode="nextn",
-                    n_ctx=command["context_size"], n_batch=min(command["context_size"], 2048),
-                    n_threads=8, n_seq_max=1,
+                    n_ctx=spec.context_size if spec is not None else command["context_size"],
+                    n_batch=spec.batch_size if spec is not None else min(command["context_size"], 2048),
+                    n_threads=8, n_seq_max=spec.sequence_count if spec is not None else 1,
+                    **({"environment": self._environment} if self._environment is not None else {}),
                 )
                 upstream = runtime.upstream
                 if (not upstream.is_available or upstream.n_embd != identity["hidden_size"]
@@ -2697,6 +2758,22 @@ class EngineHost:
                 upstream.reset()
             if cancel_event.is_set() or not runtime.loaded:
                 raise WorkerPrepareError("worker_prepare_cancelled")
+            if spec is not None:
+                if runtime.manager is not None:
+                    parameters = list(runtime.manager.model.parameters())
+                    buffers = list(runtime.manager.model.buffers()) if callable(getattr(runtime.manager.model, "buffers", None)) else []
+                    materialized = sum(p.numel() * p.element_size() for p in parameters + buffers)
+                else:
+                    observation = runtime.upstream.materialization_observation()
+                    for field in ("context_size", "batch_size", "device", "dtype", "quant_type", "kv_device", "kv_dtype", "sequence_count"):
+                        if observation.get(field) != getattr(spec, field):
+                            raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch")
+                    materialized = observation["materialized_bytes"]
+                runtime.materialization_receipt = {
+                    "load_spec": spec.to_dict(), "materialized_bytes": materialized,
+                    "memory_scope": "weight_tensors", "layer_range": deepcopy(identity["layer_range"]),
+                    "artifact_sha256": identity["artifact_sha256"],
+                }
             return runtime
         except Exception as exc:
             if runtime.upstream is None:
@@ -2707,6 +2784,15 @@ class EngineHost:
                 self._retain_failed_worker_runtime(runtime)
                 raise
             raise
+
+    def worker_runtime_receipt(self, identity):
+        from copy import deepcopy
+        for runtime in self._owned_worker_runtimes():
+            if runtime.identity == identity and runtime.loaded:
+                receipt = getattr(runtime, "materialization_receipt", None)
+                if receipt is not None:
+                    return deepcopy(receipt)
+        return None
 
     def prepare_worker_runtime(self, command, selected, cancel_event):
         from copy import deepcopy
@@ -2919,7 +3005,11 @@ class EngineHost:
         from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 
         from model_supply_worker import selected_gguf_path
-        model_path = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
+        environment = os.environ if self._environment is None else self._environment
+        if self._environment is None:
+            model_path = selected_gguf_path() or environment.get("QLH_LAYER_GGUF", "").strip()
+        else:
+            model_path = environment.get("QLH_LAYER_GGUF", "").strip()
         if self._layer_upstream is not None:
             previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
             if (not previous_path or previous_path == model_path) and self._layer_upstream.is_available:
@@ -2929,7 +3019,7 @@ class EngineHost:
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
-        shim_path = resolve_keep_head_shim()
+        shim_path = resolve_keep_head_shim(**({"environment": self._environment} if self._environment is not None else {}))
         if not model_path or not shim_path:
             # 具名错误：分别指出**缺哪一个**，并列出 shim 已尝试过的路径。
             missing = []
@@ -2941,7 +3031,7 @@ class EngineHost:
         from llama_keep_head import KeepHeadUnavailable, KeepHeadUpstream
 
         def _env_int(name: str, default: int) -> int:
-            raw = os.environ.get(name, "").strip()
+            raw = environment.get(name, "").strip()
             try:
                 return max(1, int(raw)) if raw else default
             except ValueError:
@@ -2957,6 +3047,7 @@ class EngineHost:
                 n_batch=_env_int("QLH_LAYER_N_BATCH", 2048),
                 n_threads=_env_int("QLH_LAYER_THREADS", 8),
                 n_seq_max=_env_int("QLH_LAYER_N_SEQ_MAX", 1),
+                **({"environment": self._environment} if self._environment is not None else {}),
             )
         except KeepHeadUnavailable as exc:
             owner = getattr(exc, "cleanup_owner", None)

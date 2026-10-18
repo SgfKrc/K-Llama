@@ -28,6 +28,7 @@ import pytest  # noqa: E402
 import api_server  # noqa: F401,E402  （加载 API composition root，配置 SchedulerCallbackSet）
 from scheduler import Scheduler, NodeInfo, NodeState, NodeRole  # noqa: E402
 from koakuma_engine import Capability  # noqa: E402
+from qlh_core.contracts.engines import ENGINE_REGISTRY, LLAMA_CPP_BINDING
 
 
 def _master_sched():
@@ -40,6 +41,9 @@ def _master_sched():
             state=NodeState.ONLINE,
             node_type="pc",
             device_info={
+                "engine_capabilities": ENGINE_REGISTRY.advertisement([
+                    ENGINE_REGISTRY.require("llama_cpp", LLAMA_CPP_BINDING),
+                ]),
                 "ram": {"total_gb": 64.0, "available_gb": 32.0},
                 "capabilities": [Capability.FORWARD_LAYERS],
             },

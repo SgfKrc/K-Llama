@@ -12,6 +12,12 @@ from llama_engine import LlamaCppEngine
 from model_host import ModelHost
 from model_module import ModelManager
 from scheduler import NodeInfo, NodeState, Scheduler
+from qlh_core.contracts.engines import ENGINE_REGISTRY, LLAMA_CPP_BINDING, PYTORCH_CUDA
+
+
+def _engine_evidence(backend="pytorch"):
+    kind = LLAMA_CPP_BINDING if backend == "llama_cpp" else PYTORCH_CUDA
+    return ENGINE_REGISTRY.advertisement([ENGINE_REGISTRY.require(backend, kind)])
 
 
 GIB = 1024 ** 3
@@ -43,6 +49,7 @@ def _torch_runtime(device=None):
 def _profile(*, vram_gb=8, ram_gb=3, backend="pytorch"):
     return {
         "backend_id": backend,
+        "engine_capabilities": _engine_evidence(backend),
         "gpu": {
             "name": "RTX", "cuda_available": True, "is_integrated": False,
             "vram_total_gb": 8, "vram_free_gb": vram_gb,
@@ -61,10 +68,14 @@ def make_scheduler(monkeypatch):
         sched._role_override = role
         monkeypatch.setattr(sched, "get_effective_node_id", lambda: "pc-local")
         monkeypatch.setattr(sched, "_configured_layer_artifact", lambda: None)
+        selected_profile = dict(profile if profile is not None else _profile())
+        # This fixture explicitly installs a PyTorch CUDA execution path; CPU
+        # budgeting/candidate selection is the independent behavior under test.
+        selected_profile.setdefault("engine_capabilities", _engine_evidence())
         sched.nodes = {
             local_id: NodeInfo(
                 node_id=local_id, role=role, state=NodeState.ONLINE,
-                device_info=profile if profile is not None else _profile(),
+                device_info=selected_profile,
             ),
         }
         return sched
@@ -231,6 +242,14 @@ def test_remote_ll_worker_on_gpu_pc_uses_ram(use_hello, make_scheduler):
             }],
         }
 
+    from scheduler_task_worker import SchedulerTaskWorkerMixin
+    SchedulerTaskWorkerMixin._merge_task_worker_capabilities_into_node(sched, "remote", {
+        "engines": ["llama_cpp"], "stage_types": ["layer_forward"],
+        "models": [{"model_id": "remote-segment", "engine": "llama_cpp"}],
+        "engine_capabilities": _engine_evidence("llama_cpp"),
+    })
+    # Production merge supersedes the old hardware/family hint.
+    assert sched.nodes["remote"].device_info["backend_id"] == "llama_cpp"
     record = _project(sched)
 
     assert record["execution_device"] == "cpu"

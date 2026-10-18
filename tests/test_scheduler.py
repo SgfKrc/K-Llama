@@ -21,6 +21,14 @@ import api_server  # noqa: F401,E402
 import node_runtime as node_runtime_mod
 from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState, NodeRole
 from koakuma_engine import Capability
+from qlh_core.contracts.engines import ENGINE_REGISTRY
+
+
+def _engine_contract(family, runtime_kind):
+    """Concrete execution evidence chosen explicitly by each scheduler fixture."""
+    return {"engine_capabilities": ENGINE_REGISTRY.advertisement([
+        ENGINE_REGISTRY.require(family, runtime_kind),
+    ])}
 
 
 # ================================================================
@@ -28,6 +36,7 @@ from koakuma_engine import Capability
 # ================================================================
 
 PROFILE_WORKSTATION = {
+    **_engine_contract("pytorch", "pytorch_cuda"),
     "gpu": {
         "name": "NVIDIA RTX 4090",
         "vram_total_gb": 24.0,
@@ -39,6 +48,7 @@ PROFILE_WORKSTATION = {
 }
 
 PROFILE_LAPTOP = {
+    **_engine_contract("pytorch", "pytorch_cuda"),
     "gpu": {
         "name": "NVIDIA RTX 4060 Laptop",
         "vram_total_gb": 8.0,
@@ -50,6 +60,7 @@ PROFILE_LAPTOP = {
 }
 
 PROFILE_ULTRABOOK = {
+    **_engine_contract("pytorch", "pytorch_cpu"),
     "gpu": {
         "name": "Intel Iris Xe",
         "vram_total_gb": 0.5,
@@ -61,6 +72,7 @@ PROFILE_ULTRABOOK = {
 }
 
 PROFILE_EDGE = {
+    **_engine_contract("pytorch", "pytorch_cpu"),
     "gpu": {
         "name": "None",
         "vram_total_gb": 0,
@@ -83,6 +95,7 @@ PROFILE_MOBILE = {
 }
 
 PROFILE_NO_GPU = {
+    **_engine_contract("pytorch", "pytorch_cpu"),
     "gpu": {},
     "ram": {"total_gb": 8.0},
     "cpu": {"physical_cores": 4, "freq_max_mhz": 2500},
@@ -200,6 +213,7 @@ class TestComputeLayerAssignment:
     @pytest.fixture
     def sched(self):
         s = Scheduler()
+        s._role_override = "master"
         # 注入模拟节点
         s.nodes = {
             "master": NodeInfo(
@@ -265,7 +279,7 @@ class TestComputeLayerAssignment:
             "node_id": "master",
             "role": "master",
             "node_type": "pc",
-            "device_info": {},
+            "device_info": {**_engine_contract("pytorch", "pytorch_cuda"), },
         }]
 
         result = sched.compute_layer_assignment(nodes)
@@ -286,6 +300,7 @@ class TestComputeLayerAssignment:
         }
         host = type("PreparedHost", (), {
             "is_loaded": False,
+            "runtime_kind": "pytorch_cpu", "native_abi": "torch_module.v1",
             "is_pipeline_prepared": True,
             "_engine_type": "pytorch",
             "_model_path": os.getcwd(),
@@ -345,7 +360,7 @@ class TestComputeLayerAssignment:
         sched.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
-                device_info={
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"),
                     "gpu": {"name": "RTX", "cuda_available": True,
                             "is_integrated": False, "vram_total_gb": 8,
                             "vram_free_gb": 0.6},
@@ -354,7 +369,7 @@ class TestComputeLayerAssignment:
             ),
             "worker-a": NodeInfo(
                 node_id="worker-a", role="client", state=NodeState.ONLINE,
-                device_info={
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"),
                     "gpu": {"name": "RTX", "cuda_available": True,
                             "is_integrated": False, "vram_total_gb": 8,
                             "vram_free_gb": 1.0},
@@ -362,7 +377,7 @@ class TestComputeLayerAssignment:
             ),
             "worker-b": NodeInfo(
                 node_id="worker-b", role="client", state=NodeState.ONLINE,
-                device_info={
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"),
                     "gpu": {"name": "RTX", "cuda_available": True,
                             "is_integrated": False, "vram_total_gb": 8,
                             "vram_free_gb": 1.0},
@@ -400,10 +415,12 @@ class TestComputeLayerAssignment:
         sched.nodes = {
             "fresh": NodeInfo(
                 node_id="fresh", role="client", state=NodeState.ONLINE,
+                device_info=_engine_contract("pytorch", "pytorch_cpu"),
                 last_heartbeat=now - 5,
             ),
             "silent": NodeInfo(
                 node_id="silent", role="client", state=NodeState.ONLINE,
+                device_info=_engine_contract("pytorch", "pytorch_cpu"),
                 last_heartbeat=now - 200,  # 超过 WORKER_HEARTBEAT_MAX_AGE
             ),
         }
@@ -419,7 +436,7 @@ class TestComputeLayerAssignment:
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
                 address="127.0.0.1:8888",
-                device_info={
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"),
                     "cpu": {"physical_cores": 8, "logical_cores": 16},
                     "ram": {"total_gb": 32, "available_gb": 12},
                     "gpu": {
@@ -431,14 +448,14 @@ class TestComputeLayerAssignment:
             "edge": NodeInfo(
                 node_id="edge", role="client", state=NodeState.ONLINE,
                 address="100.64.0.2:8888",
-                device_info={
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"),
                     "cpu": {"physical_cores": 4, "logical_cores": 8},
                     "ram": {"total_gb": 16, "available_gb": 10},
                 },
             ),
             "offline": NodeInfo(
                 node_id="offline", role="client", state=NodeState.OFFLINE,
-                device_info={"ram": {"total_gb": 128, "available_gb": 128}},
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"), "ram": {"total_gb": 128, "available_gb": 128}},
             ),
         }
 
@@ -485,7 +502,7 @@ class TestComputeLayerAssignment:
             "android-worker": NodeInfo(
                 node_id="android-worker", role="client", state=NodeState.ONLINE,
                 node_type="android",
-                device_info={
+                device_info={**_engine_contract("llama_cpp", "llama_cpp_android"),
                     "backend_id": "llama_cpp",
                     "capabilities": [Capability.FORWARD_LAYERS],
                     "memory": {"available_bytes": 3 * 1024 ** 3},
@@ -514,11 +531,11 @@ class TestComputeLayerAssignment:
         sched.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
-                device_info={"ram": {"available_gb": 1.0}},
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"), "ram": {"available_gb": 1.0}},
             ),
             "remote": NodeInfo(
                 node_id="remote", role="client", state=NodeState.ONLINE,
-                device_info={"ram": {"available_gb": 7.0}},
+                device_info={**_engine_contract("pytorch", "pytorch_cuda"), "ram": {"available_gb": 7.0}},
             ),
         }
         import psutil
@@ -547,7 +564,7 @@ class TestComputeLayerAssignment:
             "android-worker": NodeInfo(
                 node_id="android-worker", role=NodeRole.CLIENT,
                 state=NodeState.ONLINE, node_type="android",
-                device_info={
+                device_info={**_engine_contract("llama_cpp", "llama_cpp_android"),
                     "backend_id": "llama_cpp",
                     "capabilities": [Capability.FORWARD_LAYERS],
                     "memory": {"available_bytes": 3 * 1024 ** 3},
@@ -585,7 +602,7 @@ class TestComputeLayerAssignment:
             "android-worker": NodeInfo(
                 node_id="android-worker", role=NodeRole.CLIENT,
                 state=NodeState.ONLINE, node_type="android",
-                device_info={
+                device_info={**_engine_contract("llama_cpp", "llama_cpp_android"),
                     "backend_id": "llama_cpp",
                     "capabilities": [Capability.FORWARD_LAYERS],
                     "memory": {"available_bytes": 3 * 1024 ** 3},
@@ -625,7 +642,7 @@ class TestComputeLayerAssignment:
             "android-worker": NodeInfo(
                 node_id="android-worker", role=NodeRole.CLIENT,
                 state=NodeState.ONLINE, node_type="android",
-                device_info={
+                device_info={**_engine_contract("llama_cpp", "llama_cpp_android"),
                     "backend_id": "llama_cpp",
                     "capabilities": [Capability.FORWARD_LAYERS],
                     "memory": {"available_bytes": 3 * 1024 ** 3},
@@ -1415,6 +1432,8 @@ class TestComputeLayerAssignment:
             action="finalize",
         )
 
+        sched._persist_pipeline_lifecycle_locked()
+
         assert sched._dispatch_pipeline_model_cleanup(record) is False
         assert record["cleanup_id"] in sched._pipeline_model_cleanup_ledger
 
@@ -1580,6 +1599,8 @@ class TestComputeLayerAssignment:
                 "aborted_config_id": "cfg-old",
             },
         )
+
+        sched._persist_pipeline_lifecycle_locked()
 
         sched._on_tcp_registration_confirmed("client1")
 
@@ -2041,7 +2062,7 @@ class TestComputeLayerAssignment:
         """Android with an explicit llama.cpp layer capability can receive a segment."""
         nodes = [
             {"node_id": "master", "role": "master", "node_type": "pc", "device_info": PROFILE_WORKSTATION},
-            {"node_id": "android-worker", "role": "client", "node_type": "android", "device_info": {
+            {"node_id": "android-worker", "role": "client", "node_type": "android", "device_info": {**_engine_contract("llama_cpp", "llama_cpp_android"),
                 **PROFILE_MOBILE,
                 "backend_id": "llama_cpp",
                 "capabilities": [Capability.FORWARD_LAYERS],
@@ -2073,9 +2094,9 @@ class TestComputeLayerAssignment:
     def test_all_zero_weight_equal_split(self, sched):
         """权重全为 0 时应均分"""
         nodes = [
-            {"node_id": "n1", "role": "client", "device_info": {}},
-            {"node_id": "n2", "role": "client", "device_info": {}},
-            {"node_id": "n3", "role": "client", "device_info": {}},
+            {"node_id": "n1", "role": "client", "device_info": {**_engine_contract("pytorch", "pytorch_cuda"), }},
+            {"node_id": "n2", "role": "client", "device_info": {**_engine_contract("pytorch", "pytorch_cuda"), }},
+            {"node_id": "n3", "role": "client", "device_info": {**_engine_contract("pytorch", "pytorch_cuda"), }},
         ]
         result = sched.compute_layer_assignment(nodes)
 
@@ -2203,9 +2224,12 @@ class TestLocalDeviceProfileSync:
 
         sched.update_local_device_profile(PROFILE_IGPU_ONLY)
 
-        assert fake_client.device_info == PROFILE_IGPU_ONLY
+        expected = dict(sched._local_device_profile)
+        assert "engine_capabilities" in expected
+        assert expected["gpu"] == PROFILE_IGPU_ONLY["gpu"]
+        assert fake_client.device_info == expected
         assert sent == [(
-            {"state": "online", "device_info": PROFILE_IGPU_ONLY},
+            {"state": "online", "device_info": expected},
             "status_res",
         )]
 
@@ -7704,6 +7728,7 @@ class TestCheckMasterHealthTcp:
 
 
 PROFILE_IGPU_ONLY = {
+    **_engine_contract("pytorch", "pytorch_cpu"),
     "gpu": {
         "name": "Intel Iris Xe Graphics",
         "vram_total_gb": 0.5,

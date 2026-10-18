@@ -388,8 +388,8 @@ def test_register_gguf_model_is_allowed_without_cuda(monkeypatch, tmp_path):
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
-        "save_local_experimental_model",
-        lambda model_id, config_json: saved.append((model_id, config_json)) or True,
+        "publish_local_model_registry",
+        lambda model_id, config_json, *, expected_revision: saved.append((model_id, config_json)) or True,
     )
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     gguf = tmp_path / "custom.Q4_K_M.gguf"
@@ -412,8 +412,8 @@ def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch, tmp_pat
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
-        "save_local_experimental_model",
-        lambda model_id, config_json: saved.append((model_id, config_json)) or True,
+        "publish_local_model_registry",
+        lambda model_id, config_json, *, expected_revision: saved.append((model_id, config_json)) or True,
     )
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     model_dir = tmp_path / "custom-hf"
@@ -808,7 +808,13 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     assert result["status"] == "ok"
 
 
-def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path):
+@pytest.fixture
+def real_api_services():
+    # Resolve the owning runtime before an API-only host stub replaces the facade.
+    return api_server._get_app_runtime().services
+
+
+def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path, real_api_services):
     calls = []
     transactions = []
     import config as cfg
@@ -896,7 +902,7 @@ def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp
 
 
 def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, real_api_services,
 ):
     aborted = []
     fake_host = types.SimpleNamespace(
@@ -959,7 +965,7 @@ def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
 
 
 def test_prepare_pipeline_model_rejects_synchronous_aborted_commit(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, real_api_services,
 ):
     aborted = []
     monkeypatch.setattr(api_server, "model_host", types.SimpleNamespace(

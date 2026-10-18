@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from task_worker_capabilities import validate_worker_engine_capabilities
+
 try:
     from .task_provider import canonical_model_engine
 except ImportError:  # pragma: no cover - top-level import in worker bundles
@@ -570,6 +572,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # Optional for backwards compatibility with existing PC workers. Android
     # workers are admitted only when this gate is present and explicitly true;
     # the scheduler performs that role-specific check after hello validation.
+    if "engine_capabilities" in capabilities:
+        expected_fields.add("engine_capabilities")
+    if "load_spec_version" in capabilities:
+        expected_fields.add("load_spec_version")
+        if type(capabilities["load_spec_version"]) is not int or capabilities["load_spec_version"] != 1:
+            raise _error("invalid_capabilities", "payload.capabilities.load_spec_version", "unsupported load policy schema")
     if "resource_gate" in capabilities:
         expected_fields.add("resource_gate")
     if "layer_ranges" in capabilities:
@@ -935,6 +943,13 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         )
     if "resource_gate" in capabilities:
         _validate_resource_gate(capabilities["resource_gate"])
+    try:
+        validate_worker_engine_capabilities(capabilities)
+    except (ValueError, TypeError) as exc:
+        raise _error(
+            "invalid_capabilities", "payload.capabilities.engine_capabilities", str(exc),
+        ) from exc
+
 
 
 def _validate_resource_gate(value: Any) -> None:

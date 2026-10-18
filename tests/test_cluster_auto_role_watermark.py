@@ -263,7 +263,7 @@ def test_voter_rpc_keeps_the_watermark_code(tmp_path):
     assert result["code"] == "quorum_watermark_unavailable"
 
 
-def test_remote_voter_call_propagates_watermark_code():
+def test_remote_voter_call_propagates_watermark_code(monkeypatch):
     """`HTTPRemoteVoter` 不得把水位码降级成通用码（白名单必须放行它）。"""
     import json as _json
     import threading
@@ -271,6 +271,10 @@ def test_remote_voter_call_propagates_watermark_code():
 
     from cluster_auto_role_runtime import HTTPRemoteVoter
     from cluster_quorum import QuorumError
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"

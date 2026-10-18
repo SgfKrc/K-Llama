@@ -430,10 +430,10 @@ def apply_node_config_to_env(
     return data
 
 
-def build_bootstrap_config(response: dict[str, Any]) -> dict[str, Any]:
+def build_bootstrap_config(response: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
     cluster = response.get("cluster") if isinstance(response.get("cluster"), dict) else {}
     node = response.get("node") if isinstance(response.get("node"), dict) else {}
-    existing = load_node_config()
+    existing = load_node_config() if existing is None else existing
     existing_cluster = (
         existing.get("cluster") if isinstance(existing.get("cluster"), dict) else {}
     )

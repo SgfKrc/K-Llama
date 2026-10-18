@@ -246,7 +246,7 @@ def test_sha_mismatch_fails_job(tmp_path):
     assert not target.exists()
 
 
-def test_registration_failure_removes_published_target(tmp_path, monkeypatch):
+def test_registration_failure_retains_published_target_for_supply_reconciliation(tmp_path, monkeypatch):
     models_root = tmp_path / "models"
     src = _make_gguf_dir(tmp_path / "src-register-failure")
     target = models_root / "register-failure"
@@ -259,7 +259,9 @@ def test_registration_failure_removes_published_target(tmp_path, monkeypatch):
 
     assert job["status"] == mj.STATUS_FAILED
     assert job["error_code"] == "REGISTER_FAILED"
-    assert not target.exists()
+    assert job["error"].startswith("cleanup_pending:")
+    assert target.is_dir()
+    assert job["target"] == str(target)
 
 
 def test_unknown_preset_raises():

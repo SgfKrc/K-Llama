@@ -44,6 +44,13 @@ from task_worker_protocol import (
     worker_protocol_status,
 )
 from torch_runtime import torch_available
+from koakuma_engine import Capability, backend_id_for, runtime_identity_for, runtime_supports
+from qlh_core.contracts.engines import (
+    ENGINE_REGISTRY, FULL_REQUEST, FORWARD_LAYERS,
+    LLAMA_CPP_BINDING, LLAMA_CPP_KEEP_HEAD, PYTORCH_CPU, PYTORCH_CUDA,
+    ISLAND_REMOTE, EXTERNAL_API_REMOTE, advertisement_supports,
+)
+from task_worker_capabilities import build_engine_capabilities
 
 logger = logging.getLogger("scheduler")
 
@@ -319,10 +326,7 @@ class SchedulerTaskWorkerMixin:
     ) -> list[dict]:
         """Return only identities executable by a complete-model stage."""
         stage_types = capabilities.get("stage_types") or []
-        if not any(
-            stage_type in stage_types
-            for stage_type in ("full_inference", "aggregate")
-        ):
+        if "full_inference" not in stage_types:
             return []
         layer_artifact_digests = {
             artifact.get("artifact_sha256")
@@ -614,38 +618,14 @@ class SchedulerTaskWorkerMixin:
 
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
-        engines = []
-        if torch_available():
-            engines.append("pytorch")
-        try:
-            if importlib.util.find_spec("llama_cpp") is not None:
-                engines.append("llama_cpp")
-            elif keep_head_shim_available():
-                # shim 路径同样能执行 llama.cpp 层段（见 keep_head_shim_available 的说明）。
-                engines.append("llama_cpp")
-        except (ImportError, ValueError):
-            pass
-        # TP 孤岛网关：以 island 引擎承担整请求推理（配置启用即上报能力）
-        try:
-            import config as _island_cfg
-            if (getattr(_island_cfg, "ISLAND_ENABLED", False)
-                    and getattr(_island_cfg, "ISLAND_BASE_URL", "")):
-                engines.append("island")
-        except Exception:
-            pass
-        # 外部推理服务（路线 B）：以 external_api 引擎承担整请求推理。
-        # 仅声明能力，实际外发仍受数据作用域门控约束（默认 opt_in 不出集群）。
-        try:
-            import config as _external_cfg
-            if (getattr(_external_cfg, "EXTERNAL_ENABLED", False)
-                    and getattr(_external_cfg, "EXTERNAL_BASE_URL", "")):
-                engines.append("external_api")
-        except Exception:
-            pass
+        engine_schema = self._task_worker_engine_schema()
+        engines = list(dict.fromkeys(
+            item["family"] for item in engine_schema["runtimes"]
+        ))
+        # Preserve a diagnostic hello for a broken slim installation, with no
+        # execution operations. aggregate is handled locally by the worker.
         if not engines:
-            # The PC application currently requires the PyTorch runtime. Keeping
-            # the schema valid also makes a broken installation visible in hello.
-            engines.append("pytorch")
+            engines = ["pytorch"]
 
         full_model_identity = self._task_worker_full_model_identity(engines)
         models = [full_model_identity] if full_model_identity is not None else []
@@ -687,7 +667,12 @@ class SchedulerTaskWorkerMixin:
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
         artifact_model = self._task_worker_layer_artifact_identity(artifact)
-        if artifact_model is not None:
+        if artifact_model is not None and (
+            full_model_identity is None
+            or (layer_worker and advertisement_supports(engine_schema, FORWARD_LAYERS))
+        ):
+            # An unsupported segment beside a real full model has no executable
+            # layer_artifacts entry; keep it out of that full model's identities.
             # Protocol v3 requires layer_artifacts to reference a physical
             # identity in models.  This is an artifact registry entry only;
             # full-stage admission independently requires a loaded full model.
@@ -699,8 +684,17 @@ class SchedulerTaskWorkerMixin:
                 models.append(artifact_model)
             elif existing != artifact_model:
                 raise RuntimeError("layer_artifact_model_identity_conflict")
-        stage_types = ["full_inference", "aggregate"]
-        if layer_worker and full_model_identity is None:
+        if (layer_worker or artifact_model is not None) and full_model_identity is None:
+            entries = ENGINE_REGISTRY.validate_advertisement(engine_schema)
+            engine_schema = ENGINE_REGISTRY.advertisement(
+                ENGINE_REGISTRY.narrow(entry.family, entry.runtime_kind,
+                                       entry.operations - {FULL_REQUEST})
+                for entry in entries
+            )
+        stage_types = ["aggregate"]
+        if advertisement_supports(engine_schema, FULL_REQUEST):
+            stage_types.insert(0, "full_inference")
+        if (layer_worker or artifact_model is not None) and full_model_identity is None:
             stage_types = []
         if layer_worker and "layer_forward" not in stage_types:
             # ★ 票 15a（能力广告半边）：**能起 server 不等于能参与层段接力**。
@@ -708,14 +702,20 @@ class SchedulerTaskWorkerMixin:
             #   子进程路径），就不得广告 `layer_forward` —— 否则 master 会把层段
             #   派给一台执行不了的 worker。判据走运行时能力探测而非 backend 名字：
             #   server 引擎对外仍报 `engine_type="llama_cpp"`。
-            if self._advertises_layer_forward():
+            if advertisement_supports(engine_schema, FORWARD_LAYERS):
                 stage_types.append("layer_forward")
             else:
                 logger.warning(
                     "task worker 声明为层段 worker，但当前推理路径不支持层段前向 "
                     "-> 不广告 layer_forward（票 15a INFER-PATH-SPLIT-01）"
                 )
+        if not layer_worker or not advertisement_supports(engine_schema, FORWARD_LAYERS):
+            layer_ranges = []
+        if not stage_types:
+            stage_types = ["aggregate"]
         capabilities = {
+            "engine_capabilities": engine_schema,
+            "load_spec_version": 1,
             "stage_types": stage_types,
             "engines": engines,
             "models": models,
@@ -746,7 +746,7 @@ class SchedulerTaskWorkerMixin:
         # false. The compatibility switch must omit the key entirely.
         if layer_worker and binary_hidden_transport_enabled():
             capabilities["binary_hidden"] = True
-        if artifact is not None and artifact.get("segment_mode") in {
+        if layer_ranges and artifact is not None and artifact.get("segment_mode") in {
             "head", "middle", "tail",
         }:
             item = {
@@ -781,25 +781,56 @@ class SchedulerTaskWorkerMixin:
             # unspecified; it must never claim a stronger release profile.
             return RUNTIME_PROFILE_UNSPECIFIED
 
-    def _advertises_layer_forward(self) -> bool:
-        """当前 runtime 能否**真的**执行层段前向（票 15a 的能力广告判据）。
-
-        保守语义：只有拿到**明确的否定结论**才不广告 —— 探测不出结论时（测试替身、
-        未加载模型、无可识别 backend）按"可以"处理，维持既有广告行为不变。
-        """
+    def _task_worker_engine_schema(self) -> dict:
+        """Discover installed paths, then apply only narrowing runtime probes."""
+        runtimes = []
+        if torch_available():
+            kind = (PYTORCH_CUDA if self._runtime_profile_for_capabilities() == "torch_cuda"
+                    else PYTORCH_CPU)
+            runtimes.append(("pytorch", kind))
         try:
-            from koakuma_engine import Capability, backend_id_for
-
-            host = self._host
-            probe = getattr(host, "supports", None)
-            if not callable(probe):
-                return True
-            if not backend_id_for(host):
-                # 没有可识别的 backend（未加载/替身）=> 不下否定结论
-                return True
-            return bool(probe(Capability.FORWARD_LAYERS))
+            if importlib.util.find_spec("llama_cpp") is not None:
+                runtimes.append(("llama_cpp", LLAMA_CPP_BINDING))
+            if keep_head_shim_available():
+                runtimes.append(("llama_cpp", LLAMA_CPP_KEEP_HEAD))
+        except (ImportError, ValueError):
+            pass
+        try:
+            import config as cfg
+            if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
+                runtimes.append(("island", ISLAND_REMOTE))
+            if getattr(cfg, "EXTERNAL_ENABLED", False) and getattr(cfg, "EXTERNAL_BASE_URL", ""):
+                runtimes.append(("external_api", EXTERNAL_API_REMOTE))
         except Exception:
-            return True
+            pass
+        host = self._host
+        family, kind = runtime_identity_for(host)
+        if ENGINE_REGISTRY.get(family, kind) is not None:
+            runtimes.append((family, kind))
+        # A current server or a negative probe must also narrow installed
+        # binding/keep-head paths; installation alone does not grant a live host.
+        allow_layers = True
+        if kind:
+            allow_layers = runtime_supports(host, Capability.FORWARD_LAYERS)
+        elif backend_id_for(host):
+            probe = getattr(host, "supports", None)
+            if callable(probe):
+                try:
+                    allow_layers = bool(probe(Capability.FORWARD_LAYERS))
+                except Exception:
+                    allow_layers = False
+        schema = build_engine_capabilities(runtimes, allow_layers=allow_layers)
+        if kind and not runtime_supports(host, Capability.CHAT):
+            entries = ENGINE_REGISTRY.validate_advertisement(schema)
+            schema = ENGINE_REGISTRY.advertisement(
+                ENGINE_REGISTRY.narrow(entry.family, entry.runtime_kind,
+                    entry.operations - {FULL_REQUEST} if entry.family == family else entry.operations)
+                for entry in entries
+            )
+        return schema
+
+    def _advertises_layer_forward(self) -> bool:
+        return advertisement_supports(self._task_worker_engine_schema(), FORWARD_LAYERS)
 
 
     def _send_task_worker_hello(
@@ -881,6 +912,18 @@ class SchedulerTaskWorkerMixin:
 
     def refresh_task_worker_capabilities(self) -> bool:
         """Schedule a hello bound to the registration requesting this refresh."""
+        # Engine changes affect a local master too, even though only clients
+        # send hello. Keep planning profiles current without warming a manager.
+        from task_worker_capabilities import engine_profile
+        schema = self._task_worker_engine_schema()
+        self._local_device_profile = engine_profile(
+            getattr(self, "_local_device_profile", None) or {}, schema,
+        )
+        local_id = "master" if self._effective_role() == "master" else self.get_effective_node_id()
+        self._merge_task_worker_capabilities_into_node(local_id, {
+            "engine_capabilities": schema,
+            "engines": list(dict.fromkeys(item["family"] for item in schema["runtimes"])),
+        })
         client = getattr(self, "_tcp_client", None)
         if (
             not self.get_distributed_inference_enabled()
@@ -1083,6 +1126,26 @@ class SchedulerTaskWorkerMixin:
                              or not self._task_worker_hello_followup_owner_current(node_id, work))):
                     pending.pop(node_id, None)
 
+    def _merge_task_worker_capabilities_into_node(self, node_id, capabilities, *, accepted=True):
+        """Publish a hello's verified engine schema to the planner node view."""
+        from task_worker_capabilities import validate_worker_engine_capabilities
+
+        schema = None
+        if accepted:
+            validate_worker_engine_capabilities(capabilities)
+            schema = capabilities.get("engine_capabilities")
+        nodes_lock = getattr(self, "_nodes_lock", None)
+        if nodes_lock is None:
+            return
+        with nodes_lock:
+            node = self.nodes.get(node_id)
+            if node is not None:
+                if schema is not None:
+                    from task_worker_capabilities import engine_profile
+                    node.device_info = engine_profile(node.device_info or {}, schema)
+                else:
+                    node.device_info = {**(node.device_info or {}), "engine_capabilities": None}
+
     def _apply_task_worker_hello_followup(self, node_id, work):
         def current():
             return self._task_worker_hello_followup_current(node_id, work)
@@ -1092,6 +1155,8 @@ class SchedulerTaskWorkerMixin:
         snapshot = self._task_worker_control.worker_snapshot(node_id)
         accepted = snapshot.get("accepted")
         capabilities = snapshot.get("capabilities") or {}
+        if current():
+            self._merge_task_worker_capabilities_into_node(node_id, capabilities, accepted=bool(accepted))
         cleanup_pending = bool(self._pending_pipeline_model_cleanup_for_node(node_id))
         if accepted and cleanup_pending and current():
             self._replay_pipeline_model_cleanup_for_node(node_id)

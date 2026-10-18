@@ -474,3 +474,17 @@ void qlh_kh_close(void * handle_void) {
     }
     free(handle);
 }
+
+/* Read-only R3 load receipt. Values come from the loaded native handle. */
+uint64_t qlh_kh_model_bytes(void * ptr) {
+    qlh_keep_head * h = (qlh_keep_head *) ptr;
+    return h && h->model ? llama_model_size(h->model) : 0;
+}
+uint32_t qlh_kh_context_size(void * ptr) {
+    qlh_keep_head * h = (qlh_keep_head *) ptr;
+    return h && h->ctx ? llama_n_ctx(h->ctx) : 0;
+}
+uint32_t qlh_kh_batch_size(void * ptr) {
+    qlh_keep_head * h = (qlh_keep_head *) ptr;
+    return h && h->ctx ? llama_n_batch(h->ctx) : 0;
+}

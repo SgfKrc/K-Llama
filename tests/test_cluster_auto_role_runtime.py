@@ -19,6 +19,7 @@ from cluster_auto_role_runtime import (  # noqa: E402
     install_auto_role_controller,
 )
 from cluster_control_contract import VoterIdentity, VoterSet  # noqa: E402
+from tests.test_refactor_authority_defects import certs  # noqa: E402, F401
 
 
 def _key_material():
@@ -151,3 +152,83 @@ def test_runtime_renews_live_lease_and_stops_supervisor():
     count = controller.renew_count
     time.sleep(0.1)
     assert controller.renew_count == count
+
+
+@pytest.mark.parametrize("operation", ["reserve_term", "prepare"])
+@pytest.mark.parametrize("committed", [False, True])
+def test_rpc_future_caller_time_cannot_bypass_local_live_lease(tmp_path, operation, committed):
+    from cluster_control_contract import QuorumCertificate
+    from cluster_quorum import QuorumCollector
+    from tests.test_cluster_quorum import _fixture
+
+    voter_set, voters = _fixture(tmp_path)
+    candidate = QuorumCertificate(
+        cluster_id=voter_set.cluster_id, voter_set_epoch=1, term=1,
+        leader_id="voter-0", lease_id="existing", expires_at_ms=2000, signatures=())
+    for voter in voters.values():
+        voter.prepare("voter-0", 1, now_ms=1000)
+    candidate = candidate.with_signatures(tuple(voter.sign_vote(candidate, now_ms=1000) for voter in voters.values()))
+    if committed:
+        for voter in voters.values():
+            voter.commit_certificate(candidate, now_ms=1000)
+    now = [1000]
+    runtime = AutoRoleRuntime(
+        voter=voters["voter-0"], collector=QuorumCollector(voter_set=voter_set, voters=voters),
+        secret="test", clock=lambda: now[0])
+    before = runtime.voter.snapshot()
+    request = {"op": operation, "leader_id": "voter-1", "term": 2, "now_ms": 3000}
+    assert runtime.handle_rpc(request) == {"ok": False, "code": "quorum_active_lease"}
+    assert runtime.voter.snapshot() == before
+    now[0] = 2000
+    request["now_ms"] = 1000
+    assert runtime.handle_rpc(request)["ok"] is True
+    assert runtime.voter.snapshot().promised_term == 2
+
+
+@pytest.mark.parametrize("operation,code", [
+    ("sign_vote", "quorum_vote_rejected"), ("commit_certificate", "control_certificate_expired"),
+])
+@pytest.mark.parametrize("inject_clock", [False, True])
+def test_rpc_past_caller_time_cannot_revive_locally_expired_proof(tmp_path, monkeypatch, operation, code, inject_clock):
+    from cluster_control_contract import QuorumCertificate
+    from cluster_quorum import QuorumCollector
+    from tests.test_cluster_quorum import _fixture
+
+    voter_set, voters = _fixture(tmp_path)
+    candidate = QuorumCertificate(
+        cluster_id=voter_set.cluster_id, voter_set_epoch=1, term=1,
+        leader_id="voter-0", lease_id="existing", expires_at_ms=2000, signatures=())
+    for voter in voters.values():
+        voter.prepare("voter-0", 1, now_ms=1000)
+    candidate = candidate.with_signatures(tuple(voter.sign_vote(candidate, now_ms=1000) for voter in voters.values()))
+    now = [2000]
+    if not inject_clock:
+        monkeypatch.setattr(time, "time", lambda: now[0] / 1000)
+    runtime = AutoRoleRuntime(
+        voter=voters["voter-0"], collector=QuorumCollector(voter_set=voter_set, voters=voters),
+        secret="test", **({"clock": lambda: now[0]} if inject_clock else {}))
+    before = runtime.voter.snapshot()
+    request = {"op": operation, "certificate": candidate.to_dict(), "now_ms": 1000}
+    assert runtime.handle_rpc(request) == {"ok": False, "code": code}
+    assert runtime.voter.snapshot() == before
+
+
+@pytest.mark.parametrize("operation", ["reserve_term", "prepare", "sign_vote", "commit_certificate"])
+def test_rpc_samples_default_local_clock_for_each_operation(certs, monkeypatch, operation):
+    now, observed = [1000], []
+    monkeypatch.setattr(time, "time", lambda: now[0] / 1000)
+    candidate = certs.issue(expires_at_ms=5000)
+
+    def observe(*args, now_ms):
+        observed.append(now_ms)
+        if operation == "reserve_term":
+            return 8
+        if operation == "sign_vote":
+            return candidate.signatures[0]
+
+    runtime = AutoRoleRuntime(voter=SimpleNamespace(**{operation: observe}), collector=None, secret="test")
+    for local_now in (1000, 2000):
+        now[0] = local_now
+        assert runtime.handle_rpc({"op": operation, "leader_id": "voter-0", "term": 7,
+                                   "certificate": candidate.to_dict(), "now_ms": "untrusted clock"})["ok"]
+    assert observed == [1000, 2000]

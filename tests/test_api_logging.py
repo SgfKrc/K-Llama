@@ -38,6 +38,28 @@ def _patch_scheduler_for_test():
         yield mock_sched
 
 
+@pytest.fixture(autouse=True)
+def _explicit_memory_logging(_patch_scheduler_for_test):
+    """Memory logging is a startup resource, installed explicitly for API tests."""
+    import api_server
+    root = logging.getLogger()
+    original_level = root.level
+    handler = api_server.MemoryLogHandler()
+    handler.addFilter(api_server._request_id_filter)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    with api_server._log_buffer_lock:
+        api_server._log_buffer.clear()
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+        root.setLevel(original_level)
+        with api_server._log_buffer_lock:
+            api_server._log_buffer.clear()
+
+
 @pytest.fixture
 def log_dir_temp():
     """创建临时日志目录并 patch config.LOG_DIR。"""
@@ -396,7 +418,9 @@ class TestLogStatsApi:
         resp = client.get("/api/logs/stats")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["buffer_size"] > 0
+        assert data["buffer_size"] >= 2
+        recent = client.get("/api/logs/recent?name=test.stats&limit=50").json()["logs"]
+        assert {"stats test message one", "stats test message two"} <= {entry["message"] for entry in recent}
 
     def test_stats_empty_directory(self, log_dir_temp, client):
         """空日志目录 stats 应返回 0。"""

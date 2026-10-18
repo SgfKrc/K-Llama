@@ -165,3 +165,26 @@ def test_public_bind_preserves_model_api_cidr_boundary(monkeypatch, bind_host):
         assert client.get("/model-control").status_code == 200
     with TestClient(app, client=("198.51.100.10", 50000)) as client:
         assert client.get("/model-control").status_code == 403
+
+
+@pytest.mark.parametrize(
+    "environment, client_host, bind_host, expected_bind",
+    [
+        (None, "127.0.0.1", None, "0.0.0.0"),
+        ({}, "127.0.0.1", None, "127.0.0.1"),
+        ({}, "::1", None, "::1"),
+        ({"QLH_BACKEND_HOST": "127.0.0.2"}, "127.0.0.1", None, "127.0.0.2"),
+        ({"QLH_BACKEND_HOST": "0.0.0.0"}, "127.0.0.1", "127.0.0.1", "127.0.0.1"),
+        ({"QLH_BACKEND_HOST": "  "}, "127.0.0.1", None, "127.0.0.1"),
+    ],
+)
+def test_listener_snapshot_does_not_inherit_later_process_bind(
+    monkeypatch, environment, client_host, bind_host, expected_bind,
+):
+    monkeypatch.setenv("QLH_BACKEND_HOST", "0.0.0.0")
+    supervisor = tui_backend.BackendSupervisor(
+        host=client_host, bind_host=bind_host, environment=environment,
+    )
+    assert supervisor.bind_host == expected_bind
+    monkeypatch.setenv("QLH_BACKEND_HOST", "::")
+    assert supervisor.bind_host == expected_bind

@@ -39,9 +39,10 @@ def test_shared_lifespans_reference_count_runtime(monkeypatch):
     """Two uvicorn servers must share one runtime lifetime and readiness state."""
     startup_calls = []
     shutdown_calls = []
+    runtime = api_server._get_app_runtime()
     readiness_before = dict(api_server._runtime_readiness)
-    with api_server._runtime_lifecycle_lock:
-        api_server._runtime_lifecycle_users = 0
+    with runtime._lock:
+        runtime._users = 0
 
     def fake_startup():
         startup_calls.append(True)
@@ -69,18 +70,18 @@ def test_shared_lifespans_reference_count_runtime(monkeypatch):
         await first.__aexit__(None, None, None)
         assert shutdown_calls == []
         with api_server._runtime_lifecycle_lock:
-            assert api_server._runtime_lifecycle_users == 1
+            assert runtime._users == 1
 
         await second.__aexit__(None, None, None)
         assert shutdown_calls == [True]
         with api_server._runtime_lifecycle_lock:
-            assert api_server._runtime_lifecycle_users == 0
+            assert runtime._users == 0
 
     try:
         asyncio.run(exercise())
     finally:
-        with api_server._runtime_lifecycle_lock:
-            api_server._runtime_lifecycle_users = 0
+        with runtime._lock:
+            runtime._users = 0
         with api_server._runtime_readiness_lock:
             api_server._runtime_readiness.clear()
             api_server._runtime_readiness.update(readiness_before)

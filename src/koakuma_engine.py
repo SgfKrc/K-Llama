@@ -9,6 +9,13 @@ remain behind the host/manager adapters for now.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
+from types import MappingProxyType
+
+from qlh_core.contracts.engines import (
+    COMMON_CAPABILITIES, ENGINE_REGISTRY, LEGACY_ENGINE_SPECS,
+    LLAMA_CPP_BINDING, LLAMA_CPP_KEEP_HEAD, PYTORCH_CPU, PYTORCH_CUDA, ISLAND_REMOTE,
+)
 from typing import Any, Mapping, Protocol, FrozenSet
 
 
@@ -31,14 +38,6 @@ class Capability:
     ENSURE_FULL_MODEL = "ensure_full_model"
 
 
-COMMON_CAPABILITIES: FrozenSet[str] = frozenset({
-    Capability.CHAT,
-    Capability.CHAT_STREAM,
-    Capability.LOAD_MODEL,
-    Capability.UNLOAD_MODEL,
-})
-
-
 @dataclass(frozen=True)
 class BackendCapabilities:
     """Capabilities exposed by an engine, independent of its implementation."""
@@ -50,40 +49,10 @@ class BackendCapabilities:
         return capability in self.capabilities
 
 
-_BACKEND_CAPABILITIES = {
-    BackendId.LLAMA_CPP: BackendCapabilities(
-        backend_id=BackendId.LLAMA_CPP,
-        capabilities=frozenset({
-            *COMMON_CAPABILITIES,
-            Capability.CHAT_IMAGE,
-            # ★ 2026-09-19：llama.cpp 现在**也能做层前向**，故补齐层接力能力位。
-            #   理由（本会话实测）：
-            #     * 当**下游** —— `LlamaCppEngine.forward_layers_from_hidden()` 经 `llama_batch.embd`
-            #       注入上游 hidden，跑本 GGUF（裁层）的层并出 logits；
-            #     * 当**上游** —— `LlamaCppEngine.forward_layers_to_hidden()` 出 hidden
-            #       （取「本文件最后一层之后」，故上游需用**切点处的裁层 GGUF**）。
-            #   ⚠️ 这里只是**声明能力**：llama.cpp 不需要 torch ⇒
-            #   **Android/边缘设备（无 torch、有 GGUF 引擎）因此可以参与层流水线**。
-            #   ⚠️ 不含 `LOAD_LAYER_RANGE` / `ENSURE_FULL_MODEL` —— 那两个是 PyTorch 侧语义
-            #   （按 key 物化层段 / 需要整模），llama.cpp 用「裁层 GGUF」表达同一意图。
-            Capability.FORWARD_LAYERS,
-        }),
-    ),
-    BackendId.PYTORCH: BackendCapabilities(
-        backend_id=BackendId.PYTORCH,
-        capabilities=frozenset({
-            *COMMON_CAPABILITIES,
-            Capability.CHAT_IMAGE,
-            Capability.LOAD_LAYER_RANGE,
-            Capability.FORWARD_LAYERS,
-            Capability.ENSURE_FULL_MODEL,
-        }),
-    ),
-    BackendId.ISLAND: BackendCapabilities(
-        backend_id=BackendId.ISLAND,
-        capabilities=COMMON_CAPABILITIES,
-    ),
-}
+_BACKEND_CAPABILITIES = MappingProxyType({
+    family: BackendCapabilities(family, spec.capabilities)
+    for family, spec in LEGACY_ENGINE_SPECS.items()
+})
 _EMPTY_CAPABILITIES = BackendCapabilities(
     backend_id="",
     capabilities=frozenset(),
@@ -159,12 +128,16 @@ def canonical_backend(value: Any, default: str = "") -> str:
     return _BACKEND_REQUEST_ALIASES.get(normalized, default)
 
 
-def backend_capabilities(backend: Any) -> BackendCapabilities:
+def backend_capabilities(backend: Any, runtime_kind: str | None = None) -> BackendCapabilities:
     """Return the public capability set for a backend identifier."""
 
     if not str(backend or "").strip():
         return _EMPTY_CAPABILITIES
     backend_id = canonical_backend(backend, default="")
+    if runtime_kind is not None:
+        spec = ENGINE_REGISTRY.get(backend_id, runtime_kind)
+        return (BackendCapabilities(backend_id, spec.capabilities)
+                if spec is not None else _EMPTY_CAPABILITIES)
     return _BACKEND_CAPABILITIES.get(backend_id, _EMPTY_CAPABILITIES)
 
 
@@ -240,15 +213,71 @@ def backend_id_for(runtime: Any, default: str = "") -> str:
     return default
 
 
-def runtime_supports(runtime: Any, capability: str) -> bool:
-    """Probe a runtime capability while keeping legacy compatibility local."""
+def _runtime_attribute(runtime: Any, name: str) -> Any:
+    """Read a declared property without triggering a lazy host's __getattr__."""
+    if inspect.getattr_static(runtime, name, None) is None:
+        return None
+    return getattr(runtime, name, None)
 
+
+def runtime_identity_for(runtime: Any) -> tuple[str, str]:
+    """Identify the concrete execution path without importing/materializing it."""
+    if runtime is None:
+        return "", ""
+    peek = _runtime_attribute(runtime, "peek_manager")
+    if callable(peek):
+        manager = peek()
+        if manager is not None and manager is not runtime:
+            return runtime_identity_for(manager)
+    family = backend_id_for(runtime)
+    declared_kind = _runtime_attribute(runtime, "runtime_kind")
+    inference_path = _runtime_attribute(runtime, "inference_path")
+    if declared_kind and inference_path and declared_kind != inference_path:
+        return family, ""
+    kind = declared_kind or inference_path
+    if kind:
+        return family, str(kind)
+    # Existing implementations predate runtime_kind. Keep this adaptation at
+    # the legacy boundary, based on the actual implementation, not its family.
+    cls = type(runtime)
+    if cls.__name__ == "LlamaCppEngine" and cls.__module__ == "llama_engine":
+        kind = LLAMA_CPP_KEEP_HEAD if vars(runtime).get("_keep_head") is not None else LLAMA_CPP_BINDING
+    elif cls.__name__ == "ModelManager" and cls.__module__ == "model_module":
+        native = vars(runtime).get("_llama_engine") or vars(runtime).get("_island_engine")
+        if native is not None:
+            return runtime_identity_for(native)
+        if family == BackendId.PYTORCH:
+            model = vars(runtime).get("model")
+            device = str(getattr(model, "device", None) or vars(runtime).get("device", "cpu"))
+            kind = PYTORCH_CUDA if device.startswith("cuda") else PYTORCH_CPU
+    elif cls.__name__ == "IslandEngine" and cls.__module__ == "island_engine":
+        kind = ISLAND_REMOTE
+    return family, str(kind or "")
+
+
+def runtime_supports(runtime: Any, capability: str) -> bool:
+    """Intersect a runtime probe with its concrete static contract."""
     if runtime is None:
         return False
-    supports = getattr(runtime, "supports", None)
-    if callable(supports):
-        return bool(supports(capability))
-    return backend_capabilities(backend_id_for(runtime)).supports(capability)
+    try:
+        family, kind = runtime_identity_for(runtime)
+        spec = ENGINE_REGISTRY.get(family, kind)
+        abi = _runtime_attribute(runtime, "native_abi")
+        if spec is None or (abi is not None and abi != spec.native_abi):
+            return False
+        if not backend_capabilities(family, kind).supports(capability):
+            return False
+        supports = _runtime_attribute(runtime, "supports")
+        if callable(supports) and not bool(supports(capability)):
+            return False
+        peek = _runtime_attribute(runtime, "peek_manager")
+        if callable(peek):
+            manager = peek()
+            if manager is not None and manager is not runtime:
+                return runtime_supports(manager, capability)
+        return True
+    except Exception:
+        return False
 
 
 __all__ = [
@@ -264,5 +293,6 @@ __all__ = [
     "accepted_backend_requests",
     "registered_backends",
     "runtime_supports",
+    "runtime_identity_for",
     "select_backend",
 ]

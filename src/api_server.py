@@ -38,7 +38,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Opt-in evidence must capture bytes before importing the business runtime.
 import runtime_source as _product_runtime_source
-_product_runtime_source.initialize()
 
 from release_contract import (
     FIXED_RELEASE_ENV,
@@ -228,7 +227,8 @@ _join_ledger_instance: JoinGrantLedger | None = None
 # P4.5 fencing is opt-in until a voter set/certificate distribution path is
 # configured.  When enabled, the middleware below covers control-plane writes;
 # read/status routes remain available in read-only mode.
-control_fence = ControlFence.from_environment()
+# Resolved through the explicit runtime only on use; import opens no voter IO.
+control_fence = None
 
 
 def _get_join_ledger() -> JoinGrantLedger:
@@ -308,6 +308,10 @@ class MemoryLogHandler(logging.Handler):
             self.handleError(record)
 
 
+_logging_original_level = None
+_console_logging_enabled = True
+
+
 def _close_logging_handlers(keep_memory: bool = False):
     """
     关闭并移除 root logger 上的 handlers，避免 Windows 下日志文件被占用。
@@ -317,8 +321,11 @@ def _close_logging_handlers(keep_memory: bool = False):
                      仅关闭文件类 handler（RotatingFileHandler）。
                      用于日志文件删除操作期间维持内存缓冲和终端输出。
     """
+    global _logging_original_level
     root = logging.getLogger()
     for handler in root.handlers[:]:
+        if not getattr(handler, "_qlh_owned", False):
+            continue
         is_file_handler = isinstance(handler, logging.FileHandler)
         if keep_memory and not is_file_handler and isinstance(
             handler, (logging.StreamHandler, MemoryLogHandler)
@@ -329,6 +336,9 @@ def _close_logging_handlers(keep_memory: bool = False):
             handler.close()
         except Exception:
             pass
+    if not keep_memory and _logging_original_level is not None:
+        root.setLevel(_logging_original_level)
+        _logging_original_level = None
 
 
 def setup_logging():
@@ -340,15 +350,18 @@ def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
     level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
 
+    global _logging_original_level
     root = logging.getLogger()
     _close_logging_handlers()
+    _logging_original_level = root.level
 
     # 控制台 handler
     ch = logging.StreamHandler(sys.stderr)
-    ch.setLevel(level)
+    ch.setLevel(level if _console_logging_enabled else logging.CRITICAL + 1)
     ch.addFilter(_request_id_filter)
     ch.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] request_id=%(request_id)s %(message)s"))
+    ch._qlh_owned = True
     root.addHandler(ch)
 
     # 文件 handler（按日期 + 大小滚动）
@@ -362,6 +375,7 @@ def setup_logging():
     fh.addFilter(_request_id_filter)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] request_id=%(request_id)s %(name)s: %(message)s"))
+    fh._qlh_owned = True
     root.addHandler(fh)
 
     # 内存环形缓冲 handler（用于 /api/logs/recent，不持有文件句柄）
@@ -370,6 +384,7 @@ def setup_logging():
     mh.addFilter(_request_id_filter)
     mh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] request_id=%(request_id)s %(name)s: %(message)s"))
+    mh._qlh_owned = True
     root.addHandler(mh)
 
     # uvicorn 日志也走文件
@@ -379,7 +394,6 @@ def setup_logging():
     root.setLevel(level)
 
 
-setup_logging()
 logger = logging.getLogger("api_server")
 
 # ============================================================
@@ -391,43 +405,21 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）
-
-    ★ 2026-10-05：runtime 启动/关闭改为**进程级只执行一次**。
-    `run_api_servers()` 在通配地址下为 `0.0.0.0` 与 `::` 各起一个
-    `uvicorn.Server`（共享同一 `app`），uvicorn 会对每个 server 各跑一次
-    lifespan。此前每次都重启 `_run_runtime_startup` 线程、每次 shutdown 都调
-    `_shutdown_resources()`，导致进程内两套 TCPServer，且任一 server 关闭会
-    连带停掉整个 runtime。现在用进程级引用计数共享一次启动，并只在最后一个
-    lifespan 退出时收尾；后续 lifespan 不会重置 readiness。
-    """
-    global _runtime_startup_thread, _runtime_lifecycle_users
-    with _runtime_lifecycle_lock:
-        first = _runtime_lifecycle_users == 0
-        _runtime_lifecycle_users += 1
-        if first:
-            _reset_runtime_readiness()
-            _mark_process_ready()
-            _runtime_startup_done.clear()
-            _runtime_startup_thread = threading.Thread(
-                target=_run_runtime_startup,
-                name="runtime-startup",
-                daemon=True,
-            )
-            _runtime_startup_thread.start()
+    """Share one explicit runtime across IPv4/IPv6 server lifespans."""
+    runtime = _get_app_runtime()
+    runtime.acquire(startup=_run_runtime_startup)
     try:
-        # The HTTP process can serve liveness/readiness while the slower
-        # runtime components finish initializing in the background.
         yield
     finally:
-        # ---- shutdown ----
-        # 只有最后一个共享 lifespan 负责收尾。
-        with _runtime_lifecycle_lock:
-            _runtime_lifecycle_users = max(0, _runtime_lifecycle_users - 1)
-            last = _runtime_lifecycle_users == 0
-        if last:
-            _runtime_startup_done.wait(timeout=30.0)
-            await _shutdown_resources()
+        if runtime.begin_release():
+            try:
+                await run_in_threadpool(runtime.wait_startup)
+                await _shutdown_resources()
+            except BaseException as exc:
+                runtime.mark_cleanup_failure(exc)
+                raise
+            else:
+                runtime.finish_close()
 
 
 app = FastAPI(
@@ -500,6 +492,14 @@ def _is_control_write_path(request: Request) -> bool:
 
 @app.middleware("http")
 async def api_boundary_middleware(request: Request, call_next):
+    services = _app_runtime._services
+    if services is None:
+        return await _api_boundary_impl(request, call_next)
+    with services.store.scope():
+        return await _api_boundary_impl(request, call_next)
+
+
+async def _api_boundary_impl(request: Request, call_next):
     """Apply the common source/auth boundary before route validation or work.
 
     Individual handlers still keep their role and node-state checks. This
@@ -577,8 +577,9 @@ async def api_boundary_middleware(request: Request, call_next):
         status = 503 if exc.code == "control_fence_unavailable" else 409
         return _boundary_response(status, {"code": exc.code, "message": str(exc)})
     finally:
-        if control_fence.enabled:
-            control_fence.clear_context()
+        services = _app_runtime._services
+        if services is not None and services.fence.enabled:
+            services.fence.clear_context()
 
 def _normalize_request_id(value: str | None) -> str:
     if not value:
@@ -687,105 +688,61 @@ _device_profile_started = False
 # Process liveness and inference-runtime readiness are intentionally separate.
 # A model is not part of this gate: the application must remain usable so the
 # user can inspect/download/select a model after entering the TUI.
-_RUNTIME_COMPONENTS = ("local_store", "scheduler", "device_profile")
-_runtime_readiness_lock = threading.RLock()
-_runtime_readiness: dict[str, Any] = {
-    "process_ready": False,
-    "ready": False,
-    "status": "starting",
-    "components": {name: False for name in _RUNTIME_COMPONENTS},
-    "error": None,
-    "started_at": None,
-    "ready_at": None,
-}
-_runtime_startup_done = threading.Event()
-_runtime_startup_thread: Optional[threading.Thread] = None
-# ★ 2026-10-05：runtime 启动/关闭的**进程级**引用计数与锁。
-#   `run_api_servers()` 在通配地址下会为 `0.0.0.0` 与 `::` 各起一个
-#   `uvicorn.Server`（共享同一 `app`），uvicorn 因此对每个 server 各跑一次
-#   lifespan。此前 `_lifespan` 每次都重启 `_run_runtime_startup` 线程、且每次
-#   shutdown 都调 `_shutdown_resources()` ⇒ 进程内出现两套 TCPServer（已在
-#   `scheduler.start()` 侧止血），且任一 server 关闭会连带停掉整个 runtime。
-#   现在只让首个 lifespan 启动、最后一个 lifespan 关闭，后续 lifespan 复用运行时。
-_runtime_lifecycle_lock = threading.Lock()
-_runtime_lifecycle_users = 0
+from qlh_core.bootstrap.runtime import AppRuntime, LazyResource
+
+def _build_default_resources(config, *, host=None):
+    from qlh_core.bootstrap.services import RuntimeServices
+    services = RuntimeServices(config, host=host)
+    services.scheduler.configure_callbacks(_scheduler_callbacks)
+    services.host.configure_scheduler_callbacks(_scheduler_callbacks)
+    services.scheduler._worker_prepare.configure_runtime(_get_layer_stage_host)
+    return services
+
+
+_app_runtime = AppRuntime(host=model_host, resources_factory=_build_default_resources,
+                              config_observer=lambda config: _initialize_legacy_runtime_settings())
+_runtime_readiness_lock = _app_runtime._readiness_lock
+_runtime_readiness = _app_runtime._readiness
+_runtime_startup_done = _app_runtime.startup_done
+# Kept as read-only compatibility references while route owners migrate.
+_runtime_lifecycle_lock = _app_runtime._lock
 
 
 def _reset_runtime_readiness() -> None:
-    with _runtime_readiness_lock:
-        _runtime_readiness.update(
-            process_ready=False,
-            ready=False,
-            status="starting",
-            components={name: False for name in _RUNTIME_COMPONENTS},
-            error=None,
-            started_at=time.time(),
-            ready_at=None,
-        )
+    _app_runtime.reset_readiness()
 
 
 def _mark_process_ready() -> None:
-    with _runtime_readiness_lock:
-        _runtime_readiness["process_ready"] = True
+    _app_runtime.mark_process_ready()
 
 
-def _mark_runtime_component(
-    name: str, ready: bool, *, error: Optional[str] = None,
-) -> None:
-    if name not in _RUNTIME_COMPONENTS:
-        return
-    with _runtime_readiness_lock:
-        components = _runtime_readiness["components"]
-        components[name] = bool(ready)
-        if error:
-            _runtime_readiness["error"] = str(error)
-        all_ready = all(components.values())
-        _runtime_readiness["ready"] = all_ready
-        if all_ready:
-            _runtime_readiness["status"] = "ready"
-            _runtime_readiness["error"] = None
-            _runtime_readiness["ready_at"] = time.time()
-        elif error:
-            _runtime_readiness["status"] = "degraded"
+def _mark_runtime_component(name, ready, *, error=None) -> None:
+    _app_runtime.mark_component(name, ready, error=error)
 
 
-def _mark_runtime_startup_failure(error: BaseException) -> None:
-    with _runtime_readiness_lock:
-        _runtime_readiness["ready"] = False
-        _runtime_readiness["status"] = "failed"
-        _runtime_readiness["error"] = f"{type(error).__name__}: {error}"
+def _mark_runtime_startup_failure(error) -> None:
+    _app_runtime.mark_failure(error)
 
 
 def _runtime_readiness_snapshot() -> dict[str, Any]:
-    with _runtime_readiness_lock:
-        return {
-            **_runtime_readiness,
-            "components": dict(_runtime_readiness["components"]),
-        }
+    return _app_runtime.readiness()
 
-# 调度器（单机 / 分布式模式共用）
-scheduler: ClusterScheduler = ClusterScheduler()
-scheduler.set_control_fence(control_fence)
-# HA-ROLE-AUTO-01: explicit ``NODE_ROLE=auto`` must construct the same
-# controller used by scheduler startup. Configuration failures stay read-only;
-# they are surfaced in ``/api/cluster/my-role`` rather than becoming a static
-# master by accident.
+
+def _get_app_runtime():
+    global _app_runtime, _runtime_readiness_lock, _runtime_readiness, _runtime_startup_done, _runtime_lifecycle_lock
+    if _app_runtime._closed:
+        _app_runtime = AppRuntime(host=model_host, resources_factory=_build_default_resources,
+                              config_observer=lambda config: _initialize_legacy_runtime_settings())
+        _runtime_readiness_lock = _app_runtime._readiness_lock
+        _runtime_readiness = _app_runtime._readiness
+        _runtime_startup_done = _app_runtime.startup_done
+        _runtime_lifecycle_lock = _app_runtime._lock
+    return _app_runtime
+
+
+scheduler = LazyResource(lambda: _get_app_runtime().services.scheduler)
+control_fence = LazyResource(lambda: _get_app_runtime().services.fence)
 auto_role_runtime = None
-if NODE_ROLE == "auto":
-    try:
-        from cluster_auto_role_runtime import install_auto_role_controller
-
-        auto_role_runtime = install_auto_role_controller(scheduler, control_fence)
-    except Exception as exc:
-        logger.error(
-            "auto role wiring unavailable; scheduler will remain read-only: %s",
-            getattr(exc, "code", type(exc).__name__),
-        )
-    # ``install_auto_role_controller`` may strengthen the initially optional
-    # fence with the auto-role authority. Keep middleware and route modules on
-    # that same object, otherwise API writes would bypass the runtime fence.
-    if scheduler._control_fence is not control_fence:
-        control_fence = scheduler._control_fence
 _task_graph_runtime_lock = threading.RLock()
 _RUNTIME_FEATURE_ENV_NAMES = frozenset(FIXED_RELEASE_ENV)
 
@@ -1208,12 +1165,58 @@ def _run_exclusive_model_change(
 # ============================================================
 
 _master_discovery_responder = None
+_runtime_background_stop = threading.Event()
+_runtime_background_threads = []
+
+
+def _initialize_legacy_runtime_settings():
+    import config as configuration
+    runtime_config = _app_runtime.config
+    projection = {
+        **runtime_config.legacy_settings(),
+        "STATE_DIR": runtime_config.state_dir, "LOG_DIR": runtime_config.log_dir,
+        "NODE_ID": runtime_config.node_id, "NODE_ROLE": runtime_config.node_role,
+        "RUN_MODE": runtime_config.run_mode, "API_PORT": runtime_config.api_port,
+        "SERVER_PORT": runtime_config.server_port, "SERVER_IP": runtime_config.server_ip,
+        "CLUSTER_SECRET": runtime_config.environment_snapshot().get("QLH_CLUSTER_SECRET", ""),
+    }
+    for name, value in projection.items():
+        setattr(configuration, name, value)
+        for module_name in ("api_server", "scheduler", "tcp_comm", "scheduler_cluster", "scheduler_pipeline", "scheduler_task_worker"):
+            module = sys.modules.get(module_name)
+            if module is not None and name in vars(module):
+                setattr(module, name, value)
+    _validate_pipeline_role_switches(
+        relay_enabled=PIPELINE_RELAY_ENABLED, relay_probe_only=PIPELINE_RELAY_PROBE_ONLY,
+        task_worker_enabled=TASK_WORKER_EXPERIMENTAL_ENABLED,
+    )
+    model_host.configure_runtime_environment(runtime_config.environment_snapshot())
+    model_host.configure_scheduler_callbacks(_scheduler_callbacks)
+    scheduler.configure_callbacks(_scheduler_callbacks)
+
+
+def _rotate_cluster_credential():
+    return _get_app_runtime().rotate_cluster_credential()
+
+
+def _bootstrap_cluster_credential():
+    return _get_app_runtime().cluster_credential()
 
 
 def _run_runtime_startup() -> None:
     """Run the slower runtime initialization outside the HTTP event loop."""
     try:
-        _startup_device_detection()
+        _product_runtime_source.initialize()
+        _app_runtime.open_identity()
+        if _app_runtime.stop_requested.is_set():
+            return
+        _initialize_legacy_runtime_settings()
+        setup_logging()
+        _app_runtime.services.configure_authority()
+        global auto_role_runtime
+        auto_role_runtime = _app_runtime.services.auto_role
+        with _app_runtime.services.store.scope():
+            _startup_device_detection()
     except BaseException as exc:  # keep liveness available and report /ready
         logger.critical("runtime startup failed: %s", exc, exc_info=True)
         _mark_runtime_startup_failure(exc)
@@ -1224,11 +1227,12 @@ def _run_runtime_startup() -> None:
 def _startup_device_detection():
     """Initialize local runtime components and detect slower hardware in background."""
     global device_profile, _device_profile_started, _master_discovery_responder
+    _runtime_background_stop.clear()
     active_scheduler: ClusterScheduler = globals()["scheduler"]
 
     _mark_runtime_component("local_store", False)
     try:
-        sqlite_path = _local_store.initialize_local_store()
+        sqlite_path = _app_runtime.services.store.initialize()
         logger.info("主节点 SQLite 已就绪: %s", sqlite_path)
         _mark_runtime_component("local_store", True)
     except Exception as exc:
@@ -1240,6 +1244,8 @@ def _startup_device_detection():
         global device_profile
         try:
             profiler = get_profile()
+            if _app_runtime.stop_requested.is_set():
+                return
             device_profile = profiler.to_dict()
             active_scheduler.update_local_device_profile(device_profile)
             logger.info(
@@ -1261,11 +1267,9 @@ def _startup_device_detection():
 
     if not _device_profile_started:
         _device_profile_started = True
-        threading.Thread(
-            target=_detect_device_profile,
-            name="device-profile",
-            daemon=True,
-        ).start()
+        profile_thread = threading.Thread(target=_detect_device_profile, name="device-profile", daemon=True)
+        _runtime_background_threads.append(profile_thread)
+        profile_thread.start()
     elif device_profile is not None:
         _mark_runtime_component("device_profile", True)
     elif _device_profile_ready.is_set():
@@ -1299,14 +1303,16 @@ def _startup_device_detection():
             def _review_expire_loop():
                 import time as _time
                 from review import ReviewManager
-                _time.sleep(120)  # 启动后等 2 分钟再开始（避免空跑）
-                while getattr(active_scheduler, '_running', True):
+                if _runtime_background_stop.wait(120):
+                    return
+                while not _runtime_background_stop.is_set() and getattr(active_scheduler, '_running', True):
                     try:
                         ReviewManager().resolve_expired()
                     except Exception:
                         pass
-                    _time.sleep(300)  # 每 5 分钟检查一次
+                    _runtime_background_stop.wait(300)
             _t = _th2.Thread(target=_review_expire_loop, daemon=True, name="review-expire")
+            _runtime_background_threads.append(_t)
             _t.start()
             logger.info("⏳ 审查工单过期检查线程已启动 (master)")
     except Exception as e:
@@ -1318,22 +1324,42 @@ def _startup_device_detection():
 # ============================================================
 
 async def _shutdown_resources():
-    """应用关闭时清理调度器、推理引擎与 TCP 服务。"""
-    active_scheduler: ClusterScheduler = globals()["scheduler"]
-    await _intent_routes.shutdown()
+    """Drain owned work; retain failed owners so a later close can retry."""
+    global _LAYER_STAGE_HOST, _device_profile_started, _log_retention_thread_started
+    _runtime_background_stop.set()
+    errors = []
+    async def close_action(action):
+        try:
+            await run_in_threadpool(action)
+        except Exception as exc:
+            errors.append(exc)
+    try:
+        await _intent_routes.shutdown()
+    except Exception as exc:
+        errors.append(exc)
     if _master_discovery_responder is not None:
-        await run_in_threadpool(_master_discovery_responder.stop)
-    try:
-        with model_host.full_chat_execution_lock:
-            task_graph_coordinator.close()
-    except Exception as e:
-        logger.warning(f"任务图 journal 关闭异常: {e}")
-    # 1. 停止调度器（关闭 TCP 连接，注销从节点）
-    try:
-        active_scheduler.stop()
-        logger.info("调度器已停止")
-    except Exception as e:
-        logger.warning(f"调度器停止异常: {e}")
+        await close_action(_master_discovery_responder.stop)
+    await close_action(task_graph_coordinator.close)
+    services = _app_runtime._services
+    if services is not None:
+        await close_action(services.close)
+    # RuntimeServices owns the stage host and retries any failed close.
+    _LAYER_STAGE_HOST = None
+    await close_action(model_host.unload_model)
+    alive = []
+    for thread in tuple(_runtime_background_threads):
+        if thread is not threading.current_thread():
+            await run_in_threadpool(thread.join, 2.0)
+        if thread.is_alive():
+            alive.append(thread)
+    _runtime_background_threads[:] = alive
+    if alive:
+        errors.append(TimeoutError("runtime background work is still draining"))
+    if errors:
+        raise ExceptionGroup("API runtime cleanup failed", errors)
+    _device_profile_started = False
+    _log_retention_thread_started = False
+    _close_logging_handlers()
 
 # ============================================================
 # 优雅退出（TUI / 外部命令触发）
@@ -3604,8 +3630,8 @@ def _execute_task_worker_stage(
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
 
 
-#: 模块级缓存：`_execute_task_worker_stage` 是模块级函数（无 `self`），层段 Stage 需要
-#: 一个持有 keep-head 上游的载体。上游按 env 创建一次后复用（重载 500MB GGUF 代价高）。
+#: 兼容引用：层段 Stage 的真实资源由所属 AppRuntime.services.stage_host 持有，
+#: 同一 runtime 复用 keep-head 上游，并在 runtime 关闭时统一收尾。
 _LAYER_STAGE_HOST = None
 _LAYER_STAGE_HOST_LOCK = threading.Lock()
 
@@ -3613,13 +3639,9 @@ _LAYER_STAGE_HOST_LOCK = threading.Lock()
 def _get_layer_stage_host():
     global _LAYER_STAGE_HOST
     with _LAYER_STAGE_HOST_LOCK:
-        if _LAYER_STAGE_HOST is None:
-            from inference_service.engine_host import EngineHost as _EngineHost
-            _LAYER_STAGE_HOST = _EngineHost()
+        _LAYER_STAGE_HOST = _get_app_runtime().services.stage_host()
         return _LAYER_STAGE_HOST
 
-
-scheduler._worker_prepare.configure_runtime(_get_layer_stage_host)
 
 
 def _execute_task_graph_chat_with_slot(
@@ -6644,15 +6666,17 @@ def _start_log_retention_thread() -> None:
 
     def _retention_loop() -> None:
         # 启动后等待 5 分钟再首次清理（避免干扰初始化）
-        time.sleep(300)
-        while True:
+        if _runtime_background_stop.wait(300):
+            return
+        while not _runtime_background_stop.is_set():
             try:
                 _run_log_retention_cleanup()
             except Exception:
                 logger.warning("日志保留清理异常", exc_info=True)
-            time.sleep(LOG_RETENTION_CHECK_INTERVAL)
+            _runtime_background_stop.wait(LOG_RETENTION_CHECK_INTERVAL)
 
     t = threading.Thread(target=_retention_loop, daemon=True, name="log-retention")
+    _runtime_background_threads.append(t)
     t.start()
     logger.info(
         "日志保留策略已启动: max_age_days=%d max_total_mb=%d interval_s=%d",
@@ -6722,8 +6746,6 @@ _scheduler_callbacks = SchedulerCallbackSet(
     filter_recent_logs=_filter_recent_logs,
     format_model_response=_format_model_response,
 )
-model_host.configure_scheduler_callbacks(_scheduler_callbacks)
-scheduler.configure_callbacks(_scheduler_callbacks)
 
 
 def _api_bind_hosts(host: str) -> list[str]:
@@ -6731,7 +6753,7 @@ def _api_bind_hosts(host: str) -> list[str]:
     return ["0.0.0.0", "::"] if (host or "").strip() in ("", "0.0.0.0", "::") else [(host or "").strip()]
 
 
-def run_api_servers(host: str = "0.0.0.0", port: int = None) -> None:
+def run_api_servers(host: str | None = None, port: int = None) -> None:
     """
     启动 API 服务器（IPv4/IPv6 双栈）。
 
@@ -6744,7 +6766,12 @@ def run_api_servers(host: str = "0.0.0.0", port: int = None) -> None:
     import uvicorn
     from network_address import create_listen_sockets
 
-    port = port or API_PORT
+    runtime = _get_app_runtime()
+    config = runtime.resolve_config()
+    environment = config.environment_snapshot()
+    host = host if host is not None else environment.get("QLH_BACKEND_HOST", "0.0.0.0")
+    port = port if port is not None else int(environment.get("QLH_BACKEND_PORT") or config.api_port)
+    runtime.configure_listener(port)
     hosts = _api_bind_hosts(host)
 
     sockets = create_listen_sockets(
@@ -6805,6 +6832,4 @@ if __name__ == "__main__":
     # 支持 start_tui 脚本的 QLH_BACKEND_HOST / QLH_BACKEND_PORT 覆盖；
     # 默认双栈监听（IPv4 + IPv6）。
     logger.info("启动 API 服务器...")
-    _backend_host = os.environ.get("QLH_BACKEND_HOST", "0.0.0.0")
-    _backend_port = int(os.environ.get("QLH_BACKEND_PORT") or API_PORT)
-    run_api_servers(_backend_host, _backend_port)
+    run_api_servers()

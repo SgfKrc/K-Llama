@@ -1,7 +1,13 @@
-"""Strict, transport independent identity for remote segment preparation."""
+"""Strict identities, frozen load policies and actual runtime receipts.
+
+Legacy field sets remain decodable. New deployments negotiate version 1 and
+bind the complete policy digest into prepare, commit and stage identities.
+"""
 from __future__ import annotations
 from copy import deepcopy
 import re
+
+from qlh_core.contracts.load import RuntimeLoadSpec
 
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,256}")
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -11,6 +17,7 @@ IDENTITY_FIELDS = frozenset({
     "manifest_sha256", "source_model_id", "source_model_sha256",
     "tokenizer_sha256", "layer_range", "total_layers", "hidden_size", "segment_mode",
 })
+OPTIONAL_IDENTITY_FIELDS = frozenset({"load_spec_digest"})
 STAGE_IDENTITY_FIELDS = frozenset({"operation_id", "config_id", "generation", "assignment_id", "artifact_sha256"})
 
 
@@ -21,7 +28,8 @@ class WorkerPrepareError(ValueError):
 
 
 def validate_stage_identity(value):
-    if not isinstance(value, dict) or set(value) != STAGE_IDENTITY_FIELDS:
+    if (not isinstance(value, dict) or not STAGE_IDENTITY_FIELDS.issubset(value)
+            or set(value) - STAGE_IDENTITY_FIELDS - OPTIONAL_IDENTITY_FIELDS):
         raise WorkerPrepareError("invalid_prepare_identity")
     for key in ("operation_id", "config_id", "assignment_id"):
         if not isinstance(value[key], str) or not _ID.fullmatch(value[key]):
@@ -30,17 +38,24 @@ def validate_stage_identity(value):
         raise WorkerPrepareError("invalid_prepare_identity")
     if not isinstance(value["artifact_sha256"], str) or not _SHA.fullmatch(value["artifact_sha256"]):
         raise WorkerPrepareError("invalid_prepare_identity")
+    if "load_spec_digest" in value and not _SHA.fullmatch(str(value["load_spec_digest"])):
+        raise WorkerPrepareError("invalid_prepare_identity")
     return deepcopy(value)
 
 
 def stage_identity(identity):
-    return validate_stage_identity({key: identity[key] for key in STAGE_IDENTITY_FIELDS})
+    return validate_stage_identity({key: identity[key] for key in STAGE_IDENTITY_FIELDS | OPTIONAL_IDENTITY_FIELDS if key in identity})
 
 
 def validate_identity(value):
-    if not isinstance(value, dict) or set(value) != IDENTITY_FIELDS:
+    if (not isinstance(value, dict) or not IDENTITY_FIELDS.issubset(value)
+            or set(value) - IDENTITY_FIELDS - OPTIONAL_IDENTITY_FIELDS):
         raise WorkerPrepareError("invalid_prepare_identity")
     stage_identity(value)
+    if "load_spec_digest" in value and (
+            not isinstance(value["load_spec_digest"], str)
+            or not _SHA.fullmatch(value["load_spec_digest"])):
+        raise WorkerPrepareError("invalid_prepare_identity")
     for key in ("node_id", "model_id", "source_model_id"):
         if not isinstance(value[key], str) or not _ID.fullmatch(value[key]):
             raise WorkerPrepareError("invalid_prepare_identity")
@@ -69,6 +84,19 @@ def validate_identity(value):
     return deepcopy(value)
 
 
+def validate_load_spec(value, *, identity=None, context_size=None):
+    """Validate the opt-in PC extension; never derive policy from local config."""
+    try:
+        spec = value if isinstance(value, RuntimeLoadSpec) else RuntimeLoadSpec.from_dict(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkerPrepareError("invalid_prepare_load_spec") from exc
+    if identity is not None and identity.get("load_spec_digest") != spec.digest:
+        raise WorkerPrepareError("prepare_load_spec_digest_mismatch")
+    if context_size is not None and spec.context_size != context_size:
+        raise WorkerPrepareError("prepare_load_spec_context_mismatch")
+    return spec
+
+
 def validate_command(value):
     if not isinstance(value, dict):
         raise WorkerPrepareError("invalid_prepare_command")
@@ -80,6 +108,8 @@ def validate_command(value):
         expected |= {"context_size", "middle_channel"}
         if type(value.get("context_size")) is not int or not 1 <= value["context_size"] <= 131072 or value.get("middle_channel") != "keep_head_layer_out":
             raise WorkerPrepareError("invalid_prepare_options")
+    if action == "prepare" and "load_spec" in value:
+        expected.add("load_spec")
     if action in {"abort", "finalize"} or "cleanup_id" in value:
         expected.add("cleanup_id")
         if not isinstance(value.get("cleanup_id"), str) or not _ID.fullmatch(value["cleanup_id"]):
@@ -87,6 +117,15 @@ def validate_command(value):
     if set(value) != expected:
         raise WorkerPrepareError("invalid_prepare_command")
     validate_identity(value.get("identity"))
+    if action == "prepare":
+        if "load_spec" in value:
+            # The wire boundary accepts only the complete JSON document.
+            if not isinstance(value["load_spec"], dict):
+                raise WorkerPrepareError("invalid_prepare_load_spec")
+            validate_load_spec(value["load_spec"], identity=value["identity"],
+                               context_size=value["context_size"])
+        elif "load_spec_digest" in value["identity"]:
+            raise WorkerPrepareError("prepare_load_spec_missing")
     return deepcopy(value)
 
 
@@ -106,6 +145,9 @@ def validate_ack(value):
         expected.add("error")
         if not isinstance(value.get("error"), str) or not _ID.fullmatch(value["error"]):
             raise WorkerPrepareError("invalid_prepare_ack")
+    if "runtime_receipt" in value:
+        expected.add("runtime_receipt")
+        validate_runtime_receipt(value["runtime_receipt"], identity=value.get("identity"))
     if set(value) != expected:
         raise WorkerPrepareError("invalid_prepare_ack")
     if value["status"] != "error" and phase in {"prepare", "commit"} and not value["loaded"]:
@@ -116,4 +158,15 @@ def validate_ack(value):
     if value["status"] != "error" and phase == "release" and value["loaded"]:
         raise WorkerPrepareError("prepare_runtime_not_released")
     validate_identity(value.get("identity"))
+    return deepcopy(value)
+
+
+def validate_runtime_receipt(value, *, identity):
+    if (not isinstance(value, dict) or set(value) != {"load_spec", "materialized_bytes", "memory_scope", "layer_range", "artifact_sha256"}
+            or value.get("memory_scope") != "weight_tensors"
+            or type(value.get("materialized_bytes")) is not int or value["materialized_bytes"] <= 0
+            or not isinstance(identity, dict) or value.get("layer_range") != identity.get("layer_range")
+            or value.get("artifact_sha256") != identity.get("artifact_sha256")):
+        raise WorkerPrepareError("prepare_runtime_receipt_invalid")
+    validate_load_spec(value["load_spec"], identity=identity)
     return deepcopy(value)

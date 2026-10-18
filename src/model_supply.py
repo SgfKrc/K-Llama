@@ -237,8 +237,19 @@ class ModelSupplyCoordinator:
         if not self.scheduler.get_distributed_inference_enabled():
             raise ModelSupplyError("SUPPLY_LOCAL_MODE", "Node has opted out of distributed inference")
 
-    def create(self, intent: dict, *, wait_for_nodes: bool = False) -> dict:
+    def create(self, intent: dict, *, wait_for_nodes: bool = False, idempotency_key: str = "") -> dict:
+        return self.accept(intent, wait_for_nodes=wait_for_nodes, idempotency_key=idempotency_key)[0]
+
+    def accept(self, intent: dict, *, wait_for_nodes: bool = False, idempotency_key: str = "") -> tuple[dict, bool]:
+        """Return the durable receipt and whether this call owns its background work."""
         self._check_master()
+        owner = getattr(self.scheduler, "_model_control", None)
+        if owner is not None and idempotency_key:
+            for prior in owner.snapshot()["supplies"].values():
+                if prior.get("idempotency_key") == idempotency_key:
+                    if prior["intent"] != intent:
+                        raise ModelSupplyError("INTENT_IDEMPOTENCY_CONFLICT", "Idempotency key belongs to another selection")
+                    return copy.deepcopy(prior), False
         if str(intent.get("quant_type", "")).lower() in {"fp32", "f32", "float32"}:
             raise ModelSupplyError("SUPPLY_RUNTIME_PRECISION_UNSUPPORTED", "FP32 supply requires per-tensor materialized byte admission")
         if any(re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value or "") is None for value in intent.get("node_ids", [])):
@@ -262,40 +273,62 @@ class ModelSupplyCoordinator:
             if self._active and self._operations[self._active]["status"] not in self.TERMINAL:
                 existing = self._operations[self._active]
                 if existing["intent"] == intent:
-                    return copy.deepcopy(existing)
+                    return copy.deepcopy(existing), False
                 raise ModelSupplyError("SUPPLY_OPERATION_BUSY", "Another model supply operation is active")
             op_id = "supply_" + uuid.uuid4().hex
-            operation = {"operation_id": op_id, "intent": copy.deepcopy(intent),
+            operation = {"operation_id": op_id, "intent": copy.deepcopy(intent), "idempotency_key": idempotency_key,
                          "status": "queued", "reason_code": "", "created_at": time.time(),
                          "updated_at": time.time(), "loaded_ready": False, "nodes": {},
                          "plan": None, "capacity_diagnostic": None,
                          "requires_prepare": True, "wait_for_nodes": wait_for_nodes}
+            try:
+                self._persist(operation)
+            except Exception as exc:
+                if owner is None or getattr(exc, "code", "") not in {
+                        "operation_idempotency_reused", "operation_idempotency_conflict"}:
+                    raise
+                for prior in owner.snapshot()["supplies"].values():
+                    if prior.get("idempotency_key") == idempotency_key:
+                        if prior["intent"] != intent:
+                            raise ModelSupplyError("INTENT_IDEMPOTENCY_CONFLICT", "Idempotency key belongs to another selection") from exc
+                        return copy.deepcopy(prior), False
+                raise
             self._operations[op_id] = operation
             self._events[op_id] = threading.Event()
             self._active = op_id
-            self._persist(operation)
             # Bound in-memory history without deleting user artifacts.
             for old_id in list(self._operations)[:-64]:
                 if self._operations[old_id]["status"] in self.TERMINAL:
                     self._operations.pop(old_id, None)
                     self._events.pop(old_id, None)
             threading.Thread(target=self._run, args=(op_id,), name="model-supply", daemon=True).start()
-            return copy.deepcopy(operation)
+            return copy.deepcopy(operation), True
 
     def _persist(self, operation):
         # Keep the owner lock through backoff so a delayed write cannot land
         # after a newer update or cancellation.
         with self._condition:
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None:
+                owner.start()
+                owner.save_supply(operation)
+                return
             directory = self.root / operation["operation_id"]
             directory.mkdir(parents=True, exist_ok=True)
             atomic_write_json(directory / "operation.json", operation, ensure_ascii=False, indent=2)
 
     def get(self, op_id: str) -> dict:
         with self._condition:
+            if not op_id.startswith("supply_") or len(op_id) != 39 or not all(c in "0123456789abcdef" for c in op_id[7:]):
+                raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None:
+                saved = owner.snapshot()["supplies"].get(op_id)
+                if saved is None:
+                    raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
+                return copy.deepcopy(saved)
             op = self._operations.get(op_id)
             if op is None:
-                if not op_id.startswith("supply_") or len(op_id) != 39 or not all(c in "0123456789abcdef" for c in op_id[7:]):
-                    raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
                 path = self.root / op_id / "operation.json"
                 if not path.is_file():
                     raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
@@ -318,6 +351,14 @@ class ModelSupplyCoordinator:
 
     def _check(self, op_id):
         self._check_master()
+        owner = getattr(self.scheduler, "_model_control", None)
+        if owner is not None:
+            snapshot = owner.snapshot()
+            operation = snapshot["operations"].get(op_id)
+            if (snapshot["boot_id"] != owner.boot_id
+                    or operation and (snapshot["selected_operation"] != op_id
+                                      or operation["status"] in {"failed", "cancelled", "superseded"})):
+                raise ModelSupplyError("SUPPLY_OPERATION_STALE", "Supply operation was superseded")
         if self._events[op_id].is_set():
             raise ModelSupplyError("SUPPLY_CANCELLED", "Supply operation cancelled")
         if self._active != op_id:
@@ -524,6 +565,7 @@ class ModelSupplyCoordinator:
                                wait_for_new=False, capacity_diagnostic=None):
         """Extend only the unpublished automatic pool, using the live join owners."""
         expanded = False
+        next_refresh = time.monotonic() + 1.0
         while True:
             with self._condition:
                 self._check(op_id)
@@ -568,6 +610,30 @@ class ModelSupplyCoordinator:
                 # Inventory/source inspection can take long enough for another
                 # peer to register. Drain new joined peers before planning once.
                 continue
+            if wait_for_new and not pending and time.monotonic() >= next_refresh:
+                # Re-observe existing nodes as well as joins. Capacity may become
+                # available without a membership change; inventory owns live RAM,
+                # VRAM and local artifact evidence. No build has started here.
+                refreshed = {"master": self.scheduler._model_supply_worker.inventory(model_id=intent["model_id"])}
+                for node_id in worker_ids:
+                    self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
+                                               "source_model_sha256": ""})
+                for node_id in worker_ids:
+                    refreshed[node_id] = self._wait(op_id, node_id, "inventory_result",
+                                                   min(90, max(0, deadline - time.monotonic())))
+                    if not refreshed[node_id].get("distributed"):
+                        raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
+                with self._condition:
+                    self._check(op_id)
+                    self._check_receivers(op_id)
+                fields = ("engines", "pytorch_runtime", "memory_available_bytes", "disk_free_bytes",
+                          "sources", "artifacts", "local_cut", "distributed")
+                changed = any(any(inventories[node_id].get(key) != value.get(key) for key in fields)
+                              for node_id, value in refreshed.items())
+                inventories.update(refreshed)
+                if changed:
+                    return True
+                next_refresh = time.monotonic() + 1.0
             if wait_for_new and capacity_diagnostic is not None:
                 diagnostic = copy.deepcopy(capacity_diagnostic)
                 diagnostic["pending_node_ids"] = sorted(
@@ -672,6 +738,9 @@ class ModelSupplyCoordinator:
                         self._leases.pop(key, None)
                 cancelled = self._events[op_id].is_set()
                 self._events[op_id].set()
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None and owner.snapshot()["boot_id"] != owner.boot_id:
+                return  # A recovered owner has already durably fenced this boot.
             self._update(op_id, status="cancelled" if cancelled else "failed",
                          reason_code="SUPPLY_CANCELLED" if cancelled else code, reason=message,
                          capacity_diagnostic=None if cancelled else getattr(exc, "diagnostic", None))
@@ -683,7 +752,8 @@ class ModelSupplyCoordinator:
         self._update(op_id, status="inspecting")
         selected = set(intent.get("node_ids") or [])
         auto_pool = not selected and self.get(op_id).get("wait_for_nodes") is True
-        deadline = time.monotonic() + int(intent.get("timeout_seconds", 3600))
+        created_at = self.get(op_id).get("created_at", time.time())
+        deadline = time.monotonic() + max(0, created_at + int(intent.get("timeout_seconds", 3600)) - time.time())
         while True:
             self._check(op_id)
             connections = self._worker_connections(selected)

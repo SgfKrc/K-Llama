@@ -89,6 +89,10 @@ def _chat_args(args: list[str]) -> list[str]:
                 raise ValueError("%s 缺少参数" % value)
             item = args[i + 1]
             if value == "--host":
+                # Internal dispatch parses the translated hostname again;
+                # bracket a bare IPv6 address before treating it as a URL.
+                if "://" not in item and item.count(":") > 1 and not item.startswith("["):
+                    item = "[" + item + "]"
                 parsed = urllib.parse.urlsplit(item if "://" in item else "http://" + item)
                 if parsed.hostname:
                     translated.extend(["--host", parsed.hostname])
@@ -123,15 +127,22 @@ def _shell_options(translated: list[str]) -> dict:
     def value_of(name: str, default):
         return translated[translated.index(name) + 1] if name in translated else default
 
+    environment = {}
+    if "--auto-start" in translated:
+        _ensure_src_on_path()
+        from qlh_core.adapters.settings import SettingsStore
+        environment = SettingsStore().load_listener()
+    default_port = environment.get("QLH_BACKEND_PORT") or environment.get("QLH_API_PORT") or 8000
     return {
         "host": value_of("--host", "127.0.0.1"),
         "bind_host": value_of("--backend-host", None),
-        "port": int(value_of("--port", 8000)),
+        "port": int(value_of("--port", default_port)),
         "route": value_of("--route", "auto"),
         "interval": float(value_of("--interval", 5.0)),
         "thinking": "--thinking" in translated,
         "log_token": value_of("--log-token", ""),
         "auto_start": "--auto-start" in translated,
+        "environment": environment,
     }
 
 
@@ -151,6 +162,7 @@ def _run_textual_shell(args: list[str]) -> int:
 
         supervisor = BackendSupervisor(
             host=options["host"], port=options["port"], bind_host=options["bind_host"],
+            environment=options["environment"],
         )
 
     from tui_textual import run as run_textual

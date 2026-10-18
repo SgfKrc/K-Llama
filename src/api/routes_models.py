@@ -707,6 +707,7 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
     _api_module.require_model_api_source(request)
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise _api_module.HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
+    registry_snapshot = _api_module._local_store.get_local_model_registry_snapshot(req.model_id)
     resolved_model_path = _api_module.mc.resolve_model_path(req.model_path) if req.model_path else ""
     resolved_gguf_path = _api_module.mc.resolve_model_path(req.gguf_path) if req.gguf_path else ""
     try:
@@ -722,8 +723,13 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
             model_type=req.model_type,
             source=req.huggingface_id,
         )
-        _api_module.write_manifest(manifest_root, manifest)
+        from model_registry_validation import publish_registration_manifest
+        publish_registration_manifest(manifest_root, manifest)
     except ValueError as exc:
+        if str(exc) == "registration_manifest_conflict":
+            raise _api_module.HTTPException(status_code=409, detail={
+                "reason_code": "MODEL_MANIFEST_CONFLICT", "message": "目录已绑定其他模型修订，请保留原件并使用新的工件目录",
+            }) from exc
         raise _api_module.HTTPException(status_code=400, detail=f"model preflight failed: {exc}") from exc
     from model_registry_validation import manifest_external_files
     config = {
@@ -745,11 +751,13 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
     }
 
     try:
-        ok = _api_module._local_store.save_local_experimental_model(
-            req.model_id, _api_module.json.dumps(config, ensure_ascii=False),
+        ok = _api_module._local_store.publish_local_model_registry(
+            req.model_id, config, expected_revision=registry_snapshot.registry_revision,
         )
         if not ok:
-            raise _api_module.HTTPException(status_code=500, detail="注册模型配置失败")
+            raise _api_module.HTTPException(status_code=409, detail={
+                "reason_code": "MODEL_REGISTRY_CHANGED", "message": "模型注册在校验期间已改变，请刷新后重试",
+            })
         return {"status": "registered", "model_id": req.model_id}
     except _api_module.HTTPException:
         raise

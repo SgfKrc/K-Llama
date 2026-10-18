@@ -1215,3 +1215,19 @@ def test_gc_snapshot_fence_rejects_new_operation_prepare_or_lease(tmp_path, chan
         return {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
     c.scheduler._model_supply_worker.collect_garbage = collect
     c._collect_garbage(op_id)
+
+
+@pytest.mark.parametrize("node_id", ["master", "worker"])
+def test_capacity_wait_refreshes_existing_node_without_new_membership(startup_pool_case, node_id):
+    case = startup_pool_case
+    case.budgets = {"master": 45, "worker": 45}
+    case.release_source.set()
+    runner = case.start()
+    assert case.waiting.wait(2)
+    assert not case.build_calls
+    case.budgets[node_id] = 200
+    result = _assert_startup_available(case, runner, {"master", "worker"})
+    assert len(case.capacity_pools) == 2
+    assert case.inventory_nodes == ["worker", "worker"]
+    assert case.source_calls == [True]
+    assert result["operation_id"] == case.op

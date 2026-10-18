@@ -48,7 +48,7 @@ def test_registry_cas_never_replaces_changed_deleted_or_invalid_payload(change):
             current["name"] = "reregistered"
         else:
             current["manifest_external_files"]["external/model.gguf"] = "models/new/model.gguf"
-        local_store.save_local_experimental_model("fixture", current)
+        assert local_store.save_local_experimental_model("fixture", current, expected_revision=snapshot.registry_revision)
     with sqlite3.connect(local_store._sqlite_path()) as connection:
         before = connection.execute("SELECT * FROM model_registry").fetchall()
     assert not local_store.save_local_experimental_model_cas(
@@ -124,5 +124,5 @@ def test_registry_cas_comparison_holds_sqlite_write_lock(monkeypatch):
     monkeypatch.setattr(local_store, "_connect", lambda: ConnectionProbe(connect()))
     updated = _row("cas-winner")
     assert local_store.save_local_experimental_model_cas("fixture", updated, expected=old)
-    assert blocked == [True]
+    assert blocked and all(blocked)
     assert local_store.get_local_experimental_models() == [updated]

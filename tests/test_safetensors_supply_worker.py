@@ -226,8 +226,16 @@ def test_supply_capabilities_reject_mixed_engine_format(tiny_supply, engine, fmt
     assert caught.value.field == "payload.capabilities.layer_artifacts[0].model_id"
 
 
-def test_metadata_only_architecture_does_not_advertise_layer_forward(tiny_supply, monkeypatch):
+@pytest.mark.parametrize("full_loaded", [False, True])
+def test_metadata_only_architecture_does_not_advertise_layer_forward(tiny_supply, monkeypatch, full_loaded):
     tiny_supply.activate(2)
+    full_identity = ModelIdentity(model_id="full-model", engine="pytorch", format="safetensors",
+                                  revision="1", sha256="a" * 64)
+    if full_loaded:
+        host = tiny_supply.scheduler._host
+        host.model_loaded = host.is_loaded = True
+        tiny_supply.scheduler._require_callbacks = lambda: SimpleNamespace(
+            active_task_graph_model_identity=lambda: full_identity)
     selected = get_selected_model()
     selected["manifest"]["model_type"] = "gemma4_unified"
     monkeypatch.setattr(supply, "get_selected_model", lambda root=None: selected)
@@ -235,7 +243,10 @@ def test_metadata_only_architecture_does_not_advertise_layer_forward(tiny_supply
     assert "layer_forward" not in caps["stage_types"]
     assert caps["layer_worker"] is False
     assert caps["models"][0]["engine"] == "pytorch"
-    assert tiny_supply.scheduler._task_worker_full_model_identities(caps) == []
+    assert ("full_inference" in caps["stage_types"]) is full_loaded
+    expected = [full_identity.snapshot()] if full_loaded else []
+    assert tiny_supply.scheduler._task_worker_full_model_identities(caps) == expected
+    _validate_capabilities(caps, version=PROTOCOL_VERSION)
 
 
 def test_supplied_physical_identity_never_becomes_a_full_model_alias(tiny_supply):
@@ -273,9 +284,20 @@ def test_two_real_segments_match_full_prefill_decode_reset_and_tail(tiny_supply,
         prepare_calls.append(kwargs)
         return original_prepare(manager, *args, **kwargs)
 
-    def materialize(tracker, handle, key):
-        materialized.append((tracker.start_layer, tracker.end_layer, key))
-        return original_materialize(tracker, handle, key)
+    expected_sources = {}
+    for manifest, directory in tiny_supply.segments[:2]:
+        index = json.loads((directory / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        expected_sources[tuple(manifest["layer_range"])] = {
+            key: (directory / shard).resolve(strict=True)
+            for key, shard in index["weight_map"].items()
+        }
+
+    def materialize(tracker, handle, key, source_file=""):
+        assert source_file, "filtered loading must identify the source shard"
+        source = Path(source_file).resolve(strict=True)
+        assert source == expected_sources[(tracker.start_layer, tracker.end_layer)][key]
+        materialized.append((tracker.start_layer, tracker.end_layer, key, source))
+        return original_materialize(tracker, handle, key, source_file=source_file)
 
     def no_full_load(*args, **kwargs):
         pytest.fail("production worker attempted full-model loading")
@@ -335,7 +357,8 @@ def test_two_real_segments_match_full_prefill_decode_reset_and_tail(tiny_supply,
     print(f"tiny Qwen2 two-segment prefill/decode/reset max_logit_abs_error={max_abs_error:.3g}")
     assert layers_loaded == [(0, 2), (2, 4), (2, 4)]
     assert [call["layer_range"] for call in prepare_calls] == [(0, 2), (2, 4), (2, 4)]
-    for start, end, key in materialized:
+    for start, end, key, source in materialized:
+        assert source == expected_sources[(start, end)][key]
         if key.startswith("model.layers."):
             assert start <= int(key.split(".")[2]) < end
     for worker, (_, directory) in ((head, tiny_supply.segments[0]),
@@ -346,6 +369,11 @@ def test_two_real_segments_match_full_prefill_decode_reset_and_tail(tiny_supply,
         assert metrics["mode"] == "safetensors_key_filtered"
         assert metrics["source_tensor_bytes"] == index["metadata"]["total_size"]
         assert metrics["selected_tensor_count"] == len(index["weight_map"])
+        proof = metrics["materialization_proof"]
+        assert {tensor.name: Path(tensor.source_file).resolve(strict=True)
+                for tensor in proof.tensors} == expected_sources[proof.layer_range]
+        assert {key for start, end, key, _ in materialized
+                if (start, end) == proof.layer_range} == set(index["weight_map"])
     # Return exactly v3's token format; run the same prompt from a fresh KV.
     with torch.no_grad():
         ids = torch.tensor([[1, 3, 7]])

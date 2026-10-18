@@ -59,6 +59,9 @@ def main() -> int:
             if operation == "close":
                 _response(ok=True)
                 return 0
+            if operation == "load_observation":
+                _response(ok=True, observation=upstream.materialization_observation())
+                continue
             if operation == "reset":
                 upstream.reset()
                 _response(ok=True)

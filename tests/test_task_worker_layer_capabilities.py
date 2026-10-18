@@ -202,8 +202,12 @@ class TestLayerCapabilities:
             active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
             forward_layers=False,
         )
-        assert caps["stage_types"] == []
+        # R2 keeps hello valid (stage_types must be non-empty) while granting
+        # neither full-model work nor layers to this unavailable layer worker.
+        assert caps["stage_types"] == ["aggregate"]
         assert "layer_forward" not in caps["stage_types"]
+        assert "full_inference" not in caps["stage_types"]
+        assert caps["layer_ranges"] == []
 
     def test_layer_worker_with_forward_layers_keeps_advertising_it(self):
         """绑定路径（真的支持层段前向）广告行为不变。"""

@@ -315,6 +315,10 @@ class SchedulerClusterMixin:
         if not isinstance(profile, dict) or not profile:
             return
 
+        # Hardware facts do not imply an execution path. Project concrete
+        # installed/current runtimes without constructing a lazy model manager.
+        from task_worker_capabilities import engine_profile
+        profile = engine_profile(profile, self._task_worker_engine_schema())
         self._local_device_profile = dict(profile)
         effective_role = self._effective_role()
         local_node_id = "master" if effective_role == "master" else self.get_effective_node_id()
@@ -2306,13 +2310,13 @@ class SchedulerClusterMixin:
             )
 
 
-    @staticmethod
-    def _persist_master_endpoint_preference(master_host: str, master_port: int) -> dict:
+    def _persist_master_endpoint_preference(self, master_host: str, master_port: int) -> dict:
         """Expose a failed local preference write instead of silently losing it."""
         try:
             from node_config import persist_preferred_master_endpoint
 
-            endpoint = persist_preferred_master_endpoint(master_host, master_port)
+            persist = getattr(self, "_persist_preferred_endpoint", None) or persist_preferred_master_endpoint
+            endpoint = persist(master_host, master_port)
             return {
                 "endpoint_preference": {
                     "persisted": True,
@@ -2376,7 +2380,8 @@ class SchedulerClusterMixin:
                     master_api_host=master_host,
                     master_api_port=api_port,
                     node_id=node_id,
-                    node_type=os.environ.get("QLH_NODE_TYPE", "pc"),
+                    node_type=(self._runtime_config.environment_snapshot() if self._runtime_config is not None else os.environ).get("QLH_NODE_TYPE", "pc"),
+                    **({"accept_bootstrap": self._accept_bootstrap} if getattr(self, "_accept_bootstrap", None) is not None else {}),
                 )
                 cluster = bootstrap_result.get("cluster", {})
                 node = bootstrap_result.get("node", {})
@@ -2388,7 +2393,7 @@ class SchedulerClusterMixin:
                     node_id, master_host, master_port,
                 )
 
-            if force_bootstrap or not getattr(cfg, "CLUSTER_SECRET", ""):
+            if force_bootstrap or not (self._runtime_settings.get("CLUSTER_SECRET", "") if self._runtime_settings is not None else getattr(cfg, "CLUSTER_SECRET", "")):
                 try:
                     _run_first_connect_bootstrap(
                         "explicit_join" if force_bootstrap else "missing_secret"
@@ -2947,13 +2952,15 @@ class SchedulerClusterMixin:
         try:
             from node_config import load_node_config
 
-            data = load_node_config()
+            read_document = getattr(self, "_read_identity_document", None) or load_node_config
+            data = read_document()
             node = data.get("node") if isinstance(data.get("node"), dict) else {}
             role_confirmed = bool(
                 data.get("bootstrapped", False)
                 or node.get("role_confirmed", False)
             )
-            if os.environ.get("QLH_NODE_ROLE", "").strip() == "master":
+            environment = self._runtime_config.environment_snapshot() if self._runtime_config is not None else os.environ
+            if environment.get("QLH_NODE_ROLE", "").strip() == "master":
                 role_confirmed = True
             # 主节点身份由本机 SQLite 绑定。旧远端库是否配置不再影响
             # provisional 判定，也不会隐藏管理能力或 Tailnet 发现入口。
@@ -3277,13 +3284,14 @@ class SchedulerClusterMixin:
         """
         # 已完成 bootstrap 的节点优先使用本地配置。
         import config as cfg
+        settings = self._runtime_settings if self._runtime_settings is not None else vars(cfg)
         if (not skip_config
-                and cfg.CLIENT_MASTER_HOST
-                and cfg.CLIENT_MASTER_HOST != "192.168.x.x"):
+                and settings.get("CLIENT_MASTER_HOST")
+                and settings["CLIENT_MASTER_HOST"] != "192.168.x.x"):
             return {
                 "found": True,
-                "master_host": cfg.CLIENT_MASTER_HOST,
-                "master_port": cfg.CLIENT_MASTER_PORT,
+                "master_host": settings["CLIENT_MASTER_HOST"],
+                "master_port": settings["CLIENT_MASTER_PORT"],
                 "stale": False,
                 "source": "config",
             }
@@ -3330,7 +3338,8 @@ class SchedulerClusterMixin:
         try:
             from node_config import get_bootstrap_master_endpoint
 
-            bootstrap_endpoint = get_bootstrap_master_endpoint()
+            read_document = getattr(self, "_read_identity_document", None)
+            bootstrap_endpoint = get_bootstrap_master_endpoint(read_document()) if read_document is not None else get_bootstrap_master_endpoint()
             if bootstrap_endpoint is not None:
                 _append(
                     bootstrap_endpoint["host"],
@@ -3653,8 +3662,9 @@ class SchedulerClusterMixin:
         if not configured_host:
             try:
                 import config as cfg
-                configured_host = str(getattr(cfg, "CLIENT_MASTER_HOST", "") or "")
-                configured_port = int(getattr(cfg, "CLIENT_MASTER_PORT", 0) or 0)
+                settings = self._runtime_settings if self._runtime_settings is not None else vars(cfg)
+                configured_host = str(settings.get("CLIENT_MASTER_HOST", "") or "")
+                configured_port = int(settings.get("CLIENT_MASTER_PORT", 0) or 0)
             except Exception:
                 configured_host = ""
                 configured_port = 0

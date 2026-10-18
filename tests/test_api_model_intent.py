@@ -400,6 +400,11 @@ def test_late_intent_retirement_preserves_newer_committed_model(retirement_case,
         try:
             await wait_until(entered.is_set)
             if replacement == "native":
+                # A new selection explicitly retires old admission and obtains
+                # exact release evidence before preparing another deployment.
+                case.master._invalidate_pipeline_load_transaction("new_selection")
+                for record in list(case.master._pipeline_model_cleanup_ledger.values()):
+                    assert _ack_cleanup(case.master, record)
                 plan = _start_candidate(case, "candidate-newer")
                 assert plan["admitted"]
                 _worker_ack(case.master, "prepared")

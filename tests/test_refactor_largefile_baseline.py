@@ -1,4 +1,8 @@
-"""Compatibility gates for the scheduler/API large-file split."""
+"""Legacy split characterization; private facades are reviewed during R1-R5.
+
+The external product contract is tests/test_refactor_product_contract.py.
+This file preserves pinned old-structure evidence, not permanent target APIs.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,14 @@ import ast
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 import sys
 import threading
 import time
 
 import pytest
+
+pytestmark = pytest.mark.legacy_characterization
+PINNED_SOURCE_REVISION = "fb870d1d4ef2d1d2901db1c5e299ac387fc9597b"
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,39 +72,11 @@ def _scheduler_sources() -> list[Path]:
     return sources
 
 
-def _target_names(target: ast.AST) -> set[str]:
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: set[str] = set()
-        for item in target.elts:
-            names.update(_target_names(item))
-        return names
-    return set()
-
-
-def _module_names_from_head() -> set[str]:
-    source = subprocess.check_output(
-        ["git", "show", "HEAD:src/scheduler.py"],
-        cwd=ROOT,
-        text=True,
-        encoding="utf-8",
-    )
-    tree = ast.parse(source)
-    names: set[str] = set()
-    for statement in tree.body:
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(statement.name)
-        elif isinstance(statement, ast.Import):
-            names.update(alias.asname or alias.name.split(".")[0] for alias in statement.names)
-        elif isinstance(statement, ast.ImportFrom):
-            names.update(alias.asname or alias.name for alias in statement.names if alias.name != "*")
-        elif isinstance(statement, ast.Assign):
-            for target in statement.targets:
-                names.update(_target_names(target))
-        elif isinstance(statement, ast.AnnAssign):
-            names.update(_target_names(statement.target))
-    return names
+def _module_names_from_baseline() -> set[str]:
+    path = ROOT / "tests" / "fixtures" / "refactor_legacy_scheduler_symbols.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    assert snapshot["baseline_revision"] == PINNED_SOURCE_REVISION
+    return set(snapshot["symbols"])
 
 
 def _openapi_snapshot() -> dict:
@@ -122,15 +100,15 @@ def test_scheduler_facade_exports_required_symbols() -> None:
     assert SCHEDULER_FACADE_SYMBOLS <= set(dir(scheduler))
 
 
-def test_scheduler_facade_preserves_head_module_names() -> None:
-    # The split must not silently remove names that existed at the start of
-    # this ticket. TYPE_CHECKING-only names are absent from runtime dir().
+def test_scheduler_facade_preserves_pinned_module_names() -> None:
+    # This records the old split only; owner migration may explicitly replace
+    # it. TYPE_CHECKING-only names are absent from runtime dir().
     runtime_names = set(dir(scheduler))
-    missing = (_module_names_from_head() - runtime_names) - {
+    missing = (_module_names_from_baseline() - runtime_names) - {
         "InferenceHost",
         "SchedulerCallbacks",
     }
-    assert not missing, f"scheduler facade lost HEAD symbols: {sorted(missing)}"
+    assert not missing, f"scheduler facade lost pinned legacy symbols: {sorted(missing)}"
 
 
 def test_scheduler_source_scan_covers_current_and_split_modules() -> None:

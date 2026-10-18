@@ -90,10 +90,10 @@ class KeepHeadUnavailable(RuntimeError):
     """shim 缺失、符号不对或加载/初始化失败（都属于「不能用」，绝不降级成 embeddings 通道）。"""
 
 
-def _add_dll_dirs(shim_dir: Path, extra: Sequence[str] = ()) -> tuple[list[str], list[object]]:
+def _add_dll_dirs(shim_dir: Path, extra: Sequence[str] = (), *, environment=None) -> tuple[list[str], list[object]]:
     dirs: list[str] = [str(shim_dir)]
     dirs.extend(extra)
-    dirs.extend(d for d in os.environ.get(EXTRA_DLL_DIRS_ENV, "").split(os.pathsep) if d)
+    dirs.extend(d for d in (os.environ if environment is None else environment).get(EXTRA_DLL_DIRS_ENV, "").split(os.pathsep) if d)
     added: list[str] = []
     handles: list[object] = []
     for candidate in dirs:
@@ -173,7 +173,9 @@ class KeepHeadUpstream:
         n_seq_max: int = 1,
         extra_dll_dirs: Sequence[str] = (),
         _worker_process: bool = False,
+        environment=None,
     ) -> None:
+        self._environment = dict(os.environ if environment is None else environment)
         if mode not in MODE_CODES:
             raise KeepHeadUnavailable(f"mode 必须是 {sorted(MODE_CODES)}，实得 {mode!r}")
         if mode == "layer_inp" and cut_layer is None:
@@ -222,7 +224,7 @@ class KeepHeadUpstream:
             return
 
         self._dll_dirs, self._dll_dir_handles = _add_dll_dirs(
-            self.shim_path.parent, extra_dll_dirs)
+            self.shim_path.parent, extra_dll_dirs, environment=self._environment)
         try:
             self._lib = ctypes.CDLL(str(self.shim_path))
         except OSError as exc:  # noqa: PERF203
@@ -274,6 +276,13 @@ class KeepHeadUpstream:
         lib.qlh_kh_n_embd.restype = ctypes.c_int32
         lib.qlh_kh_n_layer.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_n_layer.restype = ctypes.c_int32
+        for symbol, result_type in (("qlh_kh_model_bytes", ctypes.c_uint64),
+                                    ("qlh_kh_context_size", ctypes.c_uint32),
+                                    ("qlh_kh_batch_size", ctypes.c_uint32)):
+            if hasattr(lib, symbol):
+                function = getattr(lib, symbol)
+                function.argtypes = [ctypes.c_void_p]
+                function.restype = result_type
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_close.restype = None
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
@@ -306,6 +315,8 @@ class KeepHeadUpstream:
     def _init_isolated_worker(self, *, n_ctx: int, n_threads: int, n_batch: int,
                               n_seq_max: int, extra_dll_dirs: Sequence[str]) -> None:
         """Keep the patched llama.cpp ABI out of the pip llama.cpp process."""
+        environment = getattr(self, "_environment", None)
+        environment = dict(os.environ if environment is None else environment)
         worker = Path(__file__).with_name("llama_keep_head_worker.py")
         if not worker.is_file():
             raise KeepHeadUnavailable(f"keep-head worker missing: {worker}")
@@ -335,8 +346,10 @@ class KeepHeadUpstream:
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         # worker 的 stderr 必须落盘：llama.cpp 的日志量很大，用 PIPE 会填满缓冲而死锁，
         # 用 DEVNULL 则失败时无信息。落盘后可随时 tail 诊断。
-        log_path = Path(os.environ.get("QLH_KEEP_HEAD_WORKER_LOG")
-                        or (Path.cwd() / "build" / "relay-records" / "_keephead_worker.err"))
+        log_path = Path(environment.get("QLH_KEEP_HEAD_WORKER_LOG")
+                        or ((Path(environment["QLH_STATE_DIR"]) / "native-logs" / f"keephead-{os.getpid()}-{id(self):x}.err")
+                            if environment.get("QLH_STATE_DIR") else
+                            (Path.cwd() / "build" / "relay-records" / f"keephead-{os.getpid()}-{id(self):x}.err")))
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             stderr_target: object = open(log_path, "w", encoding="utf-8", errors="replace")
@@ -346,9 +359,12 @@ class KeepHeadUpstream:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=stderr_target, text=True, encoding="utf-8",
-                bufsize=1, **popen_kwargs)
+                bufsize=1, env=environment, **popen_kwargs)
         except OSError as exc:
             raise KeepHeadUnavailable(f"keep-head worker start failed: {exc}") from exc
+        finally:
+            if hasattr(stderr_target, "close"):
+                stderr_target.close()
         self._worker = process
         self._worker_log = log_path
         try:
@@ -388,6 +404,18 @@ class KeepHeadUpstream:
         if not isinstance(value, dict):
             raise KeepHeadUnavailable("keep-head worker response is not an object")
         return value
+
+    def materialization_observation(self):
+        if self._worker is not None:
+            return self._worker_request({"op": "load_observation"})["observation"]
+        symbols = ("qlh_kh_model_bytes", "qlh_kh_context_size", "qlh_kh_batch_size")
+        if not self.is_available or not all(hasattr(self._lib, symbol) for symbol in symbols):
+            raise KeepHeadUnavailable("keep_head_load_observation_unsupported")
+        return {"materialized_bytes": int(self._lib.qlh_kh_model_bytes(self._handle)),
+                "context_size": int(self._lib.qlh_kh_context_size(self._handle)),
+                "batch_size": int(self._lib.qlh_kh_batch_size(self._handle)),
+                "device": "cpu", "dtype": "artifact", "quant_type": "artifact",
+                "kv_device": "cpu", "kv_dtype": "float16", "sequence_count": self.n_seq_max}
 
     @property
     def is_available(self) -> bool:

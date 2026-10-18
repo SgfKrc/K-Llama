@@ -74,7 +74,8 @@ def _register(tmp_path: Path, *, root: Path | None = None, gguf: Path | None = N
     cfg = ModelConfig(model_id=model_id, name="Source fixture", model_type="safetensors",
                       model_path=str(root) if root else str(tmp_path / "models" / model_id),
                       gguf_path=str(gguf) if gguf else "", huggingface_id=repo)
-    local_store.save_local_experimental_model(model_id, {**asdict(cfg), **fields})
+    snapshot = local_store.get_local_model_registry_snapshot(model_id)
+    assert local_store.save_local_experimental_model(model_id, {**asdict(cfg), **fields}, expected_revision=snapshot.registry_revision)
     return cfg
 
 
@@ -824,7 +825,8 @@ def test_external_manifest_binding_does_not_bypass_live_validation(tmp_path, tam
         gguf.unlink()
     else:
         cfg = mc.get_model_config("fixture", local_store.get_local_experimental_models())
-        local_store.save_local_experimental_model("fixture", {**asdict(cfg), "gguf_path": ""})
+        snapshot = local_store.get_local_model_registry_snapshot("fixture")
+        assert local_store.save_local_experimental_model("fixture", {**asdict(cfg), "gguf_path": ""}, expected_revision=snapshot.registry_revision)
     _assert_code("SUPPLY_SOURCE_METADATA_INVALID", lambda: _ensure(tmp_path, want_gguf=True))
 
 
@@ -1062,9 +1064,10 @@ def test_download_cas_conflict_preserves_source_adopted_by_new_registration(
 
     def progress(value):
         if value["phase"] == "registering":
-            local_store.save_local_experimental_model("fixture", {
+            snapshot = local_store.get_local_model_registry_snapshot("fixture")
+            assert local_store.save_local_experimental_model("fixture", {
                 **asdict(cfg), "name": "Concurrent registration adopted this source",
-            })
+            }, expected_revision=snapshot.registry_revision)
             captured["row"] = local_store.get_local_experimental_models()[0]
 
     _assert_code("SUPPLY_REGISTRY_CHANGED", lambda: _ensure(tmp_path, progress=progress))

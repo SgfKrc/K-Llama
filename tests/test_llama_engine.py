@@ -21,19 +21,13 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
 ):
     model = tmp_path / "qwen35.gguf"
     model.write_bytes(b"GGUF fixture")
-    tokenizer_root = tmp_path / "tokenizer-asset"
-    tokenizer_root.mkdir()
     tokenizer_payload = b'{"version":1}'
-    (tokenizer_root / "tokenizer.json").write_bytes(tokenizer_payload)
     tokenizer_sha256 = hashlib.sha256(tokenizer_payload).hexdigest()
-    (tokenizer_root / ".qlh-model-asset.json").write_text(json.dumps({
-        "schema_version": 1,
-        "files": [{
-            "path": "tokenizer.json",
-            "size": len(tokenizer_payload),
-            "sha256": tokenizer_sha256,
-        }],
-    }), encoding="utf-8")
+    # Tokenizer evidence is read from the inspected GGUF revision. A builtin
+    # name cannot authorize a tokenizer asset in a different model directory.
+    monkeypatch.setattr(
+        "relay_segment_info.read_gguf_tokenizer_sha256", lambda _path: tokenizer_sha256,
+    )
     monkeypatch.setattr(
         "relay_segment_info.read_gguf_layer_info",
         lambda _path: {"architecture": "qwen35", "n_layer": 2, "n_embd": 2048},
@@ -47,7 +41,7 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
     )
     monkeypatch.setattr(
         "model_config.get_builtin_model",
-        lambda _model_id: types.SimpleNamespace(model_path=str(tokenizer_root)),
+        lambda _model_id: pytest.fail("builtin name is not tokenizer revision evidence"),
     )
     monkeypatch.setattr(
         "model_config.resolve_model_path", lambda value: value,

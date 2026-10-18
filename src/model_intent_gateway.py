@@ -259,6 +259,8 @@ async def forward_intent(scheduler, request: Request, suffix: str, body=None):
     _require_worker(binding, connection)
     url = build_url("http", binding["master_host"], binding["master_api_port"], path)
     headers = {name: request.headers[name] for name in _REQUEST_HEADERS if name in request.headers}
+    if "idempotency-key" in request.headers:
+        headers["Idempotency-Key"] = request.headers["idempotency-key"]
     headers[HOP_HEADER] = "1"
     # Bound the wire body without accepting compression bombs from the peer.
     headers["Accept-Encoding"] = "identity"

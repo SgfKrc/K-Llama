@@ -27,11 +27,11 @@ def default_shim_path() -> Path:
     return Path(__file__).resolve().parent.parent / DEFAULT_SHIM_RELATIVE
 
 
-def resolve_keep_head_shim(explicit: str | None = None) -> str:
+def resolve_keep_head_shim(explicit: str | None = None, *, environment=None) -> str:
     """显式入参 > 环境变量 > 当前运行形态的默认路径；缺失返回空串。"""
     if explicit and str(explicit).strip():
         return str(explicit).strip()
-    from_env = os.environ.get(ENV_VAR, "").strip()
+    from_env = (os.environ if environment is None else environment).get(ENV_VAR, "").strip()
     if from_env:
         return from_env
     candidate = default_shim_path()

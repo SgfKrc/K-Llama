@@ -1023,6 +1023,23 @@ class ModelManager:
     # 模型加载（双引擎入口）
     # ================================================================
 
+    def configure_catalog(self, catalog_prepare, *, model_id: str = "") -> None:
+        """Inject the catalog's prepare validator; no global registry lookup."""
+        self._catalog_prepare = catalog_prepare
+
+    def _verify_catalog_artifact(self, model_id, model_path, rows=None, *, expected=None):
+        from qlh_core.adapters.artifacts import verify_registered_artifact
+
+        prepare = getattr(self, "_catalog_prepare", None)
+        resolved = prepare(model_id, model_path) if prepare is not None else None
+        if resolved is None:
+            resolved = verify_registered_artifact(model_id, model_path, rows=rows)
+        if expected is not None and resolved != expected:
+            from qlh_core.contracts.catalog import CatalogError
+            raise CatalogError("artifact_revision_mismatch", "source binding changed since pipeline preparation")
+        self._resolved_artifact = resolved
+        return resolved
+
     @staticmethod
     def _normalize_load_path(path: str | None) -> str:
         if not path:
@@ -1055,33 +1072,9 @@ class ModelManager:
         model_id: str,
         db_experimental_models: list[dict] | None,
     ) -> Dict[str, str]:
-        if mc.get_builtin_model(model_id) is not None or not db_experimental_models:
-            return {}
-        entry = next(
-            (
-                item for item in db_experimental_models
-                if isinstance(item, dict) and str(item.get("model_id", "")) == model_id
-            ),
-            None,
-        )
-        if entry is None:
-            return {}
-        identity: Dict[str, str] = {}
-        for key in (
-            "artifact_id", "sha256", "model_sha256", "artifact_sha256",
-            "manifest_sha256", "revision", "resolved_revision", "commit_hash",
-            "quantization",
-        ):
-            value = str(entry.get(key, "") or "").strip()
-            if value:
-                identity[key] = value
-        source = entry.get("source")
-        if isinstance(source, dict):
-            for key in ("provider", "repo_id", "requested_revision", "resolved_revision"):
-                value = str(source.get(key, "") or "").strip()
-                if value:
-                    identity[f"source_{key}"] = value
-        return identity
+        from qlh_core.contracts.catalog import registry_load_identity
+
+        return registry_load_identity(model_id, db_experimental_models)
 
     @classmethod
     def _artifact_load_identity(
@@ -1106,6 +1099,11 @@ class ModelManager:
             "size_bytes": int(stat_result.st_size),
             "mtime_ns": int(stat_result.st_mtime_ns),
         })
+        from qlh_core.adapters.artifacts import artifact_load_identity
+
+        identity.update(artifact_load_identity(
+            normalized, model_id=model_id, rows=db_experimental_models,
+        ))
         sidecar_sha256 = cls._read_sha256_sidecar(normalized)
         if sidecar_sha256:
             identity["sidecar_sha256"] = sidecar_sha256
@@ -1353,6 +1351,8 @@ class ModelManager:
         resolved_path = request["path"] or None
         resolved_id = request["model_id"]
         resolved_engine = request["engine"]
+        if resolved_engine != "island":
+            self._verify_catalog_artifact(resolved_id, resolved_path or "", db_experimental_models)
 
         # ---- TP 孤岛引擎：无本地模型文件，"加载" = 健康检查 + 解析后端模型名 ----
         # 孤岛模型不进本地注册表（无落盘 artifact），跳过注册表/文件校验。
@@ -1491,6 +1491,7 @@ class ModelManager:
         from pipeline_model_descriptor import inspect_pipeline_model
 
         resolved_path = os.path.abspath(model_path or "")
+        self._verify_catalog_artifact(model_id, resolved_path)
         # Assignment manifests contain only the worker's layer range. Validate
         # that range instead of treating the filtered directory as complete.
         descriptor = inspect_pipeline_model(
@@ -1809,6 +1810,7 @@ class ModelManager:
         profile: dict = None,
         total_layers: int = None,
         model_id: str = None,
+        load_spec=None,
     ) -> None:
         """
         加载模型的指定层范围（分布式流水线节点专用）。
@@ -1837,6 +1839,20 @@ class ModelManager:
             mgr.load_layer_range(16, 24, has_embedding=False, has_lm_head=True)
         """
         import torch.nn as nn
+        from qlh_core.contracts.load import RuntimeLoadSpec
+        spec = RuntimeLoadSpec.from_dict(load_spec) if load_spec is not None else None
+        if spec is not None:
+            components = {"layers", "final_norm"}
+            if has_embedding:
+                components.add("embedding")
+            if has_lm_head:
+                components.add("lm_head")
+            if (spec.materialization != "safetensors_key_filtered" or set(spec.components) != components
+                    or spec.quant_type not in {"fp16", "fp32"} or spec.kv_policy != "dynamic"
+                    or spec.kv_device != spec.device or spec.kv_dtype != spec.dtype):
+                raise ValueError("deployment_local_policy_unsupported")
+            quant_type = spec.quant_type
+            self.quant_type = spec.quant_type
 
         # ★ 2026-10-08：登记**上游层段**的量化档，供两侧精度对齐诊断（见 `src/relay_precision.py`）。
         #    只记录，**不改变任何加载行为**；优先级：路径标记（`*-f16-dequant` 等）> `quant_type` 意图。
@@ -1849,6 +1865,8 @@ class ModelManager:
         # has 28 layers while the legacy Qwen project default has 24, and the
         # master normally reuses ``_full_model_path`` without passing a path.
         path = model_path or self._full_model_path or self._model_path or MODEL_PATH
+        prepared = getattr(self, "_resolved_artifact", None)
+        self._verify_catalog_artifact(model_id or self._active_model_id, path, expected=prepared)
         config_path = os.path.join(path, "config.json")
         if os.path.isfile(config_path):
             try:
@@ -1911,6 +1929,7 @@ class ModelManager:
                 quant_type=quant_type,
                 profile=profile,
                 model_config=model_config,
+                load_spec=spec,
             )
         elif model_type == "qwen":
             load_tracker = self._load_qwen_layer_range(
@@ -1922,6 +1941,7 @@ class ModelManager:
                 quant_type=quant_type,
                 profile=profile,
                 model_config=model_config,
+                load_spec=spec,
             )
         elif model_type in {"gemma", "gemma4_unified"}:
             raise RuntimeError(
@@ -2075,6 +2095,7 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
+        load_spec=None,
         architecture: str = "qwen2",
     ) -> _LayerRangeLoadTracker:
         """Materialize only selected parameters from safetensors shards.
@@ -2152,7 +2173,8 @@ class ModelManager:
 
         model_prefixes = [model_key_of(prefix) for prefix in selected_prefixes]
 
-        target_device, target_dtype = _select_layer_runtime(quant_type or QUANT_TYPE)
+        target_device, target_dtype = ((load_spec.device, getattr(torch, load_spec.dtype))
+                                       if load_spec is not None else _select_layer_runtime(quant_type or QUANT_TYPE))
         load_tracker = _LayerRangeLoadTracker(
             architecture=architecture,
             start_layer=start_layer,
@@ -2300,6 +2322,7 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
+        load_spec=None,
     ) -> _LayerRangeLoadTracker:
         """Materialize one original Qwen-1.8B ``transformer.h`` segment."""
         import gc
@@ -2319,7 +2342,8 @@ class ModelManager:
         if total_layers <= 0:
             raise RuntimeError("Qwen config 缺少 num_hidden_layers")
 
-        target_device, target_dtype = _select_layer_runtime(quant_type or QUANT_TYPE)
+        target_device, target_dtype = ((load_spec.device, getattr(torch, load_spec.dtype))
+                                       if load_spec is not None else _select_layer_runtime(quant_type or QUANT_TYPE))
         use_cuda = target_device.startswith("cuda")
         runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE

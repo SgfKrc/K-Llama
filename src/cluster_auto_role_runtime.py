@@ -16,10 +16,11 @@ import logging
 import math
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from cluster_auto_role import AutoRoleController
 from cluster_control_contract import (
@@ -67,9 +68,10 @@ def _decode_key(value: str) -> bytes:
     return decoded
 
 
-def _private_key_from_environment() -> Any:
-    raw = os.environ.get("QLH_CONTROL_VOTER_PRIVATE_KEY", "")
-    path = os.environ.get("QLH_CONTROL_VOTER_PRIVATE_KEY_FILE", "").strip()
+def _private_key_from_environment(environment=None) -> Any:
+    environment = os.environ if environment is None else environment
+    raw = environment.get("QLH_CONTROL_VOTER_PRIVATE_KEY", "")
+    path = environment.get("QLH_CONTROL_VOTER_PRIVATE_KEY_FILE", "").strip()
     if path:
         try:
             raw = Path(path).expanduser().read_text(encoding="ascii").strip()
@@ -82,8 +84,9 @@ def _private_key_from_environment() -> Any:
     return Ed25519PrivateKey.from_private_bytes(_decode_key(raw))
 
 
-def _json_env(name: str, default: Any) -> Any:
-    raw = os.environ.get(name, "").strip()
+def _json_env(name: str, default: Any, environment=None) -> Any:
+    environment = os.environ if environment is None else environment
+    raw = environment.get(name, "").strip()
     if not raw:
         return default
     try:
@@ -107,6 +110,9 @@ class HTTPRemoteVoter:
         self.endpoint = _rpc_endpoint(endpoint)
         self._secret = str(secret)
         self._timeout = float(timeout)
+        # Cluster credentials travel directly to the configured peer, independent
+        # of user download proxies or urllib's process-global cached opener.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def _call(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         body = json.dumps(dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -120,7 +126,7 @@ class HTTPRemoteVoter:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with self._opener.open(request, timeout=self._timeout) as response:
                 value = json.loads(response.read().decode("utf-8"))
         except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise QuorumError("quorum_unavailable", "voter peer is unreachable") from exc
@@ -181,18 +187,36 @@ class JournalPrefixAuthority:
         self._lock = threading.RLock()
         #: 诊断：本次进程内因接管核对而被截断的 workflow → 被丢弃的事件数。
         self.truncated: dict[str, int] = {}
+        self.floor_provider = lambda: ()
+        self.model_control = None
 
-    def _recover(self, workflow_id: str) -> None:
+    def _recover(self, workflow_id: str, *, permit=None) -> None:
         """落后时主动追赶一次；追赶失败不改结论（仍然是「不够格接管」）。"""
         if self.recovery is None:
             return
         try:
-            self.recovery(workflow_id)
+            import inspect
+            if permit is not None:
+                permit.check()
+            if permit is not None and "permit" in inspect.signature(self.recovery).parameters:
+                self.recovery(workflow_id, permit=permit)
+            elif permit is not None:
+                permit.mutate(lambda: self.recovery(workflow_id))
+            else:
+                self.recovery(workflow_id)
         except Exception:  # noqa: BLE001 - 追赶失败不改变判定
             return
 
     def held(self, workflow_id: str) -> CommitWatermark | None:
         """本地耐久持有且**自洽**的前缀；不完整（例如刚截断过）时为 None。"""
+        from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN
+        if workflow_id == MODEL_CONTROL_DOMAIN:
+            if self.model_control is None:
+                return None
+            status = self.model_control.repository.recovery_status()
+            return (CommitWatermark(workflow_id=MODEL_CONTROL_DOMAIN, last_sequence=status["durable_sequence"],
+                                    checkpoint_digest=status["checkpoint_digest"])
+                    if status.get("verified") else None)
         with self._lock:
             try:
                 status = self.replica.recovery_status(str(workflow_id))
@@ -208,38 +232,53 @@ class JournalPrefixAuthority:
 
     def propose(self) -> tuple[CommitWatermark, ...]:
         """leader 提议：只声明**已经自洽**的 workflow（读不到的就不承诺）。"""
+        # Durable signed/committed domains must survive configuration edits and
+        # read failures. An unavailable floor prevents renewal instead of shrinking it.
+        floors = {item.workflow_id: item for item in self.floor_provider()}
         proposed = []
-        for workflow_id in self.workflows:
+        for workflow_id in sorted(set(self.workflows) | set(floors)):
             item = self.held(workflow_id)
+            floor = floors.get(workflow_id)
+            if floor is not None and (item is None or item.last_sequence < floor.last_sequence
+                    or (item.last_sequence == floor.last_sequence and item.checkpoint_digest != floor.checkpoint_digest)):
+                raise AutoRoleRuntimeError("committed_prefix_behind", "required recovery floor is unavailable")
             if item is not None:
                 proposed.append(item)
         return tuple(proposed)
 
-    def enforce(self, certificate: Any) -> None:
+    def enforce(self, certificate: Any, *, permit=None) -> None:
         """接管前核对：先截断未提交尾部，再要求本地前缀 ≥ 且一致于证书承诺。"""
         watermarks = tuple(getattr(certificate, "commit_watermark", ()) or ())
         if not watermarks:
             return
         for watermark in watermarks:
+            if permit is not None:
+                permit.check()
             workflow_id = watermark.workflow_id
+            from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN
+            if workflow_id == MODEL_CONTROL_DOMAIN:
+                held = self.held(workflow_id)
+                if held is None or held != watermark:
+                    raise AutoRoleRuntimeError("committed_prefix_behind", "model-control recovery domain is unavailable")
+                continue
             with self._lock:
                 prefix = self.replica.durable_prefix(workflow_id)
                 if int(prefix["last_sequence"]) > int(watermark.last_sequence):
-                    result = self.replica.truncate_to(
-                        workflow_id, last_sequence=int(watermark.last_sequence),
-                    )
+                    guarded = {"permission_check": permit.check} if permit is not None and isinstance(self.replica, DurableJournalReplica) else {}
+                    truncate = lambda: self.replica.truncate_to(workflow_id, last_sequence=int(watermark.last_sequence), **guarded)
+                    result = permit.mutate(truncate) if permit is not None else truncate()
                     self.truncated[workflow_id] = int(result.get("removed_events", 0))
                 held = self.held(workflow_id)
                 if held is None or held.last_sequence < int(watermark.last_sequence):
                     # 落后（或截断后不自洽）⇒ 先尝试**主动追赶一次**，再判定。
-                    self._recover(workflow_id)
+                    self._recover(workflow_id, permit=permit)
                     held = self.held(workflow_id)
             if held is None:
                 raise AutoRoleRuntimeError(
                     "committed_prefix_behind",
                     f"replica prefix for {workflow_id} is not self-consistent yet",
                 )
-            if held.last_sequence < watermark.last_sequence:
+            if held.last_sequence != watermark.last_sequence:
                 raise AutoRoleRuntimeError(
                     "committed_prefix_behind",
                     f"replica prefix {held.last_sequence} < committed {watermark.last_sequence}",
@@ -265,10 +304,12 @@ class AutoRoleRuntime:
         secret: str,
         commit_watermark_provider: Any = None,
         committed_prefix_guard: Any = None,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         self.voter = voter
         self.collector = collector
         self.secret = str(secret)
+        self._clock = clock if clock is not None else lambda: int(time.time() * 1000)
         #: #93：透传给 AutoRoleController 的提交证明来源与接管核对钩子。
         self.commit_watermark_provider = commit_watermark_provider
         self.committed_prefix_guard = committed_prefix_guard
@@ -297,16 +338,28 @@ class AutoRoleRuntime:
             )
             self._renewal_thread.start()
 
-    def stop_lease_renewal(self) -> None:
+    def stop_lease_renewal(self, timeout: float = 30.0) -> None:
         with self._renewal_lock:
-            stop = self._renewal_stop
-            thread = self._renewal_thread
-            self._renewal_stop = None
-            self._renewal_thread = None
+            stop, thread = self._renewal_stop, self._renewal_thread
             if stop is not None:
                 stop.set()
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=0.5)
+        if thread is not None:
+            if thread is threading.current_thread():
+                raise RuntimeError("renewal thread cannot close its own resources")
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise TimeoutError("authority renewal is still draining")
+        with self._renewal_lock:
+            if self._renewal_thread is thread:
+                self._renewal_stop = None
+                self._renewal_thread = None
+
+    def close(self) -> None:
+        self.stop_lease_renewal()
+        replica = getattr(self, "_replica", None)
+        if replica is not None:
+            replica.close()
+            self._replica = None
 
     def _renew_lease_loop(self, controller: AutoRoleController, stop: threading.Event) -> None:
         interval = max(0.01, min(self.collector.policy.lease_duration_ms / 3000.0, 5.0))
@@ -327,21 +380,22 @@ class AutoRoleRuntime:
         """Handle one authenticated local-voter RPC without exposing exceptions."""
         try:
             operation = str(payload.get("op", ""))
-            now_ms = payload.get("now_ms")
+            # The wire timestamp is untrusted. Lease exclusion and expiry use
+            # a fresh receiver-local sample for every voter operation.
             if operation == "reserve_term":
-                return {"ok": True, "term": self.voter.reserve_term(str(payload["leader_id"]), now_ms=now_ms)}
+                return {"ok": True, "term": self.voter.reserve_term(str(payload["leader_id"]), now_ms=self._clock())}
             if operation == "prepare":
-                self.voter.prepare(str(payload["leader_id"]), int(payload["term"]), now_ms=now_ms)
+                self.voter.prepare(str(payload["leader_id"]), int(payload["term"]), now_ms=self._clock())
                 return {"ok": True}
             if operation == "sign_vote":
                 from cluster_control_contract import QuorumCertificate
 
                 certificate = QuorumCertificate.from_dict(payload["certificate"])
-                return {"ok": True, "signature": self.voter.sign_vote(certificate, now_ms=now_ms).to_dict()}
+                return {"ok": True, "signature": self.voter.sign_vote(certificate, now_ms=self._clock()).to_dict()}
             if operation == "commit_certificate":
                 from cluster_control_contract import QuorumCertificate
 
-                self.voter.commit_certificate(QuorumCertificate.from_dict(payload["certificate"]), now_ms=now_ms)
+                self.voter.commit_certificate(QuorumCertificate.from_dict(payload["certificate"]), now_ms=self._clock())
                 return {"ok": True}
             if operation == "snapshot":
                 return {"ok": True, "snapshot": self.voter.snapshot().to_dict()}
@@ -355,82 +409,43 @@ class AutoRoleRuntime:
             return {"ok": False, "code": "quorum_unavailable"}
 
 
-def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRuntime:
+def build_auto_role_runtime(*, fence: ControlFence | None = None, environment=None, model_control=None) -> AutoRoleRuntime:
     """Build a runtime from explicit environment configuration.
 
     ``QLH_CONTROL_VOTER_SET`` and a private key are intentionally mandatory.
     A deployment may list peer API base URLs in
     ``QLH_CONTROL_VOTER_PEERS`` as ``{"voter-b": "https://host:8000"}``.
     """
-    raw_voter_set = _json_env("QLH_CONTROL_VOTER_SET", None)
+    environment = dict(os.environ if environment is None else environment)
+    raw_voter_set = _json_env("QLH_CONTROL_VOTER_SET", None, environment)
     if not isinstance(raw_voter_set, Mapping):
         raise AutoRoleRuntimeError("auto_role_voter_set_missing", "QLH_CONTROL_VOTER_SET is required")
     try:
         voter_set = VoterSet.from_dict(raw_voter_set)
     except (ControlContractError, TypeError, ValueError) as exc:
         raise AutoRoleRuntimeError("auto_role_voter_set_invalid", "configured voter set is invalid") from exc
-    voter_id = os.environ.get("QLH_CONTROL_VOTER_ID", "").strip()
+    voter_id = environment.get("QLH_CONTROL_VOTER_ID", "").strip()
     if not voter_id or voter_id not in voter_set.voter_map:
         raise AutoRoleRuntimeError("auto_role_voter_id_invalid", "QLH_CONTROL_VOTER_ID is not in voter set")
     if fence is not None and fence.authority is not None and fence.authority.voter_set != voter_set:
         raise AutoRoleRuntimeError("auto_role_authority_mismatch", "control fence voter set differs from auto-role voter set")
-    private_key = _private_key_from_environment()
-    ledger_path = os.environ.get("QLH_CONTROL_VOTER_LEDGER", "").strip()
-    if not ledger_path:
-        ledger_path = str(Path(os.environ.get("QLH_STATE_DIR", ".qlh-state")).expanduser() / f"quorum-{voter_id}.sqlite3")
-    # #93：若部署给了本地 journal 复制副本，就用它当「已提交前缀」的权威：
-    # ① voter 签名前自检是否耐久持有；② leader 提议水位；③ 接管前核对（截断/拒绝）。
-    replica_path = os.environ.get("QLH_JOURNAL_REPLICA", "").strip()
-    prefix_authority: JournalPrefixAuthority | None = None
-    if replica_path:
-        workflows = [
-            item.strip()
-            for item in os.environ.get("QLH_COMMIT_WATERMARK_WORKFLOWS", "").split(",")
-            if item.strip()
-        ]
-        replica = DurableJournalReplica(
-            replica_path,
-            source_node_id=os.environ.get("QLH_JOURNAL_SOURCE_NODE_ID", "").strip() or voter_id,
-            stream_id=os.environ.get("QLH_JOURNAL_STREAM_ID", "").strip() or "journal-1",
-        )
-        # #93：配置了 quorum peers 就意味着「落后时可以主动追赶」——从对端拉回一个
-        # 已自洽的 checkpoint 再重试接管核对；没配就保持「拒绝接管」，绝不凑合上线。
-        replication_settings = JournalReplicationSettings.from_env()
-        recovery = None
-        if replication_settings.quorum_peers:
-
-            def recovery(  # noqa: F811 - 有意覆盖上面的 None
-                workflow_id: str,
-                _replica: DurableJournalReplica = replica,
-                _settings: JournalReplicationSettings = replication_settings,
-            ) -> None:
-                recover_journal_prefix(_replica, workflow_id=workflow_id, settings=_settings)
-
-        prefix_authority = JournalPrefixAuthority(
-            replica, workflows=workflows, recovery=recovery,
-        )
-    local = QuorumVoter(
-        voter_id=voter_id,
-        private_key=private_key,
-        voter_set=voter_set,
-        ledger=SQLiteVoterLedger(ledger_path, voter_id=voter_id, cluster_id=voter_set.cluster_id, voter_set_epoch=voter_set.voter_set_epoch),
-        watermark_source=prefix_authority.held if prefix_authority is not None else None,
-    )
-    secret = os.environ.get("QLH_CONTROL_VOTER_RPC_SECRET", "") or os.environ.get("QLH_CLUSTER_SECRET", "")
+    private_key = _private_key_from_environment(environment)
+    replication_settings = JournalReplicationSettings.from_env(environment)
+    secret = environment.get("QLH_CONTROL_VOTER_RPC_SECRET", "") or environment.get("QLH_CLUSTER_SECRET", "")
     if not secret:
         raise AutoRoleRuntimeError("auto_role_rpc_secret_missing", "voter RPC requires a shared secret")
-    peers = _json_env("QLH_CONTROL_VOTER_PEERS", {})
+    peers = _json_env("QLH_CONTROL_VOTER_PEERS", {}, environment)
     if not isinstance(peers, Mapping):
         raise AutoRoleRuntimeError("auto_role_peers_invalid", "QLH_CONTROL_VOTER_PEERS must be a JSON object")
-    lease_ms = int(os.environ.get("QLH_CONTROL_VOTER_LEASE_MS", "10000"))
+    lease_ms = int(environment.get("QLH_CONTROL_VOTER_LEASE_MS", "10000"))
     if lease_ms < 1000:
         raise AutoRoleRuntimeError("auto_role_lease_too_short", "auto-role lease must be at least one second")
-    timeout = float(os.environ.get("QLH_CONTROL_VOTER_RPC_TIMEOUT", AUTO_ROLE_RPC_TIMEOUT_SECONDS))
+    timeout = float(environment.get("QLH_CONTROL_VOTER_RPC_TIMEOUT", AUTO_ROLE_RPC_TIMEOUT_SECONDS))
     if not math.isfinite(timeout) or timeout <= 0:
         raise AutoRoleRuntimeError("auto_role_rpc_timeout_invalid", "voter RPC timeout must be positive and finite")
     peer_count = max(1, len(peers))
     timeout = min(timeout, lease_ms / (8000.0 * peer_count))
-    voters: dict[str, Any] = {voter_id: local}
+    voters: dict[str, Any] = {}
     for peer_id, endpoint in peers.items():
         peer_id = str(peer_id)
         if peer_id == voter_id:
@@ -438,23 +453,88 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None) -> AutoRoleRun
         if peer_id not in voter_set.voter_map:
             raise AutoRoleRuntimeError("auto_role_peer_invalid", "voter peer is not in voter set")
         voters[peer_id] = HTTPRemoteVoter(peer_id, str(endpoint), secret=secret, timeout=timeout)
-    if len(voters) < voter_set.quorum_size:
+    if len(voters) + 1 < voter_set.quorum_size:
         raise AutoRoleRuntimeError("auto_role_peers_incomplete", "configured voter peers cannot form a quorum")
+    ledger_path = environment.get("QLH_CONTROL_VOTER_LEDGER", "").strip()
+    if not ledger_path:
+        ledger_path = str(Path(environment.get("QLH_STATE_DIR", ".qlh-state")).expanduser() / f"quorum-{voter_id}.sqlite3")
+    # #93：若部署给了本地 journal 复制副本，就用它当「已提交前缀」的权威：
+    # ① voter 签名前自检是否耐久持有；② leader 提议水位；③ 接管前核对（截断/拒绝）。
+    replica_path = environment.get("QLH_JOURNAL_REPLICA", "").strip()
+    prefix_authority: JournalPrefixAuthority | None = None
+    replica = None
+    try:
+        if replica_path:
+            workflows = [
+                item.strip()
+                for item in environment.get("QLH_COMMIT_WATERMARK_WORKFLOWS", "").split(",")
+                if item.strip()
+            ]
+            replica = DurableJournalReplica(
+                replica_path,
+                source_node_id=environment.get("QLH_JOURNAL_SOURCE_NODE_ID", "").strip() or voter_id,
+                stream_id=environment.get("QLH_JOURNAL_STREAM_ID", "").strip() or "journal-1",
+            )
+            # #93：配置了 quorum peers 就意味着「落后时可以主动追赶」——从对端拉回一个
+            # 已自洽的 checkpoint 再重试接管核对；没配就保持「拒绝接管」，绝不凑合上线。
+            recovery = None
+            if replication_settings.quorum_peers:
+
+                def recovery(  # noqa: F811 - 有意覆盖上面的 None
+                    workflow_id: str,
+                    *, permit=None,
+                    _replica: DurableJournalReplica = replica,
+                    _settings: JournalReplicationSettings = replication_settings,
+                ) -> None:
+                    recover_journal_prefix(_replica, workflow_id=workflow_id, settings=_settings,
+                                           mutation_guard=permit.mutate if permit is not None else None,
+                                           permission_check=permit.check if permit is not None else None)
+
+            prefix_authority = JournalPrefixAuthority(
+                replica, workflows=workflows, recovery=recovery,
+            )
+        ledger = SQLiteVoterLedger(ledger_path, voter_id=voter_id, cluster_id=voter_set.cluster_id, voter_set_epoch=voter_set.voter_set_epoch)
+        if prefix_authority is None:
+            # Even without a graph replica, preserve the complete durable floor.
+            class UnavailableReplica:
+                def recovery_status(self, domain):
+                    return {"verified": False}
+                def close(self):
+                    pass
+            prefix_authority = JournalPrefixAuthority(UnavailableReplica())
+        prefix_authority.floor_provider = ledger.recovery_floors
+        prefix_authority.model_control = model_control
+        local = QuorumVoter(
+            voter_id=voter_id,
+            private_key=private_key,
+            voter_set=voter_set,
+            ledger=ledger,
+            watermark_source=prefix_authority.held if prefix_authority is not None else None,
+        )
+    except BaseException:
+        if replica is not None:
+            replica.close()
+        raise
+    voters[voter_id] = local
     collector = QuorumCollector(voter_set=voter_set, voters=voters, policy=QuorumPolicy(lease_duration_ms=lease_ms))
-    return AutoRoleRuntime(
+    result = AutoRoleRuntime(
         voter=local,
         collector=collector,
         secret=secret,
         commit_watermark_provider=prefix_authority.propose if prefix_authority is not None else None,
         committed_prefix_guard=prefix_authority.enforce if prefix_authority is not None else None,
     )
+    result._replica = prefix_authority.replica if prefix_authority is not None else None
+    return result
 
 
-def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = None) -> AutoRoleRuntime | None:
+def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = None, *, environment=None) -> AutoRoleRuntime | None:
     """Attach an auto controller only when ``QLH_NODE_ROLE=auto`` is explicit."""
-    if os.environ.get("QLH_NODE_ROLE", "").strip().lower() != "auto":
+    environment = dict(os.environ if environment is None else environment)
+    if environment.get("QLH_NODE_ROLE", "").strip().lower() != "auto":
         return None
-    runtime = build_auto_role_runtime(fence=fence)
+    runtime = build_auto_role_runtime(fence=fence, environment=environment,
+                                      model_control=getattr(scheduler, "_model_control", None))
     # ``auto`` is a controller mode, not a static role in the control
     # contract.  Keep the authority's compatibility role ``unknown`` while
     # the AutoRoleController owns the runtime role state.

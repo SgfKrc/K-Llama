@@ -27,6 +27,15 @@ def recovery_case(retirement_case, monkeypatch):
     """Real Scheduler/ModelHost/API owners; only persistence and model I/O are local."""
     case = retirement_case
     master = case.master
+    # This suite exercises import/retirement of the frozen legacy JSON schema.
+    # R3 SQLite crash/commit behavior is covered by test_refactor_deployment_owner.
+    master._model_control = None
+    legacy_new_master = case.new_master
+    def new_legacy_master(host):
+        restored = legacy_new_master(host)
+        restored.master._model_control = None
+        return restored
+    case.new_master = new_legacy_master
     master._running = True
     # The fixture's connected worker is healthy; both old participants are offline.
     assignments = []

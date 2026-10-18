@@ -726,10 +726,17 @@ class TestApiServerIntegration:
     def test_api_server_configures_explicit_scheduler_callbacks(self):
         import api_server
 
-        callbacks = api_server.scheduler.inference_callbacks
-        assert callbacks is model_host.scheduler_callbacks
-        assert callable(callbacks.execute_task_worker_stage)
-        assert callable(callbacks.active_task_graph_model_identity)
+        # R1 binds callbacks at explicit construction, so import stays inert.
+        resources = api_server._build_default_resources(
+            api_server._get_app_runtime().resolve_config(), host=model_host)
+        try:
+            callbacks = resources.scheduler.inference_callbacks
+            assert resources.host is model_host
+            assert callbacks is model_host.scheduler_callbacks
+            assert callable(callbacks.execute_task_worker_stage)
+            assert callable(callbacks.active_task_graph_model_identity)
+        finally:
+            resources.close()
 
     def test_no_reverse_import(self):
         # 阶段 0.5 验收项：scheduler 不再 import api_server
