@@ -1,9 +1,9 @@
 # 票 13 续验与阻塞复核（2026-10-16）
 
-> 状态：票 13、21a 开放；干净来源已冻结，严格三机 DL／LL 待复采；可信签名三平台实际发行执行后置为发布前门。
+> 状态：票 13、21a 开放；ROG 免安装首启与三机 DL／LL API 已验，frozen 来源修复与严格重采继续；可信签名三平台实际发行执行后置为发布前门。
 > 更新日期：2026-10-18
 
-此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11；当前收口范围与干净构建见 §12。
+此前 Android 真裁切和开发推理证据保留；新增提交中的三机 bundle 因来源与观测完整性缺口撤销严格通过结论。运行回执、独立校验与发行附件生产链已补齐，软件验证、来源阻塞复核及协议修复见 §8～§11；当前收口范围与干净构建见 §12，ROG 免安装续验及 frozen 来源合同见 §13。
 
 本记录复核此前同日的阻塞归因，保留原始证据于 `build/ci-release-followup-20261016/`；新证据独立存于 `build/ticket13-verify-20261016/`，不覆盖原始日志。§1～§5 是上午续验：当时主仓 HEAD `5f63b267c197dcf24af3905d12a33830f01a6ef2`、Android HEAD `07fcba305d5ac5ebd8e9497bab7aafbf6a78d409`，运行含未提交修改。这些改动已于 12:43 的一批提交入库；下午复核起点为干净主仓 `d657ca7f49365d6d50832b57c4fe1a0dde307c60`、Android `76a408a7f23dd1d5b332c9dac93273b8ab17f323`，新增修复与发行检查见 §6～§9。三端来源分别记录，不能仅以 HEAD 相同宣称最终同 revision 签名验收通过。
 
@@ -341,3 +341,55 @@ DL 的 `product-capture-addresses-r1/producer-result.json` 与 LL 的 `product-c
 - Windows 免安装包在 Surface 的真实 API 首启／入群仍待设备验证，可信签名三平台最终产物实际发行执行按后置发布前门安排。旧 Launcher 治理与后续独立分支顺序按本节开头执行。
 
 票 13 产品链验收保持开放，票 14 尚未启动。
+
+## 13. ROG 免安装续验与 frozen 来源合同（2026-10-18）
+
+适用范围为 Windows 免安装程序的独立运行环境、同来源 Android 更新、三机产品路径与来源观测；发行签名和发布总门继续按 §12 的后置安排验收。证据根为 `build/ticket13-rog-clean-20261018/`，产品进展索引 `physical-product-progress.json`。
+
+### 同来源产物与 ROG 首启
+
+固定来源为 `5d157b05eab6911328b3edcb87d9188eb7d09e85`，主仓及五个子模块 clean/pinned；`frozen-checkouts.json`、两端产物内的 `build-info.json` 分别记录实际修订。Windows 重新执行五个正式 spec，native llama／ggml／shim 按锁定源码实际编译，四个 GCC runtime DLL 来自指定工具链，九 DLL 摘要均绑定 `windows-package/native-fresh-build-receipt.json`。ZIP 为 129,597,720 bytes，SHA `5d4c7d893765d321858ff714547da2b059ea55f363e3bbc9c00938f2bf966fd1`；主 EXE SHA `753921abd4235123308edd01051faae997ca02b67553efb7644a3f7ed986b516`。559 项解压往返与 281 个 x64 PE 依赖检查通过；worker 文件共享冲突及单文件工具首次加载失败的原件保留，有界复试通过，详见 `windows-package/validation-report.json`。
+
+ROG 使用全新 `C:\Users\ROG\QLH-Portable-20261018-5d157b05` 目录，产品由包内 EXE 和依赖运行，PATH 限定系统及 Tailscale，沿用默认 state、节点 `rog-5060` 和加密凭据。按需计划任务没有重启触发器；PID 20348 实际持有 API 8001 与 TCP 8889，`/api/health` 返回 ok，worker 注册／hello 完成，连接指向唯一 master。旧验收源码目录仍在磁盘，未配置为产品依赖；该口径是隔离程序环境，并非全新操作系统。原件为 `rog-clean5d-deployment.stdout`、`rog-first-start.stdout`、`rog-ready-after-probe-cleanup.json`。
+
+Android 实际执行 `assembleDebug` 和正式 native 构建，APK 25,863,011 bytes，SHA `7d3a3a259f08cb29ee2449d008b9dc36085be96d41f4124fd14ad6afd3f35ec9`。沿用日常 debug 证书覆盖安装，安装字节回拉摘要完全一致，包内来源为 clean `5d157b05`。应用数据、SAF、身份及 USB 模式保持，见 `android-build/result.json` 与 `installed-update-receipt.json`。
+
+### 三机自动 DL／LL
+
+正式 `/api/models/intent`、`strategy=auto` 对 Qwen3.5-9B 形成以下连续 proper segments。容量倍率、预留、安全余量及 master 唯一协调边界保持产品配置。
+
+| 模式 | operation | 自动分配 | API 两问 |
+| --- | --- | --- | --- |
+| LL | `supply_ba62b17cf4004217a97a3e59cf20d640` | master llama.cpp `[0,20)` → ROG `[20,24)` → Y700 `[24,32)` | 2／6，text_stop，无 fallback |
+| DL | `supply_7186cf5a90764bca9a1e40232d34fc32` | master PyTorch/CUDA `[0,8)` → ROG llama.cpp `[8,24)` → Y700 `[24,32)` | 2／6，eos_token，无 fallback |
+
+两档每问均为 distributed_required，实际 workers 为 ROG 与 Y700，operation／config／整数 generation 与 ready 计划一致。LL 选择由独立产品操作创建，已有 ready 操作保留后采集；DL 由记录中的正式自动意图创建。DL 供给中 ROG 采用 distribute，Y700 采用 local_cut 后登记；真实状态原件见 `dl-portable-three-clean5d/intent-history.jsonl`。
+
+`pc_product_observer.observe_pc` 的 master 两档采集无 collection_errors：LL 实际范围 `[0,20)`，DL `[0,8)`，full_model_loaded=false，来源均 clean `5d157b05`。DL immutable materialization 为 108 个张量、5,494,026,496 bytes。Android 两档正式 product probe 的递归进程树 complete，native 均为 `[24,32)` 8 层、full_model_loaded=false。ROG 的 DL 独立 OS 映射观测仅见一个 3,465,964,704-byte GGUF，头信息为 qwen35／16 blocks，完整 SHA `aeb895453613e728baee5fb55e229140e992c7bbdc0a9b6bfd97f161a4b7875f`；产品进程及其 native 子进程均来自包内主 EXE，映射符合 `[8,24)`，见 `dl-clean5d-product-observation/rog-mapping.json`。
+
+一次 PowerShell 只读观测在 JSON 序列化时超时，遗留进程占用约 15 GB 私有内存，导致两机尝试被真实容量门拒绝。控制器以完整命令指纹确认并仅结束自身探针，ROG 可用 RAM 恢复至 10,145,439,744 bytes；产品进程与其他应用保持。拒绝诊断、独立内存观测、定向清理及恢复记录分别保存在 `ll-portable-two-node-clean5d/`、`rog-capacity-independent.json`、`rog-diagnostic-process-cleanup.json` 和 `rog-ready-after-probe-cleanup.json`。
+
+### frozen 来源缺口与修复
+
+clean5d 的 `runtime_source.initialize` 沿用源码 checkout 清单，frozen EXE 缺少源码目录／Git 时捕获失败。ROG 加载成功后，完整 `/api/diagnostics/product-runtime` 明确返回 409、`PRODUCT_OBSERVATION_UNAVAILABLE`、`startup source Git observation unavailable`，见 `rog-clean5d-frozen-source-refusal.json`。产品推理成功与严格来源通过分别记录。
+
+`runtime_frozen_source.export_package_manifest` 从实际完整程序包及已 staged 的 build-info 导出固定 `product-package-observation.json`。`runtime_source.initialize` 的 frozen 分支以真实 PID、创建时间、OS EXE、安装根 cwd 和完整文件大小／SHA 捕获启动事实；`observe_source` 复算同一库存，拒绝文件增减、内容漂移、链接／reparse、非法路径和启动身份变化。排除项仅为代码固定的顶层运行数据、清单自身及后生成的精确 `manifest/install-manifest.json`；其余程序文件仍纳入清单。`build-cpu.bat` 的 llama_cpp_only 档在伴随工具与 pubkeys 完成、provenance stage 之后导出，随后原发行签名步骤覆盖该来源清单。
+
+`product_observations._installed_exe_source` 和 `pc_product_observer.rehash_installed_exe` 增加独立的 installed_exe 合同，绑定 OS EXE／cwd、启动 manifest、完整程序库存、真实 build-info 字节 SHA 及 clean/full revision。独立复核重放曾发现纯门漏验 OS cwd，现已补规范化比较和前后漂移拒绝，原复现已转为明确拒绝。观测元数据用于证明来源字节一致性；可信发行认证继续由既有 release gate 验收。
+
+`api.routes_diagnostics.product_source_observation` 提供空载即可访问的 `/api/diagnostics/product-source`，共用 opt-in、真实 loopback peer、nonce 与现有 API 认证边界，不读取模型 manager；完整 runtime 入口保留模型事实要求。诊断 router 抽取和 OpenAPI 基线已由提交 `7d3390ad` 入库，其他来源修复保持工作树真实状态。
+
+最终定向整合 **10 文件、489 passed、3 skipped、47.86 秒**，跳过项均为本机 Windows 符号链接创建权限限制，见 `frozen-source-fix/final-integration/`。独立 observer 的 cwd 补充组合 **633 passed、3 skipped**；CPU 接线及既有 packaging 合同 **71 passed**；API／router 专项 **50 passed**。组合存在重叠，分别记录用途。
+
+### 修复试包的 ROG 实际验证
+
+五项产品补丁复制到独立 `5d157b05` checkout，正式 begin／stage／构建后复核均保留 source_dirty=true。五个 spec 重新冻结，九 DLL 复用上述同 pin、同输入的 clean5d 实编组并单列来源；新 ZIP 129,642,550 bytes，SHA `b5b68a19a14f1a760f2f89972a98c01a276136e05bc0ccd921ce819e1913e05e`，EXE SHA `8c930013333fbdd994876d5e58cb0cf294acb4b51c25e2f6ac2ee286616d11c4`，562 项完整解压往返通过。新 helper／router 的 frozen bytecode、来源清单与程序字节分别核验，原 clean 包保持原样，见 `windows-observation-fixed/zip-ready.json`。
+
+ROG 在独立 `QLH-Source-Observation-20261018` 目录、临时 state、single 模式和 API 8013 启动该真实 EXE。PID 14956 的 product-source 返回 200／installed_exe，560 个程序文件与独立外部 observer 的完整复算一致；PID／创建时间、OS EXE、安装根 cwd、清单和前后来源均绑定。实际观测约 3.66 秒，进程树没有模型映射；完整 product-runtime 因空载继续返回 409。严格 `_source` 明确拒绝 `source_dirty=true`。原件为 `source-only-independent-result.json`；实验实例已定向停止，默认 state 和 clean worker PID 20348 保持，见 `rog-source-only-stop-r2.json`。
+
+### 继续验收项
+
+- 修复入库后冻结新的同一 clean revision，三机 DL／LL 重采 Textual/SSE、逐段完成回执及完整独立节点观测，生成正式严格证据包。
+- 可信签名三平台最终发行执行、近期 Linux 实机与旧 Launcher 治理沿用 §12 的后置安排。
+
+票 13 产品链验收保持开放。
