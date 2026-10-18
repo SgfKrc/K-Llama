@@ -30,6 +30,7 @@ void llama_model_free(struct llama_model * ptr) { abort(); }
 void llama_free(struct llama_context * ptr) { abort(); }
 uint32_t llama_n_ctx(const struct llama_context * ptr) { return 32; }
 uint32_t llama_n_batch(const struct llama_context * ptr) { return 4; }
+uint64_t llama_model_size(const struct llama_model * ptr) { return sizeof(*ptr); }
 int32_t llama_model_n_layer(const struct llama_model * ptr) { return 1; }
 int32_t llama_model_n_embd(const struct llama_model * ptr) { return 2; }
 enum llama_rope_type llama_model_rope_type(const struct llama_model * ptr) { return LLAMA_ROPE_TYPE_NORM; }

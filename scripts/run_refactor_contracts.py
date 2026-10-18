@@ -76,16 +76,45 @@ def deployment_targets() -> list[str]:
     return targets
 
 
+def execution_targets() -> list[str]:
+    manifest = json.loads((MANIFEST.parent / "refactor_execution_suite_v1.json").read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("base_suite") != "refactor_deployment_suite_v1.json":
+        raise ValueError("invalid R4 execution suite manifest")
+    targets = deployment_targets() + manifest["additional_targets"]
+    if len(targets) != len(set(targets)):
+        raise ValueError("duplicate execution test target")
+    for target in targets:
+        path = (ROOT / target.split("::", 1)[0]).resolve()
+        if not path.is_relative_to(ROOT / "tests") or not path.is_file():
+            raise ValueError(f"invalid execution test target: {target}")
+    return targets
+
+
+def client_targets() -> list[str]:
+    manifest = json.loads((MANIFEST.parent / "refactor_client_cutover_suite_v1.json").read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("base_suite") != "refactor_execution_suite_v1.json":
+        raise ValueError("invalid R5 client suite manifest")
+    promoted = set(manifest["promoted_files"])
+    targets = [t for t in execution_targets() if t.split("::", 1)[0] not in promoted] + manifest["additional_targets"]
+    if len(targets) != len(set(targets)):
+        raise ValueError("duplicate client test target")
+    for target in targets:
+        path = (ROOT / target.split("::", 1)[0]).resolve()
+        if not path.is_relative_to(ROOT / "tests") or not path.is_file():
+            raise ValueError(f"invalid client test target: {target}")
+    return targets
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("contract", "bootstrap", "catalog", "deployment"), default="contract")
+    parser.add_argument("--stage", choices=("contract", "bootstrap", "catalog", "deployment", "execution", "client"), default="contract")
     parser.add_argument("--workers", type=int, choices=range(5), default=0)
     parser.add_argument("--seed", type=int, default=20261018)
     parser.add_argument("--junitxml", type=Path, default=ROOT / "test-results" / "refactor-contracts.xml")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     args.junitxml = (ROOT / args.junitxml).resolve()
-    targets = {"contract": suite_targets, "bootstrap": bootstrap_targets, "catalog": catalog_targets, "deployment": deployment_targets}[args.stage]()
+    targets = {"contract": suite_targets, "bootstrap": bootstrap_targets, "catalog": catalog_targets, "deployment": deployment_targets, "execution": execution_targets, "client": client_targets}[args.stage]()
     command = [sys.executable, "-B", "-m", "pytest", *targets, "-n", str(args.workers),
                "--maxfail=0", "--tb=short", "-qq", "--qlh-order-seed", str(args.seed),
                "--junitxml", str(args.junitxml)]
@@ -94,7 +123,7 @@ def main(argv=None) -> int:
     if args.dry_run:
         print(json.dumps(command, ensure_ascii=False))
         return 0
-    label = {"contract": "R0", "bootstrap": "R1 bootstrap", "catalog": "R2 catalog", "deployment": "R3 deployment"}[args.stage]
+    label = {"contract": "R0", "bootstrap": "R1 bootstrap", "catalog": "R2 catalog", "deployment": "R3 deployment", "execution": "R4 execution", "client": "R5 client"}[args.stage]
     print(f"{label} suite: {len(targets)} targets, workers={args.workers}, seed={args.seed}", flush=True)
     args.junitxml.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(command, cwd=ROOT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, check=False)

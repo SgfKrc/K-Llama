@@ -25,13 +25,12 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER_SCHEMA_VERSION = "qlh.simulation_runner.v1"
 
 QUICK_TEST_TARGETS = (
-    "tests/test_task_graph_simulation.py",
+    "tests/test_refactor_execution.py",
     "tests/test_task_worker_control_simulation.py",
-    "tests/test_capacity_simulation.py",
+    "tests/test_linear_simulation.py",
 )
 EXTENDED_TEST_TARGETS = QUICK_TEST_TARGETS + (
-    "tests/test_task_graph_parallel.py",
-    "tests/test_task_graph_fencing.py",
+    "tests/test_refactor_execution_integration.py",
     "tests/test_task_worker_protocol.py",
     "tests/test_task_worker_adapter.py",
 )
@@ -154,13 +153,8 @@ def _collect_evidence() -> list[dict[str, Any]]:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-    from tests.simulation.capacity_harness import (
-        CapacitySimulationHarness,
-        available_scenarios as available_capacity_scenarios,
-    )
-    from tests.simulation.task_graph_harness import (
-        TaskGraphSimulationHarness,
-        available_scenarios as available_task_graph_scenarios,
+    from tests.simulation.linear_harness import (
+        LinearSimulationHarness, available_scenarios as available_linear_scenarios,
     )
     from tests.simulation.task_worker_harness import (
         TaskWorkerControlSimulationHarness,
@@ -168,9 +162,8 @@ def _collect_evidence() -> list[dict[str, Any]]:
     )
 
     families = (
-        ("task_graph", TaskGraphSimulationHarness, available_task_graph_scenarios),
+        ("linear_execution", LinearSimulationHarness, available_linear_scenarios),
         ("task_worker_control", TaskWorkerControlSimulationHarness, available_task_worker_scenarios),
-        ("capacity", CapacitySimulationHarness, available_capacity_scenarios),
     )
     evidence: list[dict[str, Any]] = []
     for family, harness_type, scenarios in families:
