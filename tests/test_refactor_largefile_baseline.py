@@ -24,6 +24,7 @@ from api import (  # noqa: E402
     routes_chat,
     routes_cluster,
     routes_device,
+    routes_diagnostics,
     routes_health,
     routes_logs,
     routes_model_intent,
@@ -367,6 +368,9 @@ def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
         routes_chat: 7,
         routes_system: 3,
         routes_logs: 12,
+        # ★ 2026-10-18：票 13 的两个诊断端点原先以 `@app.get(...)` 直接写在
+        #   api_server.py（违反本文件第 420 行的结构约束），已搬进独立 router。
+        routes_diagnostics: 2,
     }
     assert api_server._api_route_modules == tuple(expected)
     for module, count in expected.items():
@@ -413,7 +417,9 @@ def test_api_routers_cover_every_openapi_operation() -> None:
     )
     # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate ⇒ 147 -> 148
     # ★ 票 12d MODEL-INTENT-UX-01 新增 /api/models/intent 一族 ⇒ 148 -> 160
-    assert sum(routed.values()) == 160
+    # ★ 票 13 新增 /api/diagnostics/product-source 与 product-runtime ⇒ 160 -> 162
+    #   （两个端点同时从 api_server 搬进 routes_diagnostics，见上方 expected）
+    assert sum(routed.values()) == 162
     assert routed == openapi
 
 
