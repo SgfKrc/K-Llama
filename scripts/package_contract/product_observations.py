@@ -26,6 +26,15 @@ Required raw structure (all timestamps are original observer timestamps):
         files: [{path, sha256}]}, rehashed_files: [{path, sha256}]}
       runtime_manifest_sha256 is the manifest identity observed from the running
       process's startup/deployment receipt, NOT a CLI revision/deployment note.
+    source (frozen PC/master): {kind: installed_exe, pid, created_at,
+        source_root, executable, executable_sha256, build_info, build_info_sha256,
+        manifest, manifest_sha256, runtime_manifest_sha256, rehashed_files,
+        source_revision, source_dirty}
+      build_info_sha256 is the real file-byte SHA256. The canonical JSON SHA
+      is additionally compared to independently parsed build-info file bytes.
+      facts.package_rehash retains the external Python controller's fresh full
+      inventory and actual UTF-8 manifest/build-info text. This proves observed
+      package bytes and startup identity, without asserting a release signature.
     source (Android): {kind: installed_apk, pid, created_at, package,
         path_before, path_after, sha256_before, sha256_after, pulled_sha256,
         build_info_sha256, build_info, build_info_entry, extraction: apk_zip}
@@ -159,7 +168,181 @@ def _canonical_hash(value):
                                      ensure_ascii=True, allow_nan=False).encode()).hexdigest()
 
 
-def _source(source, root, platform, revision):
+_FROZEN_SOURCE_FIELDS = {
+    "kind", "pid", "created_at", "source_root", "executable", "executable_sha256",
+    "build_info", "build_info_sha256", "manifest", "manifest_sha256",
+    "runtime_manifest_sha256", "rehashed_files", "source_revision", "source_dirty",
+}
+_FROZEN_MANIFEST_FIELDS = {
+    "schema_version", "source_revision", "source_dirty", "executable_relative",
+    "build_info_sha256", "files",
+}
+_FROZEN_REHASH_FIELDS = {
+    "method", "observer", "started_at", "finished_at", "pid", "created_at",
+    "source_root", "executable", "executable_sha256", "build_info", "build_info_sha256",
+    "build_info_text", "manifest", "manifest_sha256", "manifest_text", "rehashed_files",
+}
+
+
+def _exact_object(value, fields, name):
+    value = _dict(value, name)
+    require(set(value) == fields, f"{name} has missing or extra fields")
+    return value
+
+
+def _frozen_relative(value):
+    require(isinstance(value, str) and value and not value.startswith("/")
+            and not any(ord(c) < 32 or c in '\\:<>"|?*' for c in value),
+            "unsafe installed EXE package path")
+    for part in value.split("/"):
+        require(part not in ("", ".", "..") and not part.endswith((" ", "."))
+                and not re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part),
+                "unsafe installed EXE package path")
+    return value
+
+
+def _frozen_absolute(value):
+    require(isinstance(value, str) and value and not value.startswith(("\\", "//")),
+            "unsafe installed EXE absolute path")
+    windows = bool(re.match(r"^[A-Za-z]:[\\/]", value))
+    require(windows or value.startswith("/"), "installed EXE path must be absolute")
+    rest = value[3:] if windows else value[1:]
+    _frozen_relative(rest.replace("\\", "/") if windows else rest)
+    return _path(value)
+
+
+# Fixed exclusions are never supplied by the endpoint, environment or caller.
+# Only installation-root user state is omitted; nested DLL/script trees remain
+# part of the program inventory, including directories named config or models.
+_FROZEN_USER_ROOTS = {"models", "chat_history", "logs", "config", "local_docs", "state"}
+_FROZEN_USER_FILES = {".env", ".tailscale_joined", "node_config.json", "node_secrets.json",
+                      "qlh-control.sqlite3", "qlh-control.sqlite3-wal", "qlh-control.sqlite3-shm",
+                      "qlh-control.sqlite3-journal"}
+
+
+def _frozen_excluded(name):
+    parts = name.casefold().split("/")
+    return (parts[0] in _FROZEN_USER_ROOTS
+            or name.casefold() == "product-package-observation.json"
+            or name == "manifest/install-manifest.json"
+            or (len(parts) == 1 and parts[0] in _FROZEN_USER_FILES))
+
+
+def _frozen_entries(value, label):
+    records, names = {}, []
+    for item in _list(value, f"installed EXE {label} files", nonempty=True):
+        item = _exact_object(item, {"path", "size_bytes", "sha256"}, f"installed EXE {label} file")
+        name = _frozen_relative(item.get("path"))
+        require(not _frozen_excluded(name), "installed EXE inventory includes observation marker or runtime user data")
+        key = name.casefold()
+        require(key not in records, f"duplicate installed EXE {label} file")
+        records[key] = (name, _int(item.get("size_bytes"), f"installed EXE {label} size_bytes", 0),
+                        _hash(item.get("sha256"), f"installed EXE {label} file SHA256"))
+        names.append(name)
+    require(names == sorted(names), f"installed EXE {label} file inventory must be sorted")
+    return records
+
+
+def _finite_json(value):
+    if isinstance(value, dict):
+        require(all(isinstance(k, str) for k in value), "invalid installed EXE JSON key")
+        for member in value.values():
+            _finite_json(member)
+    elif isinstance(value, list):
+        for member in value:
+            _finite_json(member)
+    else:
+        require(value is None or type(value) in (str, bool, int)
+                or (type(value) is float and math.isfinite(value)), "invalid/non-finite installed EXE JSON value")
+
+
+def _frozen_json_text(value, name):
+    require(isinstance(value, str), f"missing installed EXE {name} text")
+    try:
+        parsed = json.loads(value.removeprefix("\ufeff"), object_pairs_hook=_object, parse_constant=_constant)
+    except (ValueError, RecursionError) as exc:
+        raise ObservationError(f"invalid installed EXE {name} JSON: {exc}") from exc
+    _finite_json(parsed)
+    return _dict(parsed, f"installed EXE {name}"), value.encode("utf-8")
+
+
+def _installed_exe_source(source, root, revision, package_rehash, window):
+    _exact_object(source, _FROZEN_SOURCE_FIELDS, "installed EXE source")
+    _finite_json(source)
+    observed_exe = _frozen_absolute(root.get("executable"))
+    require(_frozen_absolute(source.get("executable")) == observed_exe,
+            "installed EXE differs from OS root executable")
+    flavor = ntpath if re.match(r"^[A-Za-z]:", observed_exe) else posixpath
+    package_root = _frozen_absolute(source.get("source_root"))
+    require(package_root == flavor.dirname(observed_exe), "installed EXE source root differs from OS executable parent")
+    require(_frozen_absolute(root.get("cwd")) == package_root, "installed EXE OS process cwd differs from package root")
+    manifest = _exact_object(source.get("manifest"), _FROZEN_MANIFEST_FIELDS, "installed EXE manifest")
+    require(type(manifest.get("schema_version")) is int and manifest["schema_version"] == 1,
+            "invalid installed EXE manifest schema_version")
+    relative = _frozen_relative(manifest.get("executable_relative"))
+    require("/" not in relative and relative.lower().endswith(".exe")
+            and _path(flavor.join(package_root, relative)) == observed_exe,
+            "installed EXE manifest executable differs from OS root executable")
+    digest = _canonical_hash(manifest)
+    require(digest == source.get("manifest_sha256") == source.get("runtime_manifest_sha256"),
+            "installed EXE manifest differs from running process startup manifest")
+    expected = _frozen_entries(manifest.get("files"), "manifest")
+    require(expected == _frozen_entries(source.get("rehashed_files"), "runtime rehash"),
+            "installed EXE runtime rehash missing files, extra files, or content mismatch")
+    exe_digest = _hash(source.get("executable_sha256"), "installed EXE SHA256")
+    require(relative.casefold() in expected and expected[relative.casefold()][0] == relative
+            and expected[relative.casefold()][1] > 0 and expected[relative.casefold()][2] == exe_digest,
+            "installed EXE hash is not bound to manifest file entry")
+    require("build-info.json" in expected, "installed EXE manifest missing build-info.json file entry")
+    info = _dict(source.get("build_info"), "installed EXE build-info")
+    require(type(info.get("schema_version")) is int and info["schema_version"] == 1,
+            "invalid installed EXE build-info schema_version")
+    info_digest = _canonical_hash(info)
+    # The public SHA field is the real file-byte digest, matching the builder.
+    # Canonical JSON SHA is compared independently to the fresh parsed bytes.
+    build_digest = _hash(source.get("build_info_sha256"), "installed EXE build-info SHA256")
+    require(build_digest == manifest.get("build_info_sha256") == expected["build-info.json"][2],
+            "installed EXE build-info SHA256 differs from manifest file entry")
+    for record in (source, manifest, info):
+        _hash(record.get("source_revision"), "installed EXE source revision", 40)
+        require(record.get("source_revision") == revision, "running source revision differs from expected revision")
+        require(record.get("source_dirty") is False, "installed EXE source_dirty must be explicitly false")
+
+    fresh = _exact_object(package_rehash, _FROZEN_REHASH_FIELDS, "independent installed EXE package rehash")
+    _finite_json(fresh)
+    require(fresh.get("method") == "independent_frozen_package_rehash"
+            and fresh.get("observer") == "external_python_controller",
+            "installed EXE package lacks independent external observer rehash")
+    require(_identity(fresh) == _identity(root), "installed EXE independent rehash belongs to another process")
+    began = _number(fresh.get("started_at"), "installed EXE rehash started_at")
+    ended = _number(fresh.get("finished_at"), "installed EXE rehash finished_at")
+    require(window is not None and window[0] <= began <= ended <= window[1],
+            "installed EXE independent rehash outside original observation window")
+    require(_frozen_absolute(fresh.get("source_root")) == package_root
+            and _frozen_absolute(fresh.get("executable")) == observed_exe,
+            "installed EXE independent rehash path differs from OS root executable")
+    require(fresh.get("executable_sha256") == exe_digest,
+            "installed EXE independent executable SHA256 mismatch")
+    disk_manifest, _ = _frozen_json_text(fresh.get("manifest_text"), "manifest")
+    disk_info, info_bytes = _frozen_json_text(fresh.get("build_info_text"), "build-info")
+    require(disk_manifest == fresh.get("manifest") == manifest
+            and _canonical_hash(disk_manifest) == _canonical_hash(fresh.get("manifest"))
+            == fresh.get("manifest_sha256") == digest,
+            "installed EXE actual manifest differs from startup manifest")
+    require(disk_info == fresh.get("build_info") == info
+            and _canonical_hash(disk_info) == _canonical_hash(fresh.get("build_info")) == info_digest
+            and fresh.get("build_info_sha256") == build_digest,
+            "installed EXE actual build-info differs from runtime build-info")
+    require(expected == _frozen_entries(fresh.get("rehashed_files"), "independent rehash"),
+            "installed EXE independent rehash missing files, extra files, or content mismatch")
+    build_entry = expected["build-info.json"]
+    require(build_entry[0] == "build-info.json" and build_entry[1] > 0 and build_entry[1] == len(info_bytes)
+            and build_entry[2] == hashlib.sha256(info_bytes).hexdigest(),
+            "installed EXE actual build-info bytes differ from manifest file entry")
+    return info
+
+
+def _source(source, root, platform, revision, package_rehash=None, window=None):
     source = _dict(source, "facts.source: runtime-bound source provenance")
     require(_identity(source) == _identity(root), "source provenance belongs to another process")
     if platform == "android":
@@ -177,6 +360,8 @@ def _source(source, root, platform, revision):
                 "installed APK changed during extraction or pulled bytes differ")
         info = _dict(source.get("build_info"), "installed APK build-info")
         require(_canonical_hash(info) == source.get("build_info_sha256"), "APK build-info digest mismatch")
+    elif source.get("kind") == "installed_exe":
+        info = _installed_exe_source(source, root, revision, package_rehash, window)
     else:
         require(source.get("kind") == ("synced_manifest" if platform == "pc" else "runtime_manifest"),
                 "missing PID-bound runtime/deployment manifest and full content rehash (checkout/CLI is not running source)")
@@ -371,7 +556,8 @@ def derive_node_observation(raw, *, expected_revision, expected_node_id,
     for _ in processes:
         descendants.update(pid for proc in processes if proc["pid"] in descendants for pid in proc["child_pids"])
     require(descendants == set(by_pid), "disconnected/cyclic process tree")
-    info = _source(facts.get("source"), root, platform, expected_revision)
+    info = _source(facts.get("source"), root, platform, expected_revision,
+                   facts.get("package_rehash"), (start, end))
     if platform == "android":
         require(facts["source"].get("package") == runtime.get("package_name"), "Android runtime/APK package mismatch")
     artifact = _dict(runtime.get("artifact"), "runtime artifact: loaded segment provenance missing")

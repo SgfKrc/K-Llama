@@ -60,8 +60,10 @@ def test_runtime_missing_facts_return_specific_conflict(monkeypatch):
 
 
 def test_registered_readonly_route_uses_existing_common_middleware():
-    routes=[route for route in api.app.routes if getattr(route,"path",None)=="/api/diagnostics/product-runtime"]
+    routes=[route for module in api._api_route_modules for route in module.router.routes
+            if getattr(route,"path",None)=="/api/diagnostics/product-runtime"]
     assert len(routes)==1 and routes[0].methods=={"GET"}
     assert routes[0].endpoint is api.product_runtime_observation
+    assert set(api.app.openapi()["paths"]["/api/diagnostics/product-runtime"])=={"get"}
     assert "/api/diagnostics/product-runtime" not in api._API_SOURCE_EXEMPT_PATHS
     assert "/api/diagnostics/product-runtime" not in api._API_AUTH_EXEMPT_PATHS

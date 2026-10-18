@@ -1,6 +1,9 @@
 ﻿"""Read-only PC/master OS observation bracketed by in-process loader receipts.
 
 The HTTP endpoint must already be running with QLH_PRODUCT_OBSERVATION=1.
+This script runs under the external experiment controller's Python and psutil;
+these are not dependencies added to the observed frozen product. installed_exe
+observations verify source bytes, independently of release signing policy.
 No model preparation, loading, configuration or process launch occurs here.
 """
 from __future__ import annotations
@@ -37,6 +40,14 @@ def process_observation(pid, api_port):
             entry = {"pid": process.pid}
             try:
                 entry.update(_identity(process), parent_pid=process.ppid(), command=process.cmdline(), cwd=process.cwd())
+                # Legacy/source mocks need not implement exe(); frozen provenance
+                # explicitly requires this OS fact in rehash_installed_exe/validator.
+                exe = getattr(process, "exe", None)
+                if callable(exe):
+                    try:
+                        entry["executable"] = exe()
+                    except (psutil.Error, OSError) as exc:
+                        entry["executable_error"] = type(exc).__name__ + ": " + str(exc)
                 children = sorted(p.pid for p in process.children())
                 entry.update(child_pids=children, children_complete=True)
                 entry["model_mappings"] = sorted({m.path for m in process.memory_maps(grouped=False)
@@ -73,7 +84,8 @@ def _request(base, nonce):
     if token:
         request.add_header("Authorization", "Bearer " + token)
     with urllib.request.urlopen(request, timeout=120) as response:
-        return json.load(response)
+        contract = _frozen_contract()
+        return json.load(response, object_pairs_hook=contract._object, parse_constant=contract._constant)
 
 
 def rehash_artifact(runtime):
@@ -179,6 +191,70 @@ def rehash_artifact(runtime):
     if path.is_file() and actual != artifact.get("sha256"):
         raise ValueError("independently rehashed artifact differs from loaded identity")
     return {"path": str(path), "sha256": actual, "files": files, **binding}
+
+
+def _frozen_contract():
+    directory = str(Path(__file__).resolve().parent)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    import product_observations
+    return product_observations
+
+
+def rehash_installed_exe(root):
+    """Fresh filesystem-only package reads anchored to the observed OS EXE.
+
+    The shared helper reads the entire actual package twice without a cache.
+    No API inventory, API rehashed_files, revision environment or installation
+    configuration chooses the files or root. psutil runs in this external
+    experiment controller; the product gains no Python/psutil dependency.
+    """
+    import psutil
+    contract = _frozen_contract()
+    source = str(Path(__file__).resolve().parents[2] / "src")
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import runtime_frozen_source as frozen
+
+    started = time.time()
+    identity = {key: root.get(key) for key in ("pid", "created_at")}
+    contract._identity(identity)
+    observed_exe = contract._frozen_absolute(root.get("executable"))
+
+    def check_process():
+        # Use a fresh psutil object; Windows caches exe()/create_time() per object.
+        process = psutil.Process(identity["pid"])
+        executable = Path(process.exe())
+        if (_identity(process) != identity
+                or contract._frozen_absolute(str(executable)) != observed_exe):
+            raise ValueError("installed EXE OS process identity/executable changed during rehash")
+        if contract._frozen_absolute(process.cwd()) != contract._frozen_absolute(str(executable.parent)):
+            raise ValueError("installed EXE OS process cwd differs from executable parent during rehash")
+        return executable
+
+    executable = check_process()
+    package_root = frozen._root(executable.parent)
+    current = frozen._verify_package(package_root)
+    # Retain actual text, including whitespace/BOM, so the pure validator can
+    # bind canonical JSON contents AND byte SHA to the build-info file entry.
+    marker, _, marker_bytes = frozen._hash_member(package_root, frozen.MANIFEST_NAME,
+                                                 limit=frozen._MANIFEST_LIMIT)
+    info, _, info_bytes = frozen._hash_member(package_root, frozen.BUILD_INFO_NAME,
+                                             limit=frozen._BUILD_INFO_LIMIT)
+    if (marker["sha256"] != current["_manifest_file_sha256"]
+            or info["sha256"] != current["build_info_sha256"]):
+        raise ValueError("installed EXE metadata changed during independent rehash")
+    if check_process() != executable:
+        raise ValueError("installed EXE OS executable changed during rehash")
+    manifest = current["manifest"]
+    if (package_root / manifest["executable_relative"]) != executable:
+        raise ValueError("installed EXE manifest differs from OS root executable")
+    return {"method": "independent_frozen_package_rehash", "observer": "external_python_controller",
+            "started_at": started, "finished_at": time.time(), **identity,
+            "source_root": str(package_root), "executable": str(executable),
+            **{key: current[key] for key in ("executable_sha256", "build_info", "build_info_sha256",
+                                            "manifest", "manifest_sha256", "rehashed_files")},
+            "build_info_text": info_bytes.decode("utf-8"), "manifest_text": marker_bytes.decode("utf-8")}
 
 
 def bind_artifact_rehash(runtime, rehashed):
@@ -317,6 +393,24 @@ def observe_pc(*, node_id, platform, base="http://127.0.0.1:8000", operation_id=
                          "returncode": 0 if not observed.get("error") and observed["process_tree"]["complete"] else 1,
                          "stdout": json.dumps(observed, ensure_ascii=False), "stderr": observed.get("error", "")})
         result["facts"].update({key: observed[key] for key in ("identity_before", "identity_after", "process_tree") if key in observed})
+        if (before.get("source") or {}).get("kind") == "installed_exe":
+            roots = [entry for entry in observed.get("process_tree", {}).get("processes", [])
+                     if entry.get("pid") == before["pid"]]
+            if len(roots) != 1:
+                raise ValueError("installed EXE root process missing/duplicate in OS observation")
+            record = {"command": ["external-python-observer", "independent-installed-exe-rehash",
+                                  str(before["pid"]), roots[0].get("executable", "")],
+                      "started_at": time.time(), "stdout": "", "stderr": ""}
+            try:
+                package_rehash = rehash_installed_exe(roots[0])
+                result["facts"]["package_rehash"] = package_rehash
+                record.update(returncode=0, stdout=json.dumps(package_rehash, ensure_ascii=False))
+            except Exception as exc:
+                record.update(returncode=1, stderr=type(exc).__name__ + ": " + str(exc))
+                raise
+            finally:
+                record["finished_at"] = time.time()
+                commands.append(record)
         began = time.time()
         record = {"command": ["independent-artifact-rehash", before["runtime"].get("artifact", {}).get("path", "")],
                   "started_at": began, "stdout": "", "stderr": ""}
@@ -333,6 +427,12 @@ def observe_pc(*, node_id, platform, base="http://127.0.0.1:8000", operation_id=
         after = receipt()
         if (before.get("pid"), before.get("created_at")) != (after.get("pid"), after.get("created_at")):
             raise ValueError("API process restarted during observation")
+        if (before.get("source") or {}).get("kind") == "installed_exe":
+            contract = _frozen_contract()
+            contract._finite_json(before["source"])
+            contract._finite_json(after.get("source"))
+            if contract._canonical_hash(before["source"]) != contract._canonical_hash(after.get("source")):
+                raise ValueError("actual runtime/source changed during OS observation")
         if not _same_runtime(before["runtime"], after["runtime"]) or before.get("source") != after.get("source"):
             raise ValueError("actual runtime/source changed during OS observation")
         runtime = bind_artifact_rehash(after["runtime"], rehashed)

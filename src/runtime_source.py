@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 
 _LOCK = threading.Lock()
@@ -158,8 +159,12 @@ def initialize(root=None):
             return
         try:
             import psutil
-            source_root = Path(root or Path(__file__).resolve().parents[1]).resolve()
             process = psutil.Process(os.getpid())
+            if getattr(sys, "frozen", False):
+                from runtime_frozen_source import capture_startup
+                _STARTUP = capture_startup(process, root=root)
+                return
+            source_root = Path(root or Path(__file__).resolve().parents[1]).resolve()
             identity = {"pid": process.pid, "created_at": process.create_time()}
             _require(Path(process.cwd()).resolve() == source_root, "running process cwd differs from source root")
             configured = os.environ.get("QLH_RUNTIME_SOURCE_MANIFEST")
@@ -189,6 +194,9 @@ def observe_source(platform):
     snapshot = startup_source()
     import psutil
     process = psutil.Process(os.getpid())
+    if snapshot.get("kind") == "installed_exe":
+        from runtime_frozen_source import observe_source as observe_frozen_source
+        return observe_frozen_source(snapshot, process)
     _require((process.pid, process.create_time()) == (snapshot["pid"], snapshot["created_at"]),
              "startup receipt belongs to another process")
     root = Path(snapshot["source_root"])

@@ -1670,9 +1670,8 @@ class FirstConnectBootstrapRequest(BaseModel):
 # 辅助函数
 # ============================================================
 
-@app.get("/api/diagnostics/product-runtime")
-def product_runtime_observation(request: Request, nonce: str):
-    """Explicit lab observation over the existing loopback API and auth boundary."""
+def _require_product_observation_request(request: Request, nonce: str):
+    """Share the opt-in and actual peer checks across product diagnostics."""
     import ipaddress
     enabled = os.environ.get("QLH_PRODUCT_OBSERVATION") == "1"
     try:
@@ -1685,19 +1684,6 @@ def product_runtime_observation(request: Request, nonce: str):
         raise HTTPException(404, "Not found")
     if not re.fullmatch(r"[0-9a-f]{32}", nonce):
         raise HTTPException(422, "Invalid observation nonce")
-    from product_runtime_receipt import capture_runtime
-    import psutil
-    process = psutil.Process(os.getpid())
-    role = "master" if scheduler._effective_role() == "master" else "pc"
-    # The helper reads the existing runtime owners with their established locks;
-    # source rehash happens separately and never constructs a model manager.
-    try:
-        runtime = capture_runtime(sys.modules[__name__])
-        source = _product_runtime_source.observe_source(role)
-    except ValueError as exc:
-        raise HTTPException(409, {"code": "PRODUCT_OBSERVATION_UNAVAILABLE", "message": str(exc)}) from exc
-    return {"nonce": nonce, "pid": process.pid, "created_at": process.create_time(),
-            "captured_at": time.time(), "runtime": runtime, "source": source, "errors": []}
 
 
 def _peek_model_manager():
@@ -6708,13 +6694,14 @@ from api import routes_model_intent as _intent_routes
 from api import routes_auth as _auth_routes
 from api import routes_sessions as _sessions_routes
 from api import routes_tasks as _tasks_routes
+from api import routes_diagnostics as _diagnostics_routes
 from api import routes_chat as _chat_routes
 from api import routes_system as _system_routes
 
 _api_route_modules = (
     _health_routes, _device_routes, _cluster_routes, _models_routes, _supply_routes, _intent_routes,
     _auth_routes, _sessions_routes, _tasks_routes, _chat_routes,
-    _system_routes, _logs_routes,
+    _system_routes, _logs_routes, _diagnostics_routes,
 )
 for _route_module in _api_route_modules:
     _route_module.configure_api_module(sys.modules[__name__])
