@@ -9,7 +9,7 @@
 3. 数据作用域最后关口：拒绝时不发出任何对外请求
 4. 错误分类中文化（不可达 / HTTP 状态码 / retryable 判定），凭据脱敏
 5. ExternalOpenAIProvider 经 ProviderRegistry 注册-预约-执行-取消全链路
-6. ModelIdentity engine="external_api" 被 task_provider / task_worker_protocol
+6. ModelIdentity engine="external_api" 被 execution_provider / task_worker_protocol
    扩展后的校验集接受
 7. API 层：/api/status external 段、/api/chat 外部路由 / 作用域拒绝 /
    后端故障回退本地 / prefer_external 无本地引擎的 502、/api/chat/stream SSE
@@ -49,7 +49,7 @@ from external_provider import (
     external_model_identity,
     mask_external_url,
 )
-from task_provider import (
+from execution_provider import (
     ModelIdentity,
     ProviderExecutionError,
     ProviderRegistry,
@@ -715,7 +715,7 @@ def test_model_identity_external_api_accepted(monkeypatch, mock_external_server)
     assert len(identity.sha256) == 64
     assert identity.revision.startswith("external-")
 
-    # ModelIdentity 直接构造同样接受 external_api（task_provider 扩展）
+    # ModelIdentity 直接构造同样接受 external_api（execution_provider 扩展）
     ModelIdentity(
         model_id="external-api",
         engine="external_api",

@@ -163,7 +163,7 @@ def detect_runtime_profile() -> str:
     """
     读取本进程的发行 profile（环境变量 `QLH_RUNTIME_PROFILE`）。
 
-    该变量由 `qlh_launcher` 选定并写入环境，子进程继承。只认 `RUNTIME_PROFILES`
+    该变量由应用首启选定并写入环境，子进程继承。只认 `RUNTIME_PROFILES`
     内的取值；未设置或不在此集合内一律返回 `unspecified`。
 
     字段随注册 device_info 上报主节点，使调度能区分"无 torch 的边缘发行节点"

@@ -14,6 +14,7 @@ GIB = 1024**3
 
 def capacity_operation(*, code=CAPACITY_CODE, scope="candidate_plan"):
     return {
+        "schema_version": 2, "revision": 7, "identity": {"boot_id": "tui-test"}, "observed_at": 100, "validity": "valid", "runnable": False,
         "operation_id": "supply_" + "d" * 32,
         "intent": {"model_id": "qwen35-9b"},
         "status": "waiting_nodes",
@@ -128,7 +129,7 @@ def test_vram_label_is_explicit_and_keeps_zero_deficit_from_owner():
 @pytest.mark.parametrize("code", [CAPACITY_CODE, "pipeline_distributed_workers_unavailable"])
 def test_old_diagnostic_cannot_override_current_lifecycle(status, ready, label, code):
     operation = capacity_operation(code=code)
-    operation.update(status=status, loaded_ready=ready)
+    operation.update(status=status, loaded_ready=ready, runnable=ready)
     operation["capacity_diagnostic"]["pending_node_ids"] = ["joining-worker"]
 
     text = format_model_intent(operation)

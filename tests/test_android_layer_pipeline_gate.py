@@ -25,6 +25,7 @@ from api_server import (
     _validate_pipeline_role_switches,
 )
 from koakuma_engine import Capability
+from tests.test_scheduler import _engine_contract
 from scheduler import NodeInfo, _node_supports_forward_layers
 
 
@@ -40,9 +41,9 @@ def _node(node_type: str, device_info: dict | None = None) -> NodeInfo:
 class TestNodeSupportsForwardLayers:
     """`scheduler._node_supports_forward_layers`。"""
 
-    def test_pc_without_reporting_is_allowed_legacy(self):
-        """未自报能力的 pc ⇒ 允许（保持旧行为）。"""
-        assert _node_supports_forward_layers(_node("pc")) is True
+    def test_pc_without_reporting_is_rejected(self):
+        """平台名不构成执行能力证据。"""
+        assert _node_supports_forward_layers(_node("pc")) is False
 
     def test_android_without_reporting_is_still_rejected(self):
         """★ 未自报能力的 android ⇒ **仍拒绝**（本改动不得无意放行）。"""
@@ -50,16 +51,16 @@ class TestNodeSupportsForwardLayers:
 
     def test_android_reporting_capability_is_allowed(self):
         """★ 自报 FORWARD_LAYERS 的 Android ⇒ **允许**（本改动的核心目标）。"""
-        node = _node("android", {"capabilities": [Capability.FORWARD_LAYERS]})
+        node = _node("android", {**_engine_contract("llama_cpp", "llama_cpp_android"), "capabilities": [Capability.FORWARD_LAYERS]})
         assert _node_supports_forward_layers(node) is True
 
     def test_android_reporting_capability_as_string(self):
         node = _node("android", {"capabilities": Capability.FORWARD_LAYERS})
-        assert _node_supports_forward_layers(node) is True
+        assert _node_supports_forward_layers(node) is False
 
     def test_android_reporting_llama_cpp_backend_is_allowed(self):
         """自报 backend_id=llama_cpp 的 Android ⇒ 由公开能力表判定 ⇒ 允许。"""
-        node = _node("android", {"backend_id": "llama_cpp"})
+        node = _node("android", {**_engine_contract("llama_cpp", "llama_cpp_android"), "backend_id": "llama_cpp"})
         assert _node_supports_forward_layers(node) is True
 
     def test_android_reporting_island_backend_is_rejected(self):

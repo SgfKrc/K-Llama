@@ -189,6 +189,7 @@ class JournalPrefixAuthority:
         self.truncated: dict[str, int] = {}
         self.floor_provider = lambda: ()
         self.model_control = None
+        self.requests = None
 
     def _recover(self, workflow_id: str, *, permit=None) -> None:
         """落后时主动追赶一次；追赶失败不改结论（仍然是「不够格接管」）。"""
@@ -210,11 +211,13 @@ class JournalPrefixAuthority:
     def held(self, workflow_id: str) -> CommitWatermark | None:
         """本地耐久持有且**自洽**的前缀；不完整（例如刚截断过）时为 None。"""
         from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN
-        if workflow_id == MODEL_CONTROL_DOMAIN:
-            if self.model_control is None:
+        from qlh_core.contracts.execution import REQUEST_DOMAIN
+        if workflow_id in {MODEL_CONTROL_DOMAIN, REQUEST_DOMAIN}:
+            owner = self.model_control if workflow_id == MODEL_CONTROL_DOMAIN else self.requests
+            if owner is None:
                 return None
-            status = self.model_control.repository.recovery_status()
-            return (CommitWatermark(workflow_id=MODEL_CONTROL_DOMAIN, last_sequence=status["durable_sequence"],
+            status = owner.repository.recovery_status()
+            return (CommitWatermark(workflow_id=workflow_id, last_sequence=status["durable_sequence"],
                                     checkpoint_digest=status["checkpoint_digest"])
                     if status.get("verified") else None)
         with self._lock:
@@ -256,10 +259,11 @@ class JournalPrefixAuthority:
                 permit.check()
             workflow_id = watermark.workflow_id
             from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN
-            if workflow_id == MODEL_CONTROL_DOMAIN:
+            from qlh_core.contracts.execution import REQUEST_DOMAIN
+            if workflow_id in {MODEL_CONTROL_DOMAIN, REQUEST_DOMAIN}:
                 held = self.held(workflow_id)
                 if held is None or held != watermark:
-                    raise AutoRoleRuntimeError("committed_prefix_behind", "model-control recovery domain is unavailable")
+                    raise AutoRoleRuntimeError("committed_prefix_behind", "owner recovery domain is unavailable")
                 continue
             with self._lock:
                 prefix = self.replica.durable_prefix(workflow_id)
@@ -409,7 +413,7 @@ class AutoRoleRuntime:
             return {"ok": False, "code": "quorum_unavailable"}
 
 
-def build_auto_role_runtime(*, fence: ControlFence | None = None, environment=None, model_control=None) -> AutoRoleRuntime:
+def build_auto_role_runtime(*, fence: ControlFence | None = None, environment=None, model_control=None, requests=None) -> AutoRoleRuntime:
     """Build a runtime from explicit environment configuration.
 
     ``QLH_CONTROL_VOTER_SET`` and a private key are intentionally mandatory.
@@ -504,6 +508,7 @@ def build_auto_role_runtime(*, fence: ControlFence | None = None, environment=No
             prefix_authority = JournalPrefixAuthority(UnavailableReplica())
         prefix_authority.floor_provider = ledger.recovery_floors
         prefix_authority.model_control = model_control
+        prefix_authority.requests = requests
         local = QuorumVoter(
             voter_id=voter_id,
             private_key=private_key,
@@ -534,7 +539,8 @@ def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = No
     if environment.get("QLH_NODE_ROLE", "").strip().lower() != "auto":
         return None
     runtime = build_auto_role_runtime(fence=fence, environment=environment,
-                                      model_control=getattr(scheduler, "_model_control", None))
+                                      model_control=getattr(scheduler, "_model_control", None),
+                                      requests=getattr(getattr(scheduler, "_execution_app", None), "requests", None))
     # ``auto`` is a controller mode, not a static role in the control
     # contract.  Keep the authority's compatibility role ``unknown`` while
     # the AutoRoleController owns the runtime role state.

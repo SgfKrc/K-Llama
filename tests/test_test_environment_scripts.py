@@ -189,10 +189,9 @@ def test_bjtu_routes_extracted_shell_and_release_repositories():
         assert "QLH_SHELL_ROOT" in script
         assert "QLH_RELEASE_ROOT" in script
         assert "QLH_CORE_ROOT" in script
-    assert "%QLH_RELEASE_ROOT%\\packaging\\qlh_launcher.py" in windows
-    assert "$RELEASE_ROOT/packaging/qlh_launcher.py" in unix
-    assert "pip install -r \"%QLH_SHELL_ROOT%\\requirements-tui.txt\"" in windows
-    assert "$SHELL_ROOT/requirements-tui.txt" in unix
+    assert r"src\app_bootstrap.py" in windows and "--maintenance" in windows
+    assert "$PROJECT_ROOT/src/app_bootstrap.py" in unix
+    assert 'qlh.py" maintenance' in unix
 
 
 def test_sidecar_checks_require_torch_runtime_modules():

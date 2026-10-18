@@ -52,7 +52,7 @@ class Worker(SchedulerTaskWorkerMixin):
     def _effective_role(self):
         return "client"
 
-    def _scheduler_facade_global(self, name):
+    def _runtime_setting(self, name):
         assert name == "TASK_WORKER_EXPERIMENTAL_ENABLED"
         return True
 

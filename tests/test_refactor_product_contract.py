@@ -13,8 +13,8 @@ import pytest
 pytestmark = pytest.mark.refactor_contract
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
-SNAPSHOT = json.loads((FIXTURES / "refactor_product_api_v1.json").read_text(encoding="utf-8"))
-ENTRIES = json.loads((FIXTURES / "refactor_entrypoints_v1.json").read_text(encoding="utf-8"))
+SNAPSHOT = json.loads((FIXTURES / "refactor_product_api_v2.json").read_text(encoding="utf-8"))
+ENTRIES = json.loads((FIXTURES / "refactor_entrypoints_v2.json").read_text(encoding="utf-8"))
 
 
 def semantic(value, *, named_mapping=False):
@@ -84,12 +84,12 @@ def test_entry_dispositions_have_explicit_migration_phase():
 
 
 def test_graph_poc_and_priority_strategy_are_explicitly_retired():
-    product = ENTRIES["http_surfaces"]["product_api"]
+    product = ENTRIES["retired_http"]["product_api"]
     retiring = [entry for path, entry in product.items()
                 if path.startswith(("/api/workflows", "/api/experimental/speculative", "/api/cluster/config/task-graph"))]
     assert retiring and all(e["disposition"] == "retire" and e["phase"] == "R5" for e in retiring)
     assert product["/api/cluster/queue/strategy"]["disposition"] == "retire"
-    assert ENTRIES["http_surfaces"]["native_service"]["/v1/speculative/run"]["disposition"] == "retire"
+    assert ENTRIES["retired_http"]["native_service"]["/v1/speculative/run"]["disposition"] == "retire"
 
 
 def test_product_snapshot_does_not_freeze_private_handler_names():

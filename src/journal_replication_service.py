@@ -2,7 +2,7 @@
 
 **为什么只需要"接线"**：复制契约（`src/journal_replication.py`，`JournalCheckpoint` +
 `DurableJournalReplica`）、认证 TCP 帧（`src/journal_replication_transport.py`）与事件源
-（`src/task_journal.py` 的 `workflow_events`）**三者都已存在**，而且 `TaskJournal` 的
+（`src/recovery_journal.py` 的 `workflow_events`）**三者都已存在**，而且 `TaskJournal` 的
 `get_snapshot` / `list_events` **恰好就是** `ReplicationJournal` 契约要求的那两个方法 ——
 `build_checkpoint()` 可以直接吃 `SQLiteTaskJournal`，不需要适配器。缺的只是**生产侧消费者**
 （此前唯一消费者是 `tests/test_journal_replication.py`）。

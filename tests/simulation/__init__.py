@@ -20,13 +20,6 @@ from .scenarios import (
     Scenario,
 )
 
-from .task_graph_harness import (
-    SIMULATION_SCHEMA_VERSION,
-    SimulationScenario,
-    SimulationScenarioError,
-    TaskGraphSimulationHarness,
-    available_scenarios,
-)
 
 from .task_worker_harness import (
     SIMULATION_SCHEMA_VERSION as TASK_WORKER_SIMULATION_SCHEMA_VERSION,
@@ -36,13 +29,6 @@ from .task_worker_harness import (
     available_scenarios as available_task_worker_scenarios,
 )
 
-from .capacity_harness import (
-    SIMULATION_SCHEMA_VERSION as CAPACITY_SIMULATION_SCHEMA_VERSION,
-    SimulationScenario as CapacitySimulationScenario,
-    SimulationScenarioError as CapacitySimulationScenarioError,
-    CapacitySimulationHarness,
-    available_scenarios as available_capacity_scenarios,
-)
 
 from .html_report import generate_html_report
 
@@ -64,21 +50,11 @@ __all__ = [
     "ValidationResult",
     "SCENARIOS",
     "Scenario",
-    "SIMULATION_SCHEMA_VERSION",
-    "SimulationScenario",
-    "SimulationScenarioError",
-    "TaskGraphSimulationHarness",
-    "available_scenarios",
     "TASK_WORKER_SIMULATION_SCHEMA_VERSION",
     "TaskWorkerSimulationScenario",
     "TaskWorkerSimulationScenarioError",
     "TaskWorkerControlSimulationHarness",
     "available_task_worker_scenarios",
-    "CAPACITY_SIMULATION_SCHEMA_VERSION",
-    "CapacitySimulationScenario",
-    "CapacitySimulationScenarioError",
-    "CapacitySimulationHarness",
-    "available_capacity_scenarios",
     "generate_html_report",
     "test_single_node",
     "test_distributed",

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from request_deadline import REQUEST_DEADLINE_EXCEEDED
 
-from task_provider import (
+from execution_provider import (
     DEPENDENCY_FAILURES_KEY,
     ModelIdentity,
     ProviderBusy,
@@ -895,6 +895,8 @@ class RemoteFullWorkerProvider:
             if pending.released
             and pending.released_at > 0
             and now - pending.released_at >= 5.0
+            and (pending.result is not None or getattr(pending, "physical_result_received", False)
+                 or pending.cancel_execution_stopped or pending.terminal_snapshot()[0] in {"reservation_rejected", "send_failure"})
         ]
         for attempt_id in expired:
             self._pending.pop(attempt_id, None)
@@ -1300,13 +1302,7 @@ class RemoteFullWorkerProvider:
                 workflow_id=request.workflow_id,
                 stage_id=request.stage_id,
                 created_at=time.time(),
-                selection_reason=(
-                    "auto_remote_provider"
-                    if request.runtime_context.get(
-                        "task_graph_remote_policy"
-                    ) == "auto"
-                    else "explicit_remote_provider"
-                ),
+                selection_reason="explicit_remote_provider",
                 provider_kind=self.provider_kind,
                 provider_node_id=self.node_id,
             )
@@ -1719,6 +1715,7 @@ class RemoteFullWorkerProvider:
                     attempt_id=payload["attempt_id"],
                     lease_epoch=payload["lease_epoch"],
                 )
+                pending.physical_result_received = True
                 if not pending.decide_terminal("stage_result", result=result):
                     return self._absorb_late_stage_response_locked(
                         pending, message,
@@ -1736,6 +1733,7 @@ class RemoteFullWorkerProvider:
                     provider_id=self.provider_id,
                     retryable=bool(payload["retryable"]),
                 )
+                pending.physical_result_received = True
                 if not pending.decide_terminal("stage_error", error=error):
                     return self._absorb_late_stage_response_locked(
                         pending, message,
@@ -1937,7 +1935,7 @@ class RemoteFullWorkerProvider:
 
         ★ 2026-10-05（DIST-2 要求 2：「节点掉线…必须释放 lease」）：此前这里只把
         pending 置 error 并 set 三个 event，**不释放 reservation** —— 释放完全依赖
-        上层 `task_graph._run_stage` 的 `finally`。一旦上层没走到那里（异常路径、
+        上层线性执行器的 `finally`。一旦上层没走到那里（异常路径、
         外层取消、进程卡住），条目就会留在 `_reservations` /
         `_executed_reservations` / `_reservation_attempts` 里，而该 provider 在对端
         重连前不会再有活动 ⇒ 「已预留未执行」的槽位被永久占用。
@@ -1992,6 +1990,15 @@ class RemoteFullWorkerProvider:
         for reservation_id in freed:
             self.release(reservation_id)
         return freed
+
+    def execution_drained(self, attempt_id: str) -> bool:
+        with self._lock:
+            pending = self._pending.get(attempt_id)
+            if pending is None:
+                return False
+            kind, result, error = pending.terminal_snapshot()
+            return bool(result is not None or getattr(pending, "physical_result_received", False) or pending.cancel_execution_stopped
+                        or kind in {"remote_error", "send_failure"})
 
     def release(self, reservation_id: str) -> None:
         with self._lock:

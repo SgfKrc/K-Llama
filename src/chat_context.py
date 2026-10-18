@@ -7,6 +7,10 @@ the embedding host, which reacts to session_changed and reloaded.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
+import hashlib
+
+current_client_id = ContextVar("conversation_client_id", default="default")
 from dataclasses import dataclass
 from enum import Enum
 from threading import Lock, RLock
@@ -57,7 +61,8 @@ class ConversationContextService:
         self._persist_turn = persist_turn
         self.default_session_id = self._normalize_session_id(default_session_id)
         self.max_messages = max(2, int(max_messages))
-        self.active_session_id: Optional[str] = None
+        self._active_by_client: dict[str, str] = {}
+        self._kv_session_id: Optional[str] = None
         self.histories: MutableMapping[str, list[dict]] = {}
         self._generation = 0
         self._history_generations: dict[str, int] = {}
@@ -69,6 +74,30 @@ class ConversationContextService:
         # The active session and the model KV cache are process-wide facades.
         # Keep a complete prepare -> infer -> commit transaction serialized.
         self._transaction_lock = Lock()
+
+    @property
+    def active_session_id(self):
+        with self._lock:
+            return self._active_by_client.get(current_client_id.get())
+
+    @active_session_id.setter
+    def active_session_id(self, value):
+        with self._lock:
+            key = current_client_id.get()
+            if value:
+                self._active_by_client[key] = self._normalize_session_id(value)
+            else:
+                self._active_by_client.pop(key, None)
+
+    def resolve_session(self, requested=None, *, client_id=None):
+        key = str(client_id or current_client_id.get())
+        with self._lock:
+            return self._normalize_session_id(requested or self._active_by_client.get(key)
+                                              or (self.default_session_id if key == "default" else "client-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]))
+
+    def cached_histories(self):
+        with self._lock:
+            return {key: [dict(m) for m in value] for key, value in self.histories.items()}
 
     @staticmethod
     def _normalize_session_id(value: object) -> str:
@@ -99,33 +128,6 @@ class ConversationContextService:
         while len(history) > 1 and history[0].get("role") == "assistant":
             del history[0]
 
-    def adopt_facade_state(
-        self,
-        active_session_id: Optional[str],
-        histories: MutableMapping[str, list[dict]],
-    ) -> None:
-        """Adopt compatibility globals exposed by the legacy API facade."""
-
-        with self._lock:
-            self.active_session_id = (
-                self._normalize_session_id(active_session_id)
-                if active_session_id
-                else None
-            )
-            if histories is not self.histories:
-                affected = set(self.histories) | {
-                    self._normalize_session_id(session_id)
-                    for session_id in histories
-                }
-                for session_id in affected:
-                    self._revisions[session_id] = (
-                        self._revisions.get(session_id, 0) + 1
-                    )
-                self.histories = histories
-                self._history_generations = {
-                    self._normalize_session_id(session_id): self._generation
-                    for session_id in histories
-                }
 
     @contextmanager
     def transaction(
@@ -133,6 +135,7 @@ class ConversationContextService:
         *,
         timeout: Optional[float] = None,
         deadline: Optional[RequestDeadline] = None,
+        serialize: bool = True,
     ) -> Iterator[None]:
         """Serialize a complete conversation transaction in this process.
 
@@ -141,6 +144,9 @@ class ConversationContextService:
         acquired after that budget has expired.
         """
 
+        if not serialize:
+            yield
+            return
         self.acquire_transaction(timeout=timeout, deadline=deadline)
         try:
             yield
@@ -198,18 +204,18 @@ class ConversationContextService:
         requested_session_id: Optional[str] = None,
         *,
         force_reload: bool = False,
+        client_id: Optional[str] = None,
+        runtime_kv: bool = True,
     ) -> PreparedChatContext:
         with self._lock:
-            session_id = self._normalize_session_id(
-                requested_session_id
-                or self.active_session_id
-                or self.default_session_id
-            )
-            session_changed = self.active_session_id != session_id
+            session_id = self.resolve_session(requested_session_id, client_id=client_id)
+            session_changed = self._kv_session_id != session_id
             history, reloaded = self._ensure_loaded_locked(
                 session_id, force_reload=force_reload,
             )
-            self.active_session_id = session_id
+            self._active_by_client[str(client_id or current_client_id.get())] = session_id
+            if runtime_kv:
+                self._kv_session_id = session_id
             return PreparedChatContext(
                 session_id=session_id,
                 history=list(history),
@@ -388,6 +394,9 @@ class ConversationContextService:
             self._revisions[normalized] = (
                 self._revisions.get(normalized, 0) + 1
             )
-            if was_active:
-                self.active_session_id = None
+            for client, selected in list(self._active_by_client.items()):
+                if selected == normalized:
+                    self._active_by_client.pop(client, None)
+            if self._kv_session_id == normalized:
+                self._kv_session_id = None
             return was_active

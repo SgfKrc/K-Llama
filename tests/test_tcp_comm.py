@@ -919,6 +919,10 @@ class TestFastTensorSerialization:
 # ================================================================
 
 class TestTCPServerConnectionManagement:
+    @pytest.fixture(autouse=True)
+    def _cluster_identity(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "test-only-cluster-key")
+
     """测试 TCPServer 注册拒绝、连接表线程安全与回调日志。"""
 
     def test_callback_does_not_reflectively_rewrite_control_plane_owner(self):

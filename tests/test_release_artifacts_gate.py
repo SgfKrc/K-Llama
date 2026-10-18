@@ -98,7 +98,7 @@ def test_build_identity_requires_authenticated_matching_revision(authenticated, 
 
 def test_conflicting_artifact_revisions_fail_report():
     report = gate.Report("windows")
-    for name, revision in (("cpu", REVISION), ("launcher", "b"*40)):
+    for name, revision in (("cpu", REVISION), ("cuda", "b"*40)):
         report.ok(f"windows.{name}.revision", source_revision=revision, revision_verified=True)
     assert not report.as_dict()["passed"]
 
@@ -255,7 +255,7 @@ def test_cuda_is_explicitly_deferred_by_default(tmp_path, monkeypatch):
         return report
     monkeypatch.setitem(gate.GATES, "windows", inspect)
     assert gate.main(["--platforms", "windows", "--dist", str(tmp_path)]) == 1
-    assert seen["windows_variants"] == ["cpu", "launcher"]
+    assert seen["windows_variants"] == ["cpu"]
     assert seen["linux_variants"] == ["cpu"]
 
 

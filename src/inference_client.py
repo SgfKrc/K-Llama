@@ -17,7 +17,7 @@
   kv_init / kv_free                          → POST /v1/kv/{init,free}
   cancel_generation                          → POST /v1/chat/cancel
   execute_task_worker_stage                  → POST /v1/worker/stage
-  active_task_graph_model_identity           → GET /v1/models/current 推断
+  active_execution_model_identity           → GET /v1/models/current 推断
   format_model_response / build_model_chat_prompt
                                              → 本地等价实现（复用
                                                inference_service.engine_host
@@ -269,7 +269,7 @@ class InferenceClient:
             raise RuntimeError("remote Stage executor returned non-object output")
         return result
 
-    def active_task_graph_model_identity(self):
+    def active_execution_model_identity(self):
         """从 /v1/models/current 推断当前模型身份（等价 api_server 版语义）。"""
         try:
             info = self._get("/v1/models/current")
@@ -282,7 +282,7 @@ class InferenceClient:
         if engine not in {"pytorch", "llama_cpp", "island"} or not model_id:
             return None
         try:
-            from task_provider import ModelIdentity
+            from execution_provider import ModelIdentity
 
             return ModelIdentity(
                 model_id=model_id,
@@ -342,8 +342,8 @@ class InferenceClient:
                 from inference_service.engine_host import THINKING_SYSTEM_PROMPT
 
                 callbacks = SchedulerCallbackSet(
-                    active_task_graph_model_identity=(
-                        self.active_task_graph_model_identity
+                    active_execution_model_identity=(
+                        self.active_execution_model_identity
                     ),
                     execute_task_worker_stage=self.execute_task_worker_stage,
                     build_model_chat_prompt=self.build_model_chat_prompt,

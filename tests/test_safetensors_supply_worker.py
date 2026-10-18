@@ -24,12 +24,13 @@ import model_supply_worker as supply
 from inference_service.engine_host import EngineHost
 from model_supply_worker import ModelSupplyWorker, get_selected_model
 from scheduler_task_worker import SchedulerTaskWorkerMixin
-from task_provider import ModelIdentity
+from execution_provider import ModelIdentity
 from task_worker_protocol import PROTOCOL_VERSION, WorkerProtocolError, _validate_capabilities
 
 
 class _Scheduler(SchedulerTaskWorkerMixin):
     def __init__(self, root):
+        self._model_control = SimpleNamespace(boot_id="fixture-worker-boot")
         self._host = SimpleNamespace(
             full_chat_execution_lock=threading.RLock(),
             model_loaded=False, is_loaded=False, layer_range=None,
@@ -235,7 +236,7 @@ def test_metadata_only_architecture_does_not_advertise_layer_forward(tiny_supply
         host = tiny_supply.scheduler._host
         host.model_loaded = host.is_loaded = True
         tiny_supply.scheduler._require_callbacks = lambda: SimpleNamespace(
-            active_task_graph_model_identity=lambda: full_identity)
+            active_execution_model_identity=lambda: full_identity)
     selected = get_selected_model()
     selected["manifest"]["model_type"] = "gemma4_unified"
     monkeypatch.setattr(supply, "get_selected_model", lambda root=None: selected)
@@ -256,7 +257,7 @@ def test_supplied_physical_identity_never_becomes_a_full_model_alias(tiny_supply
     scheduler._host.model_loaded = scheduler._host.is_loaded = True
     scheduler._host.has_loaded_model = lambda: True
     scheduler._require_callbacks = lambda: SimpleNamespace(
-        active_task_graph_model_identity=lambda: ModelIdentity(**identity),
+        active_execution_model_identity=lambda: ModelIdentity(**identity),
     )
     assert scheduler._task_worker_full_model_identity(["pytorch"]) is None
     caps = scheduler._task_worker_capabilities()

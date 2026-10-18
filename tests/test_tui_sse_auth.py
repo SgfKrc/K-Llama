@@ -111,6 +111,7 @@ def live_authenticated_api(monkeypatch, tmp_path):
             _effective_role=lambda: "master",
             run_pipeline_safe=run_pipeline_safe,
             record_task_complete=lambda success=True: None,
+            configure_callbacks=lambda *_: None,
             start=lambda: None,
             stop=lambda: None,
             _running=True,
@@ -127,6 +128,9 @@ def live_authenticated_api(monkeypatch, tmp_path):
             current_quant=None,
             generation_config={},
             full_chat_execution_lock=contextlib.nullcontext(),
+            configure_runtime_environment=lambda *_: None,
+            configure_scheduler_callbacks=lambda *_: None,
+            unload_model=lambda: None,
         ),
     )
     monkeypatch.setattr(
@@ -181,5 +185,5 @@ def test_authenticated_sse_reaches_real_api_stream_route(live_authenticated_api)
     payloads = list(iter_chat_payloads(api, "hello", read_timeout=3))
 
     assert payloads[0]["start"] is True
-    assert payloads[-1]["done"] is True
+    assert payloads[-1].get("done") is True, payloads
     assert payloads[-1]["response"] == "real-stream"

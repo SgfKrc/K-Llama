@@ -48,6 +48,16 @@ class IdentityStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def persist_participation(self, mode):
+        if mode not in {"distributed", "local"}:
+            raise ValueError("participation_mode_invalid")
+        with self._lock:
+            document = self.read_document()
+            node = dict(document.get("node") or {})
+            node["desired_inference_mode"] = mode
+            document["node"] = node
+            self._write(document)
+
     def credential(self, document: dict, environment: dict) -> tuple[str, int]:
         cluster = document.get("cluster") or {}
         raw = self.secrets.get("cluster_secret")
@@ -266,6 +276,11 @@ class SettingsStore:
         cluster = public.get("cluster") or {}
         confirmed = bool(public.get("bootstrapped") or node.get("role_confirmed"))
         defaults = {}
+        desired_mode = node.get("desired_inference_mode")
+        if desired_mode is not None:
+            if desired_mode not in {"distributed", "local"}:
+                raise ValueError("participation_mode_invalid")
+            defaults["QLH_DISTRIBUTED_INFERENCE_ENABLED"] = "1" if desired_mode == "distributed" else "0"
         if confirmed and node.get("role"):
             defaults["QLH_NODE_ROLE"] = node["role"]
         if node.get("node_id"):
@@ -285,8 +300,7 @@ class SettingsStore:
             environment["QLH_CLIENT_MASTER_HOST"] = str(preferred["host"])
             environment["QLH_CLIENT_MASTER_PORT"] = str(preferred["port"])
         features = public.get("features") or {}
-        for key, field in (("QLH_TASK_GRAPH_ENABLED", "task_graph_enabled"),
-                           ("QLH_TASK_WORKER_EXPERIMENTAL_ENABLED", "task_worker_experimental_enabled")):
+        for key, field in (("QLH_TASK_WORKER_EXPERIMENTAL_ENABLED", "task_worker_experimental_enabled"),):
             if field in features:
                 environment[key] = "1" if features[field] else "0"
         from release_contract import apply_release_profile_to_env, DEFAULT_PACKAGED_NODE_ROLE, release_profile_enforced

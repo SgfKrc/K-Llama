@@ -15,9 +15,9 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 try:
-    from .task_provider import canonical_model_engine
+    from .execution_provider import canonical_model_engine
 except ImportError:  # pragma: no cover - top-level import in runtime bundles
-    from task_provider import canonical_model_engine
+    from execution_provider import canonical_model_engine
 
 
 PIPELINE_NODE_SCHEMA_VERSION = 1

@@ -2380,6 +2380,15 @@ class LlamaCppEngine:
             "cache": n_past + len(ids),
         }
 
+    def clear_pipeline_kv(self) -> None:
+        """Strict cleanup receipt: propagate native reset failure to the request owner."""
+        upstream = getattr(self, "_keep_head", None)
+        if upstream is not None:
+            upstream.reset()
+        if self._model is not None:
+            self._model._ctx.kv_cache_clear()
+        self._kv_used = 0
+
     def _clear_context_kv(self) -> None:
         """清掉原生 context 里的 KV（新序列从位置 0 起时必须做）。
 

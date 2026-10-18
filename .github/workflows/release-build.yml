@@ -122,13 +122,11 @@ jobs:
       - name: Reject stale outputs and snapshot clean pinned sources
         shell: bash
         run: python -B scripts/package_contract/release_build.py preflight --platform "${{ matrix.platform }}"
-      - name: Build signed Windows CPU and standalone Launcher
+      - name: Build signed Windows CPU application
         if: matrix.platform == 'windows'
         shell: cmd
         run: |
           call "%GITHUB_WORKSPACE%\packaging\packaging\build-cpu.bat" <NUL
-          if errorlevel 1 exit /b 1
-          call "%GITHUB_WORKSPACE%\packaging\packaging\build-launcher.bat" <NUL
           if errorlevel 1 exit /b 1
       - name: Build signed Linux CPU Debian package
         if: matrix.platform == 'linux'

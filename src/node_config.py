@@ -417,10 +417,6 @@ def apply_node_config_to_env(
     # Development feature gates remain user preferences. A release profile is
     # an artifact-owned upper bound and cannot be changed by stale user state.
     features = data.get("features") if isinstance(data.get("features"), dict) else {}
-    if not is_release_environment_locked("QLH_TASK_GRAPH_ENABLED"):
-        _set_env_value(
-            "QLH_TASK_GRAPH_ENABLED", features.get("task_graph_enabled"), overwrite=True,
-        )
     if not is_release_environment_locked("QLH_TASK_WORKER_EXPERIMENTAL_ENABLED"):
         _set_env_value(
             "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED",

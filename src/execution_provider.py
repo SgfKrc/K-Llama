@@ -21,7 +21,7 @@ MODEL_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 DEPENDENCY_FAILURES_KEY = "__qlh_failed_dependencies__"
 
 _NON_LOCAL_MODEL_ENGINES = frozenset({
-    "island", "external_api", "speculative_assisted",
+    "island", "external_api",
 })
 
 
@@ -167,7 +167,6 @@ class ModelIdentity:
         # 其 sha256 为端点指纹摘要而非本地文件摘要（见调研方案 §2.2）。
         # "external_api": 外部推理服务（路线 B，集群信任域之外的 OpenAI 兼容
         # 端点），同样以"端点指纹 + 服务端模型名"的摘要替代本地文件摘要。
-        # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify，
         # 见调研方案 §2.3），无单一本地 artifact，指纹 = draft 模型 + verify
         # 端点 + verify 模型名；输出分布等于 verify 模型。
         object.__setattr__(self, "engine", canonical_model_engine(self.engine))

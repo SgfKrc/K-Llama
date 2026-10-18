@@ -41,6 +41,9 @@ class _Manager:
         self.is_loaded = True
         return {"success": True}
 
+    def get_device(self):
+        return "cpu"
+
     def unload_model(self):
         self.unload_attempts += 1
         if self.fail_unload:

@@ -24,7 +24,17 @@ def configure_api_module(module: ModuleType) -> None:
     configure_route_module(globals(), module, _RESOLUTION_NAMES)
 
 def exported_handlers() -> dict[str, object]:
-    return {name: globals()[name] for name in ['upload_file', 'speculative_experiment_capability', 'experimental_speculative_chat', 'chat', 'chat_stream', 'cancel_chat_generation', 'clear_chat']}
+    return {name: globals()[name] for name in ['upload_file', 'chat', 'chat_stream', 'cancel_chat_generation', 'clear_chat']}
+
+def _uses_linear_executor(req):
+    scheduler = _api_module.scheduler
+    application = getattr(scheduler, "_execution_app", None)
+    return bool(application and req.routing_preference != "local_only"
+                and _api_module.RUN_MODE == "distributed"
+                and scheduler.get_distributed_inference_enabled()
+                and scheduler._effective_role() == "master"
+                and application.handles())
+
 
 async def upload_file(file: UploadFile = File(...)):
     """
@@ -115,92 +125,7 @@ async def upload_file(file: UploadFile = File(...)):
         "content": content,
     }
 
-async def speculative_experiment_capability():
-    """Return a zero-network, fail-closed capability snapshot for the UI."""
-    try:
-        import config as cfg
-        from speculative import resolve_verify_config
 
-        enabled = bool(getattr(cfg, "SPEC_ENABLED", False))
-        verify = resolve_verify_config()
-        configured = bool(verify.get("base_url"))
-        available = enabled and configured
-        reason_code = (
-            "ready"
-            if available
-            else "disabled_by_config"
-            if not enabled
-            else "verify_endpoint_missing"
-        )
-        return {
-            "enabled": enabled,
-            "configured": configured,
-            "available": available,
-            "execution_mode": "speculative_assisted",
-            "local_only": not configured,
-            "data_scope": str(getattr(cfg, "EXTERNAL_DATA_SCOPE", "opt_in")),
-            "reason_code": reason_code,
-            "verify_model": str(verify.get("model") or ""),
-            "gamma": int(verify.get("gamma", 0)),
-            "max_rounds": int(verify.get("max_rounds", 0)),
-        }
-    except Exception as exc:
-        _api_module.logger.warning("投机实验能力探针失败: %s", exc)
-        return {
-            "enabled": False,
-            "configured": False,
-            "available": False,
-            "execution_mode": "speculative_assisted",
-            "local_only": True,
-            "reason_code": "capability_probe_error",
-        }
-
-async def experimental_speculative_chat(req: SpeculativeExperimentRequest):
-    """
-    投机解码 draft-verify 实验端点（路线 C-1，阶段 0-1 探索性 PoC）。
-
-    仅在 QLH_SPEC_ENABLED=true 时存在；关闭时一律 404，主聊天路径不受影响。
-    数据作用域与路线 B 共用 QLH_EXTERNAL_DATA_SCOPE（deny 档位一个包都不发）。
-    """
-    import config as _cfg
-
-    if not getattr(_cfg, "SPEC_ENABLED", False):
-        raise _api_module.HTTPException(
-            404,
-            "投机解码实验未启用。请设置 QLH_SPEC_ENABLED=true 并配置 "
-            "QLH_SPEC_VERIFY_BASE_URL（或复用 QLH_EXTERNAL_BASE_URL）后重启。",
-        )
-
-    from external_provider import ExternalScopeDeniedError
-    from speculative import (
-        SpeculativeCapabilityError,
-        SpeculativeConfigError,
-        SpeculativeError,
-    )
-
-    try:
-        result = await _api_module.run_in_threadpool(_api_module._run_speculative_experiment, req)
-    except ExternalScopeDeniedError as exc:
-        _api_module.logger.info(
-            "数据作用域拒绝投机解码外部校验: scope=%s（消息正文未发送）",
-            getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
-        )
-        raise _api_module.HTTPException(403, str(exc)) from None
-    except SpeculativeConfigError as exc:
-        raise _api_module.HTTPException(409, str(exc)) from None
-    except SpeculativeCapabilityError as exc:
-        # 前提条件不满足时大声失败：静默降级会让输出分布不再等于 verify 模型
-        raise _api_module.HTTPException(502, str(exc)) from None
-    except SpeculativeError as exc:
-        raise _api_module.HTTPException(502, str(exc)) from None
-
-    return {
-        "content": result["content"],
-        "finish_reason": result["finish_reason"],
-        "metrics": result["metrics"],
-        "rounds": result["rounds"],
-        "request_id": _api_module._request_id_ctx.get("-"),
-    }
 
 async def _watch_client_disconnect(request: Request, cancel_event,
                                    generation_id: str = "") -> None:
@@ -250,11 +175,10 @@ async def chat(req: ChatRequest, request: Request = None):
     自动维护对话历史 + KV 缓存。
     若模型未加载，自动尝试加载默认模型。
 
-    `request` 默认 `None` 只为**向后兼容**直接调用本协程的测试
-    （`tests/test_task_graph_api.py` 多处 `api_server.chat(req)`）；
-    经 FastAPI 路由进入时总会被注入真实 `Request`，断开检测才会生效。
+    FastAPI 注入 Request；直接协程调用可省略断开检测。
     """
     _check_registered_chat_source(request)
+    req.session_id = _api_module._chat_context.resolve_session(req.session_id, client_id=req.client_id)
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
     request_deadline = _api_module.RequestDeadline.start(
@@ -263,39 +187,8 @@ async def chat(req: ChatRequest, request: Request = None):
     # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
     _api_module._maybe_log_external_scope_denial(req, _api_module._external_route_decision(req))
 
-    # `#29`：`execution_mode=auto` + **显式**给了 `task_graph_template`，却没有任何 N2.1
-    #   字段 ⇒ 不推断、也不静默落回普通流水线，而是明确拒绝并给出 reason_code。
-    #   此前它静默走下面的非任务图分支，模板未生效且毫无提示（正是本条登记的现象）。
-    #   `task_graph_template` 的默认值就是 `dual_candidate`，所以「用户是否显式给了」
-    #   只能靠 pydantic 的 `model_fields_set` 判 —— 不能只看它有值。
-    if (
-        req.execution_mode == "auto"
-        and "task_graph_template" in req.model_fields_set
-        and not (
-            req.task_graph_auto_remote
-            or str(req.task_graph_remote_stage or "").strip()
-            or str(req.task_graph_remote_provider_id or "").strip()
-        )
-    ):
-        raise _api_module.coded_http_error(
-            400,
-            "TASK_GRAPH_REQUIRES_EXPLICIT_MODE",
-            "指定 task_graph_template 时必须同时给出 execution_mode='task_graph'，"
-            "或给出任一 N2.1 字段（task_graph_auto_remote / task_graph_remote_stage / "
-            "task_graph_remote_provider_id）以便推断执行模式。",
-        )
-
     def _run_chat_request_unlocked():
         _check_registered_chat_source(request)
-        if req.execution_mode == "task_graph":
-            if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
-                raise _api_module.HTTPException(
-                    409,
-                    "任务链实验要求先加载本地完整模型。",
-                )
-            return _api_module._execute_requested_chat(
-                req, cancel_event, request_deadline,
-            )
         # A required worker request waits on the master, which can dispatch a
         # layer stage back to this same worker. Holding its model lock across
         # that wait would prevent the stage from executing. Required routing
@@ -305,6 +198,8 @@ async def chat(req: ChatRequest, request: Request = None):
             return _api_module._execute_requested_chat(
                 req, cancel_event, request_deadline, forward_only=True,
             )
+        if _uses_linear_executor(req):
+            return _api_module._execute_requested_chat(req, cancel_event, request_deadline)
         with _api_module.hold_lock_until_deadline(
             _api_module.model_host.full_chat_execution_lock,
             request_deadline,
@@ -336,6 +231,7 @@ async def chat(req: ChatRequest, request: Request = None):
 
     def _run_chat_request():
         with _api_module._chat_context.transaction(
+            serialize=not _uses_linear_executor(req),
             deadline=request_deadline,
         ):
             token = _api_module._request_id_ctx.set(
@@ -412,6 +308,8 @@ async def chat_stream(req: ChatRequest, request: Request):
     import json as _json
     request_id = _api_module._request_id_ctx.get("-")
     _check_registered_chat_source(request)
+    req.session_id = _api_module._chat_context.resolve_session(req.session_id, client_id=req.client_id)
+    req.session_id = _api_module._chat_context.resolve_session(req.session_id, client_id=req.client_id)
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
     request_deadline = _api_module.RequestDeadline.start(
@@ -424,30 +322,31 @@ async def chat_stream(req: ChatRequest, request: Request):
         completed_normally = False
         transaction_acquired = False
         try:
-            if req.streaming_mode == "full" or req.execution_mode == "task_graph":
+            if req.streaming_mode == "full":
                 # Flush headers through proxies before context/model locks or
                 # generation can consume the client's connection timeout.
                 # SSE comments carry no token or completion semantics.
                 yield ": processing\n\n"
             loop = _asyncio.get_running_loop()
-            acquire_future = loop.run_in_executor(
-                None,
-                lambda: _api_module._chat_context.acquire_transaction(
-                    deadline=request_deadline,
-                ),
-            )
-            try:
-                await _asyncio.shield(acquire_future)
-                transaction_acquired = True
-            except _asyncio.CancelledError:
-                async def _release_abandoned_acquire():
-                    try:
-                        await acquire_future
-                    finally:
-                        _api_module._chat_context.release_transaction()
+            if not _uses_linear_executor(req):
+                acquire_future = loop.run_in_executor(
+                    None,
+                    lambda: _api_module._chat_context.acquire_transaction(
+                        deadline=request_deadline,
+                    ),
+                )
+                try:
+                    await _asyncio.shield(acquire_future)
+                    transaction_acquired = True
+                except _asyncio.CancelledError:
+                    async def _release_abandoned_acquire():
+                        try:
+                            await acquire_future
+                        finally:
+                            _api_module._chat_context.release_transaction()
 
-                _asyncio.create_task(_release_abandoned_acquire())
-                raise
+                    _asyncio.create_task(_release_abandoned_acquire())
+                    raise
             async for chunk in _generate_events():
                 yield chunk
             completed_normally = True
@@ -478,6 +377,8 @@ async def chat_stream(req: ChatRequest, request: Request):
         return await loop.run_in_executor(None, _runner)
 
     def _error_event(message, *, refused: bool = False, reason_code: str = "") -> str:
+        from qlh_core.contracts.snapshots import reason
+        cause = message.get("reason_detail") if isinstance(message, dict) else None
         """★ DIST-NEXT-8：错误事件同样带相位与互斥终态。
 
         `refused=True` 用于「不可恢复、dispatch 前的具名拒绝」（例如路由门）；
@@ -502,7 +403,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 else _api_module.REASON_REQUEST_FAILED
             ),
         )
-        return f"data: {_json.dumps({'done': True, 'error': message, 'request_id': request_id, **phase}, ensure_ascii=False)}\n\n"
+        return f"data: {_json.dumps({'done': True, 'error': message, 'request_id': request_id, 'reason_detail': reason('request', phase.get('reason_code') or reason_code or 'request_failed', 'chat_sse', cause=cause), **phase}, ensure_ascii=False)}\n\n"
 
     async def _iterate_sync_generator(iterable):
         """Bridge a blocking generator without blocking the ASGI event loop."""
@@ -575,7 +476,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         if req.streaming_mode == "interactive":
             try:
                 prepared_context = _api_module._prepare_chat_context(
-                    req.session_id, req.message,
+                    req.session_id, req.message, client_id=req.client_id, runtime_kv=not _uses_linear_executor(req),
                 )
             except Exception as exc:
                 yield _error_event(f"会话上下文加载失败: {exc}")
@@ -684,8 +585,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                             async for event in _iterate_sync_generator(_api_module.scheduler.run_pipeline_stream(
                                 req.message,
                                 max_new_tokens=req.max_new_tokens,
-                                temperature=req.temperature,
-                                top_p=req.top_p,
+                                temperature=req.pipeline_sampling()[0],
+                                top_p=req.pipeline_sampling()[1],
+                                _context_revision=prepared_context.revision,
                                 session_id=target_session_id,
                                 messages=request_messages,
                                 show_thinking=req.show_thinking,
@@ -748,8 +650,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 lambda: _api_module.scheduler.run_pipeline_safe(
                                     req.message,
                                     max_new_tokens=req.max_new_tokens,
-                                    temperature=req.temperature,
-                                    top_p=req.top_p,
+                                    temperature=req.pipeline_sampling()[0],
+                                    top_p=req.pipeline_sampling()[1],
+                                    _context_revision=prepared_context.revision,
                                     session_id=target_session_id,
                                     messages=request_messages,
                                     _require_distributed=(req.routing_preference == "distributed_required"),
@@ -873,26 +776,19 @@ async def chat_stream(req: ChatRequest, request: Request):
         # ================================================================
         # ★ full 模式：完整 chat 流程，假流式（SSE 单事件）
         # ================================================================
-        if req.streaming_mode == "full" or req.execution_mode == "task_graph":
+        if req.streaming_mode == "full":
             loop = _asyncio.get_running_loop()
 
             def _execute_full_stream_request():
                 _check_registered_chat_source(request)
-                if req.execution_mode == "task_graph":
-                    if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
-                        raise _api_module.HTTPException(
-                            409,
-                            "任务链实验要求先加载本地完整模型。",
-                        )
-                    return _api_module._execute_requested_chat(
-                        req, cancel_event, request_deadline,
-                    )
                 # Keep this worker available for the master's returning stage.
                 if (req.routing_preference == "distributed_required"
                         and _api_module._should_forward_chat_to_master()):
                     return _api_module._execute_requested_chat(
                         req, cancel_event, request_deadline, forward_only=True,
                     )
+                if _uses_linear_executor(req):
+                    return _api_module._execute_requested_chat(req, cancel_event, request_deadline)
                 with _api_module.hold_lock_until_deadline(
                     _api_module.model_host.full_chat_execution_lock,
                     request_deadline,
@@ -942,7 +838,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         # ================================================================
         try:
             prepared_context = _api_module._prepare_chat_context(
-                req.session_id, req.message,
+                req.session_id, req.message, client_id=req.client_id, runtime_kv=not _uses_linear_executor(req),
             )
         except Exception as exc:
             yield _error_event(f"会话上下文加载失败: {exc}")
@@ -1076,8 +972,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                 lambda: _api_module.scheduler.forward_inference_to_master(
                     message=req.message,
                     max_new_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
+                    temperature=req.pipeline_sampling()[0],
+                    top_p=req.pipeline_sampling()[1],
                     show_thinking=req.show_thinking,
                     enable_thinking=req.enable_thinking,
                     routing_preference=req.routing_preference,
@@ -1146,8 +1042,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 async for event in _iterate_sync_generator(_api_module.scheduler.run_pipeline_stream(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
+                    temperature=req.pipeline_sampling()[0],
+                    top_p=req.pipeline_sampling()[1],
+                    _context_revision=prepared_context.revision,
                     session_id=target_session_id,
                     messages=request_messages,
                     show_thinking=req.show_thinking,
@@ -1219,8 +1116,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 lambda: _api_module.scheduler.run_pipeline_safe(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
+                    temperature=req.pipeline_sampling()[0],
+                    top_p=req.pipeline_sampling()[1],
+                    _context_revision=prepared_context.revision,
                     session_id=target_session_id,
                     messages=request_messages,
                     _require_distributed=(req.routing_preference == "distributed_required"),
@@ -1290,8 +1188,6 @@ def register_routes() -> None:
         handler = _api_module._serialized_conversation_mutation(globals()[name])
         globals()[name] = handler
     router.add_api_route('/api/chat/upload', upload_file, methods=['POST'])
-    router.add_api_route('/api/experimental/speculative/capability', speculative_experiment_capability, methods=['GET'])
-    router.add_api_route('/api/experimental/speculative', experimental_speculative_chat, methods=['POST'])
     router.add_api_route('/api/chat', chat, methods=['POST'], response_model=ChatResponse)
     router.add_api_route('/api/chat/stream', chat_stream, methods=['POST'])
     router.add_api_route('/api/chat/generations/{generation_id}/cancel', cancel_chat_generation, methods=['POST'])

@@ -29,7 +29,7 @@ class NodeState(str, Enum):
     规划文档里提到的 `registered / admitted / ready / leased / draining` 那套状态
     **尚未进本枚举**，其语义目前分散在三个对象上：task-worker 的
     `accepted` / `selected_version`（`task_worker_adapter`）、`Reservation` /
-    `lease_epoch`（`task_provider` / `task_graph`）。
+    `lease_epoch`（`execution_provider`）。
     """
     ONLINE = "online"       # 在线（对端可达；是否真能派活另见心跳新鲜度）
     OFFLINE = "offline"     # 离线/断连
@@ -246,92 +246,3 @@ class InferenceTask:
     result: Optional[str] = None
     error_msg: Optional[str] = None
     metrics: dict = field(default_factory=dict)  # 性能指标
-
-
-@dataclass
-class QueueTask:
-    """
-    流水线队列中的单个任务 — MLFQ 调度单元。
-
-    字段映射:
-    - priority_level: 0=Q0(交互,≤128tk), 1=Q1(普通,≤512tk), 2=Q2(批量,>512tk)
-    - original_level: 入队时的初始级别（用于展示老化状态）
-    - created_at: 入队时间戳（用于老化提升计算）
-    """
-
-    task_id: str
-    prompt: str = ""
-    max_new_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    session_id: Optional[str] = None
-    request_id: Optional[str] = None   # L5: API 请求 ID，用于链路追踪
-    priority_level: int = 1       # 0=Q0(交互), 1=Q1(普通), 2=Q2(批量)
-    created_at: float = field(default_factory=time.time)
-    original_level: int = 1       # 入队时的初始级别
-    # 保留原始 kwargs 以便透传给 process_fn（如 _stream_callback, _queue_timeout）
-    _extra_kwargs: dict = field(default_factory=dict)
-    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
-
-    def estimated_duration_seconds(self) -> float:
-        """预估剩余推理时间（用于 SJF 排序）。假设 ~50ms/token。"""
-        return self.max_new_tokens * 0.05
-
-    def wait_seconds(self) -> float:
-        """已等待秒数。"""
-        return time.time() - self.created_at
-
-    def to_task_data(self) -> dict:
-        """重建 **task_data 字典以调用 process_fn（向后兼容）。"""
-        return {
-            "prompt": self.prompt,
-            "max_new_tokens": self.max_new_tokens,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "session_id": self.session_id,
-            **self._extra_kwargs,
-        }
-
-    def to_dict(self) -> dict:
-        """序列化为前端展示。"""
-        return {
-            "task_id": self.task_id,
-            "priority_level": self.priority_level,
-            "original_level": self.original_level,
-            "max_new_tokens": self.max_new_tokens,
-            "wait_seconds": round(self.wait_seconds(), 1),
-            "estimated_duration_s": round(self.estimated_duration_seconds(), 1),
-            "is_aged": self.priority_level != self.original_level,
-            "created_at": self.created_at,
-        }
-
-
-class PreemptState:
-    """
-    被抢占任务的执行状态快照。
-
-    在 decode 步边界保存 Q1/Q2 任务的所有局部状态，供 Q0 完成后恢复。
-    KV cache 按 task_id 保留在各节点，不需 GPU↔CPU checkpoint。
-    """
-    __slots__ = (
-        "task_id", "generated_ids", "full_input_ids", "current_step",
-        "max_new_tokens", "temperature", "top_p", "prompt",
-        "pipeline_nodes", "first_node_id", "_stream_callback",
-    )
-
-    def __init__(self, task_id: str, generated_ids: list,
-                 full_input_ids, current_step: int,
-                 max_new_tokens: int, temperature: float, top_p: float,
-                 prompt: str, pipeline_nodes: list, first_node_id: str,
-                 _stream_callback=None):
-        self.task_id = task_id
-        self.generated_ids = list(generated_ids)       # shallow copy
-        self.full_input_ids = full_input_ids            # Tensor 引用（只读）
-        self.current_step = current_step
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.top_p = top_p
-        self.prompt = prompt
-        self.pipeline_nodes = pipeline_nodes
-        self.first_node_id = first_node_id
-        self._stream_callback = _stream_callback

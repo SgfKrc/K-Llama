@@ -240,17 +240,6 @@ async def get_status():
             "reachable": await _api_module.run_in_threadpool(check_external_reachable),
         }
 
-    # ---- 路线 C-1：投机解码外部辅助状态（启用时上报，端点已脱敏）----
-    # 刻意不做端点探活：路线 B 曾因在 /api/status 里同步探活堵死事件循环
-    # （后来用 run_in_threadpool 修掉），投机段直接不引入任何出网请求。
-    speculative_status = None
-    if getattr(_cfg, "SPEC_ENABLED", False):
-        try:
-            from speculative import speculative_status_section
-            speculative_status = speculative_status_section()
-        except Exception as exc:      # 实验特性不得拖垮 /api/status
-            speculative_status = {"enabled": True, "error": str(exc)[:200]}
-
     return {
         "model_loaded": _api_module.model_host.model_loaded,
         "pipeline_prepared": pipeline_prepared,
@@ -269,7 +258,7 @@ async def get_status():
         "engine": active_info.get("engine", "") if _api_module.model_host.model_loaded else "",
         "island": island_status,
         "external": external_status,
-        "speculative": speculative_status,
+
         "run_mode": _api_module.RUN_MODE,
         "node_role": _api_module.scheduler._effective_role(),
         "node_id": _api_module.scheduler.get_effective_node_id(),

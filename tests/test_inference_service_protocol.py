@@ -456,6 +456,7 @@ def test_chat_stream_deadline_sse_preserves_reason_code():
         "error": "request deadline exceeded",
         "request_id": "-",
         "reason_code": "request_deadline_exceeded",
+        "reason_detail": {"domain":"execution", "code":"request_deadline_exceeded", "source":"native_chat", "retryability":"unknown", "details":{}, "cause":None},
     }]
 
 
@@ -788,65 +789,8 @@ def test_kv_state_kind_uses_layer_types_not_model_type_allowlist():
 # ----------------------------------------------------------------------
 # 7. 实验端点门控
 # ----------------------------------------------------------------------
-def test_speculative_run_gated_off(client):
-    """SPEC_ENABLED 未启用（默认）→ 404 门控（复制 api_server 语义）。"""
-    resp = client.post(
-        "/v1/speculative/run", json={"message": "你好"}
-    )
-    assert resp.status_code == 404
-    assert "detail" in resp.json()
 
 
-def test_speculative_run_enabled_path(client, monkeypatch):
-    """SPEC_ENABLED=true 时启用路径：真实 SpeculativeRunRequest 全字段
-    透传到 host.speculative_run（修复前协议缺字段 → AttributeError 500）。"""
-    import config as _cfg
-
-    monkeypatch.setattr(_cfg, "SPEC_ENABLED", True)
-
-    captured = {}
-
-    def _fake_speculative_run(self, req):
-        captured["message"] = req.message
-        captured["gamma"] = req.gamma
-        captured["max_rounds"] = req.max_rounds
-        captured["seed"] = req.seed
-        captured["draft_hint"] = req.draft_hint
-        captured["allow_external"] = req.allow_external
-        captured["max_new_tokens"] = req.max_new_tokens
-        return {
-            "content": "草稿验证结果",
-            "finish_reason": "stop",
-            "metrics": {},
-            "rounds": 1,
-        }
-
-    from inference_service.engine_host import EngineHost
-
-    monkeypatch.setattr(EngineHost, "speculative_run", _fake_speculative_run)
-    resp = client.post(
-        "/v1/speculative/run",
-        json={
-            "message": "你好",
-            "gamma": 4,
-            "max_rounds": 2,
-            "seed": 42,
-            "draft_hint": "你好，",
-            "allow_external": True,
-            "max_new_tokens": 32,
-        },
-    )
-    assert resp.status_code == 200
-    assert resp.json()["content"] == "草稿验证结果"
-    assert captured == {
-        "message": "你好",
-        "gamma": 4,
-        "max_rounds": 2,
-        "seed": 42,
-        "draft_hint": "你好，",
-        "allow_external": True,
-        "max_new_tokens": 32,
-    }
 
 
 # ----------------------------------------------------------------------
@@ -870,8 +814,8 @@ def test_layers_load_unload(client):
 # 9. 1.2a 数据面执行段：task-worker Stage（复制自 api_server
 #    _execute_task_worker_stage；宿主适配 model_manager → self._host）
 # ----------------------------------------------------------------------
-from task_provider import StageRequest as ProviderStageRequest
-from task_graph import TaskGraphError
+from execution_provider import StageRequest as ProviderStageRequest
+from execution_errors import StageExecutionError
 
 
 def _stage(stage_type, stage_id, root_input, dependencies=None):
@@ -925,7 +869,7 @@ def test_worker_stage_aggregate():
 def test_worker_stage_unsupported_type():
     host = FakeEngineHost()
     req = _stage("bogus", "x", {"task_options": {}})
-    with pytest.raises(TaskGraphError):
+    with pytest.raises(StageExecutionError):
         host.execute_task_worker_stage(req, threading.Event())
 
 
@@ -935,7 +879,7 @@ def test_worker_stage_invalid_options():
         "full_inference", "candidate_a",
         {"messages": [], "task_options": {"temperature": "不是数字"}},
     )
-    with pytest.raises(TaskGraphError):
+    with pytest.raises(StageExecutionError):
         host.execute_task_worker_stage(req, threading.Event())
 
 
@@ -1266,97 +1210,6 @@ def test_engine_host_auto_load_never_rebinds_active_id_to_global_artifact(
         host._auto_load_default_model()
 
 
-def test_engine_host_remote_worker_selection_enforces_feature_health_model_and_load(
-        monkeypatch):
-    import config as cfg
-
-    class Provider:
-        def __init__(self, provider_id, supports=True):
-            self.provider_id = provider_id
-            self._supports = supports
-
-        def supports_model_identity(self, model_identity, stage_type):
-            return self._supports and model_identity == "model-a" and stage_type == "full_inference"
-
-    class Coordinator:
-        def __init__(self, statuses):
-            self._statuses = statuses
-            self.providers = {}
-
-        def has_provider(self, provider_id):
-            return provider_id in self.providers
-
-        def register_provider(self, provider):
-            self.providers[provider.provider_id] = provider
-
-        def provider_status(self):
-            return self._statuses
-
-    providers = [
-        Provider("remote-alpha"),
-        Provider("remote-beta"),
-        Provider("remote-wrong-model", supports=False),
-        Provider("remote-unavailable"),
-    ]
-    statuses = [
-        {
-            "provider_id": "remote-alpha",
-            "provider_kind": "remote_full_worker",
-            "healthy": True,
-            "available": True,
-            "supported_stage_types": ["full_inference"],
-            "max_concurrency": 2,
-            "active_reservations": 1,
-        },
-        {
-            "provider_id": "remote-beta",
-            "provider_kind": "remote_full_worker",
-            "healthy": True,
-            "available": True,
-            "supported_stage_types": ["full_inference"],
-            "max_concurrency": 2,
-            "active_reservations": 0,
-        },
-        {
-            "provider_id": "remote-wrong-model",
-            "provider_kind": "remote_full_worker",
-            "healthy": True,
-            "available": True,
-            "supported_stage_types": ["full_inference"],
-            "max_concurrency": 1,
-            "active_reservations": 0,
-        },
-        {
-            "provider_id": "remote-unavailable",
-            "provider_kind": "remote_full_worker",
-            "healthy": False,
-            "available": False,
-            "supported_stage_types": ["full_inference"],
-            "max_concurrency": 1,
-            "active_reservations": 0,
-        },
-    ]
-    host = FakeEngineHost()
-    host._scheduler = SimpleNamespace(
-        remote_task_worker_providers=lambda: providers,
-    )
-    coordinator = Coordinator(statuses)
-    host._task_graph_coordinator = coordinator
-    monkeypatch.setattr(cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
-    assert host._eligible_remote_task_worker_provider_ids(
-        "model-a", "full_inference",
-    ) == []
-
-    monkeypatch.setattr(cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-    assert host._sync_remote_task_worker_providers() == [
-        "remote-alpha",
-        "remote-beta",
-        "remote-unavailable",
-        "remote-wrong-model",
-    ]
-    assert host._eligible_remote_task_worker_provider_ids(
-        "model-a", "full_inference", limit=2,
-    ) == ["remote-beta", "remote-alpha"]
 
 
 def test_engine_host_pipeline_worker_reservation_requires_live_scheduler_check():
@@ -1576,363 +1429,26 @@ def test_engine_host_pipeline_deadline_never_enters_local_fallback(monkeypatch):
 # 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
 #      + _execute_task_graph_chat_with_slot + 5 个辅助函数）
 # ----------------------------------------------------------------------
-def test_task_graph_gate_off(monkeypatch):
-    """TASK_GRAPH_ENABLED 默认关闭 → chat_full(task_graph) 409 门控
-    （对齐 api_server 语义；不加载模型、不创建 journal）。
-    显式强制关闭：node_config 的 feature-gates 持久化会把
-    QLH_TASK_GRAPH_ENABLED 注入环境，测试须自包含不受用户配置影响。"""
-    import config as _cfg
-
-    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", False)
-    # 真实 EngineHost（FakeEngineHost 覆盖了基类 chat_full，分支不会触发）
-    host = EngineHost()
-    req = ChatRequest(message="hi", execution_mode="task_graph")
-    with pytest.raises(Exception) as excinfo:
-        host.chat_full(req)
-    assert excinfo.value.status_code == 409
-    assert excinfo.value.error_code == "TASK_GRAPH_DISABLED"
 
 
-def test_task_graph_chat_full_dispatches(monkeypatch):
-    """execution_mode=task_graph → chat_full 分派到 execute_task_graph_chat
-    （对齐 api_server._execute_requested_chat）。"""
-    from inference_service.engine_host import EngineHost
-
-    import config as _cfg
-
-    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
-    host = EngineHost()  # 真实 EngineHost：基类 chat_full 才有 task_graph 分支
-    captured = {}
-
-    def _fake_execute(self, req, cancel_event=None):
-        captured["mode"] = req.execution_mode
-        return {"content": "task-graph-ok", "thinking_content": None,
-                "metrics": {"execution_mode": "task_graph"}, "followups": []}
-
-    monkeypatch.setattr(EngineHost, "execute_task_graph_chat", _fake_execute)
-    req = ChatRequest(message="hi", execution_mode="task_graph")
-    result = host.chat_full(req)
-    assert captured["mode"] == "task_graph"
-    assert result["content"] == "task-graph-ok"
 
 
-def test_task_graph_slot_exclusive(monkeypatch):
-    """task_graph 执行槽互斥：占用中再来 → 429（对齐 api_server 语义）。"""
-    from inference_service.engine_host import EngineHost
-
-    import config as _cfg
-
-    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
-    host = EngineHost()
-    captured = []
-
-    def _fake_execute(self, req, cancel_event=None):
-        captured.append("entered")
-        return {"content": "ok", "thinking_content": None,
-                "metrics": {}, "followups": []}
-
-    monkeypatch.setattr(EngineHost, "execute_task_graph_chat_with_slot", _fake_execute)
-    # gate 的 journal 检查需 available：伪造 coordinator
-    class _FakeCoordinator:
-        def journal_status(self):
-            return {"available": True}
-
-    monkeypatch.setattr(EngineHost, "_ensure_task_graph_coordinator",
-                        lambda self: _FakeCoordinator())
-    # 先占用槽位
-    assert host._task_graph_execution_slot.acquire(blocking=False) is True
-    req = ChatRequest(message="hi", execution_mode="task_graph")
-    with pytest.raises(Exception) as excinfo:
-        host.chat_full(req)
-    assert excinfo.value.status_code == 429
-    assert captured == []  # 未进入执行体
-    host._task_graph_execution_slot.release()
 
 
-def test_task_graph_coordinator_lazy_idempotent():
-    """_ensure_task_graph_coordinator 惰性创建且幂等（单实例缓存）。"""
-    host = FakeEngineHost()
-    c1 = host._ensure_task_graph_coordinator()
-    c2 = host._ensure_task_graph_coordinator()
-    assert c1 is c2
 
 
 def test_task_graph_active_identity_none_without_model():
-    """未加载模型 → _active_task_graph_model_identity 返回 None。"""
+    """未加载模型 → _active_execution_model_identity 返回 None。"""
     host = EngineHost()  # 真实 ModelHost：model_loaded=False
-    assert host._active_task_graph_model_identity() is None
+    assert host._active_execution_model_identity() is None
 
 
-def test_task_graph_active_identity_uses_prepared_pipeline(monkeypatch):
-    """distributed-only 已准备模型（未物化权重）也要能给出身份。
-
-    `prepare-pipeline` 按设计不加载权重，而 Route A 要求活动模型身份；身份从它
-    inspect 出的描述符取，否则两者互斥、跨框架阶段链无法准入。
-    """
-    host = EngineHost()  # 真实 ModelHost：model_loaded=False
-    target = host._host
-    monkeypatch.setattr(target, "_pipeline_distributed_only", True, raising=False)
-    monkeypatch.setattr(
-        target,
-        "_pipeline_descriptor",
-        {
-            "model_id": "qwen2.5-0.5b-instruct",
-            "model_sha256": "596062f9" + "0" * 56,
-        },
-        raising=False,
-    )
-    monkeypatch.setattr(
-        target, "_active_model_id", "qwen2.5-0.5b-instruct", raising=False
-    )
-
-    identity = host._active_task_graph_model_identity()
-
-    assert identity is not None
-    assert identity.model_id == "qwen2.5-0.5b-instruct"
-    assert identity.engine == "pytorch"
-    assert identity.format == "safetensors"
-    assert identity.revision == "prepared"
-    assert identity.sha256.startswith("596062f9")
 
 
-def test_task_graph_with_slot_real_execution(monkeypatch):
-    """真实执行 execute_task_graph_chat_with_slot 主体（不 monkeypatch
-    执行体）：本地模板分支全链路——会话切换/历史维护/run_template/
-    持久化/metrics。修复前此路径 6 处 NameError 必崩。"""
-    import config as _cfg
-
-    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
-    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
-
-    host = make_full_host()
-    host._host.full_chat_execution_lock = threading.RLock()  # FakeModel 缺锁
-    host._active_session_id = "s1"
-    host._session_histories["s1"] = []
-
-    class FakeCoordinator:
-        def __init__(self):
-            self.providers = []
-
-        def journal_status(self):
-            return {"available": True}
-
-        def has_provider(self, pid):
-            return pid in self.providers
-
-        def register_provider(self, provider):
-            self.providers.append(provider.provider_id)
-
-        def run_template(self, **kw):
-            captured["run_template"] = kw
-            return (
-                {"content": "任务链答案", "thinking_content": None},
-                {
-                    "workflow_id": "wf-1",
-                    "template": "dual_candidate",
-                    "state": "completed",
-                    "partial_result": False,
-                    "stages": [],
-                    "stage_count": 0,
-                    "attempt_count": 0,
-                    "duration_seconds": 0.5,
-                },
-            )
-
-        def commit_result(self, workflow_id):
-            return {"workflow_id": workflow_id, "stages": [],
-                    "template": "dual_candidate", "state": "completed",
-                    "partial_result": False, "stage_count": 0,
-                    "attempt_count": 0, "duration_seconds": 0.5}
-
-        def discard_result(self, workflow_id, **_kwargs):
-            return None
-
-        def provider_status(self):
-            return []
-
-    fake_coord = FakeCoordinator()
-    captured = {}
-    monkeypatch.setattr(
-        EngineHost, "_ensure_task_graph_coordinator",
-        lambda self: fake_coord,
-    )
-
-    req = ChatRequest(message="hi", session_id="s1", execution_mode="task_graph")
-    result = host.chat_full(req)
-
-    assert result["content"] == "任务链答案"
-    assert result["metrics"]["execution_mode"] == "task_graph"
-    assert result["metrics"]["workflow_id"] == "wf-1"
-    # run_template 收到正确入参（root_input 带消息与历史）
-    assert captured["run_template"]["root_input"]["message"] == "hi"
-    assert captured["run_template"]["session_id"] == "s1"
-    # 历史已追加（user + assistant）
-    history = host.session_history("s1")
-    assert [message["role"] for message in history] == ["user", "assistant"]
-    # 本地 provider 注册成功（self._dispatch_local_task_provider 引用有效）
-    assert "local_full_model" in fake_coord.providers
 
 
-def test_engine_host_release_profile_discards_task_graph_required_before_commit(
-    monkeypatch,
-):
-    """The inference service cannot revive task_graph as a release route."""
-    import config as _cfg
-    from task_provider import ModelIdentity
-
-    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
-    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
-
-    host = make_full_host()
-    identity = ModelIdentity(
-        model_id="qwen-1.8b",
-        engine="llama_cpp",
-        format="gguf",
-        revision="release-test",
-        sha256="a" * 64,
-    )
-    monkeypatch.setattr(
-        host, "_active_task_graph_model_identity", lambda: identity,
-    )
-    monkeypatch.setattr(
-        host,
-        "_eligible_remote_task_worker_provider_ids",
-        lambda *_args, **_kwargs: ["remote_release_worker"],
-    )
-
-    class FakeCoordinator:
-        def __init__(self):
-            self.providers = []
-            self.discarded = []
-
-        def has_provider(self, provider_id):
-            return provider_id in self.providers
-
-        def register_provider(self, provider):
-            self.providers.append(provider.provider_id)
-
-        def run(self, **_kwargs):
-            return (
-                {"content": "forbidden task graph result"},
-                {
-                    "workflow_id": "wf_releaseenginehost01",
-                    "state": "result_ready",
-                    "stages": [{
-                        "attempts": [{
-                            "state": "completed",
-                            "provider_kind": "remote_full_worker",
-                            "provider_node_id": "worker-release",
-                        }],
-                    }],
-                },
-            )
-
-        def discard_result(self, workflow_id, **kwargs):
-            self.discarded.append((workflow_id, kwargs))
-            return {"workflow_id": workflow_id, "state": "failed"}
-
-        def commit_result(self, _workflow_id):
-            pytest.fail("release route rejection must happen before commit")
-
-    coordinator = FakeCoordinator()
-    monkeypatch.setattr(
-        host, "_ensure_task_graph_coordinator", lambda: coordinator,
-    )
-
-    with pytest.raises(HTTPException) as captured:
-        host.execute_task_graph_chat_with_slot(ChatRequest(
-            message="release route policy",
-            session_id="s1",
-            execution_mode="task_graph",
-            routing_preference="distributed_required",
-            workflow_id="wf_releaseenginehost01",
-        ))
-
-    assert captured.value.status_code == 503
-    assert (
-        captured.value.error_code
-        == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
-    )
-    assert coordinator.discarded == [(
-        "wf_releaseenginehost01",
-        {"terminal_reason_code": "request_refused"},
-    )]
 
 
-def test_task_graph_auto_remote_identity_path(monkeypatch):
-    """auto_remote 分支调用 _active_task_graph_model_identity（修复前
-    1597 行裸 model_manager NameError）：无可用远端 → 本地降级执行。"""
-    import config as _cfg
-
-    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
-    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-
-    host = make_full_host()
-    host._host.full_chat_execution_lock = threading.RLock()
-    host._active_session_id = "s1"
-    host._session_histories["s1"] = []
-
-    class FakeCoordinator:
-        def __init__(self):
-            self.providers = []
-
-        def journal_status(self):
-            return {"available": True}
-
-        def has_provider(self, pid):
-            return pid in self.providers
-
-        def register_provider(self, provider):
-            self.providers.append(provider.provider_id)
-
-        def run_template(self, **kw):
-            return (
-                {"content": "远端不可用本地降级", "thinking_content": None},
-                {
-                    "workflow_id": "wf-2",
-                    "template": "dual_candidate",
-                    "state": "completed",
-                    "partial_result": False,
-                    "stages": [],
-                    "stage_count": 0,
-                    "attempt_count": 0,
-                    "duration_seconds": 0.3,
-                },
-            )
-
-        def commit_result(self, workflow_id):
-            return {"workflow_id": workflow_id, "stages": [],
-                    "template": "dual_candidate", "state": "completed",
-                    "partial_result": False, "stage_count": 0,
-                    "attempt_count": 0, "duration_seconds": 0.3}
-
-        def discard_result(self, workflow_id, **_kwargs):
-            return None
-
-        def provider_status(self):
-            return []
-
-    monkeypatch.setattr(
-        EngineHost, "_ensure_task_graph_coordinator",
-        lambda self: FakeCoordinator(),
-    )
-    # 不 stub _active_task_graph_model_identity：真实执行方法体
-    # （FakeModel 有 _engine_type/active_model_id 但缺 _model_path →
-    # 返回 None → model_identity_unavailable → 本地降级；修复前 1597
-    # 行裸 model_manager 在此路径 NameError）
-
-    req = ChatRequest(
-        message="hi", session_id="s1", execution_mode="task_graph",
-        task_graph_auto_remote=True,
-    )
-    result = host.chat_full(req)
-    assert result["content"] == "远端不可用本地降级"
-    # 无可用远端 → 降级标记
-    assert result["metrics"]["fallback"] is True
-    assert result["metrics"]["auto_remote_enabled"] is True
-    assert result["metrics"]["auto_remote_providers"] == []
-    assert result["metrics"]["fallback_reason"] == "model_identity_unavailable"
 
 
 def test_chat_full_llama_cpp_path(monkeypatch):
@@ -1942,8 +1458,8 @@ def test_chat_full_llama_cpp_path(monkeypatch):
     monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)  # 不落盘
 
     host = make_full_host()
-    host._active_session_id = "s1"
-    host._session_histories["s1"] = [
+    host._chat_context.active_session_id = "s1"
+    host._chat_context.histories["s1"] = [
         {"role": "user", "content": "之前的问题"},
         {"role": "assistant", "content": "之前的回答"},
     ]
@@ -2040,8 +1556,8 @@ def test_chat_full_session_switch(monkeypatch):
     monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
 
     host = make_full_host()
-    host._active_session_id = "s_old"
-    host._session_histories["s_old"] = [{"role": "user", "content": "旧会话"}]
+    host._chat_context.active_session_id = "s_old"
+    host._chat_context.histories["s_old"] = [{"role": "user", "content": "旧会话"}]
 
     req = ChatRequest(message="hello", session_id="s_new")
     result = host.chat_full(req)
@@ -2070,8 +1586,8 @@ def test_chat_full_same_session_reloads_after_runtime_reset(monkeypatch):
     )
 
     host = make_full_host()
-    host._active_session_id = "s1"
-    host._session_histories["s1"] = [{"role": "user", "content": "stale"}]
+    host._chat_context.active_session_id = "s1"
+    host._chat_context.histories["s1"] = [{"role": "user", "content": "stale"}]
     host._reset_runtime_conversation_state(clear_histories=True)
 
     host.chat_full(ChatRequest(message="continue", session_id="s1"))
@@ -2079,18 +1595,6 @@ def test_chat_full_same_session_reloads_after_runtime_reset(monkeypatch):
     assert host.session_history("s1")[:2] == rows
 
 
-def test_engine_host_close_releases_task_graph_coordinator():
-    host = FakeEngineHost()
-    closed = []
-    host._task_graph_coordinator = SimpleNamespace(
-        close=lambda: closed.append(True),
-    )
-
-    host.close()
-    host.close()
-
-    assert closed == [True]
-    assert host._task_graph_coordinator is None
 
 
 def test_chat_full_first_message_auto_title(monkeypatch):
@@ -2201,8 +1705,8 @@ def test_chat_full_pytorch_path(monkeypatch):
     monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
 
     host = make_full_host(FakePyTorchModel)
-    host._active_session_id = "s1"
-    host._session_histories["s1"] = [
+    host._chat_context.active_session_id = "s1"
+    host._chat_context.histories["s1"] = [
         {"role": "user", "content": "什么是量化？"},
         {"role": "assistant", "content": "量化是模型压缩。"},
     ]
@@ -2559,7 +2063,7 @@ def test_inference_client_forward_layers_loopback(live_inference_svc):
 
 def test_inference_client_worker_stage(live_inference_svc):
     from inference_client import InferenceClient
-    from task_provider import StageRequest as ProviderStageRequest
+    from execution_provider import StageRequest as ProviderStageRequest
 
     client = InferenceClient(base_url=live_inference_svc, timeout=30)
     stage = ProviderStageRequest(
@@ -2580,7 +2084,7 @@ def test_inference_client_exposes_complete_scheduler_callback_bundle():
     callbacks = client.scheduler_callbacks
     assert callbacks is client.scheduler_callbacks
     assert callbacks.execute_task_worker_stage == client.execute_task_worker_stage
-    assert callbacks.active_task_graph_model_identity == client.active_task_graph_model_identity
+    assert callbacks.active_execution_model_identity == client.active_execution_model_identity
 
 
 def test_inference_client_kv_and_cancel(live_inference_svc):
@@ -2828,25 +2332,6 @@ def test_sched_http_my_role(sched_http_client):
     assert "is_master" in body and "node_role" in body and "node_id" in body
 
 
-def test_sched_http_queue_lifecycle(sched_http_client):
-    """queue 域：detail/strategy/pause/resume/clear。"""
-    client, _ = sched_http_client
-    r = client.get("/cluster/queue")
-    assert r.status_code == 200
-    body = r.json()
-    for key in ("paused", "strategy", "queue_size", "max_size", "q0", "q1", "q2"):
-        assert key in body, f"queue 缺字段 {key}"
-
-    r = client.post("/cluster/queue/strategy", json={"strategy": "mlfq"})
-    assert r.status_code == 200
-    assert r.json()["strategy"] == "mlfq"
-
-    r = client.post("/cluster/queue/pause")
-    assert r.status_code == 200 and r.json()["paused"] is True
-    r = client.post("/cluster/queue/resume")
-    assert r.status_code == 200 and r.json()["paused"] is False
-    r = client.post("/cluster/queue/clear")
-    assert r.status_code == 200 and "cleared" in r.json()
 
 
 def test_sched_http_config_and_layers(sched_http_client):

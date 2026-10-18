@@ -22,7 +22,7 @@ def load_contract() -> dict[str, Any]:
     profile = data.get("profile") if isinstance(data, dict) else None
     if data.get("schema_version") != 1 or not isinstance(version, dict):
         raise ValueError("unsupported release contract schema")
-    for key in ("product", "launcher", "inference_service_contract"):
+    for key in ("product", "inference_service_contract"):
         value = str(version.get(key, ""))
         if not VERSION_RE.fullmatch(value):
             raise ValueError(f"invalid {key} version: {value!r}")
@@ -38,15 +38,12 @@ def load_contract() -> dict[str, Any]:
 def generated_files(contract: dict[str, Any]) -> dict[Path, str]:
     version = contract["version"]
     product = str(version["product"])
-    launcher = str(version["launcher"])
     android_code = int(version["android_code"])
     return {
         ROOT / "packaging" / "packaging" / "version.txt": product + "\n",
-        ROOT / "packaging" / "packaging" / "launcher-version.txt": launcher + "\n",
         ROOT / "packaging" / "packaging" / "release-versions.issinc": (
             "; Generated from release-contract.json; do not edit manually.\n"
             f'#define QlhProductVersion "{product}"\n'
-            f'#define QlhLauncherVersion "{launcher}"\n'
         ),
         ROOT / "android" / "version.properties": (
             "# Generated from release-contract.json; do not edit manually.\n"

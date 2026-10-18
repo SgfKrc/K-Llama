@@ -20,6 +20,7 @@ for _candidate in (str(ROOT), str(ROOT / "src")):
         sys.path.insert(0, _candidate)
 
 import api_server  # noqa: F401,E402 - 与 tests/test_scheduler.py 保持同样的导入副作用
+from tests.test_scheduler import _engine_contract
 from scheduler import NodeInfo, NodeState, Scheduler  # noqa: E402
 
 RELAY_SPEC = {
@@ -31,7 +32,7 @@ RELAY_SPEC = {
 def _node(node_id: str, role: str) -> NodeInfo:
     return NodeInfo(
         node_id=node_id, role=role, state=NodeState.ONLINE,
-        node_type="pc", device_info={},
+        node_type="pc", device_info=_engine_contract("pytorch", "pytorch_cpu"),
     )
 
 

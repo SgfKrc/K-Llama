@@ -1,175 +1,28 @@
-"""Legacy split characterization; private facades are reviewed during R1-R5.
-
-The external product contract is tests/test_refactor_product_contract.py.
-This file preserves pinned old-structure evidence, not permanent target APIs.
-"""
-
-from __future__ import annotations
-
-import ast
-import hashlib
-import json
-from pathlib import Path
-import sys
+"""R5 ownership replaces the pinned large-file/facade characterization."""
 import threading
 import time
-
+from types import SimpleNamespace
 import pytest
+import api_server
+from scheduler import Scheduler, NodeInfo, NodeRole, NodeState
+from scheduler_pipeline import SchedulerPipelineMixin
+pytestmark = pytest.mark.refactor_contract
 
-pytestmark = pytest.mark.legacy_characterization
-PINNED_SOURCE_REVISION = "fb870d1d4ef2d1d2901db1c5e299ac387fc9597b"
+def _wait_for(event, timeout=3):
+    assert event.wait(timeout)
 
+def test_scheduler_uses_instance_settings_after_module_edits(monkeypatch):
+    import scheduler as module
+    owner = Scheduler()
+    expected = owner._runtime_setting("RUN_MODE")
+    monkeypatch.setattr(module, "RUN_MODE", "unrelated")
+    assert owner._runtime_setting("RUN_MODE") == expected
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
-import api_server  # noqa: E402
-import scheduler  # noqa: E402
-from api import (  # noqa: E402
-    routes_auth,
-    routes_chat,
-    routes_cluster,
-    routes_device,
-    routes_diagnostics,
-    routes_health,
-    routes_logs,
-    routes_model_intent,
-    routes_model_supply,
-    routes_models,
-    routes_sessions,
-    routes_system,
-    routes_tasks,
-)
-from scheduler_cluster import SchedulerClusterMixin  # noqa: E402
-from scheduler_pipeline import SchedulerPipelineMixin  # noqa: E402
-from scheduler_sidecars import SchedulerSidecarMixin  # noqa: E402
-from scheduler_task_worker import SchedulerTaskWorkerMixin  # noqa: E402
-from scheduler import (  # noqa: E402
-    NodeInfo,
-    NodeRole,
-    NodeState,
-    PipelineQueue,
-    Scheduler,
-    _bootstrap_api_port,
-    _node_supports_forward_layers,
-)
-
-
-SCHEDULER_FACADE_SYMBOLS = {
-    "Scheduler",
-    "PipelineQueue",
-    "NodeInfo",
-    "NodeState",
-    "NodeRole",
-    "_node_supports_forward_layers",
-    "_bootstrap_api_port",
-}
-
-
-def _scheduler_sources() -> list[Path]:
-    sources = [ROOT / "src" / "scheduler.py"]
-    sources.extend(sorted((ROOT / "src").glob("scheduler_*.py")))
-    return sources
-
-
-def _module_names_from_baseline() -> set[str]:
-    path = ROOT / "tests" / "fixtures" / "refactor_legacy_scheduler_symbols.json"
-    snapshot = json.loads(path.read_text(encoding="utf-8"))
-    assert snapshot["baseline_revision"] == PINNED_SOURCE_REVISION
-    return set(snapshot["symbols"])
-
-
-def _openapi_snapshot() -> dict:
-    path = ROOT / "tests" / "fixtures" / "refactor_largefile_openapi_baseline.json"
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _canonical_openapi_paths() -> dict[str, list[str]]:
-    return {
-        path: sorted(operation_map.keys())
-        for path, operation_map in sorted(api_server.app.openapi()["paths"].items())
-    }
-
-
-def _wait_for(event: threading.Event, timeout: float = 3.0) -> None:
-    assert event.wait(timeout), "异步转发测试未在限定时间内完成"
-
-
-def test_scheduler_facade_exports_required_symbols() -> None:
-    assert SCHEDULER_FACADE_SYMBOLS <= set(scheduler.__all__)
-    assert SCHEDULER_FACADE_SYMBOLS <= set(dir(scheduler))
-
-
-def test_scheduler_facade_preserves_pinned_module_names() -> None:
-    # This records the old split only; owner migration may explicitly replace
-    # it. TYPE_CHECKING-only names are absent from runtime dir().
-    runtime_names = set(dir(scheduler))
-    missing = (_module_names_from_baseline() - runtime_names) - {
-        "InferenceHost",
-        "SchedulerCallbacks",
-    }
-    assert not missing, f"scheduler facade lost pinned legacy symbols: {sorted(missing)}"
-
-
-def test_scheduler_source_scan_covers_current_and_split_modules() -> None:
-    sources = _scheduler_sources()
-    assert sources
-    assert all(path.exists() and path.read_text(encoding="utf-8") for path in sources)
-
-
-def test_scheduler_sidecars_are_mixin_methods_with_facade_factory() -> None:
-    assert issubclass(Scheduler, SchedulerSidecarMixin)
-    assert Scheduler.configure_gemma4_pipeline_sidecar is (
-        SchedulerSidecarMixin.configure_gemma4_pipeline_sidecar
-    )
-    instance = Scheduler()
-    assert instance._qwen3_multisidecar_factory() is scheduler.Qwen3PipelineMultiSidecar
-
-
-def test_scheduler_split_mixins_preserve_facade_patch_points(monkeypatch) -> None:
-    instance = Scheduler()
-    assert issubclass(Scheduler, SchedulerTaskWorkerMixin)
-    assert issubclass(Scheduler, SchedulerClusterMixin)
-    assert issubclass(Scheduler, SchedulerPipelineMixin)
-    assert "_effective_role" not in SchedulerClusterMixin.__dict__
-    assert Scheduler._on_tcp_message.__qualname__.startswith("Scheduler.")
-    assert Scheduler.register_node is SchedulerClusterMixin.register_node
-    assert Scheduler._run_pipeline is SchedulerPipelineMixin._run_pipeline
-    assert Scheduler._send_task_worker_hello is SchedulerTaskWorkerMixin._send_task_worker_hello
-
-    monkeypatch.setattr(scheduler, "RUN_MODE", "facade-patch-probe")
-    assert instance.get_status()["run_mode"] == "facade-patch-probe"
-
-    enabled = scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED
-    monkeypatch.setattr(scheduler, "TASK_WORKER_EXPERIMENTAL_ENABLED", not enabled)
-    assert instance.get_task_worker_protocol_status()["experiment_enabled"] is not enabled
-
-
-def test_effective_role_reads_scheduler_runtime_global(monkeypatch) -> None:
-    import config
-
-    instance = Scheduler()
-    instance._role_override = None
-    instance._auto_role_controller = None
-    monkeypatch.setattr(config, "NODE_ROLE", "master", raising=False)
-    monkeypatch.setattr(scheduler, "NODE_ROLE", "client")
-
-    assert instance._effective_role() == "client"
-
-
-def test_scheduler_lock_identity_is_instance_owned() -> None:
-    instance = Scheduler()
-    locks = [
-        getattr(instance, name)
-        for name in ("_inference_lock", "_layer_config_lock", "_layer_execution_lock")
-    ]
-
-    assert all(lock is getattr(instance, name) for lock, name in zip(
-        locks,
-        ("_inference_lock", "_layer_config_lock", "_layer_execution_lock"),
-    ))
-    assert len({id(lock) for lock in locks}) == 3
-
+def test_published_executor_has_no_legacy_queue_or_decode_entry():
+    import scheduler as module
+    assert not hasattr(module, "PipelineQueue")
+    assert not hasattr(SchedulerPipelineMixin, "_run_route_a_stage_pipeline")
+    assert not hasattr(SchedulerPipelineMixin, "_run_pipeline")
 
 def test_handle_infer_forward_runs_pipeline_and_returns_result(monkeypatch) -> None:
     import local_store
@@ -233,7 +86,6 @@ def test_handle_infer_forward_runs_pipeline_and_returns_result(monkeypatch) -> N
     ]
     assert not instance._forward_cancel_events
 
-
 def test_handle_infer_forward_rejects_full_concurrency_slot(monkeypatch) -> None:
     instance = Scheduler()
     sent: list[dict] = []
@@ -258,7 +110,6 @@ def test_handle_infer_forward_rejects_full_concurrency_slot(monkeypatch) -> None
     assert len(sent) == 1
     assert sent[0]["kwargs"]["status"] == "error"
     assert "并发上限" in sent[0]["kwargs"]["error"]
-
 
 def test_handle_infer_forward_cancellation_reaches_pipeline(monkeypatch) -> None:
     instance = Scheduler()
@@ -299,140 +150,3 @@ def test_handle_infer_forward_cancellation_reaches_pipeline(monkeypatch) -> None
     assert sent[0]["kwargs"]["status"] == "error"
     assert sent[0]["kwargs"]["error"] == "cancelled"
     assert not instance._forward_cancel_events
-
-
-def test_api_openapi_path_method_snapshot_is_stable() -> None:
-    snapshot = _openapi_snapshot()
-    actual = _canonical_openapi_paths()
-    encoded = json.dumps(actual, separators=(",", ":"), ensure_ascii=True)
-
-    assert len(actual) == snapshot["path_count"]
-    assert sum(len(methods) for methods in actual.values()) == snapshot["operation_count"]
-    assert hashlib.sha256(encoded.encode()).hexdigest() == snapshot["canonical_path_method_sha256"]
-
-
-def test_api_log_route_order_keeps_literal_routes_before_path_parameter() -> None:
-    routes = list(routes_logs.router.routes)
-    recent = [
-        index for index, route in enumerate(routes)
-        if route.path == "/api/logs/recent" and "GET" in (route.methods or set())
-    ]
-    wildcard = [
-        index for index, route in enumerate(routes)
-        if route.path == "/api/logs/{filename:path}"
-    ]
-
-    assert recent and wildcard
-    assert max(recent) < min(wildcard)
-
-
-def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
-    expected = {
-        routes_health: 4,
-        routes_device: 3,
-        # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate
-        #   （OpenAPI 路径 126->127、operation 147->148）
-        routes_cluster: 68,
-        # ★ 票 12d MODEL-INTENT-UX-01：/api/models/intent 一族来自
-        #   routes_model_intent（6 条），既有 routes_models 从 23 增至 24；
-        #   供给意图端点落在 routes_model_supply（5 条）。见 fixtures 快照
-        #   （路径 127->137、operation 148->160）。
-        routes_models: 24,
-        routes_model_supply: 5,
-        routes_model_intent: 6,
-        routes_auth: 12,
-        routes_sessions: 10,
-        routes_tasks: 6,
-        routes_chat: 7,
-        routes_system: 3,
-        routes_logs: 12,
-        # ★ 2026-10-18：票 13 的两个诊断端点原先以 `@app.get(...)` 直接写在
-        #   api_server.py（违反本文件第 420 行的结构约束），已搬进独立 router。
-        routes_diagnostics: 2,
-    }
-    assert api_server._api_route_modules == tuple(expected)
-    for module, count in expected.items():
-        assert module._api_module is api_server
-        assert len(module.router.routes) == count
-        # ★ 票 12 / 12d：路由模块用 exported_handlers() 显式声明对 facade 导出的 handler。
-        #   routes_model_supply 与 routes_model_intent 返回空字典 ⇒ 这些端点只经 router
-        #   暴露，不进 api_server 命名空间（create / get / current / connect 这类泛名
-        #   会污染 facade）。因此断言改为按各模块自报的导出名单核对。
-        for name, handler in module.exported_handlers().items():
-            assert getattr(api_server, name) is handler
-
-    assert api_server.health is routes_health.health
-    assert api_server.get_status is routes_health.get_status
-    assert api_server.get_device_profile is routes_device.get_device_profile
-    assert api_server.get_recent_logs is routes_logs.get_recent_logs
-    assert api_server.read_log_file is routes_logs.read_log_file
-    assert api_server.get_cluster_status is routes_cluster.get_cluster_status
-    assert api_server.list_models is routes_models.list_models
-    assert api_server.auth_login is routes_auth.auth_login
-    assert api_server.create_session is routes_sessions.create_session
-    assert api_server.list_workflows is routes_tasks.list_workflows
-    assert api_server.chat is routes_chat.chat
-    assert api_server.system_shutdown is routes_system.system_shutdown
-
-
-def test_api_routers_cover_every_openapi_operation() -> None:
-    from collections import Counter
-
-    def normalize_route_path(path: str) -> str:
-        return path.replace(":path}", "}")
-
-    routed = Counter(
-        (normalize_route_path(route.path), method.lower())
-        for module in api_server._api_route_modules
-        for route in module.router.routes
-        if route.include_in_schema
-        for method in route.methods or ()
-    )
-    openapi = Counter(
-        (path, method)
-        for path, operations in api_server.app.openapi()["paths"].items()
-        for method in operations
-    )
-    # ★ 票9 SEC-BOUNDARY-01 新增 POST /api/cluster/credentials/rotate ⇒ 147 -> 148
-    # ★ 票 12d MODEL-INTENT-UX-01 新增 /api/models/intent 一族 ⇒ 148 -> 160
-    # ★ 票 13 新增 /api/diagnostics/product-source 与 product-runtime ⇒ 160 -> 162
-    #   （两个端点同时从 api_server 搬进 routes_diagnostics，见上方 expected）
-    assert sum(routed.values()) == 162
-    assert routed == openapi
-
-
-def test_api_facade_no_longer_owns_endpoint_definitions() -> None:
-    tree = ast.parse((ROOT / "src" / "api_server.py").read_text(encoding="utf-8"))
-    route_methods = {"get", "post", "put", "patch", "delete", "api_route"}
-    remaining = [
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(
-            isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Attribute)
-            and isinstance(decorator.func.value, ast.Name)
-            and decorator.func.value.id == "app"
-            and decorator.func.attr in route_methods
-            for decorator in node.decorator_list
-        )
-    ]
-    assert remaining == []
-
-
-
-@pytest.mark.parametrize(
-    "name",
-    (
-        "app",
-        "model_manager",
-        "scheduler",
-        "ChatGenerationCancelled",
-        "_request_id_ctx",
-        "_run_log_retention_cleanup",
-        "_client_supports_forward_layers",
-        "run_api_servers",
-    ),
-)
-def test_api_facade_preserves_imported_symbols(name: str) -> None:
-    assert hasattr(api_server, name), name

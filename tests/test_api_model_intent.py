@@ -102,8 +102,8 @@ def registered_api(api, monkeypatch):
     assert tcp_server.confirm_registration(node_id)
     monkeypatch.setattr(server.scheduler, "_tcp_server_default", tcp_server)
     monkeypatch.setattr(server.scheduler, "get_distributed_inference_enabled", lambda: True)
-    original_facade = server.scheduler._scheduler_facade_global
-    monkeypatch.setattr(server.scheduler, "_scheduler_facade_global",
+    original_facade = server.scheduler._runtime_setting
+    monkeypatch.setattr(server.scheduler, "_runtime_setting",
                         lambda name: "distributed" if name == "RUN_MODE" else original_facade(name))
     monkeypatch.setattr(server, "_get_all_model_configs", lambda: [])
     return SimpleNamespace(server=server, routes=routes, coordinator=fake, tcp=tcp_server,
@@ -246,7 +246,7 @@ def test_loopback_worker_relay_reaches_registered_master_without_manual_cidr(reg
     import model_intent_gateway as gateway
     owner = registered_api
     worker = SimpleNamespace(_effective_role=lambda: "client", get_distributed_inference_enabled=lambda: True,
-        _scheduler_facade_global=lambda _name: "distributed",
+        _runtime_setting=lambda _name: "distributed",
         _tcp_client=SimpleNamespace(_running=True, is_registered=True, sock=object(), registration_epoch=1,
                                    server_host="100.64.1.2", server_port=18888, client_id=owner.node_id))
     owner.monkeypatch.setattr(gateway.node_config, "load_node_config", lambda: {

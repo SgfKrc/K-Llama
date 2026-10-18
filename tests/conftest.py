@@ -196,7 +196,8 @@ def _clear_chat_state(api_server) -> None:
             service._revisions.clear()
             service.histories.clear()
             service._history_generations.clear()
-            service.active_session_id = None
+            service._active_by_client.clear()
+            service._kv_session_id = None
     ctx = getattr(api_server, "_request_id_ctx", None)
     if ctx is not None:
         ctx.set("")
@@ -219,7 +220,7 @@ def _isolate_local_store(tmp_path):
             isolation.setattr(local_store, "_initialized_paths", set())
             paths = {
                 "STATE_DIR": str(tmp_path / "state"),
-                "TASK_GRAPH_JOURNAL_PATH": str(tmp_path / "state" / "task-graph.sqlite3"),
+                "LEGACY_RECOVERY_JOURNAL_PATH": str(tmp_path / "state" / "task-graph.sqlite3"),
                 "JOURNAL_REPLICATION_REPLICA_PATH": str(tmp_path / "journal-replica.sqlite3"),
                 "KV_COLD_CACHE_ROOT": str(tmp_path / "state" / "kv-cold"),
                 "LOG_DIR": str(tmp_path / "logs"),
@@ -290,16 +291,6 @@ def _reset_process_wide_chat_state(_isolate_local_store):
         (runtime.get_node_id(), runtime.get_node_role()) if runtime is not None else None
     )
 
-    # A lazy coordinator caches its first journal path. Give the default proxy
-    # a test lifetime so a later test cannot keep writing the earlier journal.
-    # Explicit scoped coordinator fixtures retain their own lifecycle.
-    original_coordinator = vars(api_server).get("task_graph_coordinator") if api_server is not None else None
-    lazy_coordinator_type = vars(api_server).get("_LazyTaskGraphCoordinator") if api_server is not None else None
-    test_coordinator = None
-    if lazy_coordinator_type is not None and type(original_coordinator) is lazy_coordinator_type:
-        test_coordinator = lazy_coordinator_type(vars(original_coordinator)["_factory"])
-        api_server.task_graph_coordinator = test_coordinator
-
     # Inspect the instance dictionary and lazy slot directly. getattr/hasattr on
     # ModelHost or _LazyModelManager can otherwise construct a real ModelManager.
     host_module = sys.modules.get("model_host")
@@ -307,7 +298,11 @@ def _reset_process_wide_chat_state(_isolate_local_store):
     host_originals = dict(vars(host)) if host is not None else {}
     generation = host_originals.get("generation_config")
     generation_snapshot = deepcopy(generation)
-    manager = host_originals.get("_manager")
+    controller = host_originals.get("_runtime_controller")
+    controller_originals = dict(vars(controller)) if controller is not None else None
+    if controller_originals is not None:
+        controller_originals["_metadata"] = deepcopy(controller_originals["_metadata"])
+    manager = controller.manager() if controller is not None else host_originals.get("_manager")
     missing = object()
     try:
         lazy_instance = object.__getattribute__(manager, "_instance")
@@ -323,15 +318,10 @@ def _reset_process_wide_chat_state(_isolate_local_store):
         try:
             _clear_chat_state(api_server)
         finally:
-            if test_coordinator is not None:
-                current_coordinator = vars(api_server).get("task_graph_coordinator")
-                try:
-                    if current_coordinator is not None and current_coordinator not in (original_coordinator, test_coordinator):
-                        current_coordinator.close()
-                    test_coordinator.close()
-                finally:
-                    api_server.task_graph_coordinator = original_coordinator
             if host is not None:
+                if controller is not None:
+                    vars(controller).clear()
+                    vars(controller).update(controller_originals)
                 if lazy_instance is not missing:
                     object.__setattr__(manager, "_instance", lazy_instance)
                 if generation is not None:

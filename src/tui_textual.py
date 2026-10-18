@@ -119,7 +119,6 @@ from tui_api import (  # noqa: E402
     pause_queue,
     rename_session,
     resume_queue,
-    set_queue_strategy,
     unload_model,
     auth_capability,
     auth_login,
@@ -164,7 +163,7 @@ PAGES: List[Tuple[str, str, str]] = [
     ("models", "模型", "选模 · L 自动供给并准备 · U 卸载 · C 取消选模"),
     ("cluster", "分布式", "配置 · 容量 · 层段 · /cluster/*"),
     ("nodes", "节点", "成员 · 入群 · 邀请 · 连接 · /cluster/nodes"),
-    ("queue", "队列", "MLFQ 三级 · P 暂停/恢复 · S 策略 · C 清空排队"),
+    ("queue", "队列", "FIFO · P 暂停/恢复 · C 清空排队"),
     ("logs", "日志", "筛选 · 统计 · 导出 · /logs/*"),
     ("device", "设备", "画像 · 自动配置 · GPU · /device/*"),
     ("settings", "设置", "会话参数与依赖边界"),
@@ -535,19 +534,6 @@ class ChatPane(Vertical):
             else:
                 self.query_one("#chat-status", Static).update(
                     "[red]用法: /route auto|local|distributed|required")
-            return
-        if text.startswith("/mode "):
-            # ★ 2026-10-07（#29 发起侧缺口）：请求级执行模式。
-            #   `auto` = 沿用后端推断（含 N2.1 显式字段推断）；`task_graph` = 显式任务图。
-            value = text.split(" ", 1)[1].strip().lower()
-            mapping = {"auto": "auto", "task_graph": "task_graph", "graph": "task_graph"}
-            if value in mapping:
-                self.app.execution_mode = mapping[value]
-                self.query_one("#chat-status", Static).update(
-                    f"执行模式 → {mapping[value]}")
-            else:
-                self.query_one("#chat-status", Static).update(
-                    "[red]用法: /mode auto|task_graph")
             return
         if text.startswith("/thinking "):
             value = text.split(" ", 1)[1].strip().lower()
@@ -1074,14 +1060,10 @@ class ChatPane(Vertical):
 
     def cmd_queue(self, text: str) -> None:
         parts = text.split()
-        usage = ("用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+        usage = ("用法: /queue pause | resume | clear"
                  " | cancel <task_id>")
         if len(parts) == 2 and parts[1].lower() in {"pause", "resume"}:
             self.queue_call(parts[1].lower())
-            return
-        if len(parts) == 3 and parts[1].lower() == "strategy" \
-                and parts[2].lower() in {"fifo", "mlfq"}:
-            self.queue_call("strategy", parts[2].lower())
             return
         if len(parts) == 3 and parts[1].lower() == "cancel":
             self.queue_call("cancel", parts[2])
@@ -1104,8 +1086,6 @@ class ChatPane(Vertical):
                 pause_queue(app.api)
             elif action == "resume":
                 resume_queue(app.api)
-            elif action == "strategy":
-                set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
             elif action == "cancel":
@@ -1344,7 +1324,6 @@ class MainScreen(Screen):
         Binding("i", "model_register", "登记模型"),
         Binding("v", "model_search", "搜索模型"),
         Binding("p", "queue_toggle_pause", "暂停/恢复"),
-        Binding("s", "queue_cycle_strategy", "调度策略"),
         Binding("c", "queue_clear", "清空排队"),
         Binding("t", "cluster_toggle", "分布式开关"),
         Binding("m", "cluster_max_nodes", "最大节点"),
@@ -1475,7 +1454,7 @@ class MainScreen(Screen):
                     yield Static("选择节点后可执行邀请、连接和注销。", id="nodes-pane")
                     yield DataTable(id="nodes-table")
                 with Vertical(id="page-queue", classes="page"):
-                    yield Static("队列 · MLFQ 三级调度", classes="page-title")
+                    yield Static("队列 · 有界 FIFO", classes="page-title")
                     yield Static(PAGES[5][2], classes="page-hint")
                     yield Static("加载中…", id="queue-pane")
                     yield DataTable(id="queue-table")
@@ -1587,7 +1566,7 @@ class MainScreen(Screen):
             "节点", "角色 / 状态", "CPU 物理/逻辑", "内存 总/可用", "GPU 数/CUDA", "显存 总/可用")
         self.query_one("#nodes-table", DataTable).add_columns(
             "节点", "角色", "类型", "状态", "地址", "RTT")
-        self.query_one("#queue-table", DataTable).add_columns("队列", "深度", "上限(tokens)", "任务")
+        self.query_one("#queue-table", DataTable).add_columns("位置", "请求", "执行资源", "终局")
         self.query_one("#gpu-table", DataTable).add_columns(
             "", "名称", "类型", "CUDA", "显存GB", "驱动")
         self.query_one("#api-table", DataTable).add_columns(
@@ -2708,47 +2687,20 @@ class MainScreen(Screen):
         )
 
     def fill_queue(self, queue: Dict[str, Any]) -> None:
-        """``/cluster/queue`` → MLFQ：``q0/q1/q2`` + ``*_depth`` + ``completed_count``。
-
-        此前按 ``tasks`` 解析——真实返回里没有该键（是三级队列），故只能显示"队列空闲"。
-        """
         pane = self.query_one("#queue-pane", Static)
         table = self.query_one("#queue-table", DataTable)
         table.clear()
         self.queue_state = queue if "_error" not in queue else {}
         if "_error" in queue:
-            pane.update(f"[red]队列不可用[/]  ·  {queue['_error']}")
+            pane.update(f"[red]队列不可用[/] · {queue['_error']}")
             return
-        if queue.get("paused"):
-            state = "[yellow]已暂停[/]"
-        elif queue.get("running"):
-            state = "[green]运行中[/]"
-        else:
-            state = "[yellow]未运行[/]"
-        pane.update(
-            f"{state}  ·  策略 {queue.get('strategy') or '—'}"
-            f"  ·  队列 {queue.get('queue_size', '—')}/{queue.get('max_size', '—')}"
-            f"  ·  已完成 {queue.get('completed_count', '—')}"
-            f"  ·  当前任务 {queue.get('current_task') or '无'}")
-        aging = queue.get("aging_params") or {}
-        limits = {"q0": aging.get("q0_max_tokens", 128),
-                  "q1": aging.get("q1_max_tokens", 512),
-                  "q2": None}
-        for level in ("q0", "q1", "q2"):
-            tasks = queue.get(level) or []
-            depth = queue.get(f"{level}_depth", len(tasks))
-            preview = ", ".join(
-                str(task.get("task_id") or task.get("id") or "task")
-                for task in tasks[:3] if isinstance(task, dict)
-            ) or "[dim]空[/]"
-            if len(tasks) > 3:
-                preview += f" … +{len(tasks) - 3}"
-            table.add_row(
-                f"[b]{level.upper()}[/]",
-                str(depth),
-                str(limits[level]) if limits[level] else "不限",
-                preview,
-            )
+        state = "已暂停接收" if queue.get("paused") else "接受请求"
+        pane.update(f"{state} · FIFO · {queue.get('queue_size', 0)}/{queue.get('capacity', '—')} · revision {queue.get('revision', '—')}")
+        active = queue.get("active")
+        if active:
+            table.add_row("执行中", str(active.get("request_id", "")), str(active.get("execution_state", "unknown")), str(active.get("terminal") or "进行中"))
+        for item in queue.get("tasks", []):
+            table.add_row(str(item.get("position", "—")), str(item.get("request_id", "")), f"等待 {item.get('wait_seconds', 0):.1f}s", str(item.get("outcome") or "排队中"))
 
     def fill_logs(self, logs: Dict[str, Any]) -> None:
         view = self.query_one("#logs-log", RichLog)
@@ -3404,26 +3356,6 @@ class MainScreen(Screen):
             return
         self.run_queue_action("resume" if self.queue_state.get("paused") else "pause")
 
-    def action_queue_cycle_strategy(self) -> None:
-        """队列屏 S：mlfq ↔ fifo（影响新请求的排队行为，故先确认）。"""
-        if PAGES[self.page_index][0] == "logs":
-            self.action_logs_stats()
-            return
-        if PAGES[self.page_index][0] != "queue":
-            self.write_status("[yellow]请先切到「队列」屏[/]")
-            return
-        if not self.queue_state:
-            self.write_status("[yellow]队列数据不可用，无法操作[/]")
-            return
-        current = str(self.queue_state.get("strategy") or "mlfq").lower()
-        target = "fifo" if current == "mlfq" else "mlfq"
-        self.app.confirm(
-            "切换调度策略",
-            f"当前 [b]{current}[/] → [b]{target}[/]\n"
-            "影响：新入队请求的优先级与老化（aging）行为；执行中的任务不受影响。",
-            lambda: self.run_queue_action("strategy", target),
-            confirm_label="切换",
-        )
 
     def action_queue_clear(self) -> None:
         """队列屏 C：清空排队任务（列出将清空的内容后再确认）。"""
@@ -3441,7 +3373,7 @@ class MainScreen(Screen):
             return
         pending = self.queue_state.get("queue_size", "—")
         listing = []
-        for level in ("q0", "q1", "q2"):
+        for level in ("tasks",):
             tasks = self.queue_state.get(level) or []
             if not tasks:
                 continue
@@ -3452,7 +3384,7 @@ class MainScreen(Screen):
         self.app.confirm(
             "清空排队任务",
             f"将清空**排队中**的任务（queue_size={pending}），执行中的任务**不受影响**：\n"
-            + ("\n".join(listing) if listing else "  （三级队列当前为空）")
+            + ("\n".join(listing) if listing else "  （FIFO 当前为空）")
             + "\n此操作不可撤销。",
             lambda: self.run_queue_action("clear"),
             confirm_label="清空",
@@ -3467,8 +3399,6 @@ class MainScreen(Screen):
                 pause_queue(app.api)
             elif action == "resume":
                 resume_queue(app.api)
-            elif action == "strategy":
-                set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
             elif action == "cancel":
@@ -3791,9 +3721,13 @@ def run(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, interval: float =
     而启动器正是这样调它的。
     """
     api = ApiClient(host=host, port=port, log_token=log_token)
-    KoakumaApp(api, interval=interval, routing_preference=routing_preference,
-               show_thinking=show_thinking, enable_thinking=enable_thinking,
-               supervisor=supervisor).run()
+    try:
+        KoakumaApp(api, interval=interval, routing_preference=routing_preference,
+                   show_thinking=show_thinking, enable_thinking=enable_thinking,
+                   supervisor=supervisor).run()
+    finally:
+        if supervisor is not None:
+            supervisor.stop()
     return 0
 
 

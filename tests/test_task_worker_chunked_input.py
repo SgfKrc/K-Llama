@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import api_server  # noqa: F401,E402
 from scheduler import Scheduler  # noqa: E402
-from task_provider import (  # noqa: E402
+from execution_provider import (  # noqa: E402
     ModelIdentity,
     StageAttempt,
     StageRequest,

@@ -213,7 +213,7 @@ def cmd_queue(api: ApiClient, args: argparse.Namespace) -> int:
         print(queue)
         return 0
     print("◆ 请求队列")
-    print(_line("队列", "%s / %s" % (queue.get("queue_size", "—"), queue.get("max_size", "—"))))
+    print(_line("队列", "%s / %s" % (queue.get("queue_size", "—"), queue.get("capacity", "—"))))
     print(_line("调度策略", queue.get("strategy")))
     items = queue.get("tasks") or queue.get("queue") or queue.get("items") or []
     if not items:

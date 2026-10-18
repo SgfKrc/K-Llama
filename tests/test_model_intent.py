@@ -50,9 +50,26 @@ class Supply:
             self.operations[op_id]["status"] = "cancelled"
 
 
+class IntentOwner:
+    """Selection repository test double; native barriers have separate real-owner tests."""
+    boot_id = "intent-test"
+    def __init__(self):
+        self.state = {"boot_id":self.boot_id,"revision":0,"operations":{},"supplies":{},
+            "selected_operation":"", "commit_scope":"test"}
+    def runnable(self, *args, **kwargs): return True
+    def start(self): return self.snapshot()
+    def snapshot(self): return deepcopy(self.state)
+    def save_operation(self, record, *, select=False, **options):
+        self.state["revision"] += 1
+        self.state["operations"][record["operation_id"]] = deepcopy(record)
+        if select: self.state["selected_operation"] = record["operation_id"]
+    def fence_operation_failure(self, record): self.save_operation(record)
+
+
 def setup(tmp_path, prepare, *, retire=None, retire_timeout=300):
     supply = Supply(tmp_path)
-    scheduler = SimpleNamespace(_model_supply=supply, _layer_config_lock=threading.RLock(),
+    scheduler = SimpleNamespace(_model_supply=supply, _model_control=IntentOwner(), _model_control_authority=lambda: {}, _model_control_connections=lambda: {},
+                                _model_control_input_revisions=lambda transaction: {}, _layer_config_lock=threading.RLock(),
                                 _pipeline_load_transaction=None, _active_pipeline_capacity_plan=None,
                                 _pipeline_model_cleanup_ledger={}, _worker_assignments=WorkerAssignmentRegistry(),
                                 _effective_role=lambda: "master", get_distributed_inference_enabled=lambda: True,
@@ -208,9 +225,8 @@ def test_master_restart_does_not_replay_prepare_or_claim_old_ready(tmp_path):
         c, scheduler, supply = setup(tmp_path, prepare)
         op_id = (await c.create({"model_id": "fixture"}))["operation_id"]
         await finish_tasks(c)
-        # Simulate a crash with the durable invocation still pending.
-        path = tmp_path / op_id / "intent.json"
-        path.write_text(json.dumps({"operation_id": op_id, "status": "preparing"}))
+        # Recovery is an explicit owner command; GET only projects its terminal.
+        scheduler._model_control.state["operations"][op_id].update(status="failed", reason_code="INTENT_MASTER_RESTARTED")
         recovered = ModelIntentCoordinator(scheduler, prepare)
         assert recovered.current()["reason_code"] == "INTENT_MASTER_RESTARTED"
         assert recovered._tasks == {}
@@ -235,6 +251,11 @@ def native_intent(stage_case, monkeypatch):
     from api.routes_model_supply import prepare_supply
     case = stage_case
     supply = case.master._model_supply
+    snapshot_worker = case.master._task_worker_control.worker_snapshot
+    def worker_snapshot(node):
+        value = snapshot_worker(node) or {}
+        return {**value, "capabilities": {**value.get("capabilities", {}), "node_incarnation":node+"-boot", "stage_kv_cleanup":True, "load_spec_version":1}}
+    monkeypatch.setattr(case.master._task_worker_control, "worker_snapshot", worker_snapshot)
     # stage_case substitutes receipt lookup for its native-only tests. Restore
     # the actual lookup, cancellation events, and selected-asset prepare guard.
     monkeypatch.setattr(supply, "get", lambda op: ModelSupplyCoordinator.get(supply, op))
@@ -624,7 +645,7 @@ def test_ready_receipt_remains_authoritative_when_final_projection_save_fails(na
         ack(case.master, "android", "commit")
         await task
         projected = c.get(op)
-        assert projected["status"] == "ready" and projected["loaded_ready"]
+        assert projected["status"] == "ready" and projected["loaded_ready"], json.dumps(projected)
         assert not c._tasks
         assert case.master._pipeline_load_transaction["phase"] == "ready"
         assert case.host.pipeline_candidate_status()["phase"] == "finalized"
@@ -687,6 +708,7 @@ def ready_intent(tmp_path):
     scheduler._pipeline_load_transaction["expected"]["worker"] = assignment
     scheduler._pipeline_load_transaction["worker_ids"].add("worker")
     publish_ready(scheduler)
+    c._persist(c._records[op])
     return SimpleNamespace(c=c, scheduler=scheduler, supply=supply, op=op)
 
 

@@ -124,7 +124,7 @@ def _master_server(scheduler):
     # Runtime authority, not discovery, node-list projections or saved config.
     if scheduler._effective_role() != "master":
         return None
-    facade = getattr(scheduler, "_scheduler_facade_global", None)
+    facade = getattr(scheduler, "_runtime_setting", None)
     if callable(facade):
         run_mode = facade("RUN_MODE")
     else:

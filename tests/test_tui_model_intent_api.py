@@ -19,7 +19,7 @@ def test_intent_transport_paths_payload_and_auth(monkeypatch):
         calls.append((request.method, request.full_url,
                       json.loads(request.data) if request.data else None, timeout,
                       dict(request.header_items())))
-        return io.BytesIO(json.dumps({"operation_id": OP, "status": "queued"}).encode())
+        return io.BytesIO(json.dumps({"schema_version": 2, "revision": 7, "identity": {"boot_id": "tui-test"}, "observed_at": 100, "validity": "valid", "operation_id": OP, "status": "queued"}).encode())
 
     monkeypatch.setattr(api_module.urllib.request, "urlopen", urlopen)
     api = ApiClient(auth_token="fixture-token")
@@ -91,7 +91,7 @@ def test_local_full_load_requires_leave_and_successful_real_unload():
 
 @pytest.mark.parametrize("status", MODEL_INTENT_STATUSES)
 def test_status_projection_reports_nodes_and_reasons(status):
-    operation = {"operation_id": OP, "status": status, "config_id": "config-3", "generation": 7,
+    operation = {"schema_version": 2, "revision": 7, "identity": {"boot_id": "tui-test"}, "observed_at": 100, "validity": "valid", "runnable": status == "ready", "operation_id": OP, "status": status, "config_id": "config-3", "generation": 7,
                  "loaded_ready": status == "ready", "reason_code": "MODEL_REASON", "reason": "detail",
                  "nodes": {"worker-1": {"status": "verifying", "bytes_received": 33, "total_bytes": 44,
                                           "reason_code": "NODE_REASON", "reason": "receipt", "layer_range": [5, 9]}}}
@@ -115,6 +115,8 @@ def test_readonly_distributed_commands_use_master_catalog_and_intent(capsys):
     import argparse
     import tui_commands
     class ReadOnly:
+        accept_snapshot = ApiClient.accept_snapshot
+        _snapshot_cache = {}
         base_url = "http://local-worker:8000"
         def __init__(self):
             self.paths = []
@@ -124,7 +126,7 @@ def test_readonly_distributed_commands_use_master_catalog_and_intent(capsys):
                 "/health": {"status": "ok"}, "/status": {"run_mode": "distributed"},
                 "/models/intent/catalog": {"models": [{"model_id": "master-model"}],
                                             "binding": {"status": "connected"}},
-                "/models/intent/current": {"operation_id": OP, "status": "preparing",
+                "/models/intent/current": {"schema_version": 2, "revision": 7, "identity": {"boot_id": "tui-test"}, "observed_at": 100, "validity": "valid", "operation_id": OP, "status": "preparing",
                                             "intent": {"model_id": "master-model"}},
             }.get(path, {})
     api = ReadOnly()

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,7 +74,6 @@ API_PATHS = {
     "session_activate": "/sessions/{session_id}/activate",  # POST 恢复会话
     "cluster_queue_pause": "/cluster/queue/pause",          # POST（仅主节点）
     "cluster_queue_resume": "/cluster/queue/resume",        # POST（仅主节点）
-    "cluster_queue_strategy": "/cluster/queue/strategy",    # POST {strategy: fifo|mlfq}
     "cluster_queue_clear": "/cluster/queue/clear",          # POST（仅主节点）
     # ---- 2026-09-19 补缺口 A：队列「单任务」取消（此前只能整体 clear）----
     "cluster_queue_task_cancel": "/cluster/queue/task/{task_id}",  # DELETE（仅主节点）
@@ -117,18 +117,24 @@ API_PATHS = {
 # ============================================================
 
 MODEL_INTENT_STATUSES = (
-    "queued", "waiting_nodes", "inspecting", "inventory", "planning", "building",
-    "supplying", "preparing", "ready", "failed", "cancelled", "superseded",
+    "pending", "queued", "waiting_capacity", "waiting_nodes", "inspecting", "inventory", "planning", "building",
+    "supplying", "verifying", "preparing", "ready", "failed", "cancelled", "superseded",
 )
 MODEL_INTENT_TERMINAL = frozenset({"ready", "failed", "cancelled", "superseded"})
 MODEL_INTENT_LABELS = dict(zip(MODEL_INTENT_STATUSES, (
-    "排队中", "等待节点", "检查模型", "盘点资产", "规划层段", "构建层段",
-    "供给中", "准备中", "就绪", "失败", "已取消", "已被替代",
+    "待处理", "排队中", "等待容量", "等待节点", "检查模型", "盘点资产", "规划层段", "构建层段",
+    "供给中", "校验中", "准备中", "就绪", "失败", "已取消", "已被替代",
 )))
 
 
 def model_intent_ready(operation: Dict[str, Any]) -> bool:
-    return operation.get("status") == "ready" and operation.get("loaded_ready") is True
+    revision, observed = operation.get("revision"), operation.get("observed_at")
+    return (operation.get("schema_version") == 2 and operation.get("validity") == "valid"
+            and type(revision) is int and revision >= 0
+            and isinstance(operation.get("identity"), dict) and bool(operation["identity"].get("boot_id"))
+            and type(observed) in (int, float) and math.isfinite(observed) and observed > 0
+            and operation.get("status") == "ready" and operation.get("runnable") is True
+            and operation.get("loaded_ready") is True)
 
 
 # These are capacity rejections, rather than worker discovery/registration states.
@@ -289,19 +295,13 @@ ROUTE_SHORT_ARGS = {
     "required": "distributed_required",
 }
 
-#: ★ 2026-10-07（#29 的**发起侧**缺口）：请求级执行模式。
-#:
-#: TUI 此前只传 `routing_preference`，`execution_mode` 恒为后端默认 `auto` ⇒ 用户想请求
-#: 任务图（`task_graph`）时在 UI 里**没有任何入口**，双机 TUI 端到端档（F3）也因此拿不到
-#: `distributed_used`。`#29` 修的是后端「推断 / 拒绝」语义，这里补齐 TUI 的传递能力。
+#: 请求级执行模式由版本化客户端合同限定。
 EXECUTION_MODES = (
     "auto",
-    "task_graph",
 )
 
 EXECUTION_MODE_LABELS = {
     "auto": "execute:auto",
-    "task_graph": "execute:task_graph",
 }
 
 
@@ -351,7 +351,7 @@ def build_interactive_request(
         "top_p": top_p,
     }
     if images:
-        # 图像请求仍固定在 `auto`：本地 MTMD 与任务图的组合尚未验证，不做顺带放开。
+        # 图像请求使用统一自动路由。
         body.update({
             "image_data_urls": images,
             "execution_mode": "auto",
@@ -521,12 +521,11 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/rename", "args": "<title>", "desc": "重命名当前会话"},
     {"name": "/sessions", "args": "", "desc": "列出最近会话"},
     {"name": "/delete-session", "args": "", "desc": "删除当前会话及其全部消息（需确认）"},
-    {"name": "/mode", "args": "auto|task_graph", "desc": "请求级执行模式（task_graph=显式任务图）"},
     {"name": "/reset", "args": "", "desc": "清空后端会话历史与 KV 缓存（需确认）"},
     {"name": "/model", "args": "load <id> [engine] [quant] | unload | cancel | status | connect | mode local|distributed",
      "desc": "选模与准备状态；local 退出集群并卸载后加载整模，distributed 自动供给并准备"},
     {"name": "/queue",
-     "args": "pause | resume | strategy <fifo|mlfq> | clear | cancel <task_id>",
+     "args": "pause | resume | clear | cancel <task_id>",
      "desc": "队列控制（clear 需确认）"},
     {"name": "/route", "args": "auto|local|distributed|required",
      "desc": "设置请求级路由偏好"},

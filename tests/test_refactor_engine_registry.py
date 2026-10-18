@@ -109,6 +109,7 @@ def test_real_pc_builder_matches_shared_fixture_and_roundtrips_through_validator
         ensure_full_model=forbidden_load,
     )
     harness = worker.SchedulerTaskWorkerMixin()
+    harness._model_control = SimpleNamespace(boot_id="fixture-worker-boot")
     harness._host = host
     ranges = case["layer_ranges"]
     harness._active_layer_config = {"engine": spec.family, "layer_range": ranges[0]} if ranges else {}
@@ -121,6 +122,7 @@ def test_real_pc_builder_matches_shared_fixture_and_roundtrips_through_validator
 
     actual = harness._task_worker_capabilities()
 
+    assert actual["node_incarnation"] == "fixture-worker-boot"
     assert actual["engine_capabilities"] == case["engine_capabilities"]
     assert actual["stage_types"] == case["pc_stage_types"]
     assert actual["layer_ranges"] == ranges

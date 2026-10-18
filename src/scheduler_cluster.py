@@ -248,7 +248,7 @@ class SchedulerClusterMixin:
         else:
             # ★ 安全：从节点绝不能使用 "master" 作为 node_id
             # 否则会和本机 master 运行时记录冲突。
-            configured_node_id = self._scheduler_facade_global('_configured_node_id')()
+            configured_node_id = self._runtime_setting('_configured_node_id')()
             if not configured_node_id or configured_node_id == "master":
                 node_id = f"client_{__import__('socket').gethostname()}"
                 if configured_node_id == "master":
@@ -275,7 +275,7 @@ class SchedulerClusterMixin:
 
         logger.info(
             f"节点初始化完成: {len(self.nodes)} 个节点 "
-            f"(mode={self._scheduler_facade_global('RUN_MODE')}, max_nodes={self._scheduler_facade_global('MAX_NODES')}, my_role={effective_role})"
+            f"(mode={self._runtime_setting('RUN_MODE')}, max_nodes={self._runtime_setting('MAX_NODES')}, my_role={effective_role})"
         )
         for nid, info in self.nodes.items():
             logger.info(f"  {nid}: role={info.role}, state={info.state.value}")
@@ -649,7 +649,7 @@ class SchedulerClusterMixin:
             existing.last_heartbeat = now
             existing.presence_generation = max(1, existing.presence_generation + 1)
             existing.presence_lease_id = uuid.uuid4().hex
-            existing.presence_expires_at = now + self._scheduler_facade_global('ANDROID_HTTP_CLIENT_LEASE_SECONDS')
+            existing.presence_expires_at = now + self._runtime_setting('ANDROID_HTTP_CLIENT_LEASE_SECONDS')
 
         if self._effective_role() == "master":
             self._push_node_update_to_all_clients(
@@ -669,7 +669,7 @@ class SchedulerClusterMixin:
             "presence_generation": existing.presence_generation,
             "presence_lease_id": existing.presence_lease_id,
             "lease_expires_at_ms": int(existing.presence_expires_at * 1000),
-            "heartbeat_interval_seconds": self._scheduler_facade_global('ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS'),
+            "heartbeat_interval_seconds": self._runtime_setting('ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS'),
         }
 
 
@@ -718,7 +718,7 @@ class SchedulerClusterMixin:
             else:
                 existing.state = NodeState.ONLINE
                 existing.last_heartbeat = now
-                existing.presence_expires_at = now + self._scheduler_facade_global('ANDROID_HTTP_CLIENT_LEASE_SECONDS')
+                existing.presence_expires_at = now + self._runtime_setting('ANDROID_HTTP_CLIENT_LEASE_SECONDS')
                 if http_peer:
                     existing.device_info = dict(existing.device_info or {})
                     existing.device_info["http_peer"] = http_peer
@@ -741,7 +741,7 @@ class SchedulerClusterMixin:
             "presence_generation": existing.presence_generation,
             "presence_lease_id": existing.presence_lease_id,
             "lease_expires_at_ms": int(existing.presence_expires_at * 1000),
-            "heartbeat_interval_seconds": self._scheduler_facade_global('ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS'),
+            "heartbeat_interval_seconds": self._runtime_setting('ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS'),
         }
 
 
@@ -758,7 +758,7 @@ class SchedulerClusterMixin:
                     continue
                 if node.state == NodeState.ONLINE and node.last_heartbeat:
                     lease_expired = node.presence_expires_at and now >= node.presence_expires_at
-                    if lease_expired or now - node.last_heartbeat > self._scheduler_facade_global('ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS'):
+                    if lease_expired or now - node.last_heartbeat > self._runtime_setting('ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS'):
                         node.state = NodeState.OFFLINE
                         changed.append(node)
 
@@ -779,7 +779,7 @@ class SchedulerClusterMixin:
 
     def check_nodes_ready(self) -> bool:
         """检查旧版 PyTorch LAYER_CONFIG worker 是否就绪。"""
-        if self._scheduler_facade_global('RUN_MODE') == "single":
+        if self._runtime_setting('RUN_MODE') == "single":
             return True
         self._refresh_http_client_states()
         with self._nodes_lock:
@@ -1081,10 +1081,10 @@ class SchedulerClusterMixin:
         # 收集当前集群信息，一并发送给新主节点
         cluster_info = {
             "transfer_id": transfer_id,
-            "old_master_id": self._scheduler_facade_global('NODE_ID'),
+            "old_master_id": self._runtime_setting('NODE_ID'),
             "new_master_id": target_node_id,
-            "server_ip": getattr(self, '_lan_ip', '') or self._scheduler_facade_global('SERVER_IP'),
-            "server_port": self._scheduler_facade_global('SERVER_PORT'),
+            "server_ip": getattr(self, '_lan_ip', '') or self._runtime_setting('SERVER_IP'),
+            "server_port": self._runtime_setting('SERVER_PORT'),
             "timestamp": time.time(),
             "layer_assignments": self.get_layer_assignments(),
             "registered_nodes": {
@@ -1101,7 +1101,7 @@ class SchedulerClusterMixin:
                 target_node_id, cluster_info, MessageType.ROLE_TRANSFER
             )
             logger.info(
-                f"角色转让请求已发送: {self._scheduler_facade_global('NODE_ID')} → {target_node_id} "
+                f"角色转让请求已发送: {self._runtime_setting('NODE_ID')} → {target_node_id} "
                 f"(transfer_id={transfer_id})"
             )
         except Exception as e:
@@ -1111,13 +1111,13 @@ class SchedulerClusterMixin:
         activate_data = {
             "activate_id": f"activate_{transfer_id}",
             "transfer_id": transfer_id,
-            "old_master_id": self._scheduler_facade_global('NODE_ID'),
+            "old_master_id": self._runtime_setting('NODE_ID'),
             "new_master_id": target_node_id,
-            "server_ip": getattr(self, '_lan_ip', '') or self._scheduler_facade_global('SERVER_IP'),
-            "server_port": self._scheduler_facade_global('SERVER_PORT'),
+            "server_ip": getattr(self, '_lan_ip', '') or self._runtime_setting('SERVER_IP'),
+            "server_port": self._runtime_setting('SERVER_PORT'),
             "timestamp": time.time(),
             "message": (
-                f"主节点身份即将从 {self._scheduler_facade_global('NODE_ID')} 转让给 {target_node_id}。"
+                f"主节点身份即将从 {self._runtime_setting('NODE_ID')} 转让给 {target_node_id}。"
                 "请暂代主节点职责，直到新主节点上线接管。"
             ),
         }
@@ -1188,7 +1188,7 @@ class SchedulerClusterMixin:
         })
         self._append_ha_log("spare_master_logs", "activated", {
             "transfer_id": transfer_id,
-            "old_master_id": self._scheduler_facade_global('NODE_ID'),
+            "old_master_id": self._runtime_setting('NODE_ID'),
             "new_master_id": target_node_id,
             "spare_node_id": spare_id,
             "ack": spare_ack,
@@ -1199,7 +1199,7 @@ class SchedulerClusterMixin:
         )
 
         logger.info(
-            f"✅ 角色转让完成: {self._scheduler_facade_global('NODE_ID')} → {target_node_id} "
+            f"✅ 角色转让完成: {self._runtime_setting('NODE_ID')} → {target_node_id} "
             f"备用主节点 {spare_id} 已激活暂代 (transfer_id={transfer_id})"
         )
 
@@ -1211,7 +1211,7 @@ class SchedulerClusterMixin:
                 f"建议双方重启服务：目标节点以主节点模式运行，本节点以从节点模式运行。"
             ),
             "transfer_id": transfer_id,
-            "from_node": self._scheduler_facade_global('NODE_ID'),
+            "from_node": self._runtime_setting('NODE_ID'),
             "to_node": target_node_id,
             "spare_activated": spare_id,
             "target_ack": target_ack,
@@ -1261,7 +1261,7 @@ class SchedulerClusterMixin:
             "ack": {
                 "transfer_id": transfer_id,
                 "accepted": True,
-                "node_id": self._scheduler_facade_global('NODE_ID'),
+                "node_id": self._runtime_setting('NODE_ID'),
                 "timestamp": time.time(),
             },
         }
@@ -1521,10 +1521,10 @@ class SchedulerClusterMixin:
         # 收集集群信息一并发送
         designate_data = {
             "designate_id": designate_id,
-            "master_id": self._scheduler_facade_global('NODE_ID'),
+            "master_id": self._runtime_setting('NODE_ID'),
             "target_node_id": target_node_id,
-            "server_ip": getattr(self, '_lan_ip', '') or self._scheduler_facade_global('SERVER_IP'),
-            "server_port": self._scheduler_facade_global('SERVER_PORT'),
+            "server_ip": getattr(self, '_lan_ip', '') or self._runtime_setting('SERVER_IP'),
+            "server_port": self._runtime_setting('SERVER_PORT'),
             "timestamp": time.time(),
             "role": "spare_master",
         }
@@ -1575,7 +1575,7 @@ class SchedulerClusterMixin:
         )
         self._append_ha_log("spare_master_logs", "designated", {
             "designate_id": designate_id,
-            "master_id": self._scheduler_facade_global('NODE_ID'),
+            "master_id": self._runtime_setting('NODE_ID'),
             "target_node_id": target_node_id,
             "ack": ack_data,
         })
@@ -1621,7 +1621,7 @@ class SchedulerClusterMixin:
             "ack": {
                 "designate_id": designate_id,
                 "accepted": True,
-                "node_id": self._scheduler_facade_global('NODE_ID'),
+                "node_id": self._runtime_setting('NODE_ID'),
                 "timestamp": time.time(),
             },
         }
@@ -1698,7 +1698,7 @@ class SchedulerClusterMixin:
             "ack": {
                 "activate_id": activate_id,
                 "accepted": True,
-                "node_id": self._scheduler_facade_global('NODE_ID'),
+                "node_id": self._runtime_setting('NODE_ID'),
                 "timestamp": time.time(),
             },
         }
@@ -1784,7 +1784,7 @@ class SchedulerClusterMixin:
             # 仅当自己是 pending 的新主节点，且备用主节点处于激活状态时发送
             if (spare and spare.get("node_id")
                     and spare_active
-                    and pending_new_master == self._scheduler_facade_global('NODE_ID')):
+                    and pending_new_master == self._runtime_setting('NODE_ID')):
                 logger.info(
                     f"检测到本节点为转让目标，备用主节点 {spare['node_id']} 处于激活状态，"
                     "准备发送接管通知..."
@@ -1813,7 +1813,7 @@ class SchedulerClusterMixin:
                 deactivate_id = f"deactivate_{int(time.time() * 1000)}"
                 deactivate_data = {
                     "deactivate_id": deactivate_id,
-                    "new_master_id": self._scheduler_facade_global('NODE_ID'),
+                    "new_master_id": self._runtime_setting('NODE_ID'),
                     "timestamp": time.time(),
                     "message": "新主节点已上线，请退出暂代模式。",
                 }
@@ -1833,7 +1833,7 @@ class SchedulerClusterMixin:
                 )
                 self._append_ha_log("spare_master_logs", "deactivated", {
                     "deactivate_id": deactivate_id,
-                    "new_master_id": self._scheduler_facade_global('NODE_ID'),
+                    "new_master_id": self._runtime_setting('NODE_ID'),
                 })
 
         except Exception as e:
@@ -1875,7 +1875,7 @@ class SchedulerClusterMixin:
         )
         if existing:
             self._append_ha_log("spare_master_logs", "undesignated", {
-                "master_id": self._scheduler_facade_global('NODE_ID'),
+                "master_id": self._runtime_setting('NODE_ID'),
                 "previous_spare": existing.get("node_id"),
             })
             logger.info("备用主节点已清除: %s", existing.get("node_id"))
@@ -2072,7 +2072,7 @@ class SchedulerClusterMixin:
         pipeline_info = self._get_pipeline_status()
 
         # 请求队列状态
-        queue_info = self.pipeline_queue.get_status()
+        queue_info = self._execution_app.requests.queue_snapshot()
 
         # TCP 客户端状态（从节点视角：到主节点的连接状态）
         tcp_client_info = None
@@ -2089,7 +2089,7 @@ class SchedulerClusterMixin:
 
         status = {
             "running": self._running,
-            "run_mode": self._scheduler_facade_global('RUN_MODE'),
+            "run_mode": self._runtime_setting('RUN_MODE'),
             "nodes": node_status,
             "current_task": current_task,
             "tcp_server": tcp_info,
@@ -2213,20 +2213,20 @@ class SchedulerClusterMixin:
             QUANT_TYPE, PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN,
         )
         # 优先使用运行时检测到的局域网 IP，回退到配置值
-        server_ip = getattr(self, '_lan_ip', '') or self._scheduler_facade_global('SERVER_IP')
+        server_ip = getattr(self, '_lan_ip', '') or self._runtime_setting('SERVER_IP')
 
         # 动态分层配置
         layers_info = self.get_layer_assignments()
 
         return {
-            "run_mode": self._scheduler_facade_global('RUN_MODE'),
+            "run_mode": self._runtime_setting('RUN_MODE'),
             "node_role": self._effective_role(),
             "node_id": self.get_effective_node_id(),
             "max_nodes": self._max_nodes,
             "network": {
                 "server_ip": server_ip,
-                "server_port": self._scheduler_facade_global('SERVER_PORT'),
-                "heartbeat_interval_s": self._scheduler_facade_global('HEARTBEAT_INTERVAL'),
+                "server_port": self._runtime_setting('SERVER_PORT'),
+                "heartbeat_interval_s": self._runtime_setting('HEARTBEAT_INTERVAL'),
             },
             "layers": layers_info,
             "distributed_inference": {
@@ -2361,7 +2361,7 @@ class SchedulerClusterMixin:
             import config as cfg
 
             # ★ 安全：从节点绝不能使用 "master" 作为 client_id
-            configured_node_id = self._scheduler_facade_global('_configured_node_id')()
+            configured_node_id = self._runtime_setting('_configured_node_id')()
             if not configured_node_id or configured_node_id == "master":
                 node_id = f"client_{__import__('socket').gethostname()}"
             else:
@@ -2371,7 +2371,7 @@ class SchedulerClusterMixin:
                 nonlocal node_id, master_host, master_port
                 from bootstrap import first_connect
 
-                api_port = self._scheduler_facade_global('_bootstrap_api_port')()
+                api_port = self._runtime_setting('_bootstrap_api_port')()
                 logger.info(
                     "开始首次连接自动部署: reason=%s master_api=%s:%s",
                     reason, master_host, api_port,
@@ -2450,12 +2450,12 @@ class SchedulerClusterMixin:
                 _publish_client(previous_client)
                 previous_node_id = getattr(previous_client, "client_id", "")
                 if previous_node_id:
-                    self._scheduler_facade_global('_sync_runtime_node_config')(
+                    self._runtime_setting('_sync_runtime_node_config')(
                         node_id=previous_node_id,
                         node_role="client",
                     )
 
-            advertise_port = self._tcp_server.port if self._tcp_server else self._scheduler_facade_global('SERVER_PORT')
+            advertise_port = self._tcp_server.port if self._tcp_server else self._runtime_setting('SERVER_PORT')
             client = create_client(
                 server_host=master_host,
                 server_port=master_port,
@@ -2471,7 +2471,7 @@ class SchedulerClusterMixin:
             _publish_client(client)
             if self._control_fence is not None:
                 client.set_control_fence(self._control_fence)
-            self._scheduler_facade_global('_sync_runtime_node_config')(node_id=node_id, node_role="client")
+            self._runtime_setting('_sync_runtime_node_config')(node_id=node_id, node_role="client")
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
             # _sync_node_rtt 内部已有 _nodes_lock 保护
             def _bind_client_callbacks(target_client) -> None:
@@ -2519,10 +2519,10 @@ class SchedulerClusterMixin:
                 self._report_local_device_profile(client, node_id)
 
                 # 更新运行时 node_id，避免 scheduler 模块导入常量滞后。
-                self._scheduler_facade_global('_sync_runtime_node_config')(node_id=node_id)
+                self._runtime_setting('_sync_runtime_node_config')(node_id=node_id)
                 # 若通过 activate_client_mode 切换而来，同步更新角色
                 if getattr(self, '_role_override', None) == "client":
-                    self._scheduler_facade_global('_sync_runtime_node_config')(node_role="client")
+                    self._runtime_setting('_sync_runtime_node_config')(node_role="client")
 
                 # 节点在线状态以主节点收到的 TCP REGISTER 为事实源。
                 # 从节点只保存 bootstrap 目标，不写共享状态或远端节点表。
@@ -2552,7 +2552,7 @@ class SchedulerClusterMixin:
             reason = getattr(client, "last_register_error", "") or (
                 f"TCP 连接失败 ({master_host}:{master_port})，请检查主节点地址和端口是否正确"
             )
-            if self._scheduler_facade_global('_is_auth_register_failure')(reason):
+            if self._runtime_setting('_is_auth_register_failure')(reason):
                 try:
                     logger.info("TCP 注册认证失败，尝试刷新首次连接配置后重试: %s", reason)
                     _run_first_connect_bootstrap("auth_failed")
@@ -2568,7 +2568,7 @@ class SchedulerClusterMixin:
                     _publish_client(client)
                     if self._control_fence is not None:
                         client.set_control_fence(self._control_fence)
-                    self._scheduler_facade_global('_sync_runtime_node_config')(node_id=node_id, node_role="client")
+                    self._runtime_setting('_sync_runtime_node_config')(node_id=node_id, node_role="client")
                     _bind_client_callbacks(client)
                     ok = client.connect(
                         on_message=lambda msg: self._on_tcp_message("master", msg)
@@ -2577,9 +2577,9 @@ class SchedulerClusterMixin:
                         _retire_previous_client()
                         _mark_local_node_online()
                         self._report_local_device_profile(client, node_id)
-                        self._scheduler_facade_global('_sync_runtime_node_config')(node_id=node_id)
+                        self._runtime_setting('_sync_runtime_node_config')(node_id=node_id)
                         if getattr(self, '_role_override', None) == "client":
-                            self._scheduler_facade_global('_sync_runtime_node_config')(node_role="client")
+                            self._runtime_setting('_sync_runtime_node_config')(node_role="client")
                         try:
                             from transport_port import MessageType
                             client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
@@ -2804,13 +2804,13 @@ class SchedulerClusterMixin:
               discovery_methods, mac_addresses, identity_verified, identity_reason }
         """
         # 使用运行时检测到的可广告地址或已有的配置值。
-        lan_ip = getattr(self, '_lan_ip', '') or self._scheduler_facade_global('SERVER_IP')
+        lan_ip = getattr(self, '_lan_ip', '') or self._runtime_setting('SERVER_IP')
         try:
             from network_address import is_tailscale_ip
             host_source = "tailnet" if is_tailscale_ip(lan_ip) else "lan"
         except Exception:
             host_source = "lan"
-        port = self._tcp_server.port if self._tcp_server else self._scheduler_facade_global('SERVER_PORT')
+        port = self._tcp_server.port if self._tcp_server else self._runtime_setting('SERVER_PORT')
         macs = getattr(self, '_mac_addresses', [])
 
         # Phase 2.1+: 锁保护迭代计数，防止并发修改
@@ -2891,15 +2891,15 @@ class SchedulerClusterMixin:
 
         # 1. 设置角色覆盖
         self._role_override = "client"
-        self._scheduler_facade_global('_sync_runtime_node_config')(node_role="client")
-        self.pipeline_queue.stop()
+        self._runtime_setting('_sync_runtime_node_config')(node_role="client")
+        self._execution_app.requests.close()
 
         # 2. 重新初始化为从节点
         with self._nodes_lock:
             self.nodes.clear()
         self.init_nodes()
         effective_id = self.get_effective_node_id()
-        self._scheduler_facade_global('_sync_runtime_node_config')(node_id=effective_id)
+        self._runtime_setting('_sync_runtime_node_config')(node_id=effective_id)
         # 3. 启动从节点健康监控
         self._start_client_health_monitor()
 
@@ -3060,7 +3060,7 @@ class SchedulerClusterMixin:
         从节点 → 使用配置的 NODE_ID，若为 "master"（默认值）则自动生成
         """
         effective_role = self._effective_role()
-        node_id = self._scheduler_facade_global('_configured_node_id')()
+        node_id = self._runtime_setting('_configured_node_id')()
         if effective_role == "client" and (not node_id or node_id == "master"):
             return f"client_{__import__('socket').gethostname()}"
         return node_id
@@ -3091,7 +3091,7 @@ class SchedulerClusterMixin:
             "is_master": effective_role == "master",
             "is_client": effective_role == "client",
             "max_nodes": self._max_nodes,
-            "run_mode": self._scheduler_facade_global('RUN_MODE'),
+            "run_mode": self._runtime_setting('RUN_MODE'),
             "my_node": my_info.to_dict() if my_info else None,
             "tcp_server_running": self._tcp_server is not None and self._tcp_server._running,
         }
@@ -3298,7 +3298,7 @@ class SchedulerClusterMixin:
 
         try:
             from bootstrap import discover_master_via_tailnet
-            return discover_master_via_tailnet(api_port=self._scheduler_facade_global('_bootstrap_api_port')())
+            return discover_master_via_tailnet(api_port=self._runtime_setting('_bootstrap_api_port')())
         except Exception as e:
             logger.debug("Tailnet 主节点发现失败: %s", e, exc_info=True)
             return {"found": False, "source": "none"}
@@ -3368,8 +3368,7 @@ class SchedulerClusterMixin:
         """
         if self._distributed_inference_enabled is not None:
             return self._distributed_inference_enabled
-        from config import DISTRIBUTED_INFERENCE_ENABLED
-        return DISTRIBUTED_INFERENCE_ENABLED
+        return bool(self._runtime_setting("DISTRIBUTED_INFERENCE_ENABLED"))
 
 
     def set_distributed_inference_enabled(self, enabled: bool) -> dict:

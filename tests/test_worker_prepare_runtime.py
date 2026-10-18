@@ -248,7 +248,7 @@ def test_scheduler_rejects_no_identity_before_accept_or_execution():
             return True
         def get_effective_node_id(self):
             return "pc"
-        def _scheduler_facade_global(self, name):
+        def _runtime_setting(self, name):
             return True
         def _send_task_worker_stage_accept(self, message_id, offer, **kw):
             self.accepts.append(kw)
@@ -367,7 +367,7 @@ def test_real_api_factory_and_layer_stage_share_single_runtime_through_retry_and
     import inference_service.engine_host as engine_module
     import model_module
     import model_supply_worker
-    from task_graph import TaskGraphError
+    from qlh_core.contracts.execution import ExecutionError
     from tests.test_worker_prepare import Client, run
 
     # Assert the real composition-root registration before isolating native
@@ -429,7 +429,7 @@ def test_real_api_factory_and_layer_stage_share_single_runtime_through_retry_and
             assert api_server._execute_task_worker_stage(req, threading.Event()) == first
             cancelled = threading.Event()
             cancelled.set()
-            with pytest.raises(TaskGraphError):
+            with pytest.raises(ExecutionError):
                 api_server._execute_task_worker_stage(req, cancelled)
             # Cancellation during real forward must clear partial KV and keep
             # the committed manager so a prefill retry uses the same runtime.
@@ -440,7 +440,7 @@ def test_real_api_factory_and_layer_stage_share_single_runtime_through_retry_and
                 return result
             stage_checks.setattr(manager, "forward_layers", cancel_after_forward)
             cancelled.clear()
-            with pytest.raises(TaskGraphError, match="supplied_stage_cancelled"):
+            with pytest.raises(ExecutionError, match="supplied_stage_cancelled"):
                 api_server._execute_task_worker_stage(req, cancelled)
             assert host._supplied_layer_caches == {}
             stage_checks.setattr(manager, "forward_layers", original_forward)
@@ -499,6 +499,9 @@ def api_retirement_runtime(tiny_supply, monkeypatch, scoped_api_runtime):
         _worker_assignments={}, _layer_config_retry_state={}, _local_pipeline_steps={},
         refresh_task_worker_capabilities=lambda: None, release_pipeline_worker_for_local_model=lambda: True,
     )
+    from qlh_core.control.participation import ParticipationService
+    scheduler._participation = ParticipationService(enabled=True)
+    scheduler._model_control = SimpleNamespace(boot_id="retirement-test")
     scheduler.get_distributed_inference_enabled = lambda: scheduler._distributed_inference_enabled
     controller = WorkerPrepareController(scheduler, runtime_factory=registered_factory)
     scheduler._worker_prepare = controller

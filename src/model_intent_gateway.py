@@ -76,7 +76,7 @@ def _view(status, is_master, code="", reason="", **fields) -> dict:
 def _role_binding(scheduler, api_port) -> dict | None:
     try:
         role = scheduler._effective_role()
-        facade = getattr(scheduler, "_scheduler_facade_global", None)
+        facade = getattr(scheduler, "_runtime_setting", None)
         if callable(facade):
             run_mode = facade("RUN_MODE")
         else:

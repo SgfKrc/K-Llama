@@ -55,7 +55,6 @@ from .protocol import (
     LayerUnloadRequest,
     LMHeadRequest,
     LoadModelRequest,
-    SpeculativeRunRequest,
     SwitchModelRequest,
     UnloadModelRequest,
     WorkerStageRequest,
@@ -183,6 +182,7 @@ def _sse_error(
     request_id: str = "-",
     reason_code: str = "",
 ) -> str:
+    cause = message.get("reason_detail") if isinstance(message, dict) else None
     if isinstance(message, dict):
         reason_code = reason_code or str(
             message.get("reason_code")
@@ -194,6 +194,8 @@ def _sse_error(
     payload = {"done": True, "error": message, "request_id": request_id}
     if reason_code:
         payload["reason_code"] = reason_code
+    from qlh_core.contracts.snapshots import reason
+    payload["reason_detail"] = reason("execution", reason_code or "inference_failed", "native_chat", cause=cause)
     return _sse_event(payload)
 
 
@@ -545,7 +547,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 detail="interactive 终态未完成允许的分布式执行",
                             )
                         except HTTPException as exc:
-                            yield _sse_error(str(exc.detail), request_id)
+                            yield _sse_error(exc.detail, request_id)
                             return
                         event["history_committed"] = host.commit_stream_event(
                             req, event, cancel_event, request_id,
@@ -624,52 +626,6 @@ async def chat_cancel(req: ChatCancelRequest, request: Request):
 # ----------------------------------------------------------------------
 # 实验端点
 # ----------------------------------------------------------------------
-@router.post("/speculative/run")
-def speculative_run(req: SpeculativeRunRequest, request: Request):
-    """投机解码 draft-verify 实验端点（1.2b 接入真实实现；
-    门控/异常映射复制自 api_server.experimental_speculative_chat）。
-    同步 def：run_speculative_chat 阻塞，交线程池执行。"""
-    _require_master_role(request)
-    import config as _cfg
-
-    host = _engine_host(request)
-    if not getattr(_cfg, "SPEC_ENABLED", False):
-        raise HTTPException(
-            404,
-            "投机解码实验未启用。请设置 QLH_SPEC_ENABLED=true 并配置 "
-            "QLH_SPEC_VERIFY_BASE_URL（或复用 QLH_EXTERNAL_BASE_URL）后重启。",
-        )
-    from external_provider import ExternalScopeDeniedError
-    from speculative import (
-        SpeculativeCapabilityError,
-        SpeculativeConfigError,
-        SpeculativeError,
-    )
-
-    try:
-        result = host.speculative_run(req)
-    except NotImplementedError:
-        raise HTTPException(status_code=501, detail="speculative 实验端点未接入")
-    except ExternalScopeDeniedError as exc:
-        logger.info(
-            "数据作用域拒绝投机解码外部校验: scope=%s（消息正文未发送）",
-            getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
-        )
-        raise HTTPException(403, str(exc)) from None
-    except SpeculativeConfigError as exc:
-        raise HTTPException(409, str(exc)) from None
-    except SpeculativeCapabilityError as exc:
-        raise HTTPException(502, str(exc)) from None
-    except SpeculativeError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-    return {
-        "content": result["content"],
-        "finish_reason": result["finish_reason"],
-        "metrics": result["metrics"],
-        "rounds": result["rounds"],
-        "request_id": request.headers.get("X-QLH-Request-ID", "-"),
-    }
 
 
 # ----------------------------------------------------------------------
@@ -757,7 +713,6 @@ async def layers_lm_head(req: LMHeadRequest, request: Request):
 
 # ----------------------------------------------------------------------
 # task-worker Stage 执行（1.4：scheduler-svc 注入 InferenceClient 使用；
-# 1.2d 随 task_graph 执行段复制完成后为完整实现）
 # ----------------------------------------------------------------------
 @router.post("/worker/stage")
 def worker_stage(req: WorkerStageRequest, request: Request):
@@ -774,7 +729,7 @@ def worker_stage(req: WorkerStageRequest, request: Request):
     generation_id, cancel_event = host.register_generation(req.request_id or None)
 
     from dataclasses import fields
-    from task_provider import StageRequest as ProviderStageRequest
+    from execution_provider import StageRequest as ProviderStageRequest
 
     kwargs = {f.name: getattr(req, f.name) for f in fields(ProviderStageRequest)
               if hasattr(req, f.name)}
@@ -785,8 +740,8 @@ def worker_stage(req: WorkerStageRequest, request: Request):
     try:
         result = host.execute_task_worker_stage(stage_request, cancel_event)
     except Exception as e:
-        from task_graph import TaskGraphError
-        if isinstance(e, TaskGraphError):
+        from execution_errors import StageExecutionError
+        if isinstance(e, StageExecutionError):
             raise HTTPException(status_code=422, detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -834,3 +789,19 @@ async def kv_free(req: KVFreeRequest, request: Request):
         ) from exc
     except KeyError:
         raise HTTPException(status_code=404, detail=f"未知任务: {req.task_id}")
+
+@router.post("/speculative/run", include_in_schema=False)
+def retired_experiment():
+    raise coded_http_error(410, "CLIENT_FEATURE_REMOVED", {"code": "CLIENT_FEATURE_REMOVED", "contract_version": 2})
+
+@router.get("/client/state")
+def client_state(request: Request):
+    host = _engine_host(request)
+    from qlh_core.bootstrap.client_snapshots import ClientSnapshots
+    from qlh_core.contracts.snapshots import envelope
+    import time
+    if host._scheduler is not None:
+        return ClientSnapshots(host._scheduler).current()
+    snapshot = host._host.runtime_controller.snapshot()
+    return envelope({"participation": {"desired": "standalone", "phase": "stable"}, "runnable": snapshot.model_loaded},
+                    revision=snapshot.revision, identity={"owner": "runtime_controller"}, observed_at=time.time())

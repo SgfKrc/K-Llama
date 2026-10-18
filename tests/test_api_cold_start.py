@@ -27,7 +27,7 @@ def _isolated_api_probe_env(tmp_path: Path) -> dict[str, str]:
         "QLH_NODE_CONFIG_PATH": str(tmp_path / "node-config.json"),
         "QLH_TASK_GRAPH_ENABLED": "false",
         "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": "false",
-        "QLH_TASK_GRAPH_INSTANCE_ID": f"cold-probe-{tmp_path.name}",
+        "QLH_LEGACY_RECOVERY_INSTANCE_ID": f"cold-probe-{tmp_path.name}",
     })
     env["PYTHONPATH"] = os.pathsep.join(
         item for item in (str(repo_root / "src"), env.get("PYTHONPATH", "")) if item
@@ -138,7 +138,10 @@ def test_frontend_bootstrap_endpoints_keep_model_manager_lazy(monkeypatch):
     monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "model_manager", model_host_module._LazyModelManager())
 
+    from types import SimpleNamespace
     class FakeScheduler:
+        _participation = SimpleNamespace(snapshot=lambda: {"phase":"stable"})
+        _model_control = SimpleNamespace(boot_id="cold-start-test")
         _max_nodes = 3
 
         def get_distributed_inference_enabled(self):

@@ -99,8 +99,8 @@ def interactive_env(monkeypatch):
         ),
     )
     monkeypatch.setattr(api_server, "RUN_MODE", "local")
-    monkeypatch.setattr(api_server, "active_session_id", None)
-    monkeypatch.setattr(api_server, "session_histories", {})
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "histories", {})
     monkeypatch.setattr(
         api_server._chat_context,
         "_load_history",
@@ -231,17 +231,17 @@ class TestInteractiveContract:
         assert user_message == "提交测试"
         assert response_text == "你好，世界！"
         assert metrics["engine"] == "llama_cpp"
-        assert api_server.session_histories["sess_commit"] == [
+        assert api_server._chat_context.histories["sess_commit"] == [
             {"role": "user", "content": "提交测试"},
             {"role": "assistant", "content": "你好，世界！"},
         ]
 
     def test_interactive_uses_and_extends_canonical_history(self, interactive_env):
         client, calls = interactive_env
-        api_server.session_histories["sess_context"] = [
+        api_server._chat_context.set_history("sess_context", [
             {"role": "user", "content": "记住颜色"},
             {"role": "assistant", "content": "蓝色"},
-        ]
+        ])
 
         response = client.post("/api/chat/stream", json={
             "message": "颜色是什么",
@@ -256,7 +256,7 @@ class TestInteractiveContract:
             {"role": "assistant", "content": "蓝色"},
             {"role": "user", "content": "颜色是什么"},
         ]
-        assert api_server.session_histories["sess_context"][-2:] == [
+        assert api_server._chat_context.histories["sess_context"][-2:] == [
             {"role": "user", "content": "颜色是什么"},
             {"role": "assistant", "content": "你好，世界！"},
         ]
@@ -680,10 +680,10 @@ class TestRoutingPreference:
 class TestFastContextContract:
     def test_fast_uses_and_commits_canonical_history(self, interactive_env):
         client, calls = interactive_env
-        api_server.session_histories["sess_fast"] = [
+        api_server._chat_context.set_history("sess_fast", [
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "second"},
-        ]
+        ])
 
         response = client.post("/api/chat/stream", json={
             "message": "third",
@@ -701,7 +701,7 @@ class TestFastContextContract:
         done = _sse_events(response)[-1]
         assert done["done"] is True
         assert done["history_committed"] is True
-        assert api_server.session_histories["sess_fast"][-2:] == [
+        assert api_server._chat_context.histories["sess_fast"][-2:] == [
             {"role": "user", "content": "third"},
             {"role": "assistant", "content": "你好，世界！"},
         ]
@@ -721,8 +721,8 @@ class TestContextReload:
             "_load_history",
             lambda session_id: list(rows) if session_id == "sess_reload" else [],
         )
-        api_server.active_session_id = "sess_reload"
-        api_server.session_histories = {
+        api_server._chat_context.active_session_id = "sess_reload"
+        api_server._chat_context.histories = {
             "sess_reload": [{"role": "user", "content": "stale"}],
         }
 
@@ -750,13 +750,11 @@ class TestSessionCrudContextContract:
             {"role": "user", "content": "persisted question"},
             {"role": "assistant", "content": "persisted answer"},
         ]
-        api_server.active_session_id = "sess_activate"
-        api_server.session_histories = {
+        api_server._chat_context.active_session_id = "sess_activate"
+        api_server._chat_context.histories = {
             "sess_activate": [{"role": "user", "content": "stale"}],
         }
-        api_server._sync_chat_context_facade()
         api_server._chat_context.invalidate_session("sess_activate")
-        api_server._publish_chat_context_facade()
         monkeypatch.setattr(
             api_server._chat_context,
             "_load_history",
@@ -767,7 +765,7 @@ class TestSessionCrudContextContract:
 
         assert response.status_code == 200
         assert response.json()["messages"] == rows
-        assert api_server.session_histories["sess_activate"] == rows
+        assert api_server._chat_context.histories["sess_activate"] == rows
 
     def test_delete_active_session_clears_kv_before_dropping_facade(
         self, interactive_env, monkeypatch,
@@ -775,8 +773,8 @@ class TestSessionCrudContextContract:
         client, _calls = interactive_env
         cleared = []
         initialized = []
-        api_server.active_session_id = "sess_delete"
-        api_server.session_histories = {
+        api_server._chat_context.active_session_id = "sess_delete"
+        api_server._chat_context.histories = {
             "sess_delete": [
                 {"role": "user", "content": "q"},
                 {"role": "assistant", "content": "a"},
@@ -799,8 +797,8 @@ class TestSessionCrudContextContract:
         response = client.delete("/api/sessions/sess_delete")
 
         assert response.status_code == 200
-        assert api_server.active_session_id is None
-        assert "sess_delete" not in api_server.session_histories
+        assert api_server._chat_context.active_session_id is None
+        assert "sess_delete" not in api_server._chat_context.histories
         assert cleared == [True]
         assert initialized == [True]
 
@@ -822,8 +820,8 @@ class TestSessionCrudContextContract:
             }
             for index in range(18, 218)
         ]
-        api_server.active_session_id = "sess_window"
-        api_server.session_histories = {"sess_window": warm_window}
+        api_server._chat_context.active_session_id = "sess_window"
+        api_server._chat_context.histories = {"sess_window": warm_window}
         monkeypatch.setattr(
             api_server._local_store,
             "get_local_conversation_count",
@@ -850,8 +848,8 @@ class TestSessionCrudContextContract:
         assert response.status_code == 200
         assert response.json()["remaining_turns"] == 109
         assert deleted == [("sess_window", 0)]
-        assert api_server.session_histories["sess_window"] == reloaded_window
-        assert api_server.session_histories["sess_window"][0]["content"] == "18"
+        assert api_server._chat_context.histories["sess_window"] == reloaded_window
+        assert api_server._chat_context.histories["sess_window"][0]["content"] == "18"
 
 
 class TestCommitFunction:

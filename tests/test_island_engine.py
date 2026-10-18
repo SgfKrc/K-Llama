@@ -592,7 +592,9 @@ def test_scheduler_node_weight_boosted_and_layer_split_excluded(monkeypatch):
 
     sched = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
 
+    from tests.test_scheduler import _engine_contract
     plain_info = {
+        **_engine_contract("pytorch", "pytorch_cpu"),
         "ram": {"total_gb": 16},
         "cpu": {"physical_cores": 8, "freq_max_mhz": 3200},
     }

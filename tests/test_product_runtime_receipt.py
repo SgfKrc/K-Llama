@@ -394,11 +394,13 @@ def _llama_fixture(tmp_path, monkeypatch, *, changed_on_load=False):
         engine._loaded = True
         if changed_on_load:
             path.write_bytes(b"different artifact during loading")
-    monkeypatch.setattr(engine, "load_model", load)
+    monkeypatch.setattr(engine, "_load_model_runtime", load)
     def native_count(pointer):
         assert pointer == "native-handle"
         return 2
-    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", NS(llama_model_n_layer=native_count))
+    binding = NS(llama_model_n_layer=native_count)
+    monkeypatch.setitem(sys.modules, "llama_cpp", NS(Llama=NS, llama_cpp=binding))
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", binding)
     engine.load_layer_range(0, 2)
     return engine, path, digest
 

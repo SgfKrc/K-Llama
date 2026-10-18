@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from scheduler_types import NodeRole
-from task_provider import (
+from execution_provider import (
     ModelIdentity as TaskModelIdentity,
     StageRequest as TaskProviderStageRequest,
     sanitize_result_metadata as sanitize_task_result_metadata,
@@ -57,7 +57,7 @@ logger = logging.getLogger("scheduler")
 _LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
 _LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
 _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
-_REQUEST_DEADLINE_EXCEEDED = "request_deadline_exceeded"
+from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED as _REQUEST_DEADLINE_EXCEEDED
 
 
 def _task_worker_capability_log_summary(
@@ -278,7 +278,7 @@ class SchedulerTaskWorkerMixin:
                 or getattr(self._host, "layer_range", None) is not None
             ):
                 return None
-            identity = self._require_callbacks().active_task_graph_model_identity()
+            identity = self._require_callbacks().active_execution_model_identity()
             if identity is None or (
                 engines is not None and identity.engine not in engines
             ):
@@ -735,6 +735,8 @@ class SchedulerTaskWorkerMixin:
             #   （实测 `route_a_stage_frame_too_large:…:wire=24160940:budget=8126464`）。
             #   非层段 worker 不接收 hidden，故按 `layer_worker` 保守声明。
             "stage_chunked_input": bool(layer_worker),
+            "stage_kv_cleanup": bool(layer_worker),
+            "node_incarnation": self._model_control.boot_id,
             "relay_middle": bool(
                 layer_worker
                 and active_layer_config
@@ -841,7 +843,7 @@ class SchedulerTaskWorkerMixin:
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
-            or not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+            or not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
         ):
             return False
         target = client or getattr(self, "_tcp_client", None)
@@ -928,7 +930,7 @@ class SchedulerTaskWorkerMixin:
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
-            or not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+            or not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
             or not client
             or not getattr(client, "is_registered", False)
         ):
@@ -1479,6 +1481,7 @@ class SchedulerTaskWorkerMixin:
             payload, provider_id=provider_id,
         )
         response_payload["reason_code"] = terminal_reason
+        response_payload["execution_state"] = "execution_stopped" if active.done_event.is_set() else "execution_in_flight"
         response = build_task_worker_message(
             "stage_cancelled",
             response_payload,
@@ -1648,7 +1651,7 @@ class SchedulerTaskWorkerMixin:
         coordinator = self._task_worker_control.coordinator_snapshot()
         if not self.get_distributed_inference_enabled():
             reject_reason = "local_inference_mode"
-        elif not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+        elif not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             reject_reason = "worker_experiment_disabled"
             reject_retryable = True
         else:
@@ -1928,6 +1931,17 @@ class SchedulerTaskWorkerMixin:
                         if expires_at <= now:
                             completed.pop(completed_id, None)
                     completed[attempt_id] = (removed, now + 5.0)
+            if removed is not None and removed.cancel_event.is_set():
+                stopped = self._task_worker_attempt_payload(offer, provider_id=expected_provider)
+                stopped.update(reason_code=removed.terminal_reason or "provider_cancelled",
+                               execution_state="execution_stopped")
+                try:
+                    response = build_task_worker_message("stage_cancelled", stopped,
+                        message_id=f"msg_stopped_{uuid.uuid4().hex}", sent_at_ms=int(time.time() * 1000),
+                        version=TASK_WORKER_PROTOCOL_VERSION)
+                    self._send_task_worker_response(message.message_id, response)
+                except Exception:
+                    logger.warning("physical stop receipt delivery failed attempt=%s", attempt_id, exc_info=True)
 
 
     def _handle_task_worker_message(self, client_id: str, msg: dict) -> None:
@@ -2276,7 +2290,7 @@ class SchedulerTaskWorkerMixin:
             )
         full_model_ready = bool(full_model_worker_ids)
         layer_stage_ready = bool(layer_stage_worker_ids)
-        if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+        if not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             readiness_reason = "task_worker_experiment_disabled"
         elif not connected:
             readiness_reason = "task_worker_control_plane_not_connected"
@@ -2286,18 +2300,18 @@ class SchedulerTaskWorkerMixin:
             readiness_reason = "task_worker_manual_dispatch_ready"
         runtime.update({
             "phase": "TC-N2.4",
-            "experiment_enabled": self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'),
+            "experiment_enabled": self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'),
             "experimental_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
             "auto_provider_selection_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
             "manual_stage_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
             "layer_stage_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 and connected and layer_stage_ready
             ),
             # ★ 2026-10-03：上面那个字段的判据是 `layer_stage_worker_ids` —— 那是
@@ -2309,7 +2323,7 @@ class SchedulerTaskWorkerMixin:
             #   这里按**自己的** capabilities 给出同名字段，口径与 master 侧
             #   `task_worker_adapter.py:359` 一致。
             "self_layer_stage_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 and connected
                 and "layer_forward" in (
                     self._task_worker_capabilities().get("stage_types") or []
@@ -2330,9 +2344,9 @@ class SchedulerTaskWorkerMixin:
             "worker_readiness_reason": readiness_reason,
             "admission_state": (
                 "n2_4_experimental_physical_validation_pending"
-                if self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected
+                if self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected
                 else "n2_4_experiment_enabled_not_connected"
-                if self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                if self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 else "n2_4_experiment_disabled"
             ),
         })

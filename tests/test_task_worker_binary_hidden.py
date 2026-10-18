@@ -38,7 +38,7 @@ from task_worker_protocol import (
 from tcp_comm import TCPClient, TCPServer
 from scheduler_task_worker import SchedulerTaskWorkerMixin
 from task_worker_adapter import TaskWorkerControlPlane, RemoteFullWorkerProvider
-from task_provider import ModelIdentity, StageRequest, StageAttempt
+from execution_provider import ModelIdentity, StageRequest, StageAttempt
 from tcp_comm import ClientConn, parse_message
 
 #: 一段 32 字节的 hidden（8 个 f32 的字节数），逐位可核。

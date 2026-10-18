@@ -882,11 +882,11 @@ class ModelSupplyWorker:
             try:
                 state = vars(host)
                 candidate_lock = state.get("_pipeline_candidate_lock")
-                if candidate_lock is None or "_manager" not in state:
+                if candidate_lock is None:
                     raise UnknownOwner()
                 locks.enter_context(candidate_lock)
-                manager(state["_manager"])
-                path(state.get("model_path"))
+                manager(host.runtime_controller.manager())
+                path(dict(host.runtime_controller.snapshot().metadata).get("model_path"))
                 transaction = state.get("_pipeline_candidate_transaction")
                 if transaction is not None:
                     path(transaction.model_path)
@@ -997,10 +997,18 @@ class ModelSupplyWorker:
             raise SupplyError("SUPPLY_ADMISSION_UNAVAILABLE")
         if not full.acquire(blocking=False):
             raise SupplyError("SUPPLY_WORKER_BUSY")
+        native = getattr(getattr(host, "runtime_controller", None), "execution_lock", None)
+        native_held = False
         try:
+            if native is not None:
+                native_held = native.acquire(blocking=False)
+                if not native_held:
+                    raise SupplyError("SUPPLY_WORKER_BUSY")
             with stage:
                 yield
         finally:
+            if native_held:
+                native.release()
             full.release()
 
     def _assert_idle(self, op: _Operation) -> None:

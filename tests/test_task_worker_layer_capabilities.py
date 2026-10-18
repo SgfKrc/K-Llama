@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from scheduler import Scheduler  # noqa: E402
 import scheduler_task_worker  # noqa: E402
-from task_provider import ModelIdentity  # noqa: E402
+from execution_provider import ModelIdentity  # noqa: E402
 from task_worker_adapter import remote_provider_id  # noqa: E402
 
 
@@ -110,6 +110,7 @@ def _scheduler(*, active_layer_config=None, layer_range=None,
                forward_layers=None):
     """绕过 Scheduler.__init__ 构造最小能力快照目标。"""
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._model_control = SimpleNamespace(boot_id="fixture-worker-boot")
     scheduler._distributed_inference_enabled = True
     scheduler._host = _FakeHost(
         layer_range=layer_range, full_model_loaded=full_model_loaded,
@@ -118,7 +119,7 @@ def _scheduler(*, active_layer_config=None, layer_range=None,
     scheduler._active_layer_config = active_layer_config
     if full_model_identity is not None:
         scheduler._require_callbacks = lambda: SimpleNamespace(
-            active_task_graph_model_identity=lambda: full_model_identity,
+            active_execution_model_identity=lambda: full_model_identity,
         )
     return scheduler
 
@@ -141,7 +142,7 @@ def _reject_stage_offer(scheduler, *, stage_type, model_identity):
     scheduler._task_worker_control = SimpleNamespace(
         coordinator_snapshot=lambda: {"manual_stage_dispatch_enabled": True},
     )
-    scheduler._scheduler_facade_global = lambda name: True
+    scheduler._runtime_setting = lambda name: True
     scheduler.get_effective_node_id = lambda: "pc-worker"
     scheduler._task_worker_stage_lock = threading.Lock()
     scheduler._task_worker_active_attempts = {}

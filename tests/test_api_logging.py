@@ -731,18 +731,11 @@ class TestStructuredLogFormat:
         assert "event=test_event" in caplog.text
         assert "field1=value1" in caplog.text
 
-    def test_task_id_log_format(self, caplog):
-        """scheduler 的 task enqueue 日志应包含 task_id 和 request_id。"""
-        from scheduler import PipelineQueue
-
-        q = PipelineQueue(max_size=10, result_ttl=60)
-        with caplog.at_level(logging.INFO, logger="scheduler"):
-            q.enqueue(prompt="test", max_new_tokens=128, request_id="rid-test-001")
-            q.stop()
-
-        # 日志中应包含 task_id 和 request_id
-        assert any("task_id=" in r.getMessage() and "request_id=rid-test-001" in r.getMessage()
-                   for r in caplog.records)
+    def test_request_identity_projection(self):
+        from qlh_core.execution.requests import RequestService
+        value = RequestService._snapshot_record({"request_id": "request", "boot_id": "boot", "deployment_id": "deployment", "revision": 1})
+        assert value["identity"] == {"request_id": "request", "boot_id": "boot", "deployment_id": "deployment"}
+        assert value["schema_version"] == 2
 
     def test_log_retention_cleanup_log_format(self, log_dir_temp, caplog):
         """日志保留清理应输出 event=log_retention_cleanup。"""

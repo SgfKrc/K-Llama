@@ -1173,7 +1173,7 @@ def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
     req = api_server.ChatRequest(message="hello", max_new_tokens=1)
     monkeypatch.setattr(api_server, "model_manager", Manager())
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups", lambda *a, **kw: [])
     monkeypatch.setattr(
         api_server._local_store,
@@ -1212,7 +1212,7 @@ def test_reserved_worker_forward_failure_does_not_restore_full_model(monkeypatch
         "forward_inference_to_master",
         lambda **kwargs: {"status": "disconnected", "error": "master offline"},
     )
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
 
     with pytest.raises(api_server.HTTPException) as exc_info:
         api_server._execute_chat_full(req)
@@ -1259,7 +1259,7 @@ def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
             "error": "route_a_mixed_legacy_execution_bridge_not_ready",
         },
     )
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
     monkeypatch.setattr(
         api_server,
         "_external_route_decision",
@@ -1472,7 +1472,7 @@ def test_local_native_image_chat_uses_mtmd_and_removes_temp_file(monkeypatch):
     )
     monkeypatch.setattr(api_server, "model_manager", NativeManager())
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups_llama", lambda *a, **kw: [])
     monkeypatch.setattr(
         api_server,
@@ -1833,8 +1833,8 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        api_server,
-        "session_histories",
+        api_server._chat_context,
+        "histories",
         {"default": [{"role": "assistant", "content": "DeepSeek-R1 intro"}]},
     )
     monkeypatch.setattr(
@@ -1862,7 +1862,7 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
     assert len(switch_calls) == 1
     assert cleared == [True]
     assert api_server.kv_cache is None
-    assert api_server.session_histories == {}
+    assert api_server._chat_context.histories == {}
     assert api_server.conversation_stats == {
         "total_prompt_tokens": 0,
         "total_generated_tokens": 0,

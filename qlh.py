@@ -28,7 +28,9 @@ READ_ONLY_SUBCOMMANDS = ("status", "models", "nodes", "queue", "device", "logs",
 
 def _usage() -> str:
     return (
-        "QLH core TUI\n"
+        "QLH application\n"
+        "  qlh maintenance <command>  应用验签、版本切换、回退、修复与数据保留\n"
+        "  qlh migrate-state --source PATH --target PATH --backup PATH [--dry-run]\n"
         "  qlh                         进入交互外壳（Textual；本机后端自动启动）\n"
         "  qlh [options]               同上；选项直通（--port/--route/--host/--thinking/--log-token…）\n"
         "  qlh chat [--host URL] [--backend-host ADDRESS] [--route auto|local_only|distributed_preferred|distributed_required]\n"
@@ -210,6 +212,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     command = args.pop(0).lower()
+    if command == "migrate-state":
+        _ensure_src_on_path()
+        from qlh_core.adapters.state_migration import main as migrate_state
+        return migrate_state(args)
+    if command == "maintenance":
+        sys.path.insert(0, str(ROOT / "packaging" / "packaging"))
+        from app_maintenance import main as maintenance
+        return maintenance(args)
     if command == "chat":
         if args and args[0] in {"-h", "--help"}:
             print(

@@ -30,7 +30,7 @@ from cluster_quorum import (  # noqa: E402
     SQLiteVoterLedger,
 )
 from journal_replication import DurableJournalReplica, build_checkpoint  # noqa: E402
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 WF = "wf-wired"
 DIGEST = "c" * 64

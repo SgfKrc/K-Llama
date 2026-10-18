@@ -46,7 +46,7 @@ def configure_api_module(module: ModuleType) -> None:
     configure_route_module(globals(), module, _RESOLUTION_NAMES)
 
 def exported_handlers() -> dict[str, object]:
-    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'rotate_cluster_secret', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'quorum_voter_rpc', 'get_queue_detail', 'set_queue_strategy', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_task_graph_config', 'set_task_graph_config', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
+    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'rotate_cluster_secret', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'quorum_voter_rpc', 'get_queue_detail', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
 
 async def get_cluster_status():
     """
@@ -751,19 +751,8 @@ async def get_queue_detail():
     """
     if not _api_module.scheduler._effective_role() == "master":
         raise _api_module.HTTPException(403, "仅主节点可查看请求队列")
-    return _api_module.scheduler.pipeline_queue.get_queue_detail()
+    return _api_module.scheduler._execution_app.requests.queue_snapshot()
 
-async def set_queue_strategy(req: SetQueueStrategyRequest, request: Request):
-    """切换调度策略: fifo | mlfq。仅主节点。"""
-    if _api_module.control_fence.enabled:
-        _api_module.control_fence.require_current_permit(action="cluster.queue.strategy")
-    if not _api_module.scheduler._effective_role() == "master":
-        raise _api_module.HTTPException(403, "仅主节点可切换调度策略")
-    try:
-        _api_module.scheduler.pipeline_queue.set_strategy(req.strategy)
-        return {"success": True, "strategy": req.strategy}
-    except ValueError as e:
-        raise _api_module.HTTPException(400, str(e))
 
 async def pause_queue(request: Request):
     """暂停接受新请求。仅主节点。"""
@@ -771,7 +760,7 @@ async def pause_queue(request: Request):
         _api_module.control_fence.require_current_permit(action="cluster.queue.pause")
     if not _api_module.scheduler._effective_role() == "master":
         raise _api_module.HTTPException(403, "仅主节点可暂停请求队列")
-    _api_module.scheduler.pipeline_queue.pause()
+    _api_module.scheduler._execution_app.requests.pause()
     return {"success": True, "paused": True}
 
 async def resume_queue(request: Request):
@@ -780,7 +769,7 @@ async def resume_queue(request: Request):
         _api_module.control_fence.require_current_permit(action="cluster.queue.resume")
     if not _api_module.scheduler._effective_role() == "master":
         raise _api_module.HTTPException(403, "仅主节点可恢复请求队列")
-    _api_module.scheduler.pipeline_queue.resume()
+    _api_module.scheduler._execution_app.requests.resume()
     return {"success": True, "paused": False}
 
 async def clear_queue(request: Request):
@@ -789,7 +778,7 @@ async def clear_queue(request: Request):
         _api_module.control_fence.require_current_permit(action="cluster.queue.clear")
     if not _api_module.scheduler._effective_role() == "master":
         raise _api_module.HTTPException(403, "仅主节点可清空请求队列")
-    count = _api_module.scheduler.pipeline_queue.clear()
+    count = _api_module.scheduler._execution_app.requests.clear()
     return {"success": True, "cleared": count}
 
 async def cancel_queue_task(task_id: str, request: Request):
@@ -803,7 +792,7 @@ async def cancel_queue_task(task_id: str, request: Request):
         _api_module.control_fence.require_current_permit(action="cluster.queue.cancel")
     if not _api_module.scheduler._effective_role() == "master":
         raise _api_module.HTTPException(403, "仅主节点可取消队列任务")
-    ok = _api_module.scheduler.pipeline_queue.cancel_task(task_id)
+    ok = _api_module.scheduler._execution_app.requests.cancel(task_id)
     if ok:
         return _api_module.CancelTaskResponse(success=True, task_id=task_id, message="任务已取消")
     else:
@@ -812,26 +801,7 @@ async def cancel_queue_task(task_id: str, request: Request):
             message="任务不存在或已经完成，无法取消"
         )
 
-async def get_task_graph_config():
-    """Read task-graph experiment switches without claiming physical readiness."""
-    return _api_module._task_graph_feature_settings()
 
-async def set_task_graph_config(req: TaskGraphConfigRequest):
-    """Toggle local task-graph experiments; production Worker dispatch stays gated."""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(403, "仅主节点可切换任务链实验开关")
-    if req.enabled is None and req.worker_experimental_enabled is None:
-        raise _api_module.HTTPException(400, "至少提供一个任务链开关")
-    try:
-        return _api_module._set_task_graph_runtime_settings(
-            task_graph_enabled=req.enabled,
-            task_worker_experimental_enabled=req.worker_experimental_enabled,
-        )
-    except _api_module.HTTPException:
-        raise
-    except Exception as exc:
-        _api_module.logger.error("任务链运行时开关更新失败", exc_info=True)
-        raise _api_module.HTTPException(500, f"任务链实验开关更新失败: {exc}") from exc
 
 async def get_distributed_inference_config():
     """
@@ -1202,6 +1172,14 @@ async def cast_review_vote(req: CastVoteRequest):
         _api_module.logger.error(f"投票失败: {e}", exc_info=True)
         raise _api_module.HTTPException(status_code=500, detail=f"投票失败: {e}")
 
+def _safe_review_timestamp(value):
+    import math
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
 async def list_review_tickets(
     status: Optional[str] = None,
     limit: int = 20,
@@ -1218,11 +1196,11 @@ async def list_review_tickets(
                 {
                     "ticket_id": ticket.ticket_id,
                     "status": ticket.status.value,
-                    "created_at": _api_module._workflow_safe_timestamp(ticket.created_at),
+                    "created_at": _safe_review_timestamp(ticket.created_at),
                     "target_node_id": str(ticket.target_node_id or ""),
                     "score": max(-100, min(int(ticket.score or 0), 100)),
-                    "expires_at": _api_module._workflow_safe_timestamp(ticket.expires_at),
-                    "resolved_at": _api_module._workflow_safe_timestamp(ticket.resolved_at),
+                    "expires_at": _safe_review_timestamp(ticket.expires_at),
+                    "resolved_at": _safe_review_timestamp(ticket.resolved_at),
                     "vote_count": min(len(ticket.votes), 100),
                 }
                 for ticket in tickets
@@ -1325,13 +1303,10 @@ def register_routes() -> None:
     router.add_api_route('/api/cluster/control-plane/certificate', install_control_plane_certificate, methods=['POST'])
     router.add_api_route('/api/cluster/quorum/voter', quorum_voter_rpc, methods=['POST'])
     router.add_api_route('/api/cluster/queue', get_queue_detail, methods=['GET'])
-    router.add_api_route('/api/cluster/queue/strategy', set_queue_strategy, methods=['POST'])
     router.add_api_route('/api/cluster/queue/pause', pause_queue, methods=['POST'])
     router.add_api_route('/api/cluster/queue/resume', resume_queue, methods=['POST'])
     router.add_api_route('/api/cluster/queue/clear', clear_queue, methods=['POST'])
     router.add_api_route('/api/cluster/queue/task/{task_id}', cancel_queue_task, methods=['DELETE'])
-    router.add_api_route('/api/cluster/config/task-graph', get_task_graph_config, methods=['GET'])
-    router.add_api_route('/api/cluster/config/task-graph', set_task_graph_config, methods=['PUT'])
     router.add_api_route('/api/cluster/config/distributed-inference', get_distributed_inference_config, methods=['GET'])
     router.add_api_route('/api/cluster/config/distributed-inference', set_distributed_inference_config, methods=['PUT'])
     router.add_api_route('/api/cluster/layers', get_layer_assignments, methods=['GET'])

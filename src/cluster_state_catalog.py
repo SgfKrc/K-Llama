@@ -188,13 +188,13 @@ def build_state_catalog() -> StateCatalog:
             "Revalidate or reissue from the voter ledger; never trust a copied in-memory authority.",
         ),
         StateCatalogEntry(
-            "task_graph.journal_events", "task-graph", "src/task_journal.py:workflow_events",
+            "task_graph.journal_events", "task-graph", "src/recovery_journal.py:workflow_events",
             "must_replicate", "cluster", "durable_local", "journal_replay_before_write",
             "required_before_new_leader_write", False,
             "Append-only events are the recoverable task authority; snapshots are only projections.",
         ),
         StateCatalogEntry(
-            "task_graph.snapshots", "task-graph", "src/task_journal.py:workflow_snapshots",
+            "task_graph.snapshots", "task-graph", "src/recovery_journal.py:workflow_snapshots",
             "rebuildable", "cluster", "durable_local", "rebuild_from_local_state",
             "rebuild_after_new_leader", False,
             "Rebuild from accepted journal events; a snapshot is not cross-node atomic state.",

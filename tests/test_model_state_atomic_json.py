@@ -17,7 +17,6 @@ import pytest
 
 import atomic_json
 from atomic_json import atomic_write_json
-from model_intent import ModelIntentCoordinator
 from model_supply import ModelSupplyCoordinator, ModelSupplyError
 
 
@@ -31,7 +30,6 @@ def state(tmp_path):
     )
     supply = ModelSupplyCoordinator(scheduler, tmp_path)
     scheduler._model_supply = supply
-    intent = ModelIntentCoordinator(scheduler, lambda operation_id: None, root=tmp_path)
     operation_id = "supply_dbac01f9fd054f86a72df7ca724517df"
     supply._active = operation_id
     supply._operations[operation_id] = {
@@ -39,19 +37,14 @@ def state(tmp_path):
     }
     supply._events[operation_id] = threading.Event()
     supply._leases[(operation_id, "worker")] = {"token": "secret", "files": {}}
-    intent._current = operation_id
-    intent._records[operation_id] = {"operation_id": operation_id, "status": "queued"}
     supply._persist(supply._operations[operation_id])
-    intent._persist(intent._records[operation_id])
-    return SimpleNamespace(root=tmp_path, supply=supply, intent=intent, operation_id=operation_id)
+    return SimpleNamespace(root=tmp_path, supply=supply, operation_id=operation_id)
 
 
 def _publication(state, filename):
-    if filename == "operation.json":
-        return (state.root / state.operation_id / filename,
-                lambda: state.supply._update(state.operation_id, status="building"))
-    path = state.root / state.operation_id / filename if filename == "intent.json" else state.root / filename
-    return path, lambda: state.intent._update(state.operation_id, status="preparing")
+    assert filename == "operation.json"
+    return (state.root / state.operation_id / filename,
+            lambda: state.supply._update(state.operation_id, status="building"))
 
 
 @contextmanager
@@ -87,7 +80,7 @@ def _windows_read_handle_without_delete_share(path):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows kernel sharing locks")
-@pytest.mark.parametrize("filename", ["operation.json", "intent.json", "current-intent.json"])
+@pytest.mark.parametrize("filename", ["operation.json"])
 def test_windows_reader_release_allows_state_replace(state, monkeypatch, filename):
     path, publish = _publication(state, filename)
     previous = path.read_bytes()
@@ -127,7 +120,7 @@ def test_windows_reader_release_allows_state_replace(state, monkeypatch, filenam
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows kernel sharing locks")
-@pytest.mark.parametrize("filename", ["operation.json", "intent.json", "current-intent.json"])
+@pytest.mark.parametrize("filename", ["operation.json"])
 def test_windows_unreleased_reader_fails_with_bounded_retries(state, monkeypatch, filename):
     path, publish = _publication(state, filename)
     previous = path.read_bytes()
@@ -295,7 +288,7 @@ def test_overlapping_writers_use_distinct_complete_sibling_files(tmp_path, monke
     assert not list(tmp_path.glob("*.tmp"))
 
 
-@pytest.mark.parametrize("filename", ["operation.json", "intent.json"])
+@pytest.mark.parametrize("filename", ["operation.json"])
 def test_retry_keeps_owner_lock_and_cancel_cannot_be_overwritten(state, monkeypatch, filename):
     path, publish = _publication(state, filename)
     owner = state.supply if filename == "operation.json" else state.intent
@@ -348,52 +341,6 @@ def test_retry_keeps_owner_lock_and_cancel_cannot_be_overwritten(state, monkeypa
     assert not list(state.root.rglob("*.tmp"))
 
 
-def test_current_pointer_retry_cannot_overwrite_new_selection(state, monkeypatch):
-    path = state.root / "current-intent.json"
-    newer_id = "supply_" + "b" * 32
-    retrying, resume, newer_started = threading.Event(), threading.Event(), threading.Event()
-    attempts = []
-    error = PermissionError(errno.EACCES, "injected Windows read lock")
-    error.winerror = 5
-    replace = os.replace
-
-    def fail_first_replace(source, target):
-        if Path(target) == path:
-            assert state.intent._lock._is_owned()
-            attempts.append(json.loads(Path(source).read_text(encoding="utf-8"))["operation_id"])
-            if len(attempts) == 1:
-                raise error
-        return replace(source, target)
-
-    def pause_retry(delay):
-        assert state.intent._lock._is_owned()
-        retrying.set()
-        assert resume.wait(5)
-
-    def select_newer():
-        newer_started.set()
-        with state.intent._lock:
-            state.intent._current = newer_id
-            state.intent._records[newer_id] = {"operation_id": newer_id, "status": "queued"}
-            state.intent._persist(state.intent._records[newer_id])
-
-    monkeypatch.setattr(atomic_json, "sys", SimpleNamespace(platform="win32"))
-    monkeypatch.setattr(atomic_json, "time", SimpleNamespace(sleep=pause_retry))
-    monkeypatch.setattr(atomic_json.os, "replace", fail_first_replace)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        older = pool.submit(state.intent._persist, state.intent._records[state.operation_id])
-        try:
-            assert retrying.wait(5)
-            newer = pool.submit(select_newer)
-            assert newer_started.wait(5) and not newer.done()
-        finally:
-            resume.set()
-        older.result(timeout=5)
-        newer.result(timeout=5)
-    assert attempts == [state.operation_id, state.operation_id, newer_id]
-    assert json.loads(path.read_text(encoding="utf-8")) == {"operation_id": newer_id}
-    assert json.loads((state.root / newer_id / "intent.json").read_text(encoding="utf-8"))["operation_id"] == newer_id
-    assert not list(state.root.rglob("*.tmp"))
 
 
 def test_coordinators_preserve_existing_json_format(state):
@@ -403,8 +350,3 @@ def test_coordinators_preserve_existing_json_format(state):
     operation = (state.root / state.operation_id / "operation.json").read_text(encoding="utf-8")
     assert operation == json.dumps(record, ensure_ascii=False, indent=2)
     assert b"\xe4\xb8\xad\xe6\x96\x87" in (state.root / state.operation_id / "operation.json").read_bytes()
-    record = state.intent._records[state.operation_id]
-    record["reason"] = "\u4e2d\u6587"
-    state.intent._persist(record)
-    assert (state.root / state.operation_id / "intent.json").read_text(encoding="utf-8") == json.dumps(record)
-    assert (state.root / "current-intent.json").read_text(encoding="utf-8") == json.dumps({"operation_id": state.operation_id})

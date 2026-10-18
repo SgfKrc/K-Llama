@@ -108,10 +108,10 @@ def test_build_commands_use_real_entrypoints_with_noninteractive_windows():
     assert job["env"]["QLH_SIGNING_KEY"] == "${{ vars.QLH_RELEASE_SIGNING_KEY_PATH }}"
     runs = [(s.get("shell"), s.get("run", "")) for s in job["steps"]]
     cmd = next(script for shell, script in runs if shell == "cmd")
-    for name in ("build-cpu.bat", "build-launcher.bat"):
+    for name in ("build-cpu.bat",):
         assert f'call "%GITHUB_WORKSPACE%\\packaging\\packaging\\{name}" <NUL\n' in cmd
         assert (ROOT / "packaging/packaging" / name).is_file()
-    assert cmd.count("if errorlevel 1 exit /b 1") == 2
+    assert cmd.count("if errorlevel 1 exit /b 1") == 1
     combined = "\n".join(script for _, script in runs)
     assert "bash packaging/packaging/linux/build-deb.sh cpu" in combined
     assert "bash android/gradlew -p android :app:assembleRelease --console=plain" in combined
@@ -125,8 +125,8 @@ def test_build_commands_use_real_entrypoints_with_noninteractive_windows():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Execute the actual cmd workflow on Windows")
-@pytest.mark.parametrize("cpu_code,launcher_code", [(0, 0), (7, 0), (0, 9)])
-def test_windows_workflow_survives_cpu_cwd_change_and_propagates_failures(tmp_path, cpu_code, launcher_code):
+@pytest.mark.parametrize("cpu_code", [0, 7])
+def test_windows_workflow_survives_cpu_cwd_change_and_propagates_failures(tmp_path, cpu_code):
     workflow = load_yaml(ROOT / ".github/workflows/release-build.yml")
     script = next(s["run"] for s in workflow["jobs"]["artifacts"]["steps"] if s.get("shell") == "cmd")
     # Controlled offline entrypoints only; never invoke the real builders.
@@ -135,15 +135,11 @@ def test_windows_workflow_survives_cpu_cwd_change_and_propagates_failures(tmp_pa
     builders.mkdir(parents=True)
     (builders / "build-cpu.bat").write_text(
         '@echo off\ncd /d "%~dp0.."\nexit /b ' + str(cpu_code) + '\n', encoding="utf-8")
-    (builders / "build-launcher.bat").write_text(
-        '@echo off\n>"%GITHUB_WORKSPACE%\\launcher-ran.txt" echo reached\nexit /b ' + str(launcher_code) + '\n',
-        encoding="utf-8")
     command = workspace / "workflow.cmd"
     command.write_text(script, encoding="utf-8")
     result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(command)],
         cwd=workspace, env={**os.environ, "GITHUB_WORKSPACE": str(workspace)}, capture_output=True, timeout=15)
-    assert (result.returncode == 0) == (cpu_code == launcher_code == 0), result
-    assert (workspace / "launcher-ran.txt").exists() == (cpu_code == 0)
+    assert (result.returncode == 0) == (cpu_code == 0), result
 
 
 @pytest.mark.parametrize("change", [lambda i: i.pop("source_dirty"), lambda i: i.update(source_dirty=0),
@@ -183,7 +179,7 @@ def test_postbuild_reuses_strict_original_snapshot_and_rejects_source_drift(chec
 
 
 @pytest.mark.parametrize("platform,stale", [("windows", "packaging/dist/QLH-Edge-Inference/old.exe"),
-    ("windows", "packaging/dist/QLH-Launcher/old.exe"), ("linux", "packaging/packaging/linux/qlh-edge-inference-cpu_old.deb"),
+    ("linux", "packaging/packaging/linux/qlh-edge-inference-cpu_old.deb"),
     ("android", "android/app/build/outputs/apk/release/old.apk")])
 def test_preflight_refuses_stale_outputs_without_deleting_them(tmp_path, monkeypatch, run_env, platform, stale):
     key = tmp_path / "existing.key"
@@ -304,9 +300,7 @@ def test_windows_stages_only_signed_file_set_from_packaging_dist(tmp_path, monke
     output = tmp_path / "out"
     build.stage_windows(tmp_path, output, INFO, types.SimpleNamespace(_clone_bundle=clone), CONTRACT, tmp_path / "work")
     assert calls == [(tmp_path / "packaging/dist/QLH-Edge-Inference", "cpu"),
-                     (output / "QLH-Edge-Inference", "cpu"),
-                     (tmp_path / "packaging/dist/QLH-Launcher", "launcher"),
-                     (output / "QLH-Launcher", "launcher")]
+                     (output / "QLH-Edge-Inference", "cpu")]
 
 
 def test_linux_extracts_and_authenticates_deb_without_installing(tmp_path, monkeypatch):

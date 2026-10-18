@@ -194,11 +194,9 @@ def test_wire_model_identity_normalizes_alias_and_preserves_non_local_engine(gol
     capabilities = hello["payload"]["capabilities"]
     capabilities["engines"] = ["speculative_assisted"]
     capabilities["models"][0]["engine"] = "speculative_assisted"
-    decoded = decode_message(hello)
-    assert decoded.payload["capabilities"]["engines"] == ["speculative_assisted"]
-    assert decoded.payload["capabilities"]["models"][0]["engine"] == (
-        "speculative_assisted"
-    )
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(hello)
+    assert captured.value.code == "invalid_capabilities"
 
 
 def test_wire_engine_aliases_fail_closed_and_canonical_duplicates_are_rejected(golden):

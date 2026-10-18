@@ -296,42 +296,6 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     )
     EXTERNAL_LABEL = _env_first("QLH_EXTERNAL_LABEL", default="外部推理服务")  # 展示名
 
-    # --- 投机解码外部辅助（路线 C-1 阶段 0-1 探索性 PoC，
-    #     详见 docs/投机解码外部辅助实施说明.md）---
-    # 本地小模型每轮生成 γ 个草稿 token，外部大模型一次前向并行校验，接受则一次
-    # 前进 k+1 个 token。输出分布严格等于 verify 模型（标准投机采样性质），
-    # 因此语义是"以本地小模型加速外部大模型"，质量对齐外部端。
-    # 前提：外部端必须支持 /v1/completions 的 per-token logprobs（纯 chat 接口不够），
-    # 且 top_logprobs 的 key 可还原为 token id（vLLM --return-tokens-as-token-ids）。
-    # ★ 数据作用域**不另设开关**：本路径把用户内容派生的草稿 token 送出集群，
-    #   与路线 B 完全同一风险面，因此共用 QLH_EXTERNAL_DATA_SCOPE 硬门控。
-    SPEC_ENABLED = _env_bool("QLH_SPEC_ENABLED", False)          # 投机解码总开关（默认关）
-    SPEC_GAMMA = _env_int("QLH_SPEC_GAMMA", 4, min_val=1, max_val=64)   # 每轮草稿 token 数 γ（static 默认 / adaptive 初值）
-    SPEC_GAMMA_MODE = environment.get("QLH_SPEC_GAMMA_MODE", "static")  # static|adaptive（SPC-CS 置信度调度）
-    SPEC_GAMMA_MIN = _env_int("QLH_SPEC_GAMMA_MIN", 1, min_val=1, max_val=64)
-    SPEC_GAMMA_MAX = _env_int("QLH_SPEC_GAMMA_MAX", 16, min_val=1, max_val=64)
-    SPEC_CONF_ALPHA = _env_float("QLH_SPEC_CONF_ALPHA", 0.2, min_val=0.0, max_val=1.0)
-    SPEC_MAX_ROUNDS = _env_int("QLH_SPEC_MAX_ROUNDS", 64, min_val=1, max_val=4096)  # 单会话最大轮数
-    SPEC_MAX_NEW_TOKENS = _env_int(
-        "QLH_SPEC_MAX_NEW_TOKENS", 128, min_val=1, max_val=4096,
-    )                                                            # 单会话最大新 token 数
-    # verify 端点：留空则回落到 QLH_EXTERNAL_* 同名配置，一个外部端点同时服务 B 与 C。
-    # 凭据回落有额外约束：只有 BASE_URL 也是回落来的（B/C 同端点）才复用
-    # EXTERNAL_API_KEY，避免把 B 的凭据发给另一台 verify 主机（见 speculative.py）。
-    SPEC_VERIFY_BASE_URL = _env_first("QLH_SPEC_VERIFY_BASE_URL", default="")
-    SPEC_VERIFY_API_KEY = environment.get("QLH_SPEC_VERIFY_API_KEY", "")
-    SPEC_VERIFY_MODEL = _env_first("QLH_SPEC_VERIFY_MODEL", default="")
-    SPEC_TIMEOUT = _env_int("QLH_SPEC_TIMEOUT", 60, min_val=1, max_val=3600)  # 单轮校验超时（秒）
-    SPEC_CONNECT_TIMEOUT = _env_int("QLH_SPEC_CONNECT_TIMEOUT", 5, min_val=1, max_val=300)
-    # 采样温度：0 = 贪心模式（接受当且仅当草稿 token == verify argmax）
-    SPEC_TEMPERATURE = _env_float("QLH_SPEC_TEMPERATURE", 0.7, min_val=0.0, max_val=2.0)
-    # 每个位置请求的 top-k logprobs：残差重采样的支撑集大小，越大越接近真实分布
-    SPEC_TOP_LOGPROBS = _env_int("QLH_SPEC_TOP_LOGPROBS", 20, min_val=1, max_val=100)
-    # 外部端是否为会话维护 KV / 已开前缀缓存（vLLM --enable-prefix-caching）。
-    # 仅影响通信量指标口径（bytes_up vs bytes_up_ideal_stateful），不改变协议。
-    SPEC_STATEFUL_VERIFY = _env_bool("QLH_SPEC_STATEFUL_VERIFY", False)
-    SPEC_LABEL = _env_first("QLH_SPEC_LABEL", default="投机解码外部辅助")  # 展示名
-
     # --- n-gram 自投机（绑定路径 / 无 CUDA 边缘）---
     # ★ 2026-10-13 实测（Qwen3.6-35B-A3B-UD-Q4_K_XL，`.venv-test` 绑定）：
     #   `draft_model=LlamaPromptLookupDecoding` 在**绑定路径**上有效 —— 重复文本
@@ -382,22 +346,9 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     # ============================================================
     TOTAL_MODEL_LAYERS = 24                  # Qwen-1.8B-Chat Transformer 层总数
     LAYER_STRATEGY = "dynamic"              # 分层策略: "dynamic" 动态 | "manual" 手动覆盖
-    DISTRIBUTED_INFERENCE_ENABLED = True    # 分布式推理开关（主节点默认开启，从节点默认关闭）
-    TASK_GRAPH_ENABLED = _env_bool("QLH_TASK_GRAPH_ENABLED", False)
+    DISTRIBUTED_INFERENCE_ENABLED = _env_bool("QLH_DISTRIBUTED_INFERENCE_ENABLED", True)    # 分布式推理开关（主节点默认开启，从节点默认关闭）
     TASK_WORKER_EXPERIMENTAL_ENABLED = _env_bool(
         "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED", False,
-    )
-    TASK_GRAPH_MAX_RECORDS = _env_int(
-        "QLH_TASK_GRAPH_MAX_RECORDS", 100, min_val=10, max_val=1000,
-    )
-    TASK_GRAPH_MAX_PARALLEL_STAGES = _env_int(
-        "QLH_TASK_GRAPH_MAX_PARALLEL_STAGES", 4, min_val=1, max_val=32,
-    )
-    TASK_GRAPH_RETENTION_DAYS = _env_int(
-        "QLH_TASK_GRAPH_RETENTION_DAYS", 30, min_val=0, max_val=3650,
-    )
-    TASK_GRAPH_RETENTION_MAX_RECORDS = _env_int(
-        "QLH_TASK_GRAPH_RETENTION_MAX_RECORDS", 1000, min_val=0, max_val=100000,
     )
 
     # ------------------------------------------------------- journal 复制（R-R11，默认全关）
@@ -522,7 +473,6 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
 
     # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
     # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
-    GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
 
     # 流水线推理超时与并发控制
     #: ★ 2026-10-11（ROG+Y700+本机三机实测）：此前是硬编码 `120`，而三机层接力每步约
@@ -549,26 +499,6 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     PIPELINE_QUEUE_POLL_INTERVAL = 0.5       # 排队请求轮询间隔（秒）
 
     # ============================================================
-    # 4.5 推理调度策略（MLFQ 三级反馈队列）
-    # ============================================================
-    PIPELINE_SCHEDULING_STRATEGY = "mlfq"     # 调度策略: "fifo" | "mlfq"
-
-    # 三级队列阈值（按 max_new_tokens 分级）
-    PIPELINE_Q0_MAX_TOKENS = 128              # Q0 交互级上限 (≤128)
-    PIPELINE_Q1_MAX_TOKENS = 512              # Q1 普通级上限 (≤512，>Q1→Q2 批量级)
-
-    # 老化提升参数（防饥饿）
-    PIPELINE_AGING_Q1_TO_Q0_SECONDS = 60      # Q1 等待 > 60s → 提升到 Q0
-    PIPELINE_AGING_Q2_TO_Q1_SECONDS = 120     # Q2 等待 > 120s → 提升到 Q1
-    PIPELINE_AGING_MAX_WAIT_SECONDS = 300     # 绝对上限: 等待 > 300s → 强制置顶 Q0
-
-    # 协同抢占控制（二期实施，参数预留）
-    PIPELINE_PREEMPT_ENABLED = True           # 是否启用协同抢占（仅 Q0 可抢占 Q1/Q2）
-    PIPELINE_PREEMPT_MIN_INTERVAL = 10.0      # 两次抢占最小间隔（防抖动）
-    PIPELINE_PREEMPT_MIN_TOKENS = 16          # 至少生成 N token 后才接受抢占
-    PIPELINE_PREEMPT_MAX_OVERHEAD_MS = 500    # checkpoint+restore 超过此值 → 禁用抢占
-
-    # ============================================================
     # 5. 节点身份配置
     # ============================================================
     if resolve_initial_node_role is not None:
@@ -586,8 +516,8 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
         "cuda" if "cuda" in os.path.basename(_APP_ROOT).lower() else "cpu"
     )
     APP_VARIANT = _env_first("QLH_APP_VARIANT", default=_default_app_variant)
-    TASK_GRAPH_INSTANCE_ID = _env_first(
-        "QLH_TASK_GRAPH_INSTANCE_ID",
+    LEGACY_RECOVERY_INSTANCE_ID = _env_first(
+        "QLH_LEGACY_RECOVERY_INSTANCE_ID",
         default=f"{APP_VARIANT}-{NODE_ID}",
     )
     _task_graph_instance_segment = "".join(
@@ -595,12 +525,12 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
         if character.isascii()
         and (character.isalnum() or character in {"-", "_", "."})
         else "_"
-        for character in TASK_GRAPH_INSTANCE_ID
+        for character in LEGACY_RECOVERY_INSTANCE_ID
     ).strip("._")[:48] or "default"
     _task_graph_instance_digest = hashlib.sha256(
-        TASK_GRAPH_INSTANCE_ID.encode("utf-8")
+        LEGACY_RECOVERY_INSTANCE_ID.encode("utf-8")
     ).hexdigest()[:12]
-    TASK_GRAPH_JOURNAL_PATH = os.path.join(
+    LEGACY_RECOVERY_JOURNAL_PATH = os.path.join(
         STATE_DIR,
         "task_graph",
         f"instance-{_task_graph_instance_segment}-{_task_graph_instance_digest}.sqlite3",

@@ -101,7 +101,10 @@ def test_dual_process_restart_fences_old_generation_and_reconnects():
     assert evidence.task_outcomes[0]["result"] == "retry_pending"
 
 
-def test_crosshost_metadata_is_attached_from_real_ha_components(tmp_path: Path):
+def test_crosshost_metadata_is_attached_from_real_ha_components(tmp_path: Path, monkeypatch):
+    # Metadata assertions use a deterministic clock; lease expiry has separate coverage.
+    from qlh_core.control import clock
+    monkeypatch.setattr(clock, "operation_clock", lambda now_ms=None: lambda: now_ms)
     voter_set, authority, fence, old, new, coordinator = _ha_fixture(tmp_path / "quorum")
     old_certificate = old.certificate
     assert old_certificate is not None

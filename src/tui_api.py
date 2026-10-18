@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -36,10 +38,11 @@ class ApiError(Exception):
     """后端返回的错误（含 HTTP 状态码，便于界面区分 4xx/5xx）。"""
 
     def __init__(self, message: str, status: Optional[int] = None,
-                 reason_code: str = "") -> None:
+                 reason_code: str = "", reason_detail=None) -> None:
         super().__init__(message)
         self.status = status
         self.reason_code = reason_code
+        self.reason_detail = reason_detail
 
 
 class ApiClient:
@@ -47,7 +50,9 @@ class ApiClient:
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  timeout: float = 5.0, log_token: str = "",
-                 auth_token: str = "") -> None:
+                 auth_token: str = "", client_id: str = "") -> None:
+        self.client_id = client_id or "tui:" + uuid.uuid4().hex
+        self._snapshot_cache = {}
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -55,6 +60,21 @@ class ApiClient:
         #: ★ 2026-09-19（G-⑤）：登录态 Bearer token。由 TUI 的 /login 写入，
         #   之后所有请求自动带 `Authorization: Bearer <token>`。
         self.auth_token = auth_token
+
+    def accept_snapshot(self, value, *, stream="model_control"):
+        if value is None:
+            return None
+        identity = value.get("identity") or {}
+        revision, observed = value.get("revision"), value.get("observed_at")
+        if (value.get("schema_version") != 2 or value.get("validity") != "valid"
+                or not identity.get("boot_id") or type(revision) is not int
+                or type(observed) not in (int, float) or not math.isfinite(observed) or observed <= 0 or revision < 0):
+            raise ApiError("状态快照无效", reason_code="snapshot_invalid")
+        prior = self._snapshot_cache.get(stream)
+        if prior and (observed < prior[2] or (identity["boot_id"] == prior[0] and revision < prior[1])):
+            raise ApiError("状态快照已过期", reason_code="snapshot_stale")
+        self._snapshot_cache[stream] = (identity["boot_id"], revision, observed)
+        return value
 
     @property
     def base_url(self) -> str:
@@ -72,7 +92,7 @@ class ApiClient:
         source header.  Authentication and optional log credentials are the
         only client headers that need to be propagated here.
         """
-        headers = {"Accept": accept}
+        headers = {"Accept": accept, "X-QLH-Client-ID": self.client_id}
         if content_type:
             headers["Content-Type"] = "application/json"
         if with_log_token and self.log_token:
@@ -108,6 +128,8 @@ class ApiClient:
             try:
                 raw = e.read().decode("utf-8", errors="replace")
                 parsed = json.loads(raw) if raw else {}
+                reason_detail = parsed.get("reason_detail") if isinstance(parsed, dict) else None
+                reason_code = str((reason_detail or {}).get("code") or parsed.get("error_code", "")) if isinstance(parsed, dict) else ""
                 detail = parsed.get("detail", raw) if isinstance(parsed, dict) else raw
                 if isinstance(detail, dict):
                     reason_code = str(detail.get("code") or detail.get("reason_code") or "")
@@ -116,7 +138,7 @@ class ApiClient:
                 detail = ""
             label = f"{reason_code}: " if reason_code else ""
             raise ApiError("HTTP %d: %s%s" % (e.code, label, detail or e.reason),
-                           status=e.code, reason_code=reason_code)
+                           status=e.code, reason_code=reason_code, reason_detail=locals().get("reason_detail"))
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
             if isinstance(reason, (TimeoutError, OSError)) and "timed out" in str(reason):
@@ -214,7 +236,7 @@ def cancel_generation(api: ApiClient, generation_id: str) -> None:
 #: 模型加载/卸载耗时约 5-20 秒（后端 /models/load 注释），故放宽超时
 MODEL_CONTROL_TIMEOUT = 180.0
 
-QUEUE_STRATEGIES = ("mlfq", "fifo")
+
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -277,10 +299,10 @@ def load_local_model(api: ApiClient, model_id: str, *, engine: str = "llama_cpp"
 
 def create_model_intent(api: ApiClient, model_id: str, *, engine: str = "auto",
                         quant_type: str = "") -> Dict[str, Any]:
-    return _as_dict(api.request("POST", API_PATHS["models_intent"], body={
+    return api.accept_snapshot(_as_dict(api.request("POST", API_PATHS["models_intent"], body={
         "model_id": model_id, "engine": engine, "quant_type": quant_type,
         "strategy": "auto", "timeout_seconds": 3600,
-    }, timeout=MODEL_CONTROL_TIMEOUT))
+    }, timeout=MODEL_CONTROL_TIMEOUT)))
 
 
 def get_model_intent_catalog(api: ApiClient) -> Dict[str, Any]:
@@ -289,7 +311,7 @@ def get_model_intent_catalog(api: ApiClient) -> Dict[str, Any]:
 
 def current_model_intent(api: ApiClient) -> Optional[Dict[str, Any]]:
     value = api.get(API_PATHS["models_intent_current"])
-    return value if isinstance(value, dict) and value.get("operation_id") else None
+    return api.accept_snapshot(value) if isinstance(value, dict) and value.get("operation_id") else None
 
 
 def _model_intent_path(operation_id: str) -> str:
@@ -299,11 +321,13 @@ def _model_intent_path(operation_id: str) -> str:
 
 
 def get_model_intent(api: ApiClient, operation_id: str) -> Dict[str, Any]:
-    return _as_dict(api.get(_model_intent_path(operation_id)))
+    path = _model_intent_path(operation_id)
+    return api.accept_snapshot(_as_dict(api.get(path)))
 
 
 def cancel_model_intent(api: ApiClient, operation_id: str) -> Dict[str, Any]:
-    return _as_dict(api.delete(_model_intent_path(operation_id), timeout=MODEL_CONTROL_TIMEOUT))
+    path = _model_intent_path(operation_id)
+    return api.accept_snapshot(_as_dict(api.delete(path, timeout=MODEL_CONTROL_TIMEOUT)))
 
 
 def connect_model_intent(api: ApiClient) -> Dict[str, Any]:
@@ -366,11 +390,6 @@ def resume_queue(api: ApiClient) -> Dict[str, Any]:
     return _as_dict(api.post(API_PATHS["cluster_queue_resume"]))
 
 
-def set_queue_strategy(api: ApiClient, strategy: str) -> Dict[str, Any]:
-    """切换调度策略（POST ``/cluster/queue/strategy``）。"""
-    if strategy not in QUEUE_STRATEGIES:
-        raise ValueError("调度策略只能是 %s" % " | ".join(QUEUE_STRATEGIES))
-    return _as_dict(api.post(API_PATHS["cluster_queue_strategy"], {"strategy": strategy}))
 
 
 def clear_queue(api: ApiClient) -> Dict[str, Any]:

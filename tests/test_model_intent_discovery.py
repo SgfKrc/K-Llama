@@ -39,7 +39,7 @@ class FakeScheduler:
     def _effective_role(self):
         return self.role
 
-    def _scheduler_facade_global(self, name):
+    def _runtime_setting(self, name):
         assert name == "RUN_MODE"
         return self.run_mode
 

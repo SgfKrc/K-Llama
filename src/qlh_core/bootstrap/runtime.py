@@ -173,6 +173,12 @@ class AppRuntime:
             config = self._identity_store.accept_bootstrap(self.config, response)
             self._publish_identity_config(config)
 
+    def persist_participation(self, mode):
+        with self._lock:
+            if self._closing or self._closed:
+                raise RuntimeError("runtime is closing or closed")
+            self._get_identity_store().persist_participation(mode)
+
     def persist_preferred_master_endpoint(self, host, port):
         with self._lock:
             if self._closing or self._closed:

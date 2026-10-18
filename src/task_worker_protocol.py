@@ -13,9 +13,9 @@ from typing import Any, Mapping
 from task_worker_capabilities import validate_worker_engine_capabilities
 
 try:
-    from .task_provider import canonical_model_engine
+    from .execution_provider import canonical_model_engine
 except ImportError:  # pragma: no cover - top-level import in worker bundles
-    from task_provider import canonical_model_engine
+    from execution_provider import canonical_model_engine
 
 
 PROTOCOL_NAME = "qlh.task_worker"
@@ -85,13 +85,12 @@ _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LAYER_SEGMENT_MODES = frozenset({"head", "middle", "tail"})
 
-# 受支持的推理引擎标识（与 task_provider.ModelIdentity 的校验集保持一致）:
+# 受支持的推理引擎标识（与 execution_provider.ModelIdentity 的校验集保持一致）:
 #   pytorch / llama_cpp   本地引擎
 #   island                TP 孤岛（路线 A，指纹为端点摘要）
 #   external_api          外部推理服务（路线 B，指纹为外部端点摘要）
-#   speculative_assisted  投机解码（路线 C-1，本地 draft + 外部 verify）
 _SUPPORTED_ENGINES = frozenset({
-    "pytorch", "llama_cpp", "island", "external_api", "speculative_assisted",
+    "pytorch", "llama_cpp", "island", "external_api",
 })
 _TEXT_STAGE_TYPES = frozenset({"full_inference", "aggregate", "layer_forward"})
 
@@ -436,7 +435,6 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
     _require_string(model["model_id"], f"{field}.model_id", pattern=_SAFE_ID)
     # "island": TP 孤岛引擎（网关整请求转发，指纹为端点摘要）
     # "external_api": 外部推理服务（路线 B，指纹为外部端点摘要）
-    # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify）
     engine = _require_string(
         model["engine"], f"{field}.engine", max_length=64,
     )
@@ -631,6 +629,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   的 dispatch 前预检负责拒绝超预算请求）。两侧必须同时放行。
     if "stage_chunked_input" in capabilities:
         expected_fields.add("stage_chunked_input")
+    if "node_incarnation" in capabilities:
+        expected_fields.add("node_incarnation")
+        _require_string(capabilities["node_incarnation"], "payload.capabilities.node_incarnation")
+    if "stage_kv_cleanup" in capabilities:
+        expected_fields.add("stage_kv_cleanup")
+        _require_bool(capabilities["stage_kv_cleanup"], "payload.capabilities.stage_kv_cleanup")
     # ★ 票 21a（COMM-WIRE-01）：层段 hidden 的**二进制帧**接收能力（可选，默认关）。
     #   声明 `binary_hidden == true` 的对端，才可能收到 `format:"binary"` 的帧
     #   （见 `build_message` 的 `binary_body`）；未声明者继续走 base64 内联，

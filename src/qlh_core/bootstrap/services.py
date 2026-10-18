@@ -3,23 +3,6 @@ from __future__ import annotations
 
 import threading
 
-from qlh_core.contracts.runtime import ParticipationSnapshot
-
-
-class SchedulerParticipation:
-    def __init__(self, scheduler):
-        self.scheduler = scheduler
-        self._revision = 0
-
-    def snapshot(self):
-        enabled = self.scheduler.get_distributed_inference_enabled()
-        return ParticipationSnapshot("distributed" if enabled else "local", self._revision, bool(enabled))
-
-    def set_mode(self, mode):
-        # Unload/retirement and API command migration remain R3/R4 responsibilities.
-        raise RuntimeError("participation mode changes require the existing retirement command")
-
-
 class RuntimeServices:
     def __init__(self, config, *, host=None, callbacks=None):
         from cluster_fence import ControlFence
@@ -40,19 +23,22 @@ class RuntimeServices:
         self.host.configure_catalog(self.catalog_prepare)
         self.fence = ControlFence.from_environment(config.environment_snapshot())
         self.scheduler = Scheduler(host=self.host, runtime_config=config)
+        self.requests = self.scheduler._execution_app.requests
+        self.runtime_controller = getattr(self.host, "runtime_controller", None)
         self.scheduler._catalog = self.catalog
         self.scheduler.set_control_fence(self.fence)
         if callbacks is not None:
             self.scheduler.configure_callbacks(callbacks)
             self.host.configure_scheduler_callbacks(callbacks)
         self.scheduler._worker_prepare.configure_runtime(self.stage_host)
-        self.participation = SchedulerParticipation(self.scheduler)
+        self.participation = self.scheduler._participation
         self.auto_role = None
         self.journal = None
         self._closing = False
         self._closed = False
 
     def bind_runtime(self, runtime):
+        self.participation.bind_persistence(runtime.persist_participation)
         self.scheduler._accept_bootstrap = runtime.accept_bootstrap
         self.scheduler._persist_preferred_endpoint = runtime.persist_preferred_master_endpoint
         self.scheduler._read_identity_document = runtime.read_identity_document
@@ -72,12 +58,12 @@ class RuntimeServices:
         self.host.configure_runtime_environment(config.environment_snapshot())
         self.scheduler._runtime_config = config
         from scheduler import _bootstrap_api_port
-        self.scheduler._runtime_settings = {
+        self.scheduler._runtime_settings.update({
             **config.legacy_settings(), "NODE_ID": config.node_id, "NODE_ROLE": config.node_role,
             "RUN_MODE": config.run_mode, "SERVER_IP": config.server_ip, "SERVER_PORT": config.server_port,
             "_configured_node_id": lambda: config.node_id,
             "_bootstrap_api_port": lambda: _bootstrap_api_port(environment=config.environment_snapshot()),
-        }
+        })
 
     def configure_authority(self):
         if self.config.node_role == "auto" and self.auto_role is None:
@@ -109,7 +95,13 @@ class RuntimeServices:
             if self._closed:
                 return
             self._closing = True
-        actions = [self.scheduler.stop]
+        try:
+            self.scheduler.stop()
+        except Exception as exc:
+            # A draining request still owns native resources. Preserve the
+            # dependency graph for a later close instead of blocking in unload.
+            raise ExceptionGroup("runtime cleanup failed", [exc]) from exc
+        actions = []
         if self.auto_role is not None:
             actions.append(self.auto_role.close)
         if self._stage_host is not None:

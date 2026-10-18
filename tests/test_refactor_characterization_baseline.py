@@ -117,27 +117,19 @@ class TestReasonCodeFactSources(unittest.TestCase):
 
     DEADLINE_CODE = "request_deadline_exceeded"
 
-    def test_the_same_deadline_code_is_defined_four_times(self) -> None:
-        """★ 最刺眼的一处：一个 code 值有 **4 份模块级常量定义**。
-
-        票面要求「不允许在 API、scheduler、solver、worker 各层重写真因」——
-        这 4 份就是反例；票 14 应收敛成单一定义并在各层 import。
-        """
-        definitions = {
-            "request_deadline.py": "REQUEST_DEADLINE_EXCEEDED",
-            "request_outcome.py": "REASON_REQUEST_DEADLINE_EXCEEDED",
-            "relay_transport.py": "REQUEST_DEADLINE_EXCEEDED",
-            "scheduler_task_worker.py": "_REQUEST_DEADLINE_EXCEEDED",
-        }
-        values = {}
-        for filename, symbol in definitions.items():
-            values[f"{filename}:{symbol}"] = assignment_value(
-                read_source(filename), symbol)
-        self.assertEqual(
-            set(values.values()), {self.DEADLINE_CODE},
-            f"4 份定义的值必须一致（当前事实），实际：{values}",
-        )
-        self.assertEqual(len(values), 4, "定义份数变了，请更新本条基线")
+    def test_deadline_code_has_one_definition_and_compatibility_aliases(self) -> None:
+        from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED
+        from request_deadline import REQUEST_DEADLINE_EXCEEDED as compatibility
+        from request_outcome import REASON_REQUEST_DEADLINE_EXCEEDED
+        from relay_transport import REQUEST_DEADLINE_EXCEEDED as relay
+        from scheduler_task_worker import _REQUEST_DEADLINE_EXCEEDED as worker
+        self.assertEqual(REQUEST_DEADLINE_EXCEEDED, self.DEADLINE_CODE)
+        for value in (compatibility, REASON_REQUEST_DEADLINE_EXCEEDED, relay, worker):
+            self.assertIs(value, REQUEST_DEADLINE_EXCEEDED)
+        sources = ["request_deadline.py", "request_outcome.py", "relay_transport.py", "scheduler_task_worker.py"]
+        literal = re.compile(r"^[A-Z_]+\s*=\s*['\"]request_deadline_exceeded['\"]", re.MULTILINE)
+        self.assertTrue(all(not literal.search(read_source(source)) for source in sources))
+        self.assertEqual(len(literal.findall(read_source("qlh_core/contracts/deadline.py"))), 1)
 
     def test_independent_reason_vocabularies_stay_separate(self) -> None:
         """当前事实：每个领域各自定义 reason 常量，**没有共享枚举**。
@@ -146,7 +138,7 @@ class TestReasonCodeFactSources(unittest.TestCase):
         以便票 14 判断哪些该收敛、哪些该保留。
         """
         vocabularies = {
-            "request_outcome.py": "REQUEST_OUTCOME 终局词表",
+            "qlh_core/contracts/outcome.py": "REQUEST_OUTCOME 终局词表",
             "model_preflight.py": "MODEL_PREFLIGHT 事前检查词表",
             "worker_assignment_state.py": "WORKER_ASSIGNMENT 词表",
             "model_pipeline_availability.py": "MODEL_PIPELINE_AVAILABILITY 词表",
@@ -220,21 +212,16 @@ class TestPipelinePlanFactSources(unittest.TestCase):
 class TestSessionContextFactSources(unittest.TestCase):
     """④ 会话上下文：**服务已统一，但仍有进程内 facade 镜像**。"""
 
-    def test_service_is_single_but_facade_duplicates_it(self) -> None:
-        """当前事实：`ConversationContextService` 是唯一实现，但 `api_server` 又建了一层
-        模块级 facade（`active_session_id` / `session_histories` 两个名字指向同一对象）。
-
-        票 14 若抽「会话上下文服务」，这层 facade 是「事务边界」要收紧的对象。
-        """
-        context = read_source("chat_context.py")
-        self.assertIn("class ConversationContextService", context)
-        self.assertIn("self.active_session_id: Optional[str] = None", context)
-        self.assertIn("self.histories: MutableMapping[str, list[dict]] = {}", context)
-
-        api = read_source("api_server.py")
-        self.assertIn("_chat_context = ConversationContextService(", api)
-        self.assertIn("active_session_id = _chat_context.active_session_id", api)
-        self.assertIn("session_histories = _chat_context.histories", api)
+    def test_context_owner_keeps_client_selection_without_facade_mirrors(self) -> None:
+        from chat_context import ConversationContextService
+        context = ConversationContextService(load_history=lambda _: [], persist_turn=lambda *a: True)
+        context.prepare("first", client_id="alpha", runtime_kv=False)
+        context.prepare("second", client_id="beta", runtime_kv=False)
+        self.assertEqual(context.resolve_session(client_id="alpha"), "first")
+        self.assertEqual(context.resolve_session(client_id="beta"), "second")
+        import api_server
+        self.assertNotIn("active_session_id", vars(api_server))
+        self.assertNotIn("session_histories", vars(api_server))
 
     def test_persistence_is_a_separate_fact_source(self) -> None:
         """当前事实：持久化在 `local_store` 独立承担，服务只持有两个回调。"""

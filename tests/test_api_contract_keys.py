@@ -6,6 +6,7 @@ MetricsPanel/ChatPanel 读取）。本测试锁定关键端点响应 key 不被�
 """
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -34,6 +35,7 @@ class TestApiResponseKeys:
         assert "max_new_tokens" in body
 
     def test_status_returns_current_quant_key(self, client, monkeypatch):
+        monkeypatch.setattr(api_server_mod, "model_manager", SimpleNamespace(is_loaded=True, active_model_id="fixture", is_pipeline_prepared=False, get_model_info=lambda: {"model_id":"fixture"}))
         monkeypatch.setattr(model_host, "model_loaded", True)
         res = client.get("/api/status")
         assert res.status_code == 200
@@ -44,6 +46,7 @@ class TestApiResponseKeys:
         assert body["model_loaded"] is model_host.model_loaded
 
     def test_status_quant_value_follows_host(self, client, monkeypatch):
+        monkeypatch.setattr(api_server_mod, "model_manager", SimpleNamespace(is_loaded=True, active_model_id="fixture", is_pipeline_prepared=False, get_model_info=lambda: {"model_id":"fixture"}))
         monkeypatch.setattr(model_host, "model_loaded", True)
         monkeypatch.setattr(model_host, "current_quant", "int8")
         res = client.get("/api/status")
@@ -108,11 +111,8 @@ class TestApiResponseKeys:
 
     def test_speculative_capability_is_zero_network_and_fail_closed(self, client, monkeypatch):
         res = client.get("/api/experimental/speculative/capability")
-        assert res.status_code == 200
-        body = res.json()
-        assert body["execution_mode"] == "speculative_assisted"
-        assert body["available"] is False
-        assert body["reason_code"] in {"disabled_by_config", "verify_endpoint_missing"}
+        assert res.status_code == 410
+        assert res.json()["detail"]["code"] == "CLIENT_FEATURE_REMOVED"
 
     def test_android_heartbeat_returns_lease_contract(self, client, monkeypatch):
         monkeypatch.setattr(

@@ -137,7 +137,7 @@ class TestSwitchModelAfterGgufEngine:
 
 def _callback_set(marker="default"):
     return SchedulerCallbackSet(
-        active_task_graph_model_identity=lambda: marker,
+        active_execution_model_identity=lambda: marker,
         execute_task_worker_stage=lambda request, cancel_event: {"marker": marker},
         build_model_chat_prompt=lambda tokenizer, messages, **kwargs: marker,
         thinking_system_prompt=f"thinking:{marker}",
@@ -162,7 +162,7 @@ class TestSchedulerCallbackInjection:
 
     def test_callback_bundle_keyword_order_does_not_change_wiring(self):
         values = {
-            "active_task_graph_model_identity": lambda: "identity",
+            "active_execution_model_identity": lambda: "identity",
             "execute_task_worker_stage": lambda request, cancel_event: {"ok": True},
             "build_model_chat_prompt": lambda tokenizer, messages, **kwargs: "prompt",
             "thinking_system_prompt": "thinking",
@@ -172,7 +172,7 @@ class TestSchedulerCallbackInjection:
         }
         callbacks = SchedulerCallbackSet(**dict(reversed(list(values.items()))))
 
-        assert callbacks.active_task_graph_model_identity() == "identity"
+        assert callbacks.active_execution_model_identity() == "identity"
         assert callbacks.execute_task_worker_stage(None, None) == {"ok": True}
         assert callbacks.build_model_chat_prompt(None, []) == "prompt"
         assert callbacks.thinking_system_prompt == "thinking"
@@ -734,7 +734,7 @@ class TestApiServerIntegration:
             assert resources.host is model_host
             assert callbacks is model_host.scheduler_callbacks
             assert callable(callbacks.execute_task_worker_stage)
-            assert callable(callbacks.active_task_graph_model_identity)
+            assert callable(callbacks.active_execution_model_identity)
         finally:
             resources.close()
 
@@ -762,9 +762,9 @@ def test_host_unload_failure_preserves_direct_engine_projection():
     with pytest.raises(OSError, match="native owner still alive"):
         host.unload_model()
     assert host._manager is engine and host.model_loaded is True
-    assert host.__dict__["model_path"] == "head.gguf"
-    assert host.__dict__["active_model_id"] == "segment-model"
+    assert dict(host.runtime_controller.snapshot().metadata)["model_path"] == "head.gguf"
+    assert dict(host.runtime_controller.snapshot().metadata)["active_model_id"] == "segment-model"
     should_fail[0] = False
     host.unload_model()
     assert host.model_loaded is False
-    assert "model_path" not in host.__dict__ and "active_model_id" not in host.__dict__
+    assert not dict(host.runtime_controller.snapshot().metadata)

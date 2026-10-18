@@ -215,12 +215,12 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 | --- | --- |
 | 控制面与入口 | `api_server.py`、`api_errors.py`、`config.py`、`bootstrap.py`、`model_api_access.py`、`review.py`、`local_store.py` |
 | 调度与集群 | `scheduler.py`、`scheduler_svc_http.py`、`cluster_join.py`、`cluster_transport.py`、`edge_cluster.py`、`node_config.py`、`node_runtime.py`、`transport_runtime.py`、`transport_port.py`、`network_address.py`、`network_path.py`、`proxy_config.py`、`wss_loopback.py` |
-| 引擎 | `llama_engine.py`（L 档）、`model_module.py`（D 档层拆分）、`island_engine.py`、`koakuma_engine.py`、`tcp_comm.py`、`inference_client.py`、`inference_svc_main.py`、`inference_service/`、`paged_kv_cache.py`、`external_provider.py`、`speculative*.py` |
+| 引擎 | `llama_engine.py`（L 档）、`model_module.py`（D 档层拆分）、`island_engine.py`、`koakuma_engine.py`、`tcp_comm.py`、`inference_client.py`、`inference_svc_main.py`、`inference_service/`、`paged_kv_cache.py`、`external_provider.py` |
 | RPC 与层接力 | `llama_rpc_contract.py`、`llama_rpc_device.py`、`llama_rpc_planner.py`、`relay_contract.py`、`relay_planner.py`、`relay_transport.py` |
 | 层段/层流水线合同 | `pipeline_node_contract.py`、`pipeline_capacity.py`、`pipeline_assignment_manifest.py`、`pipeline_model_descriptor.py`、`pipeline_reshard.py`、`cache_unit_layout.py` |
 | 跨框架/多模态流水线 | `qwen3_pipeline_*.py`、`qwen3_multimodal_*.py`、`gemma4_pipeline_*.py`、`multimodal.py` |
 | 模型与资产 | `model_config.py`、`model_host.py`、`model_sync.py`、`model_downloader.py`、`model_download_jobs.py`、`model_search.py`、`model_registry_validation.py`、`model_runtime_contracts.py`、`local_model_assets.py` |
-| 任务图与工作流 | `task_graph*.py`、`task_journal.py`、`task_provider.py`、`task_worker_*.py`、`graph_orchestrator.py` |
+| 线性接力与请求恢复 | `qlh_core/execution/`、`qlh_core/bootstrap/execution.py`、`execution_provider.py`、`recovery_journal.py`、`task_worker_*.py` |
 | TUI 与交互 | `tui_textual.py`、`tui_api.py`、`tui_shared.py`、`tui_sse.py`、`tui_backend.py`、`tui_commands.py` |
 | 设备与压测 | `device_profiler.py`、`provider_soak.py`；RAG 已外置至 `harness_workbench`/Koakumix |
 

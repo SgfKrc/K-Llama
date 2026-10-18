@@ -138,18 +138,18 @@ def test_two_runtimes_really_isolate_storage_identity_callbacks_and_readiness(tm
         assert a.scheduler is not b.scheduler and a.host is not b.host
         calls = []
         for services, label in ((a, "one"), (b, "two")):
-            callbacks = SimpleNamespace(active_task_graph_model_identity=lambda label=label: calls.append(label))
+            callbacks = SimpleNamespace(active_execution_model_identity=lambda label=label: calls.append(label))
             services.scheduler.configure_callbacks(callbacks)
             services.host.configure_scheduler_callbacks(callbacks)
-        a.scheduler.inference_callbacks.active_task_graph_model_identity()
-        b.host.scheduler_callbacks.active_task_graph_model_identity()
+        a.scheduler.inference_callbacks.active_execution_model_identity()
+        b.host.scheduler_callbacks.active_execution_model_identity()
         assert calls == ["one", "two"]
         assert a.scheduler.inference_callbacks is a.host.scheduler_callbacks
         assert b.scheduler.inference_callbacks is b.host.scheduler_callbacks
         assert a.scheduler._worker_prepare._runtime_factory.__self__ is a
         assert b.scheduler._worker_prepare._runtime_factory.__self__ is b
-        assert a.scheduler._scheduler_facade_global("CLUSTER_SECRET") == "one"
-        assert b.scheduler._scheduler_facade_global("CLUSTER_SECRET") == "two"
+        assert a.scheduler._runtime_setting("CLUSTER_SECRET") == "one"
+        assert b.scheduler._runtime_setting("CLUSTER_SECRET") == "two"
         one.mark_component("scheduler", True)
         assert two.readiness()["components"]["scheduler"] is False
         assert one.identity.node_id != two.identity.node_id
@@ -406,7 +406,7 @@ def test_first_connect_and_preferred_endpoint_use_the_owning_runtime(tmp_path, m
             assert runtime.identity.boot_id == initial_boot
             assert runtime.identity.credential_epoch == 3
             assert runtime.config.legacy_settings()["CLUSTER_SECRET"] == "bootstrap-secret-" + label
-            assert runtime.services.scheduler._scheduler_facade_global("CLUSTER_SECRET") == "bootstrap-secret-" + label
+            assert runtime.services.scheduler._runtime_setting("CLUSTER_SECRET") == "bootstrap-secret-" + label
             assert runtime.services.scheduler.discover_master()["master_host"] == label + ".master"
             preferred = runtime.services.scheduler._persist_master_endpoint_preference("fd7a:115c:a1e0::10", 18889)
             assert preferred["endpoint_preference"]["persisted"] is True

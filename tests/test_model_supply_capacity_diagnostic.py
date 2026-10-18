@@ -214,6 +214,7 @@ def test_model_intent_and_supply_api_include_same_owner_capacity_diagnostic(tmp_
     op = value['operation_id']
     c._current = op
     c._records[op] = {'operation_id': op, 'status': 'queued'}
+    c._persist(c._records[op])
     diagnostic = _diagnostic()
     supply.operations[op].update(reason_code=diagnostic['reason_code'], reason=diagnostic['reason'],
                                  capacity_diagnostic=deepcopy(diagnostic))

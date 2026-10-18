@@ -66,7 +66,7 @@ def main() -> int:
         full_chat_execution_lock=threading.RLock(),
     )
     scheduler.configure_callbacks(SchedulerCallbackSet(
-        active_task_graph_model_identity=lambda: None,
+        active_execution_model_identity=lambda: None,
         execute_task_worker_stage=execute_stage,
         build_model_chat_prompt=lambda tokenizer, messages, **kwargs: "",
         thinking_system_prompt="thinking",
