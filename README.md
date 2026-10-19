@@ -6,9 +6,11 @@ K-Llama（Llama for Koakuma）是面向异构边缘设备的分布式推理核�
 
 > 状态：**现行**
 >
-> 更新日期：2026-10-14
+> 更新日期：2026-10-19
 >
 > 本 README 只描述主仓当前边界和可复现入口。实验记录、历史实现和外置子项目不等同于主仓生产能力。
+>
+> 单一事实源重构（票 14）R0–R5 软件门已于 2026-10-18/19 完成，R6 产品门待验；主线已从任务图调度／独立投机 PoC／抢占式队列／独立 Launcher 切到**线性接力 + 版本化快照**。详见[重构设计](docs/单一事实源重构设计-2026-10-18.md)与 [R5 交付报告](docs/重构客户端切换-R5-2026-10-19.md)。
 >
 > English: [docs/README.en.md](docs/README.en.md)
 
@@ -19,6 +21,7 @@ K-Llama（Llama for Koakuma）是面向异构边缘设备的分布式推理核�
 - 让 Edge 节点默认使用 1B 以内模型完成本地推理，同时保留作为大模型 RPC worker 的能力。
 - 用同一套层段合同管理三类节点（本机、远端 RPC、跨框架），并按设备画像与能力选择引擎。
 - 通过设备画像、容量计划、模型身份、层段合同、租约和 epoch fencing 控制分布式准入与故障恢复。
+- 事实源集中在 `src/qlh_core/`（`contracts`／`control`／`adapters`／`bootstrap`／`planning`／`execution` 六层）：模型目录、部署事务、请求终态、deadline、客户端快照各只有一个 owner；`src/app_bootstrap.py` 是正式程序的单一组合入口。
 - 用 Textual TUI 访问聊天、状态、模型资产、节点、分布式布局、队列、设备、日志和设置；只读单命令走标准库薄层。
 
 引擎分**双档**，两档都在主仓：
@@ -93,9 +96,10 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 实现与端点：
 
 - `src/pipeline_node_contract.py`：`PipelineNode` 合同、既有产物映射、布局 fail-closed 校验；
-- `src/pipeline_capacity.py` 容量求解，`src/pipeline_assignment_manifest.py` 分配 manifest；
+- 容量求解在 `src/qlh_core/planning/capacity.py`（`src/pipeline_capacity.py` 已退为 21 行兼容门面），`src/pipeline_assignment_manifest.py` 分配 manifest；
 - `src/pipeline_reshard.py`：容量重解 + 工件就绪门 + epoch 原子提交；
-- `GET /api/cluster/layers`、`GET /api/cluster/pipeline-capacity`、`GET /api/cluster/pipeline-reshard`。
+- `GET /api/cluster/layers`、`GET /api/cluster/pipeline-capacity`、`GET /api/cluster/pipeline-reshard`；
+- 客户端消费 `GET /api/client/state` 与 `GET /api/client/events`（版本化快照 + revision 游标，见 `src/api/routes_client_state.py` 与 `src/qlh_core/contracts/snapshots.py`）。
 
 ### 跨框架逐层接力（D→L）
 
@@ -144,7 +148,7 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 
 | 能力 | 当前口径 |
 | --- | --- |
-| Textual TUI | 统一 `qlh` 入口；聊天、9 个功能屏和 1 个调试兜底屏共用一个进程，可在本机按需启动后端；模型下载/搜索/预检/登记、集群配置、节点管理、日志筛选/统计/导出、设备配置、用户设置等写操作经确认框闸门 |
+| Textual TUI | 统一 `qlh` 入口；聊天页 + 8 个功能屏（状态／模型／集群／节点／队列／日志／设备／设置）与 1 个调试兜底屏共用一个进程，可在本机按需启动后端；模型下载/搜索/预检/登记、集群配置、节点管理、日志筛选/统计/导出、设备配置、用户设置等写操作经确认框闸门 |
 | Edge <=1B 单机 | 已有模型画像、GGUF/llama.cpp 路径和边缘预检；默认不加载 torch |
 | 同机双进程 RPC | 已有 llama host + `ggml-rpc-server` 模拟及合同测试；不等同于跨机生产准入 |
 | PC RPC | 有设备评分、自动层数规划、租约/断线回退和资产同步合同；吞吐收益未宣称，容量收益与 D→L 分开验收 |
@@ -153,7 +157,7 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 | PyTorch D 档 | 层拆分/层间流水线/多节点层段承载的实现方，兼作对照实验；不进入 Edge 默认依赖 |
 | Relay R | L→L、D→L、f32/采样矩阵和 SSH 跨机证据已完成正确性验证；容量收益已量化；默认路由不替代可直接整模的 L/RPC |
 | Android | `qlh-android` P0 交叉编译/JNI 已完成；P1 的设备运行、RPC worker、断线、热/电和安全证据未完成 |
-| 运行环境 | 版本窗口以 [`requirements.txt`](requirements.txt) 为准（`transformers>=5.17.0,<5.18.0`、`llama-cpp-python==0.3.35`）；全部 PyTorch 侧车统一到 5.17.0；`.venv-test` 含 `triton-windows`，Windows 原生 `torch.compile` 可用 |
+| 运行环境 | 版本窗口以 [`requirements.txt`](requirements.txt) 为准（`transformers>=5.17.0,<5.18.0`、`llama-cpp-python==0.3.35`）；全部 PyTorch 侧车统一到 5.17.0；Windows 原生 `torch.compile` 需另装 [`requirements-compile.txt`](requirements-compile.txt) 的 `triton-windows`（本机 `.venv-test` 已装 3.8.0.post28；`requirements-test.txt` 不含它） |
 | 模型资产 | 模型文件不入 Git（本机 `models/` 是 Junction，指向仓库外目录）；主仓资产清单支持 Qwen2.5-0.5B、Qwen3-0.6B、Qwen3.5-2B、Qwen3VL-4B、MiniCPM4-0.5B、DistilQwen2.5-DS3-0324-7B 等登记模型；Qwen3.6-35B-A3B 及其社区蒸馏/派生版（`qwen35moe` 与 `qwen3next` 两种架构头）已在本机 llama.cpp `b10964` 实测可加载 |
 | 选模与供给意图 | 统一入口 `POST/GET/DELETE /api/models/intent`（含 `/catalog`、`/current`、`/connect`）：用户只提交模型 ID、engine、量化与自动策略，master 沿既有供给与 native prepare 事务完成规划、传输、校验、装载与提交；Web 模型页、Textual TUI 与 Android 选模面板共用同一目录与 operation 进度（`src/model_intent*.py`、`src/api/routes_model_intent.py`） |
 
@@ -178,16 +182,17 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 | --- | --- |
 | `src/` | K-Llama 主代码：控制面、引擎、层段/层流水线合同、TUI（分组见下） |
 | `tests/` | pytest 套件（TUI、RPC/层段、调度、合同、文档门） |
-| `scripts/` | 验证、实验、环境与文档工具（`edge_preflight.py`、`android_validation.py`、`llama_rpc_*.py`、`relay_*.py`、`run_doc_checks.py` 等） |
+| `scripts/` | 验证、实验、环境与文档工具（`edge_preflight.py`、`android_validation.py`、`llama_rpc_*.py`、`relay_*.py`、`run_doc_checks.py`、`run_test_channels.py`、`check_refactor_boundaries.py`、`run_refactor_contracts.py` 等） |
 | `docs/` | 现行文档；历史与已迁移内容在 `docs/archive/` |
 | `schemas/` | 跨进程/跨仓 JSON Schema 合同（artifact-manifest、cluster-profile、experiment-record 等） |
 | `fixtures/` | 测试固件（含离线聊天事件回放，供 `qlh chat --fixture` 使用） |
 | `local_docs/` | 本地实验与验收原始记录；不作为公开源码接口 |
 | `runtime/` | 运行期日志与 llama.cpp 运行时目录 |
 | `qlh.py` / `qlh_edge.py` | 交互 TUI/CLI 入口与 Edge 入口 |
-| `qlh.bat` / `qlh.sh` / `K-Llama.bat` / `K-Llama.sh` / `bjtu.*` / `koakuma.*` | 启动器；`K-Llama` 是推荐别名，`bjtu`、`koakuma` 是兼容别名，统一入口脚本是 `qlh.py` |
+| `qlh.bat` / `qlh.sh` / `K-Llama.bat` / `K-Llama.sh` / `bjtu.*` / `koakuma.*` | 启动器；`K-Llama` 是推荐别名，`bjtu`、`koakuma` 是兼容别名。`qlh`／`K-Llama`／`koakuma` 四个薄封装转发 `qlh.py`；`bjtu.*` 另兼应用首启与维护分派（`src/app_bootstrap.py` 的 `--ui`／`--web`／`--headless`，以及 `qlh.py maintenance`） |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | 一键启动与多环境安装脚本 |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` | 依赖清单与工具配置 |
+| `refactor-boundaries.json` / `release-contract.json` | 静态导入边界清单（含禁止导入的已裁撤模块）与发布合同 |
 | `models/`、`chat_history/`、`dist/`、`build/`、`test-results/`、`logs/` | 本地产物或归档区，不入 Git |
 
 **子模块（4 个）** —— 由 `.gitmodules` 登记，`git submodule update --init` 拉取：
@@ -213,14 +218,15 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 
 | 分组 | 代表模块 |
 | --- | --- |
-| 控制面与入口 | `api_server.py`、`api_errors.py`、`config.py`、`bootstrap.py`、`model_api_access.py`、`review.py`、`local_store.py` |
+| 控制面与入口 | `app_bootstrap.py`（单一组合入口）、`api_server.py`、`api_errors.py`、`execution_errors.py`、`config.py`、`bootstrap.py`、`model_api_access.py`、`review.py`、`local_store.py`、`api/routes_client_state.py` |
 | 调度与集群 | `scheduler.py`、`scheduler_svc_http.py`、`cluster_join.py`、`cluster_transport.py`、`edge_cluster.py`、`node_config.py`、`node_runtime.py`、`transport_runtime.py`、`transport_port.py`、`network_address.py`、`network_path.py`、`proxy_config.py`、`wss_loopback.py` |
 | 引擎 | `llama_engine.py`（L 档）、`model_module.py`（D 档层拆分）、`island_engine.py`、`koakuma_engine.py`、`tcp_comm.py`、`inference_client.py`、`inference_svc_main.py`、`inference_service/`、`paged_kv_cache.py`、`external_provider.py` |
 | RPC 与层接力 | `llama_rpc_contract.py`、`llama_rpc_device.py`、`llama_rpc_planner.py`、`relay_contract.py`、`relay_planner.py`、`relay_transport.py` |
-| 层段/层流水线合同 | `pipeline_node_contract.py`、`pipeline_capacity.py`、`pipeline_assignment_manifest.py`、`pipeline_model_descriptor.py`、`pipeline_reshard.py`、`cache_unit_layout.py` |
+| 层段/层流水线合同 | `pipeline_node_contract.py`、`pipeline_assignment_manifest.py`、`pipeline_model_descriptor.py`、`pipeline_reshard.py`、`cache_unit_layout.py`；容量求解已迁至 `qlh_core/planning/capacity.py`（`pipeline_capacity.py` 为 21 行兼容门面） |
 | 跨框架/多模态流水线 | `qwen3_pipeline_*.py`、`qwen3_multimodal_*.py`、`gemma4_pipeline_*.py`、`multimodal.py` |
-| 模型与资产 | `model_config.py`、`model_host.py`、`model_sync.py`、`model_downloader.py`、`model_download_jobs.py`、`model_search.py`、`model_registry_validation.py`、`model_runtime_contracts.py`、`local_model_assets.py` |
-| 线性接力与请求恢复 | `qlh_core/execution/`、`qlh_core/bootstrap/execution.py`、`execution_provider.py`、`recovery_journal.py`、`task_worker_*.py` |
+| 模型与资产 | `model_config.py`、`model_host.py`、`model_sync.py`、`model_downloader.py`、`model_download_jobs.py`、`model_search.py`、`model_registry_validation.py`、`model_runtime_contracts.py`、`local_model_assets.py`、`model_supply*.py`、`model_intent*.py`、`model_preflight.py`、`model_load_resolver.py` |
+| 单一事实源核心（`qlh_core/`） | `contracts/`（runtime／authority／catalog／engines／deployment／load／execution／deadline／outcome／snapshots）、`control/`（authority／catalog／deployment／participation／clock）、`adapters/`（settings／catalog_repository／model_control_repository／local_store／artifacts／llama_vocabulary／publication_cleanup／runtime_observation／request_repository／state_migration）、`bootstrap/`（runtime／services／execution／model_control／client_snapshots）、`planning/`（capacity／load_spec）、`execution/`（linear／requests／runtime／stopping） |
+| 线性接力与请求恢复 | `execution_provider.py`、`recovery_journal.py`、`request_deadline.py`、`request_outcome.py`（后两者是 `qlh_core.contracts.*` 的星号导入门面）、`task_worker_*.py`、`journal_replication*.py` |
 | TUI 与交互 | `tui_textual.py`、`tui_api.py`、`tui_shared.py`、`tui_sse.py`、`tui_backend.py`、`tui_commands.py` |
 | 设备与压测 | `device_profiler.py`、`provider_soak.py`；RAG 已外置至 `harness_workbench`/Koakumix |
 
@@ -275,9 +281,9 @@ python qlh.py status
 python qlh.py models
 ```
 
-`qlh chat` 在本机后端未运行时于当前进程的 daemon 线程中启动后端，并在启动屏显示探活阶段；后端日志写入既有日志文件与日志页面。`status`、`models` 等单命令不自动启动后端，`--fixture` 是不联网的聊天事件回放路径。写操作从外壳发起：模型屏 `L` 选模（自动供给并准备）/ `U` 卸载 / `C` 取消选模，队列屏 `P` 暂停-恢复 / `S` 策略 / `C` 清空排队，聊天屏可用 `/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`；破坏性与长耗时操作先弹确认框。模型控制接口按 loopback 默认放行，远程控制主节点需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
+`qlh chat` 在本机后端未运行时于当前进程的 daemon 线程中启动后端，并在启动屏显示探活阶段；后端日志写入既有日志文件与日志页面。`status`、`models` 等单命令不自动启动后端，`--fixture` 是不联网的聊天事件回放路径。写操作从外壳发起：模型屏 `L` 选模（自动供给并准备）/ `U` 卸载 / `C` 取消选模，队列屏 `P` 暂停/恢复 / `C` 清空排队（FIFO，已无策略切换），聊天屏可用 `/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`；破坏性与长耗时操作先弹确认框。模型控制接口按 loopback 默认放行，远程控制主节点需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
 
-Windows 可直接用 `qlh.bat`（或 `K-Llama.bat`），Linux/macOS 用 `qlh.sh`（或 `K-Llama.sh`）；三者转发到同一入口脚本 `qlh.py`。页面清单与命令语义见 [TUI 使用指南](docs/TUI使用指南.md) 与 [TUI 指令集](docs/TUI指令集.md)。
+Windows 可直接用 `qlh.bat`（或 `K-Llama.bat`），Linux/macOS 用 `qlh.sh`（或 `K-Llama.sh`）；这四个薄封装都转发到同一入口脚本 `qlh.py`（`bjtu.*` 另兼应用首启与维护分派，见上方目录结构）。页面清单与命令语义见 [TUI 使用指南](docs/TUI使用指南.md) 与 [TUI 指令集](docs/TUI指令集.md)。
 
 ## 模型与分布式
 
@@ -291,7 +297,7 @@ Windows 可直接用 `qlh.bat`（或 `K-Llama.bat`），Linux/macOS 用 `qlh.sh`
 4. 涉及跨框架或层间流水线时，先在本机复核 D→L 接力的数值一致性与性能边界。
 5. 再进入 ARM64/Android worker 验收。
 
-不能用完整模型复制、任务图整请求并行或旧 PyTorch 双机结果宣称"模型已分片"。节点故障时的小模型绕行是调度策略，不是独立产品形态。模型获取与设备画像分档见[项目速览](docs/项目速览-QLH-at-a-Glance.md)。
+不能用完整模型复制、已裁撤的任务图整请求并行或旧 PyTorch 双机结果宣称"模型已分片"。节点故障时的小模型绕行是调度策略，不是独立产品形态。模型获取与设备画像分档见[项目速览](docs/项目速览-QLH-at-a-Glance.md)。
 
 ## Android 验证
 
@@ -331,15 +337,18 @@ python -m venv .venv-test
 .\.venv-test\Scripts\python.exe -m pytest -q tests/test_pipeline_node_contract.py tests/test_pipeline_reshard.py tests/test_pipeline_capacity.py
 ```
 
-串行全量基线：**6055 passed / 33 skipped / 0 failed**（`-n 0`，2026-10-14，HEAD `b84522f3`）。xdist 并发下偶有 flaky，判定以串行为准。
+串行全量基线分两档记录（2026-10-19）：重构 R0–R5 固定集合 **4309 passed / 27 skipped / 0 failed**（串行与四进程逐项状态一致）；根 Python 全量（四进程，过滤 `real_model`／`external`／`requires_gpu`）**8301 passed / 32 skipped**。分仓另计：packaging **459 passed / 9 skipped**、Web Playwright **110 passed / 1 skipped**、Android JVM **710 passed / 4 skipped**。xdist 并发下偶有 flaky，判定以串行为准。
 
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯不替代这些证据。测试通道划分与标记语义见[测试通道运行说明](docs/测试通道运行说明.md)，判据与对照组见[测试与评判标准](docs/测试与评判标准.md)。
 
 **文档检查**（纯静态、只需标准库）：`python scripts/run_doc_checks.py` 跑两条检查 —— 相对链接死链、README 双语结构同步。同一套检查在 CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）与本地 pre-push 钩子（[`.githooks/`](.githooks/README.md)，用 `git config core.hooksPath .githooks` 启用）各跑一遍 —— 一处定义、两处复用。
 
+**静态边界门**：`python scripts/check_refactor_boundaries.py` 校验模块导入方向与写入归属（已接入 [`core-tests.yml`](.github/workflows/core-tests.yml)，当前 48 个模块 0 违规）；重构分层验收用 `python scripts/run_refactor_contracts.py --stage {contract,bootstrap,catalog,deployment,execution,client}`，六档层叠（后者包含前者的 targets）。
+
 ## 文档入口
 
 - [整体架构](docs/整体架构.md) · [模块接口说明](docs/模块接口说明.md) · [核心技术原理](docs/核心技术原理.md) · [分布式资源调度系统](docs/分布式资源调度系统.md)
+- **单一事实源重构（票 14）**：[设计](docs/单一事实源重构设计-2026-10-18.md) · [合同与行为基线 R0](docs/重构合同与行为基线-R0-2026-10-18.md) · [启动与控制权 R1](docs/重构启动与控制权-R1-2026-10-18.md) · [模型目录与能力 R2](docs/重构模型目录与能力-R2-2026-10-18.md) · [供给与部署 R3](docs/重构供给与部署-R3-2026-10-18.md) · [接力执行 R4](docs/重构接力执行-R4-2026-10-18.md) · [客户端切换 R5](docs/重构客户端切换-R5-2026-10-19.md) · [事实归属审计](docs/当前功能与事实归属审计-2026-10-18.md)
 - [跨框架接力-当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)（接力方向的索引文档）· [项目报告](docs/跨框架层接力-项目报告.md) · [容量收益实测](docs/跨框架层接力-容量收益实测-2026-09-21.md)
 - [TUI 使用指南](docs/TUI使用指南.md) · [TUI 指令集](docs/TUI指令集.md)
 - [测试与评判标准](docs/测试与评判标准.md) · [测试通道运行说明](docs/测试通道运行说明.md) · [发行物门](docs/发行物门-RELEASE-ARTIFACTS.md)

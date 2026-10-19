@@ -471,9 +471,6 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     #   默认 0：不改变既有行为（llama 优先）。
     PREFER_PYTORCH = _env_bool("QLH_PREFER_PYTORCH", False)
 
-    # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
-    # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
-
     # 流水线推理超时与并发控制
     #: ★ 2026-10-11（ROG+Y700+本机三机实测）：此前是硬编码 `120`，而三机层接力每步约
     #:   0.2s ⇒ 长思考请求（`show_thinking=true` + 大 `max_new_tokens`）跑到 500+ 步就撞上，

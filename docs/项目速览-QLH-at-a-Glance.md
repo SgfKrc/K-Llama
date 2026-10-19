@@ -32,7 +32,7 @@ L档的显式本地整模路径由`src/inference_path_selector.py`的`select_inf
 | 能力 | 判据 / 日期 |
 |---|---|
 | 双机真机分层推理（QW1.8B 0-21 / 21-24，该模型已从内置候选列表退役） | 3 次 `distributed_required` 全过，RTT 6-12 ms（2026-08-20） |
-| 历史任务链重启 / 杀进程恢复 + Tailnet IPv6 | `wf_330d0aa1…`，重派 0（2026-08-21） |
+| 历史任务链重启 / 杀进程恢复 + Tailnet IPv6（该机制已于票 14 R5 裁撤，仅存历史证据） | `wf_330d0aa1…`，重派 0（2026-08-21） |
 | D→L 跨框架接力正确性 | 主仓双引擎矩阵 **27/27 逐 token 一致**（2026-09-21） |
 | D→L 容量收益 | qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×**（严格口径，`C` 只计不属于任何 `*.layers.<i>.*` 的张量；含视觉塔时为 1.613×）；同一受控 3.0 GB CUDA 预算下整模被拒而 12 层上游通过（2026-09-21） |
 | L→L keep-head 通道 | `--path l2l_keep_head` / `d2l2l_keep_head` **32/32**，含「1 torch 上游 + 2 llama 下游」三段（2026-09-21） |
@@ -68,10 +68,9 @@ L档的显式本地整模路径由`src/inference_path_selector.py`的`select_inf
 | NVIDIA 驱动 + CUDA（可选） | — | L 档 `llama_server` 路径（有 CUDA 且本机有 `llama-server` 时自动选）与 D 档 |
 
 ```bash
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
-cd LEDS_BJTU
-python scripts/setup_envs.py --all            # 主线 Python 环境（默认不含 Node）
-python scripts/setup_envs.py --all --with-node # 另行配置产品壳 Node 迁移源
+git clone --recurse-submodules https://github.com/SgfKrc/K-Llama
+cd K-Llama
+python scripts/setup_envs.py --all            # 主线 Python 环境（不含产品壳 Node，后者由 qlh-shell 自维护）
 python scripts/setup_envs.py --only test    # 只配指定环境（可选名见下）
 python scripts/setup_envs.py --check          # 只校验不安装（无副作用）
 ```
@@ -103,7 +102,7 @@ python scripts/setup_envs.py --check          # 只校验不安装（无副作�
 
 - **证据链优先**：每个"已完成"附测试/日志/真机证据，判据与日期缺一不可。
 - **判据纪律**：一致性只认 per-token argmax；分叉如实标 FAIL；区分 `mainrepo_end_to_end` / `raw_binding_probe` / `capacity_only` 三类记录，不混用。
-- **机制化而非绿化**：测试通道分单元/契约/浏览器/竞态/仿真/真机；修复必配负例。
+- **机制化而非绿化**：主仓测试通道为 `unit`（并行）/ `external`（串行）/ `smoke`（真实权重，显式 opt-in）；票 14 重构另有 R0–R5 固定 stage 合同集（`scripts/run_refactor_contracts.py --stage`）与静态边界门（`scripts/check_refactor_boundaries.py`）。修复必配负例。
 - **先测再解释**：性能结论先量出瓶颈在哪一环（分段耗时 / RTT / 离散度）。
 - **用户主权**：模型工件、密钥、知识库归用户；离线可恢复。
 

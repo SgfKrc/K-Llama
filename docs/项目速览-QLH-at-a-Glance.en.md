@@ -32,7 +32,7 @@ Design principles: **data stays in-cluster, offline autonomy, reproducible accep
 | Capability | Criterion / date |
 |---|---|
 | Dual-machine real-device layer pipeline (QW1.8B layers 0-21 / 21-24; this model has since been retired from the built-in candidate list) | 3× `distributed_required` all passed, RTT 6-12 ms (2026-08-20) |
-| Historical task-graph restart / kill-and-recover + Tailnet IPv6 | `wf_330d0aa1…`, reassignment 0 (2026-08-21) |
+| Historical task-chain restart / kill-and-recover + Tailnet IPv6 (the mechanism was retired in ticket 14 R5; historical evidence only) | `wf_330d0aa1…`, reassignment 0 (2026-08-21) |
 | D→L cross-framework relay correctness | Main-repo dual-engine matrix **27/27 per-token identical** (2026-09-21) |
 | D→L capacity gain | qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×** (strict definition: `C` counts only tensors outside every `*.layers.<i>.*`; counting the visual tower gives 1.613×); under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes (2026-09-21) |
 | L→L keep-head channel | `--path l2l_keep_head` / `d2l2l_keep_head` **32/32**, including the three-stage "1 torch upstream + 2 llama downstream" case (2026-09-21) |
@@ -68,10 +68,9 @@ Prerequisites:
 | NVIDIA driver + CUDA (optional) | — | The L-tier `llama_server` path (auto-selected when CUDA and a local `llama-server` are both present) and the D tier |
 
 ```bash
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
-cd LEDS_BJTU
-python scripts/setup_envs.py --all            # mainline Python environments (no Node by default)
-python scripts/setup_envs.py --all --with-node # also configure the product-shell Node source
+git clone --recurse-submodules https://github.com/SgfKrc/K-Llama
+cd K-Llama
+python scripts/setup_envs.py --all            # mainline Python environments (no product-shell Node; qlh-shell maintains its own)
 python scripts/setup_envs.py --only test    # only the named environments (names below)
 python scripts/setup_envs.py --check          # verify only, no side effects
 ```
@@ -103,7 +102,7 @@ The 2B tier peaks at 2.24 GB VRAM in measurement, which does not fit an ultraboo
 
 - **Evidence first**: every "done" carries test/log/real-device evidence, with criterion and date.
 - **Criterion discipline**: consistency is judged by per-token argmax only; divergence is reported as FAIL; records are split into `mainrepo_end_to_end` / `raw_binding_probe` / `capacity_only` and never mixed.
-- **Mechanized, not greenwashed**: test channels split into unit/contract/browser/race/simulation/real-device; every fix ships a negative case.
+- **Mechanized, not greenwashed**: the main-repo test channels are `unit` (parallel) / `external` (serial) / `smoke` (real weights, explicit opt-in); the ticket-14 refactor adds the R0–R5 fixed stage contract sets (`scripts/run_refactor_contracts.py --stage`) and the static boundary gate (`scripts/check_refactor_boundaries.py`). Every fix ships a negative case.
 - **Measure before explaining**: performance conclusions first locate the bottleneck (per-segment time / RTT / dispersion).
 - **User sovereignty**: model artifacts, keys and knowledge bases belong to the user; offline recovery works.
 
