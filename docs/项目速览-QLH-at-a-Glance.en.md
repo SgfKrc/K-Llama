@@ -2,7 +2,7 @@
 
 > Status: **current**
 >
-> Updated: 2026-10-14
+> Updated: 2026-10-19
 >
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
@@ -21,9 +21,9 @@ K-Llama is a **lightweight distributed LLM inference system for heterogeneous ed
 | **L tier** | llama.cpp / GGUF (including cut GGUF + `embd` injection) | Lightweight, edge, torch-less nodes |
 | **D tier** | PyTorch (layer splitting, inter-layer pipeline, multi-node segments) | CUDA PCs; also the platform for cut-point search and experiments |
 
-The L tier is itself split into two paths by capability (`select_inference_path` in `src/inference_path_selector.py`, controlled by the `INFER_PATH` switch in `src/config.py`, default `auto`): with CUDA detected and a local `llama-server` binary present it uses the `llama_server` subprocess, otherwise it uses the llama.cpp binding inside the QLH engine. CUDA therefore affects more than the D tier: a machine without CUDA still runs the L binding path, and with CUDA the L tier switches to the subprocess.
+For explicit local full-model inference, `select_inference_path` in `src/inference_path_selector.py` chooses the binding or llama-server. LL segments use keep-head/native forwarding; DL uses a PyTorch first segment followed by llama.cpp segments. Current paths and capability boundaries are in the [architecture](整体架构.md#2-当前执行路径).
 
-**Three node kinds are isomorphic** and share one contract plus fail-closed validation: `local` (in-process), `remote_rpc` (borrowed compute over the network — `ggml-rpc-server` on Android/PC), and `cross_framework` (cross-engine layer handoff). The optional Relay R track (cut GGUF + `embd` injection, same-host or cross-host) serves **capacity merging and heterogeneous capability composition**; relay is a capacity mechanism, a same-host CUDA monolith is faster, and default routing prefers the L / RPC paths that can run the model outright (numbers and setup: [README §layer pipeline](README.en.md#layer-pipeline-and-cross-framework-layer-relay)).
+In distributed mode the master coordinates and forwards every continuous segment; workers keep star connections. Explicitly leaving compute participation and retiring the segment permits local full-model loading. Insufficient distributed capacity produces a named wait or refusal. Versioned clients and migration are described in [R5 client cutover](重构客户端切换-R5-2026-10-19.md).
 
 Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**.
 
@@ -32,7 +32,7 @@ Design principles: **data stays in-cluster, offline autonomy, reproducible accep
 | Capability | Criterion / date |
 |---|---|
 | Dual-machine real-device layer pipeline (QW1.8B layers 0-21 / 21-24; this model has since been retired from the built-in candidate list) | 3× `distributed_required` all passed, RTT 6-12 ms (2026-08-20) |
-| Task-graph restart / kill-and-recover + Tailnet IPv6 | `wf_330d0aa1…`, reassignment 0 (2026-08-21) |
+| Historical task-graph restart / kill-and-recover + Tailnet IPv6 | `wf_330d0aa1…`, reassignment 0 (2026-08-21) |
 | D→L cross-framework relay correctness | Main-repo dual-engine matrix **27/27 per-token identical** (2026-09-21) |
 | D→L capacity gain | qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×** (strict definition: `C` counts only tensors outside every `*.layers.<i>.*`; counting the visual tower gives 1.613×); under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes (2026-09-21) |
 | L→L keep-head channel | `--path l2l_keep_head` / `d2l2l_keep_head` **32/32**, including the three-stage "1 torch upstream + 2 llama downstream" case (2026-09-21) |
@@ -49,12 +49,10 @@ Full matrix, setups and report paths: [cross-framework relay — current baselin
 
 ## Outstanding work
 
-- Cross-host RPC vs relay has not been compared; cross-host long-run (LL/DL three-segment `gen=256`, 256/256) and multi-segment cut-point combinations (G2/G3 32/32) passed on 2026-09-26, while artifact auto-distribution and fault injection remain queued.
-- A middle stage must share a LAN with its caller: with the middle stage on a cross-network node (Surface through the Tailscale DERP relay, RTT 777 ms) every step costs a round trip, and end-to-end went from ~140 ms median to ~800 ms.
-- Production routing admission (`task_dispatch` off), long-running and power-loss recovery, real 443/WSS, IPv6-only installers and real 7B/12B three-node peak memory are in the deferred acceptance queue; local gates and simulations do not count as passes.
-- Android is at P0 only (cross-compile/JNI + layer-segment numerical validation); on-device running, RPC worker, disconnection, thermal/power and security evidence are outstanding.
-- Tensor parallelism exists only as an out-of-cluster PoC; speculative decoding is an experimental path.
-- Relay consistency is judged by per-token argmax only; a divergence is reported as FAIL.
+- R6 collects new-architecture evidence for actual package startup, production-data migration and multi-device 9B LL/DL. Historical device figures retain their table dates; criteria are in the [refactor design](单一事实源重构设计-2026-10-18.md#12-验收与退出标准).
+- Cross-master majority replication, physical fault recovery and trusted signed releases retain separate external gates; current status is in the [ticket plan](彻查后修复与重构排票计划-2026-10-09.md).
+- Distributed speculation still requires a local draft, multi-position output and verifiable state rollback. Standalone PoCs have been retired; native local n-gram remains. See the [capability audit](当前功能与事实归属审计-2026-10-18.md#5-推理优化与图依赖边界).
+- Network latency directly affects stepwise relay. Deployment decisions use measured RTT and capacity; comparisons use the same model, quantization, build and sampling setup.
 
 ## First-time setup
 

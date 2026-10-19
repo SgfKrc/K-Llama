@@ -216,12 +216,12 @@ The main project keeps no image-generation runtime or assets; image generation b
 | --- | --- |
 | Control plane and entry | `api_server.py`, `api_errors.py`, `config.py`, `bootstrap.py`, `model_api_access.py`, `review.py`, `local_store.py` |
 | Scheduling and cluster | `scheduler.py`, `scheduler_svc_http.py`, `cluster_join.py`, `cluster_transport.py`, `edge_cluster.py`, `node_config.py`, `node_runtime.py`, `transport_runtime.py`, `transport_port.py`, `network_address.py`, `network_path.py`, `proxy_config.py`, `wss_loopback.py` |
-| Engines | `llama_engine.py` (tier L), `model_module.py` (tier D layer splitting), `island_engine.py`, `koakuma_engine.py`, `tcp_comm.py`, `inference_client.py`, `inference_svc_main.py`, `inference_service/`, `paged_kv_cache.py`, `external_provider.py`, `speculative*.py` |
+| Engines | `llama_engine.py` (tier L), `model_module.py` (tier D layer splitting), `island_engine.py`, `koakuma_engine.py`, `tcp_comm.py`, `inference_client.py`, `inference_svc_main.py`, `inference_service/`, `paged_kv_cache.py`, `external_provider.py` |
 | RPC and layer relay | `llama_rpc_contract.py`, `llama_rpc_device.py`, `llama_rpc_planner.py`, `relay_contract.py`, `relay_planner.py`, `relay_transport.py` |
 | Layer-segment/layer-pipeline contracts | `pipeline_node_contract.py`, `pipeline_capacity.py`, `pipeline_assignment_manifest.py`, `pipeline_model_descriptor.py`, `pipeline_reshard.py`, `cache_unit_layout.py` |
 | Cross-framework/multimodal pipeline | `qwen3_pipeline_*.py`, `qwen3_multimodal_*.py`, `gemma4_pipeline_*.py`, `multimodal.py` |
 | Models and assets | `model_config.py`, `model_host.py`, `model_sync.py`, `model_downloader.py`, `model_download_jobs.py`, `model_search.py`, `model_registry_validation.py`, `model_runtime_contracts.py`, `local_model_assets.py` |
-| Task graph and workflows | `task_graph*.py`, `task_journal.py`, `task_provider.py`, `task_worker_*.py`, `graph_orchestrator.py` |
+| Linear execution and request recovery | `qlh_core/execution/`, `qlh_core/bootstrap/execution.py`, `execution_provider.py`, `recovery_journal.py`, `task_worker_*.py` |
 | TUI and interaction | `tui_textual.py`, `tui_api.py`, `tui_shared.py`, `tui_sse.py`, `tui_backend.py`, `tui_commands.py` |
 | Devices and soak | `device_profiler.py`, `provider_soak.py`; RAG now lives in `harness_workbench`/Koakumix |
 
