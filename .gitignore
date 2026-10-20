@@ -201,6 +201,7 @@ scripts/*
 !scripts/edge_preflight.py
 !scripts/experiment_core/
 !scripts/experiment_gemma_judge_real.py
+!scripts/llama_kernel_bench.py
 !scripts/llama_pc_rpc.py
 !scripts/llama_relay_probe.py
 !scripts/llama_relay_xframe_probe.py
