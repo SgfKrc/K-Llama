@@ -298,3 +298,18 @@ dsh-migration-backup-*/
 
 # R2 reviewed catalog migration entrypoint.
 !scripts/migrate_model_catalog.py
+
+# DEVICE-AWARE-INFER-01 reproducible local A/B calibration
+!scripts/inference_switch_bench.py
+
+# COMM-WIRE-01 reproducible frame costs and native numerical gate
+!scripts/comm_wire_bench.py
+
+# COMM-MULTIPOS-01 fixed-token native parity gate
+!scripts/comm_multipos_bench.py
+
+# COMM-BATCH-01: autoregressive generation and rejection recovery evidence
+!scripts/comm_batch_bench.py
+
+# COMM-MERGE-01 reproducible provider/worker causal timing gate
+!scripts/comm_merge_bench.py
