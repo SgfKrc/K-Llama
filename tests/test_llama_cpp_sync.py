@@ -366,3 +366,130 @@ def test_exact_worktree_check_uses_git_line_ending_filters(patch_checkout):
         (checkout.source / name).write_bytes(content.replace("\n", "\r\n").encode("utf-8"))
 
     assert _inspect(checkout)["patches"][0]["state"] == "applied"
+
+
+@pytest.mark.parametrize("field", ["upstream", "revision_local"])
+@pytest.mark.parametrize("revision", ["g" * 40, "A" * 40, "a" * 39, None])
+def test_contract_rejects_noncanonical_revision_pins(tmp_path: Path, field, revision):
+    lock = _write_lock(tmp_path, "patch.diff", "a" * 64)
+    data = json.loads(lock.read_text(encoding="utf-8"))
+    if field == "upstream":
+        data["upstream"]["revision"] = revision
+    else:
+        data[field] = revision
+    lock.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(sync.SyncError, match="revision"):
+        sync._contract(lock)
+
+
+@pytest.mark.parametrize("pin_kind", ["missing", "tree", "unrelated_commit"])
+def test_local_pin_does_not_bypass_upstream_commit_validation(patch_checkout, pin_kind):
+    checkout = patch_checkout
+    _write_sources(checkout.source, checkout.after)
+    _commit(checkout)
+    if pin_kind == "missing":
+        upstream = "f" * 40
+    elif pin_kind == "tree":
+        upstream = _git(checkout.source, "rev-parse", f"{checkout.revision}^{{tree}}")
+    else:
+        tree = _git(checkout.source, "rev-parse", f"{checkout.revision}^{{tree}}")
+        upstream = _git(checkout.source, "commit-tree", tree, "-m", "unrelated upstream")
+    _update_lock(checkout, upstream={"revision": upstream})
+
+    with pytest.raises(sync.SyncError, match="upstream"):
+        _inspect(checkout)
+
+
+@pytest.mark.parametrize("target", ["conversion/base.py", "src/unmanaged.cpp"])
+def test_clean_local_pin_rejects_committed_changes_outside_managed_patch(patch_checkout, target):
+    checkout = patch_checkout
+    _write_sources(checkout.source, checkout.after)
+    changed = checkout.source / target
+    with changed.open("a", encoding="utf-8") as stream:
+        stream.write("// unmanaged committed change beyond patch context\n")
+    _commit(checkout)
+    assert _git(checkout.source, "status", "--porcelain") == ""
+    _git(checkout.source, "apply", "--reverse", "--check", str(checkout.patch))
+
+    with pytest.raises(sync.SyncError, match="unmanaged.*diff|pinned source.*upstream"):
+        _inspect(checkout)
+
+
+@pytest.mark.parametrize("target", ["conversion/base.py", "src/unmanaged.cpp"])
+def test_skip_worktree_cannot_hide_source_drift(patch_checkout, target):
+    checkout = patch_checkout
+    if target not in checkout.before:
+        _write_sources(checkout.source, {target: "// unchanged upstream file\n"})
+        _commit(checkout, local=False)
+    _write_sources(checkout.source, checkout.after)
+    _commit(checkout)
+    _git(checkout.source, "update-index", "--skip-worktree", "--", target)
+    with (checkout.source / target).open("a", encoding="utf-8") as stream:
+        stream.write("// unmanaged hidden worktree change beyond patch context\n")
+    assert _git(checkout.source, "status", "--porcelain") == ""
+
+    with pytest.raises(sync.SyncError, match="unmanaged.*diff"):
+        _inspect(checkout)
+
+
+def test_committed_source_verification_preserves_checkout_and_object_database(patch_checkout):
+    checkout = patch_checkout
+    _write_sources(checkout.source, checkout.after)
+    _commit(checkout)
+    before = {
+        "index": (checkout.source / ".git/index").read_bytes(),
+        "objects": _git(checkout.source, "count-objects", "-v"),
+        "status": _git(checkout.source, "status", "--porcelain"),
+        "files": {name: (checkout.source / name).read_bytes() for name in checkout.after},
+    }
+
+    assert _inspect(checkout)["patches"][0]["state"] == "applied_committed"
+
+    assert (checkout.source / ".git/index").read_bytes() == before["index"]
+    assert _git(checkout.source, "count-objects", "-v") == before["objects"]
+    assert _git(checkout.source, "status", "--porcelain") == before["status"]
+    assert {name: (checkout.source / name).read_bytes() for name in checkout.after} == before["files"]
+
+
+def test_managed_patch_checkout_preserves_locked_bytes_with_autocrlf(tmp_path: Path):
+    """Windows checkout filters must preserve the raw SHA-256 contract."""
+    root = Path(__file__).resolve().parents[1]
+    relative = Path("scripts/model_tools/patches/llama-cpp-layer-forward-api.patch")
+    repository = tmp_path / "patch checkout repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    for key, value in (("user.name", "Sync test"), ("user.email", "sync@example.invalid"),
+                       ("core.autocrlf", "true"), ("commit.gpgsign", "false")):
+        _git(repository, "config", key, value)
+    (repository / ".gitattributes").write_bytes((root / ".gitattributes").read_bytes())
+    patch = repository / relative
+    patch.parent.mkdir(parents=True)
+    expected = (root / relative).read_bytes()
+    patch.write_bytes(expected)
+    _git(repository, "add", ".gitattributes", relative.as_posix())
+    _git(repository, "commit", "-qm", "byte-pinned patch fixture")
+    exported = tmp_path / "filtered checkout"
+    prefix = exported.as_posix() + "/"
+    _git(repository, "checkout-index", "--all", "--prefix=" + prefix)
+
+    assert (exported / relative).read_bytes() == expected
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+@pytest.mark.parametrize("local_pin", [False, True])
+def test_hidden_worktree_patch_is_never_reported_as_committed(patch_checkout, flag, local_pin):
+    checkout = patch_checkout
+    if local_pin:
+        _update_lock(checkout, revision_local=checkout.revision)
+    _write_sources(checkout.source, checkout.after)
+    _git(checkout.source, "update-index", flag, "--", *checkout.before)
+    assert _git(checkout.source, "status", "--porcelain") == ""
+    original_index = (checkout.source / ".git/index").read_bytes()
+
+    result = _inspect(checkout)
+
+    assert result["state"] == "applied"
+    assert result["patches"][0]["state"] == "applied"
+    assert _git(checkout.source, "show", "HEAD:src/model.cpp").startswith("int enabled = 0;")
+    assert (checkout.source / ".git/index").read_bytes() == original_index

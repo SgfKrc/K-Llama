@@ -25,7 +25,7 @@ if __package__:
         load_lock,
         verify_managed_package,
     )
-    from .model_tools.sync_llama_cpp import _contract as source_lock_contract, SyncError
+    from .model_tools.sync_llama_cpp import SyncError, inspect_sync
 else:
     from model_tools.llama_quantize_toolchain import (
         ROOT,
@@ -37,7 +37,7 @@ else:
         load_lock,
         verify_managed_package,
     )
-    from model_tools.sync_llama_cpp import _contract as source_lock_contract, SyncError
+    from model_tools.sync_llama_cpp import SyncError, inspect_sync
 
 
 class BuildError(RuntimeError):
@@ -221,36 +221,35 @@ def _source_contract(source: Path, project_root: Path, lock: dict[str, Any]) -> 
     revision = _source_revision(source, project_root)
     if revision != expected_source_revision(lock):
         raise BuildError("llama.cpp source HEAD does not match the lock's source revision")
-    # Reuse the existing source lock parser. Its marker description is not a
-    # literal source marker, so committed identity is proven by HEAD + clean Git
-    # status; the worktree-patch form is checked by git apply --reverse --check.
+    lock_path = project_root / "scripts/model_tools/llama_quantize.lock.json"
+    if load_lock(lock_path) != lock:
+        raise BuildError("llama.cpp source lock changed during verification")
+    # Validate the selected checkout, including external Android roots, against
+    # the shared upstream/tree/patch contract. This gate never applies patches.
     try:
-        expected, patches = source_lock_contract()
+        report = inspect_sync(
+            android_root=source.resolve().parents[4], lock_path=lock_path, dry_run=True,
+        )
     except SyncError as exc:
         raise BuildError(f"llama.cpp source patch contract failed: {exc}") from exc
-    if expected != revision:
+    if report["revision"] != revision or load_lock(lock_path) != lock:
         raise BuildError("llama.cpp source lock changed during verification")
+    if report["state"] != "applied" or any(
+        item["state"] not in {"applied", "applied_committed"} for item in report["patches"]
+    ):
+        raise BuildError("llama.cpp build requires all managed patches applied; pending patches are not accepted")
     status = _run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
                   cwd=project_root, timeout=30).stdout
-    if "revision_local" in lock and status.strip():
+    # Git status can hide a complete worktree patch via index flags. The
+    # shared tree check proves whether each patch is actually present in HEAD.
+    dirty = bool(status.strip()) or any(item["state"] == "applied" for item in report["patches"])
+    if "revision_local" in lock and dirty:
         raise BuildError("llama.cpp committed-patch source has worktree patches or unrelated changes")
-    changed = {line[3:].strip() for line in status.splitlines() if line}
-    allowed = {target for item in patches for target in item["targets"]}
-    if changed - allowed:
-        raise BuildError("llama.cpp source has changes outside locked patch targets")
-    receipts = []
-    for item in patches:
-        patch = (project_root / item["path"]).resolve()
-        if not patch.is_relative_to(project_root.resolve()) or not patch.is_file():
-            raise BuildError("llama.cpp managed patch is missing or unsafe")
-        if file_sha256(patch) != item["sha256"].lower():
-            raise BuildError("llama.cpp managed patch digest does not match the lock")
-        if "revision_local" not in lock:
-            _run(["git", "-C", str(source), "apply", "--reverse", "--check", str(patch)],
-                 cwd=project_root, timeout=30)
-        receipts.append({"id": item["id"], "patch_sha256": item["sha256"].lower(),
-                         "state": "applied" if changed.intersection(item["targets"]) else "applied_committed"})
-    return {"source_revision": revision, "source_dirty": bool(changed), "source_patches": receipts}
+    receipts = [
+        {key: item[key] for key in ("id", "patch_sha256", "state")}
+        for item in report["patches"]
+    ]
+    return {"source_revision": revision, "source_dirty": dirty, "source_patches": receipts}
 
 
 def _version_line(command: list[str], project_root: Path) -> str:
@@ -323,7 +322,7 @@ def build_and_package(
 ) -> dict[str, Any]:
     if not 1 <= jobs <= 64:
         raise BuildError("jobs must be between 1 and 64")
-    lock = load_lock()
+    lock = load_lock(project_root / "scripts/model_tools/llama_quantize.lock.json")
     target_id = host_target_id()
     target = lock["targets"].get(target_id)
     if target is None:

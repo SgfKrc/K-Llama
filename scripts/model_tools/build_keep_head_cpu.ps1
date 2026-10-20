@@ -3,6 +3,8 @@
 # (or empty), and outputs inside SourceRoot must be Git-ignored. Never clean them.
 # ToolchainBin defaults to C:\msys64\ucrt64\bin; CMake defaults to its cmake.exe.
 # Override via parameters or QLH_KEEP_HEAD_TOOLCHAIN_BIN / QLH_KEEP_HEAD_CMAKE.
+# Python: -Python > QLH_KEEP_HEAD_PYTHON > SourceRoot .venv / .venv-test > PATH.
+# Only the SourceRoot sync tool's read-only, applied_committed report is accepted.
 # Example: -BuildDir 'build/native trial' -OutDir 'build/native trial/output'
 # ASCII only for Windows PowerShell 5.1.
 [CmdletBinding()]
@@ -12,6 +14,7 @@ param(
     [string]$OutDir = '',
     [string]$ToolchainBin = $env:QLH_KEEP_HEAD_TOOLCHAIN_BIN,
     [string]$CMake = $env:QLH_KEEP_HEAD_CMAKE,
+    [string]$Python = $env:QLH_KEEP_HEAD_PYTHON,
     [ValidateRange(1, 128)][int]$Jobs = 8
 )
 
@@ -80,22 +83,44 @@ function Assert-FreshOutput([string]$Path) {
     }
 }
 
-# Patch pins describe Git's LF bytes; a clean Windows checkout can use CRLF.
-# Record both physical bytes and normalized pin bytes, without rewriting input.
-function Hash-Patch([string]$Path) {
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $text = [Text.Encoding]::UTF8.GetString($bytes).Replace("`r`n", "`n")
-    $algorithm = [Security.Cryptography.SHA256]::Create()
-    try {
-        return [BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))).Replace('-', '').ToLowerInvariant()
-    } finally { $algorithm.Dispose() }
-}
-
 function Hash-File([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
     finally { $stream.Dispose(); $algorithm.Dispose() }
+}
+
+function Read-SyncReport {
+    Write-Host ('[run] "{0}" {1}' -f $Python, (($syncArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '))
+    $output = @(& $Python @syncArgs)
+    $code = $LASTEXITCODE
+    $json = $output -join "`n"
+    # A failed report is diagnostic evidence too. Emit it before preserving rc.
+    Write-Host "[sync] $json"
+    if ($code -ne 0) { Write-Host "[FAIL] $Python exit=$code"; exit $code }
+    $report = $json | ConvertFrom-Json
+    if ($report.ok -ne $true -or $report.dry_run -ne $true -or
+        $report.revision -cne $revision -or @($report.patches).Count -ne @($lock.patches).Count) {
+        throw 'Shared sync did not validate the pinned read-only source contract'
+    }
+    $pending = @(
+        if ($report.PSObject.Properties['pending']) { $report.pending }
+        foreach ($patch in $report.patches) {
+            if ($patch.state -cne 'applied_committed') { "$($patch.id)=$($patch.state)" }
+        }
+    )
+    if ($pending.Count -ne 0) {
+        throw "Fixed CPU build requires applied_committed patches; pending or uncommitted: $($pending -join ', ')"
+    }
+    if ($report.state -cne 'applied') { throw "Shared sync state must be applied (got $($report.state))" }
+    return $report
+}
+
+function Assert-UnchangedInputs {
+    foreach ($path in $inputHashes.Keys) {
+        Require-File $path
+        if ((Hash-File $path) -cne $inputHashes[$path]) { throw "Build input changed during build: $path" }
+    }
 }
 
 try {
@@ -104,10 +129,27 @@ try {
     $SourceRoot = Full-Path $SourceRoot $scriptRepo
     $source = Join-Path $SourceRoot 'android/app/src/main/cpp/llama.cpp'
     $lockPath = Join-Path $SourceRoot 'scripts/model_tools/llama_quantize.lock.json'
+    $syncScript = Join-Path $SourceRoot 'scripts/model_tools/sync_llama_cpp.py'
     $shimScript = Join-Path $SourceRoot 'scripts/model_tools/build_keep_head_shim.ps1'
     $shimSource = Join-Path $SourceRoot 'scripts/model_tools/keep_head_shim/qlh_keep_head.c'
-    foreach ($path in @($lockPath, $shimScript, $shimSource, (Join-Path $source 'CMakeLists.txt'),
-                        (Join-Path $source 'include/llama.h'))) { Require-File $path }
+    $inputHashes = [ordered]@{}
+    foreach ($path in @($lockPath, $syncScript, $shimScript, $shimSource, $PSCommandPath,
+                        (Join-Path $source 'CMakeLists.txt'), (Join-Path $source 'include/llama.h'))) {
+        Require-File $path
+        $inputHashes[$path] = Hash-File $path
+    }
+    if (-not $Python) {
+        foreach ($candidate in @('.venv/Scripts/python.exe', '.venv-test/Scripts/python.exe')) {
+            $candidate = Join-Path $SourceRoot $candidate
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $Python = $candidate; break }
+        }
+        if (-not $Python) { $Python = 'python.exe' }
+    }
+    if ([IO.Path]::IsPathRooted($Python) -or $Python.Contains('\') -or $Python.Contains('/')) {
+        $Python = Full-Path $Python $SourceRoot
+    } else { $Python = (Get-Command $Python -CommandType Application -ErrorAction Stop).Source }
+    Require-File $Python
+    $syncArgs = @('-B', '-X', 'utf8', $syncScript, '--android-root', (Join-Path $SourceRoot 'android'), '--dry-run')
     $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($lock.source -cne 'android/app/src/main/cpp/llama.cpp') { throw 'Unexpected locked source path' }
     # Only committed patches are accepted. This builder never applies patches.
@@ -125,11 +167,15 @@ try {
             $patchPath = Full-Path $patch.path $SourceRoot
             if (-not (Is-Within $patchPath $SourceRoot)) { throw 'Patch pin escapes SourceRoot' }
             Require-File $patchPath
-            $hash = Hash-Patch $patchPath
-            if ($hash -ine $patch.sha256) { throw "Patch SHA256 differs from lock: $patchPath" }
-            [ordered]@{ path = $patch.path; sha256 = $hash; checkout_sha256 = (Hash-File $patchPath); state = 'committed' }
+            $inputHashes[$patchPath] = Hash-File $patchPath
+            [ordered]@{ path = $patch.path; sha256 = $patch.sha256.ToLowerInvariant()
+                checkout_sha256 = $inputHashes[$patchPath]; state = 'applied_committed' }
         }
     )
+
+    # Validate provenance before creating output directories or invoking any compiler.
+    $syncBefore = Read-SyncReport
+    Assert-UnchangedInputs
 
     $BuildDir = Full-Path $BuildDir $SourceRoot
     if (-not $OutDir) { $OutDir = Join-Path $BuildDir 'bin' }
@@ -249,13 +295,18 @@ try {
         }
     )
     Assert-CleanSource
+    $syncAfter = Read-SyncReport
+    Assert-UnchangedInputs
     $receipt = [ordered]@{
         schema_version = 1; exit_code = 0; completed_utc = [DateTime]::UtcNow.ToString('o')
         source_root = $SourceRoot; source = $source; source_revision = $revision; source_tree = $tree
         upstream_revision = $lock.upstream.revision; source_git_clean = $true; patches = $patches
-        lock_sha256 = (Hash-File $lockPath); builder_sha256 = (Hash-File $PSCommandPath)
+        lock_sha256 = $inputHashes[$lockPath]; builder_sha256 = $inputHashes[$PSCommandPath]
         header_sha256 = (Hash-File (Join-Path $source 'include/llama.h'))
-        shim_script_sha256 = (Hash-File $shimScript); shim_source_sha256 = (Hash-File $shimSource)
+        shim_script_sha256 = $inputHashes[$shimScript]; shim_source_sha256 = $inputHashes[$shimSource]
+        input_sha256 = $inputHashes
+        source_sync = [ordered]@{ python = $Python; script = $syncScript; script_sha256 = $inputHashes[$syncScript]
+            arguments = $syncArgs; before = $syncBefore; after = $syncAfter }
         build_dir = $BuildDir; out_dir = $OutDir; tools = $tools
         configure_arguments = $configure; build_arguments = $compile; shim_arguments = $shimArgs
         cache_sha256 = (Hash-File $cachePath); artifacts = $artifacts
