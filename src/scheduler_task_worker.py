@@ -34,6 +34,7 @@ from task_worker_protocol import (
     RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
     WorkerProtocolError,
+    InvalidTokenOutputResult,
     binary_hidden_frame_bytes,
     build_message as build_task_worker_message,
     canonical_message_bytes as task_worker_message_bytes,
@@ -616,6 +617,15 @@ class SchedulerTaskWorkerMixin:
         )
         return messages
 
+    def _task_worker_multi_position_argmax_available(self) -> bool:
+        """Use the execution owner's explicit port; ModelHost is not its owner."""
+        try:
+            probe = getattr(self._require_callbacks(), "supports_layer_multi_position_argmax", None)
+            return callable(probe) and probe() is True
+        except Exception:
+            logger.debug("multi-position argmax capability probe failed", exc_info=True)
+            return False
+
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
         engine_schema = self._task_worker_engine_schema()
@@ -748,6 +758,9 @@ class SchedulerTaskWorkerMixin:
         # false. The compatibility switch must omit the key entirely.
         if layer_worker and binary_hidden_transport_enabled():
             capabilities["binary_hidden"] = True
+        if (layer_worker and "layer_forward" in stage_types
+                and self._task_worker_multi_position_argmax_available()):
+            capabilities["multi_position_argmax"] = True
         if layer_ranges and artifact is not None and artifact.get("segment_mode") in {
             "head", "middle", "tail",
         }:
@@ -1680,6 +1693,9 @@ class SchedulerTaskWorkerMixin:
                 reject_reason = "model_identity_mismatch"
                 reject_retryable = True
 
+        if not reject_reason and offer.get("token_output") == "all_positions":
+            if not self._task_worker_multi_position_argmax_available():
+                reject_reason = "multi_position_argmax_unavailable"
         with self._task_worker_stage_lock:
             if not self.get_distributed_inference_enabled():
                 reject_reason = "local_inference_mode"
@@ -1783,7 +1799,7 @@ class SchedulerTaskWorkerMixin:
                     key: offer[key]
                     for key in (
                         "layer_range", "handoff_at", "hidden_sha256",
-                        "hidden_spec", "middle_channel", "seq_ids", "positions", "prepare_identity",
+                        "hidden_spec", "middle_channel", "seq_ids", "positions", "prepare_identity", "token_output",
                     )
                     if key in offer
                 },
@@ -1986,7 +2002,15 @@ class SchedulerTaskWorkerMixin:
                     "event=task_worker_binary_hidden_received peer=%s message_type=%s bytes=%d",
                     client_id, raw.get("message_type"), len(binary_body),
                 )
-            message = decode_task_worker_message(raw, binary_hidden=binary_hidden)
+            try:
+                message = decode_task_worker_message(raw, binary_hidden=binary_hidden)
+            except InvalidTokenOutputResult as exc:
+                if self._effective_role() != "master":
+                    raise
+                # Route only the bounded, otherwise validated receipt through the
+                # usual registered-node/provider/attempt checks. The provider
+                # records a terminal token-output error instead of a timeout.
+                message = exc.message
             if self._effective_role() == "master":
                 if client_id == "master":
                     raise WorkerProtocolError(

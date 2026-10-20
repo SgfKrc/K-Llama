@@ -2661,7 +2661,8 @@ class SchedulerClusterMixin:
                                      routing_preference: str = "auto",
                                      _cancel_event: Optional[threading.Event] = None,
                                      _request_deadline=None,
-                                     timeout: float = 120.0) -> dict:
+                                     timeout: float = 120.0,
+                                     speculative_gamma: Optional[int] = None) -> dict:
         """
         从节点将推理请求转发给主节点，并等待结果。
 
@@ -2679,6 +2680,19 @@ class SchedulerClusterMixin:
         Returns:
             {status, content, metrics, error}
         """
+        # Transit boundaries validate explicit values without resolving an env default.
+        speculation = {}
+        if speculative_gamma is not None:
+            from qlh_core.contracts.speculation import resolve_speculative_gamma
+            from qlh_core.contracts.execution import ExecutionError
+            try:
+                gamma = resolve_speculative_gamma(speculative_gamma)
+            except ExecutionError as exc:
+                return {"status": "error", "error": str(exc), "reason_code": exc.code}
+            if gamma > 1 and routing_preference == "local_only":
+                return {"status": "error", "error": "speculative_route_unsupported",
+                        "reason_code": "speculative_route_unsupported"}
+            speculation["speculative_gamma"] = gamma
         if self._effective_role() != "client":
             return {"status": "denied", "error": "仅从节点可转发推理请求"}
 
@@ -2711,6 +2725,7 @@ class SchedulerClusterMixin:
                 "request_id": request_id,   # L5: 链路追踪
                 "routing_preference": routing_preference,
                 "forward_request_id": forward_request_id,
+                **speculation,
             }
             if _request_deadline is not None:
                 infer_data["request_deadline_ms"] = (

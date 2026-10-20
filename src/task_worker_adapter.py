@@ -44,6 +44,7 @@ from task_worker_protocol import (
     PROTOCOL_VERSION,
     WorkerMessage,
     WorkerProtocolError,
+    InvalidTokenOutputResult,
     build_message,
     canonical_message_bytes,
     decode_message,
@@ -614,6 +615,8 @@ class _PendingRemoteAttempt:
     lease_expires_at: float
     lease_deadline_monotonic: float
     accepted: bool = False
+    accept_received_at: float = 0.0
+    result_received_at: float = 0.0
     accept_event: threading.Event = field(default_factory=threading.Event)
     result_event: threading.Event = field(default_factory=threading.Event)
     cancel_ack_event: threading.Event = field(default_factory=threading.Event)
@@ -1280,6 +1283,12 @@ class RemoteFullWorkerProvider:
                 provider_id=self.provider_id,
                 retryable=True,
             )
+        if request.stage_type == "layer_forward":
+            from qlh_core.contracts.token_output import validate_token_output_request
+            if validate_token_output_request(request.stage_fields or {}, request.root_input or {}):
+                if capabilities.get("multi_position_argmax") is not True:
+                    raise ProviderUnavailable("remote worker did not advertise all-position argmax",
+                        code="multi_position_argmax_unavailable", provider_id=self.provider_id)
         with self._lock:
             self._prune_pending_locked()
             if self._closed or not status.healthy:
@@ -1368,6 +1377,7 @@ class RemoteFullWorkerProvider:
         reservation: Reservation,
         cancel_event: threading.Event,
     ) -> StageResult:
+        started_at = time.perf_counter()
         with self._lock:
             owned = self._reservations.get(reservation.reservation_id)
             if owned is None or owned[0] != reservation:
@@ -1417,7 +1427,9 @@ class RemoteFullWorkerProvider:
         # ★ 2026-10-07（DIST-NEXT-2b）：超帧预算的 hidden 走**有序分片**（仅当对端声明
         #   `stage_chunked_input`）。分片必须在 offer **之前**发出：offer 只带 `hidden_ref`，
         #   worker 收到 offer 时要求分片已齐备。未声明能力/未超预算 ⇒ 原样返回（零行为变化）。
+        upload_started_at = time.perf_counter()
         root_input = self._maybe_send_stage_chunks(attempt)
+        upload_finished_at = time.perf_counter()
         # The worker derives a relative lease from this timestamp. Sampling it
         # before a large chunk upload would silently add the whole upload time
         # back to the execution lease/request budget.
@@ -1460,15 +1472,16 @@ class RemoteFullWorkerProvider:
                 version=PROTOCOL_VERSION,
                 binary_hidden=self._supports_binary_hidden(),
         )
+        offer_started_at = time.perf_counter()
         try:
             self._send_message(offer)
-            # ★ 2026-10-08（诊断，定位后降级）：真机卡点是「18 片已发、offer 似乎从不被
-            #   worker 读到」⇒ 先确认 offer 到底有没有写出去（以及它是否已是 hidden_ref 形态）。
+            offer_finished_at = time.perf_counter()
+            # Keep diagnostics independent of hidden size. WorkerMessage repr is
+            # neither the encoded frame nor free when the DEBUG sink is disabled.
             logger.debug(
                 "event=task_worker_stage_offer_sent node_id=%s attempt_id=%s stage_id=%s "
-                "bytes=%d chunked=%s",
+                "chunked=%s",
                 self.provider_id, attempt.attempt_id, attempt.request.stage_id,
-                len(json.dumps(offer, default=str).encode("utf-8")),
                 isinstance(root_input.get("hidden_ref"), dict),
             )
         except Exception as exc:
@@ -1524,11 +1537,9 @@ class RemoteFullWorkerProvider:
             if pending.lease_deadline_monotonic <= accept_timeout_deadline:
                 return "lease_expired"
             return "remote_accept_timeout"
-        # ★ 2026-10-09（接口税量化 · 方向2）：把一次 stage 往返拆成「发出→accept」与
-        #   「accept→result」两段。此前只有 stage 总耗时（docs #62 的 `s`），无法分辨
-        #   固定开销落在哪一次往返上，也无法验证 WiFi lock 是否真的压低了层段 RTT。
-        #   短字段名（`a=`/`r=`）：master.log 的 stdout 重定向会把每行截断在 ~119 字符。
-        _t_send = time.perf_counter()
+        # Receipt timestamps are published before the corresponding event. A
+        # fast response may arrive inside send_message, before this thread waits.
+        # a/r are causal intervals, not a count of application round trips.
         try:
             self._wait(
                 pending.accept_event,
@@ -1554,7 +1565,6 @@ class RemoteFullWorkerProvider:
                 code="remote_stage_not_accepted",
                 provider_id=self.provider_id,
             )
-        _t_accept = time.perf_counter()
         try:
             self._wait(
                 pending.result_event,
@@ -1582,10 +1592,19 @@ class RemoteFullWorkerProvider:
             ):
                 self._request_remote_cancel(attempt.attempt_id)
             raise
+        completed_at = time.perf_counter()
         logger.info(
             "perf2 a=%.0f r=%.0f",
-            (_t_accept - _t_send) * 1000.0,
-            (time.perf_counter() - _t_accept) * 1000.0,
+            (pending.accept_received_at - offer_started_at) * 1000.0,
+            (pending.result_received_at - pending.accept_received_at) * 1000.0,
+        )
+        logger.info(
+            "perf3 p=%.0f u=%.0f s=%.0f t=%.0f",
+            ((upload_started_at - started_at)
+             + (offer_started_at - upload_finished_at)) * 1000.0,
+            (upload_finished_at - upload_started_at) * 1000.0,
+            (offer_finished_at - offer_started_at) * 1000.0,
+            (completed_at - started_at) * 1000.0,
         )
         _kind, result, _error = pending.terminal_snapshot()
         if result is None:
@@ -1599,7 +1618,14 @@ class RemoteFullWorkerProvider:
     def handle_message(
         self, raw: bytes | str | Mapping[str, Any], *, binary_hidden: bool = False,
     ) -> WorkerMessage:
-        message = decode_message(raw, binary_hidden=binary_hidden)
+        token_output_error = None
+        try:
+            message = decode_message(raw, binary_hidden=binary_hidden)
+        except InvalidTokenOutputResult as exc:
+            token_output_error = exc
+            # Keep the identity/acceptance/replay checks below before failing the
+            # attempt. No invalid token group can become a successful StageResult.
+            message = exc.message
         if message.message_type not in {
             "stage_accept", "stage_result", "stage_error", "stage_cancelled",
             # ★ 2026-10-11（三机实测）：**回程**分片，与输入方向的 `stage_chunk` 对称。
@@ -1676,6 +1702,7 @@ class RemoteFullWorkerProvider:
                     )
                 if payload["accepted"]:
                     pending.accepted = True
+                    pending.accept_received_at = time.perf_counter()
                     pending.accept_event.set()
                 else:
                     # ★ 2026-10-03：把 worker 给的 `reason_code` 带进消息。此前只塞进
@@ -1708,14 +1735,34 @@ class RemoteFullWorkerProvider:
                         code="result_before_accept",
                         field="message_type",
                     )
+                output = payload["output"]
+                request = pending.attempt.request
+                if request.stage_type == "layer_forward" or token_output_error is not None:
+                    from qlh_core.contracts.token_output import validate_token_output, ALL_POSITIONS, TokenOutputError
+                    fields = request.stage_fields or {}
+                    all_positions = fields.get("token_output") == ALL_POSITIONS
+                    try:
+                        if token_output_error is not None:
+                            raise token_output_error
+                        validate_token_output(output, n_tokens=(fields.get("hidden_spec") or {}).get("n_tokens"),
+                            positions=fields.get("positions"), require_all=all_positions, allow_all=all_positions)
+                    except (TokenOutputError, InvalidTokenOutputResult) as exc:
+                        error = ProviderExecutionError(str(exc), code=exc.code, provider_id=self.provider_id)
+                        pending.physical_result_received = True
+                        pending.decide_terminal("invalid_token_output", error=error)
+                        self._result_chunk_assembler.discard(attempt_id)
+                        self._remember_message_locked(message)
+                        return message
+                output = self._expand_result_chunks_locked(pending, output)
                 result = StageResult(
-                    output=self._expand_result_chunks_locked(pending, payload["output"]),
+                    output=output,
                     provider_id=payload["provider_id"],
                     metadata=payload["metadata"],
                     attempt_id=payload["attempt_id"],
                     lease_epoch=payload["lease_epoch"],
                 )
                 pending.physical_result_received = True
+                pending.result_received_at = time.perf_counter()
                 if not pending.decide_terminal("stage_result", result=result):
                     return self._absorb_late_stage_response_locked(
                         pending, message,

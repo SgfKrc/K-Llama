@@ -370,7 +370,7 @@ def _decode_layer_stage_hidden_output(
 
 
 def _layer_stage_result_to_pipeline_value(
-    output: object, *, hidden_spec: dict,
+    output: object, *, hidden_spec: dict, token_output: str | None = None, positions=None,
 ):
     """Map a v3 StageResult to the old pipeline step's explicit value shape."""
     if not isinstance(output, dict):
@@ -379,6 +379,9 @@ def _layer_stage_result_to_pipeline_value(
     n_embd = int(hidden_spec.get("n_embd", 0) or 0)
     if n_tokens < 1 or n_embd < 1:
         raise ValueError("hidden_spec dimensions must be positive")
+    from qlh_core.contracts.token_output import validate_token_output, ALL_POSITIONS
+    multiple = validate_token_output(output, n_tokens=n_tokens, positions=positions,
+        require_all=token_output == ALL_POSITIONS, allow_all=token_output == ALL_POSITIONS)
     if "hidden_out_f32" in output:
         return {
             "kind": "hidden",
@@ -390,7 +393,11 @@ def _layer_stage_result_to_pipeline_value(
     token = output.get("token_argmax")
     if isinstance(token, bool) or not isinstance(token, int) or token < 0:
         raise ValueError("tail layer stage result requires token_argmax")
-    return {"kind": "token", "token_argmax": token}
+    value = {"kind": "token", "token_argmax": token}
+    if multiple:
+        value.update({key: output[key] for key in
+            ("token_argmax_by_position", "positions", "n_vocab", "n_tokens")})
+    return value
 
 
 def _assert_layer_stage_offer_fits_frame(
@@ -2662,6 +2669,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         context_size: int,
         pos_base: int = 0,
         want_hidden: bool = True,
+        want_all_tokens: bool = False,
         middle_channel: str = "extract_hidden",
         seq_ids: list[int] | None = None,
         positions: list[int] | None = None,
@@ -2694,7 +2702,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         #   分别调 `_node_declares_*` 会各付一次深拷贝。
         _worker_caps = (
             {}
-            if _fits_single_frame
+            if _fits_single_frame and not want_all_tokens
             else _node_capabilities(
                 getattr(self, "_task_worker_control", None), str(node_id)
             )
@@ -2732,6 +2740,13 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             stage_fields["seq_ids"] = list(seq_ids)
         if positions is not None:
             stage_fields["positions"] = list(positions)
+        if want_all_tokens:
+            from qlh_core.contracts.token_output import validate_token_output_request, ALL_POSITIONS
+            # Validate caller intent even if this peer requires the scalar fallback.
+            validate_token_output_request({**stage_fields, "token_output": ALL_POSITIONS},
+                                          {"want_hidden": want_hidden})
+            if _worker_caps.get("multi_position_argmax") is True:
+                stage_fields["token_output"] = ALL_POSITIONS
         # ★ 2026-10-03：把每步的 hidden 摘要打出来。跨机 D→L 的分叉定位需要与 relay
         #   路径（同层范围、同 prompt）的输出**逐位对照**，而此前链路上没有任何可对照
         #   的中间量 —— 只能看到"最终 token 不同"，无法判断差异出在 master 段还是设备段。
@@ -2814,7 +2829,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     raise RuntimeError("execution_kv_cleanup_receipt_invalid")
                 value = {"kind": "cleanup", "kv_cleared": True}
             else:
-                value = _layer_stage_result_to_pipeline_value(result.output, hidden_spec=hidden_spec)
+                value = _layer_stage_result_to_pipeline_value(result.output, hidden_spec=hidden_spec,
+                    token_output=stage_fields.get("token_output"), positions=positions)
             # A dispatch log precedes execution and cannot prove a handoff
             # succeeded. Emit this receipt only after the result is validated.
             logger.info(
@@ -4267,6 +4283,23 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             if request_deadline_ms else None
         )
         forward_request_id = str(data.get("forward_request_id", ""))
+        speculation = {}
+        # Omitted/null stays omitted: only ExecutionApplication owns env defaults.
+        if data.get("speculative_gamma") is not None:
+            from qlh_core.contracts.speculation import resolve_speculative_gamma
+            from qlh_core.contracts.execution import ExecutionError
+            try:
+                gamma = resolve_speculative_gamma(data["speculative_gamma"])
+                if gamma > 1 and routing_preference == "local_only":
+                    raise ExecutionError("speculative_route_unsupported")
+            except ExecutionError as exc:
+                self._send_infer_result(
+                    client_id, "", "", {"reason_code": exc.code},
+                    forward_request_id=forward_request_id,
+                    status="error", error=str(exc),
+                )
+                return
+            speculation["speculative_gamma"] = gamma
         cancel_key = forward_request_id or f"legacy_{uuid.uuid4().hex}"
 
         import threading as _thr
@@ -4300,6 +4333,8 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    **speculation,
+                    routing_preference=routing_preference,
                     session_id=session_id,
                     messages=messages,
                     show_thinking=show_thinking,

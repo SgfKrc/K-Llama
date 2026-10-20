@@ -119,7 +119,7 @@ _LAYER_FORWARD_OFFER_FIELDS = {
 #: ⚠️ **不能**并入 `_LAYER_FORWARD_OFFER_FIELDS`：那里的字段集合是**精确**校验（缺失即
 #: `field_mismatch`）⇒ 会把可选字段变成必填、破坏既有对端（实测踩到）。可选字段在
 #: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
-_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions", "prepare_identity"}
+_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions", "prepare_identity", "token_output"}
 
 # Request deadlines are request-scoped and must not be encoded as worker
 # ownership leases. The field is optional so peers without an end-to-end
@@ -162,7 +162,7 @@ _STAGE_CANCELLED_EXECUTION_STATES = frozenset({
 #: 而 `output` / `metadata` 本就是自由对象（仅校验类型与摘要一致性），可安全承载。
 _LAYER_FORWARD_RESULT_FIELDS = {
     "hidden_out_sha256",
-    "token_argmax",
+    "token_argmax", "token_argmax_by_position", "positions", "n_vocab", "n_tokens",
 }
 
 _ENVELOPE_FIELDS = {
@@ -273,6 +273,18 @@ class WorkerMessage:
             "sent_at_ms": self.sent_at_ms,
             "payload": self.payload,
         }
+
+
+class InvalidTokenOutputResult(WorkerProtocolError):
+    """A rejected token group with an otherwise validated result receipt.
+
+    The receipt may only be used to fail its matching pending attempt. Envelope,
+    identity syntax, output digest, metadata and wire size have all been checked.
+    """
+
+    def __init__(self, message: WorkerMessage, error):
+        super().__init__(str(error), code=error.code, field="payload.output." + error.field)
+        self.message = message
 
 
 def _error(code: str, field: str, message: str) -> WorkerProtocolError:
@@ -641,6 +653,9 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   字节与旧行为一致。与其余可选键同样按「出现才允许」处理 —— 两侧
     #   （主仓这里与 android `TaskWorkerProtocol`）必须**同时**放行，只改一边
     #   会让对端 hello 自校验失败（`segment_mode` 那次实测的静默断连坑）。
+    if "multi_position_argmax" in capabilities:
+        expected_fields.add("multi_position_argmax")
+        _require_bool(capabilities["multi_position_argmax"], "payload.capabilities.multi_position_argmax")
     if "binary_hidden" in capabilities:
         expected_fields.add("binary_hidden")
     _require_exact_fields(
@@ -1219,6 +1234,11 @@ def _validate_payload(
                             f"invalid_{field}", f"payload.{field}[{index}]",
                             f"{field} entries must be non-negative integers",
                         )
+            from qlh_core.contracts.token_output import validate_token_output_request, TokenOutputError
+            try:
+                validate_token_output_request(payload, root_input)
+            except TokenOutputError as exc:
+                raise _error(exc.code, "payload." + exc.field, str(exc)) from exc
         elif "layer_range" in payload or "handoff_at" in payload:
             # 非层段 stage 不得携带层段字段（精确字段集已拦，这里是双保险）
             raise _error(
@@ -1425,6 +1445,12 @@ def validate_message(
         raise _error(
             "message_too_large", "message", "message exceeds maximum size"
         )
+    if message_type == "stage_result":
+        from qlh_core.contracts.token_output import validate_token_output, TokenOutputError
+        try:
+            validate_token_output(payload["output"])
+        except TokenOutputError as exc:
+            raise InvalidTokenOutputResult(message, exc) from exc
     return message
 
 

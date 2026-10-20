@@ -3098,7 +3098,7 @@ class EngineHost:
 
     def _execute_supplied_layer_forward(
         self, selected, stage_request, hidden, *, want_hidden, n_past,
-        positions, seq_ids, provider_cancel_event,
+        positions, seq_ids, provider_cancel_event, want_all_tokens=False,
     ):
         """Adapt v3 hidden/KV to ModelManager's existing batched forward API."""
         import torch
@@ -3163,6 +3163,7 @@ class EngineHost:
             states = torch.from_numpy(hidden.copy()).unsqueeze(0)
             output = torch.empty((n_tokens, hidden.shape[1]), dtype=torch.float32) if want_hidden else None
             token = None
+            token_output = None
             for seq, indices in groups.items():
                 if provider_cancel_event.is_set():
                     raise _StageError("supplied_stage_cancelled")
@@ -3187,8 +3188,18 @@ class EngineHost:
                 if want_hidden:
                     output.index_copy_(0, index_tensor, out[0].detach().to(device="cpu", dtype=torch.float32))
                 elif seq == seq_ids[-1]:
-                    logits = manager.forward_lm_head(out[:, -1:, :])
+                    logits = manager.forward_lm_head(out if want_all_tokens else out[:, -1:, :])
+                    if (logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[-1] < 1
+                            or logits.shape[1] != (len(indices) if want_all_tokens else 1)
+                            or not bool(torch.isfinite(logits).all().item())):
+                        raise _StageError("supplied_logits_invalid")
                     token = int(logits[0, -1].argmax().item())
+                    if want_all_tokens:
+                        token_output = {"token_argmax": token,
+                            "token_argmax_by_position": logits[0].argmax(dim=-1).tolist(),
+                            "positions": list(positions), "n_tokens": n_tokens, "n_vocab": int(logits.shape[-1])}
+                        from qlh_core.contracts.token_output import validate_token_output
+                        validate_token_output(token_output, n_tokens=n_tokens, positions=positions, require_all=True)
             if provider_cancel_event.is_set():
                 raise _StageError("supplied_stage_cancelled")
         except Exception:
@@ -3196,7 +3207,28 @@ class EngineHost:
             self._supplied_layer_caches = {}
             raise
         self._supplied_layer_caches = caches
-        return output.numpy() if want_hidden else token
+        return output.numpy() if want_hidden else (token_output if want_all_tokens else token)
+
+    def supports_layer_multi_position_argmax(self):
+        """Inspect installed execution support without materializing any weights."""
+        import os
+        environment = self._environment if getattr(self, "_environment", None) is not None else os.environ
+        if str(environment.get("QLH_MULTI_POSITION_ARGMAX", "1")).strip().lower() in {"0", "false", "off", "no"}:
+            return False
+        active = getattr(self, "_worker_runtime_active", None)
+        if active is not None and getattr(active, "loaded", False):
+            if active.upstream is not None:
+                return getattr(active.upstream, "supports_multi_position_argmax", False) is True
+            if active.selected is not None:
+                return active.selected["manifest"]["format"] == "safetensors"
+        from model_supply_worker import get_selected_model
+        selected = get_selected_model()
+        if selected is not None and selected["manifest"]["format"] == "safetensors":
+            return True
+        from keep_head_shim import resolve_keep_head_shim
+        from llama_keep_head import keep_head_multi_position_available
+        shim = resolve_keep_head_shim(environment=environment)
+        return bool(shim and keep_head_multi_position_available(shim, environment=environment))
 
     def _execute_layer_forward_stage(self, stage_request, provider_cancel_event):
         with self._worker_layer_lock():
@@ -3243,6 +3275,8 @@ class EngineHost:
         if not isinstance(encoded, str):
             raise _StageError("层段 Stage 缺少 root_input.hidden_f32")
         stage_fields = stage_request.stage_fields or {}
+        from qlh_core.contracts.token_output import validate_token_output_request, validate_token_output
+        want_all_tokens = validate_token_output_request(stage_fields, root_input)
         spec = stage_fields.get("hidden_spec") or {}
         n_tokens = int(spec.get("n_tokens", 0) or 0)
         n_embd = int(spec.get("n_embd", 0) or 0)
@@ -3285,8 +3319,10 @@ class EngineHost:
             out = self._execute_supplied_layer_forward(
                 selected, stage_request, hidden, want_hidden=want_hidden,
                 n_past=n_past, positions=positions, seq_ids=seq_ids,
-                provider_cancel_event=provider_cancel_event,
+                provider_cancel_event=provider_cancel_event, want_all_tokens=want_all_tokens,
             )
+            if want_all_tokens:
+                return out
             if not want_hidden:
                 return {"token_argmax": int(out)}
             out_raw = np.ascontiguousarray(out, dtype=np.float32).tobytes()
@@ -3296,6 +3332,8 @@ class EngineHost:
                 "token_argmax": None,
             }
         upstream = self._layer_forward_upstream()
+        if want_all_tokens and getattr(upstream, "supports_multi_position_argmax", False) is not True:
+            raise _StageError("multi_position_argmax_unavailable")
 
         # ★ 2026-10-03：批次**从位置 0 开始**就说明这是新 prompt 的 prefill ⇒ 必须先清
         #   子进程的 KV。否则下一个请求会带着上一个请求残留的位置（实测：
@@ -3319,6 +3357,13 @@ class EngineHost:
                 "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
                 "token_argmax": None,
             }
+        if want_all_tokens:
+            tokens = upstream.forward_hidden_to_tokens(
+                hidden, n_past=n_past, seq_ids=seq_ids, positions=positions)
+            output = {"token_argmax": tokens[-1] if isinstance(tokens, (list, tuple)) and tokens else None, "token_argmax_by_position": tokens,
+                      "positions": list(positions), "n_tokens": n_tokens, "n_vocab": upstream.n_vocab}
+            validate_token_output(output, n_tokens=n_tokens, positions=positions, require_all=True)
+            return output
         token = upstream.forward_hidden_to_token(
             hidden, n_past=n_past, seq_ids=seq_ids, positions=positions,
         )
