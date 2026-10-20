@@ -1,6 +1,6 @@
 # 票 13 续验记录（2026-10-15）
 
-状态：修复后 Qwen3.5-9B 三机 DL／LL 的自动供给、真实 API 与 Textual/SSE 开发实测均通过；最终同 revision 签名发行验收仍开放，票 13 尚不能关闭。上轮记录见 [首次验收](archive/misc/ci-release-acceptance-2026-10-15.md)。
+状态：修复后 Qwen3.5-9B 三机 DL／LL 的自动供给、真实 API 与 Textual/SSE 开发实测均通过；最终同 revision 签名发行验收仍开放，票 13 尚不能关闭。上轮记录见 [首次验收](ci-release-acceptance-2026-10-15.md)。
 
 ## 2026-10-15 续验：Android 探针与三机恢复
 

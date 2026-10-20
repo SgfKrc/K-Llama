@@ -94,7 +94,7 @@ Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.
 
 上述首次失败记录保留。后续复核见 `build/ci-release-followup-20261015/final-artifact-result.json`：Linux daemon 已能应答，但仍无最终 `.deb`；Windows 现有 CPU／Launcher 的失败条件未解除；Android 仍无最终 release APK，签名配置缺失。Android 角色／native 探针代码已补齐并在保数据更新的 Y700 debug 包上获得本次 nonce／PID 的真实 JNI 观测，其最终 release 验收仍待可信签名包。没有为通过门替换信任库或复用 debug 签名。
 
-2026-10-15 后续复核已预备 Linux 验收镜像，并在禁网容器确认环境；最终 `.deb` 仍缺失。量化工具已完成真实 Windows GNU／Ninja Release 构建，补丁来源与运行依赖验证通过。最新三平台门仍退出 1，见 `build/ci-release-followup-20261015/final-artifact-retry-result.json`；具体构建修复与测试见 [票 13 续验](ci-release-followup-2026-10-15.md#构建来源与量化工具闭环)。
+2026-10-15 后续复核已预备 Linux 验收镜像，并在禁网容器确认环境；最终 `.deb` 仍缺失。量化工具已完成真实 Windows GNU／Ninja Release 构建，补丁来源与运行依赖验证通过。最新三平台门仍退出 1，见 `build/ci-release-followup-20261015/final-artifact-retry-result.json`；具体构建修复与测试见 [票 13 续验](archive/misc/ci-release-followup-2026-10-15.md#构建来源与量化工具闭环)。
 
 
-2026-10-16 的构建接线、Linux 禁网只读容器和当前发行物门实测见 [运行环境记录](ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)；打包路径修复、观测合同及最终软件组合结果见 [工件身份记录](ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。当前 debug／dirty 设备实跑继续作为开发证据，最终签名三平台执行门保持开放。
+2026-10-16 的构建接线、Linux 禁网只读容器和当前发行物门实测见 [运行环境记录](archive/misc/ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)；打包路径修复、观测合同及最终软件组合结果见 [工件身份记录](archive/misc/ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。当前 debug／dirty 设备实跑继续作为开发证据，最终签名三平台执行门保持开放。

@@ -141,7 +141,7 @@ master／ROG／Y700 同时在线。用户提交 `qwen3-5-9b` 自动模型意图�
 
 `--observations-dir` 导入实验台实际生成的 v1 原始报告并保留原时间。运行端新回执与 live collector 已接线，接口、软件验证与部署边界见 §8；旧进程缺新回执时仍明确失败。
 
-补齐 `.github/workflows/release-build.yml` 与 `scripts/package_contract/release_build.py`：manual dispatch 的完整 revision 必须等于当前 run 的 `github.sha`；受信实验台已有同 revision DL／LL bundle 先经严格门校验，再逐附件复制并复验。通过后才执行 Windows CPU／Launcher、Linux CPU deb、Android release 的既有真实构建入口。构建前记录 canonical 来源快照，拒绝旧输出；产物经当前信任库、合同、版本和同一 build-info 静态认证后，才在同一 run 上传 `qlh-final-windows`、`qlh-final-linux`、`qlh-final-android`、`qlh-product-relay-evidence`。构建接线不安装／启动产物，平台执行仍由 `release-acceptance.yml` 完成。配置见 [发行物门](发行物门-RELEASE-ARTIFACTS.md#ci-与总门)。远端 dispatch、上传及签名发行构建尚未执行。
+补齐 `.github/workflows/release-build.yml` 与 `scripts/package_contract/release_build.py`：manual dispatch 的完整 revision 必须等于当前 run 的 `github.sha`；受信实验台已有同 revision DL／LL bundle 先经严格门校验，再逐附件复制并复验。通过后才执行 Windows CPU／Launcher、Linux CPU deb、Android release 的既有真实构建入口。构建前记录 canonical 来源快照，拒绝旧输出；产物经当前信任库、合同、版本和同一 build-info 静态认证后，才在同一 run 上传 `qlh-final-windows`、`qlh-final-linux`、`qlh-final-android`、`qlh-product-relay-evidence`。构建接线不安装／启动产物，平台执行仍由 `release-acceptance.yml` 完成。配置见 [发行物门](../../发行物门-RELEASE-ARTIFACTS.md#ci-与总门)。远端 dispatch、上传及签名发行构建尚未执行。
 
 观测合同与构建链的阶段验证如下；这些定向离线组不相加作为全仓或物理验收：
 
@@ -281,9 +281,9 @@ DL 的 Surface 执行新本地裁切，`reused_bytes=0`、`actual_downloaded_byt
 
 普通CI、来源和发行合同检查继续保留；同clean revision的master加两个不同远端严格DL／LL证据转入 §14 的独立发布前门。真实 Textual/SSE、逐段完成回执、独立进程／连接／装载观测、proper segments 与容量预算继续按 `run_product_relay_gate.capture`、`product_relay_gate.validate_bundle` 和 `product_observations.derive_node_observation` 验收。
 
-可信签名 Windows／Linux／Android 最终产物的实际发行执行列为后置的发布前门；Linux 近期实机执行后置。这项范围划分允许产品链先行收口，`release_acceptance` 的签名、来源、产物执行要求及既有失败报告继续保留。Windows 免安装包可用于 Surface 隔离目录验收；需要清理现有仓库时先列 dry-run，保留模型、state、节点身份、凭据及可恢复路径。独立Launcher裁撤职责已纳入[重构设计](单一事实源重构设计-2026-10-18.md#10-裁撤与数据迁移)。
+可信签名 Windows／Linux／Android 最终产物的实际发行执行列为后置的发布前门；Linux 近期实机执行后置。这项范围划分允许产品链先行收口，`release_acceptance` 的签名、来源、产物执行要求及既有失败报告继续保留。Windows 免安装包可用于 Surface 隔离目录验收；需要清理现有仓库时先列 dry-run，保留模型、state、节点身份、凭据及可恢复路径。独立Launcher裁撤职责已纳入[重构设计](../../单一事实源重构设计-2026-10-18.md#10-裁撤与数据迁移)。
 
-当前先在独立分支完成事实归属与状态机设计，再按重构阶段迁移；19～22已有成果及剩余优化按[新设计依赖表](单一事实源重构设计-2026-10-18.md#11-分期排票与完成门)接入。
+当前先在独立分支完成事实归属与状态机设计，再按重构阶段迁移；19～22已有成果及剩余优化按[新设计依赖表](../../单一事实源重构设计-2026-10-18.md#11-分期排票与完成门)接入。
 
 干净基线为 `37c87c5c03fd7b453f307a96130f77bdab3c0469`，固定 Android `aaa5938879922143817fd2e3bdb5c866fb78376c` 及其余四个仓库 pin。隔离 detached checkout 的 Git 状态和真实文件 inventory 均经过验证；`runtime_source.main` 导出 338 个运行文件，`source_dirty=false`，canonical manifest SHA `bbc356970e1781ff959bda17faafd952011a60e0f00d84665d5d8cbf2354932d`。新证据根为 `build/ticket13-clean-20261018/`，旧 dirty raw 与原始时间、SHA、失败结果保持不变。
 
@@ -399,4 +399,4 @@ ROG 在独立 `QLH-Source-Observation-20261018` 目录、临时 state、single �
 
 严格发布门继续由现有工具执行；产品收口不修改旧passed／failed值。后续产品不退化由重构R6承接，设备缺口按实际未执行登记。
 
-独立分支`refactor/ssot-design-20261018`从干净`fb870d1d`建立。功能证据见[当前功能与事实归属审计](当前功能与事实归属审计-2026-10-18.md)，目标设计与阶段见[单一事实源重构设计](单一事实源重构设计-2026-10-18.md)。生产实现迁移和代码裁撤尚未开始。
+独立分支`refactor/ssot-design-20261018`从干净`fb870d1d`建立。功能证据见[当前功能与事实归属审计](../../当前功能与事实归属审计-2026-10-18.md)，目标设计与阶段见[单一事实源重构设计](../../单一事实源重构设计-2026-10-18.md)。生产实现迁移和代码裁撤尚未开始。
