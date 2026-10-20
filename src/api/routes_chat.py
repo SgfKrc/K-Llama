@@ -189,6 +189,7 @@ async def chat(req: ChatRequest, request: Request = None):
 
     def _run_chat_request_unlocked():
         _check_registered_chat_source(request)
+        _api_module._require_speculative_route(req)
         # A required worker request waits on the master, which can dispatch a
         # layer stage back to this same worker. Holding its model lock across
         # that wait would prevent the stage from executing. Required routing
@@ -198,7 +199,8 @@ async def chat(req: ChatRequest, request: Request = None):
             return _api_module._execute_requested_chat(
                 req, cancel_event, request_deadline, forward_only=True,
             )
-        if _uses_linear_executor(req):
+        if (_uses_linear_executor(req)
+                or (req.speculative_gamma is not None and req.speculative_gamma > 1)):
             return _api_module._execute_requested_chat(req, cancel_event, request_deadline)
         with _api_module.hold_lock_until_deadline(
             _api_module.model_host.full_chat_execution_lock,
@@ -350,6 +352,12 @@ async def chat_stream(req: ChatRequest, request: Request):
             async for chunk in _generate_events():
                 yield chunk
             completed_normally = True
+        except _api_module.HTTPException as exc:
+            yield _error_event(
+                exc.detail, refused=exc.status_code == 400,
+                reason_code=error_code_from_exception(exc),
+            )
+            completed_normally = True
         except _api_module.RequestDeadlineExceeded as exc:
             yield _error_event(
                 str(exc),
@@ -462,6 +470,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     pass
 
     async def _generate_events():
+        _api_module._require_speculative_route(req)
         # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
         _api_module._maybe_log_external_scope_denial(req, _api_module._external_route_decision(req))
         # T9.5：distributed_required 无分布式路径时明确失败（interactive/fast 共用）
@@ -566,6 +575,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
                         and not _api_module._pipeline_model_is_prepared()
                         and req.routing_preference != 'distributed_required'
+                        and (req.speculative_gamma is None or req.speculative_gamma == 1)
                     ):
                         try:
                             await _run_with_request_id(loop, _api_module._auto_load_default_model)
@@ -587,7 +597,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 max_new_tokens=req.max_new_tokens,
                                 temperature=req.pipeline_sampling()[0],
                                 top_p=req.pipeline_sampling()[1],
+                                **req.pipeline_speculation(),
                                 _context_revision=prepared_context.revision,
+                                routing_preference=req.routing_preference,
                                 session_id=target_session_id,
                                 messages=request_messages,
                                 show_thinking=req.show_thinking,
@@ -608,6 +620,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                               and callable(getattr(
                                   _api_module.scheduler, "_run_full_model_inference_stream", None,
                               ))):
+                            _api_module._require_speculative_route(req, local_fallback=True)
                             async for event in _iterate_sync_generator(
                                 _api_module.scheduler._run_full_model_inference_stream(
                                     req.message,
@@ -627,6 +640,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     yield frame
                         elif (_api_module.backend_id_for(_api_module.model_manager) == "pytorch"
                                 and _api_module.model_manager.is_loaded):
+                            _api_module._require_speculative_route(req, local_fallback=True)
                             async for event in _iterate_sync_generator(_api_module.scheduler._run_full_model_inference_stream(
                                 req.message,
                                 max_new_tokens=req.max_new_tokens,
@@ -652,7 +666,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     max_new_tokens=req.max_new_tokens,
                                     temperature=req.pipeline_sampling()[0],
                                     top_p=req.pipeline_sampling()[1],
+                                    **req.pipeline_speculation(),
                                     _context_revision=prepared_context.revision,
+                                    routing_preference=req.routing_preference,
                                     session_id=target_session_id,
                                     messages=request_messages,
                                     _require_distributed=(req.routing_preference == "distributed_required"),
@@ -669,10 +685,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 yield f"data: {_json.dumps({'token': str(response)}, ensure_ascii=False)}\n\n"
                             if result.get("error"):
                                 error = str(result["error"])
+                                terminal_reason_code = str(result.get("reason_code") or "")
             except _api_module.ChatGenerationCancelled:
                 cancelled = True
             except _api_module.HTTPException as exc:
                 error = exc.detail
+                terminal_reason_code = error_code_from_exception(exc)
             except Exception as exc:
                 _api_module.logger.error(f"interactive 模式推理失败: {exc}", exc_info=True)
                 error = str(exc)
@@ -787,7 +805,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     return _api_module._execute_requested_chat(
                         req, cancel_event, request_deadline, forward_only=True,
                     )
-                if _uses_linear_executor(req):
+                if (_uses_linear_executor(req)
+                        or (req.speculative_gamma is not None and req.speculative_gamma > 1)):
                     return _api_module._execute_requested_chat(req, cancel_event, request_deadline)
                 with _api_module.hold_lock_until_deadline(
                     _api_module.model_host.full_chat_execution_lock,
@@ -974,6 +993,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.pipeline_sampling()[0],
                     top_p=req.pipeline_sampling()[1],
+                    **req.pipeline_speculation(),
                     show_thinking=req.show_thinking,
                     enable_thinking=req.enable_thinking,
                     routing_preference=req.routing_preference,
@@ -981,8 +1001,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                     messages=request_messages,
                     request_id=request_id,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 ),
             )
+            if result.get("status") != "ok" and req.speculative_gamma is not None and req.speculative_gamma > 1:
+                code = (result.get("reason_code") or (result.get("metrics") or {}).get("reason_code")
+                        or "speculative_forward_failed")
+                yield _error_event(result.get("error") or code, reason_code=code)
+                return
             if result.get("status") == "ok":
                 metrics = result.get("metrics", {}) or {}
                 metrics.setdefault("request_id", request_id)
@@ -1024,6 +1050,7 @@ async def chat_stream(req: ChatRequest, request: Request):
             (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
             and not _api_module._pipeline_model_is_prepared()
             and req.routing_preference != 'distributed_required'
+            and (req.speculative_gamma is None or req.speculative_gamma == 1)
         ):
             loop = _asyncio.get_running_loop()
             try:
@@ -1044,7 +1071,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.pipeline_sampling()[0],
                     top_p=req.pipeline_sampling()[1],
+                    **req.pipeline_speculation(),
                     _context_revision=prepared_context.revision,
+                    routing_preference=req.routing_preference,
                     session_id=target_session_id,
                     messages=request_messages,
                     show_thinking=req.show_thinking,
@@ -1058,7 +1087,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 _api_module.logger.error(f"流式推理失败: {e}", exc_info=True)
-                yield _error_event(str(e))
+                yield _error_event(str(e), reason_code=error_code_from_exception(e))
 
         # ---- 路径 2: 单机 PyTorch 流式 ----
         elif (_api_module.backend_id_for(_api_module.model_manager) == "llama_cpp"
@@ -1068,6 +1097,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     _api_module.scheduler, "_run_full_model_inference_stream", None,
                 ))):
             try:
+                _api_module._require_speculative_route(req, local_fallback=True)
                 async for event in _iterate_sync_generator(
                     _api_module.scheduler._run_full_model_inference_stream(
                         req.message,
@@ -1085,11 +1115,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 _api_module.logger.error(f"llama.cpp 流式推理失败: {e}", exc_info=True)
-                yield _error_event(str(e))
+                yield _error_event(str(e), reason_code=error_code_from_exception(e))
 
         elif (_api_module.backend_id_for(_api_module.model_manager) == "pytorch"
                 and _api_module.model_manager.is_loaded):
             try:
+                _api_module._require_speculative_route(req, local_fallback=True)
                 async for event in _iterate_sync_generator(_api_module.scheduler._run_full_model_inference_stream(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
@@ -1106,7 +1137,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 _api_module.logger.error(f"单机流式推理失败: {e}", exc_info=True)
-                yield _error_event(str(e))
+                yield _error_event(str(e), reason_code=error_code_from_exception(e))
 
         # ---- 路径 3: llama.cpp / 从节点 / 模型未加载 → 假流式回退 ----
         else:
@@ -1118,7 +1149,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.pipeline_sampling()[0],
                     top_p=req.pipeline_sampling()[1],
+                    **req.pipeline_speculation(),
                     _context_revision=prepared_context.revision,
+                    routing_preference=req.routing_preference,
                     session_id=target_session_id,
                     messages=request_messages,
                     _require_distributed=(req.routing_preference == "distributed_required"),

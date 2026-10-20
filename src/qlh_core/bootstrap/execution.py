@@ -97,7 +97,21 @@ class ExecutionApplication:
             deadline = coerce_request_deadline(kwargs.get("_request_deadline"),
                                                timeout_seconds=kwargs.get("_request_timeout_seconds", 120))
             ports = NativePorts(self, plan, prompt, kwargs)
-            executor = LinearExecutor(ports)
+            from qlh_core.contracts.speculation import resolve_speculative_gamma
+            config = getattr(self.scheduler, "_runtime_config", None)
+            if config is not None:
+                environment = config.environment_snapshot()
+            else:
+                import os
+                environment = os.environ
+            gamma = resolve_speculative_gamma(kwargs.get("speculative_gamma"), environment=environment)
+            if gamma > 1:
+                if kwargs.get("routing_preference") == "local_only":
+                    raise ExecutionError("speculative_route_unsupported")
+                from qlh_core.execution.speculative import SpeculativeExecutor
+                executor = SpeculativeExecutor(ports, gamma=gamma)
+            else:
+                executor = LinearExecutor(ports)
             stops = kwargs.get("stop") or ()
             if not isinstance(stops, (str, list, tuple)) or (not isinstance(stops, str) and any(not isinstance(s, str) for s in stops)):
                 raise ExecutionError("route_a_stop_configuration_invalid:non_string_stop")
@@ -149,6 +163,7 @@ class NativePorts:
         self.thinking_buffer = ""
         self.prefix_started = False
         self.attempts = []
+        self._receipt_guard = LinearExecutor(self)
 
     def current(self, plan):
         return self.application.current(plan)
@@ -181,6 +196,93 @@ class NativePorts:
         self.context_size = local["load_spec"]["context_size"]
         if self.prompt_length + self.options.get("max_new_tokens", 1024) > self.context_size:
             raise ExecutionError("execution_context_size_exceeded")
+
+    def prepare_speculation(self, plan, record):
+        """Admit the exact active owners while holding the request execution lock."""
+        from qlh_core.contracts.speculation import require_speculative_plan
+        from gguf_metadata_contract import read_gguf_header
+        descriptor = self.host.get_pipeline_descriptor()
+        require_speculative_plan(plan, descriptor, self.host.engine_type)
+        try:
+            metadata, tensors = read_gguf_header(descriptor.get("loaded_artifact") or descriptor["model_path"])
+        except (OSError, ValueError, TypeError):
+            raise ExecutionError("speculative_model_metadata_invalid") from None
+        if (metadata.get("general.architecture") != "qwen2"
+                or metadata.get("qwen2.full_attention_interval", 1) != 1
+                or metadata.get("qwen2.nextn_predict_layers", 0) != 0
+                or any("ssm" in key.lower() or "recurrent" in key.lower()
+                       or ("sliding_window" in key.lower() and value != 0)
+                       for key, value in metadata.items())
+                or any("ssm" in name.lower() for name in tensors)):
+            raise ExecutionError("speculative_attention_state_unsupported")
+        prefix = plan.segments[0]
+        if (metadata.get("qwen2.block_count") != prefix.end - prefix.start
+                or metadata.get("qwen2.embedding_length") != descriptor.get("hidden_size")):
+            raise ExecutionError("speculative_model_metadata_invalid")
+        required_batch = self.prompt_length + self.options.get("max_new_tokens", 1024) - 1
+        for segment in plan.segments:
+            spec = json.loads(segment.payload)["load_spec"]
+            if spec["batch_size"] < required_batch:
+                raise ExecutionError("speculative_replay_batch_limit")
+        tail = plan.segments[-1]
+        worker = self.scheduler._task_worker_control.worker_snapshot(tail.node_id) or {}
+        if worker.get("capabilities", {}).get("multi_position_argmax") is not True:
+            raise ExecutionError("speculative_multi_position_unsupported")
+        LinearExecutor._check(self._receipt_guard, plan, record)
+
+    def prompt_tokens(self):
+        return self.input_ids.reshape(-1).tolist()
+
+    def forward_tokens(self, plan, record, ids, position, step, *, all_tokens=False):
+        """Send one contiguous causal batch through every frozen segment."""
+        import numpy as np
+        self._receipt_guard._check(plan, record)
+        if (not isinstance(ids, list) or not ids or any(type(token) is not int or token < 0 for token in ids)
+                or type(position) is not int or position < 0 or position + len(ids) > self.context_size):
+            raise ExecutionError("speculative_input_invalid")
+        if position and self.cache != position:
+            raise ExecutionError("speculative_prefix_position_mismatch")
+        self.prefix_started = True
+        result = self.host.forward_layers(input_ids=np.array([ids], dtype=np.int64),
+            attention_mask=None, past_key_values=self.cache, use_cache=True, apply_lm_head=False)
+        self._receipt_guard._check(plan, record)
+        self.cache = result.get("cache")
+        if self.cache is None:
+            self.cache = result.get("past_key_values")
+        if type(self.cache) is not int or self.cache != position + len(ids):
+            raise ExecutionError("speculative_prefix_position_mismatch")
+        hidden = result.get("hidden_states")
+        if hasattr(hidden, "detach"):
+            hidden = hidden.detach().float().cpu().numpy()
+        hidden = np.ascontiguousarray(hidden, dtype=np.float32)
+        if hidden.ndim == 3 and hidden.shape[0] == 1:
+            hidden = hidden[0]
+        if hidden.ndim != 2 or hidden.shape[0] != len(ids):
+            raise ExecutionError("execution_hidden_shape_invalid")
+        positions = list(range(position, position + len(ids)))
+        for segment in plan.segments[1:]:
+            self._receipt_guard._check(plan, record)
+            from qlh_core.contracts.execution import StageIdentity
+            identity = StageIdentity.for_segment(plan, segment, record["request_id"], record["attempt_id"], step)
+            receipt = self.stage(segment, identity, hidden, record, positions=positions,
+                                 all_tokens=all_tokens and segment.head)
+            self._receipt_guard._check(plan, record)
+            hidden = self._receipt_guard.accept(identity, receipt)
+        if all_tokens:
+            from qlh_core.contracts.token_output import validate_token_output
+            validate_token_output(hidden, n_tokens=len(ids), positions=positions, require_all=True)
+        return hidden
+
+    def restore_prefix(self, plan, record, ids, step):
+        """Reset every owner, then rebuild KV using only committed input tokens."""
+        self._receipt_guard._check(plan, record)
+        if not self._drain_attempts(record):
+            raise ExecutionError("speculative_restore_cleanup_pending")
+        self._reset_pipeline_kv(record, tag=f"restore:{step}", check=True)
+        self._receipt_guard._check(plan, record)
+        output = self.forward_tokens(plan, record, ids, 0, step, all_tokens=False)
+        from qlh_core.contracts.token_output import tail_token
+        return tail_token(output)
 
     def eos_ids(self):
         value = getattr(self.tokenizer, "eos_token_id", None)
@@ -220,22 +322,30 @@ class NativePorts:
             raise ExecutionError("execution_hidden_shape_invalid")
         return hidden
 
-    def stage(self, segment, identity, hidden, record):
+    def stage(self, segment, identity, hidden, record, *, positions=None, all_tokens=None):
         from execution_provider import ModelIdentity
         assignment = json.loads(segment.payload)
         frozen = assignment["worker_prepare_identity"]
-        positions = list(range(len(hidden))) if identity.step == 0 else [self.prompt_length + identity.step - 1] * len(hidden)
+        if positions is None:
+            start = 0 if identity.step == 0 else self.prompt_length + identity.step - 1
+            positions = list(range(start, start + len(hidden)))
+        if all_tokens is None:
+            all_tokens = segment.head and self.options.get("_all_position_argmax") is True
         self.used.append(segment)
         value = self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
             hidden_states=hidden, model_identity=ModelIdentity(**frozen["stage_model_identity"]),
             workflow_id="wf_" + record["request_id"], request_id=f'{record["request_id"]}:step:{identity.step}',
             stage_id=f'{segment.node_id}:step:{identity.step}', context_size=self.context_size,
-            want_hidden=not segment.head, middle_channel="keep_head_layer_out", positions=positions,
+            want_hidden=not segment.head,
+            want_all_tokens=segment.head and all_tokens,
+            middle_channel="keep_head_layer_out", positions=positions,
             seq_ids=[0] * len(hidden), cancel_event=record["cancel"], request_deadline=record["deadline"],
             execution_attempts=self.attempts)
-        output = value["token_argmax"] if segment.head else value["hidden_states"]
+        output = value if segment.head else value["hidden_states"]
         if segment.head:
-            raw = str(output).encode()
+            from qlh_core.contracts.token_output import tail_token
+            tail_token(output)
+            raw = json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
         else:
             # The wire decoder returns a Tensor when torch is loaded and a
             # NumPy array in edge builds. Relay one canonical f32 byte layout.
@@ -275,50 +385,72 @@ class NativePorts:
         if event["token"]:
             callback(event)
 
-    def cleanup(self, record):
+    def _drain_attempts(self, record):
+        for provider, attempt_id in self.attempts:
+            while not provider.execution_drained(attempt_id):
+                if record["deadline"].expired():
+                    return False
+                threading.Event().wait(min(0.02, record["deadline"].remaining()))
+        return True
+
+    def _reset_pipeline_kv(self, record, *, tag, check=False):
         import numpy as np
         from execution_provider import ModelIdentity
-        clean = True
+        errors = []
         try:
-            # Provider reservations are logical. Wait for a physical stop receipt.
-            for provider, attempt_id in self.attempts:
-                while not provider.execution_drained(attempt_id):
-                    if record["deadline"].expired():
-                        clean = False
-                        break
-                    threading.Event().wait(min(0.02, record["deadline"].remaining()))
-                if not clean:
-                    break
-            if clean:
-                for segment in dict.fromkeys(self.used):
-                    if record["deadline"].expired():
-                        clean = False
-                        break
+            for segment in dict.fromkeys(self.used):
+                try:
+                    if check:
+                        self._receipt_guard._check(self.plan, record)
+                    record["deadline"].require_remaining()
                     assignment = json.loads(segment.payload)
                     frozen = assignment["worker_prepare_identity"]
-                    try:
-                        self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
-                            hidden_states=np.zeros((1, frozen["hidden_size"]), dtype=np.float32),
-                            model_identity=ModelIdentity(**frozen["stage_model_identity"]),
-                            workflow_id="wf_" + record["request_id"], request_id=record["request_id"] + ":cleanup",
-                            stage_id=segment.node_id + ":cleanup", context_size=self.context_size,
-                            want_hidden=not segment.head, middle_channel="keep_head_layer_out",
-                            seq_ids=[0], positions=[0], cancel_event=threading.Event(), request_deadline=record["deadline"],
-                            cleanup_only=True)
-                    except Exception:
-                        clean = False
+                    receipt = self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
+                        hidden_states=np.zeros((1, frozen["hidden_size"]), dtype=np.float32),
+                        model_identity=ModelIdentity(**frozen["stage_model_identity"]),
+                        workflow_id="wf_" + record["request_id"], request_id=record["request_id"] + ":" + tag,
+                        stage_id=segment.node_id + ":" + tag, context_size=self.context_size,
+                        want_hidden=not segment.head, middle_channel="keep_head_layer_out",
+                        seq_ids=[0], positions=[0], cancel_event=record["cancel"] if check else threading.Event(),
+                        request_deadline=record["deadline"], cleanup_only=True,
+                        execution_attempts=self.attempts)
+                    if receipt.get("kv_cleared") is not True:
+                        raise ExecutionError("execution_kv_cleanup_receipt_invalid")
+                except Exception as exc:
+                    if check:
+                        raise
+                    # A failed owner must not prevent healthy later owners from
+                    # releasing KV while the same deadline still has budget.
+                    errors.append(exc)
         finally:
             self.cache = None
             if self.prefix_started:
                 try:
-                    # Native llama contexts own KV outside Python cache references.
                     reset = getattr(self.host, "clear_pipeline_kv", None)
                     if callable(reset):
                         reset()
                     elif getattr(self.host, "engine_type", "") == "llama_cpp":
-                        clean = False
-                except Exception:
-                    clean = False
+                        raise ExecutionError("execution_kv_cleanup_owner_missing")
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def cleanup(self, record):
+        clean = True
+        try:
+            if not self._drain_attempts(record):
+                clean = False
+                # A still-running remote attempt cannot share KV with cleanup.
+                self.cache = None
+                if self.prefix_started:
+                    self.host.clear_pipeline_kv()
+            else:
+                self._reset_pipeline_kv(record, tag="cleanup")
+        except Exception:
+            clean = False
+        finally:
+            self.cache = None
             if self.lock_held:
                 self.host.runtime_controller.execution_lock.release()
                 self.lock_held = False

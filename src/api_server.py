@@ -1286,6 +1286,12 @@ class ChatRequest(BaseModel):
         policy = SamplingPolicy.for_request(self)
         return policy.temperature, policy.top_p
 
+    def pipeline_speculation(self):
+        """Preserve omission so the execution owner can resolve its default."""
+        if self.speculative_gamma is None:
+            return {}
+        return {"speculative_gamma": self.speculative_gamma}
+
     message: str = Field(..., description="用户消息", min_length=1)
     image_data_urls: list[str] = Field(
         default_factory=list,
@@ -1296,6 +1302,14 @@ class ChatRequest(BaseModel):
     max_new_tokens: int = Field(default=1024, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    speculative_gamma: Optional[int] = Field(
+        default=None, strict=True, ge=1, le=8,
+        description=(
+            "Distributed greedy speculation: 1 disables it; 2..8 opt in. "
+            "Omitted/null uses the execution owner's QLH_SPECULATIVE_GAMMA (default 1). "
+            "Requires a supported full-attention qwen2 GGUF CPU deployment and one sequence."
+        ),
+    )
     show_thinking: bool = Field(default=False, description="启用深度思考展示")
     enable_thinking: Optional[bool] = Field(
         default=None,
@@ -2719,6 +2733,24 @@ def _distributed_path_available() -> bool:
         return False
 
 
+def _require_speculative_route(req: ChatRequest, *, local_fallback: bool = False) -> None:
+    """Only the distributed execution owner can admit explicit speculation."""
+    if req.speculative_gamma is None or req.speculative_gamma == 1:
+        return
+    application = getattr(scheduler, "_execution_app", None)
+    if (local_fallback or req.routing_preference == "local_only"
+            or _external_route_decision(req).use_external
+            or not _distributed_path_available()
+            or (scheduler._effective_role() == "master" and (
+                not application or not application.handles()
+                or not runtime_supports(model_manager, Capability.FORWARD_LAYERS)))):
+        raise coded_http_error(
+            400, "speculative_route_unsupported",
+            "speculative_gamma > 1 requires the distributed linear execution route; "
+            "local_only, external and local full-model routes are unsupported",
+        )
+
+
 def _routing_gate_error(req: ChatRequest) -> Optional[str]:
     """路由偏好预检（T9.5）：返回拒绝原因，None 表示允许继续。
 
@@ -3252,6 +3284,7 @@ def _execute_chat_full(
             409, "DISTRIBUTED_FORWARD_CONTEXT_CHANGED",
             "The worker forwarding context changed; retry the request",
         )
+    _require_speculative_route(req)
     routing_gate = _routing_gate_error(req)
     if routing_gate:
         raise HTTPException(400, routing_gate)
@@ -3343,6 +3376,7 @@ def _execute_chat_full(
                 max_new_tokens=req.max_new_tokens,
                 temperature=req.pipeline_sampling()[0],
                 top_p=req.pipeline_sampling()[1],
+                **req.pipeline_speculation(),
                 show_thinking=req.show_thinking,
                 enable_thinking=req.enable_thinking,
                 routing_preference=req.routing_preference,
@@ -3359,6 +3393,10 @@ def _execute_chat_full(
                     REQUEST_DEADLINE_EXCEEDED,
                     result.get("error") or "request deadline exceeded",
                 )
+            if result.get("status") != "ok" and req.speculative_gamma is not None and req.speculative_gamma > 1:
+                code = (result.get("reason_code") or (result.get("metrics") or {}).get("reason_code")
+                        or "speculative_forward_failed")
+                raise coded_http_error(503, code, result.get("error") or code)
             if result.get("status") == "ok":
                 response_text = result.get("content", "")
                 forward_metrics = _augment_chat_metrics(
@@ -3420,6 +3458,8 @@ def _execute_chat_full(
             raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            if req.speculative_gamma is not None and req.speculative_gamma > 1:
+                raise coded_http_error(503, getattr(e, "code", "speculative_forward_failed"), str(e)) from e
             logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
             _enforce_distributed_required(req, detail=str(e))
 
@@ -3459,6 +3499,7 @@ def _execute_chat_full(
                 max_new_tokens=req.max_new_tokens,
                 temperature=req.pipeline_sampling()[0],
                 top_p=req.pipeline_sampling()[1],
+                **req.pipeline_speculation(),
                 _context_revision=prepared_context.revision,
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
@@ -3475,7 +3516,8 @@ def _execute_chat_full(
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
-                if pipeline_result.get("execution_owner") == "linear":
+                if (pipeline_result.get("execution_owner") == "linear"
+                        or (req.speculative_gamma is not None and req.speculative_gamma > 1)):
                     code = pipeline_result.get("reason_code") or "request_execution_failed"
                     raise coded_http_error(504 if code == REQUEST_DEADLINE_EXCEEDED else 503,
                                            code, pipeline_result["error"])
@@ -3571,6 +3613,7 @@ def _execute_chat_full(
             logger.warning(f"流水线推理异常: {e}，回退到本地推理")
             _enforce_distributed_required(req, detail=str(e))
 
+    _require_speculative_route(req, local_fallback=True)
     if req.routing_preference == "distributed_required":
         raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
 
@@ -5568,6 +5611,7 @@ _scheduler_callbacks = SchedulerCallbackSet(
     snapshot_recent_logs=_snapshot_recent_logs,
     filter_recent_logs=_filter_recent_logs,
     format_model_response=_format_model_response,
+    supports_layer_multi_position_argmax=lambda: _get_layer_stage_host().supports_layer_multi_position_argmax(),
 )
 
 

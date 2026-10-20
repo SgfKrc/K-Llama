@@ -3,6 +3,7 @@ from __future__ import annotations
 from qlh_core.contracts.deadline import request_stop_reason
 from qlh_core.contracts.execution import ExecutionError, StageIdentity
 from qlh_core.execution.stopping import StopPolicy
+from qlh_core.contracts.token_output import tail_token
 
 
 class LinearExecutor:
@@ -38,7 +39,7 @@ class LinearExecutor:
                 receipt = self.ports.stage(segment, identity, hidden, record)
                 self._check(plan, record)
                 hidden = self.accept(identity, receipt)
-            token = int(hidden) if plan.segments[-1].head else int(self.ports.head(hidden))
+            token = tail_token(hidden) if plan.segments[-1].head else int(self.ports.head(hidden))
             if token not in policy.eos_ids:
                 generated.append(token)
             delta = policy.push(token, self.ports.decode(generated))
