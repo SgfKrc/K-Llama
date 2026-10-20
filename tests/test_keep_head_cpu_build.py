@@ -6,6 +6,7 @@ No model, device, signing key, package build, download, or production DLL is use
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -15,6 +16,8 @@ import subprocess
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "scripts/model_tools/build_keep_head_cpu.ps1"
@@ -24,7 +27,7 @@ DLLS = (
     "libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll", "libgomp-1.dll",
 )
 
-# One framework executable copied under the four tool names. It logs argv as
+# One framework executable linked under the four tool names. It logs argv as
 # individual lines so the tests exercise real PowerShell/Windows quoting.
 FAKE_TOOL = r'''using System;
 using System.IO;
@@ -90,6 +93,61 @@ class NativeTool {
 '''
 
 
+def retry_fixture_sharing(operation):
+    """Only retry Windows sharing violations while preparing fake tools."""
+    for attempt in range(12):
+        try:
+            return operation()
+        except OSError as error:
+            if getattr(error, "winerror", None) != 32 or attempt == 11:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+
+def exclusive_read(path):
+    # A completed managed process can leave a scanner holding the image briefly.
+    # Unlike Python's open(), FileShare.None also detects those remaining handles.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    handle = create(str(path), 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, OPEN_EXISTING
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    if not close(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def pin_fixture_image(path):
+    """Keep a fake image readable/executable while excluding transient writers."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    # Share reads and deletion, but no write opens between successive tool starts.
+    handle = create(str(path), 0x80000000, 0x1 | 0x4, None, 3, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    def release():
+        if not close(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    return release
+
+
 @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe") and shutil.which("git.exe"),
                      "requires Windows PowerShell and Git; no native compiler required")
 class KeepHeadCpuBuildTests(unittest.TestCase):
@@ -152,12 +210,17 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         (scripts / "llama_quantize.lock.json").write_text(json.dumps(lock, ensure_ascii=False), encoding="utf-8")
         self.tools = self.root / "build/toolchain with spaces"
         self.tools.mkdir(parents=True)
+        # Reuse one compiled image instead of writing four fresh EXEs for every
+        # case. Each path still exercises the real tool name and space quoting.
         for name in ("gcc.exe", "g++.exe", "mingw32-make.exe", "cmake.exe"):
-            shutil.copyfile(self.fake, self.tools / name)
+            os.link(self.fake, self.tools / name)
         for name in DLLS[5:]:
             (self.tools / name).write_bytes(("runtime " + name).encode())
         self.log = self.root / "build/tool-argv.log"
         self.env["QLH_TEST_TOOL_LOG"] = str(self.log)
+        self.probe_log = self.root / "build/tool-readiness.log"
+        for name in ("gcc.exe", "g++.exe", "mingw32-make.exe", "cmake.exe"):
+            self.ready_fake_tool(self.tools / name)
         self.build = self.root / "build/fresh build"
         self.output = self.root / "build/separate output"
         self.command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BUILDER),
@@ -168,23 +231,25 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         return subprocess.run(["git.exe", "-C", str(directory), *args], env=self.env,
                               capture_output=True, text=True, errors="replace", check=True, timeout=20)
 
+    def ready_fake_tool(self, path):
+        def probe():
+            result = subprocess.run([str(path), "--version"], cwd=self.tmp.name,
+                                    env=dict(self.env, QLH_TEST_TOOL_LOG=str(self.probe_log)),
+                                    capture_output=True, text=True, errors="replace", timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), f"{path.stem} fake 1.0",
+                             result.stdout + result.stderr)
+        retry_fixture_sharing(probe)
+        retry_fixture_sharing(lambda: exclusive_read(path))
+
     def run_builder(self, code=0, **env):
-        # Windows can refuse to launch a tool image that a just-written copy — or the
-        # security/indexer scan of it — still holds. PowerShell surfaces that either as
-        #   "Program 'x.exe' failed to run: The process cannot access the file ...
-        #    being used by another process"                        (WinError 32)
-        # or as a plain access denial in the middle of the same race             (5).
-        # It is a timing race on freshly created images and clears on retry. Only these
-        # signatures are retried, so any real contract violation still fails at once.
-        racing = ("being used by another process", "Access is denied", "拒绝访问",
-                  "[WinError 32]", "[WinError 5]")
-        for attempt in range(12):
+        # Never replay configuration/build against outputs from a previous launch.
+        with ExitStack() as images:
+            tools = getattr(self, "tools", None)
+            for path in sorted(tools.glob("*.exe")) if tools is not None else ():
+                images.callback(retry_fixture_sharing(lambda: pin_fixture_image(path)))
             result = subprocess.run(self.command, cwd=self.tmp.name, env=dict(self.env, **env),
                                     capture_output=True, text=True, errors="replace", timeout=45)
-            output = result.stdout + result.stderr
-            if result.returncode == code or not any(token in output for token in racing):
-                break
-            time.sleep(0.5 * (attempt + 1))
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
 
@@ -229,14 +294,15 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
             with self.subTest(name=name):
                 path = self.tools / name
                 contents = path.read_bytes()
-                path.unlink()
+                retry_fixture_sharing(path.unlink)
                 try:
                     result = self.run_builder(1)
                     self.assertIn(name, result.stdout)
                     self.assertFalse(self.log.exists())
                     self.assertFalse(self.build.exists())
                 finally:
-                    path.write_bytes(contents)
+                    retry_fixture_sharing(lambda: path.write_bytes(contents))
+                    self.ready_fake_tool(path)
 
     def test_missing_runtime_fails_before_configuration(self):
         (self.tools / "libgomp-1.dll").unlink()
@@ -326,6 +392,134 @@ class CpuBatchNativeGateTests(unittest.TestCase):
             result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(batch)],
                                     env=env, capture_output=True, text=True, errors="replace", timeout=20)
             self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
+
+
+class FakeToolReadinessTests(unittest.TestCase):
+    """Fixture retries must never turn a real builder failure into a rerun."""
+
+    def setUp(self):
+        self.builder = KeepHeadCpuBuildTests("test_fresh_build_spaces_custom_output_and_safe_config")
+        self.builder.command = ["unused fixture builder"]
+        self.builder.tmp = SimpleNamespace(name="unused fixture directory")
+        self.builder.env = {"QLH_TEST_TOOL_LOG": "formal.log"}
+        self.builder.probe_log = Path("readiness.log")
+        self.process = self.enterContext(patch.object(subprocess, "run"))
+        self.sleep = self.enterContext(patch.object(time, "sleep"))
+        self.exclusive = self.enterContext(patch(f"{__name__}.exclusive_read"))
+
+    @staticmethod
+    def result(code=0, output="gcc fake 1.0\n"):
+        return subprocess.CompletedProcess([], code, output, "")
+
+    @staticmethod
+    def windows_error(code):
+        error = OSError(f"fixture WinError {code}")
+        error.winerror = code
+        return error
+
+    def test_probe_retries_only_launch_sharing_and_keeps_separate_log(self):
+        self.process.side_effect = [self.windows_error(32), self.result()]
+
+        self.builder.ready_fake_tool(Path("gcc.exe"))
+
+        self.assertEqual(self.process.call_count, 2)
+        self.sleep.assert_called_once_with(0.5)
+        self.exclusive.assert_called_once_with(Path("gcc.exe"))
+        for call in self.process.call_args_list:
+            self.assertEqual(call.args[0], ["gcc.exe", "--version"])
+            self.assertEqual(call.kwargs["env"]["QLH_TEST_TOOL_LOG"], "readiness.log")
+        self.assertEqual(self.builder.env["QLH_TEST_TOOL_LOG"], "formal.log")
+
+    def test_exclusive_read_waits_after_successful_probe_without_relaunch(self):
+        self.process.return_value = self.result()
+        self.exclusive.side_effect = [self.windows_error(32), self.windows_error(32), None]
+
+        self.builder.ready_fake_tool(Path("gcc.exe"))
+
+        self.process.assert_called_once()
+        self.assertEqual(self.exclusive.call_count, 3)
+        self.assertEqual([call.args for call in self.sleep.call_args_list], [(0.5,), (1.0,)])
+
+    def test_probe_access_denied_and_missing_file_propagate_without_retry(self):
+        for code in (5, 2):
+            with self.subTest(winerror=code):
+                error = self.windows_error(code)
+                self.process.side_effect = error
+                with self.assertRaises(OSError) as caught:
+                    self.builder.ready_fake_tool(Path("gcc.exe"))
+                self.assertIs(caught.exception, error)
+        self.assertEqual(self.process.call_count, 2)
+        self.sleep.assert_not_called()
+        self.exclusive.assert_not_called()
+
+    def test_nonzero_or_empty_probe_output_fails_without_retry(self):
+        for result in (self.result(1, "being used by another process"), self.result(0, "")):
+            with self.subTest(returncode=result.returncode):
+                self.process.return_value = result
+                with self.assertRaises(AssertionError):
+                    self.builder.ready_fake_tool(Path("gcc.exe"))
+        self.assertEqual(self.process.call_count, 2)
+        self.sleep.assert_not_called()
+        self.exclusive.assert_not_called()
+
+    def test_file_delete_and_restore_retry_only_sharing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fake.exe"
+            path.write_bytes(b"fixture")
+            for operation in (path.unlink, lambda: path.write_bytes(b"restored")):
+                calls = []
+                def locked_once():
+                    calls.append(1)
+                    if len(calls) == 1:
+                        raise self.windows_error(32)
+                    return operation()
+                retry_fixture_sharing(locked_once)
+                self.assertEqual(len(calls), 2)
+            self.assertEqual(path.read_bytes(), b"restored")
+        self.assertEqual([call.args for call in self.sleep.call_args_list], [(0.5,), (0.5,)])
+
+    def test_file_operation_nonsharing_error_is_never_retried(self):
+        for code in (5, 2, None):
+            with self.subTest(winerror=code):
+                error = self.windows_error(code)
+                with patch.object(Path, "unlink", side_effect=error) as unlink:
+                    with self.assertRaises(OSError) as caught:
+                        retry_fixture_sharing(Path("fake.exe").unlink)
+                    self.assertIs(caught.exception, error)
+                    unlink.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_sharing_exhaustion_is_bounded_and_preserves_original_error(self):
+        self.process.return_value = self.result()
+        error = self.windows_error(32)
+        self.exclusive.side_effect = error
+
+        with self.assertRaises(OSError) as caught:
+            self.builder.ready_fake_tool(Path("gcc.exe"))
+
+        self.assertIs(caught.exception, error)
+        self.process.assert_called_once()
+        self.assertEqual(self.exclusive.call_count, 12)
+        self.assertEqual([call.args for call in self.sleep.call_args_list],
+                         [(0.5 * attempt,) for attempt in range(1, 12)])
+
+    def test_builder_failures_are_never_replayed_or_replaced(self):
+        outputs = (
+            "[FAIL] Unexpected CMake cache value for GGML_NATIVE\n",
+            "[FAIL] Expected x64 MinGW compiler, got \n",
+            "[FAIL] Program 'gcc.exe' failed to run: Access is denied [WinError 5]\n",
+            "Program 'gcc.exe' failed to run: being used by another process\n",
+        )
+        for output in outputs:
+            with self.subTest(output=output):
+                expected = self.result(1, output)
+                self.process.return_value = expected
+                self.assertIs(self.builder.run_builder(1), expected)
+                with self.assertRaises(AssertionError):
+                    self.builder.run_builder(23)
+        self.assertEqual(self.process.call_count, 2 * len(outputs))
+        self.sleep.assert_not_called()
+        self.exclusive.assert_not_called()
 
 
 if __name__ == "__main__":
