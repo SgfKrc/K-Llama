@@ -67,5 +67,22 @@ def require_runtime_receipt(assignment, receipt):
     if not valid:
         raise ModelControlError("deployment_runtime_receipt_mismatch")
     budget = assignment.get("required_bytes", assignment.get("capacity_bytes", 0))
-    if budget and receipt["materialized_bytes"] + spec.kv_cache_bytes > budget:
+    if spec.materialization == "safetensors_layer_offload":
+        # CPU mmap owners and the largest CUDA execution unit have independent
+        # budgets. The complete host residency must never be compared to VRAM.
+        names = ("device_weight_bytes", "host_source_bytes", "host_conversion_bytes")
+        if (not spec.device.startswith("cuda:")
+                or any(type(receipt.get(name)) is not int or receipt[name] < 0 for name in names)
+                or receipt["device_weight_bytes"] <= 0
+                or receipt["host_source_bytes"] != receipt["materialized_bytes"]):
+            raise ModelControlError("deployment_runtime_receipt_mismatch")
+        host_budget = assignment.get("host_required_bytes")
+        host_capacity = assignment.get("host_capacity_bytes")
+        if (type(host_budget) is not int or type(host_capacity) is not int
+                or not 0 < host_budget <= host_capacity):
+            raise ModelControlError("deployment_host_budget_missing")
+        if (receipt["host_source_bytes"] + receipt["host_conversion_bytes"] > host_budget
+                or (budget and receipt["device_weight_bytes"] + spec.kv_cache_bytes > budget)):
+            raise ModelControlError("deployment_materialization_budget_exceeded")
+    elif budget and receipt["materialized_bytes"] + spec.kv_cache_bytes > budget:
         raise ModelControlError("deployment_materialization_budget_exceeded")

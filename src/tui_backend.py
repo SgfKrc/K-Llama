@@ -37,7 +37,8 @@ class BackendSupervisor:
         # listener. Preserve the local IPv6 loopback default without exposing
         # any non-loopback interface unless explicitly configured.
         default_bind = "::1" if self.host == "::1" else "127.0.0.1"
-        listener_environment = os.environ if environment is None else environment
+        self.environment = None if environment is None else dict(environment)
+        listener_environment = os.environ if self.environment is None else self.environment
         configured_bind = (
             listener_environment.get("QLH_BACKEND_HOST") if bind_host is None else bind_host
         )
@@ -98,7 +99,7 @@ class BackendSupervisor:
         # api_server 的日志仍保留在文件和内存 handler；TUI 独占终端，
         # 不允许后端启动/访问日志穿透到同一个 stdout/stderr。
         if hasattr(api_server, "_get_app_runtime"):
-            api_server._get_app_runtime().configure_listener(self.port)
+            api_server._get_app_runtime().configure_listener(self.port, environment=self.environment)
         api_server._console_logging_enabled = False
         self._silence_console_logging()
         self._set_status("启动 API 服务")

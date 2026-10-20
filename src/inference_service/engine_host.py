@@ -2607,7 +2607,10 @@ class EngineHost:
                 expected_components.add("embedding")
             if manifest.get("has_lm_head", end == manifest["total_layers"]):
                 expected_components.add("lm_head")
-            if (spec.materialization != "safetensors_key_filtered"
+            if (spec.materialization not in {"safetensors_key_filtered", "safetensors_layer_offload"}
+                    or (spec.materialization == "safetensors_layer_offload"
+                        and not spec.device.startswith("cuda:"))
+                    or {"fp16": "float16", "fp32": "float32"}.get(spec.quant_type) != spec.dtype
                     or set(spec.components) != expected_components
                     or spec.kv_policy != "dynamic" or spec.sequence_count != 1
                     or spec.kv_device != spec.device or spec.kv_dtype != spec.dtype
@@ -2644,10 +2647,20 @@ class EngineHost:
                 parameters = (list(model.parameters())
                               if callable(getattr(model, "parameters", None)) else [])
                 floating = [parameter for parameter in parameters if parameter.is_floating_point()]
-                if (not floating or manager.quant_type != spec.quant_type
-                        or any(str(parameter.device) != spec.device
-                               or str(parameter.dtype).removeprefix("torch.") != spec.dtype
-                               for parameter in floating)):
+                if spec.materialization == "safetensors_layer_offload":
+                    try:
+                        placement = manager.layer_offload_observation()
+                    except (AttributeError, ValueError) as exc:
+                        raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch") from exc
+                    valid = (placement["execution_device"] == spec.device
+                             and placement["execution_dtype"] == spec.dtype
+                             and placement["resident_source_bytes"] > 0
+                             and placement["device_weight_bytes"] > 0)
+                else:
+                    valid = not any(str(parameter.device) != spec.device
+                                    or str(parameter.dtype).removeprefix("torch.") != spec.dtype
+                                    for parameter in floating)
+                if not floating or manager.quant_type != spec.quant_type or not valid:
                     raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch")
                 # Internal policy snapshot only; actual materialization receipts
                 # and assignment budget reconciliation are a deployment concern.
@@ -2729,10 +2742,15 @@ class EngineHost:
             if cancel_event.is_set() or not runtime.loaded:
                 raise WorkerPrepareError("worker_prepare_cancelled")
             if spec is not None:
+                placement = None
                 if runtime.manager is not None:
-                    parameters = list(runtime.manager.model.parameters())
-                    buffers = list(runtime.manager.model.buffers()) if callable(getattr(runtime.manager.model, "buffers", None)) else []
-                    materialized = sum(p.numel() * p.element_size() for p in parameters + buffers)
+                    if spec.materialization == "safetensors_layer_offload":
+                        placement = runtime.manager.layer_offload_observation()
+                        materialized = placement["resident_source_bytes"]
+                    else:
+                        parameters = list(runtime.manager.model.parameters())
+                        buffers = list(runtime.manager.model.buffers()) if callable(getattr(runtime.manager.model, "buffers", None)) else []
+                        materialized = sum(p.numel() * p.element_size() for p in parameters + buffers)
                 else:
                     observation = runtime.upstream.materialization_observation()
                     for field in ("context_size", "batch_size", "device", "dtype", "quant_type", "kv_device", "kv_dtype", "sequence_count"):
@@ -2744,6 +2762,15 @@ class EngineHost:
                     "memory_scope": "weight_tensors", "layer_range": deepcopy(identity["layer_range"]),
                     "artifact_sha256": identity["artifact_sha256"],
                 }
+                if placement is not None:
+                    # Worker commands bind identity/policy but carry no budget.
+                    # The coordinator reconciles these actual measurements
+                    # against the frozen assignment's host and CUDA budgets.
+                    runtime.materialization_receipt.update(
+                        device_weight_bytes=placement["device_weight_bytes"],
+                        host_source_bytes=placement["resident_source_bytes"],
+                        host_conversion_bytes=placement["host_conversion_bytes"],
+                    )
             return runtime
         except Exception as exc:
             if runtime.upstream is None:

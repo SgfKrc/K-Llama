@@ -177,9 +177,16 @@ class WorkerPrepareCoordinatorMixin:
                     validate_runtime_receipt(receipt, identity=identity)
                 except WorkerPrepareError:
                     return
-                budget = expected.get("required_bytes", expected.get("capacity_bytes", 0))
-                if budget and receipt["materialized_bytes"] + receipt["load_spec"]["kv_cache_bytes"] > budget:
-                    ack.update(status="error", error="prepare_materialization_budget_exceeded")
+                if expected.get("load_spec", {}).get("materialization") == "safetensors_layer_offload":
+                    from qlh_core.contracts.deployment import ModelControlError, require_runtime_receipt
+                    try:
+                        require_runtime_receipt(expected, receipt)
+                    except ModelControlError as exc:
+                        ack.update(status="error", error=exc.code)
+                else:
+                    budget = expected.get("required_bytes", expected.get("capacity_bytes", 0))
+                    if budget and receipt["materialized_bytes"] + receipt["load_spec"]["kv_cache_bytes"] > budget:
+                        ack.update(status="error", error="prepare_materialization_budget_exceeded")
             if ack["status"] == "error":
                 if phase == expected.get("phase") and transaction.get("phase") in {"preparing", "committing", "committing_global", "ready"}:
                     transaction.setdefault("acks", {})[node_id] = deepcopy(ack)

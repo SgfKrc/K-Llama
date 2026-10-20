@@ -7,6 +7,7 @@ ranges describe registered assets; they never establish a loaded-ready ACK.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -157,6 +158,25 @@ def _annotate(plan, preferred, strategy):
     return result
 
 
+def _same_placement_quality(candidate, baseline):
+    """Cached assets break placement ties; they cannot change node policy/work."""
+    policy = baseline.get("placement_policy")
+    if not isinstance(policy, Mapping) or candidate.get("placement_policy") != policy:
+        return False
+    left, right = candidate.get("placement_objective"), baseline.get("placement_objective")
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    if left.get("node_count") != right.get("node_count"):
+        return False
+    for field in ("weighted_work_cost", "memory_pressure_cost", "score_total"):
+        lhs, rhs = left.get(field), right.get(field)
+        if (type(lhs) not in (int, float) or type(rhs) not in (int, float)
+                or not math.isfinite(lhs) or not math.isfinite(rhs)
+                or not math.isclose(lhs, rhs, rel_tol=1e-12, abs_tol=1e-15)):
+            return False
+    return True
+
+
 def plan_segment_supply_reuse(
     descriptors: dict[str, dict], capacity_records: list[dict], nodes: list[dict], *,
     planner: Callable[..., dict], source_model_id: str, source_model_sha256: str,
@@ -177,10 +197,11 @@ def plan_segment_supply_reuse(
     A model's physical id/digest and supported engine/format must match its
     artifact. Installed engines, node.engine and guessed formats are insufficient.
 
-    First try all verified worker ranges jointly. On rejection, add individual
-    assets by descending advertised decoder weight bytes (never runtime-scaled
-    estimates); keep an addition only if admission retains every fixed worker.
-    One worker can execute one segment. Calls are bounded by candidate_count + 2.
+    Solve unrestricted placement first. Verified cached ranges may break ties
+    only when the node-count policy and capability/memory objective are equal
+    to that baseline. Then try ranges jointly and individually by descending
+    advertised decoder bytes. One worker executes one segment. Calls remain
+    bounded by candidate_count + 2; cache metadata cannot override capability.
     Metadata distinguishes joint_fixed, greedy_fixed and unrestricted selection;
     it describes target preference, never execution or loaded readiness.
     """
@@ -190,6 +211,9 @@ def plan_segment_supply_reuse(
         engine_by_node=engine_by_node, capabilities_by_node=capabilities_by_node,
         alignment=alignment,
     )
+    baseline = planner(preferred_ranges={})
+    if not baseline.get("admitted"):
+        return _annotate(baseline, {}, "unrestricted")
     if candidates:
         joint = {}
         for item in candidates:
@@ -198,7 +222,8 @@ def plan_segment_supply_reuse(
                  for node_id, spans in sorted(joint.items())}
         joint = {node_id: [list(span) for span in spans] for node_id, spans in joint.items()}
         plan = planner(preferred_ranges=copy.deepcopy(joint))
-        if _preserves(plan, joint, total, alignment, engine_by_node):
+        if (_preserves(plan, joint, total, alignment, engine_by_node)
+                and _same_placement_quality(plan, baseline)):
             return _annotate(plan, joint, "joint_fixed")
         fixed, selected = {}, None
         for item in candidates:
@@ -206,8 +231,9 @@ def plan_segment_supply_reuse(
                 continue
             trial = {**fixed, item.node_id: [[item.start, item.end]]}
             plan = planner(preferred_ranges=copy.deepcopy(trial))
-            if _preserves(plan, trial, total, alignment, engine_by_node):
+            if (_preserves(plan, trial, total, alignment, engine_by_node)
+                    and _same_placement_quality(plan, baseline)):
                 fixed, selected = trial, plan
         if selected is not None:
             return _annotate(selected, fixed, "greedy_fixed")
-    return _annotate(planner(preferred_ranges={}), {}, "unrestricted")
+    return _annotate(baseline, {}, "unrestricted")

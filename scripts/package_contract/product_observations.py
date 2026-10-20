@@ -433,7 +433,49 @@ def _materialization(runtime, identity, root, artifact, span):
         count += math.prod(shape) * _int(item.get("element_size"), "DL tensor element_size")
     require(observed_layers == set(range(*span)), "DL selective materialization omits decoder layers")
     require(count == _int(proof.get("materialized_bytes"), "DL materialized_bytes"), "DL materialization byte accounting mismatch")
+    return proof
 
+
+
+
+def _offload_mapped_shards(proof, artifact):
+    """Allow only observed CPU mmap sources of a verified selective load."""
+    if "layer_offload" not in proof:
+        return set()
+    observed = _dict(proof["layer_offload"], "DL actual layer offload observation")
+    require(observed.get("materialization") == "safetensors_layer_offload"
+            and observed.get("source_device") == "cpu"
+            and observed.get("source_dtype") == "artifact"
+            and observed.get("active") is False
+            and isinstance(observed.get("execution_device"), str)
+            and re.fullmatch(r"cuda:[0-9]+", observed["execution_device"])
+            and observed.get("execution_dtype") in {"float16", "float32"},
+            "DL actual CPU/CUDA layer offload ownership missing")
+    host = _int(observed.get("resident_source_bytes"), "DL offload CPU source bytes")
+    device = _int(observed.get("device_weight_bytes"), "DL offload CUDA unit bytes")
+    target = _int(observed.get("target_weight_bytes"), "DL offload target weight bytes")
+    conversion = _int(observed.get("host_conversion_bytes"), "DL offload CPU conversion bytes", 0)
+    require(host >= proof["materialized_bytes"] and conversion <= device <= target,
+            "DL offload weight domains differ from materialization")
+    directory = _path(artifact["path"])
+    require(_path(proof.get("artifact_path")) == directory,
+            "DL offload source directory differs from rehashed artifact")
+    flavor = ntpath if "\\" in directory or re.match(r"^[A-Za-z]:", directory) else posixpath
+    require(flavor.isabs(directory), "DL offload artifact directory must be absolute")
+    shards = set()
+    for item in proof["tensor_metadata"].values():
+        shard = _path(item["source_file"])
+        try:
+            inside = flavor.commonpath((directory, shard)) == directory
+        except ValueError:
+            inside = False
+        require(flavor.isabs(shard) and inside and shard != directory
+                and shard.lower().endswith(".safetensors"),
+                "DL offload source shard outside rehashed artifact directory")
+        require(_int(item.get("source_element_size"), "DL offload source element_size")
+                == item["element_size"], "DL offload CPU source dtype was not retained")
+        shards.add(shard)
+    return shards
 
 
 def _mapped_artifact_aliases(process, artifact, paths, *, platform, engine, start, end):
@@ -570,19 +612,22 @@ def derive_node_observation(raw, *, expected_revision, expected_node_id,
         require(digest == expected_assignment["artifact_sha256"], "loaded artifact differs from assignment artifact")
     loader = _int(runtime.get("loader_pid"), "native loader_pid")
     require(loader in by_pid, "native loader child missing from process observation")
+    offload_shards = set()
+    if engine == "pytorch":
+        require(loader == root["pid"], "DL materialization loader differs from root process")
+        proof = _materialization(runtime, identity, root, artifact, span)
+        offload_shards = _offload_mapped_shards(proof, artifact)
     mapped = []
     for proc in processes:
         paths = [_path(p) for p in _list(proc.get("model_mappings"), "process model_mappings")]
         aliases = _mapped_artifact_aliases(proc, artifact, paths, platform=platform,
                                            engine=engine, start=start, end=end)
-        require(all(p == artifact_path or p in aliases for p in paths),
+        allowed_shards = offload_shards if proc["pid"] == loader else set()
+        require(all(p == artifact_path or p in aliases or p in allowed_shards for p in paths),
                 "unexpected/unproven/full-model mapping in process tree")
         if proc["pid"] == loader:
             mapped = [artifact_path if p in aliases else p for p in paths]
-    if engine == "pytorch":
-        require(loader == root["pid"], "DL materialization loader differs from root process")
-        _materialization(runtime, identity, root, artifact, span)
-    else:
+    if engine == "llama_cpp":
         require(artifact_path in mapped, "native loader has no mapping for verified loaded segment")
         require(runtime.get("native_layer_count") == span[1]-span[0]
                 and type(runtime.get("native_layer_count")) is int, "native runtime decoder count missing/mismatched")

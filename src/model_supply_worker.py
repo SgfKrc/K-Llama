@@ -662,7 +662,12 @@ class ModelSupplyWorker:
                 is_cuda = str(device).startswith("cuda")
                 runtime = {"execution_device": "cuda" if is_cuda else "cpu",
                            "target_element_size": torch.empty((), dtype=dtype).element_size(),
-                           "available_bytes": int(torch.cuda.mem_get_info(device)[0]) if is_cuda else max(0, available_memory)}
+                           "available_bytes": max(0, available_memory),
+                           "materializations": (["safetensors_key_filtered", "safetensors_layer_offload"]
+                                                if is_cuda else ["safetensors_key_filtered"])}
+                if is_cuda:
+                    from cuda_memory_budget import sample_cuda_memory_budget
+                    runtime.update(sample_cuda_memory_budget(torch, device))
             except (ImportError, OSError, RuntimeError):
                 # The engine remains discoverable, but a new supply plan cannot
                 # admit it without a real runtime dtype and memory budget.

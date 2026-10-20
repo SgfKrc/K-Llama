@@ -252,7 +252,12 @@ def test_actual_selected_head_0_4_does_not_lock_the_second_full_source_solve(tmp
     pointer = (worker.root / "current.json").read_bytes()
     second = candidate()
     assert second["admitted"], second
-    assert [(a["start_layer"], a["end_layer"]) for a in second["assignments"]] == [(0, 7), (7, 8)]
+    head, tail = second["assignments"]
+    assert head["node_id"] == "master" and head["start_layer"] == 0
+    assert 4 < head["end_layer"] < 8
+    assert tail["start_layer"] == head["end_layer"] and tail["end_layer"] == 8
+    assert all(item["required_bytes"] <= item["capacity_bytes"] for item in second["assignments"])
+    assert second["placement_policy"]["objective"] == "capability_weighted_work_square"
     assert (worker.root / "current.json").read_bytes() == pointer
     assert str(worker.selected_model_path()) == selected["model_path"]
     print(json.dumps({"registered_range": selected["manifest"]["layer_range"],

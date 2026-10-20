@@ -331,8 +331,10 @@ def test_layer_budget_supersedes_fixed_layer_ranges():
 
     assert plan["admitted"] is True
     by_node = {item["node_id"]: item for item in plan["assignments"]}
-    assert by_node["worker-a"]["layers_count"] == 3
+    # Equal capability balances decoder work; local_cut still unlocks the old [0,1).
+    assert by_node["worker-a"]["layers_count"] == 2
     assert by_node["worker-a"]["start_layer"] == 0
+    assert by_node["worker-a"]["layers_count"] <= 3
 
 
 def test_layer_budget_without_local_cut_keeps_fixed_ranges():

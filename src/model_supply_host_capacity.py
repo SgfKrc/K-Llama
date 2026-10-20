@@ -1,7 +1,7 @@
 """Metadata-only RAM constraints for staging CUDA source tensors.
 
 GPU admission remains with the supply solver. This helper constrains that
-solver to proper layer ranges whose exact source tensors also fit host RAM,
+solver to proper layer ranges whose source mappings and one dtype conversion also fit host RAM,
 using the same boundary charges and rounding as the supply host post-check.
 """
 from __future__ import annotations
@@ -34,9 +34,11 @@ def allowed_host_layer_ranges(
 ) -> list[list[int]]:
     """Return all aligned proper ranges admitted by the real host RAM budget.
 
-    Master ranges start at zero and charge embedding, final norm and other
-    tensors. Every remote range charges all four boundary components, matching
-    the conservative source staging post-check even for middle segments.
+    Master ranges start at zero. Each range charges final norm and other
+    tensors plus its owned embedding or tail head, matching runtime selection.
+    Tied tail heads charge the shared embedding source exactly once.
+    The selected dtype may require one extra converted CPU tensor before CUDA
+    transfer. Its maximum is charged once, never summed across layers.
     Runtime/VRAM byte estimates and inventory ranges do not affect this bound.
 
     Malformed metadata raises HostCapacityProjectionError (a ValueError).
@@ -75,8 +77,17 @@ def allowed_host_layer_ranges(
             "source_component_weight_bytes must declare all four boundaries with nonnegative integer sizes",
         )
 
-    keys = ("embedding", "final_norm", "other") if node_id == "master" else _BOUNDARIES
-    boundary_bytes = sum(components[key] for key in keys)
+    conversion_layers = projection.get("runtime_conversion_layer_max_bytes")
+    conversion_components = projection.get("runtime_conversion_component_max_bytes")
+    if conversion_layers is None and conversion_components is None:
+        conversion_layers = [0] * total
+        conversion_components = dict.fromkeys(_BOUNDARIES, 0)
+    elif (not isinstance(conversion_layers, (list, tuple)) or len(conversion_layers) != total
+            or any(type(size) is not int or size < 0 for size in conversion_layers)
+            or not isinstance(conversion_components, Mapping)
+            or any(key not in conversion_components for key in _BOUNDARIES)
+            or any(type(size) is not int or size < 0 for size in conversion_components.values())):
+        raise HostCapacityProjectionError("invalid per-tensor CPU conversion metadata")
     prefix = [0]
     for size in layers:
         prefix.append(prefix[-1] + size)
@@ -90,7 +101,17 @@ def allowed_host_layer_ranges(
         for end in range(start + alignment, total + 1, alignment):
             if end - start == total:
                 continue
+            keys = ["final_norm", "other"]
+            tied = projection.get("tie_word_embeddings") is True
+            if start == 0 or (end == total and tied):
+                keys.append("embedding")
+            if end == total and not tied:
+                keys.append("lm_head")
+            boundary_bytes = sum(components[key] for key in keys)
+            boundary_conversion = max((conversion_components[key] for key in keys), default=0)
             source_bytes = prefix[end] - prefix[start] + boundary_bytes
+            conversion_bytes = max(boundary_conversion, max(conversion_layers[start:end], default=0))
+            source_bytes += conversion_bytes
             # Costs increase with end. Never use a mean/max layer multiplier:
             # the source bytes of this particular interval govern host staging.
             if source_bytes > budget:

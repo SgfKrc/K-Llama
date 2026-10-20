@@ -116,15 +116,15 @@ class TestComputeNodeWeight:
     @pytest.mark.parametrize(
         ("profile_name", "profile", "expected_weight"),
         [
-            ("cuda_workstation", PROFILE_WORKSTATION, 160.0),
-            ("cuda_laptop", PROFILE_LAPTOP, 99.16666666666667),
-            # 集显不计专用显存分：仅 RAM 3.75 + CPU 10.0。
-            ("integrated_ultrabook", PROFILE_ULTRABOOK, 13.75),
-            ("edge", PROFILE_EDGE, 6.875),
-            ("gpu_field_missing", PROFILE_NO_GPU, 12.5),
-            ("empty", {}, 8.125),
-            ("none", None, 8.125),
-            ("mobile_arm", PROFILE_MOBILE, 8.4375),
+            ("cuda_workstation", PROFILE_WORKSTATION, 130.0),
+            ("cuda_laptop", PROFILE_LAPTOP, 91.66666666666667),
+            # 缺少 available_gb 时 RAM 分为 0；集显仅计 CPU 10.0。
+            ("integrated_ultrabook", PROFILE_ULTRABOOK, 10.0),
+            ("edge", PROFILE_EDGE, 5.0),
+            ("gpu_field_missing", PROFILE_NO_GPU, 8.75),
+            ("empty", {}, 6.25),
+            ("none", None, 6.25),
+            ("mobile_arm", PROFILE_MOBILE, 7.5),
         ],
     )
     def test_fixed_profile_weight_is_formula_stable(
@@ -144,7 +144,7 @@ class TestComputeNodeWeight:
         # 8GB 专用显存 16.6667 分 + CUDA 执行后端 60 分。
         bonus = w_gpu - w_no_gpu
         assert bonus == pytest.approx(76.66666666666667)
-        assert w_gpu / w_no_gpu == pytest.approx(4.407407407407407)
+        assert w_gpu / w_no_gpu == pytest.approx(6.111111111111111)
 
     def test_cuda_laptop_outscores_igpu_cpu_worker(self, sched):
         """4060 CUDA 主机评分必须显著高于同核数的集显 CPU worker。"""
@@ -152,7 +152,7 @@ class TestComputeNodeWeight:
         igpu_weight = sched._compute_node_weight(PROFILE_IGPU_ONLY)
 
         assert cuda_weight > igpu_weight
-        assert cuda_weight / igpu_weight == pytest.approx(4.407407407407407)
+        assert cuda_weight / igpu_weight == pytest.approx(6.111111111111111)
 
 
 # ================================================================
@@ -7260,8 +7260,8 @@ class TestPipelineOrchestrationIntegration:
         )
 
         weight_igpu = sched_master._compute_node_weight(PROFILE_IGPU_ONLY)
-        assert weight_igpu == pytest.approx(22.5)
-        assert weight / weight_igpu == pytest.approx(4.407407407407407)
+        assert weight_igpu == pytest.approx(15.0)
+        assert weight / weight_igpu == pytest.approx(6.111111111111111)
 
     def test_vram_uses_scoring_gpu_not_frontend_gpu(self, sched_master):
         """_get_node_vram_mb 应使用评分 GPU 而非前端选中 GPU"""

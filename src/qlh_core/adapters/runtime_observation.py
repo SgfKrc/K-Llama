@@ -15,6 +15,14 @@ def observe_runtime(manager, assignment):
         if observation.get("artifact_sha256") != identity["artifact_sha256"]:
             raise ValueError("deployment_local_artifact_mismatch")
         materialized = observation["materialized_bytes"]
+    elif spec.materialization == "safetensors_layer_offload":
+        observation = manager.layer_offload_observation()
+        if (not spec.device.startswith("cuda:")
+                or manager.quant_type != spec.quant_type
+                or observation.get("execution_device") != spec.device
+                or observation.get("execution_dtype") != spec.dtype):
+            raise ValueError("deployment_local_policy_mismatch")
+        materialized = observation["resident_source_bytes"]
     else:
         parameters = list(manager.model.parameters())
         buffers = list(manager.model.buffers()) if callable(getattr(manager.model, "buffers", None)) else []
@@ -41,6 +49,10 @@ def observe_runtime(manager, assignment):
     receipt = {"load_spec": spec.to_dict(), "materialized_bytes": materialized,
                "memory_scope": "weight_tensors", "layer_range": identity["layer_range"],
                "artifact_sha256": identity["artifact_sha256"]}
+    if spec.materialization == "safetensors_layer_offload":
+        receipt.update(device_weight_bytes=observation["device_weight_bytes"],
+                       host_source_bytes=observation["resident_source_bytes"],
+                       host_conversion_bytes=observation["host_conversion_bytes"])
     from qlh_core.contracts.deployment import require_runtime_receipt
     require_runtime_receipt(assignment, receipt)
     return receipt

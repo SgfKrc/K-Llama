@@ -517,3 +517,125 @@ def test_credential_rotation_updates_identity_snapshot_and_rolls_back_on_write_e
         assert dict(os.environ) == before
     finally:
         runtime.close()
+
+
+def test_identity_instances_for_one_document_share_the_transaction_lock(tmp_path):
+    path = tmp_path / "node.json"
+    first = IdentityStore(str(path), str(tmp_path / "secrets.json"))
+    second = IdentityStore(str(path.parent / "child" / ".." / path.name), str(tmp_path / "secrets.json"))
+    independent = IdentityStore(str(tmp_path / "other.json"), str(tmp_path / "other-secrets.json"))
+    assert first._lock is second._lock
+    assert independent._lock is not first._lock
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows sharing violation")
+def test_identity_reader_and_other_owner_write_are_serialized_without_retry(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import qlh_core.adapters.settings as module
+
+    path = tmp_path / "node.json"
+    first = IdentityStore(str(path), str(tmp_path / "secrets.json"))
+    second = IdentityStore(str(path), str(tmp_path / "secrets.json"))
+    original = {"node": {"node_id": "stable"}, "retained": [1, 2]}
+    first._write(original)
+    reader_open = threading.Event()
+    release_reader = threading.Event()
+    reader_ident = []
+    contentions = []
+    replacements = []
+    real_open = Path.open
+    real_read = Path.read_text
+    replace_file = module.os.replace
+
+    def hold_reader(candidate, *args, **kwargs):
+        if candidate == path and threading.get_ident() in reader_ident:
+            # Keep a real CRT read handle alive, without FILE_SHARE_DELETE.
+            with real_open(candidate, "r", encoding=kwargs.get("encoding", "utf-8")) as stream:
+                reader_open.set()
+                assert release_reader.wait(5), "writer did not coordinate with the reader"
+                return stream.read()
+        return real_read(candidate, *args, **kwargs)
+
+    class ObservedLock:
+        def __init__(self, lock):
+            self.lock = lock
+        def __enter__(self):
+            if not self.lock.acquire(blocking=False):
+                contentions.append(True)
+                # Release only after observing real lock contention, with no sleep.
+                release_reader.set()
+                self.lock.acquire()
+            return self
+        def __exit__(self, *args):
+            self.lock.release()
+
+    def observed_replace(source, target):
+        if Path(target) == path:
+            replacements.append(Path(source))
+        return replace_file(source, target)
+
+    def read():
+        reader_ident.append(threading.get_ident())
+        return first.read_document()
+
+    second._lock = ObservedLock(second._lock)
+    monkeypatch.setattr(Path, "read_text", hold_reader)
+    monkeypatch.setattr(module.os, "replace", observed_replace)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(read)
+        try:
+            assert reader_open.wait(5), "reader never opened the existing document"
+            second.persist_participation("local")
+        finally:
+            release_reader.set()
+        assert pending.result(timeout=5) == original
+    assert contentions == [True]
+    assert len(replacements) == 1
+    assert first.read_document() == {**original, "node": {"node_id": "stable", "desired_inference_mode": "local"}}
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows sharing violation")
+def test_identity_external_reader_denial_preserves_credentials_and_does_not_retry(tmp_path, monkeypatch):
+    import ctypes
+    from ctypes import wintypes
+    import qlh_core.adapters.settings as module
+
+    runtime = AppRuntime(settings(tmp_path))
+    response = {"cluster": {"cluster_id": "stable", "cluster_secret": "committed-test-value",
+                            "cluster_secret_epoch": 1},
+                "node": {"node_id": runtime.config.node_id, "role": "client"}}
+    runtime.accept_bootstrap(response)
+    config, identity = runtime.config, runtime.identity
+    path = Path(config.node_config_path)
+    before = path.read_bytes()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(str(path), 0x80000000, 3, None, 3, 0x80, None)
+    assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
+    replace_file = module.os.replace
+    replacements = []
+
+    def observed_replace(source, target):
+        if Path(target) == path:
+            replacements.append(Path(source))
+        return replace_file(source, target)
+
+    monkeypatch.setattr(module.os, "replace", observed_replace)
+    try:
+        with pytest.raises(PermissionError) as caught:
+            runtime.accept_bootstrap({**response, "cluster": {**response["cluster"],
+                "cluster_secret": "uncommitted-test-value", "cluster_secret_epoch": 2}})
+        assert caught.value.winerror == 5
+        assert len(replacements) == 1
+        assert path.read_bytes() == before
+        assert runtime.config is config and runtime.identity is identity
+        assert runtime.cluster_credential() == ("committed-test-value", 1)
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        assert kernel.CloseHandle(handle)
+        runtime.close()

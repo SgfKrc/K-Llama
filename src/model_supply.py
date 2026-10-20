@@ -82,7 +82,8 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                         safety_margin: float = 1.2,
                         runtime_descriptors: dict[str, dict] | None = None,
                         preferred_ranges: dict[str, list[list[int]]] | None = None,
-                        runtime_host_ranges: dict[str, list[list[int]]] | None = None) -> dict:
+                        runtime_host_ranges: dict[str, list[list[int]]] | None = None,
+                        prefer_all_workers: bool | None = None) -> dict:
     """Reuse capacity admission while planning missing, not just existing, assets.
 
     GGUF segments retain non-block tensors. Charge those tensors on *each* GGUF
@@ -101,10 +102,15 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         )
     except RuntimeCapacityProjectionError as exc:
         raise ModelSupplyError(exc.code, exc.message) from exc
+    if prefer_all_workers is None:
+        from config import PIPELINE_PREFER_ALL_WORKERS
+        prefer_all_workers = PIPELINE_PREFER_ALL_WORKERS
+    if type(prefer_all_workers) is not bool:
+        raise ModelSupplyError("SUPPLY_PLACEMENT_POLICY_INVALID", "prefer_all_workers must be a boolean")
     reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
     total = int(reference["total_layers"])
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
-                                    require_distributed=True, prefer_all_workers=True,
+                                    require_distributed=True, prefer_all_workers=prefer_all_workers,
                                     required_node_id="master")
     if result.get("reason_code") == "pipeline_required_node_unavailable":
         result = {**result, "reason_code": "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
@@ -114,6 +120,7 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         diagnostic = explain_supply_capacity(
             result, grouped_descriptor=grouped, projected_nodes=projected,
             alignment=alignment, total_layers=total, safety_margin=safety_margin,
+            prefer_all_workers=prefer_all_workers,
         )
         return {**result, "total_layers": total, "loaded_ready": False, "supply_only": True,
                 "capacity_diagnostic": diagnostic}
@@ -123,9 +130,29 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         item["start_layer"] *= alignment
         item["end_layer"] *= alignment
         item["layers_count"] = item["end_layer"] - item["start_layer"]
+        if "range_weight_quote" in item:
+            item["range_weight_quote"] = {**item["range_weight_quote"],
+                "layer_range": [item["start_layer"], item["end_layer"]]}
         if "layer_ranges" in item:
             item["layer_ranges"] = [[start * alignment, end * alignment] for start, end in item["layer_ranges"]]
-        item["engine"] = by_id[item["node_id"]]["engine"]
+        selected_node = by_id[item["node_id"]]
+        item["engine"] = selected_node["engine"]
+        if selected_node.get("materialization") == "safetensors_layer_offload":
+            from model_supply_runtime_capacity import runtime_range_capacity
+            from qlh_core.planning.load_spec import assignment_load_spec
+            quote = runtime_range_capacity(runtime_descriptors[item["node_id"]],
+                item["start_layer"], item["end_layer"],
+                has_embedding=item["has_embedding"], has_lm_head=item["has_lm_head"])
+            host_required = math.ceil(quote["host_weight_peak_bytes"] * safety_margin) + selected_node["reserve_bytes"]
+            host_capacity = selected_node.get("host_capacity_bytes")
+            if type(host_capacity) is not int or not 0 < host_required <= host_capacity:
+                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", "Layer offload host budget changed")
+            item.update(quote, runtime_materialization="safetensors_layer_offload",
+                        host_required_bytes=host_required, host_capacity_bytes=host_capacity,
+                        runtime_target_dtype=runtime_descriptors[item["node_id"]]["runtime_target_dtype"],
+                        runtime_target_element_size=runtime_descriptors[item["node_id"]]["runtime_target_element_size"])
+            spec = assignment_load_spec(item, artifact_format="safetensors")
+            item.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest)
         if item["engine"] == "llama_cpp":
             # Native cut artifacts retain all non-block tensors on every node.
             # Keep this header-derived quote for the later prepare admission.
@@ -792,7 +819,8 @@ class ModelSupplyCoordinator:
                     available = runtime.get("available_bytes")
                     if (device not in {"cpu", "cuda"} or type(available) is not int or available <= 0):
                         raise ModelSupplyError("SUPPLY_RUNTIME_BUDGET_MISSING", f"Worker {node_id} has an invalid runtime memory budget")
-                    projection = project_runtime_descriptor(sources["hf"], sources["descriptors"]["pytorch"], element_size)
+                    projection = project_runtime_descriptor(sources["hf"], sources["descriptors"]["pytorch"], element_size,
+                        target_dtype={2: "float16", 4: "float32"}.get(element_size))
                     if device == "cuda":
                         # Selective loaders read Safetensors on CPU and transfer one
                         # tensor at a time. Charge target weights to VRAM, source
@@ -803,12 +831,30 @@ class ModelSupplyCoordinator:
                             "layer_weight_bytes": projection["runtime_layer_weight_bytes"],
                             "component_weight_bytes": projection["runtime_component_weight_bytes"]}
                     runtime_descriptors[node_id] = projection
+                    from model_supply_capacity import runtime_capacity_source
                     base.update(capacity_bytes=available, execution_device=device, runtime_multiplier=1.0,
-                                capacity_source="supply.cuda.mem_get_info" if device == "cuda" else "supply.ram.available_bytes_live")
+                                capacity_source=runtime_capacity_source(runtime, device, prefix="supply"))
+                    if device == "cuda" and isinstance(runtime.get("budget_observations"), dict):
+                        base["capacity_observations"] = copy.deepcopy(runtime["budget_observations"])
                 base["engine"] = engine
+                # Source resolution may select a different engine from the
+                # previous execution. Score its actual device and fresh RAM.
+                node_lock = getattr(self.scheduler, "_nodes_lock", None)
+                if node_lock is not None:
+                    with node_lock:
+                        observed_node = self.scheduler.nodes.get(node_id)
+                        profile = getattr(observed_node, "device_info", None)
+                    if isinstance(profile, dict):
+                        from scheduler_layer_plan import compute_node_weight
+                        profile = copy.deepcopy(profile)
+                        profile["ram"] = {**(profile.get("ram") or {}),
+                            "available_gb": max(0, int(inventory.get("memory_available_bytes", 0))) / 1024**3}
+                        base["score"] = compute_node_weight(profile, execution_device=base["execution_device"])
                 logger.info("event=supply_runtime_budget operation=%s node=%s engine=%s device=%s capacity_bytes=%s reserve_bytes=%s multiplier=%s score=%s",
                             op_id, node_id, engine, base.get("execution_device"), base.get("capacity_bytes"),
                             base.get("reserve_bytes"), base.get("runtime_multiplier"), base.get("score"))
+                if engine == "pytorch" and device == "cuda":
+                    base["host_capacity_bytes"] = int(inventory.get("memory_available_bytes", 0))
                 records.append(base)
             from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
             from model_supply_host_capacity import allowed_host_layer_ranges
@@ -842,6 +888,25 @@ class ModelSupplyCoordinator:
                 source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
                 engine_by_node={record["node_id"]:record["engine"] for record in records},
                 alignment=sources["alignment"])
+            if not plan.get("admitted"):
+                # Prefer resident execution when feasible. A supported CUDA
+                # master may retry with CPU mmap ownership and one staged unit;
+                # RAM and VRAM remain independent admission domains.
+                local_runtime = inventories["master"].get("pytorch_runtime") or {}
+                local_projection = runtime_descriptors.get("master") or {}
+                if (sources["master_engine"] == "pytorch"
+                        and local_runtime.get("execution_device") == "cuda"
+                        and "safetensors_layer_offload" in local_runtime.get("materializations", [])
+                        and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
+                    resident_diagnostic = copy.deepcopy(plan.get("capacity_diagnostic"))
+                    records = [{**record, "materialization": "safetensors_layer_offload"}
+                               if record["node_id"] == "master" else record for record in records]
+                    plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
+                        planner=capacity_plan, source_model_id=sources["source_model_id"],
+                        source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
+                        engine_by_node={record["node_id"]:record["engine"] for record in records},
+                        alignment=sources["alignment"])
+                    plan["resident_capacity_diagnostic"] = resident_diagnostic
             if not plan.get("admitted"):
                 diagnostic = plan["capacity_diagnostic"]
                 # A host range is a staging constraint, not an absent artifact.
@@ -883,12 +948,18 @@ class ModelSupplyCoordinator:
                 projection = runtime_host_descriptors.get(node_id)
                 if projection is None:
                     continue
-                components = projection["source_component_weight_bytes"]
-                keys = ("embedding", "final_norm", "other") if node_id == "master" else ("embedding", "final_norm", "lm_head", "other")
-                source_bytes = sum(projection["source_layer_weight_bytes"][assignment["start_layer"]:assignment["end_layer"]])
-                source_bytes += sum(int(components.get(key, 0)) for key in keys)
+                from model_supply_runtime_capacity import runtime_range_capacity
+                from qlh_core.planning.load_spec import assignment_load_spec
+                materialization = assignment.get("runtime_materialization", "safetensors_key_filtered")
+                quote = runtime_range_capacity(
+                    projection, assignment["start_layer"], assignment["end_layer"],
+                    has_embedding=assignment["has_embedding"], has_lm_head=assignment["has_lm_head"],
+                    materialization=materialization,
+                )
+                source_bytes = quote["host_source_bytes"]
+                conversion_bytes = quote["host_conversion_bytes"]
                 reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
-                required = math.ceil(source_bytes * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
+                required = math.ceil((source_bytes + conversion_bytes) * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
                 if required > int(inventories[node_id].get("memory_available_bytes", 0)):
                     from model_supply_diagnostics import explain_host_capacity
                     diagnostic = explain_host_capacity(
@@ -900,13 +971,37 @@ class ModelSupplyCoordinator:
                     )
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
-                assignment.update(host_source_bytes=source_bytes, host_required_bytes=required,
-                                  runtime_target_element_size=projection["runtime_target_element_size"])
+                # Freeze the exact runtime quote as well as the source identity.
+                # Fresh admission must retain target-dtype costs for resident
+                # CUDA too, rather than reverting to source artifact precision.
+                assignment.update(quote, host_source_bytes=source_bytes,
+                                  host_conversion_bytes=conversion_bytes,
+                                  host_required_bytes=required,
+                                  host_capacity_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                  runtime_materialization=materialization,
+                                  runtime_target_element_size=projection["runtime_target_element_size"],
+                                  runtime_target_dtype=projection["runtime_target_dtype"])
+                spec = assignment_load_spec(assignment, artifact_format="safetensors")
+                assignment.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest)
+            reference = sources["descriptors"].get("llama_cpp") or sources["descriptors"][sources["master_engine"]]
+            plan["plan_id"] = _digest({
+                "source": reference.get("source_model_sha256", reference.get("model_sha256")),
+                "assignments": plan["assignments"],
+            })
             break
         with self._condition:
             self._check(op_id)
             self._check_receivers(op_id)
-            self._update(op_id, status="building", plan=plan)
+            assigned = {item["node_id"] for item in plan["assignments"]}
+            candidate_node_ids = sorted(nodes)
+            nodes = {node_id: value for node_id, value in nodes.items() if node_id in assigned}
+            # Inventory candidates are observations. Once placement is published,
+            # only its executors own connection/receipt obligations.
+            for key in list(self._connections):
+                if key[0] == op_id and key[1] not in assigned:
+                    self._connections.pop(key)
+            self._update(op_id, status="building", plan=plan, nodes=nodes,
+                         candidate_node_ids=candidate_node_ids)
         from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
         pending_receipts = []
         for assignment in plan["assignments"]:

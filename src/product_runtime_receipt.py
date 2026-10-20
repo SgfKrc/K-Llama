@@ -184,6 +184,17 @@ def _pytorch(manager, selection, process):
     _require(byte_count == proof.materialized_bytes == metrics.get("materialized_tensor_bytes"),
              "selective tensor materialization byte accounting differs")
     materialization = {**proof.as_dict(), **process, **selection}
+    if _state(manager, "_layer_offload") is not None:
+        # Observe the live CPU source owners and CUDA unit sizes under the
+        # existing manager lock. A requested policy is never mmap evidence.
+        try:
+            observation = deepcopy(manager.layer_offload_observation())
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeObservationError("actual layer offload observation unavailable") from exc
+        _require(isinstance(observation, dict)
+                 and observation.get("materialization") == "safetensors_layer_offload",
+                 "actual layer offload materialization missing")
+        materialization["layer_offload"] = observation
     return {"engine": "pytorch", "loaded": True, "full_model_loaded": False,
             "layer_range": span, "total_layers": total, "loader_pid": process["pid"],
             "artifact": {"path": proof.artifact_path, "sha256": digest,

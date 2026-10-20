@@ -16,6 +16,7 @@ from functools import lru_cache
 from typing import Any
 
 from qlh_core.contracts.load import RuntimeLoadSpec
+from qlh_core.planning.placement import placement_weight, stage_placement_cost
 
 
 CAPACITY_PLAN_SCHEMA_VERSION = 1
@@ -83,6 +84,32 @@ def _normalize_layer_ranges(
             )
         normalized.append((start, end))
     return tuple(sorted(set(normalized)))
+
+
+def _normalize_range_weight_bytes(value, field, *, total_layers):
+    """Exact device-peak costs including the quoted range's boundary units."""
+    if not isinstance(value, (list, tuple)):
+        raise PipelineCapacityError(f"{field} must be a list of exact range quotes")
+    normalized, seen = [], set()
+    for index, quote in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(quote, dict):
+            raise PipelineCapacityError(f"{item_field} must be an object")
+        span = _normalize_layer_ranges([quote.get("layer_range")], item_field,
+                                      total_layers=total_layers)[0]
+        if span in seen:
+            raise PipelineCapacityError(f"{field} contains duplicate layer_range")
+        seen.add(span)
+        weight = quote.get("weight_bytes")
+        if type(weight) is not int or weight <= 0:
+            raise PipelineCapacityError(f"{item_field}.weight_bytes must be a positive integer")
+        for flag in ("has_embedding", "has_lm_head"):
+            if type(quote.get(flag)) is not bool:
+                raise PipelineCapacityError(f"{item_field}.{flag} must be a boolean")
+        normalized.append({"layer_range": span, "weight_bytes": weight,
+                           "has_embedding": quote["has_embedding"],
+                           "has_lm_head": quote["has_lm_head"]})
+    return tuple(sorted(normalized, key=lambda item: item["layer_range"]))
 
 
 def _normalize_layer_artifacts(
@@ -399,15 +426,36 @@ def _normalize_nodes(
             if normalized["execution_device"] not in ("unknown", spec.device):
                 raise PipelineCapacityError(f"node[{node_id}].load_spec device mismatch")
             engine = raw.get("engine")
-            materialization = {"pytorch": "safetensors_key_filtered", "llama_cpp": "gguf_segment"}.get(engine)
-            if materialization is not None and spec.materialization != materialization:
+            materializations = {
+                "pytorch": {"safetensors_key_filtered", "safetensors_layer_offload"},
+                "llama_cpp": {"gguf_segment"},
+            }.get(engine)
+            if materializations is not None and spec.materialization not in materializations:
                 raise PipelineCapacityError(f"node[{node_id}].load_spec engine mismatch")
+            if spec.materialization == "safetensors_layer_offload" and (
+                    not spec.device.startswith("cuda:") or "range_weight_bytes" not in raw):
+                raise PipelineCapacityError(
+                    f"node[{node_id}].load_spec layer offload requires CUDA and exact range_weight_bytes")
             if reserve_bytes < spec.kv_cache_bytes:
                 raise PipelineCapacityError(f"node[{node_id}].reserve_bytes does not cover KV")
             normalized.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest,
                               execution_device=spec.device)
         elif "load_spec_digest" in raw:
             raise PipelineCapacityError(f"node[{node_id}].load_spec_digest has no spec")
+        host_fields = ("host_required_bytes", "host_capacity_bytes")
+        offload = normalized.get("load_spec", {}).get("materialization") == "safetensors_layer_offload"
+        if offload or "host_required_bytes" in raw:
+            for field in host_fields:
+                if type(raw.get(field)) is not int or raw[field] <= 0:
+                    raise PipelineCapacityError(f"node[{node_id}].{field} must be a positive integer")
+                normalized[field] = raw[field]
+            if normalized["host_required_bytes"] > normalized["host_capacity_bytes"]:
+                raise PipelineCapacityError(f"node[{node_id}].host_required_bytes exceeds host_capacity_bytes")
+        elif "host_capacity_bytes" in raw:
+            # Resident CUDA inventory also samples host memory. This observation
+            # alone introduces no host requirement and cannot block GPU admission.
+            normalized["host_capacity_bytes"] = _non_negative_int(
+                raw["host_capacity_bytes"], f"node[{node_id}].host_capacity_bytes")
         if "layer_weight_bytes" in raw:
             sizes = raw["layer_weight_bytes"]
             if (not isinstance(sizes, (list, tuple))
@@ -417,6 +465,11 @@ def _normalize_nodes(
                     f"node[{node_id}].layer_weight_bytes must quote every decoder layer"
                 )
             normalized["layer_weight_bytes"] = tuple(sizes)
+        if "range_weight_bytes" in raw:
+            normalized["range_weight_bytes"] = _normalize_range_weight_bytes(
+                raw["range_weight_bytes"], f"node[{node_id}].range_weight_bytes",
+                total_layers=total_layers,
+            )
         # Candidate generation constraints are independent of ready artifacts.
         # In particular, local_cut must never relax a host/source range budget.
         if "candidate_layer_ranges" in raw:
@@ -463,6 +516,8 @@ def _normalize_nodes(
                 )
             normalized["segment_mode"] = raw_segment_mode.lower()
         usable.append(normalized)
+    # The execution contract puts a participating master at the input stage.
+    # This order chooses stage positions; the objective below chooses amounts.
     usable.sort(
         key=lambda node: (
             node["role"] != "master",
@@ -662,6 +717,10 @@ def solve_pipeline_capacity(
     ``capacity_bytes`` must describe currently free memory, not installed
     physical memory. ``reserve_bytes`` is charged once to every participating
     node for allocator, activation, KV-cache and loading workspace headroom.
+    Optional ``range_weight_bytes`` quotes replace additive decoder/component
+    bytes with an exact device peak for a range and its input/output flags.
+    Missing quotes reject that candidate. Host budgets remain independently
+    projected into candidate ranges; free host memory never augments VRAM here.
     When ``require_distributed`` is true, a single-node full-model placement is
     deliberately rejected; the returned plan must contain at least two
     participating nodes. This is used by an explicitly distributed request,
@@ -672,9 +731,11 @@ def solve_pipeline_capacity(
 
     ``prefer_all_workers`` flips the optimization between feasible placements
     from "fewest nodes" (default: least network hops) to "most nodes" — the
-    latter is what exercises multi-segment chains (master + middle + tail),
-    which the default criterion would never pick because two segments are
-    always fewer.
+    latter selects the longest feasible chain. Within the selected node count,
+    minimize the sum of squared decoder-work fractions divided by device
+    capability. Stronger nodes therefore take more work when capacity permits.
+    Master-first order preserves the execution contract; it grants no extra
+    decoder layers. Source/artifact ranges and byte budgets remain hard gates.
     """
 
     if required_node_id is not None and (
@@ -791,41 +852,27 @@ def solve_pipeline_capacity(
             "control_only_nodes": [node["node_id"] for node in usable],
         }
 
+    work_total = prefix[layer_budget] or 1
+    range_quotes = {
+        node["node_id"]: {quote["layer_range"]: quote for quote in node["range_weight_bytes"]}
+        for node in usable if "range_weight_bytes" in node
+    }
+    if range_quotes:
+        base["capacity_cost_mode"] = "exact_range"
+
     @lru_cache(maxsize=None)
-    def _range_shortfall(candidate) -> int:
-        """声明了 `layer_ranges` 的节点中，分配区间**没有正好跑满** advertised 区间的个数。
-
-        `layer_ranges` 的语义是"该节点手上**已经有工件**的区间"。只把它当 ⊆ 约束是不够的：
-        在 `prefer_all_workers`（节点数最多）下，求解器会尽量把每个节点切小，于是这个
-        节点会拿到自己工件覆盖不到的另一段，offer 必然被 `layer_range_not_advertised`
-        拒掉。
-
-        ⚠️ **未参与的节点同样计入**。否则"完全不用这台 worker"（它不在 candidate 里 ⇒
-        不计）会与"让它跑满自己的区间"并列在 0，随后 `prefer_all_workers` 又把节点数
-        更多、但区间切碎的解选出来 —— 实测踩到（Surface 被分到 `[1,16)`）。
-        """
-        used: dict[int, tuple[int, int]] = {
-            value[0]: (value[1], value[2]) for value in candidate
-        }
-        shortfall = 0
-        for index, node in enumerate(usable):
-            ranges = node.get("layer_ranges")
-            if not ranges:
-                continue
-            # 与 `search` 里的硬约束保持同一条件：设备声明了"能按分配在本地裁层"
-            # （`layer_budget.local_cut=true`）时，`layer_ranges` 只表示"当前已就绪"，
-            # 不再是它的能力边界 ⇒ 不参与"是否跑满"的衡量。
-            budget = node.get("layer_budget")
-            if budget is not None and budget.get("local_cut"):
-                continue
-            span = used.get(index)
-            if span is None:
-                shortfall += 1
-                continue
-            cursor, end = span
-            if not any(start == cursor and stop == end for start, stop in ranges):
-                shortfall += 1
-        return shortfall
+    def placement_objective(candidate):
+        costs = [stage_placement_cost(
+            (prefix[value[2]] - prefix[value[1]]) / work_total,
+            usable[value[0]]["score"], value[4], usable[value[0]]["capacity_bytes"],
+        ) for value in candidate]
+        return (
+            -len(candidate) if prefer_all_workers else len(candidate),
+            sum(cost[0] for cost in costs),
+            sum(cost[1] for cost in costs),
+            -sum(usable[value[0]]["score"] for value in candidate),
+            tuple((usable[value[0]]["node_id"], value[1], value[2]) for value in candidate),
+        )
 
     @lru_cache(maxsize=None)
     def search(
@@ -966,7 +1013,20 @@ def solve_pipeline_capacity(
                         or has_lm_head != ("lm_head" in components)):
                     exclude(node, cursor, end, "node_load_spec_components_mismatch")
                     continue
-            if "retained_component_bytes" in node:
+            range_quote = None
+            if node["node_id"] in range_quotes:
+                range_quote = range_quotes[node["node_id"]].get((cursor, end))
+                if range_quote is None:
+                    exclude(node, cursor, end, "node_range_weight_quote_missing")
+                    continue
+                if (range_quote["has_embedding"] != has_embedding
+                        or range_quote["has_lm_head"] != has_lm_head):
+                    exclude(node, cursor, end, "node_range_weight_components_mismatch")
+                    continue
+                # Nonadditive peaks already include decoder and boundary units.
+                # The common budget function still applies reserve/margin once.
+                raw_bytes = range_quote["weight_bytes"]
+            elif "retained_component_bytes" in node:
                 raw_bytes += node["retained_component_bytes"] - per_node_bytes
             else:
                 if has_embedding:
@@ -1003,19 +1063,7 @@ def solve_pipeline_capacity(
             if best is None:
                 best = candidate
                 continue
-            candidate_key = (
-                _range_shortfall(candidate),
-                (-len(candidate) if prefer_all_workers else len(candidate)),
-                -min(usable[value[0]]["capacity_bytes"] - value[4] for value in candidate),
-                -sum(usable[value[0]]["score"] for value in candidate),
-            )
-            best_key = (
-                _range_shortfall(best),
-                (-len(best) if prefer_all_workers else len(best)),
-                -min(usable[value[0]]["capacity_bytes"] - value[4] for value in best),
-                -sum(usable[value[0]]["score"] for value in best),
-            )
-            if candidate_key < best_key:
+            if placement_objective(candidate) < placement_objective(best):
                 best = candidate
         return best
 
@@ -1067,6 +1115,7 @@ def solve_pipeline_capacity(
                 local_layer_budget=local_layer_budget,
                 relay_claims=relay_claims,
                 required_node_id=required_node_id,
+                prefer_all_workers=prefer_all_workers,
             )
             if segmentless.get("admitted"):
                 return {
@@ -1079,9 +1128,9 @@ def solve_pipeline_capacity(
                         "cannot form the requested pipeline"
                     ),
                     "allocatable_bytes": allocatable_bytes,
-                    "raw_capacity_deficit_bytes": max(
+                    **({} if range_quotes else {"raw_capacity_deficit_bytes": max(
                         0, raw_model_bytes - allocatable_bytes
-                    ),
+                    )}),
                     "assignments": [],
                     "control_only_nodes": [node["node_id"] for node in usable],
                 }
@@ -1109,6 +1158,7 @@ def solve_pipeline_capacity(
                 local_layer_budget=local_layer_budget,
                 relay_claims=relay_claims,
                 required_node_id=required_node_id,
+                prefer_all_workers=prefer_all_workers,
             )
             unconstrained_admission = bool(unconstrained.get("admitted"))
         if range_constrained and unconstrained_admission:
@@ -1155,7 +1205,7 @@ def solve_pipeline_capacity(
                         "(aggregate capacity is sufficient; check per-node free memory)"
                     ),
                     "allocatable_bytes": allocatable_bytes,
-                    "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
+                    **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
                     "assignments": [],
                     "uncovered_layer_ranges": [],
                     "control_only_nodes": [node["node_id"] for node in usable],
@@ -1176,7 +1226,7 @@ def solve_pipeline_capacity(
                 "reason_code": "pipeline_layer_range_coverage_insufficient",
                 "reason": reason,
                 "allocatable_bytes": allocatable_bytes,
-                "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
+                **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
                 "assignments": [],
                 "uncovered_layer_ranges": [list(gap) for gap in gaps],
                 "control_only_nodes": [node["node_id"] for node in usable],
@@ -1191,7 +1241,7 @@ def solve_pipeline_capacity(
                 else "pipeline_cluster_capacity_insufficient"
             ),
             "allocatable_bytes": allocatable_bytes,
-            "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
+            **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
             "assignments": [],
             "control_only_nodes": [node["node_id"] for node in usable],
         }
@@ -1225,9 +1275,12 @@ def solve_pipeline_capacity(
             "execution_device": node["execution_device"],
             "capacity_source": node["capacity_source"],
             "score": node["score"],
+            "placement_weight": placement_weight(node["score"]),
+            "placement_work_fraction": (prefix[end] - prefix[start]) / work_total,
             **_node_budget(raw_bytes, node, safety_margin),
         }
-        for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
+        for field in ("configured_reserve_bytes", "retained_component_reserve_bytes",
+                      "host_required_bytes", "host_capacity_bytes"):
             if field in node:
                 assignment[field] = node[field]
         if "retained_component_bytes" in node:
@@ -1245,15 +1298,26 @@ def solve_pipeline_capacity(
                 **artifact,
                 "layer_range": list(artifact["layer_range"]),
             }
+        if node["node_id"] in range_quotes:
+            quote = range_quotes[node["node_id"]][(start, end)]
+            assignment["range_weight_quote"] = {**quote, "layer_range": [start, end]}
         assignments.append(assignment)
 
-    selected_layer_bytes = sum(
-        item[3] - (usable[item[0]]["retained_component_bytes"]
-                   if "retained_component_bytes" in usable[item[0]] else
-                   per_node_bytes + (embedding_bytes if item[5] else 0)
-                   + (output_bytes if item[6] else 0))
-        for item in solved
-    )
+    selected_layer_bytes = 0
+    for index, start, end, raw, _, embedding, lm_head, artifact_index in solved:
+        node = usable[index]
+        if node["node_id"] in range_quotes:
+            artifact = node["layer_artifacts"][artifact_index] if artifact_index is not None else {}
+            sizes = artifact.get("layer_weight_bytes")
+            if sizes is None:
+                sizes = node.get("layer_weight_bytes", layer_bytes)[start:end]
+            # Model size remains the complete decoder bytes, not its device peak.
+            selected_layer_bytes += sum(sizes)
+        else:
+            selected_layer_bytes += raw - (
+                node["retained_component_bytes"] if "retained_component_bytes" in node else
+                per_node_bytes + (embedding_bytes if embedding else 0) + (output_bytes if lm_head else 0)
+            )
     base["raw_model_bytes"] = (
         selected_layer_bytes + sum(layer_bytes[layer_budget:])
         + embedding_bytes + per_node_bytes + output_bytes
@@ -1275,6 +1339,11 @@ def solve_pipeline_capacity(
         }
         if "retained_component_bytes" in item:
             identity_item["retained_component_bytes"] = item["retained_component_bytes"]
+        for field in ("host_required_bytes", "host_capacity_bytes"):
+            if field in item:
+                identity_item[field] = item[field]
+        if "range_weight_quote" in item:
+            identity_item["range_weight_quote"] = item["range_weight_quote"]
         if "load_spec" in item:
             identity_item["load_spec_digest"] = item["load_spec_digest"]
         if "layer_ranges" in item:
@@ -1303,10 +1372,28 @@ def solve_pipeline_capacity(
             full_bytes = sum(node["layer_weight_bytes"]) + node.get(
                 "retained_component_bytes", embedding_bytes + per_node_bytes + output_bytes,
             )
+        if node["node_id"] in range_quotes:
+            full_quote = range_quotes[node["node_id"]].get((0, total_layers))
+            if (full_quote is None or not full_quote["has_embedding"]
+                    or not full_quote["has_lm_head"]):
+                continue
+            full_bytes = full_quote["weight_bytes"]
         required = _required_bytes(full_bytes, node, safety_margin)
         if required <= node["capacity_bytes"]:
             full_model_fits.append(node["node_id"])
 
+    objective = placement_objective(solved)
+    base["placement_policy"] = {
+        "prefer_all_workers": bool(prefer_all_workers),
+        "work_basis": "descriptor_decoder_weight_bytes",
+        "objective": "capability_weighted_work_square",
+    }
+    base["placement_objective"] = {
+        "node_count": len(assignments),
+        "weighted_work_cost": objective[1],
+        "memory_pressure_cost": objective[2],
+        "score_total": -objective[3],
+    }
     participating_count = len(assignments) + len(relay_only)
     return {
         **base,

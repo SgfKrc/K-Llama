@@ -15,38 +15,50 @@ from local_secret_store import LocalSecretStore
 from qlh_core.contracts.runtime import NodeIncarnation, RuntimeConfig
 
 
+_IDENTITY_LOCKS_GUARD = threading.Lock()
+_IDENTITY_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _identity_lock(path: Path):
+    key = os.path.normcase(str(path.expanduser().resolve()))
+    with _IDENTITY_LOCKS_GUARD:
+        return _IDENTITY_LOCKS.setdefault(key, threading.RLock())
+
+
 class IdentityStore:
     """Use the existing public document and encrypted credential pair."""
     def __init__(self, document: str, secret_store: str, *, legacy_document="") -> None:
         self.path = Path(document)
         self.legacy_path = Path(legacy_document) if legacy_document else None
         self.secrets = LocalSecretStore(secret_store)
-        self._lock = threading.RLock()
+        self._lock = _identity_lock(self.path)
 
     def read_document(self) -> dict:
-        candidate = self.path
-        if not candidate.exists():
-            candidate = self.legacy_path
-            if candidate is None or not candidate.exists():
-                return {}
-        value = json.loads(candidate.read_text(encoding="utf-8-sig"))
-        if not isinstance(value, dict):
-            raise ValueError("node configuration must be an object")
-        return value
+        with self._lock:
+            candidate = self.path
+            if not candidate.exists():
+                candidate = self.legacy_path
+                if candidate is None or not candidate.exists():
+                    return {}
+            value = json.loads(candidate.read_text(encoding="utf-8-sig"))
+            if not isinstance(value, dict):
+                raise ValueError("node configuration must be an object")
+            return value
 
     def _write(self, document: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
-        try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(document, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
+            try:
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(document, stream, ensure_ascii=False, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def persist_participation(self, mode):
         if mode not in {"distributed", "local"}:
@@ -228,9 +240,10 @@ class SettingsStore:
     Stored encrypted credentials and artifact-owned release gates always win.
     All reads are explicit; the returned snapshot does not observe later env edits.
     """
-    def __init__(self, environment=None, *, dotenv_path=None) -> None:
+    def __init__(self, environment=None, *, dotenv_path=None, default_node_role=None) -> None:
         self._environment = dict(os.environ if environment is None else environment)
         self.dotenv_path = Path(dotenv_path) if dotenv_path is not None else None
+        self._default_node_role = default_node_role
 
     def _read_inputs(self):
         """Resolve public settings without opening the encrypted credential store."""
@@ -311,7 +324,7 @@ class SettingsStore:
         apply_release_profile_to_env(environment)
         if release_profile_enforced(environment):
             environment["QLH_RELEASE_PROFILE_ENFORCE"] = "1"
-        role = str(environment.get("QLH_NODE_ROLE") or (DEFAULT_PACKAGED_NODE_ROLE if release_profile_enforced(environment) else "client")).lower()
+        role = str(environment.get("QLH_NODE_ROLE") or (DEFAULT_PACKAGED_NODE_ROLE if release_profile_enforced(environment) else self._default_node_role or "client")).lower()
         role = {"worker": "client", "slave": "client"}.get(role, role)
         if role not in {"auto", "master", "client"}:
             raise ValueError("invalid node role")

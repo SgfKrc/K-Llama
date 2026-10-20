@@ -109,6 +109,7 @@ def project_runtime_descriptor(
     source_path: str | Path,
     descriptor: dict[str, Any],
     target_element_size: int,
+    *, target_dtype: str | None = None,
 ) -> dict[str, Any]:
     """Return an independent descriptor charged for a node's actual load dtype.
 
@@ -123,7 +124,11 @@ def project_runtime_descriptor(
     Unsupported source dtypes (including bool/integer weights) and target sizes
     fail with ``SUPPLY_RUNTIME_DTYPE_UNSUPPORTED``. An element size cannot
     identify a dtype by itself: callers must obtain it from the production
-    runtime selector, which currently returns FP16 or FP32.
+    runtime selector, which currently returns FP16 or FP32. Passing its exact
+    ``target_dtype`` additionally quotes CPU aliasing and one-tensor conversion:
+    matching source tensors reuse their mmap storage; BF16 to FP16 converts even
+    though both elements occupy two bytes. Without a dtype name, conversion
+    metadata conservatively treats every tensor as requiring a CPU cast.
     """
     if (
         isinstance(target_element_size, bool)
@@ -133,6 +138,16 @@ def project_runtime_descriptor(
         raise RuntimeCapacityProjectionError(
             "SUPPLY_RUNTIME_DTYPE_UNSUPPORTED",
             "Unsupported runtime target_element_size; FP16/FP32 require 2 or 4 bytes",
+        )
+    if target_dtype is not None and not isinstance(target_dtype, str):
+        raise RuntimeCapacityProjectionError(
+            "SUPPLY_RUNTIME_DTYPE_UNSUPPORTED", "Runtime target dtype must be an explicit dtype name",
+        )
+    target_header_dtype = {"float16": "F16", "float32": "F32"}.get(target_dtype)
+    if target_dtype is not None and (target_header_dtype is None
+            or _DTYPE_BYTES[target_header_dtype] != target_element_size):
+        raise RuntimeCapacityProjectionError(
+            "SUPPLY_RUNTIME_DTYPE_UNSUPPORTED", "Runtime target dtype and element size disagree",
         )
     if not isinstance(descriptor, dict):
         raise RuntimeCapacityProjectionError(
@@ -174,6 +189,10 @@ def project_runtime_descriptor(
     runtime_layers = [0] * total_layers
     source_components = dict.fromkeys(_COMPONENTS, 0)
     runtime_components = dict.fromkeys(_COMPONENTS, 0)
+    conversion_layers = [0] * total_layers
+    conversion_components = dict.fromkeys(_COMPONENTS, 0)
+    conversion_layer_max = [0] * total_layers
+    conversion_component_max = dict.fromkeys(_COMPONENTS, 0)
     dtype_statistics: dict[str, dict[str, int]] = defaultdict(
         lambda: {"tensor_count": 0, "element_count": 0, "weight_bytes": 0},
     )
@@ -211,6 +230,15 @@ def project_runtime_descriptor(
                     source_bytes = elements * _DTYPE_BYTES[dtype]
                     runtime_bytes = elements * target_element_size
                     component, layer_index = _component_for_key(key, layout)
+                    # Accelerate and layer offload both cast on CPU before the
+                    # device transfer. Equal element sizes alone cannot prove
+                    # aliasing (BF16 -> FP16 still allocates a CPU tensor).
+                    conversion_bytes = runtime_bytes if dtype != target_header_dtype else 0
+                    if component not in ignored:
+                        conversion_components[component] += conversion_bytes
+                        conversion_component_max[component] = max(
+                            conversion_component_max[component], conversion_bytes,
+                        )
                     if layer_index is not None:
                         if layer_index >= total_layers:
                             raise RuntimeCapacityProjectionError(
@@ -219,6 +247,10 @@ def project_runtime_descriptor(
                             )
                         source_layers[layer_index] += source_bytes
                         runtime_layers[layer_index] += runtime_bytes
+                        conversion_layers[layer_index] += conversion_bytes
+                        conversion_layer_max[layer_index] = max(
+                            conversion_layer_max[layer_index], conversion_bytes,
+                        )
                     source_components[component] += source_bytes
                     if component not in ignored:
                         runtime_components[component] += runtime_bytes
@@ -253,7 +285,16 @@ def project_runtime_descriptor(
     projection.update(
         runtime_projection_mode="safetensors_headers_source_plus_target",
         runtime_target_element_size=target_element_size,
+        runtime_target_dtype=target_dtype,
         runtime_multiplier=1.0,
+        runtime_conversion_layer_max_bytes=conversion_layer_max,
+        runtime_conversion_component_max_bytes=conversion_component_max,
+        runtime_cpu_layer_weight_bytes=[source + converted for source, converted
+                                       in zip(source_layers, conversion_layers)],
+        runtime_cpu_component_weight_bytes={
+            name: 0 if name in ignored else source_components[name] + conversion_components[name]
+            for name in _COMPONENTS
+        },
         source_weight_bytes=source_weight_bytes,
         source_layer_weight_bytes=source_layers,
         source_component_weight_bytes=source_components,
@@ -272,6 +313,75 @@ def project_runtime_descriptor(
     return projection
 
 
+def runtime_range_capacity(
+    projection: dict[str, Any], start_layer: int, end_layer: int, *,
+    has_embedding: bool, has_lm_head: bool,
+    materialization: str = "safetensors_layer_offload",
+) -> dict[str, int]:
+    """Quote separate weight budgets for a selected runtime range, without I/O.
+
+    The caller adds its frozen KV/workspace reserve and safety rounding to
+    each memory domain. Host capacity is never added to CUDA capacity. Offload
+    charges the largest complete execution unit on CUDA, resident mode charges
+    every selected target weight. Source mappings plus a single CPU conversion
+    are the conservative host bound in both CUDA modes. Generated (non-checkpoint)
+    buffers, activations and KV belong to the explicit workspace/KV reservation.
+    """
+    def invalid(text):
+        raise RuntimeCapacityProjectionError("SUPPLY_RUNTIME_DESCRIPTOR_INVALID", text)
+
+    if not isinstance(projection, dict):
+        invalid("Runtime projection must be an object")
+    total = projection.get("total_layers")
+    if (type(total) is not int or total <= 0
+            or type(start_layer) is not int or type(end_layer) is not int
+            or not 0 <= start_layer < end_layer <= total
+            or type(has_embedding) is not bool or type(has_lm_head) is not bool):
+        invalid("Invalid selected runtime range or boundary ownership")
+    if materialization not in {"safetensors_layer_offload", "safetensors_key_filtered"}:
+        invalid("Unsupported runtime materialization")
+    if (materialization == "safetensors_layer_offload" and projection.get("model_type")
+            not in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
+        invalid("Architecture has no layer offload execution adapter")
+    arrays = {}
+    for name in ("source_layer_weight_bytes", "runtime_layer_weight_bytes",
+                 "runtime_conversion_layer_max_bytes"):
+        values = projection.get(name)
+        if (not isinstance(values, (list, tuple)) or len(values) != total
+                or any(type(value) is not int or value < 0 for value in values)):
+            invalid("Invalid " + name)
+        arrays[name] = values[start_layer:end_layer]
+    if any(value <= 0 for value in arrays["source_layer_weight_bytes"]):
+        invalid("Selected runtime range has missing source layers")
+    maps = {}
+    for name in ("source_component_weight_bytes", "runtime_component_weight_bytes",
+                 "runtime_conversion_component_max_bytes"):
+        values = projection.get(name)
+        if (not isinstance(values, dict) or any(key not in values for key in _COMPONENTS)
+                or any(type(value) is not int or value < 0 for value in values.values())):
+            invalid("Invalid " + name)
+        maps[name] = values
+    keys = ["final_norm", "other"]
+    # The loader reuses the embedding tensor for tied lm_head on tail nodes.
+    if has_embedding or (has_lm_head and projection.get("tie_word_embeddings") is True):
+        keys.append("embedding")
+    if has_lm_head and projection.get("tie_word_embeddings") is not True:
+        keys.append("lm_head")
+    host_source = sum(arrays["source_layer_weight_bytes"]) + sum(
+        maps["source_component_weight_bytes"][key] for key in keys)
+    host_conversion = max([*arrays["runtime_conversion_layer_max_bytes"], *(
+        maps["runtime_conversion_component_max_bytes"][key] for key in keys)], default=0)
+    device_units = [*arrays["runtime_layer_weight_bytes"], *(
+        maps["runtime_component_weight_bytes"][key] for key in keys)]
+    device_weights = (max(device_units, default=0) if materialization == "safetensors_layer_offload"
+                      else sum(device_units))
+    return {"host_source_bytes": host_source,
+            "host_conversion_bytes": host_conversion,
+            "host_weight_peak_bytes": host_source + host_conversion,
+            "device_weight_bytes": device_weights,
+            "target_weight_bytes": sum(device_units)}
+
+
 def project_supply_capacity_nodes(
     descriptors: dict[str, dict], nodes: list[dict], *, master_engine: str,
     alignment: int = 1, safety_margin: float = 1.2,
@@ -285,9 +395,9 @@ def project_supply_capacity_nodes(
     engines and fresh device budgets. ``runtime_descriptors`` must come from
     ``project_runtime_descriptor`` for the selected dtype (CUDA uses its target
     fields; host staging stays a separate range constraint). This function does
-    not discover hardware or authorize RAM offload, and leaves every load_spec
-    intact. Its three outputs replace the grouped/projected/by_id construction
-    in ``model_supply.plan_segment_supply``.
+    not discover hardware. Explicit layer offload uses exact range quotes and
+    an independent host RAM constraint, leaving every load_spec intact. Its
+    three outputs replace the grouped/projected/by_id construction in ``model_supply.plan_segment_supply``.
 
     Ready ranges and old layer budgets describe previously supplied assets.
     Full source coverage allows generating new proper aligned segments, even
@@ -354,22 +464,38 @@ def project_supply_capacity_nodes(
         if (type(multiplier) not in (int, float) or not math.isfinite(multiplier)
                 or multiplier <= 0):
             fail("SUPPLY_CAPACITY_INVALID", "Invalid runtime multiplier")
+        spec = None
         if "load_spec" in node:
             try:
                 policy = node["load_spec"]
                 spec = policy if isinstance(policy, RuntimeLoadSpec) else RuntimeLoadSpec.from_dict(policy)
             except (TypeError, ValueError) as exc:
                 raise RuntimeCapacityProjectionError("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", str(exc)) from exc
-            materialization = "gguf_segment" if engine == "llama_cpp" else "safetensors_key_filtered"
+            materializations = ({"gguf_segment"} if engine == "llama_cpp"
+                                else {"safetensors_key_filtered", "safetensors_layer_offload"})
             device = str(node.get("execution_device", ""))
-            if (spec.materialization != materialization
-                    or device not in {spec.device, spec.device.partition(":")[0]}):
+            if (spec.materialization not in materializations
+                    or device not in {spec.device, spec.device.partition(":")[0]}
+                    or ("materialization" in node and node["materialization"] != spec.materialization)):
                 fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Engine/device disagrees with selected load_spec")
             element_size = source.get("runtime_target_element_size")
             if element_size is not None and {"float16": 2, "float32": 4}.get(spec.dtype) != element_size:
                 fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Runtime quote disagrees with selected dtype")
             node["load_spec"] = spec.to_dict()
             node["execution_device"] = spec.device
+        offload = ((spec is not None and spec.materialization == "safetensors_layer_offload")
+                   or node.get("materialization") == "safetensors_layer_offload")
+        if offload:
+            if (engine != "pytorch" or not str(node.get("execution_device", "")).startswith("cuda")
+                    or multiplier != 1.0):
+                fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Layer offload requires a CUDA target with exact byte accounting")
+            if (spec is not None and (spec.sequence_count != 1 or spec.kv_device != spec.device
+                    or spec.kv_dtype != spec.dtype
+                    or {"fp16": "float16", "fp32": "float32"}.get(spec.quant_type) != spec.dtype)):
+                fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Layer offload execution policy disagrees with its target")
+            quoted_dtype = source.get("runtime_target_dtype")
+            if spec is not None and quoted_dtype is not None and spec.dtype != quoted_dtype:
+                fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Layer offload dtype disagrees with its header projection")
         components = source.get("component_weight_bytes") or {}
         keys = (("embedding", "final_norm", "lm_head", "other")
                 if engine == "llama_cpp" or node_id != "master"
@@ -377,7 +503,7 @@ def project_supply_capacity_nodes(
         if any(type(components.get(key, 0)) is not int or components.get(key, 0) < 0 for key in keys):
             fail("SUPPLY_CAPACITY_INVALID", "Invalid boundary byte quote")
         overhead = sum(components.get(key, 0) for key in keys)
-        for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models"):
+        for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models", "range_weight_bytes"):
             node.pop(key, None)
         candidates = [[start, end] for start in range(0, total, alignment)
                       for end in range(start + alignment, total + 1, alignment)
@@ -399,7 +525,34 @@ def project_supply_capacity_nodes(
         configured_reserve = node.get("reserve_bytes", 0)
         if type(configured_reserve) is not int or configured_reserve < 0:
             fail("SUPPLY_CAPACITY_INVALID", "Invalid configured reserve")
-        boundary_reserve = math.ceil(overhead * multiplier * safety_margin)
+        if offload:
+            host_available = node.get("host_capacity_bytes")
+            if host_available is not None and (type(host_available) is not int or host_available < 0):
+                fail("SUPPLY_RUNTIME_HOST_BUDGET_INVALID", "Invalid independent host RAM budget")
+            if host_available is None and (runtime_host_ranges is None or node_id not in runtime_host_ranges):
+                fail("SUPPLY_RUNTIME_HOST_BUDGET_MISSING", "Layer offload needs an independent host RAM constraint")
+            quotes = []
+            admitted = []
+            for start, end in candidates:
+                has_embedding, has_lm_head = start == 0, end == total
+                quote = runtime_range_capacity(source, start, end,
+                    has_embedding=has_embedding, has_lm_head=has_lm_head)
+                if (host_available is not None
+                        and math.ceil(quote["host_weight_peak_bytes"] * safety_margin)
+                            + configured_reserve > host_available):
+                    continue
+                admitted.append([start, end])
+                quotes.append({"layer_range": [start // alignment, end // alignment],
+                               "weight_bytes": quote["device_weight_bytes"],
+                               "has_embedding": has_embedding, "has_lm_head": has_lm_head})
+            candidates = admitted
+            node["range_weight_bytes"] = quotes
+            # The exact range quote includes every needed boundary execution
+            # unit; summing boundary reservations would count it a second time.
+            boundary_reserve = 0
+            overhead = 0
+        else:
+            boundary_reserve = math.ceil(overhead * multiplier * safety_margin)
         node.update(
             engine=engine, role="master" if node_id == "master" else "client",
             layer_weight_bytes=sizes, runtime_multiplier=float(multiplier),

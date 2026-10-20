@@ -133,7 +133,8 @@ def _shell_options(translated: list[str]) -> dict:
     if "--auto-start" in translated:
         _ensure_src_on_path()
         from qlh_core.adapters.settings import SettingsStore
-        environment = SettingsStore().load_listener()
+        from release_contract import DEFAULT_PACKAGED_NODE_ROLE
+        environment = SettingsStore(default_node_role=DEFAULT_PACKAGED_NODE_ROLE).load_listener()
     default_port = environment.get("QLH_BACKEND_PORT") or environment.get("QLH_API_PORT") or 8000
     return {
         "host": value_of("--host", "127.0.0.1"),

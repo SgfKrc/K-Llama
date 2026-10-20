@@ -1015,12 +1015,13 @@ class Scheduler(
         """Compatibility facade for island-gateway profile detection."""
         return _layer_plan.node_is_island_gateway(device_info)
 
-    def _compute_node_weight(self, device_info: dict) -> float:
+    def _compute_node_weight(self, device_info: dict, *, execution_device: str | None = None) -> float:
         """Compatibility facade for device-profile scoring."""
         return _layer_plan.compute_node_weight(
             device_info,
             select_gpu=self._select_scoring_gpu,
             gpu_is_integrated_fn=self._gpu_is_integrated,
+            execution_device=execution_device,
             debug=logger.debug,
         )
 
@@ -2335,7 +2336,7 @@ class Scheduler(
                 "execution_device": execution_device,
                 "capacity_source": capacity_source,
                 "engine": engine,
-                "score": self._compute_node_weight(device_info),
+                "score": self._compute_node_weight(device_info, execution_device=execution_device),
             }
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]

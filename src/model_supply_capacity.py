@@ -97,6 +97,18 @@ def handle_capacity_inventory(coordinator, node_id, payload):
     return True
 
 
+
+def runtime_capacity_source(runtime, device, *, prefix):
+    """Retain the actual CUDA budget authority; older workers use torch alone."""
+    if device != "cuda":
+        return f"{prefix}.ram.available_bytes_live"
+    from cuda_memory_budget import TORCH_BUDGET_SOURCE, UUID_MIN_BUDGET_SOURCE
+    source = runtime.get("budget_source") if isinstance(runtime, dict) else None
+    if source not in {TORCH_BUDGET_SOURCE, UUID_MIN_BUDGET_SOURCE}:
+        source = TORCH_BUDGET_SOURCE
+    return f"{prefix}.{source}"
+
+
 def project_inventory_capacity(record, inventory, engine, *, source_prefix="inventory"):
     """Bind fresh inventory to the selected runtime, without granting readiness.
 
@@ -122,19 +134,26 @@ def project_inventory_capacity(record, inventory, engine, *, source_prefix="inve
         available, device = runtime.get("available_bytes"), runtime["execution_device"]
     if type(available) is not int or available <= 0:
         raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no positive free-memory sample")
-    source = f"{source_prefix}.cuda.mem_get_info" if device == "cuda" else f"{source_prefix}.ram.available_bytes_live"
+    source = runtime_capacity_source(runtime, device, prefix=source_prefix)
     result = {**deepcopy(record), "capacity_bytes": available, "capacity_source": source,
               "execution_device": device, "engine": engine,
               "runtime_multiplier": 1.0 if device == "cuda" else 2.0}
+    if device == "cuda" and isinstance(runtime.get("budget_observations"), dict):
+        result["capacity_observations"] = deepcopy(runtime["budget_observations"])
     if "load_spec" in result:
         try:
             value = result["load_spec"]
             spec = value if isinstance(value, RuntimeLoadSpec) else RuntimeLoadSpec.from_dict(value)
         except (TypeError, ValueError) as exc:
             raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Invalid runtime load_spec") from exc
-        materialization = "safetensors_key_filtered" if engine == "pytorch" else "gguf_segment"
+        materializations = {"safetensors_key_filtered"} if engine == "pytorch" else {"gguf_segment"}
+        if engine == "pytorch" and spec.materialization == "safetensors_layer_offload":
+            supported = runtime.get("materializations")
+            if device != "cuda" or not isinstance(supported, list) or spec.materialization not in supported:
+                raise _error("SUPPLY_RUNTIME_MATERIALIZATION_UNAVAILABLE", "Selected runtime has no layer offload adapter")
+            materializations.add("safetensors_layer_offload")
         if (result.get("load_spec_digest", spec.digest) != spec.digest
-                or spec.device.partition(":")[0] != device or spec.materialization != materialization
+                or spec.device.partition(":")[0] != device or spec.materialization not in materializations
                 or (runtime is not None and {"float16": 2, "float32": 4}.get(spec.dtype)
                     != runtime["target_element_size"])):
             raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Inventory disagrees with selected engine/device/dtype load_spec")
@@ -143,6 +162,71 @@ def project_inventory_capacity(record, inventory, engine, *, source_prefix="inve
     if device == "cuda" and type(host) is int and host >= 0:
         result.update(host_capacity_bytes=host, host_capacity_source=f"{source_prefix}.ram.available_bytes_live")
     return result
+
+
+def bind_supplied_runtime_capacity(record, assignment, inventory):
+    """Restore a supplied CUDA policy and its exact target/host range budgets.
+
+    Artifact byte quotes remain source-precision evidence. The runtime quote
+    includes all selected boundary weights and replaces their additive GPU cost;
+    only the fresh record's configured reserve and solver margin are added.
+    """
+    from qlh_core.planning.load_spec import assignment_load_spec
+
+    value = assignment.get("load_spec")
+    mode = value.get("materialization") if isinstance(value, dict) else None
+    cuda_assignment = str(assignment.get("execution_device", "")).startswith("cuda")
+    cuda_spec = isinstance(value, dict) and str(value.get("device", "")).startswith("cuda:")
+    quoted_cuda = (assignment.get("engine") == "pytorch" and cuda_assignment
+                   and any(key in assignment for key in (
+                       "device_weight_bytes", "runtime_target_element_size", "runtime_target_dtype")))
+    if mode != "safetensors_layer_offload" and not (cuda_spec or quoted_cuda):
+        return record
+    if not isinstance(value, dict):
+        raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Supplied CUDA quote has no frozen load policy")
+    try:
+        spec = assignment_load_spec(assignment, artifact_format="safetensors")
+    except (TypeError, ValueError) as exc:
+        raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Supplied CUDA load policy is invalid") from exc
+    source, conversion = assignment.get("host_source_bytes"), assignment.get("host_conversion_bytes")
+    host_required, weight = assignment.get("host_required_bytes"), assignment.get("device_weight_bytes")
+    host_capacity = inventory.get("memory_available_bytes")
+    start, end = assignment.get("start_layer"), assignment.get("end_layer")
+    embedding, lm_head = assignment.get("has_embedding"), assignment.get("has_lm_head")
+    if (not spec.device.startswith("cuda:")
+            or spec.materialization not in {"safetensors_key_filtered", "safetensors_layer_offload"}
+            or assignment.get("engine", "pytorch") != "pytorch"
+            or assignment.get("execution_device", spec.device) not in {spec.device, "cuda"}
+            or assignment.get("runtime_materialization", spec.materialization) != spec.materialization
+            or spec.quant_type != {"float16": "fp16", "float32": "fp32"}.get(spec.dtype)
+            or any(type(size) is not int or size < 0 for size in (source, conversion))
+            or type(host_required) is not int or host_required <= 0 or host_required < source + conversion
+            or type(weight) is not int or weight <= 0
+            or any(type(bound) is not int for bound in (start, end)) or not 0 <= start < end
+            or type(embedding) is not bool or type(lm_head) is not bool
+            or embedding != ("embedding" in spec.components) or lm_head != ("lm_head" in spec.components)
+            or assignment.get("load_spec_digest") != spec.digest):
+        raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Supplied CUDA range quote is invalid")
+    if (spec.materialization == "safetensors_key_filtered" and "target_weight_bytes" in assignment
+            and (type(assignment["target_weight_bytes"]) is not int
+                 or assignment["target_weight_bytes"] != weight)):
+        raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Resident target weight quote disagrees with CUDA budget")
+    if type(host_capacity) is not int or host_capacity < host_required:
+        raise _error("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", "Host RAM changed before CUDA admission")
+    result = deepcopy(record)
+    result.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest,
+                  runtime_materialization=spec.materialization,
+                  host_capacity_bytes=host_capacity, host_required_bytes=host_required,
+                  host_source_bytes=source, host_conversion_bytes=conversion,
+                  retained_component_bytes=0,
+                  range_weight_bytes=[{"layer_range": [start, end], "weight_bytes": weight,
+                                       "has_embedding": embedding, "has_lm_head": lm_head}])
+    return result
+
+
+def bind_supplied_offload_capacity(record, assignment, inventory):
+    """Compatibility entry point; CUDA resident and offload quotes share a binder."""
+    return bind_supplied_runtime_capacity(record, assignment, inventory)
 
 
 class SupplyCapacityEvidence:
@@ -169,7 +253,8 @@ class SupplyCapacityEvidence:
             if node_id != "master" and not _assignment_capability_matches(by_id[node_id], assignment, query):
                 raise _error("SUPPLY_RUNTIME_CAPABILITY_CHANGED", "Worker capacity projection does not match the supplied segment")
             inventory = self._inventories[node_id]
-            record = project_inventory_capacity(by_id[node_id], inventory, engine)
+            selected_record = bind_supplied_runtime_capacity(by_id[node_id], assignment, inventory)
+            record = project_inventory_capacity(selected_record, inventory, engine)
             available, device, source = (record["capacity_bytes"], record["execution_device"],
                                          record["capacity_source"])
             if engine == "llama_cpp" and "retained_component_bytes" in assignment:
@@ -187,9 +272,10 @@ class SupplyCapacityEvidence:
             item.update(reserve_bytes=record.get("reserve_bytes", 0),
                         reserve_source=record.get("reserve_source", "explicit"),
                         runtime_multiplier=record["runtime_multiplier"])
-            for field in ("host_capacity_bytes", "host_capacity_source", "load_spec_digest"):
+            for field in ("host_required_bytes", "host_capacity_bytes", "host_capacity_source",
+                          "load_spec_digest", "range_weight_bytes", "capacity_observations"):
                 if field in record:
-                    item[field] = record[field]
+                    item[field] = deepcopy(record[field])
             provenance.append(item)
             logger.info("event=pipeline_runtime_budget operation=%s query=%s node=%s engine=%s device=%s capacity_bytes=%s capacity_source=%s reserve_bytes=%s multiplier=%s registration_epoch=%s layer_ranges=%s",
                         query["operation_id"], query["query_id"], node_id, engine, device, available, source,

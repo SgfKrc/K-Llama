@@ -162,11 +162,21 @@ def validate_ack(value):
 
 
 def validate_runtime_receipt(value, *, identity):
-    if (not isinstance(value, dict) or set(value) != {"load_spec", "materialized_bytes", "memory_scope", "layer_range", "artifact_sha256"}
+    fields = {"load_spec", "materialized_bytes", "memory_scope", "layer_range", "artifact_sha256"}
+    if (not isinstance(value, dict) or not fields.issubset(value)
             or value.get("memory_scope") != "weight_tensors"
             or type(value.get("materialized_bytes")) is not int or value["materialized_bytes"] <= 0
             or not isinstance(identity, dict) or value.get("layer_range") != identity.get("layer_range")
             or value.get("artifact_sha256") != identity.get("artifact_sha256")):
         raise WorkerPrepareError("prepare_runtime_receipt_invalid")
-    validate_load_spec(value["load_spec"], identity=identity)
+    spec = validate_load_spec(value["load_spec"], identity=identity)
+    if spec.materialization == "safetensors_layer_offload":
+        domains = {"device_weight_bytes", "host_source_bytes", "host_conversion_bytes"}
+        fields |= domains
+        if (any(type(value.get(name)) is not int or value[name] < 0 for name in domains)
+                or value["device_weight_bytes"] <= 0
+                or value["host_source_bytes"] != value["materialized_bytes"]):
+            raise WorkerPrepareError("prepare_runtime_receipt_invalid")
+    if set(value) != fields:
+        raise WorkerPrepareError("prepare_runtime_receipt_invalid")
     return deepcopy(value)

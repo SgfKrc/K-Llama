@@ -1916,7 +1916,8 @@ class MainScreen(Screen):
             table.clear()
             self.model_rows = {}
             if "_error" in registry:
-                table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
+                label = "主节点目录不可用" if self.model_mode == "distributed" else "模型目录不可用"
+                table.add_row("", f"[red]{label}[/]", "", "", "", registry["_error"])
                 return
             rows = registry.get("models")
             if not isinstance(rows, list) or not rows:

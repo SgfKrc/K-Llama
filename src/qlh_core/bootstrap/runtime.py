@@ -90,13 +90,16 @@ class AppRuntime:
                 self.config = SettingsStore().load()
             return self.config
 
-    def configure_listener(self, port):
+    def configure_listener(self, port, *, environment=None):
         """Freeze the actual listener port before startup and service advertising."""
         from dataclasses import replace
         import json
         with self._lock:
             if self._thread is not None or self._services is not None:
                 raise RuntimeError("listener configuration must precede startup")
+            if self.config is None and environment is not None:
+                from qlh_core.adapters.settings import SettingsStore
+                self.config = SettingsStore(environment).load()
             config = self.resolve_config()
             resolved = int(port)
             if not 1 <= resolved <= 65535:

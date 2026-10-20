@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from qlh_core.planning.placement import placement_score_breakdown
+
 
 def gpu_is_integrated(gpu: dict) -> bool:
     """Classify a GPU conservatively when profiler metadata is incomplete."""
@@ -85,33 +87,27 @@ def compute_node_weight(
     *,
     select_gpu: Callable[[dict], dict] = select_scoring_gpu,
     gpu_is_integrated_fn: Callable[[dict], bool] = gpu_is_integrated,
+    execution_device: str | None = None,
     debug: Callable[..., Any] | None = None,
 ) -> float:
-    """Compute the existing node score from a device profile."""
-    gpu = select_gpu(device_info)
-    ram = device_info.get("ram", {}) if device_info else {}
-    cpu = device_info.get("cpu", {}) if device_info else {}
+    """Estimate placement capability using free host RAM and the active backend.
 
+    Omitting execution_device preserves inferred-backend scoring for legacy
+    layer planning. Capacity callers pass their selected runtime device so a
+    CPU GGUF executor cannot inherit its host's unused CUDA bonus.
+    """
+    gpu = select_gpu(device_info)
     cuda_discrete = bool(
         isinstance(gpu, dict)
         and gpu.get("cuda_available", False)
         and not gpu_is_integrated_fn(gpu)
     )
-    vram_gb = gpu.get("vram_total_gb", 0) if isinstance(gpu, dict) else 0
-    vram_score = (
-        min(vram_gb / 24.0, 1.0) * 50.0
-        if cuda_discrete and vram_gb > 0 else 0
+    parts = placement_score_breakdown(
+        device_info, gpu=gpu, cuda_discrete=cuda_discrete,
+        execution_device=execution_device,
     )
-
-    ram_gb = ram.get("total_gb", 4) if isinstance(ram, dict) else 4
-    ram_score = min(ram_gb / 64.0, 1.0) * 30.0
-
-    cpu_cores = cpu.get("physical_cores", 2) if isinstance(cpu, dict) else 2
-    cpu_freq = cpu.get("freq_max_mhz", 2000) if isinstance(cpu, dict) else 2000
-    core_score = min(cpu_cores / 16.0, 1.0) * 10.0
-    freq_score = min(cpu_freq / 4000.0, 1.0) * 10.0
-    cpu_score = core_score + freq_score
-    accelerator_score = 60.0 if cuda_discrete else 0.0
+    vram_score, ram_score = parts["vram"], parts["ram"]
+    cpu_score, accelerator_score = parts["cpu"], parts["accelerator"]
 
     island_score = 0.0
     island = device_info.get("island", {}) if device_info else {}

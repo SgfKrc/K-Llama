@@ -33,21 +33,21 @@ def node(node_id, capacity, *, reserve=0, multiplier=1.0, score=0, device="cpu",
     }
 
 
-def rejected(descriptor, nodes, margin=1.0):
+def rejected(descriptor, nodes, margin=1.0, *, prefer_all_workers=False):
     result = solve_pipeline_capacity(
         descriptor, nodes, safety_margin=margin,
-        require_distributed=True, prefer_all_workers=True,
+        require_distributed=True, prefer_all_workers=prefer_all_workers,
     )
     assert result["admitted"] is False
     return result
 
 
-def explain(descriptor, nodes, *, plan=None, alignment=1, margin=1.0):
+def explain(descriptor, nodes, *, plan=None, alignment=1, margin=1.0, prefer_all_workers=False):
     return explain_supply_capacity(
-        rejected(descriptor, nodes, margin) if plan is None else plan,
+        rejected(descriptor, nodes, margin, prefer_all_workers=prefer_all_workers) if plan is None else plan,
         grouped_descriptor=descriptor, projected_nodes=nodes,
         alignment=alignment, total_layers=descriptor["total_layers"] * alignment,
-        safety_margin=margin,
+        safety_margin=margin, prefer_all_workers=prefer_all_workers,
     )
 
 
@@ -136,13 +136,14 @@ def test_already_projected_boundary_and_conservative_ratio_are_not_recomputed():
     assert rows(explain(descriptor, nodes, margin=margin, plan=plan))["master"] == master
 
 
+@pytest.mark.parametrize("prefer_all_workers", [False, True])
 @pytest.mark.parametrize("first_options,second_options", [
     ({"capacity": 200, "reserve": 100}, {"capacity": 80, "reserve": 0}),
     ({"capacity": 100, "score": 9}, {"capacity": 400, "score": 8}),
     ({"capacity": 200, "reserve": 100}, {"capacity": 100, "reserve": 0}),
 ])
 def test_solver_relative_order_and_host_ranges_survive_capacity_inflation(
-    monkeypatch, first_options, second_options,
+    monkeypatch, first_options, second_options, prefer_all_workers,
 ):
     descriptor = grouped((500, 500, 500))
     # The reversed input list must not become the execution order. These exact
@@ -152,7 +153,7 @@ def test_solver_relative_order_and_host_ranges_survive_capacity_inflation(
         node("master", 600, layer_ranges=[[0, 1]]),
         node("a-first", layer_ranges=[[1, 2]], **first_options),
     ]
-    plan = rejected(descriptor, nodes)
+    plan = rejected(descriptor, nodes, prefer_all_workers=prefer_all_workers)
     before = deepcopy((plan, descriptor, nodes))
     captured = []
 
@@ -168,30 +169,41 @@ def test_solver_relative_order_and_host_ranges_survive_capacity_inflation(
             }
         assert len(increments) == 1 and next(iter(increments)) > 0
         assert kwargs == {"safety_margin": 1.0, "require_distributed": True,
-                          "prefer_all_workers": True, "required_node_id": "master"}
+                          "prefer_all_workers": prefer_all_workers, "required_node_id": "master"}
         return solve_pipeline_capacity(value, inflated, **kwargs)
 
     monkeypatch.setattr(diagnostics, "solve_pipeline_capacity", checked_solver)
-    result = explain(descriptor, nodes, plan=plan, alignment=2)
+    result = explain(descriptor, nodes, plan=plan, alignment=2, prefer_all_workers=prefer_all_workers)
     assert len(captured) == 1
     assert [(item["node_id"], item["layer_range"]) for item in result["nodes"]] == [
         ("master", [0, 2]), ("a-first", [2, 4]), ("z-second", [4, 6]),
     ]
     assert (plan, descriptor, nodes) == before
     assert solve_pipeline_capacity(descriptor, nodes, safety_margin=1,
-                                   require_distributed=True, prefer_all_workers=True) == plan
+                                   require_distributed=True, prefer_all_workers=prefer_all_workers) == plan
 
 
-def test_joint_shortage_is_visible_when_each_node_can_fit_its_cheapest_segment():
+@pytest.mark.parametrize("prefer_all_workers", [False, True])
+def test_joint_shortage_is_visible_when_each_node_can_fit_its_cheapest_segment(prefer_all_workers):
     descriptor = grouped((100,) * 6)
     nodes = [node("b", 150), node("master", 150), node("a", 150)]
-    plan = rejected(descriptor, nodes)
+    plan = rejected(descriptor, nodes, prefer_all_workers=prefer_all_workers)
     plan["raw_capacity_deficit_bytes"] = 1  # Must not be copied into per-node gaps.
-    result = explain(descriptor, nodes, plan=plan, alignment=2)
+    result = explain(descriptor, nodes, plan=plan, alignment=2, prefer_all_workers=prefer_all_workers)
     assert all(100 <= item["available_bytes"] for item in result["nodes"])
-    assert [item["required_bytes"] for item in result["nodes"]] == [200, 200, 200]
-    assert [item["deficit_bytes"] for item in result["nodes"]] == [50, 50, 50]
-    assert [item["layer_range"] for item in result["nodes"]] == [[0, 4], [4, 8], [8, 12]]
+    selected = [item for item in result["nodes"] if "required_bytes" in item]
+    if prefer_all_workers:
+        assert [item["required_bytes"] for item in selected] == [200, 200, 200]
+        assert [item["deficit_bytes"] for item in selected] == [50, 50, 50]
+        assert [item["layer_range"] for item in selected] == [[0, 4], [4, 8], [8, 12]]
+    else:
+        assert [item["node_id"] for item in selected] == ["master", "a"]
+        assert [item["required_bytes"] for item in selected] == [300, 300]
+        assert [item["deficit_bytes"] for item in selected] == [150, 150]
+        assert [item["layer_range"] for item in selected] == [[0, 6], [6, 12]]
+        assert not {"required_bytes", "deficit_bytes", "layer_range"}.intersection(rows(result)["b"])
+    assert result["reason_code"] == plan["reason_code"]
+    assert "assignments" not in result and "loaded_ready" not in result
 
 
 def test_topologically_unavailable_reordering_cannot_invent_a_candidate():
@@ -299,7 +311,7 @@ def test_invalid_grouping_or_margin_cannot_give_an_explanation(alignment, total,
                                 alignment=alignment, total_layers=total, safety_margin=margin)
 
 
-@pytest.mark.parametrize("node_id,boundary", [("master", 50), ("worker", 110)])
+@pytest.mark.parametrize("node_id,boundary", [("master", 50), ("worker", 50)])
 @pytest.mark.parametrize("offset", [-1, 0, 1])
 def test_host_exact_source_budget_agrees_with_real_admission_at_one_byte(node_id, boundary, offset):
     projection = host_projection()
@@ -319,7 +331,7 @@ def test_host_exact_source_budget_agrees_with_real_admission_at_one_byte(node_id
 
 
 @pytest.mark.parametrize("node_id,expected_range,boundary", [
-    ("master", [0, 2], 50), ("pc-worker", [2, 4], 110), ("android-worker", [2, 4], 110),
+    ("master", [0, 2], 50), ("pc-worker", [2, 4], 20), ("android-worker", [2, 4], 20),
 ])
 def test_minimum_host_span_uses_nonuniform_aligned_source_groups(node_id, expected_range, boundary):
     projection = host_projection((80, 20, 9, 11, 30, 50))
@@ -339,7 +351,7 @@ def test_host_explicit_candidate_uses_its_exact_source_range_and_not_minimum():
     assert explicit["scope"] == "candidate_plan"
     assert minimum["nodes"][0]["deficit_bytes"] == 0
     assert explicit["nodes"][0]["layer_range"] == [0, 4]
-    required = math.ceil((120 + 110) * 1.2) + 23
+    required = math.ceil((120 + 50) * 1.2) + 23
     assert explicit["nodes"][0]["required_bytes"] == required
     assert explicit["nodes"][0]["deficit_bytes"] == required - 200
 
@@ -347,8 +359,8 @@ def test_host_explicit_candidate_uses_its_exact_source_range_and_not_minimum():
 @pytest.mark.parametrize("component,node_id,charge", [
     ("embedding", "master", 7), ("final_norm", "master", 7),
     ("other", "master", 7), ("lm_head", "master", 0),
-    ("embedding", "worker", 7), ("final_norm", "worker", 7),
-    ("other", "worker", 7), ("lm_head", "worker", 7),
+    ("embedding", "worker", 0), ("final_norm", "worker", 7),
+    ("other", "worker", 7), ("lm_head", "worker", 0),
 ])
 def test_host_boundaries_match_postcheck_including_remote_middle(component, node_id, charge):
     projection = host_projection((10,) * 4)
@@ -443,3 +455,57 @@ assert "torch" not in sys.modules and "safetensors" not in sys.modules
     result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", code, source_path],
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("span", [[0, 1], [1, 2], [3, 4]])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_host_owned_boundaries_match_runtime_range_quote_and_real_admission(tied, span, offset):
+    from model_supply_runtime_capacity import runtime_range_capacity
+
+    keys = ("layers", "embedding", "final_norm", "lm_head", "visual", "mtp", "multimodal", "other")
+    value = host_projection((10, 20, 30, 40))
+    value.update(tie_word_embeddings=tied, runtime_layer_weight_bytes=[5, 10, 15, 20],
+                 runtime_conversion_layer_max_bytes=[2, 4, 6, 8],
+                 source_component_weight_bytes={**dict.fromkeys(keys, 0),
+                     "embedding": 7, "final_norm": 2, "lm_head": 13, "other": 3},
+                 runtime_component_weight_bytes=dict.fromkeys(keys, 1),
+                 runtime_conversion_component_max_bytes={**dict.fromkeys(keys, 0),
+                     "embedding": 9, "lm_head": 11, "final_norm": 3, "other": 1})
+    start, end = span
+    quote = runtime_range_capacity(value, start, end, has_embedding=start == 0, has_lm_head=end == 4,
+                                   materialization="safetensors_key_filtered")
+    required = math.ceil(quote["host_weight_peak_bytes"] * 1.2) + 5
+    available = required + offset
+    row = host_explain(value, "worker", available=available, reserve=5, margin=1.2,
+                       layer_range=span)["nodes"][0]
+    assert row["host_source_bytes"] == quote["host_source_bytes"]
+    assert row["host_conversion_bytes"] == quote["host_conversion_bytes"]
+    assert row["required_bytes"] == required
+    assert row["deficit_bytes"] == max(0, -offset)
+    assert row["layer_range"] == span
+    assert (span in allowed_host_layer_ranges(value, "worker", available, 5, 1.2, 1)) == (offset >= 0)
+    if tied and span == [1, 2]:
+        assert row["host_source_bytes"] == 25
+        assert row["host_conversion_bytes"] == 4
+    if tied and span == [3, 4]:
+        assert row["host_source_bytes"] == 52
+        assert row["host_conversion_bytes"] == 9
+
+
+@pytest.mark.parametrize("cost_domain", ["owned_boundaries", "cpu_conversion"])
+def test_minimum_host_span_compares_complete_candidate_quotes(cost_domain):
+    value = host_projection((1, 10, 20, 1))
+    value["source_component_weight_bytes"] = dict.fromkeys(("embedding", "final_norm", "lm_head", "other"), 0)
+    if cost_domain == "owned_boundaries":
+        value["source_component_weight_bytes"].update(embedding=100, lm_head=200)
+    else:
+        value.update(runtime_conversion_layer_max_bytes=[100, 0, 0, 200],
+                     runtime_conversion_component_max_bytes=dict.fromkeys(
+                         ("embedding", "final_norm", "lm_head", "other"), 0))
+    row = host_explain(value, "worker", available=0, reserve=0, margin=1)["nodes"][0]
+    assert row["layer_range"] == [1, 2]
+    assert row["required_bytes"] == row["host_source_bytes"] == 10
+    assert row["host_conversion_bytes"] == 0
+    assert [1, 2] not in allowed_host_layer_ranges(value, "worker", 9, 0, 1, 1)
+    assert [1, 2] in allowed_host_layer_ranges(value, "worker", 10, 0, 1, 1)

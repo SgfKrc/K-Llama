@@ -46,11 +46,19 @@ class RuntimeController:
             self.current_quant = value
             self._revision += 1
 
+    def _metadata_manager(self):
+        manager = self._manager
+        # Observe an already-created native owner without triggering a cold
+        # lazy factory. The proxy remains installed after the first torch load.
+        if type(manager).__name__ == "_LazyModelManager":
+            return object.__getattribute__(manager, "_instance")
+        return manager
+
     def publish_metadata(self, name, value):
         with self._lock:
-            manager = self._manager
+            manager = self._metadata_manager()
             # Published fields have one read path; preserve lazy construction.
-            if manager is not None and type(manager).__name__ != "_LazyModelManager":
+            if manager is not None:
                 try:
                     self._write_metadata(manager, name, value) if self._write_metadata else None
                 except (AttributeError, TypeError):
@@ -60,8 +68,8 @@ class RuntimeController:
 
     def read_metadata(self, name):
         with self._lock:
-            manager = self._manager
-            if manager is not None and type(manager).__name__ != "_LazyModelManager":
+            manager = self._metadata_manager()
+            if manager is not None:
                 try:
                     return getattr(manager, name)
                 except AttributeError:

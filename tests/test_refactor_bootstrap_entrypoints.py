@@ -64,7 +64,10 @@ def local_backend(monkeypatch, shell):
     probes = iter([False, True])
     monkeypatch.setattr(tui_backend.BackendSupervisor, "probe", lambda self, **kwargs: next(probes))
     monkeypatch.setattr(tui_backend.BackendSupervisor, "_silence_console_logging", staticmethod(lambda: None))
-    runtime = SimpleNamespace(configure_listener=lambda port: events.append(("configure", port)))
+    def configure_listener(port, *, environment=None):
+        events.append(("configure", port))
+        shell["runtime_environment"] = environment
+    runtime = SimpleNamespace(configure_listener=configure_listener)
 
     def config(app, **options):
         events.append(("bind", options["host"], options["port"]))
@@ -126,6 +129,7 @@ def test_tui_entrypoint_resolves_listener_before_bind(
     assert local_backend["listener"]["host"] == bind_host
     assert local_backend["listener"]["port"] == port
     assert local_backend["events"] == [("configure", port), ("bind", bind_host, port)]
+    assert local_backend["runtime_environment"] == calls[0]
     assert local_backend["started"] is True
     supervisor = local_backend["supervisor"]
     assert supervisor.server.should_exit is True
