@@ -66,16 +66,22 @@ class NativeTool {
             if (Failure("CONFIGURE") != 0) return Failure("CONFIGURE");
             string dir = After(args, "-B");
             var cache = new List<string>();
+            string missingKey = Environment.GetEnvironmentVariable("QLH_TEST_MISSING_CACHE_KEY");
             foreach (string arg in args) {
                 if (arg.StartsWith("-D")) {
                     int equal = arg.IndexOf('=');
-                    cache.Add(arg.Substring(2, equal - 2) + ":STRING=" + arg.Substring(equal + 1).Replace('\\', '/'));
+                    string key = arg.Substring(2, equal - 2);
+                    if (key != missingKey)
+                        cache.Add(key + ":STRING=" + arg.Substring(equal + 1).Replace('\\', '/'));
                 }
             }
             cache.Add("CMAKE_GENERATOR:INTERNAL=" + After(args, "-G"));
             cache.Add("CMAKE_HOME_DIRECTORY:INTERNAL=" + After(args, "-S").Replace('\\', '/'));
             if (Environment.GetEnvironmentVariable("QLH_TEST_BAD_CACHE") == "1")
                 cache.Add("GGML_NATIVE:BOOL=ON");
+            string badKey = Environment.GetEnvironmentVariable("QLH_TEST_BAD_CACHE_KEY");
+            if (!String.IsNullOrEmpty(badKey))
+                cache.Add(badKey + ":STRING=" + Environment.GetEnvironmentVariable("QLH_TEST_BAD_CACHE_VALUE"));
             Write(Path.Combine(dir, "CMakeCache.txt"), String.Join("\n", cache));
             Mutate("CONFIGURE");
             return 0;
@@ -111,6 +117,27 @@ def retry_fixture_sharing(operation):
             if getattr(error, "winerror", None) != 32 or attempt == 11:
                 raise
             time.sleep(0.5 * (attempt + 1))
+
+
+def wait_image_released(path, *, deadline=3.0):
+    """Wait until a just-exited exec image can be pinned.
+
+    ``pin_fixture_image`` excludes write sharing, so while the previous
+    process image is still unmapping Windows answers ERROR_ACCESS_DENIED (5).
+    That is a different condition from the sharing violations
+    ``retry_fixture_sharing`` handles, so it gets its own short wait instead of
+    widening that helper's contract. Callers pass one of the hard-linked tool
+    names: they share an image, so one wait covers all of them.
+    """
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            pin_fixture_image(path)()
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) != 5 or time.monotonic() >= end:
+                raise
+            time.sleep(0.05)
 
 
 def exclusive_read(path):
@@ -291,12 +318,83 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         # Never replay configuration/build against outputs from a previous launch.
         with ExitStack() as images:
             tools = getattr(self, "tools", None)
-            for path in sorted(tools.glob("*.exe")) if tools is not None else ():
+            names = sorted(tools.glob("*.exe")) if tools is not None else []
+            # The four tool names are hard links to one image: a single wait
+            # clears the unmapping window for all of them.
+            if names:
+                wait_image_released(names[0])
+            for path in names:
                 images.callback(retry_fixture_sharing(lambda: pin_fixture_image(path)))
             result = subprocess.run(self.command, cwd=self.tmp.name, env=dict(self.env, **env),
                                     capture_output=True, text=True, errors="replace", timeout=45)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
+
+    def assert_profile_contract(self, profile):
+        receipt = json.loads((self.build / "keep-head-cpu-build.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(receipt["schema_version"], 1)
+        self.assertEqual(receipt["isa_profile"], profile)
+        self.assertEqual(receipt["production_default_profile"], "avx2")
+        self.assertIs(receipt["experimental_profile"], profile == "avx2_vnni")
+        expected = {
+            "CMAKE_BUILD_TYPE": "Release", "BUILD_SHARED_LIBS": "ON", "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+            "CMAKE_C_COMPILER": str(self.tools / "gcc.exe"),
+            "CMAKE_CXX_COMPILER": str(self.tools / "g++.exe"),
+            "CMAKE_MAKE_PROGRAM": str(self.tools / "mingw32-make.exe"),
+            "CMAKE_TOOLCHAIN_FILE": "", "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "",
+            "CMAKE_C_FLAGS": "", "CMAKE_CXX_FLAGS": "",
+            "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG", "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
+            "CMAKE_EXE_LINKER_FLAGS": "", "CMAKE_SHARED_LINKER_FLAGS": "", "CMAKE_MODULE_LINKER_FLAGS": "",
+            "LLAMA_USE_SYSTEM_GGML": "OFF", "LLAMA_BUILD_COMMON": "OFF", "LLAMA_BUILD_TOOLS": "OFF",
+            "LLAMA_BUILD_TESTS": "OFF", "LLAMA_BUILD_EXAMPLES": "OFF", "LLAMA_BUILD_SERVER": "OFF",
+            "LLAMA_BUILD_APP": "OFF", "LLAMA_BUILD_UI": "OFF", "LLAMA_USE_PREBUILT_UI": "OFF",
+            "LLAMA_BUILD_MTMD": "OFF", "LLAMA_OPENSSL": "OFF", "LLAMA_CURL": "OFF", "LLAMA_LLGUIDANCE": "OFF",
+            "LLAMA_TOOLS_INSTALL": "OFF", "LLAMA_TESTS_INSTALL": "OFF",
+            "FETCHCONTENT_FULLY_DISCONNECTED": "ON", "FETCHCONTENT_UPDATES_DISCONNECTED": "ON",
+            "GGML_CPU": "ON", "GGML_CPU_REPACK": "ON", "GGML_NATIVE": "OFF", "GGML_AVX": "ON", "GGML_AVX2": "ON",
+            "GGML_SSE42": "ON", "GGML_BMI2": "ON", "GGML_FMA": "ON", "GGML_F16C": "ON",
+            "GGML_AVX_VNNI": "ON" if profile == "avx2_vnni" else "OFF",
+            "GGML_AVX512": "OFF", "GGML_AVX512_VBMI": "OFF",
+            "GGML_AVX512_VNNI": "OFF", "GGML_AVX512_BF16": "OFF",
+            "GGML_AMX_TILE": "OFF", "GGML_AMX_INT8": "OFF", "GGML_AMX_BF16": "OFF",
+            "GGML_CPU_ALL_VARIANTS": "OFF", "GGML_BACKEND_DL": "OFF",
+            "GGML_CPU_HBM": "OFF", "GGML_CPU_KLEIDIAI": "OFF", "GGML_CCACHE": "OFF",
+            "GGML_OPENMP": "ON", "GGML_LLAMAFILE": "ON",
+            "GGML_BUILD_TESTS": "OFF", "GGML_BUILD_EXAMPLES": "OFF",
+            "GGML_ACCELERATE": "OFF", "GGML_BLAS": "OFF", "GGML_CUDA": "OFF", "GGML_HIP": "OFF",
+            "GGML_MUSA": "OFF", "GGML_VULKAN": "OFF", "GGML_SYCL": "OFF", "GGML_RPC": "OFF",
+            "GGML_METAL": "OFF", "GGML_WEBGPU": "OFF", "GGML_OPENCL": "OFF", "GGML_OPENVINO": "OFF",
+            "GGML_HEXAGON": "OFF", "GGML_ZDNN": "OFF", "GGML_ZENDNN": "OFF",
+            "GGML_VIRTGPU": "OFF", "GGML_VIRTGPU_BACKEND": "OFF",
+        }
+        self.assertEqual(receipt["cmake_definitions"], expected)
+        configure = receipt["configure_arguments"]
+        flags = [arg for arg in configure if arg.startswith("-D")]
+        self.assertCountEqual(flags, [f"-D{key}={value}" for key, value in expected.items()])
+        keys = [flag.split("=", 1)[0] for flag in flags]
+        self.assertEqual(len(keys), len(set(keys)), "CMake definitions must appear exactly once")
+        logged = self.log.read_text().splitlines()
+        start = logged.index("-S")
+        self.assertEqual(logged[start:logged.index("END", start)], configure)
+        self.assertEqual(configure[:6], ["-S", str(self.source), "-B", str(self.build), "-G", "MinGW Makefiles"])
+        # The tiny fake deliberately does not generate compile_commands.json.
+        self.assertFalse((self.build / "compile_commands.json").exists())
+        inputs = receipt["input_sha256"]
+        for name, digest in inputs.items():
+            self.assertEqual(hashlib.sha256(Path(name).read_bytes()).hexdigest(), digest, name)
+        self.assertIn(str(Path(sys.executable)), inputs)
+        self.assertEqual(inputs[str(BUILDER)], receipt["builder_sha256"])
+        self.assertEqual(set(receipt["tools"]), {"cmake", "gcc", "g++", "make"})
+        for tool in receipt["tools"].values():
+            self.assertEqual(tool["sha256"], inputs[tool["path"]])
+        for name in ("cmake.exe", "gcc.exe", "g++.exe", "mingw32-make.exe", *DLLS[5:]):
+            self.assertIn(str(self.tools / name), inputs)
+        for artifact in receipt["artifacts"]:
+            path = Path(artifact["path"])
+            self.assertEqual(artifact["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            if artifact["name"] in DLLS[5:]:
+                self.assertEqual(artifact["sha256"], inputs[str(self.tools / artifact["name"])])
+        return receipt
 
     def test_fresh_build_spaces_custom_output_and_safe_config(self):
         # Host CFLAGS must not change the portable ISA selection.
@@ -305,6 +403,7 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
                          QLH_KEEP_HEAD_PYTHON=str(self.root / "wrong python.exe"))
         receipt = json.loads((self.build / "keep-head-cpu-build.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(self.assert_profile_contract("avx2"), receipt)
         sync = receipt["source_sync"]
         self.assertEqual(Path(sync["python"]), Path(sys.executable))
         self.assertEqual(Path(sync["script"]), self.sync)
@@ -334,6 +433,59 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         self.assertEqual(self.git(self.source, "status", "--porcelain").stdout, "")
         for name in DLLS[5:]:
             self.assertEqual((self.output / name).read_bytes(), (self.tools / name).read_bytes())
+
+    def test_explicit_production_profile_has_exact_default_flags(self):
+        self.command += ["-IsaProfile", "avx2"]
+        self.run_builder()
+        self.assert_profile_contract("avx2")
+
+    def test_candidate_profile_changes_only_vnni(self):
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        self.run_builder(QLH_KEEP_HEAD_ISA_PROFILE="avx2", GGML_AVX_VNNI="OFF")
+        self.assert_profile_contract("avx2_vnni")
+
+    def test_profile_names_are_canonical_in_receipt(self):
+        self.command += ["-IsaProfile", "AVX2_VNNI"]
+        self.run_builder()
+        self.assert_profile_contract("avx2_vnni")
+
+    def test_environment_cannot_select_candidate_or_override_fixed_definitions(self):
+        self.run_builder(QLH_KEEP_HEAD_ISA_PROFILE="avx2_vnni", ISA_PROFILE="avx2_vnni",
+                         GGML_AVX_VNNI="ON", GGML_NATIVE="ON", GGML_CPU_REPACK="OFF",
+                         CMAKE_EXPORT_COMPILE_COMMANDS="OFF")
+        self.assert_profile_contract("avx2")
+
+    def test_invalid_profile_is_rejected_before_tools_or_output(self):
+        command = self.command[:]
+        for profile in ("avx512", "native", "", "avx2_vnni;avx2"):
+            with self.subTest(profile=profile):
+                self.command = command + ["-IsaProfile", profile]
+                result = self.run_builder(1)
+                self.assertIn("IsaProfile", result.stdout + result.stderr)
+                self.assert_no_build()
+
+    def test_candidate_cache_mismatches_are_rejected_before_compile(self):
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        build_root = self.build
+        bad_values = {"GGML_AVX_VNNI": "OFF", "GGML_CPU_REPACK": "OFF", "GGML_NATIVE": "ON",
+                      "GGML_AVX512": "ON", "GGML_AMX_TILE": "ON", "CMAKE_EXPORT_COMPILE_COMMANDS": "OFF"}
+        for key, value in bad_values.items():
+            with self.subTest(key=key):
+                self.build = build_root / key
+                self.command[self.command.index("-BuildDir") + 1] = str(self.build)
+                result = self.run_builder(1, QLH_TEST_BAD_CACHE_KEY=key, QLH_TEST_BAD_CACHE_VALUE=value)
+                self.assertIn(f"Unexpected CMake cache value for {key}", result.stdout)
+                self.assertNotIn("--build\n", self.log.read_text())
+                self.assertFalse(self.output.exists())
+                self.assertFalse((self.build / "keep-head-cpu-build.json").exists())
+
+    def test_candidate_cache_must_include_vnni_definition(self):
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        result = self.run_builder(1, QLH_TEST_MISSING_CACHE_KEY="GGML_AVX_VNNI")
+        self.assertIn("Unexpected CMake cache value for GGML_AVX_VNNI", result.stdout)
+        self.assertNotIn("--build\n", self.log.read_text())
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.build / "keep-head-cpu-build.json").exists())
 
     def test_configure_failure_preserves_code_and_never_builds(self):
         self.run_builder(23, QLH_TEST_FAIL_CONFIGURE="23")
@@ -501,6 +653,12 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
     def test_shim_script_drift_during_shim_compile_is_rejected(self):
         self.assert_drift_rejected(self.root / "scripts/model_tools/build_keep_head_shim.ps1",
                                    "SHIM", "Build input changed", addition="\n# drift\n")
+
+    def test_runtime_drift_during_build_is_rejected_even_when_shim_copies_it(self):
+        runtime = self.tools / "libgomp-1.dll"
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        self.assert_drift_rejected(runtime, "BUILD", "Build input changed")
+        self.assertEqual((self.output / runtime.name).read_bytes(), runtime.read_bytes())
 
     def test_python_environment_override_without_explicit_parameter(self):
         index = self.command.index("-Python")

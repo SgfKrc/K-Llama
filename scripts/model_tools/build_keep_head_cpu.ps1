@@ -3,6 +3,7 @@
 # (or empty), and outputs inside SourceRoot must be Git-ignored. Never clean them.
 # ToolchainBin defaults to C:\msys64\ucrt64\bin; CMake defaults to its cmake.exe.
 # Override via parameters or QLH_KEEP_HEAD_TOOLCHAIN_BIN / QLH_KEEP_HEAD_CMAKE.
+# ISA selection is explicit only: avx2 (production default), avx2_vnni (experimental).
 # Python: -Python > QLH_KEEP_HEAD_PYTHON > SourceRoot .venv / .venv-test > PATH.
 # Only the SourceRoot sync tool's read-only, applied_committed report is accepted.
 # Example: -BuildDir 'build/native trial' -OutDir 'build/native trial/output'
@@ -15,6 +16,7 @@ param(
     [string]$ToolchainBin = $env:QLH_KEEP_HEAD_TOOLCHAIN_BIN,
     [string]$CMake = $env:QLH_KEEP_HEAD_CMAKE,
     [string]$Python = $env:QLH_KEEP_HEAD_PYTHON,
+    [ValidateSet('avx2', 'avx2_vnni')][string]$IsaProfile = 'avx2',
     [ValidateRange(1, 128)][int]$Jobs = 8
 )
 
@@ -124,6 +126,7 @@ function Assert-UnchangedInputs {
 }
 
 try {
+    $IsaProfile = $IsaProfile.ToLowerInvariant()
     $scriptRepo = Full-Path '..\..' $PSScriptRoot
     if (-not $SourceRoot) { $SourceRoot = $scriptRepo }
     $SourceRoot = Full-Path $SourceRoot $scriptRepo
@@ -149,6 +152,7 @@ try {
         $Python = Full-Path $Python $SourceRoot
     } else { $Python = (Get-Command $Python -CommandType Application -ErrorAction Stop).Source }
     Require-File $Python
+    $inputHashes[$Python] = Hash-File $Python
     $syncArgs = @('-B', '-X', 'utf8', $syncScript, '--android-root', (Join-Path $SourceRoot 'android'), '--dry-run')
     $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($lock.source -cne 'android/app/src/main/cpp/llama.cpp') { throw 'Unexpected locked source path' }
@@ -194,8 +198,15 @@ try {
     $gxx = Join-Path $ToolchainBin 'g++.exe'
     $make = Join-Path $ToolchainBin 'mingw32-make.exe'
     $runtimes = @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll', 'libgomp-1.dll')
-    foreach ($tool in @($CMake, $gcc, $gxx, $make)) { Require-File $tool }
-    foreach ($name in $runtimes) { Require-File (Join-Path $ToolchainBin $name) }
+    foreach ($tool in @($CMake, $gcc, $gxx, $make)) {
+        Require-File $tool
+        $inputHashes[$tool] = Hash-File $tool
+    }
+    foreach ($name in $runtimes) {
+        $path = Join-Path $ToolchainBin $name
+        Require-File $path
+        $inputHashes[$path] = Hash-File $path
+    }
     # CMake/make/compiler subprocesses must use this runtime group, even if PATH
     # contains another MinGW installation. Empty flags below override CFLAGS etc.
     $env:PATH = $ToolchainBin + ';' + (Split-Path -Parent $CMake) + ';' + $originalPath
@@ -208,11 +219,11 @@ try {
         $version = @(Invoke-Checked $entry[1] @('--version'))
         if ($version.Count -eq 0) { throw "Tool returned no version: $($entry[1])" }
         Write-Host "[tool] $($version[0])"
-        $tools[$entry[0]] = [ordered]@{ path = $entry[1]; version = $version[0]; sha256 = (Hash-File $entry[1]) }
+        $tools[$entry[0]] = [ordered]@{ path = $entry[1]; version = $version[0]; sha256 = $inputHashes[$entry[1]] }
     }
 
     $definitions = [ordered]@{
-        CMAKE_BUILD_TYPE = 'Release'; BUILD_SHARED_LIBS = 'ON'
+        CMAKE_BUILD_TYPE = 'Release'; BUILD_SHARED_LIBS = 'ON'; CMAKE_EXPORT_COMPILE_COMMANDS = 'ON'
         CMAKE_C_COMPILER = $gcc; CMAKE_CXX_COMPILER = $gxx; CMAKE_MAKE_PROGRAM = $make
         CMAKE_TOOLCHAIN_FILE = ''; CMAKE_PROJECT_TOP_LEVEL_INCLUDES = ''
         CMAKE_C_FLAGS = ''; CMAKE_CXX_FLAGS = ''
@@ -224,7 +235,7 @@ try {
         LLAMA_BUILD_MTMD = 'OFF'; LLAMA_OPENSSL = 'OFF'; LLAMA_CURL = 'OFF'; LLAMA_LLGUIDANCE = 'OFF'
         LLAMA_TOOLS_INSTALL = 'OFF'; LLAMA_TESTS_INSTALL = 'OFF'
         FETCHCONTENT_FULLY_DISCONNECTED = 'ON'; FETCHCONTENT_UPDATES_DISCONNECTED = 'ON'
-        GGML_CPU = 'ON'; GGML_NATIVE = 'OFF'; GGML_AVX = 'ON'; GGML_AVX2 = 'ON'
+        GGML_CPU = 'ON'; GGML_CPU_REPACK = 'ON'; GGML_NATIVE = 'OFF'; GGML_AVX = 'ON'; GGML_AVX2 = 'ON'
         GGML_SSE42 = 'ON'; GGML_BMI2 = 'ON'; GGML_FMA = 'ON'; GGML_F16C = 'ON'
         GGML_AVX_VNNI = 'OFF'; GGML_AVX512 = 'OFF'; GGML_AVX512_VBMI = 'OFF'
         GGML_AVX512_VNNI = 'OFF'; GGML_AVX512_BF16 = 'OFF'
@@ -239,8 +250,10 @@ try {
         GGML_HEXAGON = 'OFF'; GGML_ZDNN = 'OFF'; GGML_ZENDNN = 'OFF'
         GGML_VIRTGPU = 'OFF'; GGML_VIRTGPU_BACKEND = 'OFF'
     }
+    if ($IsaProfile -ceq 'avx2_vnni') { $definitions['GGML_AVX_VNNI'] = 'ON' }
     $configure = @('-S', $source, '-B', $BuildDir, '-G', 'MinGW Makefiles')
     foreach ($key in $definitions.Keys) { $configure += "-D$key=$($definitions[$key])" }
+    Assert-UnchangedInputs
     New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
     Invoke-Checked $CMake $configure | Out-Host
     # Check the actual cache before compiling, including flags that could select
@@ -299,6 +312,8 @@ try {
     Assert-UnchangedInputs
     $receipt = [ordered]@{
         schema_version = 1; exit_code = 0; completed_utc = [DateTime]::UtcNow.ToString('o')
+        isa_profile = $IsaProfile; production_default_profile = 'avx2'
+        experimental_profile = ($IsaProfile -ceq 'avx2_vnni')
         source_root = $SourceRoot; source = $source; source_revision = $revision; source_tree = $tree
         upstream_revision = $lock.upstream.revision; source_git_clean = $true; patches = $patches
         lock_sha256 = $inputHashes[$lockPath]; builder_sha256 = $inputHashes[$PSCommandPath]
@@ -308,6 +323,7 @@ try {
         source_sync = [ordered]@{ python = $Python; script = $syncScript; script_sha256 = $inputHashes[$syncScript]
             arguments = $syncArgs; before = $syncBefore; after = $syncAfter }
         build_dir = $BuildDir; out_dir = $OutDir; tools = $tools
+        cmake_definitions = $definitions
         configure_arguments = $configure; build_arguments = $compile; shim_arguments = $shimArgs
         cache_sha256 = (Hash-File $cachePath); artifacts = $artifacts
     }

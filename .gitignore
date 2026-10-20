@@ -202,6 +202,8 @@ scripts/*
 !scripts/experiment_core/
 !scripts/experiment_gemma_judge_real.py
 !scripts/llama_kernel_bench.py
+!scripts/llama_isa_bench.py
+!scripts/placement_study.py
 !scripts/llama_pc_rpc.py
 !scripts/llama_relay_probe.py
 !scripts/llama_relay_xframe_probe.py
@@ -314,3 +316,6 @@ dsh-migration-backup-*/
 
 # COMM-MERGE-01 reproducible provider/worker causal timing gate
 !scripts/comm_merge_bench.py
+
+# LLAMA-COMM-BORROW-01 local I/O and compute interference evidence
+!scripts/comm_borrow_bench.py
