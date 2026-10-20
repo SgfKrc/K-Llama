@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git(source: Path, *args: str, check: bool = True) -> str:
+def _git(
+    source: Path, *args: str, check: bool = True, env: dict[str, str] | None = None,
+) -> str:
     result = subprocess.run(
         ["git", "-C", str(source), *args],
         capture_output=True,
@@ -34,6 +37,7 @@ def _git(source: Path, *args: str, check: bool = True) -> str:
         encoding="utf-8",
         errors="replace",
         timeout=30,
+        env=env,
     )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:500]
@@ -57,7 +61,7 @@ def _contract(lock_path: Path = LOCK_PATH) -> tuple[str, list[dict[str, Any]]]:
     每个补丁条目声明：
       * ``path``    —— 补丁文件（相对仓库根）
       * ``targets`` —— 它改动的文件（相对 submodule 根）；兼容旧字段 ``target``（单数）
-      * ``marker``  —— 判定「是否已应用」的标记串
+      * ``marker``  —— 仅供诊断的说明或标记串，不参与补丁状态判定
       * ``sha256``  —— 补丁文件的摘要（防止内容漂移）
     """
     try:
@@ -124,16 +128,56 @@ def _safe_relative(root: Path, value: str) -> Path:
 
 
 def _status_paths(source: Path) -> set[str]:
-    output = _git(source, "status", "--porcelain", "--untracked-files=all")
+    output = _git(source, "status", "--porcelain", "-z", "--untracked-files=all")
     paths: set[str] = set()
-    for line in output.splitlines():
-        if not line:
+    records = iter(output.split("\0"))
+    for record in records:
+        if not record:
             continue
-        path = line[3:].strip()
-        if " -> " in path:
-            path = path.rsplit(" -> ", 1)[1]
-        paths.add(path.replace("\\", "/"))
+        paths.add(record[3:])
+        if "R" in record[:2] or "C" in record[:2]:
+            paths.add(next(records))
     return paths
+
+
+def _patch_check(
+    source: Path, patch_path: Path, *, reverse: bool = False,
+    cached: bool = False, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    flags = (["--reverse"] if reverse else []) + (["--cached"] if cached else [])
+    return subprocess.run(
+        ["git", "-C", str(source), "apply", *flags, "--check", str(patch_path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, env=env,
+    )
+
+
+def _check_worktree_diff(source: Path, applied: list[dict[str, Any]], targets: set[str]) -> None:
+    """Compare dirty targets with HEAD plus managed patches using disposable Git state."""
+    with tempfile.TemporaryDirectory(prefix="qlh-llama-sync-") as directory:
+        scratch = Path(directory)
+        objects = scratch / "objects"
+        objects.mkdir()
+        # Keep the real checkout, index and object database untouched, including
+        # in --dry-run. Git still supplies its normal content/line-ending filters.
+        env = {
+            **os.environ,
+            "GIT_INDEX_FILE": str(scratch / "index"),
+            "GIT_OBJECT_DIRECTORY": str(objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": _git(
+                source, "rev-parse", "--path-format=absolute", "--git-path", "objects",
+            ),
+        }
+        _git(source, "read-tree", "HEAD", env=env)
+        for entry in applied:
+            if _patch_check(source, entry["patch_path"], reverse=True, cached=True, env=env).returncode == 0:
+                continue  # The pinned HEAD already contains this complete patch.
+            if _patch_check(source, entry["patch_path"], cached=True, env=env).returncode != 0:
+                raise SyncError(f"llama.cpp unmanaged diff for patch {entry['id']}")
+            _git(source, "apply", "--cached", str(entry["patch_path"]), env=env)
+        _git(
+            source, "diff", "--quiet", "--no-ext-diff", "--", *sorted(targets), env=env,
+        )
 
 
 def inspect_sync(
@@ -150,7 +194,8 @@ def inspect_sync(
       * submodule 的 HEAD 等于 lock 的 revision；
       * **worktree 中允许出现的改动，恰好是所有补丁 targets 的并集**
         （原先要求「只有唯一 target 有改动」⇒ 多补丁必然误报 unrelated changes）；
-      * marker 在 ⇒ 必须可 reverse（已应用）；marker 不在 ⇒ 必须可 apply（待应用）。
+      * 仅按 apply / reverse --check 判定完整补丁状态，marker 只用于诊断；
+      * dirty targets 的内容必须恰好匹配 HEAD 加受管补丁，拒绝混入其他 diff。
     """
     revision, patch_contracts = _contract(lock_path)
     source = _android_root(android_root) / "app" / "src" / "main" / "cpp" / "llama.cpp"
@@ -186,6 +231,17 @@ def inspect_sync(
                     f"llama.cpp patch target is missing: {raw_target} (patch {contract['id']})"
                 )
             relative_targets.append(target.relative_to(source).as_posix())
+        stats = _git(source, "apply", "--numstat", "-z", str(patch_path))
+        actual_targets = set()
+        for record in stats.split("\0"):
+            if not record:
+                continue
+            fields = record.split("\t", 2)
+            if len(fields) != 3:
+                raise SyncError(f"llama.cpp patch has unsupported targets: {contract['id']}")
+            actual_targets.add(fields[2])
+        if actual_targets != set(relative_targets):
+            raise SyncError(f"llama.cpp patch targets do not match the lock: {contract['id']}")
         allowed_paths.update(relative_targets)
         entries.append({**contract, "patch_path": patch_path, "relative_targets": relative_targets})
 
@@ -196,48 +252,31 @@ def inspect_sync(
 
     results: list[dict[str, Any]] = []
     for entry in entries:
-        marker = entry["marker"]
-        applied = any(
-            marker in (source / rel).read_text(encoding="utf-8", errors="replace")
-            for rel in entry["relative_targets"]
-        )
-        if applied:
-            # ★ 2026-09-20：区分「补丁在 git commit 里」与「补丁只在工作树」。
-            #   若该补丁的 targets 都不在 worktree 改动集合里，说明它已经被提交
-            #   （HEAD 就是 revision_local），此时 reverse-check 必然失败 ——
-            #   不能据此判为错误，而要如实报 `applied_committed`。
+        reverse = _patch_check(source, entry["patch_path"], reverse=True)
+        forward = _patch_check(source, entry["patch_path"])
+        if reverse.returncode == 0 and forward.returncode != 0:
             dirty = any(rel in status_paths for rel in entry["relative_targets"])
-            if not dirty:
-                state = "applied_committed"
-            else:
-                reverse = subprocess.run(
-                    ["git", "-C", str(source), "apply", "--reverse", "--check",
-                     str(entry["patch_path"])],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=30,
-                )
-                if reverse.returncode != 0:
-                    raise SyncError(
-                        f"llama.cpp target contains the marker but the managed patch "
-                        f"{entry['id']} is not reversible"
-                    )
-                state = "applied"
-        else:
-            check = subprocess.run(
-                ["git", "-C", str(source), "apply", "--check", str(entry["patch_path"])],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
-            if check.returncode != 0:
-                detail = (check.stderr or check.stdout).strip()[:500]
-                raise SyncError(f"llama.cpp patch {entry['id']} does not apply cleanly: {detail}")
+            state = "applied" if dirty else "applied_committed"
+        elif forward.returncode == 0 and reverse.returncode != 0:
             state = "ready_to_apply"
+        else:
+            marker_present = any(
+                entry["marker"] in (source / rel).read_text(encoding="utf-8", errors="replace")
+                for rel in entry["relative_targets"]
+            )
+            detail = (
+                f"forward: {(forward.stderr or forward.stdout).strip()[:500]}; "
+                f"reverse: {(reverse.stderr or reverse.stdout).strip()[:500]}"
+            )
+            problem = (
+                "has ambiguous apply/reverse checks"
+                if forward.returncode == reverse.returncode == 0
+                else "is neither applicable nor reversible"
+            )
+            raise SyncError(
+                f"llama.cpp patch {entry['id']} {problem} "
+                f"(marker_present={marker_present}): {detail}"
+            )
         results.append(
             {
                 "id": entry["id"],
@@ -247,6 +286,16 @@ def inspect_sync(
                 "state": state,
             }
         )
+
+    if status_paths:
+        applied = [
+            entry for entry, result in zip(entries, results)
+            if result["state"].startswith("applied")
+        ]
+        try:
+            _check_worktree_diff(source, applied, allowed_paths)
+        except SyncError as exc:
+            raise SyncError(f"llama.cpp worktree has unmanaged diff: {exc}") from exc
 
     # 顶层字段保留首个补丁的信息，兼容既有消费方；新增 `patches` 给出全量。
     first = results[0]
