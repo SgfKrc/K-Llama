@@ -48,13 +48,14 @@ def _current_model_payload():
         descriptor = public_pipeline_descriptor(
             _api_module.model_manager.get_pipeline_descriptor()
         )
+        materialized = bool(getattr(_api_module.model_manager, "is_loaded", False))
+        loaded_info = _api_module.model_manager.get_model_info() if materialized else {}
         return {
+            "inference_switches": loaded_info.get("inference_switches"),
             "inference_mode": _api_module._node_inference_mode(),
             "loaded": False,
             "pipeline_prepared": True,
-            "segment_materialized": bool(
-                getattr(_api_module.model_manager, "is_loaded", False)
-            ),
+            "segment_materialized": materialized,
             "quant_type": _api_module.model_host.current_quant,
             "model_id": descriptor.get("model_id"),
             "descriptor": descriptor,
@@ -94,6 +95,7 @@ def _current_model_payload():
                        or _api_module.model_manager.active_model_id),
         "model_path": info.get("model_path", ""),
         "engine": info.get("engine", ""),
+        "inference_switches": info.get("inference_switches"),
         "total_params": info.get("total_params", "N/A"),
         "device": info.get("device", "N/A"),
         "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),

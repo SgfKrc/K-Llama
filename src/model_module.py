@@ -967,7 +967,12 @@ def _resolve_pytorch_flash_attn() -> bool:
     try:
         from inference_switches import resolve_from_device_profile
 
-        return bool(resolve_from_device_profile().flash_attn)
+        # KV quantization is a llama.cpp option; its Flash dependency cannot
+        # enable a PyTorch kernel. Only the PyTorch Flash preference applies.
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ("QLH_INFER_KV_CACHE", "QLH_INFER_THREADS")}
+        return bool(resolve_from_device_profile(env=environment,
+                    execution_path="pytorch_remote_qwen").flash_attn)
     except Exception as exc:  # pragma: no cover - 依赖缺失时保持既有行为
         logger.warning("推理开关不可用，PyTorch flash-attn 保持关闭: %s", exc)
         return False
@@ -2829,7 +2834,7 @@ class ModelManager:
                 # 却实际走了 server 路径，自相矛盾。
                 cuda_available=decision.cuda_available,
             )
-            self._llama_engine.load_model(model_path=gguf_path, n_ctx=n_ctx)
+            self._llama_engine.load_model(model_path=gguf_path, context_limit=n_ctx)
         else:
             if decision.cuda_available and decision.requested == AUTO:
                 # auto 降级必须可观测（有 GPU 却回落到 CPU 绑定，用户会奇怪为什么慢）
@@ -2837,7 +2842,7 @@ class ModelManager:
             self._llama_engine = LlamaCppEngine()
             self._llama_engine.load_model(
                 model_path=gguf_path,
-                n_ctx=n_ctx,
+                context_limit=n_ctx,
             )
         self._model_path = gguf_path
 
@@ -4662,6 +4667,19 @@ class ModelManager:
             "loaded_layers": self._model_layers,
             "device": str(self.get_device()),
         }
+        actual_config = getattr(self.model, "config", None)
+        text_config = getattr(actual_config, "text_config", actual_config)
+        implementation = getattr(text_config, "_attn_implementation", None)
+        remote_flash = getattr(actual_config, "use_flash_attn", None)
+        info["inference_switches"] = ({
+            "schema_version": 2, "scope": "loaded_model", "execution_path": "pytorch",
+            "requested": {"flash_attn": remote_flash if type(remote_flash) is bool else "engine_policy"},
+            "effective": {"attention_implementation": implementation,
+                          "remote_qwen_use_flash_attn": remote_flash,
+                          "device": str(self.get_device())},
+            "sources": {"attention": "loaded_model_config"},
+            "selection": {"reason": "pytorch_independent_policy"},
+        } if self.model is not None else None)
         if getattr(self, "_layer_offload", None) is not None:
             info["layer_offload"] = self.layer_offload_observation()
         if self._layer_load_metrics is not None:

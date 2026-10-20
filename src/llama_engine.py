@@ -154,7 +154,7 @@ def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
     )
 
 
-def _default_n_ctx(model_path: str) -> int:
+def _default_n_ctx(model_path: str, *, execution_device="cpu", ceiling=None, **context_options) -> int:
     """未显式给 `n_ctx` 时的默认值：先用「每段 KV 预算」收窄，再回退既有常量。
 
     票 20 完成定义第三条：`n_ctx` 应基于每段 KV 预算（层数 × 每层字节 × ctx），
@@ -164,10 +164,15 @@ def _default_n_ctx(model_path: str) -> int:
     from config import MAX_SEQ_LEN
 
     baseline = MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else 4096
+    if ceiling is not None:
+        if type(ceiling) is not int or ceiling <= 0:
+            raise ValueError("inference_context_limit_invalid")
+        baseline = min(baseline, ceiling)
     try:
         import inference_switches
 
-        suggested = inference_switches.suggest_n_ctx_from_gguf(model_path, max_ctx=baseline)
+        suggested = inference_switches.suggest_n_ctx_from_gguf(
+            model_path, max_ctx=baseline, execution_device=execution_device, **context_options)
     except Exception as exc:  # pragma: no cover - 预算属可选事实
         logger.debug("KV 预算推导不可用，n_ctx 用既有默认 %s: %s", baseline, exc)
         return baseline
@@ -180,26 +185,19 @@ def _default_n_ctx(model_path: str) -> int:
     return baseline
 
 
-def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
-    """按设备画像与环境覆盖挂上推理开关（就地修改 `load_kwargs`）。
-
-    映射表与实测依据见 `src/inference_switches.py`。**默认档位不新增任何键** ⇒
-    未设置 `QLH_INFER_*` 时加载路径与本函数引入前逐字一致；每次都记一行日志，
-    使「关闭态」同样可观测（便于回滚与对拍）。
-    """
-    try:
-        import inference_switches
-    except Exception as exc:  # pragma: no cover - 模块缺失属异常部署
-        logger.warning("推理开关模块不可用，按默认档位继续: %s", exc)
-        return
-
-    try:
-        switches = inference_switches.resolve_from_device_profile()
-        inference_switches.apply_to_load_kwargs(switches, load_kwargs)
-    except Exception as exc:
-        logger.warning("推理开关解析失败，按默认档位继续: %s", exc)
-        return
+def _apply_inference_switches(load_kwargs: Dict[str, Any], *, explicit_keys=(),
+                              environment=None, execution_path="llama_cpp_binding"):
+    """Resolve once, apply before native load and return the requested snapshot."""
+    import inference_switches
+    switches = inference_switches.resolve_for_load(
+        str(load_kwargs.get("model_path") or ""), load_kwargs,
+        execution_path=execution_path, explicit_keys=explicit_keys, env=environment)
+    if switches.n_threads and "n_threads" not in explicit_keys:
+        load_kwargs.pop("n_threads", None)
+    inference_switches.apply_to_load_kwargs(switches, load_kwargs)
+    inference_switches.validate_binding_options(load_kwargs)
     logger.info("推理开关: %s", switches.describe())
+    return switches
 
 
 def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
@@ -291,6 +289,7 @@ class LlamaCppEngine:
         self._n_ctx: int = 4096      # 上下文窗口大小
         self._n_threads: int = 4     # CPU 线程数
         self._loaded: bool = False
+        self._inference_switches = None
         self._pipeline_descriptor: Dict[str, Any] | None = None
         self._layer_load_proof: NativeLayerLoadProof | None = None
         self._pipeline_sha_cache: Dict[str, Any] = {}
@@ -879,7 +878,7 @@ class LlamaCppEngine:
         load_spec = kwargs.get("load_spec")
         if load_spec is None:
             self._runtime_load_spec = None
-            self._load_model_runtime(path)
+            self._load_model_runtime(path, calibration_allowed=False)
         else:
             from qlh_core.contracts.load import RuntimeLoadSpec
             from qlh_core.adapters.llama_vocabulary import LlamaVocabulary
@@ -896,7 +895,21 @@ class LlamaCppEngine:
             self.unload()
             # Tokenization owns a vocabulary-only handle. Segment tensors and KV
             # have exactly one owner, the observed keep-head runner below.
+            from inference_switches import resolve_from_device_profile
+            switches = resolve_from_device_profile(env=self._environment, execution_path="llama_keep_head")
+            if switches.kv_cache_type_k or "flash_attn" in switches.overrides:
+                raise ValueError("deployment_inference_switch_unsupported")
             self._runtime_load_spec = spec
+            self._inference_switches = {
+                "schema_version": 2, "scope": "loaded_model", "execution_path": "llama_keep_head",
+                "requested": switches.to_dict(),
+                "effective": {"n_ctx": spec.context_size, "sequence_count": spec.sequence_count,
+                              "n_batch": spec.batch_size, "n_threads": switches.n_threads or 8,
+                              "type_k": "f16", "type_v": "f16", "flash_attn": "native_default"},
+                "sources": {"policy": "frozen_load_spec", "n_threads": switches.sources.get("n_threads", "native_baseline")},
+                "capabilities": {"kv_type_tuning": False, "flash_attn_tuning": False},
+            }
+            logger.info("层段推理开关: %s", self._inference_switches)
             self._model = LlamaVocabulary(path)
             self._model_path = path
             self._n_ctx = spec.context_size
@@ -960,6 +973,8 @@ class LlamaCppEngine:
         rpc_split: float | str | List[float] | None = None,
         align_numerics: bool = False,
         n_seq_max: int | None = None,
+        context_limit: int | None = None,
+        calibration_allowed: bool = True,
         **kwargs,
     ) -> None:
         """
@@ -967,7 +982,7 @@ class LlamaCppEngine:
 
         Args:
             model_path: GGUF 文件路径
-            n_ctx: 上下文窗口大小（默认 4096，边缘设备建议 2048）
+            n_ctx: 显式上下文窗口；省略时按资源预算收窄，受MAX_SEQ_LEN与context_limit约束
             n_threads: CPU 推理线程数（默认自动检测：物理核心数）
             chat_format: 对话格式（默认自动检测，Qwen 用 "chatml"）
                 align_numerics: 跨路径数值对齐（关闭 CPU_REPACK，使 RPC 与本机 no-repack 逐比特一致）。
@@ -1046,8 +1061,42 @@ class LlamaCppEngine:
         if not self._quant_type:
             self._quant_type = "GGUF"
 
+        explicit_keys = set(kwargs)
+        if n_threads is not None:
+            explicit_keys.add("n_threads")
+        if n_ctx is not None:
+            explicit_keys.add("n_ctx")
+        if n_seq_max is not None:
+            explicit_keys.add("n_seq_max")
+        tuning_path = "llama_cpp_binding"
+        import config as inference_config
+        if (not calibration_allowed or rpc_servers or rpc_worker_exe or align_numerics or embedding
+                or mmproj_path or n_seq_max or inference_config.NGRAM_SPEC_ENABLED):
+            tuning_path = "llama_cpp_binding_special"
+        context_observation = {"reason": "explicit_context", "n_ctx": n_ctx}
         if n_ctx is None:
-            n_ctx = _default_n_ctx(model_path)
+            from inference_switches import resolve_from_device_profile, preference_environment
+            preferences = resolve_from_device_profile(
+                env=preference_environment(self._environment, explicit_keys))
+            context_observation = {}
+            device = "cpu"
+            try:
+                import llama_cpp
+                if (kwargs.get("n_gpu_layers", 0) != 0 and kwargs.get("offload_kqv", True)
+                        and llama_cpp.llama_supports_gpu_offload()):
+                    device = f"cuda:{int(kwargs.get('main_gpu', 0))}"
+                    if kwargs.get("tensor_split") is not None:
+                        device = "multi_gpu"
+                if rpc_servers or rpc_worker_exe:
+                    device = "rpc"
+                elif embedding:
+                    device = "embedding"
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
+            n_ctx = _default_n_ctx(model_path, execution_device=device, ceiling=context_limit,
+                cache_type_k=kwargs.get("type_k", preferences.kv_cache_type_k),
+                cache_type_v=kwargs.get("type_v", preferences.kv_cache_type_v),
+                n_seq_max=n_seq_max or 1, observation=context_observation)
         if n_threads is None:
             n_threads = self._auto_threads()
 
@@ -1081,11 +1130,11 @@ class LlamaCppEngine:
                 # Qwen-1.8B GGUF metadata is not always detected reliably.
                 load_kwargs["chat_format"] = "chatml"
 
-            # 推理开关（设备画像 → KV 量化 / flash-attn / 线程）：默认档位不新增键，
-            # 紧随其后的显式 kwargs 仍然优先（见 src/inference_switches.py）。
-            _apply_inference_switches(load_kwargs)
-
             load_kwargs.update(kwargs)
+            switches = _apply_inference_switches(
+                load_kwargs, explicit_keys=explicit_keys,
+                environment=self._environment, execution_path=tuning_path)
+            self._n_threads = int(load_kwargs["n_threads"])
             # n-gram 自投机（绑定路径 / 无 CUDA 边缘）：默认关闭；
             # 调用方显式传了 draft_model 时不覆盖。
             _apply_ngram_draft_model(load_kwargs)
@@ -1144,6 +1193,13 @@ class LlamaCppEngine:
                     engine_detail = ""
                 engine_label = "llama.cpp (CPU)"
 
+            from inference_switches import loaded_switch_state
+            self._inference_switches = loaded_switch_state(switches, load_kwargs, actual=self._model)
+            self._inference_switches["context_budget"] = context_observation
+            if "n_ctx" not in explicit_keys and context_observation.get("reason") == "ok":
+                self._inference_switches["sources"]["n_ctx"] = "context_budget"
+            for key in explicit_keys & set(self._inference_switches["effective"]):
+                self._inference_switches["sources"][key] = "call_argument"
             self._loaded = True
             self._install_chat_template_controls()
             self._embedding_enabled = embedding
@@ -1507,6 +1563,7 @@ class LlamaCppEngine:
         self._model = None
         self._close_rpc_session()
         self._loaded = False
+        self._inference_switches = None
         self._embedding_enabled = False
         self._embedding_dimension = None
         self._embedding_model_id = ""
@@ -2242,6 +2299,7 @@ class LlamaCppEngine:
             "n_threads": self._n_threads,
             "loaded": self._loaded,
             "capabilities": self.get_capabilities(),
+            "inference_switches": getattr(self, "_inference_switches", None),
         }
         if self._loaded:
             info["memory"] = self.get_memory_usage()
@@ -2487,6 +2545,7 @@ class LlamaCppEngine:
             self._keep_head = KeepHeadUpstream(
                 shim, str(artifact), mode="nextn",
                 n_ctx=spec.context_size if spec else int(getattr(self, "_n_ctx", 4096) or 4096),
+                n_threads=int((getattr(self, "_inference_switches", None) or {}).get("effective", {}).get("n_threads") or 8),
                 n_batch=spec.batch_size if spec else max(
                     512,
                     int(environment.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),

@@ -141,7 +141,7 @@ class TestApplyToLoadKwargs:
         apply_to_load_kwargs(switches, kwargs)
         assert kwargs["type_k"] == "q4_0", "调用方显式值不得被画像映射覆盖"
         assert kwargs["n_threads"] == 4
-        assert kwargs["type_v"] == "q8_0"
+        assert kwargs["type_v"] == mod.binding_kv_type("q8_0")
         assert kwargs["flash_attn"] is True
 
     def test_non_default_switches_reach_the_loader(self, monkeypatch):
@@ -150,7 +150,7 @@ class TestApplyToLoadKwargs:
         kwargs: dict = {}
         apply_to_load_kwargs(switches, kwargs)
         # 量化 KV 会联动打开 flash-attn（实测硬约束，见 resolve 里的注释）
-        assert kwargs == {"type_k": "q4_0", "type_v": "q4_0", "flash_attn": True}
+        assert kwargs == {"type_k": mod.binding_kv_type("q4_0"), "type_v": mod.binding_kv_type("q4_0"), "flash_attn": True}
 
 
 class TestServerArgTranslation:
@@ -263,23 +263,30 @@ class TestKvBudgetAndCtx:
         assert mod.kv_budget_bytes_from_profile({"ram": {"available_gb": "many"}}) is None
         assert mod.kv_budget_bytes_from_profile({"ram": {"available_gb": 0}}) is None
 
-    def test_from_gguf_uses_header_fields(self, monkeypatch):
-        """读 GGUF 头（不加载模型）+ 预算 ⇒ 推导；head_count_kv 为按层数组时取最大。"""
-        metadata = {"block_count": 24, "head_count_kv": [4, 4, 8], "key_length": 128}
-        monkeypatch.setattr("gguf_metadata_contract.read_gguf_metadata", lambda path: dict(metadata))
-        per_token = mod.kv_bytes_per_token(24, 8, 128)
-        assert mod.suggest_n_ctx_from_gguf(
-            "dummy.gguf", budget_bytes=per_token * 2048, max_ctx=8192,
-        ) == 2048
+    def test_from_gguf_delegates_actual_layout_and_resource_domain(self, monkeypatch):
+        seen = {}
+        def estimate(path, **kwargs):
+            seen.update(kwargs)
+            return {"n_ctx": 2048, "reason": "ok"}
+        monkeypatch.setattr("inference_context.context_budget_from_gguf", estimate)
+        assert mod.suggest_n_ctx_from_gguf("dummy.gguf", budget_bytes=10**8,
+            max_ctx=8192, n_seq_max=2, execution_device="cpu") == 2048
+        assert seen["n_seq_max"] == 2
+        assert seen["execution_device"] == "cpu"
+        assert seen["budget_bytes"] == 10**8
 
-    def test_from_gguf_returns_none_when_header_unreadable(self, monkeypatch):
-        def _boom(path):
-            raise OSError("not a gguf")
+    def test_from_gguf_unreadable_header_reports_named_fallback(self):
+        observation = {}
+        assert mod.suggest_n_ctx_from_gguf("missing.gguf", budget_bytes=10**8,
+            observation=observation) is None
+        assert observation["reason"] == "invalid_gguf_header"
 
-        monkeypatch.setattr("gguf_metadata_contract.read_gguf_metadata", _boom)
-        assert mod.suggest_n_ctx_from_gguf("dummy.gguf", budget_bytes=10 ** 9) is None
+    def test_scalar_budget_validates_per_sequence_minimum(self):
+        per_token = mod.kv_bytes_per_token(24, 4, 128)
+        assert mod.suggest_n_ctx(budget_bytes=per_token * 512, layer_count=24,
+            kv_heads=4, key_length=128, n_seq_max=2) is None
 
-    def test_from_gguf_returns_none_without_required_fields(self, monkeypatch):
-        monkeypatch.setattr("gguf_metadata_contract.read_gguf_metadata",
-                            lambda path: {"block_count": 24})
-        assert mod.suggest_n_ctx_from_gguf("dummy.gguf", budget_bytes=10 ** 9) is None
+    @pytest.mark.parametrize("budget", [float("nan"), float("inf"), True, -1])
+    def test_scalar_budget_rejects_nonfinite_or_invalid_values(self, budget):
+        assert mod.suggest_n_ctx(budget_bytes=budget, layer_count=24,
+            kv_heads=4, key_length=128) is None

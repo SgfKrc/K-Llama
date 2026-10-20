@@ -90,6 +90,7 @@ class SchedulerCallbacks(Protocol):
     snapshot_recent_logs: Callable[[], tuple[list[dict], int]]
     filter_recent_logs: Callable[..., list[dict]]
     format_model_response: Callable[..., tuple[str, Optional[str]]]
+    supports_layer_multi_position_argmax: Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ class SchedulerCallbackSet:
     snapshot_recent_logs: Callable[[], tuple[list[dict], int]]
     filter_recent_logs: Callable[..., list[dict]]
     format_model_response: Callable[..., tuple[str, Optional[str]]]
+    supports_layer_multi_position_argmax: Callable[[], bool] = lambda: False
 
 
 class _LazyModelManager:
@@ -1162,7 +1164,7 @@ class ModelHost:
         self._configure_manager_catalog(engine_obj, model_id=resolved_id or "")
         engine_obj.load_model(
             model_path=gguf_path,
-            n_ctx=n_ctx,
+            context_limit=n_ctx,
             model_profile=model_metadata,
         )
         # Install the engine as the manager: chat/chat_stream/is_loaded are then proxied

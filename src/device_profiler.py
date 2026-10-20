@@ -198,7 +198,7 @@ class DeviceProfile:
     # None = 非孤岛网关节点，旧版本节点无感）
     island: Optional[Dict[str, Any]] = None
     # 推理开关映射（票 20 `DEVICE-AWARE-INFER-01`）：画像 → llama.cpp 开关的
-    # 显式化结果，含每条映射的实测依据；None = 未解析（如映射模块不可用）。
+    # 候选偏好及历史依据；实际生效值由模型owner报告。None = 映射不可用。
     inference_switches: Optional[Dict[str, Any]] = None
 
 
