@@ -580,6 +580,8 @@ class Scheduler(
             self._running = True
         try:
             self._worker_prepare.reopen()
+            with self._task_worker_stage_lock:
+                self._task_worker_io_stopped = False
             self._start_impl(host=host, port=port)
         except Exception:
             try:

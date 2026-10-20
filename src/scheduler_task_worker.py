@@ -8,6 +8,7 @@ import importlib
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -58,6 +59,7 @@ logger = logging.getLogger("scheduler")
 _LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
 _LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
 _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
+_TASK_WORKER_RESPONSE_CONTEXT = threading.local()
 from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED as _REQUEST_DEADLINE_EXCEEDED
 
 
@@ -1019,29 +1021,167 @@ class SchedulerTaskWorkerMixin:
         return self._task_worker_control.worker_binary_hidden_enabled(owner)
 
 
-    def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
+    def _task_worker_response_owner(self, *, physical_stop=False):
+        """Keep a reply attached to the registration that delivered its request."""
+        scope = getattr(_TASK_WORKER_RESPONSE_CONTEXT, "scope", None)
+        if scope is not None and scope[0] is self:
+            generation = (getattr(self, "_task_worker_io_generation", 0)
+                          if physical_stop else scope[2])
+            return scope[1], generation
+        from tcp_comm import TCPClient
+        owner = TCPClient.received_registration_owner()
         client = getattr(self, "_tcp_client", None)
-        if not client or not getattr(client, "is_registered", False):
-            raise ConnectionError("task worker is not connected to its master")
+        if owner is None:
+            capture = getattr(client, "capture_registration_owner", None)
+            owner = capture() if callable(capture) else None
+        return owner, getattr(self, "_task_worker_io_generation", 0)
+
+
+    def _task_worker_response_current(self, owner, generation):
+        if generation != getattr(self, "_task_worker_io_generation", 0):
+            return False
+        client = getattr(self, "_tcp_client", None)
+        if owner is None:
+            return bool(client and getattr(client, "is_registered", False))
+        capture = getattr(client, "capture_registration_owner", None)
+        return bool(owner[0] is client and callable(capture) and capture() == owner)
+
+
+    def _run_task_worker_stage_offer(self, message, owner, generation):
+        previous = getattr(_TASK_WORKER_RESPONSE_CONTEXT, "scope", None)
+        _TASK_WORKER_RESPONSE_CONTEXT.scope = (self, owner, generation)
+        try:
+            if not self._task_worker_response_current(owner, generation):
+                self._forget_task_worker_request(message.message_id)
+                return
+            self._handle_task_worker_stage_offer(message)
+        finally:
+            _TASK_WORKER_RESPONSE_CONTEXT.scope = previous
+
+
+    def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
+        owner, generation = self._task_worker_response_owner(
+            physical_stop=(message.message_type == "stage_cancelled"
+                           and message.payload.get("execution_state") == "execution_stopped"),
+        )
+        client = getattr(self, "_tcp_client", None)
+        if not self._task_worker_response_current(owner, generation):
+            raise ConnectionError("task worker reply registration is retired")
         from transport_port import MessageType
 
-        capture = getattr(client, "capture_registration_owner", None)
-        owner = capture() if callable(capture) else None
         snapshot, binary_body = split_task_worker_hidden(
             message.snapshot(),
             enabled=self._task_worker_control.worker_binary_hidden_enabled(owner),
         )
-        if binary_body is None:
-            client.send_data(snapshot, MessageType.TASK_WORKER)
+        options = {} if owner is None else {"connection_sock": owner[2]}
+        if binary_body is not None:
+            options["binary_body"] = binary_body
+            logger.debug(
+                "event=task_worker_binary_hidden_sent_to_master message_type=%s bytes=%d",
+                snapshot.get("message_type"), len(binary_body),
+            )
+        # Bind JSON and binary alike. Reconnection during encoding/queue wait
+        # must never redirect a previous registration's result to its successor.
+        client.send_data(snapshot, MessageType.TASK_WORKER, **options)
+
+
+    @staticmethod
+    def _task_worker_io_enabled():
+        return os.environ.get("QLH_TASK_WORKER_IO_ISOLATION", "0").strip().lower() in {
+            "1", "true", "on",
+        }
+
+
+    @staticmethod
+    def _task_worker_response_charge(responses):
+        """Charge the retained Python response graph without encoding it twice."""
+        seen = set()
+        def size(value):
+            if id(value) in seen:
+                return 0
+            seen.add(id(value))
+            total = sys.getsizeof(value)
+            if isinstance(value, dict):
+                total += sum(size(k) + size(v) for k, v in value.items())
+            elif isinstance(value, (list, tuple)):
+                total += sum(size(v) for v in value)
+            return total
+        return size([response.snapshot() for response in responses])
+
+
+    def _send_task_worker_responses(self, request_message_id, responses, *, wait=True, ready_event=None):
+        """Submit a whole ordered batch; accept still waits for its actual write."""
+        responses = tuple(responses)
+        if not responses:
             return
-        logger.debug(
-            "event=task_worker_binary_hidden_sent_to_master message_type=%s bytes=%d",
-            snapshot.get("message_type"), len(binary_body),
+        if not self._task_worker_io_enabled():
+            for response in responses:
+                self._send_task_worker_response(request_message_id, response)
+            return
+        from task_worker_io import WorkerIOSender
+        # Terminal data survives a delivery retirement/full queue. Publish a
+        # complete batch under one lock; duplicates cannot observe half a batch.
+        # Accept is published only after its original write succeeds, so a
+        # duplicate cannot advertise admission when the original submit fails.
+        cacheable = [response for response in responses
+                     if response.message_type != "stage_accept"]
+        self._cache_task_worker_responses(request_message_id, cacheable)
+        # A duplicate can observe a complete cached result before the original
+        # submission/finally completes. Replays share its physical publication
+        # boundary, even if the original queue admission failed.
+        if ready_event is None:
+            with self._task_worker_stage_lock:
+                for response in responses:
+                    if response.message_type == "stage_result":
+                        active = self._task_worker_active_attempts.get(response.payload["attempt_id"])
+                        if active is not None:
+                            ready_event = active.done_event
+                        break
+        physical_stop = (len(responses) == 1 and responses[0].message_type == "stage_cancelled"
+                         and responses[0].payload.get("execution_state") == "execution_stopped")
+        owner, generation = self._task_worker_response_owner(physical_stop=physical_stop)
+        if owner is None or not self._task_worker_response_current(owner, generation):
+            raise ConnectionError("task worker I/O needs a current authenticated registration")
+        with self._task_worker_stage_lock:
+            if getattr(self, "_task_worker_io_stopped", False):
+                raise ConnectionError("task worker I/O is stopped")
+            sender = getattr(self, "_task_worker_io_sender", None)
+            if sender is None:
+                sender = WorkerIOSender(max_bytes=128 * 1024 * 1024)
+                self._task_worker_io_sender = sender
+        def send_batch():
+            previous = getattr(_TASK_WORKER_RESPONSE_CONTEXT, "scope", None)
+            _TASK_WORKER_RESPONSE_CONTEXT.scope = (self, owner, generation)
+            try:
+                # A result may reach the coordinator before send_data returns.
+                # Publish physical completion before making it visible on wire,
+                # so an immediate next offer cannot see the completed stage busy.
+                if ready_event is not None:
+                    while not ready_event.wait(_TASK_WORKER_LOCK_WAIT_SLICE_SECONDS):
+                        if not self._task_worker_response_current(owner, generation):
+                            raise ConnectionError("task worker result publication is retired")
+                for response in responses:
+                    if not self._task_worker_response_current(owner, generation):
+                        raise ConnectionError("task worker I/O batch is retired")
+                    self._send_task_worker_to_master(response)
+                    if response.message_type == "stage_accept":
+                        self._cache_task_worker_responses(request_message_id, [response])
+            finally:
+                _TASK_WORKER_RESPONSE_CONTEXT.scope = previous
+        future = sender.submit(
+            send_batch, charge_bytes=self._task_worker_response_charge(responses),
+            is_current=lambda: self._task_worker_response_current(owner, generation),
+            description=responses[-1].message_type,
         )
-        # A reconnect during serialization must not send the old result to a
-        # successor that has not negotiated binary hidden.
-        client.send_data(snapshot, MessageType.TASK_WORKER,
-                         connection_sock=owner[2], binary_body=binary_body)
+        if wait:
+            future.result()
+        else:
+            def finished(done):
+                if done.cancelled() or done.exception() is not None:
+                    logger.warning("event=task_worker_io_delivery_failed message_type=%s",
+                                   responses[-1].message_type)
+            future.add_done_callback(finished)
+        return future
 
 
     def _task_worker_hello_followup_owner_current(self, node_id, work) -> bool:
@@ -1247,6 +1387,16 @@ class SchedulerTaskWorkerMixin:
             return False, []
 
 
+    def _cache_task_worker_responses(self, request_message_id, responses):
+        if request_message_id is None or not responses:
+            return
+        snapshots = [response.snapshot() for response in responses]
+        with self._task_worker_stage_lock:
+            cached = self._task_worker_seen_messages.get(request_message_id)
+            if cached is not None:
+                cached[1].extend(snapshots)
+
+
     def _cache_task_worker_response(
         self, request_message_id: str, response: WorkerMessage,
     ) -> None:
@@ -1265,20 +1415,28 @@ class SchedulerTaskWorkerMixin:
                 pass
 
 
-    def _send_task_worker_response(
-        self, request_message_id: str, response: WorkerMessage,
-    ) -> None:
-        self._cache_task_worker_response(request_message_id, response)
+    def _send_task_worker_response_sync(self, request_message_id, response):
+        if request_message_id is not None:
+            self._cache_task_worker_response(request_message_id, response)
         self._send_task_worker_to_master(response)
 
 
-    def _replay_task_worker_responses(self, responses: list[dict]) -> None:
-        for response in responses:
-            self._send_task_worker_to_master(
-                decode_task_worker_message(
-                    response, binary_hidden=self._task_worker_binary_hidden_enabled(),
-                )
+    def _send_task_worker_response(
+        self, request_message_id: str, response: WorkerMessage,
+    ) -> None:
+        if self._task_worker_io_enabled():
+            self._send_task_worker_responses(
+                request_message_id, [response], wait=response.message_type == "stage_accept",
             )
+        else:
+            self._send_task_worker_response_sync(request_message_id, response)
+
+
+    def _replay_task_worker_responses(self, responses: list[dict]) -> None:
+        decoded = [decode_task_worker_message(
+            response, binary_hidden=self._task_worker_binary_hidden_enabled(),
+        ) for response in responses]
+        self._send_task_worker_responses(None, decoded, wait=False)
 
 
     @staticmethod
@@ -1636,6 +1794,13 @@ class SchedulerTaskWorkerMixin:
             for attempt in self._task_worker_active_attempts.values():
                 attempt.cancel_reason = reason_code
                 attempt.cancel_event.set()
+            self._task_worker_io_generation = getattr(self, "_task_worker_io_generation", 0) + 1
+            sender = getattr(self, "_task_worker_io_sender", None)
+            self._task_worker_io_sender = None
+            if close:
+                self._task_worker_io_stopped = True
+        if sender is not None:
+            sender.close(wait=False)
         controller = getattr(self, "_worker_prepare", None)
         if controller is not None:
             if close:
@@ -1856,17 +2021,18 @@ class SchedulerTaskWorkerMixin:
                 attempt_id=attempt_id,
                 provider_id=expected_provider,
             )
-            for response in responses:
-                try:
-                    self._send_task_worker_response(message.message_id, response)
-                except Exception:
-                    logger.warning(
-                        "event=task_worker_stage_result_send_failed attempt_id=%s",
-                        attempt_id, exc_info=True,
-                    )
-                    return
+            try:
+                self._send_task_worker_responses(
+                    message.message_id, responses, wait=False, ready_event=active.done_event,
+                )
+            except Exception:
+                logger.warning(
+                    "event=task_worker_stage_result_send_failed attempt_id=%s",
+                    attempt_id, exc_info=True,
+                )
+                return
             logger.info(
-                "event=task_worker_stage_result_sent workflow_id=%s stage_id=%s attempt_id=%s chunks=%d",
+                "event=task_worker_stage_result_submitted workflow_id=%s stage_id=%s attempt_id=%s chunks=%d",
                 offer["workflow_id"], offer["stage_id"], attempt_id,
                 max(0, len(responses) - 1),
             )
@@ -2218,9 +2384,10 @@ class SchedulerTaskWorkerMixin:
                     if duplicate:
                         self._replay_task_worker_responses(responses)
                         return
+                    owner, generation = self._task_worker_response_owner()
                     threading.Thread(
-                        target=self._handle_task_worker_stage_offer,
-                        args=(message,),
+                        target=self._run_task_worker_stage_offer,
+                        args=(message, owner, generation),
                         name=f"task-worker-stage-{message.payload['attempt_id']}",
                         daemon=True,
                     ).start()
