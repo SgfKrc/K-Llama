@@ -3,6 +3,12 @@ from __future__ import annotations
 from qlh_core.contracts.execution import ExecutionError
 
 
+def native_thinking_suppression_required(show_thinking: bool, model_prompt: str) -> bool:
+    """Hide generated reasoning only while the prompt leaves its block open."""
+    tail = (model_prompt or "")[-128:].lower()
+    return bool(not show_thinking and "<think" in tail and "</think>" not in tail)
+
+
 class StopPolicy:
     def __init__(self, *, max_tokens, eos_ids=(), stops=()):
         if type(max_tokens) is not int or max_tokens < 1:

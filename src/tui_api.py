@@ -527,8 +527,8 @@ def iter_chat_payloads(
     show_thinking: bool = False,
     enable_thinking: Optional[bool] = None,
     max_new_tokens: int = 1024,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
     read_timeout: Optional[float] = None,
     streaming_mode: Optional[str] = None,
 ) -> Iterator[Dict[str, Any]]:

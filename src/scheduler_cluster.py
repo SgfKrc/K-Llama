@@ -85,7 +85,10 @@ class SchedulerClusterMixin:
                 "runtime_role": self._effective_role(),
                 "reason": "auto_role_disabled",
             }
-        return controller.on_disconnect().to_dict()
+        decision = controller.on_disconnect()
+        if getattr(self, "_running", False):
+            self._on_auto_role_decision(decision)
+        return decision.to_dict()
 
 
     def auto_role_on_reconnect(
@@ -104,11 +107,17 @@ class SchedulerClusterMixin:
                 "runtime_role": self._effective_role(),
                 "reason": "auto_role_disabled",
             }
-        return controller.on_reconnect(
-            certificate=certificate,
-            available_voter_ids=available_voter_ids,
-            now_ms=now_ms,
-        ).to_dict()
+        runtime = getattr(self, "_auto_role_runtime", None)
+        if certificate is None and available_voter_ids is None and runtime is not None:
+            decision = runtime.observe_leader(controller)
+            if decision is None:
+                return controller.snapshot(now_ms=now_ms)
+        else:
+            decision = controller.on_reconnect(certificate=certificate,
+                available_voter_ids=available_voter_ids, now_ms=now_ms)
+        if getattr(self, "_running", False):
+            self._on_auto_role_decision(decision)
+        return decision.to_dict()
 
 
     def set_handoff_coordinator(self, coordinator: HandoffCoordinator | None) -> None:
@@ -443,6 +452,10 @@ class SchedulerClusterMixin:
             注销是否成功
         """
         self._require_control_write("cluster.node.deregister")
+        return self._observe_node_disconnected(node_id)
+
+    def _observe_node_disconnected(self, node_id: str) -> bool:
+        """Record a local TCP loss even after this node's lease has been fenced."""
         with self._nodes_lock:
             if node_id not in self.nodes:
                 return False
@@ -2356,6 +2369,14 @@ class SchedulerClusterMixin:
         effective_role = self._effective_role()
         if effective_role != "client":
             return {"status": "denied", "reason": "仅从节点可以连接主节点"}
+        controller = self._auto_role_controller
+        connecting_role = "auto" if controller is not None and controller.mode == "auto" else "client"
+        if connecting_role == "auto":
+            runtime = getattr(self, "_auto_role_runtime", None)
+            certificate = controller.certificate
+            endpoint = runtime.leader_endpoint(certificate.leader_id) if runtime is not None and certificate is not None else None
+            if controller.state != "follower" or endpoint != (master_host, master_port):
+                return {"status": "waiting_authority", "reason_code": "control_certificate_not_current"}
 
         try:
             import config as cfg
@@ -2452,7 +2473,7 @@ class SchedulerClusterMixin:
                 if previous_node_id:
                     self._runtime_setting('_sync_runtime_node_config')(
                         node_id=previous_node_id,
-                        node_role="client",
+                        node_role=connecting_role,
                     )
 
             advertise_port = self._tcp_server.port if self._tcp_server else self._runtime_setting('SERVER_PORT')
@@ -2471,7 +2492,7 @@ class SchedulerClusterMixin:
             _publish_client(client)
             if self._control_fence is not None:
                 client.set_control_fence(self._control_fence)
-            self._runtime_setting('_sync_runtime_node_config')(node_id=node_id, node_role="client")
+            self._runtime_setting('_sync_runtime_node_config')(node_id=node_id, node_role=connecting_role)
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
             # _sync_node_rtt 内部已有 _nodes_lock 保护
             def _bind_client_callbacks(target_client) -> None:
@@ -2483,6 +2504,8 @@ class SchedulerClusterMixin:
                 def _on_client_reconnect() -> None:
                     if (self._tcp_client is target_client
                             and getattr(target_client, "is_registered", False)):
+                        if self._auto_role_controller is not None:
+                            self.auto_role_on_reconnect()
                         self.refresh_task_worker_capabilities()
 
                 target_client.on_heartbeat = _on_client_heartbeat
@@ -2522,7 +2545,7 @@ class SchedulerClusterMixin:
                 self._runtime_setting('_sync_runtime_node_config')(node_id=node_id)
                 # 若通过 activate_client_mode 切换而来，同步更新角色
                 if getattr(self, '_role_override', None) == "client":
-                    self._runtime_setting('_sync_runtime_node_config')(node_role="client")
+                    self._runtime_setting('_sync_runtime_node_config')(node_role=connecting_role)
 
                 # 节点在线状态以主节点收到的 TCP REGISTER 为事实源。
                 # 从节点只保存 bootstrap 目标，不写共享状态或远端节点表。
@@ -2568,7 +2591,7 @@ class SchedulerClusterMixin:
                     _publish_client(client)
                     if self._control_fence is not None:
                         client.set_control_fence(self._control_fence)
-                    self._runtime_setting('_sync_runtime_node_config')(node_id=node_id, node_role="client")
+                    self._runtime_setting('_sync_runtime_node_config')(node_id=node_id, node_role=connecting_role)
                     _bind_client_callbacks(client)
                     ok = client.connect(
                         on_message=lambda msg: self._on_tcp_message("master", msg)
@@ -2579,7 +2602,7 @@ class SchedulerClusterMixin:
                         self._report_local_device_profile(client, node_id)
                         self._runtime_setting('_sync_runtime_node_config')(node_id=node_id)
                         if getattr(self, '_role_override', None) == "client":
-                            self._runtime_setting('_sync_runtime_node_config')(node_role="client")
+                            self._runtime_setting('_sync_runtime_node_config')(node_role=connecting_role)
                         try:
                             from transport_port import MessageType
                             client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
@@ -2937,6 +2960,8 @@ class SchedulerClusterMixin:
 
     def can_join_existing_master(self) -> bool:
         """Whether this node may be explicitly converted into a client."""
+        if self._auto_role_controller is not None and self._auto_role_controller.mode == "auto":
+            return False
         if self._effective_role() == "client":
             return True
         if self._effective_role() != "master":
@@ -3018,6 +3043,9 @@ class SchedulerClusterMixin:
         然后尝试发现主节点并连接。停止时立即取消等待。
         """
         if self._startup_cancel_event.wait(timeout=5) or not self._running:
+            return
+        if self._auto_role_controller is not None and self._auto_role_controller.mode == "auto":
+            self.auto_role_on_reconnect()
             return
         # 如果已经连接（例如通过 activate_client_mode），跳过
         tcp_client = getattr(self, '_tcp_client', None)
@@ -3734,6 +3762,10 @@ class SchedulerClusterMixin:
     def _client_health_monitor_loop(self) -> None:
         """从节点健康监控循环（后台 daemon 线程）"""
         while self._running:
+            if self._auto_role_controller is not None and self._auto_role_controller.mode == "auto":
+                if self._startup_cancel_event.wait(1):
+                    return
+                continue
             try:
                 health = self.check_master_health()
                 was_online = self._client_master_was_online

@@ -9,6 +9,7 @@ __pycache__/
 .venv-llama-rpc/
 venv/
 env/
+.venv-r6-product/
 
 # Node
 node_modules/

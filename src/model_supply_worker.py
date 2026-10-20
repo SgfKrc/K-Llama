@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import hashlib
 import importlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -32,6 +33,11 @@ _STRATEGY_REASONS = frozenset({
     "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT", "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
     "SUPPLY_LOCAL_CUT_UNSUPPORTED", "SUPPLY_NODE_CUTTER_UNAVAILABLE",
 })
+_LOG = logging.getLogger(__name__)
+# Keep product pointer readers out of atomic publish/restore, including bounded
+# Windows retries. WSL UNC can reject rename even with FILE_SHARE_DELETE.
+# Never hold this lock while hashing artifacts or refreshing capabilities.
+_POINTER_IO_LOCK = threading.RLock()
 _SELECTION_CACHE_LOCK = threading.Lock()
 _SELECTION_CACHE: dict[str, tuple[tuple, dict]] = {}
 _SELECTION_OWNERS_LOCK = threading.Lock()
@@ -61,6 +67,23 @@ def _json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise SupplyError("invalid_manifest")
     return value
+
+
+def _read_pointer(path: Path) -> bytes:
+    with _POINTER_IO_LOCK:
+        if path.is_symlink() or path.stat().st_size > _MAX_JSON_BYTES:
+            raise SupplyError("invalid_manifest")
+        return path.read_bytes()
+
+
+def _log_registration_error(op, phase: str, exc: Exception) -> None:
+    # Registration only touches validated local artifacts. Transport exceptions
+    # remain unlogged because they may contain credential-bearing URLs.
+    _LOG.error("Model supply %s failed (operation=%s, node=%s)",
+               phase, op.operation_id, op.node_id, exc_info=True,
+               extra={"supply_phase": phase, "supply_operation_id": op.operation_id,
+                      "supply_node_id": op.node_id, "supply_errno": getattr(exc, "errno", None),
+                      "supply_winerror": getattr(exc, "winerror", None)})
 
 
 def _sha(value: Any) -> bool:
@@ -257,7 +280,7 @@ def _selection_distributed(root: Path) -> bool:
     # participation check when present; this is a weak lookup, not mode state.
     with _SELECTION_OWNERS_LOCK:
         owners = list(_SELECTION_OWNERS.get(str(root.resolve()), ()))
-    return all(owner._distributed() for owner in owners)
+    return all(owner._distributed() and not owner._registration_blocked for owner in owners)
 
 
 def get_selected_model(root: Path | None = None) -> dict | None:
@@ -274,7 +297,7 @@ def get_selected_model(root: Path | None = None) -> dict | None:
         current = root / "current.json"
         if current.is_symlink() or current.stat().st_size > _MAX_JSON_BYTES:
             return None
-        pointer_bytes = current.read_bytes()
+        pointer_bytes = _read_pointer(current)
         pointer = json.loads(pointer_bytes)
         if not isinstance(pointer, dict) or pointer.get("kind") != "qlh.model_supply.current.v1":
             return None
@@ -303,7 +326,7 @@ def get_selected_model(root: Path | None = None) -> dict | None:
                 if len(_SELECTION_CACHE) >= 64:
                     _SELECTION_CACHE.clear()
                 _SELECTION_CACHE[str(root.resolve())] = (key, deepcopy(result))
-        if current.read_bytes() != pointer_bytes or not _selection_distributed(root):
+        if _read_pointer(current) != pointer_bytes or not _selection_distributed(root):
             return None
         return result
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
@@ -350,6 +373,7 @@ class ModelSupplyWorker:
         self._lock = threading.Lock()
         self._execution_lock = threading.RLock()
         self._inventory_lock = threading.Lock()
+        self._registration_blocked = False
         self._active: _Operation | None = None
         self._pending: _Operation | None = None
         self._runner: threading.Thread | None = None
@@ -829,7 +853,7 @@ class ModelSupplyWorker:
             start_layer=manifest["layer_range"][0], end_layer=manifest["layer_range"][1],
             total_layers=manifest["total_layers"], operation_id=op.operation_id, node_id=op.node_id,
             conversion_proof=manifest.get("conversion_proof"), reuse_root=self.root,
-            cut_timeout_seconds=op.cut_timeout_seconds)
+            cut_timeout_seconds=op.cut_timeout_seconds, cancelled=lambda: self._cancelled(op))
         if _manifest(result) != manifest:
             raise SupplyError("manifest_identity_mismatch")
         op.transfer_counts["reused_bytes"] = int(result.get("_reused_bytes", 0))
@@ -974,10 +998,18 @@ class ModelSupplyWorker:
                 if _link(pointer):
                     raise SupplyError("unsafe_path")
                 if pointer.is_file():
-                    protected.append(self.root.parent / _json(pointer)["directory"])
+                    protected.append(self.root.parent / json.loads(_read_pointer(pointer))["directory"])
+                import config
+                setting = getattr(self.scheduler, "_runtime_setting", None)
+                def cache_setting(name):
+                    return setting(name) if callable(setting) else getattr(config, name)
+                key = ("MODEL_SUPPLY_CACHE_KEEP" if root.resolve() == self.root.resolve()
+                       else "MODEL_SUPPLY_CACHE_MASTER_KEEP")
                 with self._native_gc_paths(root) as native:
                     return collect_supply_segments(root, protected_paths=protected,
-                        native_paths=native, keep=0, cancelled=invalidated, receive_idle=True)
+                        native_paths=native, keep=cache_setting(key),
+                        max_retained_bytes=cache_setting("MODEL_SUPPLY_CACHE_MAX_BYTES"),
+                        cancelled=invalidated, receive_idle=True)
         except Exception:
             # Retention is maintenance, never a second terminal supply result.
             return {"removed": 0, "reclaimed_bytes": 0,
@@ -1017,6 +1049,13 @@ class ModelSupplyWorker:
             raise SupplyError("SUPPLY_WORKER_BUSY")
 
     def _register(self, op: _Operation, directory: Path) -> Path:
+        try:
+            return self._register_verified(op, directory)
+        except Exception as exc:
+            _log_registration_error(op, "registration", exc)
+            raise
+
+    def _register_verified(self, op: _Operation, directory: Path) -> Path:
         self._check(op)
         directory = _within(directory, self.root.parent)
         marker = directory / "supply.manifest.json"
@@ -1061,37 +1100,44 @@ class ModelSupplyWorker:
                     # A reader without FILE_SHARE_DELETE can briefly block an
                     # otherwise valid pointer switch. Keep full -> stage held,
                     # but release the operation mutex during cancellable waits.
-                    for attempt in range(8):
-                        self._check(op)
-                        self._assert_idle(op)
-                        if current.is_symlink() or temporary.is_symlink():
-                            raise SupplyError("unsafe_path")
-                        if attempt and _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
-                            raise SupplyError("artifact_changed")
-                        with self._lock:
-                            if self._active is not op or op.cancelled.is_set():
-                                raise SupplyError("cancelled")
-                            op.previous_pointer = current.read_bytes() if current.exists() else None
-                            try:
-                                os.replace(temporary, current)
-                            except OSError as exc:
-                                if (sys.platform != "win32" or getattr(exc, "winerror", None) not in {5, 32, 33}
-                                        or attempt == 7):
-                                    raise
-                            else:
-                                op.committed = pointer
-                                break
-                        op.cancelled.wait(0.01 * 2 ** attempt)
+                    with _POINTER_IO_LOCK:
+                        for attempt in range(8):
+                            self._check(op)
+                            self._assert_idle(op)
+                            if current.is_symlink() or temporary.is_symlink():
+                                raise SupplyError("unsafe_path")
+                            if attempt and _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
+                                raise SupplyError("artifact_changed")
+                            with self._lock:
+                                if self._active is not op or op.cancelled.is_set():
+                                    raise SupplyError("cancelled")
+                                op.previous_pointer = _read_pointer(current) if current.exists() else None
+                                try:
+                                    os.replace(temporary, current)
+                                except OSError as exc:
+                                    if (sys.platform != "win32" or getattr(exc, "winerror", None) not in {5, 32, 33}
+                                            or attempt == 7):
+                                        raise
+                                else:
+                                    op.committed = pointer
+                                    break
+                            op.cancelled.wait(0.01 * 2 ** attempt)
                     self._check(op)
                     if _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
                         raise SupplyError("artifact_changed")
                     self._check(op)
-                    _remember_selection(self.root, current.read_bytes(), directory, op.manifest, model_path)
+                    published = _read_pointer(current)
+                    if json.loads(published) != pointer:
+                        raise SupplyError("registration_pointer_visibility_failed")
+                    _remember_selection(self.root, published, directory, op.manifest, model_path)
                     self._check(op)
                     self.scheduler.refresh_task_worker_capabilities()
                     self._check(op)
-                except Exception:
+                    self._registration_blocked = False
+                except Exception as exc:
                     self._revoke(op, admission_held=True)
+                    if getattr(exc, "reason_code", "") == "registration_pointer_visibility_failed":
+                        self._registration_blocked = True
                     raise
             return model_path
         finally:
@@ -1106,19 +1152,34 @@ class ModelSupplyWorker:
             self._assert_idle(op)
             current = self.root / "current.json"
             try:
-                if current.is_file() and _json(current) == op.committed:
-                    if op.previous_pointer is None:
-                        current.unlink()
-                    else:
-                        temporary = self.root / (".restore-" + uuid.uuid4().hex + ".tmp")
-                        try:
-                            temporary.write_bytes(op.previous_pointer)
-                            os.replace(temporary, current)
-                        finally:
-                            temporary.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                pass
+                with _POINTER_IO_LOCK:
+                    if current.is_file() and json.loads(_read_pointer(current)) == op.committed:
+                        if op.previous_pointer is None:
+                            current.unlink()
+                        else:
+                            temporary = self.root / (".restore-" + uuid.uuid4().hex + ".tmp")
+                            try:
+                                temporary.write_bytes(op.previous_pointer)
+                                pause = threading.Event()
+                                for attempt in range(8):
+                                    try:
+                                        os.replace(temporary, current)
+                                        break
+                                    except OSError as exc:
+                                        if (sys.platform != "win32" or getattr(exc, "winerror", None) not in {5, 32, 33}
+                                                or attempt == 7):
+                                            raise
+                                    pause.wait(0.01 * 2 ** attempt)
+                            finally:
+                                temporary.unlink(missing_ok=True)
+            except (OSError, ValueError) as exc:
+                self._registration_blocked = True
+                with _SELECTION_CACHE_LOCK:
+                    _SELECTION_CACHE.pop(str(self.root), None)
+                _log_registration_error(op, "rollback", exc)
+                raise SupplyError("registration_rollback_failed") from exc
             op.committed = None
+            self._registration_blocked = False
             with _SELECTION_CACHE_LOCK:
                 _SELECTION_CACHE.pop(str(self.root), None)
 

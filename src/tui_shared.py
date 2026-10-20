@@ -319,8 +319,8 @@ def build_interactive_request(
     show_thinking: bool = False,
     enable_thinking: Optional[bool] = None,
     max_new_tokens: int = 1024,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
     image_data_urls: Optional[List[str]] = None,
     streaming_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -347,9 +347,13 @@ def build_interactive_request(
         "show_thinking": show_thinking,
         "enable_thinking": enable_thinking,
         "max_new_tokens": max_new_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
     }
+    # Omitted sampling uses the API's route-specific default. Explicit caller
+    # choices stay explicit and receive the normal capability admission check.
+    if temperature is not None:
+        body["temperature"] = temperature
+    if top_p is not None:
+        body["top_p"] = top_p
     if images:
         # 图像请求使用统一自动路由。
         body.update({

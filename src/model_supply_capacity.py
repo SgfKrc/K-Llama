@@ -97,6 +97,54 @@ def handle_capacity_inventory(coordinator, node_id, payload):
     return True
 
 
+def project_inventory_capacity(record, inventory, engine, *, source_prefix="inventory"):
+    """Bind fresh inventory to the selected runtime, without granting readiness.
+
+    Host RAM constrains CUDA source staging independently; it is never added to
+    VRAM. Multipliers here apply to unprojected execution descriptors. Supply
+    header projections carry their own dtype/materialization byte accounting.
+    """
+    from qlh_core.contracts.load import RuntimeLoadSpec
+
+    node_id = record["node_id"]
+    engines = inventory.get("engines")
+    if (inventory.get("distributed") is not True or not isinstance(engines, list)
+            or engine not in {"pytorch", "llama_cpp"} or engine not in engines):
+        raise _error("SUPPLY_RUNTIME_ENGINE_UNAVAILABLE", f"Selected runtime on {node_id} is no longer available")
+    available, device = inventory.get("memory_available_bytes"), "cpu"
+    runtime = None
+    if engine == "pytorch":
+        runtime = inventory.get("pytorch_runtime")
+        if (not isinstance(runtime, dict) or runtime.get("execution_device") not in {"cpu", "cuda"}
+                or type(runtime.get("target_element_size")) is not int
+                or runtime["target_element_size"] not in {2, 4}):
+            raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no current budget")
+        available, device = runtime.get("available_bytes"), runtime["execution_device"]
+    if type(available) is not int or available <= 0:
+        raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no positive free-memory sample")
+    source = f"{source_prefix}.cuda.mem_get_info" if device == "cuda" else f"{source_prefix}.ram.available_bytes_live"
+    result = {**deepcopy(record), "capacity_bytes": available, "capacity_source": source,
+              "execution_device": device, "engine": engine,
+              "runtime_multiplier": 1.0 if device == "cuda" else 2.0}
+    if "load_spec" in result:
+        try:
+            value = result["load_spec"]
+            spec = value if isinstance(value, RuntimeLoadSpec) else RuntimeLoadSpec.from_dict(value)
+        except (TypeError, ValueError) as exc:
+            raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Invalid runtime load_spec") from exc
+        materialization = "safetensors_key_filtered" if engine == "pytorch" else "gguf_segment"
+        if (result.get("load_spec_digest", spec.digest) != spec.digest
+                or spec.device.partition(":")[0] != device or spec.materialization != materialization
+                or (runtime is not None and {"float16": 2, "float32": 4}.get(spec.dtype)
+                    != runtime["target_element_size"])):
+            raise _error("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Inventory disagrees with selected engine/device/dtype load_spec")
+        result.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest, execution_device=spec.device)
+    host = inventory.get("memory_available_bytes")
+    if device == "cuda" and type(host) is int and host >= 0:
+        result.update(host_capacity_bytes=host, host_capacity_source=f"{source_prefix}.ram.available_bytes_live")
+    return result
+
+
 class SupplyCapacityEvidence:
     """One immutable inventory snapshot, validated again at the solve boundary."""
     def __init__(self, coordinator, query, inventories):
@@ -121,24 +169,11 @@ class SupplyCapacityEvidence:
             if node_id != "master" and not _assignment_capability_matches(by_id[node_id], assignment, query):
                 raise _error("SUPPLY_RUNTIME_CAPABILITY_CHANGED", "Worker capacity projection does not match the supplied segment")
             inventory = self._inventories[node_id]
-            engines = inventory.get("engines")
-            if (inventory.get("distributed") is not True or not isinstance(engines, list)
-                    or engine not in engines):
-                raise _error("SUPPLY_RUNTIME_ENGINE_UNAVAILABLE", f"Selected runtime on {node_id} is no longer available")
-            available, device = inventory.get("memory_available_bytes"), "cpu"
-            if engine == "pytorch":
-                runtime = inventory.get("pytorch_runtime")
-                if (not isinstance(runtime, dict) or runtime.get("execution_device") not in {"cpu", "cuda"}
-                        or type(runtime.get("target_element_size")) is not int
-                        or runtime["target_element_size"] not in {2, 4}):
-                    raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no current budget")
-                available, device = runtime.get("available_bytes"), runtime["execution_device"]
-            if type(available) is not int or available <= 0:
-                raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no positive free-memory sample")
-            source = "inventory.cuda.mem_get_info" if device == "cuda" else "inventory.ram.available_bytes_live"
-            record = {**deepcopy(by_id[node_id]), "capacity_bytes": available,
-                      "capacity_source": source, "execution_device": device,
-                      "runtime_multiplier": 1.0 if device == "cuda" else 2.0, "engine": engine}
+            record = project_inventory_capacity(by_id[node_id], inventory, engine)
+            available, device, source = (record["capacity_bytes"], record["execution_device"],
+                                         record["capacity_source"])
+            if engine == "llama_cpp" and "retained_component_bytes" in assignment:
+                record["retained_component_bytes"] = assignment["retained_component_bytes"]
             # Preserve advertised ranges/artifact contracts and the configured
             # reserve. Only the selected runtime's memory authority changes.
             result.append(record)
@@ -149,6 +184,12 @@ class SupplyCapacityEvidence:
                     "operation_id": query["operation_id"], "query_id": query["query_id"],
                     "layer_range": [assignment["start_layer"], assignment["end_layer"]],
                     "artifact_sha256": operation["nodes"][node_id].get("artifact_sha256", "")}
+            item.update(reserve_bytes=record.get("reserve_bytes", 0),
+                        reserve_source=record.get("reserve_source", "explicit"),
+                        runtime_multiplier=record["runtime_multiplier"])
+            for field in ("host_capacity_bytes", "host_capacity_source", "load_spec_digest"):
+                if field in record:
+                    item[field] = record[field]
             provenance.append(item)
             logger.info("event=pipeline_runtime_budget operation=%s query=%s node=%s engine=%s device=%s capacity_bytes=%s capacity_source=%s reserve_bytes=%s multiplier=%s registration_epoch=%s layer_ranges=%s",
                         query["operation_id"], query["query_id"], node_id, engine, device, available, source,

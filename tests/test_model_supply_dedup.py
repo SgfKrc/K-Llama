@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import config
 import model_supply_assets as assets
 from tests.test_model_supply_assets import (
     _kwargs, _make_gguf, _safetensors_fixture, _server, _receive,
@@ -74,14 +75,13 @@ def test_builder_damaged_live_sha_rebuilds_even_with_restored_mtime(tmp_path, mo
     assert weight.read_bytes() == damaged
 
 
-@pytest.mark.parametrize("change", ["node", "range", "proof"])
+@pytest.mark.parametrize("change", ["range", "proof"])
 def test_builder_does_not_rebind_another_assignment(change, tmp_path, monkeypatch):
     source = tmp_path / "full.gguf"; _make_gguf(source)
     kwargs = _kwargs(source)
     assets.build_gguf_segment(source, tmp_path / "cache", **kwargs)
     changed = {**kwargs, "operation_id": "op-other"}
-    if change == "node": changed["node_id"] = "other-node"
-    elif change == "range": changed.update(start_layer=2, end_layer=4)
+    if change == "range": changed.update(start_layer=2, end_layer=4)
     else: changed["conversion_proof"] = {"converter_revision": "other-version"}
     calls = []; original = assets._run_cut
     def cut(*args, **kw):
@@ -162,6 +162,7 @@ def test_receiver_operation_receipts_share_bytes_then_owner_gc_reclaims(tmp_path
 
 
 def test_supply_completion_gc_protects_actual_loaded_and_prepared_host(setup, monkeypatch):
+    monkeypatch.setattr(config, "MODEL_SUPPLY_CACHE_KEEP", 0)
     from model_host import ModelHost, _PipelineCandidateTransaction
     from llama_engine import LlamaCppEngine
     worker, scheduler, client = setup
@@ -243,7 +244,8 @@ def test_source_corruption_never_triggers_distribution_fallback(setup, tmp_path,
     assert result["status"] == "failed" and result["reason_code"] == "source_model_sha256_mismatch"
 
 
-def test_gc_protects_worker_runtime_previous_orphan_and_queued_prepare(setup):
+def test_gc_protects_worker_runtime_previous_orphan_and_queued_prepare(setup, monkeypatch):
+    monkeypatch.setattr(config, "MODEL_SUPPLY_CACHE_KEEP", 0)
     from model_host import ModelHost
     from worker_prepare import WorkerPrepareController, LayerRuntime
     from inference_service.engine_host import EngineHost

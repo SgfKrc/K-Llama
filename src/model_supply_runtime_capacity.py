@@ -270,3 +270,154 @@ def project_runtime_descriptor(
         runtime_ignored_component_bytes={name: source_components[name] for name in ignored},
     )
     return projection
+
+
+def project_supply_capacity_nodes(
+    descriptors: dict[str, dict], nodes: list[dict], *, master_engine: str,
+    alignment: int = 1, safety_margin: float = 1.2,
+    runtime_descriptors: dict[str, dict] | None = None,
+    preferred_ranges: dict[str, list[list[int]]] | None = None,
+    runtime_host_ranges: dict[str, list[list[int]]] | None = None,
+) -> tuple[dict, list[dict], dict[str, dict]]:
+    """Project a new supply operation, never an executable ready advertisement.
+
+    The coordinator must first verify full source identity/provenance, available
+    engines and fresh device budgets. ``runtime_descriptors`` must come from
+    ``project_runtime_descriptor`` for the selected dtype (CUDA uses its target
+    fields; host staging stays a separate range constraint). This function does
+    not discover hardware or authorize RAM offload, and leaves every load_spec
+    intact. Its three outputs replace the grouped/projected/by_id construction
+    in ``model_supply.plan_segment_supply``.
+
+    Ready ranges and old layer budgets describe previously supplied assets.
+    Full source coverage allows generating new proper aligned segments, even
+    when a PC lacks local_cut tools: the coordinator can cut and distribute.
+    Explicit reuse preferences and host ranges remain independent hard bounds.
+    Every node is charged its exact per-group bytes, without a worst-layer
+    format ratio. Preserve the existing reserve total and separate its configured
+    workspace and retained-boundary charges. Both keep their own upward rounding.
+    """
+    from qlh_core.contracts.load import RuntimeLoadSpec
+
+    def fail(code, text):
+        raise RuntimeCapacityProjectionError(code, text)
+
+    reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
+    if not reference or reference.get("pipeline_runtime_supported") is not True:
+        fail("SUPPLY_DESCRIPTOR_UNAVAILABLE", "No supported source descriptor")
+    total = reference.get("total_layers")
+    if (type(total) is not int or total <= 0 or type(alignment) is not int
+            or alignment < 1 or total % alignment):
+        fail("SUPPLY_ALIGNMENT_INVALID", "Invalid decoder cut alignment")
+    if (type(safety_margin) not in (int, float) or not math.isfinite(safety_margin)
+            or safety_margin < 1):
+        fail("SUPPLY_CAPACITY_INVALID", "Invalid supply safety margin")
+
+    def source_sizes(source):
+        if (source.get("pipeline_runtime_supported") is not True
+                or source.get("total_layers") != total
+                or source.get("hidden_size") != reference.get("hidden_size")):
+            fail("SUPPLY_SOURCE_CONTRACT_MISMATCH", "Source dimensions or runtime support differ")
+        if source.get("partial_assignment") or (
+            "assignment_layer_range" in source and source["assignment_layer_range"] != [0, total]
+        ):
+            fail("SUPPLY_FULL_SOURCE_REQUIRED", "A ready segment cannot authorize a new full-source split")
+        sizes = source.get("layer_weight_bytes")
+        if (not isinstance(sizes, (list, tuple)) or len(sizes) != total
+                or any(type(size) is not int or size <= 0 for size in sizes)):
+            fail("SUPPLY_LAYER_BYTES_MISSING", "Source layer bytes are incomplete")
+        return [sum(sizes[i:i + alignment]) for i in range(0, total, alignment)]
+
+    group_sizes = source_sizes(reference)
+    projected, by_id = [], {}
+    for raw in nodes:
+        node = copy.deepcopy(raw)
+        node_id = node.get("node_id")
+        if not isinstance(node_id, str) or not node_id or node_id in by_id:
+            fail("SUPPLY_CAPACITY_INVALID", "Supply nodes must have unique nonempty identities")
+        engine = master_engine if node_id == "master" else node.get("engine")
+        if engine not in {"llama_cpp", "pytorch"} or engine not in descriptors:
+            fail("SUPPLY_ENGINE_SOURCE_MISSING", f"No source for {engine}")
+        original = descriptors[engine]
+        source_sizes(original)  # Full source must exist independently of its runtime quote.
+        for key in ("source_model_sha256", "tokenizer_sha256"):
+            expected = reference.get(key)
+            if expected and original.get(key) != expected:
+                fail("SUPPLY_SOURCE_CONTRACT_MISMATCH", f"Engine sources disagree on {key}")
+        source = (runtime_descriptors or {}).get(node_id, original)
+        sizes = source_sizes(source)
+        for key in ("source_model_sha256", "tokenizer_sha256"):
+            expected = original.get(key)
+            if expected and source.get(key) != expected:
+                fail("SUPPLY_SOURCE_CONTRACT_MISMATCH", f"Runtime projection changed {key}")
+        multiplier = node.get("runtime_multiplier", 1.0)
+        if (type(multiplier) not in (int, float) or not math.isfinite(multiplier)
+                or multiplier <= 0):
+            fail("SUPPLY_CAPACITY_INVALID", "Invalid runtime multiplier")
+        if "load_spec" in node:
+            try:
+                policy = node["load_spec"]
+                spec = policy if isinstance(policy, RuntimeLoadSpec) else RuntimeLoadSpec.from_dict(policy)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeCapacityProjectionError("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", str(exc)) from exc
+            materialization = "gguf_segment" if engine == "llama_cpp" else "safetensors_key_filtered"
+            device = str(node.get("execution_device", ""))
+            if (spec.materialization != materialization
+                    or device not in {spec.device, spec.device.partition(":")[0]}):
+                fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Engine/device disagrees with selected load_spec")
+            element_size = source.get("runtime_target_element_size")
+            if element_size is not None and {"float16": 2, "float32": 4}.get(spec.dtype) != element_size:
+                fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Runtime quote disagrees with selected dtype")
+            node["load_spec"] = spec.to_dict()
+            node["execution_device"] = spec.device
+        components = source.get("component_weight_bytes") or {}
+        keys = (("embedding", "final_norm", "lm_head", "other")
+                if engine == "llama_cpp" or node_id != "master"
+                else ("embedding", "final_norm", "other"))
+        if any(type(components.get(key, 0)) is not int or components.get(key, 0) < 0 for key in keys):
+            fail("SUPPLY_CAPACITY_INVALID", "Invalid boundary byte quote")
+        overhead = sum(components.get(key, 0) for key in keys)
+        for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models"):
+            node.pop(key, None)
+        candidates = [[start, end] for start in range(0, total, alignment)
+                      for end in range(start + alignment, total + 1, alignment)
+                      if end - start < total and (node_id != "master" or start == 0)]
+        for mapping, code in ((preferred_ranges, "SUPPLY_PREFERRED_RANGE_INVALID"),
+                              (runtime_host_ranges, "SUPPLY_RUNTIME_HOST_BUDGET_INVALID")):
+            if mapping is None or node_id not in mapping:
+                continue
+            spans = mapping[node_id]
+            if (not isinstance(spans, list)
+                    or any(not isinstance(span, list) or len(span) != 2
+                           or any(type(value) is not int for value in span)
+                           or not 0 <= span[0] < span[1] <= total
+                           or span[1] - span[0] == total
+                           or span[0] % alignment or span[1] % alignment for span in spans)
+                    or (mapping is preferred_ranges and (node_id == "master" or not spans))):
+                fail(code, "Invalid explicit candidate range constraint")
+            candidates = [span for span in candidates if span in spans]
+        configured_reserve = node.get("reserve_bytes", 0)
+        if type(configured_reserve) is not int or configured_reserve < 0:
+            fail("SUPPLY_CAPACITY_INVALID", "Invalid configured reserve")
+        boundary_reserve = math.ceil(overhead * multiplier * safety_margin)
+        node.update(
+            engine=engine, role="master" if node_id == "master" else "client",
+            layer_weight_bytes=sizes, runtime_multiplier=float(multiplier),
+            reserve_bytes=configured_reserve + boundary_reserve,
+            configured_reserve_bytes=configured_reserve,
+            retained_component_reserve_bytes=boundary_reserve,
+            retained_component_bytes=0,
+            candidate_layer_ranges=[[start // alignment, end // alignment] for start, end in candidates],
+        )
+        # A preference is intentionally exact within this one candidate attempt;
+        # the reuse owner may retry unrestricted if it makes admission impossible.
+        if preferred_ranges and node_id in preferred_ranges:
+            node["layer_ranges"] = [[start // alignment, end // alignment]
+                                    for start, end in preferred_ranges[node_id]]
+        by_id[node_id] = {**copy.deepcopy(raw), "engine": engine, "overhead_bytes": overhead}
+        projected.append(node)
+    grouped = copy.deepcopy(reference)
+    grouped.update(total_layers=len(group_sizes), layer_weight_bytes=group_sizes,
+                   component_weight_bytes={"embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0},
+                   runtime_ignored_components=[])
+    return grouped, projected, by_id

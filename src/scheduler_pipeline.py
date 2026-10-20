@@ -27,21 +27,8 @@ from config import (
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 
 
-def native_thinking_suppression_required(show_thinking: bool, model_prompt: str) -> bool:
-    """★ 2026-10-07（真机复验根因）：是否需要抑制「模型原生思考」的外露。
+from qlh_core.execution.stopping import native_thinking_suppression_required
 
-    Route-A stage 链路此前只判 `"<think" in model_prompt[-128:]` —— 把**模板给模型的指令**
-    当成了「模型已进入思考」的证据。`qwen3-5-2b` 的 chat template 在 `enable_thinking` 非 true
-    时注入的是**已闭合**的 `'<think>\\n\\n</think>\\n\\n'`（见
-    `models/qwen3-5-2b/tokenizer_config.json` 的 `chat_template`），生成段因此只含正文、
-    永远等不到 `</think>` ⇒ 流式 token 全被吞进缓冲（真机 `tokens=0`），非流式则被
-    `_format_model_response` 判成空正文（「流水线返回空响应」）。
-
-    正确判据是「模板注入的思考块**尚未闭合**」：只有那种情况下，生成文本里的思考才需要
-    等到 `</think>` 之后再外露。
-    """
-    tail = (model_prompt or "")[-128:].lower()
-    return bool(not show_thinking and "<think" in tail and "</think>" not in tail)
 # ★ 2026-10-07（DIST-NEXT-7）：A1 relay 的隔离边界（唯一门 + 独立诊断 namespace）。
 from relay_a1_legacy import (
     a1_isolation_status,
@@ -1430,6 +1417,9 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         return True
 
     def _clear_pipeline_recovery_fence(self) -> None:
+        # Successful retirement or a fresh ready generation ends this recovery
+        # identity. Native cleanup obligations remain in their ACK-owned ledger.
+        self._pipeline_recovery_state = None
         self._pipeline_recovery_pending = False
         self._pipeline_recovery_failure = ""
 
@@ -2814,6 +2804,11 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 reservation,
                 cancel_event or threading.Event(),
             )
+            if execution_attempts is not None:
+                # A returned StageResult already proves physical execution
+                # stopped. Its provider cache expires after release; retain
+                # only attempts that still need a late stop/cancel receipt.
+                execution_attempts.remove((provider, attempt.attempt_id))
             if cleanup_only:
                 if result.output != {"kv_cleared": True}:
                     raise RuntimeError("execution_kv_cleanup_receipt_invalid")
@@ -3335,6 +3330,18 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     transaction.get("phase", "") if transaction else "missing",
                 )
                 return
+            changed_workers = [
+                node_id for node_id, item in expected.items()
+                if item.get("worker_prepare_identity")
+                and transaction.get("connection_generations", {}).get(node_id)
+                != self._assignment_connection_generation(node_id)
+            ]
+        if changed_workers:
+            self._abort_pipeline_load_transaction(
+                config_id, "pipeline_worker_connection_changed",
+                "worker connection changed during local materialization: " + ", ".join(sorted(changed_workers)),
+            )
+            return
 
         commit_configs = {}
         for node_id, item in expected.items():
@@ -3368,6 +3375,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         for node_id in commit_configs
                     }
                 self._persist_pipeline_lifecycle_locked()
+                persist_ok = self._pipeline_lifecycle_persist_ok
+        if not persist_ok:
+            self._abort_pipeline_load_transaction(config_id, "pipeline_lifecycle_persist_failed")
+            return
         if candidate_id:
             self._publish_pipeline_candidate_configs(commit_configs)
         else:

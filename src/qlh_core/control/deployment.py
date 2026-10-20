@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from qlh_core.contracts.deployment import (
-    ModelControlError, OPERATION_TERMINAL, DEPLOYMENT_TRANSITIONS, command_key, digest,
+    ModelControlError, OPERATION_TERMINAL, DEPLOYMENT_TERMINAL, DEPLOYMENT_TRANSITIONS, command_key, digest,
     frozen_assignments, require_runtime_receipt,
 )
 
@@ -184,10 +184,33 @@ class DeploymentService:
                 native = any(item.get("worker_prepare_identity", {}).get("load_spec_digest")
                              for item in expected.values())
                 target = statuses.get(phase, "candidate")
+                previous = deployment.get("status", "candidate")
+                if previous in DEPLOYMENT_TERMINAL and target != previous:
+                    # settle_cleanup commits before the executor saves its ledger.
+                    # Reobserving that same terminal transaction must keep the
+                    # settled status; it cannot reopen a deployment or generation.
+                    prior = state.get("lifecycle") or {}
+                    terminal_observation = (previous, target) in {
+                        ("retired", "invalidated"), ("aborted", "aborting")}
+                    # Explicit model replacement retires a validated recovery
+                    # target by clearing its historical publication flag. That
+                    # observation still belongs to the settled retired deployment.
+                    if (recovery_input and previous == "retired" and target == "aborting"
+                            and lifecycle.get("phase") == "invalidated"
+                            and lifecycle.get("published") is False
+                            and all(prior.get(key) == lifecycle.get(key) for key in (
+                                "model_id", "model_type", "model_sha256", "total_layers",
+                                "tokenizer_sha256", "quant_type", "plan_id", "assignments",
+                                "local_assignment"))):
+                        terminal_observation = True
+                    if (not terminal_observation
+                            or any(prior.get(key) != lifecycle.get(key)
+                                   for key in ("config_id", "generation", "phase"))):
+                        raise ModelControlError("deployment_transition_invalid")
+                    target = previous
                 if native and not recovery_input:
                     if frozen_assignments(deployment["assignments"]) != frozen_assignments(expected):
                         raise ModelControlError("deployment_assignment_changed")
-                    previous = deployment.get("status", "candidate")
                     if target != previous and target not in DEPLOYMENT_TRANSITIONS[previous]:
                         raise ModelControlError("deployment_transition_invalid")
                 if native and phase in {"committing_local", "committing_global", "ready"} and not recovery_input:
@@ -245,7 +268,7 @@ class DeploymentService:
                     state["active_deployment"] = config_id
                 elif phase in {"aborted", "invalidated", "rejected"} and state["active_deployment"] == config_id:
                     state["active_deployment"] = ""
-                deployment.update(status=statuses.get(phase, "candidate"), published=bool(lifecycle.get("published")),
+                deployment.update(status=target, published=bool(lifecycle.get("published")),
                                   validity="current" if phase == "ready" else "pending", observed_at=self.clock(),
                                   reason_code=lifecycle.get("reason_code", ""), receipts=deepcopy(acknowledgements))
             # The executor snapshot is a recovery input, never an independent DB writer.

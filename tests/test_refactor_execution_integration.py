@@ -365,3 +365,107 @@ def test_runtime_close_timeout_preserves_native_owner_until_requests_physically_
     app.requests.close()
     services.close()
     assert services._closed and unloaded == [True]
+
+
+@pytest.mark.parametrize("suffix,generated,expected", [
+    ("<think>\n\n</think>\n\n", [42, 999], "A"),
+    ("", [42, 999], "A"),
+    ("<think>\n", [42, 999], ""),
+    ("<think>\n", [42, 43, 999], "B"),
+])
+def test_linear_closed_prompt_thinking_preserves_answer_and_stream(application, monkeypatch, suffix, generated, expected):
+    from api_server import _format_model_response
+    app, calls, _ = application
+    callbacks = app.scheduler._require_callbacks()
+    callbacks.build_model_chat_prompt = lambda *_a, **_kw: "<|im_start|>assistant\n" + suffix
+    callbacks.format_model_response = _format_model_response
+    manager = app.scheduler._host._manager
+    if suffix == "<think>\n":
+        manager.tokenizer.decode = lambda tokens, **_kw: "".join(
+            {42: "private", 43: "</think>B", 999: ""}[int(token)] for token in tokens)
+    tokens = iter(generated)
+    def offer(**kwargs):
+        if kwargs.get("cleanup_only"):
+            return {"kv_cleared": True, "kind": "cleanup"}
+        return {"kind": "token", "token_argmax": next(tokens)}
+    monkeypatch.setattr(app.scheduler, "_execute_layer_stage_offer", offer)
+    events = []
+    result = app.run("hello", max_new_tokens=8, enable_thinking=False,
+                     _stream_callback=events.append)
+    assert result["response"] == expected
+    assert "".join(event.get("token", "") for event in events) == expected
+    assert result["metrics"]["stop_reason"] == "eos_token"
+    assert result["metrics"]["request"]["execution_state"] == "stopped"
+
+
+@pytest.mark.parametrize("tensor_kind", ["numpy", "torch"])
+def test_linear_three_nodes_passes_real_wire_decoded_middle_to_tail(tmp_path, monkeypatch, tensor_kind):
+    import base64
+    import hashlib
+    import scheduler_pipeline as pipeline
+    from tests.helpers.linear_application import make_application
+    if tensor_kind == "torch":
+        import torch
+        monkeypatch.setattr(pipeline, "loaded_torch", lambda: torch)
+    else:
+        monkeypatch.setattr(pipeline, "loaded_torch", lambda: None)
+    wire_hidden = np.arange(4, dtype=np.float32).reshape(1, 4)
+    raw = wire_hidden.tobytes()
+    wire_output = {"hidden_out_f32": base64.b64encode(raw).decode("ascii"),
+                   "hidden_out_sha256": hashlib.sha256(raw).hexdigest()}
+    seen = []
+    def offer(**kwargs):
+        if kwargs.get("cleanup_only"):
+            return {"kind": "cleanup", "kv_cleared": True}
+        seen.append(kwargs["node_id"])
+        if kwargs["node_id"] == "middle":
+            return pipeline._layer_stage_result_to_pipeline_value(
+                wire_output, hidden_spec={"n_tokens": 1, "n_embd": 4})
+        np.testing.assert_array_equal(kwargs["hidden_states"], wire_hidden)
+        return {"kind": "token", "token_argmax": 42}
+    manager = SimpleNamespace(tokenizer=Tokenizer(), engine_type="llama_cpp",
+        forward_layers=lambda **_kw: {"hidden_states": np.zeros((1, 1, 4), dtype=np.float32), "cache": 1},
+        clear_pipeline_kv=lambda: None)
+    callbacks = SimpleNamespace(thinking_system_prompt="",
+        build_model_chat_prompt=lambda *_a, **_kw: "prompt",
+        format_model_response=lambda text, *_a, **_kw: (text, None))
+    app, _, _ = make_application(tmp_path / "requests.sqlite3", manager, offer, callbacks)
+    try:
+        result = app.run("hello", max_new_tokens=1)
+        assert result.get("response") == "A", result
+        assert seen == ["middle", "tail"]
+        assert result["metrics"]["workers_used"] == ["middle", "tail"]
+        assert result["metrics"]["request"]["execution_state"] == "stopped"
+    finally:
+        app.requests.close()
+
+
+def test_linear_records_physical_stage_completion_before_provider_cache_expires(application, monkeypatch):
+    from scheduler_pipeline import SchedulerPipelineMixin
+    app, _, _ = application
+    outputs = iter(({"token_argmax": 42}, {"token_argmax": 999}, {"kv_cleared": True}))
+    queries = []
+    provider = SimpleNamespace(reserve=lambda _r: SimpleNamespace(reservation_id="res_fixture"),
+        execute=lambda *_a: SimpleNamespace(output=next(outputs)), release=lambda _r: None,
+        execution_drained=lambda attempt: queries.append(attempt) or False)
+    # The provider has already discarded its old successful result cache. A
+    # validated synchronous StageResult is the physical completion proof.
+    monkeypatch.setattr(app.scheduler, "_execute_layer_stage_offer",
+        lambda **kwargs: SchedulerPipelineMixin._execute_layer_stage_offer(app.scheduler, **kwargs))
+    app.scheduler._worker_prepare_assignment_loaded = lambda *_a: (True, "")
+    app.scheduler._ensure_remote_task_worker_provider = lambda _n: provider
+    result = app.run("hello", max_new_tokens=3, _request_timeout_seconds=1)
+    assert result.get("response") == "A", result
+    assert queries == []
+    assert result["metrics"]["request"]["outcome"] == "completed"
+    assert result["metrics"]["request"]["execution_state"] == "stopped"
+
+
+def test_production_linear_completion_is_allowed_in_frozen_release_profile(application, monkeypatch):
+    from distributed_completion import validate_distributed_completion
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+    app, _, _ = application
+    result = app.run("hello", max_new_tokens=2)
+    assert result["metrics"]["execution_mode"] == "distributed_pipeline"
+    assert result["metrics"]["request"]["execution_state"] == "stopped"
+    validate_distributed_completion("distributed_required", result["metrics"])

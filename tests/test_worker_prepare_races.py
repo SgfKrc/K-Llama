@@ -708,3 +708,119 @@ def test_legacy_offline_cleanup_survives_new_transaction_and_restart(race_case, 
     assert set(restarted_again._pipeline_model_cleanup_ledger) == set(native_debts)
     assert cleanup_id not in restarted_again._pipeline_model_cleanup_ledger
     _assert_unpublished(restarted_again, assignments)
+
+
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+def test_tcp_heartbeat_and_duplicate_ack_progress_during_native_barrier(stage_case, monkeypatch, phase):
+    """A blocked real host boundary must leave its inbound TCP stream usable."""
+    import threading
+    import time
+    import config
+    import tcp_comm
+    from scheduler import Scheduler
+
+    case = stage_case
+    master = case.master
+    case.start()
+    if phase == "prepare":
+        ack(master, "worker", "prepare")
+        host_method = "materialize_pipeline_candidate"
+    else:
+        prepare_both(case)
+        ack(master, "worker", "commit")
+        host_method = "commit_pipeline_candidate"
+    entered, release, finished, returned, duplicate, heartbeat = [Event() for _ in range(6)]
+    calls = []
+    original = getattr(type(case.host), host_method)
+
+    def blocked(host, *args, **kwargs):
+        calls.append(threading.current_thread().name)
+        entered.set()
+        assert release.wait(10), "native test boundary was not released"
+        return original(host, *args, **kwargs)
+
+    monkeypatch.setattr(type(case.host), host_method, blocked)
+    transition_name = "_commit_pipeline_load_transaction" if phase == "prepare" else "_complete_pipeline_load_transaction"
+    transition = getattr(master, transition_name)
+
+    def complete(config_id):
+        try:
+            return transition(config_id)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(master, transition_name, complete)
+    monkeypatch.setattr(config, "CLUSTER_SECRET", "r6-native-heartbeat-regression")
+    monkeypatch.setattr(tcp_comm.TCPClient, "_compute_local_model_sha256", staticmethod(lambda: "test"))
+    monkeypatch.setattr(tcp_comm.TCPClient, "_heartbeat_loop", lambda *_args: None)
+    monkeypatch.setattr(tcp_comm, "detect_network_type", lambda: "ethernet")
+    monkeypatch.setattr(tcp_comm, "detect_lan_ip", lambda: "127.0.0.1")
+    server = tcp_comm.TCPServer(host="127.0.0.1", port=1)
+    server.port = 0
+    received = []
+
+    def inbound(node, message):
+        if message["type"] == "register":
+            server.confirm_registration(node)
+        elif message["type"] == "model_prepare":
+            Scheduler._on_tcp_message(master, node, message)
+            received.append(message)
+            returned.set()
+            if len(received) == 2:
+                duplicate.set()
+
+    server.start(on_message=inbound)
+    client = tcp_comm.TCPClient(server_host="127.0.0.1", server_port=server.sock.getsockname()[1], client_id="android", role="client")
+    handle_ack = client._handle_heartbeat_ack
+
+    def heartbeat_ack(message, connection_generation=None):
+        handle_ack(message, connection_generation)
+        heartbeat.set()
+
+    client._handle_heartbeat_ack = heartbeat_ack
+    expected = master._pipeline_load_transaction["expected"]["android"]
+    payload = _receipt(expected, phase)
+    payload["runtime_receipt"] = {"load_spec": deepcopy(expected["load_spec"]), "materialized_bytes": 1,
+        "memory_scope": "weight_tensors", "layer_range": deepcopy(payload["identity"]["layer_range"]),
+        "artifact_sha256": payload["identity"]["artifact_sha256"]}
+    try:
+        assert client.connect() is True
+        client.send_data(payload, tcp_comm.MessageType.MODEL_PREPARE)
+        assert entered.wait(3), "native barrier not entered"
+        client.send_data({"t_send": time.time()}, tcp_comm.MessageType.HEARTBEAT)
+        assert heartbeat.wait(2), "native barrier blocked TCP heartbeat ACK"
+        assert returned.wait(2), "TCP callback is still running native work"
+        client.send_data(payload, tcp_comm.MessageType.MODEL_PREPARE)
+        assert duplicate.wait(2), "duplicate ACK blocked transport"
+        assert len(calls) == 1
+        assert master._active_pipeline_capacity_plan is None
+        assert client.is_registered
+    finally:
+        release.set()
+        assert finished.wait(5)
+        client.disconnect()
+        server.stop()
+    assert master._pipeline_load_transaction["phase"] == ("committing" if phase == "prepare" else "ready")
+
+
+def test_reconnect_during_local_materialization_aborts_before_commit_delivery(stage_case, monkeypatch):
+    case = stage_case
+    master = case.master
+    epochs = {"worker": 11, "android": 11}
+    monkeypatch.setattr(master, "_assignment_connection_generation", lambda node: epochs[node])
+    original = type(case.host).materialize_pipeline_candidate
+
+    def materialize_then_reconnect(host, *args, **kwargs):
+        result = original(host, *args, **kwargs)
+        epochs["worker"] = 12
+        return result
+
+    monkeypatch.setattr(type(case.host), "materialize_pipeline_candidate", materialize_then_reconnect)
+    case.start()
+    ack(master, "worker", "prepare")
+    ack(master, "android", "prepare")
+    assert master._pipeline_load_transaction["phase"] == "aborted"
+    assert master._pipeline_load_transaction["reason_code"] == "pipeline_worker_connection_changed"
+    assert case.host.pipeline_candidate_status()["phase"] == "aborted"
+    assert master._active_pipeline_capacity_plan is None
+    assert not any(payload.get("action") == "commit" for _, payload, *_ in case.sent)

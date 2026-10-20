@@ -383,11 +383,18 @@ def test_transfer_completion_rechecks_cancellation_and_connection(setup, tmp_pat
         assert release.wait(5)
         return receiver(*args, **kwargs)
     monkeypatch.setattr(assets, "receive_segment", blocked)
-    start = time.monotonic()
-    worker.handle(command(manifest))
-    assert time.monotonic() - start < 0.5
+    returned = threading.Event()
+    def submit():
+        worker.handle(command(manifest))
+        returned.set()
+    caller = threading.Thread(target=submit, daemon=True)
+    caller.start()
     try:
         assert entered.wait(2)
+        # Prove acceptance returns before releasing the transfer. A wall-clock
+        # threshold also measures unrelated scheduler contention in full runs.
+        assert returned.wait(2), "handle blocked on the unfinished transfer"
+        assert not release.is_set()
         if change in {"cancel", "wrong_cancel"}:
             worker.handle({"action": "cancel", "operation_id": "op-one" if change == "cancel" else "other-op"})
         elif change == "disabled":
@@ -402,6 +409,8 @@ def test_transfer_completion_rechecks_cancellation_and_connection(setup, tmp_pat
             client._connection_generation += 1
     finally:
         release.set()
+        caller.join(5)
+    assert not caller.is_alive()
     finish(worker)
     if change == "wrong_cancel":
         assert client.wait()["status"] == "available" and scheduler.refreshed == 1
@@ -649,6 +658,9 @@ def test_local_cut_uses_only_inventory_verified_source(setup, tmp_path, monkeypa
     worker.handle(command(manifest, strategy="local_cut", source_path=str(tmp_path / "external.gguf")))
     assert client.wait()["status"] == "available"
     assert calls[0][0] == local_source and calls[0][1]["start_layer"] == 1 and calls[0][1]["end_layer"] == 3
+    assert not calls[0][1]["cancelled"]()
+    worker.cancel(manifest["operation_id"])
+    assert calls[0][1]["cancelled"]()
 
 
 def test_local_cut_rejects_external_path_and_changed_verified_source(setup, tmp_path, monkeypatch):
@@ -1490,3 +1502,154 @@ def test_local_coordinator_event_cancels_while_waiting_for_stage_admission(tmp_p
     assert not thread.is_alive()
     assert result["reason_code"] == "cancelled"
     assert not (worker.root / "current.json").exists() and scheduler.refreshed == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows pointer sharing")
+def test_selection_reader_does_not_race_pointer_publication(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    scheduler.worker = worker
+    directory = worker.root.parent / "built"
+    manifest = segment(directory, node="master")
+    assert worker.activate_local(manifest, directory)["status"] == "available"
+    current = worker.root / "current.json"
+    opened, release, admitted, replaced = (threading.Event() for _ in range(4))
+    real_read, real_replace, real_idle = Path.read_bytes, module.os.replace, worker._assert_idle
+    outcomes = {}
+    def read(path):
+        if path == current and threading.current_thread().name == "held-selection-reader":
+            with path.open("rb") as handle:
+                opened.set()
+                assert release.wait(5), "reader was not released"
+                return handle.read()
+        return real_read(path)
+    def replace(source, target):
+        if Path(target) == current:
+            replaced.set()
+        return real_replace(source, target)
+    def idle(op):
+        real_idle(op)
+        admitted.set()
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(module.os, "replace", replace)
+    monkeypatch.setattr(worker, "_assert_idle", idle)
+    reader = threading.Thread(target=lambda: outcomes.update(selected=get_selected_model(worker.root)),
+                              name="held-selection-reader")
+    writer = threading.Thread(target=lambda: outcomes.update(reply=worker.activate_local(manifest, directory)),
+                              name="selection-writer")
+    reader.start()
+    try:
+        assert opened.wait(5)
+        writer.start()
+        assert admitted.wait(5)
+        assert not replaced.wait(.15), "writer attempted replacement while a product reader held current.json"
+    finally:
+        release.set()
+        reader.join(5)
+        if writer.ident is not None:
+            writer.join(5)
+    assert not reader.is_alive() and not writer.is_alive()
+    assert outcomes["reply"]["status"] == "available"
+    assert outcomes["selected"] is not None
+
+
+def test_registration_failure_has_local_exception_context(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    directory = worker.root.parent / "built"
+    manifest = segment(directory, node="master")
+    def fail_refresh():
+        raise OSError(13, "capability refresh denied")
+    scheduler.on_refresh = fail_refresh
+    reply = worker.activate_local(manifest, directory)
+    assert reply["status"] == "failed" and reply["reason_code"] == "registration_failed"
+    records = [r for r in caplog.records if getattr(r, "supply_phase", None) == "registration"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.supply_operation_id == manifest["operation_id"]
+    assert record.supply_node_id == "master" and isinstance(record.exc_info[1], OSError)
+    assert record.supply_errno == 13
+    assert "capability refresh denied" not in json.dumps(reply)
+
+
+def test_failed_rollback_is_reported_and_selection_recovers(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    scheduler.worker = worker
+    old_dir, new_dir = worker.root.parent / "old", worker.root.parent / "new"
+    old = segment(old_dir, operation="op-old", node="master")
+    new = segment(new_dir, operation="op-new", node="master")
+    assert worker.activate_local(old, old_dir)["status"] == "available"
+    previous = (worker.root / "current.json").read_bytes()
+    real_replace = module.os.replace
+    def replace(source, target):
+        if Path(source).name.startswith(".restore-"):
+            raise PermissionError(13, "restore blocked")
+        return real_replace(source, target)
+    monkeypatch.setattr(module.os, "replace", replace)
+    scheduler.on_refresh = lambda: (_ for _ in ()).throw(RuntimeError("refresh failed"))
+    reply = worker.activate_local(new, new_dir)
+    assert reply["status"] == "failed" and reply["reason_code"] == "registration_rollback_failed"
+    assert get_selected_model(worker.root) is None
+    assert worker._active.committed is not None
+    assert any(getattr(r, "supply_phase", None) == "rollback" and r.exc_info for r in caplog.records)
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    worker._revoke(worker._active)
+    assert (worker.root / "current.json").read_bytes() == previous
+    assert get_selected_model(worker.root)["manifest"]["operation_id"] == "op-old"
+
+
+@pytest.mark.parametrize("master,keep,byte_cap", [(False, 2, 8 * 1024**3), (True, 6, 8 * 1024**3),
+                                                  (False, 0, 8 * 1024**3), (True, 6, 0)])
+def test_worker_applies_runtime_cache_budget(tmp_path, monkeypatch, master, keep, byte_cap):
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    root = worker.root.parent / "operations" if master else worker.root
+    root.mkdir(parents=True)
+    policy = {"MODEL_SUPPLY_CACHE_KEEP": keep if not master else 2,
+              "MODEL_SUPPLY_CACHE_MASTER_KEEP": keep if master else 6,
+              "MODEL_SUPPLY_CACHE_MAX_BYTES": byte_cap}
+    scheduler._runtime_setting = policy.__getitem__
+    @contextmanager
+    def native_paths(root):
+        yield []
+    monkeypatch.setattr(worker, "_native_gc_paths", native_paths)
+    calls = []
+    def collect(root, **kwargs):
+        calls.append((root, kwargs))
+        return {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
+    monkeypatch.setattr(assets, "collect_supply_segments", collect)
+    assert worker.collect_garbage(root=root)["skipped"] == {}
+    assert calls[0][0] == root
+    assert calls[0][1]["keep"] == keep and calls[0][1]["max_retained_bytes"] == byte_cap
+
+
+def test_supply_cache_defaults_and_environment_are_bounded():
+    settings = config.build_settings({"QLH_CLUSTER_SECRET": "a" * 32})
+    assert settings["MODEL_SUPPLY_CACHE_KEEP"] == 2
+    assert settings["MODEL_SUPPLY_CACHE_MASTER_KEEP"] == 6
+    assert settings["MODEL_SUPPLY_CACHE_MAX_BYTES"] == 8 * 1024**3
+    settings = config.build_settings({"QLH_CLUSTER_SECRET": "a" * 32,
+        "QLH_MODEL_SUPPLY_CACHE_KEEP": "0", "QLH_MODEL_SUPPLY_CACHE_MASTER_KEEP": "128",
+        "QLH_MODEL_SUPPLY_CACHE_MAX_BYTES": "0"})
+    assert settings["MODEL_SUPPLY_CACHE_KEEP"] == settings["MODEL_SUPPLY_CACHE_MAX_BYTES"] == 0
+    assert settings["MODEL_SUPPLY_CACHE_MASTER_KEEP"] == 128
+
+
+def test_registration_rejects_replace_success_without_pointer_visibility(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    old_dir, new_dir = worker.root.parent / "old", worker.root.parent / "new"
+    old = segment(old_dir, operation="op-old", node="master")
+    new = segment(new_dir, operation="op-new", node="master")
+    assert worker.activate_local(old, old_dir)["status"] == "available"
+    previous = (worker.root / "current.json").read_bytes()
+    monkeypatch.setattr(module.os, "replace", lambda *args: None)
+    reply = worker.activate_local(new, new_dir)
+    assert reply["status"] == "failed" and reply["reason_code"] == "registration_pointer_visibility_failed"
+    assert (worker.root / "current.json").read_bytes() == previous
+    assert get_selected_model(worker.root) is None and scheduler.refreshed == 1

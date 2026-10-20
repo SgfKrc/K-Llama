@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from cluster_auto_role import AutoRoleController
+from cluster_auto_role import AutoRoleController, AutoRoleDecision
 from cluster_control_contract import (
     CommitWatermark,
     ControlContractError,
@@ -161,6 +161,12 @@ class HTTPRemoteVoter:
 
     def snapshot(self) -> dict[str, Any]:
         return dict(self._call({"op": "snapshot"}).get("snapshot", {}))
+
+    def leader_state(self):
+        return self._call({"op": "leader_certificate"})
+
+    def leader_certificate(self):
+        return self.leader_state().get("certificate")
 
 
 class JournalPrefixAuthority:
@@ -320,6 +326,9 @@ class AutoRoleRuntime:
         self._renewal_lock = threading.Lock()
         self._renewal_thread: threading.Thread | None = None
         self._renewal_stop: threading.Event | None = None
+        self._controller: AutoRoleController | None = None
+        self.tcp_port = 0
+        self.leader_ready = lambda: True
 
     @property
     def available_voter_ids(self) -> tuple[str, ...]:
@@ -328,15 +337,16 @@ class AutoRoleRuntime:
     def authenticate(self, provided: str | None) -> bool:
         return bool(self.secret) and hmac.compare_digest(str(provided or ""), self.secret)
 
-    def start_lease_renewal(self, controller: AutoRoleController) -> None:
+    def start_lease_renewal(self, controller: AutoRoleController, *, on_decision=None) -> None:
         with self._renewal_lock:
             if self._renewal_thread is not None and self._renewal_thread.is_alive():
                 return
+            self._controller = controller
             stop = threading.Event()
             self._renewal_stop = stop
             self._renewal_thread = threading.Thread(
                 target=self._renew_lease_loop,
-                args=(controller, stop),
+                args=(controller, stop, on_decision),
                 name="auto-role-lease-renewal",
                 daemon=True,
             )
@@ -365,20 +375,99 @@ class AutoRoleRuntime:
             replica.close()
             self._replica = None
 
-    def _renew_lease_loop(self, controller: AutoRoleController, stop: threading.Event) -> None:
-        interval = max(0.01, min(self.collector.policy.lease_duration_ms / 3000.0, 5.0))
-        while not stop.wait(interval):
-            if stop.is_set() or controller.state != "leader":
+    def observe_leader(self, controller: AutoRoleController) -> AutoRoleDecision | None:
+        """Consume a configured peer's signed proof through the existing controller."""
+        from cluster_control_contract import QuorumCertificate, validate_certificate
+
+        candidates = []
+        for voter in tuple(self.collector.voters.values()):
+            read = getattr(voter, "leader_certificate", None)
+            if not callable(read):
                 continue
             try:
-                decision = controller.renew_lease(available_voter_ids=self.available_voter_ids)
+                value = read()
+                if value is None:
+                    continue
+                certificate = QuorumCertificate.from_dict(value)
+                validate_certificate(certificate, self.collector.voter_set, now_ms=self._clock())
+                current = controller.certificate
+                if current is not None and certificate.term < current.term:
+                    continue
+                if (current is not None and certificate.term == current.term
+                        and certificate.expires_at_ms < current.expires_at_ms):
+                    continue
+                if certificate.leader_id != controller.node_id:
+                    candidates.append(certificate)
+            except Exception:
+                # A failed peer read never grants authority or erases a live proof.
+                continue
+        for certificate in sorted(candidates, key=lambda c: (c.term, c.expires_at_ms), reverse=True):
+            current = controller.certificate
+            if (controller.state == "follower" and current is not None
+                    and current.digest() == certificate.digest()):
+                return AutoRoleDecision(True, "follower", "client", "valid_certificate_other_leader",
+                                        current.term, current.leader_id, current.digest(), current.lease_id)
+            decision = controller.on_reconnect(certificate=certificate, now_ms=self._clock())
+            if decision.accepted:
+                return decision
+        return None
+
+    def leader_endpoint(self, leader_id):
+        from cluster_control_contract import QuorumCertificate, validate_certificate
+        from urllib.parse import urlsplit
+
+        peer = self.collector.voters.get(leader_id)
+        if not isinstance(peer, HTTPRemoteVoter):
+            return None
+        try:
+            value = peer.leader_state()
+            certificate = QuorumCertificate.from_dict(value["certificate"])
+            validate_certificate(certificate, self.collector.voter_set, now_ms=self._clock())
+        except (QuorumError, ControlContractError, KeyError, TypeError, ValueError):
+            return None
+        if certificate.leader_id != leader_id:
+            return None
+        port = value.get("tcp_port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+            return None
+        return urlsplit(peer.endpoint).hostname, port
+
+    def supervise_once(self, controller: AutoRoleController) -> AutoRoleDecision | None:
+        if controller.state == "stopped" or getattr(controller, "mode", "auto") != "auto":
+            return None
+        if controller.state == "leader":
+            return controller.renew_lease(available_voter_ids=self.available_voter_ids)
+        observed = self.observe_leader(controller)
+        if observed is not None:
+            return observed
+        certificate = controller.certificate
+        if controller.state == "follower" and certificate is not None and certificate.expires_at_ms > self._clock():
+            return None
+        return controller.on_reconnect(available_voter_ids=self.available_voter_ids)
+
+    def _renew_lease_loop(self, controller: AutoRoleController, stop: threading.Event, on_decision=None) -> None:
+        interval = max(0.01, min(self.collector.policy.lease_duration_ms / 3000.0, 5.0))
+        while not stop.wait(interval):
+            if stop.is_set():
+                return
+            try:
+                decision = self.supervise_once(controller)
+                if stop.is_set():
+                    return
+                if on_decision is not None and decision is not None:
+                    on_decision(decision)
             except Exception:
                 if not stop.is_set():
-                    controller.on_quorum_loss()
-                logger.exception("auto-role lease renewal failed closed")
+                    fenced = controller.on_quorum_loss()
+                    if on_decision is not None:
+                        try:
+                            on_decision(fenced)
+                        except Exception:
+                            logger.exception("auto-role fenced resource notification failed")
+                logger.exception("auto-role supervision failed closed")
                 continue
-            if not decision.accepted:
-                logger.warning("auto-role lease renewal fenced: %s", decision.reason)
+            if decision is not None and not decision.accepted:
+                logger.debug("auto-role supervision waiting: %s", decision.reason)
 
     def handle_rpc(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one authenticated local-voter RPC without exposing exceptions."""
@@ -403,6 +492,10 @@ class AutoRoleRuntime:
                 return {"ok": True}
             if operation == "snapshot":
                 return {"ok": True, "snapshot": self.voter.snapshot().to_dict()}
+            if operation == "leader_certificate":
+                controller = self._controller
+                certificate = controller.certificate if controller is not None and controller.can_write() and self.leader_ready() else None
+                return {"ok": True, "certificate": certificate.to_dict() if certificate is not None else None, "tcp_port": self.tcp_port}
             return {"ok": False, "code": "quorum_unavailable"}
         except (QuorumError, ControlContractError) as exc:
             # ★ #93（真机演练暴露）：**保留稳定契约码**。一律返回 quorum_unavailable 会让
@@ -561,7 +654,12 @@ def install_auto_role_controller(scheduler: Any, fence: ControlFence | None = No
         commit_watermark_provider=runtime.commit_watermark_provider,
         committed_prefix_guard=runtime.committed_prefix_guard,
     )
-    fence.set_role_guard(controller.can_write)
+    fence.set_role_guard(lambda: controller.can_write() and getattr(scheduler, "_auto_role_binding_ready", True))
+    fence.set_peer_guard(lambda: controller.can_follow() and
+                         (controller.state != "leader" or getattr(scheduler, "_auto_role_binding_ready", True)),
+                         consume_certificate=controller.observe_peer_certificate)
+    runtime._controller = controller
+    runtime.leader_ready = lambda: getattr(scheduler, "_auto_role_binding_ready", True)
     scheduler.set_auto_role_controller(controller)
     scheduler._auto_role_runtime = runtime
     return runtime

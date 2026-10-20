@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from cluster_control_contract import (
+    CONTROL_CONTRACT_ERROR_CODES,
     CONTROL_SCHEMA_VERSION,
     ControlContractError,
     ControlPlaneAuthority,
@@ -123,16 +124,27 @@ class ControlFence:
         self.required = bool(required)
         self.audit_sink = audit_sink
         self.role_guard: Callable[[], bool] | None = None
+        self.peer_guard: Callable[[], bool] | None = None
+        self.peer_certificate_consumer = None
 
     def set_role_guard(self, guard: Callable[[], bool] | None) -> None:
         if guard is not None and not callable(guard):
             raise TypeError("role guard must be callable")
         self.role_guard = guard
 
+    def set_peer_guard(self, guard, *, consume_certificate=None) -> None:
+        if guard is not None and not callable(guard):
+            raise TypeError("peer guard must be callable")
+        if consume_certificate is not None and not callable(consume_certificate):
+            raise TypeError("peer certificate consumer must be callable")
+        self.peer_guard = guard
+        self.peer_certificate_consumer = consume_certificate
+
     def _require_local_role(self, action: str, source: str) -> None:
         if self.role_guard is None or source == "auto_role":
             return
-        if not self.role_guard():
+        guard = self.peer_guard if source == "tcp_peer" and self.peer_guard is not None else self.role_guard
+        if not guard():
             error = ControlFenceError(
                 "control_certificate_not_current",
                 "local node has no current leader authority",
@@ -232,6 +244,18 @@ class ControlFence:
             raise error from exc
         self._audit(action, source, request_id, permit=permit)
         return permit
+
+    def admit_peer(self, certificate, *, action: str, observe=False, now_ms=None):
+        """Admit a current leader's transport proof without granting local API writes."""
+        if self.required and observe and self.peer_certificate_consumer is not None:
+            try:
+                self.peer_certificate_consumer(certificate, now_ms=now_ms)
+            except ValueError as exc:
+                code = getattr(exc, "code", "control_certificate_invalid")
+                if code not in CONTROL_CONTRACT_ERROR_CODES:
+                    code = "control_certificate_not_current"
+                raise ControlFenceError(code, "peer authority was not accepted", action=action) from exc
+        return self.admit(certificate, action=action, source="tcp_peer", now_ms=now_ms)
 
     def require_current_permit(self, *, action: str) -> ControlWritePermit | None:
         if not self.required:

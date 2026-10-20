@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+from itertools import islice
 import json
 import math
 import os
@@ -403,39 +404,58 @@ def _reuse(final: Path, identity: dict, *, cancelled=None) -> dict | None:
     return _attach_local(payload, final)
 
 
-# Cache hints are bounded and private. Names never establish identity.
+# Cache hints are bounded and private. Names/timestamps never establish identity.
 _CACHE_SCAN_LIMIT = 512
 _CACHE_GENERATION_LIMIT = 128
+_CACHE_ROOT_SCAN_LIMIT = 4096
 
 
 def _segment_candidates(root: Path, cancelled=lambda: False):
+    """Prefer recent branches within 4096 root / 512 descendant entry budgets.
+
+    Root discovery has a separate bound so historical operation receipts cannot
+    spend the descendant budget before any node is visited. The finite root
+    prefix is sorted before descent; caches outside it may remain undiscovered.
+    Candidates still require the caller's manifest and live-byte verification.
+    """
     root = Path(root).absolute()
     if not root.is_dir() or any(_link(p) for p in (root, *root.parents)):
         return
-    pending = [(root, 0)]
+    pending = [(root, 0, False)]
     examined = generations = 0
-    while pending and examined < _CACHE_SCAN_LIMIT:
-        directory, depth = pending.pop(0)
+    while pending:
+        _cancelled(cancelled)
+        directory, depth, generation = pending.pop()
+        if generation:
+            generations += 1
+            yield directory
+            if generations >= _CACHE_GENERATION_LIMIT:
+                return
+            continue
+        limit = _CACHE_ROOT_SCAN_LIMIT if depth == 0 else _CACHE_SCAN_LIMIT - examined
+        if limit <= 0:
+            continue
+        children = []
         try:
             with os.scandir(directory) as entries:
-                for entry in entries:
+                for entry in islice(entries, limit):
                     _cancelled(cancelled)
-                    examined += 1
-                    if examined > _CACHE_SCAN_LIMIT:
-                        break
+                    if depth:
+                        examined += 1
                     path = Path(entry.path)
                     if _link(path) or not entry.is_dir(follow_symlinks=False):
                         continue
-                    if re.fullmatch(r"segment-[0-9a-f]{64}", entry.name):
-                        generations += 1
-                        yield path
-                        if generations >= _CACHE_GENERATION_LIMIT:
-                            return
-                    elif depth < 2 and _ID.fullmatch(entry.name) and not entry.name.startswith("."):
-                        # Supports receiver/local-cut and operation/node layouts.
-                        pending.append((path, depth + 1))
+                    generation = re.fullmatch(r"segment-[0-9a-f]{64}", entry.name) is not None
+                    if generation or (depth < 2 and _ID.fullmatch(entry.name)
+                                      and not entry.name.startswith(".")):
+                        children.append((entry.stat(follow_symlinks=False).st_mtime_ns,
+                                         path, generation))
         except OSError:
             continue
+        # A stack reaches the newest operation's node before scanning older
+        # operation metadata. Recency is only a discovery priority, never proof.
+        pending.extend((path, depth + 1, generation) for _, path, generation in
+                       sorted(children, key=lambda child: child[0]))
 
 
 def _candidate_layout(root: Path, directory: Path, manifest: dict) -> bool:
@@ -445,10 +465,25 @@ def _candidate_layout(root: Path, directory: Path, manifest: dict) -> bool:
             (len(parts) == 3 and parts[:2] == (manifest["operation_id"], manifest["node_id"])))
 
 
-def _same_segment(left: dict, right: dict, *, same_node=True) -> bool:
+def _same_segment(left: dict, right: dict, *, same_node=True, same_components=False) -> bool:
     keys = ("node_id", "source_model_id", "source_model_sha256", "tokenizer_sha256",
             "total_layers", "layer_range", "segment_mode", "format", "conversion_proof")
-    return all(left.get(key) == right.get(key) for key in keys if same_node or key != "node_id")
+    if not all(left.get(key) == right.get(key) for key in keys if same_node or key != "node_id"):
+        return False
+    if not same_components:
+        return True
+    # Builders supply these from the verified source. Receivers can still
+    # reuse individual byte-identical files before validating the new segment
+    # as a whole, even when its incoming component declarations are invalid.
+    components = ("hidden_size", "model_type", "layer_weight_bytes",
+                  "has_embedding", "has_lm_head", "tie_word_embeddings")
+    return all(left.get(key) == right[key] for key in components if key in right)
+
+
+def _segment_content_key(manifest: dict) -> str:
+    """One retained copy per verified content/semantics, independent of receipt."""
+    return _digest({key: value for key, value in manifest.items()
+                    if key not in {"operation_id", "node_id", "manifest_sha256"}})
 
 
 def _link_verified(source: Path, target: Path, entry: dict, cancelled) -> bool:
@@ -476,7 +511,8 @@ def _link_verified(source: Path, target: Path, entry: dict, cancelled) -> bool:
 
 def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: Path,
                            cancelled=lambda: False, support_files=None,
-                           gguf_metadata=None, gguf_source_metadata=None) -> dict | None:
+                           gguf_metadata=None, gguf_source_metadata=None,
+                           verify_source=None) -> dict | None:
     for candidate in _segment_candidates(reuse_root, cancelled):
         if candidate == final:
             continue
@@ -486,7 +522,8 @@ def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: 
             if _link(marker):
                 continue
             old = validate_supply_manifest(_read_json(marker))
-            if not _candidate_layout(reuse_root, candidate, old) or not _same_segment(old, identity):
+            if (not _candidate_layout(reuse_root, candidate, old)
+                    or not _same_segment(old, identity, same_node=False, same_components=True)):
                 continue
             if support_files is not None:
                 support = {e["path"]: e for e in old["files"] if e["kind"] == "support"}
@@ -515,8 +552,15 @@ def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: 
                     _verify_segment(candidate, old)
             else:
                 _verify_segment(candidate, old)
+            if old["node_id"] != identity["node_id"]:
+                # A node label is not content identity, but dropping it must
+                # not promote a self-consistent inventory into source proof.
+                if verify_source is None:
+                    continue
+                verify_source(candidate, old)
             payload = dict(old)
             payload["operation_id"] = identity["operation_id"]
+            payload["node_id"] = identity["node_id"]
             payload.pop("manifest_sha256")
             stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
             for entry in old["files"]:
@@ -553,7 +597,8 @@ def segment_cache_hint(root: Path, identity: dict) -> bool:
             if _link(marker):
                 continue
             payload = validate_supply_manifest(_read_json(marker))
-            if _candidate_layout(root, directory, payload) and _same_segment(payload, identity):
+            if (_candidate_layout(root, directory, payload)
+                    and _same_segment(payload, identity, same_node=False)):
                 return True
         except (SupplyError, OSError):
             continue
@@ -764,21 +809,33 @@ def _collect_covered_partials(root: Path, protected, *, max_remove, max_hash_byt
 
 
 def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None,
-                            keep=1, max_remove=16, max_hash_bytes=16 * 1024**3,
+                            keep=1, max_retained_bytes=8 * 1024**3,
+                            max_remove=16, max_hash_bytes=16 * 1024**3,
                             cancelled=lambda: False, receive_idle=False) -> dict:
     """Collect only verified generations while the caller holds owner admission.
 
     None is an unavailable native ownership proof, rather than an empty proof.
     All deletion targets are checked within root, with exact manifest members,
     live SHA and no reparse at any level. Work is bounded in directories/bytes.
+
+    Keep the newest verified, distinct content inventories within BOTH ``keep``
+    and ``max_retained_bytes`` (logical bytes including each supply marker).
+    Duplicate operation/node receipts do not consume extra retention slots.
+    Referenced, unowned and unverifiable data remain outside this evictable
+    cache budget; owner/lease/native protection always takes precedence.
+    A bounded pass can leave excess data for the next maintenance invocation.
     """
-    report = {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
+    report = {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0,
+              "retained": 0, "retained_bytes": 0}
     def skip(reason):
         report["skipped"][reason] = report["skipped"].get(reason, 0) + 1
     if native_paths is None:
         skip("native_references_unknown")
         return report
-    if type(keep) is not int or keep < 0 or type(max_remove) is not int or not 0 <= max_remove <= 32:
+    if (type(keep) is not int or not 0 <= keep <= _CACHE_GENERATION_LIMIT
+            or type(max_retained_bytes) is not int or max_retained_bytes < 0
+            or type(max_hash_bytes) is not int or max_hash_bytes < 0
+            or type(max_remove) is not int or not 0 <= max_remove <= 32):
         _fail("invalid_retention", "invalid segment retention bound")
     root = Path(root).absolute()
     if any(_link(path) for path in (root, *root.parents)):
@@ -800,19 +857,13 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
         hashed = 0
     candidates = sorted(_segment_candidates(root, cancelled),
                         key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    retained = 0
+    retained = set()
     for directory in candidates:
         _cancelled(cancelled)
         report["examined"] += 1
         if pinned(directory):
             skip("referenced")
             continue
-        if retained < keep:
-            retained += 1
-            continue
-        if report["removed"] >= max_remove:
-            skip("removal_budget")
-            break
         try:
             # Resolve before entering or removing any candidate, never rmtree a
             # computed destination that has not been checked under the root.
@@ -847,6 +898,17 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
             if pinned(resolved) or directory.resolve() != resolved:
                 skip("referenced")
                 continue
+            content = _segment_content_key(manifest)
+            retained_size = size + marker.stat().st_size
+            if (content not in retained and len(retained) < keep
+                    and report["retained_bytes"] + retained_size <= max_retained_bytes):
+                retained.add(content)
+                report["retained"] += 1
+                report["retained_bytes"] += retained_size
+                continue
+            if report["removed"] >= max_remove:
+                skip("removal_budget")
+                break
             if any(_link(path) for path in (directory, *directory.parents)) or any(
                     _link(path) for path in directory.rglob("*")):
                 skip("unsafe_path")
@@ -985,11 +1047,13 @@ def _layer_sizes(tensors: dict, total: int, start: int = 0, end: int | None = No
     return result
 
 
-def _range_hash(path: Path, offset: int, length: int) -> str:
+def _range_hash(path: Path, offset: int, length: int, *, cancelled=None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         handle.seek(offset)
         while length:
+            if cancelled is not None:
+                _cancelled(cancelled)
             chunk = handle.read(min(_CHUNK, length))
             if not chunk:
                 _fail("invalid_artifact", "tensor payload is truncated")
@@ -998,7 +1062,15 @@ def _range_hash(path: Path, offset: int, length: int) -> str:
     return digest.hexdigest()
 
 
-def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: int, *, timeout_seconds=3600) -> None:
+def _check_cut_owner(cancelled, deadline):
+    if cancelled is not None:
+        _cancelled(cancelled)
+    if deadline is not None and time.monotonic() >= deadline:
+        _fail("cut_timeout", "GGUF build deadline exceeded")
+
+
+def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: int, *,
+             timeout_seconds=3600, cancelled=None, deadline=None) -> None:
     args = ["--src", str(source), "--dst", str(artifact), "--manifest", str(native),
             "--source-model-id", payload["source_model_id"],
             "--tokenizer-sha256", payload["tokenizer_sha256"]]
@@ -1016,19 +1088,35 @@ def _run_cut(source: Path, artifact: Path, native: Path, payload: dict, nextn: i
         if not script.is_file():
             _fail("cut_tool_unavailable", "GGUF cutting tool is unavailable")
         command = [sys.executable, str(script), *args]
+    _check_cut_owner(cancelled, deadline)
+    expires = time.monotonic() + timeout_seconds
+    if deadline is not None:
+        expires = min(expires, deadline)
     try:
-        result = subprocess.run(command, capture_output=True, timeout=timeout_seconds,
-                                encoding="utf-8", errors="replace",
-                                creationflags=(subprocess.CREATE_NO_WINDOW
-                                               if sys.platform == "win32" else 0))
-    except subprocess.TimeoutExpired as exc:
-        raise SupplyError("cut_timeout", "GGUF cutting timed out") from exc
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   encoding="utf-8", errors="replace",
+                                   creationflags=(subprocess.CREATE_NO_WINDOW
+                                                  if sys.platform == "win32" else 0))
     except OSError as exc:
         raise SupplyError("cut_tool_unavailable", "GGUF cutting process could not start") from exc
-    if result.returncode:
-        code = "cut_tool_unavailable" if "No module named" in result.stderr or "ImportError" in result.stderr else "cut_failed"
-        _fail(code, f"GGUF cutting failed (exit {result.returncode})")
-
+    try:
+        while True:
+            _check_cut_owner(cancelled, expires)
+            try:
+                _, stderr = process.communicate(timeout=min(0.2, max(0, expires - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        _check_cut_owner(cancelled, expires)
+        if process.returncode:
+            code = "cut_tool_unavailable" if "No module named" in stderr or "ImportError" in stderr else "cut_failed"
+            _fail(code, f"GGUF cutting failed (exit {process.returncode})")
+    finally:
+        # Cancellation owns this exact cutter. Reap it before stage cleanup or
+        # returning to the caller; callback failures must follow the same path.
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
 
 
 def _gguf_tensor_selection(tensors: dict, metadata: dict,
@@ -1064,7 +1152,13 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                        source_model_sha256, tokenizer_sha256, start_layer,
                        end_layer, total_layers, operation_id, node_id,
                        conversion_proof: dict | None = None, reuse_root: Path | None = None,
-                       cut_timeout_seconds: int | None = None) -> dict:
+                       cut_timeout_seconds: int | None = None,
+                       cancelled: Callable[[], bool] | None = None,
+                       deadline: float | None = None) -> dict:
+    def stopped():
+        _check_cut_owner(cancelled, deadline)
+        return False
+    stopped()
     payload = _base_manifest(
         source_model_id=source_model_id, source_model_sha256=source_model_sha256,
         tokenizer_sha256=tokenizer_sha256, start_layer=start_layer, end_layer=end_layer,
@@ -1075,7 +1169,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
     source = Path(source).resolve()
     if not source.is_file():
         _fail("source_missing", "source GGUF is missing")
-    if sha256_file(source) != source_model_sha256:
+    if _hash_file(source, stopped) != source_model_sha256:
         _fail("source_digest_mismatch", "source GGUF digest mismatch")
     from relay_segment_info import read_gguf_tokenizer_sha256
     try:
@@ -1100,21 +1194,38 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
     root = _storage_root(destination_dir)
     final = _generation(root, payload)
     try:
-        reused = _reuse(final, payload)
+        reused = _reuse(final, payload, cancelled=stopped)
     except SupplyError as exc:
         if exc.code != "gguf_metadata_missing":
             raise
         # Keep the old ready generation intact. Publish a separate contract
         # generation so a legacy receipt cannot permanently block rebuilding.
         final = _generation(root, {**payload, "_gguf_metadata_contract": 1})
-        reused = _reuse(final, payload)
+        reused = _reuse(final, payload, cancelled=stopped)
     if reused:
         raw, _ = _gguf_table(Path(reused["local_files"]["segment.gguf"]))
         _require_gguf_metadata(normalize_gguf_metadata(raw), expected_metadata)
         return reused
-    rebound = _rebind_cached_segment(root, final, payload, reuse_root or root,
-                                    gguf_metadata=expected_metadata,
-                                    gguf_source_metadata=source_metadata)
+    def verify_cached_source(directory, manifest):
+        weight = next(entry for entry in manifest["files"] if entry["kind"] == "weights")
+        cached_path = _safe_path(directory, weight["path"])
+        _, cached_tensors = _gguf_table(cached_path)
+        expected = {target: tensors[name] for target, name in selection.tensor_sources.items()}
+        if set(expected) != set(cached_tensors):
+            _fail("layer_range_mismatch", "cached GGUF tensor set differs from source range")
+        for name, entry in expected.items():
+            output = cached_tensors[name]
+            if (entry[1:] != output[1:]
+                    or _range_hash(source, entry[0], entry[1], cancelled=stopped)
+                    != _range_hash(cached_path, output[0], output[1], cancelled=stopped)):
+                _fail("tensor_digest_mismatch", "cached GGUF tensor differs from source")
+        if _hash_file(source, stopped) != source_model_sha256:
+            _fail("source_digest_mismatch", "source GGUF changed during cache verification")
+
+    rebound = _rebind_cached_segment(root, final, {
+        **payload, "layer_weight_bytes": layer_bytes, "hidden_size": hidden, "model_type": arch,
+    }, reuse_root or root, gguf_metadata=expected_metadata,
+        gguf_source_metadata=source_metadata, cancelled=stopped, verify_source=verify_cached_source)
     if rebound:
         return rebound
     selected_size = selection.selected_weight_bytes
@@ -1124,12 +1235,15 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         artifact = stage / "segment.gguf"
         native = stage / "segment.manifest.json"
         nextn = metadata.get(f"{arch}.nextn_predict_layers", 0)
+        cut_options = {"cancelled": cancelled, "deadline": deadline} if cancelled is not None or deadline is not None else {}
+        stopped()
         if cut_timeout_seconds is None:
-            _run_cut(source, artifact, native, payload, nextn)
+            _run_cut(source, artifact, native, payload, nextn, **cut_options)
         else:
             if type(cut_timeout_seconds) is not int or not 1 <= cut_timeout_seconds <= 3600:
                 _fail("cut_timeout", "local cutter budget is exhausted")
-            _run_cut(source, artifact, native, payload, nextn, timeout_seconds=cut_timeout_seconds)
+            _run_cut(source, artifact, native, payload, nextn, timeout_seconds=cut_timeout_seconds, **cut_options)
+        stopped()
         generated = _read_json(native)
         if (generated.get("source_layer_range") != payload["layer_range"]
                 or generated.get("n_layer") != total_layers
@@ -1138,7 +1252,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                 or generated.get("source_model_id") != source_model_id
                 or generated.get("hidden_size") != hidden
                 or generated.get("kept_block_count") != end_layer - start_layer
-                or generated.get("artifact_sha256") != sha256_file(artifact)):
+                or generated.get("artifact_sha256") != _hash_file(artifact, stopped)):
             _fail("cut_manifest_mismatch", "cut manifest differs from actual assignment")
         # --end excludes source MTP blocks at a decoder tail. The cutter calls
         # this CLI shape "middle" even when the verified decoder range ends at
@@ -1161,13 +1275,14 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         if set(expected) != set(out_tensors):
             _fail("layer_range_mismatch", "cut GGUF tensor set differs from source range")
         for name, entry in expected.items():
+            stopped()
             output = out_tensors[name]
-            if (entry[1:] != output[1:] or _range_hash(source, entry[0], entry[1])
-                    != _range_hash(artifact, output[0], output[1])):
+            if (entry[1:] != output[1:] or _range_hash(source, entry[0], entry[1], cancelled=stopped)
+                    != _range_hash(artifact, output[0], output[1], cancelled=stopped)):
                 _fail("tensor_digest_mismatch", "cut GGUF tensor bytes differ from source")
         if _layer_sizes(out_tensors, total_layers, start_layer, end_layer, local=True) != layer_bytes:
             _fail("layer_bytes_mismatch", "cut GGUF per-layer bytes differ from source")
-        if sha256_file(source) != source_model_sha256:
+        if _hash_file(source, stopped) != source_model_sha256:
             _fail("source_digest_mismatch", "source GGUF changed during segment generation")
         if decoder_only_tail:
             # The role comes from the verified source range/tensor set, rather
@@ -1182,6 +1297,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         _check_public(generated)
         _write_json(native, generated)
         payload.update(layer_weight_bytes=layer_bytes, hidden_size=hidden, model_type=arch)
+        stopped()
         return _finish(stage, final, payload, {artifact.name: "weights", native.name: "manifest"})
     except OSError as exc:
         code = "insufficient_disk" if exc.errno == 28 else "artifact_io_error"
@@ -1472,7 +1588,31 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
                if Path(relative).name not in {
                    "model.manifest.json", "cross_format.provenance.json", ".qlh-model-asset.json",
                }]
-    rebound = _rebind_cached_segment(root, final, payload, reuse_root or root,
+    def verify_cached_source(directory, manifest):
+        _, cached_map, cached_headers = _source_safetensors(directory)
+        if set(cached_map) != {key for keys in selected.values() for key in keys}:
+            _fail("layer_range_mismatch", "cached tensor set differs from source range")
+        for filename, keys in selected.items():
+            header, data_start = headers[filename]
+            for key in keys:
+                cached_name = cached_map[key]
+                output_header, output_start = cached_headers[cached_name]
+                original, copied = header[key], output_header[key]
+                lo, hi = original["data_offsets"]
+                out_lo, out_hi = copied["data_offsets"]
+                if (original["dtype"] != copied["dtype"] or original["shape"] != copied["shape"]
+                        or hi - lo != out_hi - out_lo
+                        or _range_hash(root_source / filename, data_start + lo, hi - lo)
+                        != _range_hash(_safe_path(directory, cached_name), output_start + out_lo, out_hi - out_lo)):
+                    _fail("tensor_digest_mismatch", "cached tensor differs from source")
+        if _model_digest(root_source) != actual_source:
+            _fail("source_digest_mismatch", "source model changed during cache verification")
+
+    rebound = _rebind_cached_segment(root, final, {
+        **payload, "model_type": model_type, "hidden_size": decoder["hidden_size"],
+        "layer_weight_bytes": layer_bytes, "has_embedding": start_layer == 0,
+        "has_lm_head": end_layer == total_layers, "tie_word_embeddings": tied,
+    }, reuse_root or root, verify_source=verify_cached_source,
         support_files={name: _safe_path(root_source, name) for name in ["config.json", *support]})
     if rebound:
         return rebound

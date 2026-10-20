@@ -375,6 +375,18 @@ def _normalize_nodes(
             "capacity_source": capacity_source,
             "execution_device": str(raw.get("execution_device", "unknown") or "unknown"),
         }
+        if "configured_reserve_bytes" in raw or "retained_component_reserve_bytes" in raw:
+            for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
+                if type(raw.get(field)) is not int or raw[field] < 0:
+                    raise PipelineCapacityError(f"node[{node_id}].{field} must be a nonnegative integer")
+                normalized[field] = raw[field]
+            if normalized["configured_reserve_bytes"] + normalized["retained_component_reserve_bytes"] != reserve_bytes:
+                raise PipelineCapacityError(f"node[{node_id}].reserve_bytes breakdown mismatch")
+        if "retained_component_bytes" in raw:
+            if type(raw["retained_component_bytes"]) is not int:
+                raise PipelineCapacityError("retained_component_bytes must be an integer")
+            normalized["retained_component_bytes"] = _non_negative_int(
+                raw["retained_component_bytes"], "retained_component_bytes")
         if "load_spec" in raw:
             try:
                 spec = (raw["load_spec"] if isinstance(raw["load_spec"], RuntimeLoadSpec)
@@ -386,12 +398,32 @@ def _normalize_nodes(
                 raise PipelineCapacityError(f"node[{node_id}].load_spec_digest mismatch")
             if normalized["execution_device"] not in ("unknown", spec.device):
                 raise PipelineCapacityError(f"node[{node_id}].load_spec device mismatch")
+            engine = raw.get("engine")
+            materialization = {"pytorch": "safetensors_key_filtered", "llama_cpp": "gguf_segment"}.get(engine)
+            if materialization is not None and spec.materialization != materialization:
+                raise PipelineCapacityError(f"node[{node_id}].load_spec engine mismatch")
             if reserve_bytes < spec.kv_cache_bytes:
                 raise PipelineCapacityError(f"node[{node_id}].reserve_bytes does not cover KV")
             normalized.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest,
                               execution_device=spec.device)
         elif "load_spec_digest" in raw:
             raise PipelineCapacityError(f"node[{node_id}].load_spec_digest has no spec")
+        if "layer_weight_bytes" in raw:
+            sizes = raw["layer_weight_bytes"]
+            if (not isinstance(sizes, (list, tuple))
+                    or total_layers is None or len(sizes) != total_layers
+                    or any(type(size) is not int or size <= 0 for size in sizes)):
+                raise PipelineCapacityError(
+                    f"node[{node_id}].layer_weight_bytes must quote every decoder layer"
+                )
+            normalized["layer_weight_bytes"] = tuple(sizes)
+        # Candidate generation constraints are independent of ready artifacts.
+        # In particular, local_cut must never relax a host/source range budget.
+        if "candidate_layer_ranges" in raw:
+            normalized["candidate_layer_ranges"] = _normalize_layer_ranges(
+                raw["candidate_layer_ranges"], f"node[{node_id}].candidate_layer_ranges",
+                total_layers=total_layers,
+            )
         if "layer_ranges" in raw:
             normalized["layer_ranges"] = _normalize_layer_ranges(
                 raw.get("layer_ranges"),
@@ -824,6 +856,10 @@ def solve_pipeline_capacity(
         remaining = layer_budget - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count
+            candidates = node.get("candidate_layer_ranges")
+            if candidates is not None and (cursor, end) not in candidates:
+                exclude(node, cursor, end, "node_candidate_layer_range_unavailable")
+                continue
             # ★ 2026-10-03：`layer_budget.max_layers` 是承载上界，始终生效。
             advertised_budget = node.get("layer_budget")
             if advertised_budget is not None and count > advertised_budget["max_layers"]:
@@ -913,6 +949,8 @@ def solve_pipeline_capacity(
             ):
                 exclude(node, cursor, end, "node_artifact_byte_quote_missing")
                 continue
+            if segment_bytes is None and "layer_weight_bytes" in node:
+                segment_bytes = node["layer_weight_bytes"][cursor:end]
             if segment_bytes is None and missing_prefix[end] != missing_prefix[cursor]:
                 exclude(node, cursor, end, "node_artifact_byte_quote_missing")
                 continue
@@ -928,10 +966,13 @@ def solve_pipeline_capacity(
                         or has_lm_head != ("lm_head" in components)):
                     exclude(node, cursor, end, "node_load_spec_components_mismatch")
                     continue
-            if has_embedding:
-                raw_bytes += embedding_bytes
-            if has_lm_head:
-                raw_bytes += output_bytes
+            if "retained_component_bytes" in node:
+                raw_bytes += node["retained_component_bytes"] - per_node_bytes
+            else:
+                if has_embedding:
+                    raw_bytes += embedding_bytes
+                if has_lm_head:
+                    raw_bytes += output_bytes
             budget = _node_budget(raw_bytes, node, safety_margin)
             required = budget["required_bytes"]
             checks[(node["node_id"], cursor, end)] = {
@@ -986,6 +1027,25 @@ def solve_pipeline_capacity(
             _node_budget(0, node, safety_margin)["allocatable_bytes"]
             for node in usable
         )
+        if any("candidate_layer_ranges" in node for node in usable):
+            without_candidates = [
+                {key: value for key, value in node.items() if key != "candidate_layer_ranges"}
+                for node in usable
+            ]
+            relaxed = solve_pipeline_capacity(
+                descriptor, without_candidates + relay_only, safety_margin=safety_margin,
+                require_distributed=require_distributed, local_layer_budget=local_layer_budget,
+                relay_claims=relay_claims, required_node_id=required_node_id,
+                prefer_all_workers=prefer_all_workers,
+            )
+            if relaxed.get("admitted"):
+                return {
+                    **base, "status": "rejected", "admitted": False,
+                    "reason_code": "pipeline_candidate_layer_range_unsatisfied",
+                    "reason": "source coverage or staging ranges cannot form a capacity-safe contiguous split",
+                    "assignments": [], "allocatable_bytes": allocatable_bytes,
+                    "control_only_nodes": [node["node_id"] for node in usable],
+                }
         segment_constrained = any(
             node.get("segment_mode") is not None
             or node.get("layer_artifacts") is not None
@@ -1167,6 +1227,11 @@ def solve_pipeline_capacity(
             "score": node["score"],
             **_node_budget(raw_bytes, node, safety_margin),
         }
+        for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
+            if field in node:
+                assignment[field] = node[field]
+        if "retained_component_bytes" in node:
+            assignment["retained_component_bytes"] = node["retained_component_bytes"]
         if "load_spec" in node:
             assignment.update(load_spec=RuntimeLoadSpec.from_dict(node["load_spec"]).to_dict(),
                               load_spec_digest=node["load_spec_digest"])
@@ -1183,9 +1248,10 @@ def solve_pipeline_capacity(
         assignments.append(assignment)
 
     selected_layer_bytes = sum(
-        item[3] - per_node_bytes
-        - (embedding_bytes if item[5] else 0)
-        - (output_bytes if item[6] else 0)
+        item[3] - (usable[item[0]]["retained_component_bytes"]
+                   if "retained_component_bytes" in usable[item[0]] else
+                   per_node_bytes + (embedding_bytes if item[5] else 0)
+                   + (output_bytes if item[6] else 0))
         for item in solved
     )
     base["raw_model_bytes"] = (
@@ -1207,6 +1273,8 @@ def solve_pipeline_capacity(
                 "has_lm_head", "required_bytes", "capacity_bytes",
             )
         }
+        if "retained_component_bytes" in item:
+            identity_item["retained_component_bytes"] = item["retained_component_bytes"]
         if "load_spec" in item:
             identity_item["load_spec_digest"] = item["load_spec_digest"]
         if "layer_ranges" in item:
@@ -1219,6 +1287,9 @@ def solve_pipeline_capacity(
     ).hexdigest()
     full_model_fits = []
     for node in usable:
+        candidates = node.get("candidate_layer_ranges")
+        if candidates is not None and (0, total_layers) not in candidates:
+            continue
         if "load_spec" in node and not {"embedding", "lm_head"}.issubset(node["load_spec"]["components"]):
             continue
         allowed_ranges = node.get("layer_ranges")
@@ -1227,9 +1298,12 @@ def solve_pipeline_capacity(
             for start, end in allowed_ranges
         ):
             continue
-        required = _required_bytes(
-            max(raw_model_bytes, base["raw_model_bytes"]), node, safety_margin
-        )
+        full_bytes = max(raw_model_bytes, base["raw_model_bytes"])
+        if "layer_weight_bytes" in node:
+            full_bytes = sum(node["layer_weight_bytes"]) + node.get(
+                "retained_component_bytes", embedding_bytes + per_node_bytes + output_bytes,
+            )
+        required = _required_bytes(full_bytes, node, safety_margin)
         if required <= node["capacity_bytes"]:
             full_model_fits.append(node["node_id"])
 

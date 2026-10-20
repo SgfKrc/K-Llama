@@ -1526,6 +1526,14 @@ class LlamaCppEngine:
     def is_loaded(self) -> bool:
         return self._loaded and self._model is not None
 
+    @property
+    def layer_range(self) -> tuple[int, int] | None:
+        """Read the loaded assignment from the native owner's descriptor."""
+        if not self.is_loaded:
+            return None
+        span = (self._pipeline_descriptor or {}).get("assignment_layer_range")
+        return tuple(span) if span is not None else None
+
     def get_device(self) -> str:
         """流水线/缓存路径要的 device —— llama.cpp 恒为 CPU。
 
@@ -2385,8 +2393,11 @@ class LlamaCppEngine:
         upstream = getattr(self, "_keep_head", None)
         if upstream is not None:
             upstream.reset()
-        if self._model is not None:
-            self._model._ctx.kv_cache_clear()
+        context = getattr(self._model, "_ctx", None)
+        if context is not None:
+            context.kv_cache_clear()
+        elif self._model is not None and upstream is None:
+            raise RuntimeError("pipeline_kv_owner_unavailable")
         self._kv_used = 0
 
     def _clear_context_kv(self) -> None:

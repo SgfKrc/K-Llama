@@ -223,6 +223,7 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
     coordinator = TaskWorkerControlPlane()
     server = tcp_comm.TCPServer(host="127.0.0.1", port=0)
     hold_ack = threading.Event()
+    release_held_ack = threading.Event()
     register_waiting = threading.Event()
     hellos = []
     errors = []
@@ -231,7 +232,10 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
         try:
             if msg["type"] == MessageType.REGISTER.value:
                 if hold_ack.is_set():
-                    register_waiting.set()  # 收到注册但故意不回 ACK
+                    # Returning lets TCPServer send its fallback ACK. Hold the
+                    # callback itself until the test has retired this socket.
+                    register_waiting.set()
+                    assert release_held_ack.wait(5)
                     return
                 if not server.confirm_registration(client_id):
                     raise AssertionError("registration rejected")
@@ -254,6 +258,23 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
                   "initial PC hello was not accepted")
         assert client.reconnect_failure_count == 0
 
+        # Observe the completed outcome before the next attempt can clear
+        # last_register_error or overwrite last_reconnect_error. Polling either
+        # field races the retry owner and can miss a correct classification.
+        outcome_ready = threading.Event()
+        outcome_release = threading.Event()
+        interruption_applied = threading.Event()
+        outcomes = []
+        schedule_retry = client._schedule_reconnect_retry
+
+        def observe_retry_handoff():
+            if interruption_applied.is_set() and not outcome_ready.is_set():
+                outcomes.append((client.last_reconnect_error, client.reconnect_failure_count))
+                outcome_ready.set()
+                assert outcome_release.wait(5)
+            schedule_retry()
+
+        monkeypatch.setattr(client, "_schedule_reconnect_retry", observe_retry_handoff)
         # 让下一次注册卡在等待确认：服务端收下 REGISTER 却不回 ACK。
         hold_ack.set()
         _client_id, conn = server._client_items_snapshot()[0]
@@ -262,10 +283,10 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
 
         assert register_waiting.wait(5), "client never reached the registration wait"
 
-        # 模拟「别的线程关闭了本代连接」：disconnect() 正是递增 generation 再关闭 socket。
-        # **不要**把 self.sock 置 None —— 那样 recv_data() 会直接返回 None，客户端把它
-        # 当成「未收到注册确认」（真失败）而不是「本代被中断」；留在原地的已关闭描述符
-        # 才会让等待中的 recv 抛出 OSError，走到被中断的分类分支。
+        # Retire this generation while its registration is waiting. Windows
+        # may report either EOF or OSError after shutdown; both must consult
+        # the captured generation, rather than relying on an exception.
+        interruption_applied.set()
         with client._disconnect_callback_lock:
             doomed = client.sock
             client._connection_generation += 1
@@ -276,18 +297,15 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
             pass
         doomed.close()
 
-        # The next registration clears last_register_error on entry; the
-        # reconnect outcome persists until successful registration instead.
-        _wait_for(lambda: client.last_reconnect_error == "registration_interrupted",
-                  "interrupted registration was not classified: "
-                  f"{client.last_register_error!r}")
-        assert client.last_reconnect_error == "registration_interrupted"
-        assert client.reconnect_failure_count == 0, (
+        assert outcome_ready.wait(5), "interrupted registration never handed off its retry"
+        assert outcomes == [("registration_interrupted", 0)], (
             "被主动中断的注册不得计入失败，否则会被放大成 worker_reconnect_exhausted")
         assert "worker_reconnect_exhausted" not in caplog.text
 
         # 恢复正常的注册确认之后仍要能自愈。
         hold_ack.clear()
+        release_held_ack.set()
+        outcome_release.set()
         _wait_for(lambda: client.is_registered
                   and worker._task_worker_control.coordinator_snapshot().get("healthy")
                   and len(hellos) >= 2,
@@ -295,6 +313,9 @@ def test_registration_wait_interrupted_by_concurrent_socket_close(monkeypatch, c
         assert client.reconnect_failure_count == 0
         assert not errors
     finally:
+        release_held_ack.set()
+        if "outcome_release" in locals():
+            outcome_release.set()
         if client is not None:
             client.on_disconnect = None
             client.disconnect()

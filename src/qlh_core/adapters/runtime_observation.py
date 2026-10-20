@@ -19,9 +19,23 @@ def observe_runtime(manager, assignment):
         parameters = list(manager.model.parameters())
         buffers = list(manager.model.buffers()) if callable(getattr(manager.model, "buffers", None)) else []
         tensors = parameters + buffers
+        # Non-persistent RoPE buffers are derived by the model, not checkpoint
+        # weights. Transformers keeps these in FP32 even for FP16 parameters.
+        # Persistent buffers still obey the frozen weight dtype; every buffer
+        # must live on the assigned device and remains in byte accounting.
+        derived = set()
+        modules = getattr(manager.model, "modules", None)
+        if callable(modules):
+            for module in modules():
+                names = getattr(module, "_non_persistent_buffers_set", ())
+                for name, tensor in module.named_buffers(recurse=False):
+                    if name in names:
+                        derived.add(id(tensor))
         floating = [tensor for tensor in tensors if tensor.is_floating_point()]
         if (not floating or manager.quant_type != spec.quant_type
-                or any(str(t.device) != spec.device or str(t.dtype).removeprefix("torch.") != spec.dtype for t in floating)):
+                or any(str(t.device) != spec.device for t in tensors)
+                or any(str(t.dtype).removeprefix("torch.") not in (
+                    {spec.dtype, "float32"} if id(t) in derived else {spec.dtype}) for t in floating)):
             raise ValueError("deployment_local_policy_mismatch")
         materialized = sum(t.numel() * t.element_size() for t in tensors)
     receipt = {"load_spec": spec.to_dict(), "materialized_bytes": materialized,

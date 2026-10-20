@@ -373,9 +373,11 @@ class AutoRoleController:
             if state != "leader" or certificate is None:
                 return False
             try:
-                if self.fence is not None:
-                    self.fence.admit(certificate, action="auto_role.write", source="auto_role", now_ms=now_ms)
-                elif self.authority is not None:
+                # Runtime-role observation is also used by the API log handler.
+                # Validate the shared authority without logging a control write:
+                # audit -> log handler -> runtime_role would recurse and invert
+                # the logging-handler/controller locks across concurrent threads.
+                if self.authority is not None:
                     self.authority.admit_control_write(certificate, now_ms=now_ms)
                 else:
                     return False
@@ -383,6 +385,34 @@ class AutoRoleController:
             except (ControlContractError, ValueError, TypeError):
                 self.on_quorum_loss("control_certificate_not_current")
                 return False
+
+    def can_follow(self, *, now_ms: int | None = None) -> bool:
+        """A follower may consume leader commands while local writes remain fenced."""
+        with self._lock:
+            if self._state not in {"leader", "follower"} or self._certificate is None or self.authority is None:
+                return False
+            try:
+                self.authority.admit_control_write(self._certificate, now_ms=now_ms)
+                return True
+            except (ControlContractError, ValueError, TypeError):
+                return False
+
+    def observe_peer_certificate(self, certificate, *, now_ms=None):
+        # Renewals of an already installed proof are ordinary observations.
+        # A replay after disconnect still goes through on_reconnect's new-proof fence.
+        from cluster_control_contract import QuorumCertificate
+        try:
+            candidate = certificate if isinstance(certificate, QuorumCertificate) else QuorumCertificate.from_dict(certificate)
+        except (ControlContractError, TypeError, ValueError):
+            raise AutoRoleError("control_certificate_invalid", "invalid peer authority") from None
+        with self._lock:
+            current = self._certificate
+            same = current is not None and candidate.digest() == current.digest()
+            if same and self._state in {"leader", "follower"}:
+                return
+        decision = self.on_reconnect(certificate=candidate, now_ms=now_ms)
+        if not decision.accepted:
+            raise AutoRoleError(decision.reason, "peer authority was not accepted")
 
     def snapshot(self, *, now_ms: int | None = None) -> dict[str, Any]:
         writable = self.can_write(now_ms=now_ms)

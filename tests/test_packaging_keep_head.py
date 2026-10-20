@@ -132,6 +132,15 @@ def test_required_shim_or_patched_export_cannot_be_missing(native_group, library
     assert library in str(error.value) and symbol in str(error.value)
 
 
+def test_legacy_shim_without_load_receipts_is_rejected_before_build(native_group):
+    root, _, metadata = native_group
+    metadata["qlh_keep_head.dll"][1].difference_update({
+        "qlh_kh_model_bytes", "qlh_kh_context_size", "qlh_kh_batch_size",
+    })
+    with pytest.raises(RuntimeError, match="keep_head_native_symbol_missing"):
+        resources.collect_keep_head_binaries(root)
+
+
 def test_unknown_dependency_fails_even_if_a_sibling_file_exists(native_group):
     root, directory, metadata = native_group
     metadata["ggml-cpu.dll"][0]["unexpected-backend.dll"] = {"backend_init"}
@@ -179,7 +188,7 @@ def _execute_edge_spec(monkeypatch, native_group):
     monkeypatch.setattr(sys, "path", sys.path[:])
     monkeypatch.setitem(sys.modules, "keep_head_resources", resources)
     monkeypatch.setitem(sys.modules, "model_supply_resources", SimpleNamespace(
-        collect_model_supply_resources=lambda _: ([], [])))
+        collect_model_supply_resources=lambda _, **_kw: ([], [])))
     monkeypatch.setitem(sys.modules, "scripts.model_tools.llama_quantize_toolchain", SimpleNamespace(
         verify_managed_package=lambda *args, **kwargs: {"valid": False}))
     monkeypatch.setitem(sys.modules, "llama_cpp", SimpleNamespace(__file__=str(pip_lib.parent / "__init__.py")))
@@ -211,5 +220,44 @@ def test_edge_spec_missing_group_stops_before_analysis(monkeypatch, native_group
     calls, namespace = _execute_edge_spec(monkeypatch, native_group)
     (native_group[1] / "libgomp-1.dll").unlink()
     with pytest.raises(FileNotFoundError, match="keep_head_native_missing.*libgomp-1.dll"):
+        exec(compile((PACKAGING / "qlh-edge.spec").read_text(encoding="utf-8"), "qlh-edge.spec", "exec"), namespace)
+    assert calls == []
+
+
+@pytest.mark.parametrize("cuda_version", [None, "12.6"])
+def test_cuda_tui_spec_requires_gpu_torch_and_keeps_both_native_groups(monkeypatch, native_group, cuda_version):
+    calls, namespace = _execute_edge_spec(monkeypatch, native_group)
+    monkeypatch.setenv("QLH_EDGE_FREEZE_TORCH", "1")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(version=SimpleNamespace(cuda=cuda_version)))
+    code = compile((PACKAGING / "qlh-edge.spec").read_text(encoding="utf-8"), "qlh-edge.spec", "exec")
+    if cuda_version is None:
+        with pytest.raises(RuntimeError, match="CUDA-enabled PyTorch"):
+            exec(code, namespace)
+        assert calls == []
+        return
+    exec(code, namespace)
+    analysis, collection = calls
+    imports = analysis[2]["hiddenimports"]
+    assert {"torch", "model_module", "transformers.models.qwen3_5.modeling_qwen3_5", "tokenizers"} <= set(imports)
+    assert "torch" not in analysis[2]["excludes"] and "transformers" not in analysis[2]["excludes"]
+    assert collection[2]["name"] == "QLH-Edge-Inference-CUDA"
+    toc = [entry for group in collection[1][1:] for entry in group]
+    assert {f"keep_head/{name}" for name in resources.REQUIRED_DLLS} <= {dest for dest, _, _ in toc}
+    assert any(dest == "llama_cpp/lib/llama.dll" for dest, _, _ in toc)
+
+
+def test_cpu_tui_spec_continues_excluding_torch(monkeypatch, native_group):
+    calls, namespace = _execute_edge_spec(monkeypatch, native_group)
+    monkeypatch.setenv("QLH_EDGE_FREEZE_TORCH", "0")
+    exec(compile((PACKAGING / "qlh-edge.spec").read_text(encoding="utf-8"), "qlh-edge.spec", "exec"), namespace)
+    assert {"torch", "transformers"} <= set(calls[0][2]["excludes"])
+    assert "model_module" not in calls[0][2]["hiddenimports"]
+    assert calls[1][2]["name"] == "QLH-Edge-Inference"
+
+
+def test_tui_spec_rejects_unknown_torch_build_choice(monkeypatch, native_group):
+    calls, namespace = _execute_edge_spec(monkeypatch, native_group)
+    monkeypatch.setenv("QLH_EDGE_FREEZE_TORCH", "true")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
         exec(compile((PACKAGING / "qlh-edge.spec").read_text(encoding="utf-8"), "qlh-edge.spec", "exec"), namespace)
     assert calls == []

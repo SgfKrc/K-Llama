@@ -80,6 +80,32 @@ def _sha256(path: Path, chunk: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+class _TensorWriteView:
+    """Keep GGUFWriter metadata while streaming mapped bytes in bounded writes.
+
+    NumPy tofile uses C stdio; a single large call can stall Windows network
+    filesystems. The reader's contiguous byte view needs no weight copy.
+    """
+    def __init__(self, tensor):
+        self._tensor = tensor
+        self.shape = tensor.shape
+        self.dtype = tensor.dtype
+        self.nbytes = tensor.nbytes
+
+    def byteswap(self, inplace=False):
+        return _TensorWriteView(self._tensor.byteswap(inplace=inplace))
+
+    def tofile(self, output):
+        view = memoryview(self._tensor).cast("B")
+        offset = 0
+        while offset < len(view):
+            block = view[offset:offset + 1024 * 1024]
+            written = output.write(block)
+            if written is None or not 0 < written <= len(block):
+                raise OSError("GGUF output did not accept tensor bytes")
+            offset += written
+
+
 def _require_gguf():
     try:
         import gguf  # noqa: PLC0415
@@ -696,7 +722,7 @@ def main() -> int:
     n_kv = _copy_kv(gguf, reader, writer, overrides)
     print(f"[kv] 复制 {n_kv} 字段，{bc_name}: {identity['block_count']} -> {kept_block_count}")
     for tensor, new_name in keep:
-        writer.add_tensor(new_name, tensor.data, raw_dtype=tensor.tensor_type)
+        writer.add_tensor(new_name, _TensorWriteView(tensor.data), raw_dtype=tensor.tensor_type)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()

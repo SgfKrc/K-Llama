@@ -486,3 +486,23 @@ def test_binary_hidden_compatibility_switch_omits_the_unknown_key(monkeypatch):
     assert caps["stage_chunked_input"] is True
     monkeypatch.setenv("QLH_TASK_WORKER_BINARY_HIDDEN", "1")
     assert _capabilities(active_layer_config={"layer_range": [4, 16]})["binary_hidden"] is True
+
+
+def test_cold_slim_host_can_build_hello_without_torch_manager(monkeypatch):
+    from model_host import ModelHost, _LazyModelManager
+
+    def unavailable(self):
+        raise RuntimeError("frozen distribution has no torch ModelManager")
+
+    monkeypatch.setattr(_LazyModelManager, "_get_instance", unavailable)
+    monkeypatch.setattr(scheduler_task_worker, "torch_available", lambda: False)
+    monkeypatch.setattr(scheduler_task_worker, "keep_head_shim_available", lambda: True)
+    monkeypatch.delenv("QLH_LAYER_GGUF", raising=False)
+    worker = _scheduler()
+    worker._host = ModelHost()
+    caps = worker._task_worker_capabilities()
+    assert caps["engines"] == ["llama_cpp"]
+    assert caps["models"] == []
+    assert caps["layer_worker"] is False
+    assert caps["layer_ranges"] == []
+    assert worker._host.peek_manager() is None

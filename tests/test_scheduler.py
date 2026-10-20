@@ -517,6 +517,7 @@ class TestComputeLayerAssignment:
             "role": NodeRole.CLIENT,
             "capacity_bytes": 3 * 1024 ** 3,
             "reserve_bytes": records[0]["reserve_bytes"],
+            "reserve_source": "config.PIPELINE_CAPACITY_RESERVE_MB",
             "runtime_multiplier": 2.0,
             "execution_device": "cpu",
             "capacity_source": "memory.available_bytes",

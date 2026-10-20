@@ -2,12 +2,16 @@
 from __future__ import annotations
 from collections import deque
 from copy import deepcopy
+import logging
 import threading
 import time
 import uuid
 from qlh_core.contracts.deadline import DeadlineCancelEvent, request_stop_reason
 from qlh_core.contracts.execution import ExecutionError
 from qlh_core.contracts.outcome import TerminalOutcomeLatch
+
+
+logger = logging.getLogger(__name__)
 
 
 class RequestService:
@@ -182,6 +186,8 @@ class RequestService:
                 result = record["execute"](record)
             except BaseException as exc:
                 error = getattr(exc, "code", "request_execution_failed")
+                logger.error("Request execution failed: request=%s attempt=%s code=%s",
+                    record["request_id"], record["attempt_id"], error, exc_info=True)
             finally:
                 with self._condition:
                     record["execution_state"] = "draining"

@@ -411,6 +411,12 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     #   因此多段拓扑（如 master + 中间段 + 尾段）永远不会被选中 —— 两段总是更少。
     #   打开这个开关后，可行解之间改为**优先用尽可用节点**。验证多段链路时需要它。
     PIPELINE_PREFER_ALL_WORKERS = _env_bool("QLH_PIPELINE_PREFER_ALL_WORKERS", False)
+    # Evictable supply inventories; live owners and leases remain protected.
+    MODEL_SUPPLY_CACHE_KEEP = _env_int("QLH_MODEL_SUPPLY_CACHE_KEEP", 2, min_val=0, max_val=128)
+    MODEL_SUPPLY_CACHE_MASTER_KEEP = _env_int("QLH_MODEL_SUPPLY_CACHE_MASTER_KEEP", 6, min_val=0, max_val=128)
+    MODEL_SUPPLY_CACHE_MAX_BYTES = _env_int(
+        "QLH_MODEL_SUPPLY_CACHE_MAX_BYTES", 8 * 1024**3, min_val=0, max_val=1024**4,
+    )
     PIPELINE_ASSIGNMENT_CACHE_MAX_MB = _env_float(
         "QLH_PIPELINE_ASSIGNMENT_CACHE_MAX_MB", 4096.0, min_val=128.0, max_val=1048576.0,
     )

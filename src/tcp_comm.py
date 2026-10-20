@@ -362,7 +362,7 @@ def _is_fenced_control_message(msg_type: MessageType | str) -> bool:
     return value in FENCED_CONTROL_MESSAGE_TYPES
 
 
-def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFence | None) -> Any:
+def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFence | None, *, peer=False) -> Any:
     if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
         return data
     if not isinstance(data, dict):
@@ -373,7 +373,10 @@ def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFe
         if certificate is None:
             raise ControlFenceError("control_certificate_missing", "fenced control message has no current certificate")
         payload["control_certificate"] = certificate
-    fence.admit(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}", source="tcp")
+    if peer:
+        fence.admit_peer(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}")
+    else:
+        fence.admit(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}", source="tcp")
     return payload
 
 
@@ -2273,7 +2276,7 @@ class TCPClient:
             return
         data = msg.get("data")
         certificate = data.get("control_certificate") if isinstance(data, dict) else None
-        fence.admit(certificate, action=f"tcp.receive.{msg_type}", source="tcp")
+        fence.admit_peer(certificate, action=f"tcp.receive.{msg_type}", observe=True)
 
     def _transport_runtime_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         runtime = self.transport_runtime
@@ -2557,6 +2560,20 @@ class TCPClient:
                                 register_reason = f"注册确认等待失败: {e}"
                                 logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
+                    # A local shutdown can return EOF instead of raising on
+                    # Windows. Even a valid ACK can finish after retirement.
+                    # Check ownership for every receive outcome, not only the
+                    # OSError path, before consuming the registration result.
+                    with self._disconnect_callback_lock:
+                        displaced = (
+                            self.sock is not register_sock
+                            or self._connection_generation != register_generation
+                        )
+                        if displaced or not self._running:
+                            registered = False
+                            registration_interrupted = True
+                            register_reason = "注册被中断（连接已由其他线程关闭）"
+
                     if not registered:
                         self.last_register_error = register_reason
                         self._last_registration_interrupted = registration_interrupted
@@ -2565,11 +2582,15 @@ class TCPClient:
                         # write to the closed descriptor and surface WinError
                         # 10038 during a reconnect race.
                         with self._disconnect_callback_lock:
-                            self._connection_generation += 1
-                            self._running = False
-                            self._registered = False
-                            failed_sock = self.sock
-                            self.sock = None
+                            if (self.sock is register_sock
+                                    and self._connection_generation == register_generation):
+                                self._connection_generation += 1
+                                self._running = False
+                                self._registered = False
+                                self.sock = None
+                            # Cleanup belongs to this attempt, even when a
+                            # successor has already installed another socket.
+                            failed_sock = register_sock
                         if failed_sock is not None:
                             try:
                                 shutdown = getattr(failed_sock, "shutdown", None)
@@ -2599,6 +2620,15 @@ class TCPClient:
                             opened_sock.close()
                             return False
                         with self._disconnect_callback_lock:
+                            # Retirement can also happen between the receive
+                            # check above and this publication lock.
+                            if (self.sock is not register_sock
+                                    or self._connection_generation != register_generation
+                                    or not self._running):
+                                self.last_register_error = "注册被中断（连接已由其他线程关闭）"
+                                self._last_registration_interrupted = True
+                                opened_sock.close()
+                                return False
                             self._registered = True
                             self._last_registration_interrupted = False
                             self._registration_epoch += 1
@@ -2771,7 +2801,7 @@ class TCPClient:
                   connection_sock: socket.socket = None,
                   binary_body: Optional[bytes] = None) -> None:
         """向主节点发送数据"""
-        data = _decorate_control_payload(data, msg_type, self._control_fence)
+        data = _decorate_control_payload(data, msg_type, self._control_fence, peer=True)
         packet = build_message(msg_type, data, binary_body=binary_body)
         self._transport_runtime_call(
             "observe_legacy_send",

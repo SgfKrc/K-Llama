@@ -219,8 +219,12 @@ def test_gguf_reuse_hashes_live_file_even_with_preserved_stat(gguf_source, tmp_p
         build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
 
 
+def _finished_cut(returncode=0, stderr=""):
+    return SimpleNamespace(returncode=returncode, communicate=lambda **kw: ("", stderr), poll=lambda: returncode)
+
+
 def test_cut_failure_does_not_publish(gguf_source, tmp_path, monkeypatch):
-    monkeypatch.setattr(assets.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=2, stderr="", stdout=""))
+    monkeypatch.setattr(assets.subprocess, "Popen", lambda *a, **k: _finished_cut(2))
     with pytest.raises(SupplyError) as exc:
         build_gguf_segment(gguf_source, tmp_path / "out", **_kwargs(gguf_source))
     assert exc.value.code == "cut_failed"
@@ -232,8 +236,8 @@ def test_frozen_cut_dispatch(gguf_source, tmp_path, monkeypatch):
     monkeypatch.setattr(assets.sys, "frozen", True, raising=False)
     def run(argv, **kwargs):
         command.extend(argv)
-        return SimpleNamespace(returncode=0)
-    monkeypatch.setattr(assets.subprocess, "run", run)
+        return _finished_cut()
+    monkeypatch.setattr(assets.subprocess, "Popen", run)
     payload = assets._base_manifest(**_kwargs(gguf_source))
     assets._run_cut(gguf_source, tmp_path / "out.gguf", tmp_path / "native.json", payload, 0)
     assert command[:2] == [assets.sys.executable, "--qlh-cut-layers"]
@@ -247,16 +251,17 @@ def test_cut_creationflags_hide_windows_console(gguf_source, tmp_path, monkeypat
     calls = []
     def run(argv, **options):
         calls.append((argv, options))
-        return SimpleNamespace(returncode=0)
+        return _finished_cut()
     monkeypatch.setattr(assets.sys, "frozen", frozen, raising=False)
     monkeypatch.setattr(assets.sys, "platform", platform_name)
     # The constant is unavailable on non-Windows hosts running this regression.
     monkeypatch.setattr(assets.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
-    monkeypatch.setattr(assets.subprocess, "run", run)
+    monkeypatch.setattr(assets.subprocess, "Popen", run)
     assets._run_cut(gguf_source, tmp_path / "segment.gguf", tmp_path / "segment.manifest.json", payload, 0)
     command, options = calls[0]
     assert options["creationflags"] == (0x08000000 if platform_name == "win32" else 0)
-    assert options["capture_output"]
+    assert options["stdout"] == assets.subprocess.PIPE
+    assert options["stderr"] == assets.subprocess.PIPE
     assert command[0] == assets.sys.executable
     assert (command[1] == "--qlh-cut-layers") == frozen
 
@@ -1540,3 +1545,45 @@ def test_native_kept_block_count_cannot_disagree_with_metadata(gguf_segment):
     with pytest.raises(SupplyError, match="block_count") as error:
         assets._reuse(root, validate_supply_manifest(changed))
     assert error.value.code == "gguf_metadata_mismatch"
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline", "callback_error"])
+def test_cut_reaps_real_child_before_reporting_stop(gguf_source, tmp_path, monkeypatch, stop):
+    import subprocess
+    import time
+    ready = tmp_path / "child-ready"
+    children = []
+    popen = subprocess.Popen
+    def child(argv, **kwargs):
+        process = popen([assets.sys.executable, "-c",
+            "from pathlib import Path; import time; Path(" + repr(str(ready)) + ").touch(); time.sleep(120)"], **kwargs)
+        children.append(process)
+        return process
+    monkeypatch.setattr(assets.subprocess, "Popen", child)
+    def cancelled():
+        if stop == "callback_error" and ready.exists():
+            raise RuntimeError("owner check failed")
+        return stop == "cancel" and ready.exists()
+    options = {"cancelled": cancelled, "deadline": time.monotonic() + 1.0}
+    payload = assets._base_manifest(**_kwargs(gguf_source))
+    expected = RuntimeError if stop == "callback_error" else SupplyError
+    with pytest.raises(expected) as exc:
+        assets._run_cut(gguf_source, tmp_path / "out.gguf", tmp_path / "native.json", payload, 0, **options)
+    if stop != "callback_error":
+        assert exc.value.code == ("cancelled" if stop == "cancel" else "cut_timeout")
+    assert ready.exists() and len(children) == 1
+    assert children[0].poll() is not None, "stop returned before its cutter exited"
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_gguf_build_stopped_before_source_read_or_publish(gguf_source, tmp_path, monkeypatch, stop):
+    import time
+    kwargs = _kwargs(gguf_source)
+    monkeypatch.setattr(assets, "_hash_file", lambda *a, **k: pytest.fail("stopped build read source"))
+    monkeypatch.setattr(assets, "_run_cut", lambda *a, **k: pytest.fail("stopped build started child"))
+    with pytest.raises(SupplyError) as exc:
+        build_gguf_segment(gguf_source, tmp_path / "out", **kwargs,
+                           cancelled=lambda: stop == "cancel",
+                           deadline=time.monotonic() - 1 if stop == "deadline" else None)
+    assert exc.value.code == ("cancelled" if stop == "cancel" else "cut_timeout")
+    assert not (tmp_path / "out").exists()

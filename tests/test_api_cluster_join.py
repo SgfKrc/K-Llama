@@ -37,11 +37,19 @@ def join_api(monkeypatch, tmp_path):
             "status": "connected", "master_host": host, "master_port": port,
         },
     )
-    with TestClient(api_server.app) as client:
-        client.headers.update({"Authorization": f"Bearer {token}"})
+    runtime = api_server._get_app_runtime()
+    assert runtime.services.store.path == str(tmp_path / "control.sqlite3")
+    # Join routes need real runtime-owned stores, but not process startup,
+    # which opens discovery/listeners on production ports. Transport recovery
+    # has its own real loopback tests.
+    client = TestClient(api_server.app)
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    try:
         yield client, role, secret
-    monkeypatch.setattr(api_server, "_join_ledger_instance", None)
-    auth_service._reset_for_tests()
+    finally:
+        client.close()
+        monkeypatch.setattr(api_server, "_join_ledger_instance", None)
+        auth_service._reset_for_tests()
 
 
 def test_join_request_issue_consume_and_replay_rejected(join_api):
@@ -53,6 +61,9 @@ def test_join_request_issue_consume_and_replay_rejected(join_api):
         json={"master_endpoint": "[fd7a:115c::1]:8888", "target_node_id": "client-test"},
     )
     assert created.status_code == 200, created.text
+    import api_server
+    import os
+    assert api_server._get_join_ledger().path == os.environ["QLH_SQLITE_PATH"]
     request_code = created.json()["request_code"]
     assert request_code.startswith("qlhjoinreq1.")
 

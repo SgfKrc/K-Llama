@@ -222,6 +222,18 @@ def _manager_port(name):
         setattr(host._materialize_manager(), name, value)
     return property(read, write)
 
+
+def _manager_state(name, empty=None):
+    """Observe an existing owner; explicit writes may construct the manager."""
+    def read(host):
+        manager = host.peek_manager()
+        return empty if manager is None else getattr(manager, name)
+
+    def write(host, value):
+        setattr(host._materialize_manager(), name, value)
+
+    return property(read, write)
+
 class ModelHost:
     """推理宿主：统一持有 ModelManager + 模型运行时状态 + 执行锁。
 
@@ -230,16 +242,15 @@ class ModelHost:
 
     abort_pipeline_materialization = _manager_port("abort_pipeline_materialization")
     clear_pipeline_kv = _manager_port("clear_pipeline_kv")
-    tokenizer = _manager_port("tokenizer")
-    model = _manager_port("model")
-    layer_range = _manager_port("layer_range")
-    role = _manager_port("role")
-    _total_model_layers = _manager_port("_total_model_layers")
-    _model_path = _manager_port("_model_path")
-    _full_model_path = _manager_port("_full_model_path")
-    _island_engine = _manager_port("_island_engine")
-    _chat_template = _manager_port("_chat_template")
-    _thinking_controlled = _manager_port("_thinking_controlled")
+    tokenizer = _manager_state("tokenizer")
+    model = _manager_state("model")
+    role = _manager_state("role")
+    _total_model_layers = _manager_state("_total_model_layers", 0)
+    _model_path = _manager_state("_model_path")
+    _full_model_path = _manager_state("_full_model_path")
+    _island_engine = _manager_state("_island_engine")
+    _chat_template = _manager_state("_chat_template")
+    _thinking_controlled = _manager_state("_thinking_controlled", False)
     chat = _manager_port("chat")
     chat_image = _manager_port("chat_image")
     chat_stream = _manager_port("chat_stream")
@@ -251,7 +262,6 @@ class ModelHost:
     get_device = _manager_port("get_device")
     get_memory_usage = _manager_port("get_memory_usage")
     get_model_info = _manager_port("get_model_info")
-    get_pipeline_descriptor = _manager_port("get_pipeline_descriptor")
     _get_generation_eos_token_ids = _manager_port("_get_generation_eos_token_ids")
     _merge_stop_sequences = _manager_port("_merge_stop_sequences")
     _build_stop_criteria = _manager_port("_build_stop_criteria")
@@ -419,6 +429,18 @@ class ModelHost:
                 "请选择 llama_cpp/GGUF 引擎"
             ) from exc
 
+    @property
+    def layer_range(self):
+        """Read the existing native owner's range without creating a manager."""
+        manager = self.peek_manager()
+        return None if manager is None else getattr(manager, "layer_range", None)
+
+    def get_pipeline_descriptor(self) -> dict:
+        """Describe the existing owner without constructing a torch runtime."""
+        manager = self.peek_manager()
+        describe = getattr(manager, "get_pipeline_descriptor", None)
+        return describe() if callable(describe) else {}
+
     def has_loaded_model(self) -> bool:
         """Check LLM ownership without materializing the lazy manager."""
 
@@ -527,6 +549,11 @@ class ModelHost:
         error: Exception,
     ) -> Optional[Exception]:
         transaction.error = str(error)
+        # Unwound observer/loader frames can retain the model and tensor lists.
+        # Release those locals before unload runs GC/empty_cache, retaining the
+        # original traceback locations and error for diagnostics.
+        import traceback
+        traceback.clear_frames(error.__traceback__)
         try:
             self._close_pipeline_manager(manager)
         except Exception as cleanup_error:
@@ -772,7 +799,7 @@ class ModelHost:
         from qlh_core.planning.load_spec import assignment_load_spec
         transaction = self._require_pipeline_candidate(transaction_id)
         native = getattr(transaction.manager, "engine_type", "pytorch") == "llama_cpp"
-        artifact_sha = transaction.model_sha256
+        artifact_sha = transaction.model_sha256 or transaction.descriptor.get("model_sha256")
         if native:
             path = transaction.manager._find_layer_artifact(int(assignment["start_layer"]), int(assignment["end_layer"]))
             if not path:

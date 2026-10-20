@@ -801,7 +801,7 @@ def test_return_chunking_includes_the_certificate_added_by_tcp(monkeypatch):
     certificate = {"leader_node_id": "master", "term": 1, "signature": "c" * 64,
                    "cluster_id": '集群\n"路径\\'}
     worker._tcp_client._control_fence = SimpleNamespace(
-        enabled=True, current_certificate=lambda: dict(certificate), admit=lambda *a, **kw: None,
+        enabled=True, current_certificate=lambda: dict(certificate), admit_peer=lambda *a, **kw: None,
     )
     messages = worker._task_worker_stage_result_messages(payload, **kwargs)
     assert [message.message_type for message in messages] == ["stage_result_chunk"] * 9 + ["stage_result"]

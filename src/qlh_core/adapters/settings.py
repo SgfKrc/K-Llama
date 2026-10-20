@@ -184,6 +184,10 @@ class IdentityStore:
                     raise ValueError("bootstrap credential would regress or fork the stored epoch")
             document = {**existing, **build_bootstrap_config(response, existing=existing)}
             node = document["node"]
+            if config.node_role == "auto":
+                if node.get("node_id") != config.node_id:
+                    raise ValueError("bootstrap cannot replace an automatic voter's identity")
+                node["role"] = "auto"
             if not node.get("node_id") or node.get("role") not in {"client", "auto", "master"}:
                 raise ValueError("bootstrap response contains an invalid node identity")
             return self._persist_config(config, document, secret, epoch)

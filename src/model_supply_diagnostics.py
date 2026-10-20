@@ -32,6 +32,7 @@ _REASONS = {
     "pipeline_cluster_capacity_insufficient": "当前各节点容量无法满足层段预算",
     "pipeline_capacity_single_node_insufficient": "当前层段约束下，存在节点无法容纳自己的层段",
     "pipeline_layer_range_coverage_insufficient": "当前节点的可用层段范围无法组成连续接力",
+    "pipeline_candidate_layer_range_unsatisfied": "当前源覆盖或源张量暂存范围无法组成满足容量的连续接力",
     "pipeline_segment_contract_unsatisfied": "当前工件的层段类型或来源约束无法组成接力",
 }
 _RESOURCE_NAMES = {"ram": "内存", "vram": "显存", "host_ram": "源张量暂存内存"}
@@ -80,6 +81,9 @@ def _capacity_candidate(
     # them, but never relax a caller's additional range/artifact contracts here.
     raw_upper = sum(layers)
     for node in nodes:
+        sizes = node.get("layer_weight_bytes")
+        if sizes is not None:
+            raw_upper = max(raw_upper, sum(sizes) + int(node.get("retained_component_bytes", 0)))
         for artifact in node.get("layer_artifacts", ()):
             sizes = artifact.get("layer_weight_bytes")
             if sizes is not None:

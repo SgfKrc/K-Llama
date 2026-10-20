@@ -6,7 +6,7 @@
     "inference_service_contract": "0.1.0"
   },
   "profile": {
-    "name": "route-a-production-v1",
+    "name": "linear-production-v2",
     "default_node_role": "master",
     "fixed_environment": {
       "QLH_ROUTE_A_STAGE_OFFER": "1",
@@ -16,7 +16,7 @@
     },
     "distributed_required": {
       "allowed_execution_modes": [
-        "route_a_stage_offer_v3",
+        "distributed_pipeline",
         "forwarded_to_master"
       ],
       "failure_mode": "named"

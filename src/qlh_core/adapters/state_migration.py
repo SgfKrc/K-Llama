@@ -46,7 +46,7 @@ def _credentials(path):
     except Exception as exc: raise MigrationError('migration_credential_corrupt') from exc
 
 def _connect(path):
-    connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+    connection = sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -54,8 +54,26 @@ def _database(path):
     connection = _connect(path)
     try:
         if connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok': raise MigrationError('migration_database_corrupt')
-        if connection.execute('PRAGMA user_version').fetchone()[0] != 0: raise MigrationError('migration_database_schema_unknown')
+        version = connection.execute('PRAGMA user_version').fetchone()[0]
         tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # control-svc owns user_version (local_store deliberately preserves it).
+        # Accept observed shared schemas only after checking the columns Python
+        # consumes. An arbitrary DB with a familiar version is not a control DB.
+        if version not in {0, 5, 7}: raise MigrationError('migration_database_schema_unknown')
+        if version:
+            shared = {
+                'sessions': {'session_id': ('TEXT', 1), 'title': ('TEXT', 0),
+                    'created_at': ('TEXT', 0), 'updated_at': ('TEXT', 0), 'message_count': ('INTEGER', 0)},
+                'session_messages': {'message_id': ('INTEGER', 1), 'session_id': ('TEXT', 0),
+                    'role': ('TEXT', 0), 'content': ('TEXT', 0), 'created_at': ('TEXT', 0), 'metrics': ('TEXT', 0)},
+                'cluster_settings': {'key': ('TEXT', 1), 'value': ('TEXT', 0), 'updated_at': ('TEXT', 0)},
+                'model_registry': {'model_id': ('TEXT', 1), 'model_path': ('TEXT', 0), 'payload': ('TEXT', 0)},
+            }
+            for table, expected in shared.items():
+                columns = {r['name']: (r['type'].upper(), r['pk'])
+                           for r in connection.execute('PRAGMA table_info(' + table + ')')}
+                if not all(columns.get(name) == definition for name, definition in expected.items()):
+                    raise MigrationError('migration_database_schema_unknown')
         for table in ('model_control_state', 'request_journal_state'):
             if table in tables:
                 row = connection.execute('SELECT payload FROM ' + table + ' WHERE id=1').fetchone()

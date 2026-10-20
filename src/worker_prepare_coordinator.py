@@ -2,6 +2,7 @@
 from __future__ import annotations
 from copy import deepcopy
 import logging
+import threading
 from worker_prepare_contract import validate_identity, validate_ack, stage_identity, WorkerPrepareError
 from worker_assignment_state import new_assignment_id, PHASE_READY
 
@@ -118,7 +119,7 @@ class WorkerPrepareCoordinatorMixin:
             owner.note_delivery(node_id, command, delivered=delivered is not False)
         return delivered
 
-    def _handle_worker_prepare_ack(self, node_id, payload):
+    def _handle_worker_prepare_ack(self, node_id, payload, *, defer_native_work=False):
         payload = {key: value for key, value in payload.items() if key != "control_certificate"}
         try:
             ack = validate_ack(payload)
@@ -211,10 +212,41 @@ class WorkerPrepareCoordinatorMixin:
             self._invalidate_pipeline_load_transaction("worker_native_runtime_lost")
         elif abort:
             self._abort_pipeline_load_transaction(*abort)
-        elif advance == "prepare":
-            self._commit_pipeline_load_transaction(identity["config_id"])
-        elif advance == "commit":
-            self._complete_pipeline_load_transaction(identity["config_id"])
+        elif advance:
+            self._advance_worker_prepare_transaction(
+                identity["config_id"], advance, background=defer_native_work,
+            )
+
+    def _advance_worker_prepare_transaction(self, config_id, phase, *, background=False):
+        """Keep native loading/publication off the TCP receive thread.
+
+        Claim each barrier once before starting work. Duplicate ACKs can still
+        refresh their receipt while the same transaction is waiting to advance.
+        The transition methods recheck the captured config and current phase.
+        """
+        transition = (self._commit_pipeline_load_transaction if phase == "prepare"
+                      else self._complete_pipeline_load_transaction)
+        if not background:
+            return transition(config_id)
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            expected_phase = "preparing" if phase == "prepare" else "committing_global"
+            if (not transaction or transaction.get("config_id") != config_id
+                    or transaction.get("phase") != expected_phase):
+                return
+            scheduled = transaction.setdefault("native_advances_scheduled", set())
+            if phase in scheduled:
+                return
+            scheduled.add(phase)
+
+        def advance():
+            try:
+                transition(config_id)
+            except Exception:
+                logger.exception("pipeline native transition failed: config=%s phase=%s", config_id, phase)
+                self._abort_pipeline_load_transaction(config_id, "pipeline_native_transition_failed")
+
+        threading.Thread(target=advance, name=f"pipeline-{phase}-{config_id}", daemon=True).start()
 
     def _worker_prepare_assignment_loaded(self, node_id, assignment):
         identity = assignment.get("worker_prepare_identity")

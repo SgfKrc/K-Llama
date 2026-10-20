@@ -3293,6 +3293,43 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
     sent = []
     accepted = threading.Event()
     completed = threading.Event()
+    execution_started = threading.Event()
+    release_execution = threading.Event()
+    execution_stopped = threading.Event()
+    threads = []
+    response_requests = {}
+    renewal_rejections = []
+
+    # Own both threads until their final receipts have been delivered. An empty
+    # active registry alone is insufficient: the stop receipt follows removal.
+    for method_name in (
+        "_handle_task_worker_stage_offer", "_watch_task_worker_lease",
+    ):
+        handler = getattr(scheduler, method_name)
+
+        def tracked_handler(*args, _handler=handler):
+            threads.append(threading.current_thread())
+            return _handler(*args)
+
+        monkeypatch.setattr(scheduler, method_name, tracked_handler)
+
+    send_response = scheduler._send_task_worker_response
+
+    def track_response(request_message_id, response):
+        response_requests[response.message_id] = request_message_id
+        return send_response(request_message_id, response)
+
+    monkeypatch.setattr(scheduler, "_send_task_worker_response", track_response)
+    renew_lease = scheduler._handle_task_worker_lease_renew
+
+    def track_renewal(message):
+        try:
+            return renew_lease(message)
+        except WorkerProtocolError as exc:
+            renewal_rejections.append((message.message_id, exc.code))
+            raise
+
+    monkeypatch.setattr(scheduler, "_handle_task_worker_lease_renew", track_renewal)
 
     class Client:
         is_registered = True
@@ -3303,16 +3340,19 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
                 accepted.set()
             if data["message_type"] == "stage_error":
                 completed.set()
+            if data["message_type"] == "stage_cancelled":
+                execution_stopped.set()
 
     scheduler._tcp_client = Client()
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
     ))
-    scheduler.configure_callbacks(_scheduler_callbacks(
-        execute=lambda request, cancel_event: (
-            threading.Event().wait(0.3) or {"content": "too late"}
-        ),
-    ))
+    def execute(request, cancel_event):
+        execution_started.set()
+        assert release_execution.wait(5)
+        return {"content": "too late"}
+
+    scheduler.configure_callbacks(_scheduler_callbacks(execute=execute))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
     offer = build_message(
@@ -3325,7 +3365,7 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
             "attempt_id": "att_expiredrenew01",
             "lease_id": "lease_expiredrenew01",
             "lease_epoch": 1,
-            "lease_expires_at_ms": now_ms + 100,
+            "lease_expires_at_ms": now_ms + 500,
             "provider_id": remote_provider_id("worker_01"),
             "root_input": root_input,
             "dependencies": {},
@@ -3336,31 +3376,73 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
         sent_at_ms=now_ms,
         version=2,
     )
-    scheduler._handle_task_worker_message("master", {"data": offer.snapshot()})
-    assert accepted.wait(2)
-    threading.Event().wait(0.15)
-    renew_now_ms = int(time.time() * 1000)
-    renewal = build_message(
-        "lease_renew",
-        {
-            "workflow_id": "wf_expiredrenew01",
-            "stage_id": "candidate_a",
-            "attempt_id": "att_expiredrenew01",
-            "lease_id": "lease_expiredrenew01",
-            "lease_epoch": 1,
-            "lease_expires_at_ms": renew_now_ms + 1000,
-        },
-        message_id="msg_expiredrenew01",
-        sent_at_ms=renew_now_ms,
-        version=2,
-    )
-    scheduler._handle_task_worker_message(
-        "master", {"data": renewal.snapshot()},
-    )
+    try:
+        scheduler._handle_task_worker_message("master", {"data": offer.snapshot()})
+        assert accepted.wait(2)
+        assert execution_started.wait(2)
+        with scheduler._task_worker_stage_lock:
+            active = scheduler._task_worker_active_attempts[offer.payload["attempt_id"]]
+            original_deadlines = (
+                active.lease_expires_at_ms, active.lease_deadline_monotonic,
+            )
+        # Observe actual expiry, keeping native execution in flight while the
+        # late renewal is handled. A fixed sleep cannot establish this ordering.
+        assert active.cancel_event.wait(2)
+        renew_now_ms = int(time.time() * 1000)
+        renewal = build_message(
+            "lease_renew",
+            {
+                key: offer.payload[key]
+                for key in (
+                    "workflow_id", "stage_id", "attempt_id", "lease_id", "lease_epoch",
+                )
+            } | {"lease_expires_at_ms": renew_now_ms + 1000},
+            message_id="msg_expiredrenew01",
+            sent_at_ms=renew_now_ms,
+            version=2,
+        )
+        scheduler._handle_task_worker_message(
+            "master", {"data": renewal.snapshot()},
+        )
+        assert renewal_rejections == [(renewal.message_id, "lease_expired")]
+        with scheduler._task_worker_stage_lock:
+            assert scheduler._task_worker_active_attempts[active.attempt_id] is active
+            assert active.terminal_reason == "lease_expired"
+            assert active.lease_expired is True
+            assert active.cancel_event.is_set()
+            assert (
+                active.lease_expires_at_ms, active.lease_deadline_monotonic,
+            ) == original_deadlines
+        assert not completed.is_set()
 
-    assert completed.wait(2)
-    assert sent[-1][0]["message_type"] == "stage_error"
-    assert sent[-1][0]["payload"]["error_code"] == "lease_expired"
+        release_execution.set()
+        # Force the formerly flaky interleaving: physical stop is delivered
+        # before the error observer resumes. Both receipts have distinct roles.
+        assert execution_stopped.wait(2)
+        assert completed.wait(2)
+    finally:
+        release_execution.set()
+        for thread in threads:
+            thread.join(2)
+        assert all(not thread.is_alive() for thread in threads)
+
+    assert len(threads) == 2
+    assert not scheduler._task_worker_active_attempts
+    assert len(sent) == 3
+    responses = {data["message_type"]: data for data, _ in sent}
+    assert set(responses) == {"stage_accept", "stage_error", "stage_cancelled"}
+    for data, _ in sent:
+        assert response_requests[data["message_id"]] == offer.message_id
+        for key in (
+            "workflow_id", "stage_id", "attempt_id", "lease_id", "lease_epoch",
+            "provider_id",
+        ):
+            assert data["payload"][key] == offer.payload[key]
+    assert responses["stage_accept"]["payload"]["accepted"] is True
+    assert responses["stage_error"]["payload"]["error_code"] == "lease_expired"
+    assert responses["stage_error"]["payload"]["retryable"] is True
+    assert responses["stage_cancelled"]["payload"]["reason_code"] == "lease_expired"
+    assert responses["stage_cancelled"]["payload"]["execution_state"] == "execution_stopped"
 
 
 def test_scheduler_worker_lease_uses_duration_across_wall_clock_skew(

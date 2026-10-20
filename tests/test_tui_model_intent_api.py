@@ -188,3 +188,13 @@ def test_full_chat_uses_finite_prefill_budget_and_keeps_caller_override(monkeypa
         {"done": True, "response": "2"},
     ]
     assert budgets == [expected]
+
+@pytest.mark.parametrize('sampling', [{}, {'temperature': 0.0, 'top_p': 1.0}, {'temperature': 0.7}])
+def test_tui_preserves_omitted_or_explicit_sampling_for_route_admission(monkeypatch, sampling):
+    calls = []
+    def open_response(request, timeout):
+        calls.append(json.loads(request.data))
+        return io.BytesIO(b'data: {"done":true,"response":"2"}\n\n')
+    monkeypatch.setattr(api_module.urllib.request, 'urlopen', open_response)
+    list(api_module.iter_chat_payloads(ApiClient(), 'hello', **sampling))
+    assert {key: calls[0][key] for key in ('temperature', 'top_p') if key in calls[0]} == sampling

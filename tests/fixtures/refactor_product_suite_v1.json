@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "base_suite": "refactor_client_cutover_suite_v1.json",
+  "scope": "R6 software regressions for physical-product fixes; real-device acceptance is recorded separately",
+  "additional_targets": [
+    "tests/test_packaging_keep_head.py",
+    "tests/test_refactor_product_gate.py",
+    "tests/test_windows_mapped_artifact.py",
+    "tests/test_pc_product_observer.py",
+    "tests/test_product_relay_gate.py",
+    "tests/test_model_supply_assets.py",
+    "tests/test_cut_layers_metadata_contract.py",
+    "tests/test_cut_layers.py",
+    "tests/test_cut_layers_pipeline.py",
+    "tests/test_refactor_auto_role_supervision.py",
+    "tests/test_refactor_auto_role_process.py",
+    "tests/test_model_supply_cache_retention.py",
+    "tests/test_pc_supply_layer_budget.py",
+    "tests/test_serial_runtime_lifecycle.py",
+    "tests/test_serial_tcp_registration.py",
+    "tests/test_surface_rejoin_deployment_cleanup.py"
+  ],
+  "separate_gates": [
+    "real Qwen3.5-9B two/three-node LL/DL automatic supply and inference",
+    "fresh Windows/Android package, preserved user-data migration and independent native/OS observation",
+    "disconnect/rejoin, cancellation/next request, local exit/rejoin and model switch",
+    "recoverable SAF/disk-space failures",
+    "clean-source release evidence, packaging/Android and documentation checks"
+  ]
+}

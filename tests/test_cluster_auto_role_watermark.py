@@ -299,7 +299,7 @@ def test_remote_voter_call_propagates_watermark_code(monkeypatch):
         remote = HTTPRemoteVoter("rog-voter", f"http://{host}:{port}", secret="s" * 40, timeout=3.0)
         with pytest.raises(QuorumError) as excinfo:
             remote.snapshot()
-        assert excinfo.value.code == "quorum_watermark_unheld"
+        assert excinfo.value.code == "quorum_watermark_unheld", repr(excinfo.value.__cause__)
     finally:
         server.shutdown()
         server.server_close()

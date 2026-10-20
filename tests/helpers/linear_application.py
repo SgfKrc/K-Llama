@@ -40,7 +40,14 @@ def make_application(path, manager, offer, callbacks, *, boundaries=(0, 4, 8, 12
         "deployments": {"deployment": {"published": True, "status": "active", "boot_id": "boot", "authority": {"term": 1},
             "connections": {s["node_id"]: 1 for s in stages}, "local_assignment": local,
             "assignments": {s["node_id"]: s for s in stages}}}}
-    manager.layer_range = tuple(boundaries[:2])
+    from llama_engine import LlamaCppEngine
+    if isinstance(manager, LlamaCppEngine):
+        manager._pipeline_descriptor = {
+            **(manager._pipeline_descriptor or {}),
+            "assignment_layer_range": list(boundaries[:2]),
+        }
+    else:
+        manager.layer_range = tuple(boundaries[:2])
     host = ModelHost(manager=manager)
     scheduler = SimpleNamespace(_host=host, _model_control=SimpleNamespace(boot_id="boot", snapshot=lambda: deepcopy(state),
         runnable=lambda *a, **kw: state["deployments"]["deployment"]["status"] == "active"),

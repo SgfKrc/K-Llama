@@ -147,6 +147,7 @@ assert_worker_liveness_thresholds(HEARTBEAT_INTERVAL)
 
 from scheduler_task_worker import SchedulerTaskWorkerMixin, _TaskWorkerActiveAttempt
 from scheduler_cluster import SchedulerClusterMixin
+from scheduler_auto_role import SchedulerAutoRoleMixin
 from scheduler_pipeline import SchedulerPipelineMixin
 # ★ 2026-10-07（DIST-NEXT-7）：A1 隔离状态自证（独立 namespace，启动即见）。
 from relay_a1_legacy import log_isolation_status
@@ -274,7 +275,7 @@ def _node_supports_forward_layers(node: "NodeInfo") -> bool:
 
 class Scheduler(
     SchedulerSidecarMixin, SchedulerTaskWorkerMixin,
-    SchedulerClusterMixin, SchedulerPipelineMixin,
+    SchedulerAutoRoleMixin, SchedulerClusterMixin, SchedulerPipelineMixin,
 ):
     """
     主节点调度器
@@ -322,6 +323,11 @@ class Scheduler(
         self._host = host if host is not None else get_model_host()
         self._control_fence: ControlFence | None = None
         self._auto_role_controller: AutoRoleController | None = None
+        self._auto_role_binding_ready = False
+        self._auto_role_bound_role = None
+        self._auto_role_binding_event = threading.Event()
+        self._auto_role_binding_lock = threading.Lock()
+        self._auto_role_binding_thread = None
         self._handoff_coordinator: HandoffCoordinator | None = None
         self._callbacks = callbacks if callbacks is not None else getattr(
             self._host, "scheduler_callbacks", None,
@@ -650,8 +656,6 @@ class Scheduler(
                 decision.get("accepted"), decision.get("state"),
                 decision.get("runtime_role"), decision.get("reason"),
             )
-            if runtime is not None:
-                runtime.start_lease_renewal(self._auto_role_controller)
 
         self._model_control.start()
         self._execution_app.requests.start()
@@ -803,6 +807,13 @@ class Scheduler(
                 daemon=True,
             ).start()
 
+        self._auto_role_bound_role = self._effective_role()
+        self._auto_role_binding_ready = True
+        runtime = getattr(self, "_auto_role_runtime", None)
+        if runtime is not None:
+            runtime.tcp_port = self._tcp_server.port if self._tcp_server is not None else 0
+            runtime.start_lease_renewal(self._auto_role_controller, on_decision=self._on_auto_role_decision)
+
     def _start_deferred_network_identity(self) -> None:
         """Schedule network address, identity, and discovery work after start."""
         with self._network_identity_lock:
@@ -829,6 +840,12 @@ class Scheduler(
                 return
 
             if self._effective_role() != "master":
+                return
+            if self._auto_role_controller is not None and self._auto_role_controller.mode == "auto":
+                if self._tcp_server is not None:
+                    with self._nodes_lock:
+                        if "master" in self.nodes:
+                            self.nodes["master"].address = f"{self._lan_ip}:{self._tcp_server.port}"
                 return
             self._verify_master_identity()
             if self._master_identity_reason == "mac_mismatch":
@@ -869,13 +886,15 @@ class Scheduler(
 
     def stop(self) -> None:
         """停止调度器"""
+        self._running = False
+        self._auto_role_binding_ready = False
+        self._startup_cancel_event.set()
         self._execution_app.requests.close()
         self._cleanup_task_worker_prepare("worker_prepare_stopped", close=True)
-        self._startup_cancel_event.set()
-        self._running = False
         runtime = getattr(self, "_auto_role_runtime", None)
         if runtime is not None:
             runtime.stop_lease_renewal()
+        self._stop_auto_role_binding()
         controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             try:
@@ -2311,6 +2330,7 @@ class Scheduler(
                 "role": node.role,
                 "capacity_bytes": max(0, int(capacity_gb * 1024 ** 3)),
                 "reserve_bytes": reserve_bytes,
+                "reserve_source": "config.PIPELINE_CAPACITY_RESERVE_MB",
                 "runtime_multiplier": runtime_multiplier,
                 "execution_device": execution_device,
                 "capacity_source": capacity_source,
@@ -2354,7 +2374,7 @@ class Scheduler(
                     record["layer_ranges"] = [
                         [int(local_artifact["start"]), int(local_artifact["end"])],
                     ]
-                    local_mode = str(local_artifact.get("mode", "") or "").lower()
+                    local_mode = str(local_artifact.get("segment_mode") or local_artifact.get("mode", "") or "").lower()
                     if local_mode in {"head", "middle", "tail"}:
                         record["segment_mode"] = local_mode
             records.append(record)
@@ -3541,7 +3561,7 @@ class Scheduler(
             payload = msg.get("data")
             if isinstance(payload, dict):
                 if self._effective_role() == "master":
-                    self._handle_worker_prepare_ack(client_id, payload)
+                    self._handle_worker_prepare_ack(client_id, payload, defer_native_work=True)
                 elif client_id == "master":
                     self._worker_prepare.handle(payload, self._tcp_client)
 
@@ -4031,21 +4051,23 @@ class Scheduler(
             self._push_node_update_to_all_clients(
                 client_id, "update", node_info
             )
-        self.deregister_node(client_id)
-        reshard = self._stage_pipeline_reshard_after_disconnect(client_id)
+        self._observe_node_disconnected(client_id)
+        reshard = self._stage_pipeline_reshard_after_disconnect(client_id) if need_push else None
         if need_push:
             if reshard and reshard.get("accepted"):
                 self.request_authoritative_layer_sync(require_distributed=True)
             else:
                 self.push_layer_config_to_clients()
 
-    def _on_master_connection_lost(self, source_client=None) -> None:
+    def _on_master_connection_lost(self, source_client=None, *, notify_auto_role=True) -> None:
         """Worker-side cleanup when PIPELINE_DONE/ABORT can no longer arrive."""
         if (source_client is not None
                 and getattr(self, "_tcp_client", None) is not source_client):
             logger.debug("忽略旧主节点连接的迟到断连回调")
             return
 
+        if notify_auto_role:
+            self.auto_role_on_disconnect()
         self._cleanup_task_worker_prepare("coordinator_disconnected", client=source_client)
         self._task_worker_control.disconnect_coordinator()
         with self._task_worker_stage_lock:

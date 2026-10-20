@@ -10,6 +10,7 @@ from qlh_core.contracts.deployment import canonical
 from qlh_core.contracts.execution import ExecutionPlan, Segment, SamplingPolicy, ExecutionError, StageReceipt
 from qlh_core.execution.requests import RequestService
 from qlh_core.execution.linear import LinearExecutor
+from qlh_core.execution.stopping import native_thinking_suppression_required
 
 
 def build_requests(scheduler, store=None):
@@ -171,7 +172,7 @@ class NativePorts:
             system_prompt=callbacks.thinking_system_prompt if thinking else None,
             assistant_prefill="思考\n" if thinking else None,
             **({"enable_thinking": self.options["enable_thinking"]} if self.options.get("enable_thinking") is not None else {}))
-        self.native_thinking = not thinking and "<think" in self.model_prompt[-128:].lower()
+        self.native_thinking = native_thinking_suppression_required(thinking, self.model_prompt)
         self.suppress_thinking = self.native_thinking
         inputs = self.tokenizer(self.model_prompt, return_tensors="pt")
         self.input_ids, self.attention = inputs["input_ids"], inputs.get("attention_mask")
@@ -233,7 +234,16 @@ class NativePorts:
             seq_ids=[0] * len(hidden), cancel_event=record["cancel"], request_deadline=record["deadline"],
             execution_attempts=self.attempts)
         output = value["token_argmax"] if segment.head else value["hidden_states"]
-        raw = str(output).encode() if segment.head else output.tobytes()
+        if segment.head:
+            raw = str(output).encode()
+        else:
+            # The wire decoder returns a Tensor when torch is loaded and a
+            # NumPy array in edge builds. Relay one canonical f32 byte layout.
+            import numpy as np
+            if hasattr(output, "detach"):
+                output = output.detach().float().cpu().numpy()
+            output = np.ascontiguousarray(output, dtype=np.float32)
+            raw = output.tobytes()
         import hashlib
         return StageReceipt(identity, hashlib.sha256(raw).hexdigest(), output)
 

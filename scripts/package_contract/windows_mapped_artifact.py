@@ -93,7 +93,15 @@ class _WindowsMemoryBackend:
         return {"pid": process.pid, "created_at": process.create_time()}
 
     def maps(self, pid):
-        return self._psutil.Process(pid).memory_maps(grouped=False)
+        from types import SimpleNamespace
+        for mapping in self._psutil.Process(pid).memory_maps(grouped=False):
+            # psutil's Windows rss is the resident working set, not the mapped
+            # address extent. ReadProcessMemory bounds come from VirtualQueryEx.
+            region = self.query(int(mapping.addr, 16))
+            if region["address"] != int(mapping.addr, 16):
+                raise ValueError("mapped address differs from VirtualQueryEx region")
+            yield SimpleNamespace(addr=mapping.addr, perms=mapping.perms,
+                                  path=mapping.path, region_bytes=region["region_bytes"])
 
     def open(self, pid):
         self._handle = self._kernel.OpenProcess(
@@ -166,10 +174,10 @@ def _snapshot(backend, pid):
     records = []
     for mapping in backend.maps(pid):
         if (not isinstance(mapping.addr, str) or not isinstance(mapping.perms, str)
-                or not isinstance(mapping.path, str) or type(mapping.rss) is not int
-                or mapping.rss <= 0):
+                or not isinstance(mapping.path, str) or type(mapping.region_bytes) is not int
+                or mapping.region_bytes <= 0):
             raise ValueError("memory maps enumeration returned a malformed region")
-        records.append((mapping.addr, mapping.perms, mapping.path, mapping.rss))
+        records.append((mapping.addr, mapping.perms, mapping.path, mapping.region_bytes))
     return tuple(sorted(records))
 
 

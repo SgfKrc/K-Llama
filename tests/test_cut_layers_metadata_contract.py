@@ -125,3 +125,42 @@ def test_verify_reads_no_gguf_or_native_modules(cut_pair, monkeypatch, legacy):
     spec.loader.exec_module(cli)
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--src", str(dst), "--verify-manifest", str(native_path)])
     assert cli.main() == (1 if legacy else 0)
+
+
+@pytest.mark.parametrize("short_writes", [False, True])
+def test_cutter_tensor_stream_uses_bounded_views_and_preserves_exact_bytes(short_writes):
+    import io
+    import numpy as np
+    spec = importlib.util.spec_from_file_location("r6_cut_stream", SCRIPT)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    tensor = np.arange(3 * 1024**2 + 17, dtype=np.uint8)
+    class Sink(io.BytesIO):
+        sizes = []
+        def write(self, value):
+            assert isinstance(value, memoryview) and value.obj is tensor
+            self.sizes.append(len(value))
+            assert len(value) <= 1024**2
+            if short_writes:
+                value = value[:min(len(value), 65537)]
+            return super().write(value)
+    sink = Sink()
+    payload = cli._TensorWriteView(tensor)
+    assert payload.shape == tensor.shape and payload.dtype == tensor.dtype
+    assert payload.nbytes == tensor.nbytes
+    payload.tofile(sink)
+    assert sink.getvalue() == tensor.tobytes()
+    assert len(sink.sizes) >= 4
+
+
+def test_cutter_tensor_stream_fails_if_output_stops_accepting_bytes():
+    import numpy as np
+    spec = importlib.util.spec_from_file_location("r6_cut_stream", SCRIPT)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    class NoSpace:
+        def write(self, value):
+            raise OSError(28, "No space left on device")
+    with pytest.raises(OSError) as error:
+        cli._TensorWriteView(np.ones(8, dtype=np.float32)).tofile(NoSpace())
+    assert error.value.errno == 28

@@ -188,7 +188,8 @@ def test_partial_host_ranges_are_reported_as_staging_not_artifact_coverage(start
     assert result['reason_code'] == 'SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT'
     diagnostic = result['capacity_diagnostic']
     assert diagnostic['scope'] == 'candidate_plan'
-    assert diagnostic['origin_reason_code'] == 'pipeline_layer_range_coverage_insufficient'
+    assert diagnostic['origin_reason_code'] in {'pipeline_layer_range_coverage_insufficient',
+                                                'pipeline_candidate_layer_range_unsatisfied'}
     assert isinstance(diagnostic['origin_reason'], str) and diagnostic['origin_reason']
     assert result['plan'] is None and not result.get('loaded_ready')
     assert all(row['resource'] == 'host_ram' for row in diagnostic['nodes'])

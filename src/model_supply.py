@@ -87,79 +87,22 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
 
     GGUF segments retain non-block tensors. Charge those tensors on *each* GGUF
     executor, including the middle, and use aligned groups for hybrid models.
-    Mixed precision nodes are charged a conservative per-group ratio; the actual
-    packaged size is rechecked before dispatch.
+    Each executor uses its exact projected per-layer bytes for the selected
+    engine and load specification; packaged size is rechecked before dispatch.
     """
+    from model_supply_runtime_capacity import (
+        RuntimeCapacityProjectionError, project_supply_capacity_nodes,
+    )
+    try:
+        grouped, projected, by_id = project_supply_capacity_nodes(
+            descriptors, nodes, master_engine=master_engine, alignment=alignment,
+            safety_margin=safety_margin, runtime_descriptors=runtime_descriptors,
+            preferred_ranges=preferred_ranges, runtime_host_ranges=runtime_host_ranges,
+        )
+    except RuntimeCapacityProjectionError as exc:
+        raise ModelSupplyError(exc.code, exc.message) from exc
     reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
-    if not reference or not reference.get("pipeline_runtime_supported"):
-        raise ModelSupplyError("SUPPLY_DESCRIPTOR_UNAVAILABLE", "No supported source descriptor")
     total = int(reference["total_layers"])
-    if isinstance(alignment, bool) or alignment < 1 or total % alignment:
-        raise ModelSupplyError("SUPPLY_ALIGNMENT_INVALID", "Invalid decoder cut alignment")
-    group_sizes = [sum(reference["layer_weight_bytes"][i:i + alignment])
-                   for i in range(0, total, alignment)]
-    projected = []
-    by_id = {}
-    for raw in nodes:
-        node = dict(raw)
-        node_id = str(node["node_id"])
-        engine = master_engine if node_id == "master" else str(node.get("engine", "llama_cpp"))
-        source = (runtime_descriptors or {}).get(node_id) or descriptors.get(engine)
-        if not source:
-            raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No source for {engine}")
-        if int(source["total_layers"]) != total or int(source["hidden_size"]) != int(reference["hidden_size"]):
-            raise ModelSupplyError("SUPPLY_SOURCE_CONTRACT_MISMATCH", "Source dimensions differ")
-        sizes = [sum(source["layer_weight_bytes"][i:i + alignment])
-                 for i in range(0, total, alignment)]
-        if any(value <= 0 for value in sizes + group_sizes):
-            raise ModelSupplyError("SUPPLY_LAYER_BYTES_MISSING", "Source layer bytes are incomplete")
-        multiplier = float(node.get("runtime_multiplier", 1.0))
-        components = source.get("component_weight_bytes") or {}
-        # GGUF cut files retain every non-block tensor. Selective PyTorch
-        # loading charges the head's input components and each node's norm;
-        # remote PyTorch nodes conservatively reserve both possible boundaries.
-        boundary_keys = (("embedding", "final_norm", "lm_head", "other")
-                         if engine == "llama_cpp" or node_id != "master" else
-                         ("embedding", "final_norm", "other"))
-        overhead = sum(int(components.get(key, 0)) for key in boundary_keys)
-        # A target plan may create a new segment. Inventory ranges constrain
-        # executable plans, never this supply plan. No execution advert is changed.
-        for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models"):
-            node.pop(key, None)
-        wanted_ranges = (preferred_ranges or {}).get(node_id)
-        if wanted_ranges is not None:
-            if (node_id == "master" or not isinstance(wanted_ranges, list) or not wanted_ranges
-                    or any(not isinstance(span, list) or len(span) != 2
-                           or any(type(value) is not int for value in span)
-                           or not 0 <= span[0] < span[1] <= total
-                           or span[1] - span[0] == total
-                           or span[0] % alignment or span[1] % alignment
-                           for span in wanted_ranges)):
-                raise ModelSupplyError("SUPPLY_PREFERRED_RANGE_INVALID", "Invalid reusable segment preference")
-            node["layer_ranges"] = [[span[0] // alignment, span[1] // alignment] for span in wanted_ranges]
-        host_ranges = (runtime_host_ranges or {}).get(node_id)
-        if host_ranges is not None:
-            if (not isinstance(host_ranges, list)
-                    or any(not isinstance(span, list) or len(span) != 2
-                           or any(type(value) is not int for value in span)
-                           or not 0 <= span[0] < span[1] <= total
-                           or span[1] - span[0] == total
-                           or span[0] % alignment or span[1] % alignment for span in host_ranges)):
-                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_BUDGET_INVALID", "Invalid source staging ranges")
-            admitted_ranges = [[span[0] // alignment, span[1] // alignment] for span in host_ranges]
-            if "layer_ranges" in node:
-                admitted_ranges = [span for span in admitted_ranges if span in node["layer_ranges"]]
-            node["layer_ranges"] = admitted_ranges
-        node["role"] = "master" if node_id == "master" else "client"
-        node["reserve_bytes"] = int(node.get("reserve_bytes", 0)) + math.ceil(overhead * multiplier * safety_margin)
-        node["runtime_multiplier"] = multiplier * max(a / b for a, b in zip(sizes, group_sizes))
-        node["engine"] = engine
-        by_id[node_id] = {**raw, "engine": engine, "overhead_bytes": overhead}
-        projected.append(node)
-    grouped = {**reference, "total_layers": len(group_sizes),
-               "layer_weight_bytes": group_sizes,
-               "component_weight_bytes": {"embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0},
-               "runtime_ignored_components": []}
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
                                     require_distributed=True, prefer_all_workers=True,
                                     required_node_id="master")
@@ -183,6 +126,10 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         if "layer_ranges" in item:
             item["layer_ranges"] = [[start * alignment, end * alignment] for start, end in item["layer_ranges"]]
         item["engine"] = by_id[item["node_id"]]["engine"]
+        if item["engine"] == "llama_cpp":
+            # Native cut artifacts retain all non-block tensors on every node.
+            # Keep this header-derived quote for the later prepare admission.
+            item["retained_component_bytes"] = by_id[item["node_id"]]["overhead_bytes"]
         item["segment_mode"] = ("head" if item["start_layer"] == 0 else
                                 "tail" if item["end_layer"] == total else "middle")
         assignments.append(item)
@@ -984,12 +931,14 @@ class ModelSupplyCoordinator:
                 "conversion_proof": sources["conversion_proof"]}
             if free < max(estimated * 2, 64 * 1024**2) and not segment_cache_hint(self.root, identity):
                 raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
+            build_options = ({"cancelled": lambda: self._events[op_id].is_set(), "deadline": deadline}
+                             if assignment["engine"] == "llama_cpp" else {})
             manifest = builder(src, directory, source_model_id=sources["source_model_id"],
                                source_model_sha256=sources["source_model_sha256"],
                                tokenizer_sha256=sources["tokenizer_sha256"],
                                start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
                                total_layers=plan["total_layers"], operation_id=op_id, node_id=node_id,
-                               conversion_proof=sources["conversion_proof"], reuse_root=self.root)
+                               conversion_proof=sources["conversion_proof"], reuse_root=self.root, **build_options)
             self._check(op_id)
             reused_bytes = manifest.pop("_reused_bytes", 0)
             files = manifest.pop("local_files")

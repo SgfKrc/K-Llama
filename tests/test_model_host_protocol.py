@@ -214,6 +214,24 @@ class TestLazyModelManager:
             host.ensure_full_model()
         assert host.runtime_status()["manager_loaded"] is False
 
+    def test_range_probe_never_materializes_missing_torch(self, monkeypatch):
+        import model_host as model_host_module
+
+        def unavailable(self):
+            raise AssertionError("cold range observation constructed a manager")
+
+        monkeypatch.setattr(model_host_module._LazyModelManager, "_get_instance", unavailable)
+        host = ModelHost()
+        assert host.layer_range is None
+        assert host.peek_manager() is None
+        manager = types.SimpleNamespace(layer_range=(4, 8))
+        host.runtime_controller.install(manager)
+        assert host.layer_range == (4, 8)
+        manager.layer_range = None
+        assert host.layer_range is None
+        with pytest.raises(AttributeError):
+            host.layer_range = (0, 8)
+
     def test_explicit_torch_load_reports_missing_torch(self, monkeypatch):
         import model_host as model_host_module
 
@@ -768,3 +786,71 @@ def test_host_unload_failure_preserves_direct_engine_projection():
     host.unload_model()
     assert host.model_loaded is False
     assert not dict(host.runtime_controller.snapshot().metadata)
+
+
+class TestColdRuntimeObservation:
+    @staticmethod
+    def _cold_host(monkeypatch):
+        import model_host as module
+
+        attempts = []
+
+        def unavailable(_self):
+            attempts.append("torch manager construction")
+            raise ImportError("torch intentionally absent")
+
+        monkeypatch.setattr(module._LazyModelManager, "_get_instance", unavailable)
+        return ModelHost(), attempts
+
+    def test_state_readout_uses_unloaded_values_without_torch(self, monkeypatch):
+        host, attempts = self._cold_host(monkeypatch)
+        assert host.model is None
+        assert host.tokenizer is None
+        assert host._total_model_layers == 0
+        assert host._model_path is None
+        assert host._full_model_path is None
+        assert host._island_engine is None
+        assert host.get_pipeline_descriptor() == {}
+        assert host.runtime_status()["manager_loaded"] is False
+        assert attempts == []
+
+    def test_cluster_status_and_layer_planning_do_not_construct_cold_manager(
+        self, monkeypatch,
+    ):
+        from scheduler import Scheduler
+        from config import TOTAL_MODEL_LAYERS
+
+        host, attempts = self._cold_host(monkeypatch)
+        scheduler = Scheduler(host=host)
+        status = scheduler.get_status()
+        assert status["pipeline"]["active"] is False
+        assert status["pipeline"]["engine_compatible"] is False
+        assert scheduler.get_layer_assignments()["total"] == TOTAL_MODEL_LAYERS
+        assert host.peek_manager() is None
+        assert attempts == []
+
+    def test_state_readout_tracks_owner_replacement_and_explicit_writes(
+        self, monkeypatch,
+    ):
+        host, attempts = self._cold_host(monkeypatch)
+        descriptor = {"total_layers": 32, "pipeline_runtime_supported": True}
+        first = types.SimpleNamespace(
+            model=object(), tokenizer=object(), _total_model_layers=32,
+            _model_path="first", get_pipeline_descriptor=lambda: dict(descriptor),
+        )
+        second = types.SimpleNamespace(
+            model=None, tokenizer=None, _total_model_layers=8,
+            _model_path="second", get_pipeline_descriptor=lambda: {"total_layers": 8},
+        )
+        host.runtime_controller.install(first)
+        assert host.model is first.model
+        assert host.tokenizer is first.tokenizer
+        assert host.get_pipeline_descriptor() == descriptor
+        host._model_path = "updated"
+        assert first._model_path == "updated"
+        host.runtime_controller.install(second)
+        assert host.model is None
+        assert host._total_model_layers == 8
+        assert host._model_path == "second"
+        assert host.get_pipeline_descriptor() == {"total_layers": 8}
+        assert attempts == []

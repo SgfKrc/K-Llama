@@ -288,6 +288,8 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
     monkeypatch.setattr(module, "plan_segment_supply", lambda *args, **kw: {"admitted": True, "assignments": assignments, "total_layers": 6})
     manifests = {}
     def build(source, directory, **kw):
+        assert callable(kw["cancelled"]) and not kw["cancelled"]()
+        assert time.monotonic() < kw["deadline"] <= time.monotonic() + c._operations[op_id]["intent"].get("timeout_seconds", 3600)
         file = directory / "segment.gguf"
         file.write_bytes(b"segment")
         manifest = {"operation_id":op_id, "node_id":kw["node_id"], "layer_range":[kw["start_layer"],kw["end_layer"]],
