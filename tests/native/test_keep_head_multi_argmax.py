@@ -14,7 +14,7 @@ SENTINEL = 12345
 
 
 @pytest.fixture(scope="module")
-def multi_argmax(tmp_path_factory):
+def multi_argmax(tmp_path_factory, native_executable_guard):
     compiler = os.environ.get("QLH_NATIVE_TEST_CC") or shutil.which("gcc") or shutil.which("clang")
     if not compiler:
         pytest.skip("native multi-position harness requires a C compiler")
@@ -30,6 +30,7 @@ def multi_argmax(tmp_path_factory):
          "-o", str(executable)],
         capture_output=True, text=True, env=environment, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
+    native_executable_guard(executable)
 
     def run(logits, *, decode_rc=0, missing_row=-1, missing_model=False, missing_vocab=False,
             **options):

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
-def native_argmax(tmp_path_factory):
+def native_argmax(tmp_path_factory, native_executable_guard):
     compiler = os.environ.get("QLH_NATIVE_TEST_CC") or shutil.which("gcc") or shutil.which("clang")
     if not compiler and os.name == "nt":
         candidate = Path("C:/msys64/ucrt64/bin/gcc.exe")
@@ -31,6 +31,7 @@ def native_argmax(tmp_path_factory):
                "-o", str(executable)]
     built = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=60)
     assert built.returncode == 0, built.stdout + built.stderr
+    native_executable_guard(executable)
 
     def run(logits, *, decode_rc=0, missing_row=-1, missing_model=False, missing_vocab=False):
         columns = len(logits[0])
