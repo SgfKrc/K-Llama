@@ -1029,6 +1029,10 @@ def _run_runtime_startup() -> None:
         if _app_runtime.stop_requested.is_set():
             return
         _initialize_legacy_runtime_settings()
+        import config as configuration
+        configuration.warn_if_cluster_secret_unavailable(
+            _app_runtime.config.environment_snapshot(),
+        )
         setup_logging()
         _app_runtime.services.configure_authority()
         global auto_role_runtime

@@ -560,14 +560,6 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     # node_config 启动阶段会让加密存储中的 (secret, epoch) 覆盖旧环境投影；
     # QLH_CLUSTER_SECRET 只保留首次导入/开发兼容语义，不能回滚已轮换凭据。
     CLUSTER_SECRET = environment.get("QLH_CLUSTER_SECRET", "")
-    if not CLUSTER_SECRET:
-        import warnings
-        warnings.warn(
-            "QLH_CLUSTER_SECRET 未设置！集群通信认证将失败。"
-            "请通过环境变量设置 32+ 字符的随机密钥。",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     try:
         CLUSTER_SECRET_EPOCH = max(1, int(environment.get("QLH_CLUSTER_SECRET_EPOCH", "1") or 1))
     except ValueError:
@@ -744,6 +736,18 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
 
     return {name: value for name, value in locals().items()
             if name != "environment" and name != "probe_device"}
+
+
+def warn_if_cluster_secret_unavailable(environment) -> None:
+    """Warn at runtime startup when identity resolution found no credential."""
+    if str((environment or {}).get("QLH_CLUSTER_SECRET") or "").strip():
+        return
+    import warnings
+    warnings.warn(
+        "集群凭据未加载！集群通信认证将失败。请完成可信的集群引导或凭据恢复。",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 # Legacy consumers receive a read-only startup view. Explicit AppRuntime startup

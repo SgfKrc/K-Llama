@@ -56,7 +56,38 @@ def test_cold_import_starts_no_resources(tmp_path):
                             capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "IMPORT_ZERO_RESOURCES" in result.stdout
+    assert "QLH_CLUSTER_SECRET 未设置" not in result.stderr
     assert not (tmp_path / "state").exists()
+
+
+def test_cluster_secret_warning_uses_resolved_runtime_snapshot(tmp_path):
+    import warnings
+
+    from config import warn_if_cluster_secret_unavailable
+    from local_secret_store import LocalSecretStore
+
+    secret = "encrypted-fixture-credential-32chars"
+    config = settings(tmp_path)
+    LocalSecretStore(config.secret_store_path).set("cluster_secret", json.dumps({
+        "schema": "qlh.cluster-credential.v1", "secret": secret, "epoch": 4,
+    }))
+    resolved = SettingsStore(
+        config.environment_snapshot(), dotenv_path=tmp_path / "absent.env",
+    ).load()
+    runtime = AppRuntime(resolved)
+    try:
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always")
+            runtime.open_identity()
+            warn_if_cluster_secret_unavailable(runtime.config.environment_snapshot())
+        assert not [warning for warning in emitted if issubclass(warning.category, RuntimeWarning)]
+        assert runtime.config.environment_snapshot()["QLH_CLUSTER_SECRET"] == secret
+    finally:
+        runtime.close()
+
+    missing = settings(tmp_path / "missing")
+    with pytest.warns(RuntimeWarning, match="集群凭据未加载"):
+        warn_if_cluster_secret_unavailable(missing.environment_snapshot())
 
 
 def test_final_config_is_immutable_and_identity_projection_agrees(tmp_path):
