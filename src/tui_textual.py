@@ -2239,26 +2239,30 @@ class MainScreen(Screen):
             table.add_row("[dim]（无在线节点）[/]", str(resources.get("scope") or "—"),
                           "", "", "", "")
             return
+        totals = resources.get("totals") or {}
+        physical_total = totals.get("physical_cores")
+        physical_total = physical_total if physical_total is not None else "—"
         for node in nodes[:64]:
             cpu = node.get("cpu") or {}
             ram = node.get("ram") or {}
             gpu = node.get("gpu") or {}
+            physical_cores = cpu.get("physical_cores")
             table.add_row(
                 str(node.get("node_id") or "—"),
                 f"{node.get('role') or '—'} / "
                 f"{'[green]在线[/]' if node.get('available') else '[yellow]离线[/]'}",
-                f"{cpu.get('physical_cores', '—')} / {cpu.get('logical_cores', '—')}",
+                f"{physical_cores if physical_cores is not None else '—'} / "
+                f"{cpu.get('logical_cores', '—')}",
                 f"{ram.get('total_gb', '—')} / {ram.get('available_gb', '—')} GB",
                 f"{gpu.get('count', '—')} / {gpu.get('cuda_count', '—')}",
                 f"{gpu.get('vram_total_gb', '—')} / {gpu.get('vram_free_gb', '—')} GB",
             )
-        totals = resources.get("totals") or {}
         if totals:
             table.add_row(
                 "[b]合计[/]",
                 f"{resources.get('available_node_count', '—')}/"
                 f"{resources.get('node_count', '—')} 可用",
-                f"{totals.get('physical_cores', '—')} / {totals.get('logical_cores', '—')}",
+                f"{physical_total} / {totals.get('logical_cores', '—')}",
                 f"{totals.get('ram_total_gb', '—')} / {totals.get('ram_available_gb', '—')} GB",
                 f"{totals.get('gpu_count', '—')} / {totals.get('cuda_gpu_count', '—')}",
                 f"{totals.get('vram_total_gb', '—')} / {totals.get('vram_free_gb', '—')} GB",

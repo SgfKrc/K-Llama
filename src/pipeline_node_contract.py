@@ -715,8 +715,27 @@ def _project_resources(raw: Mapping[str, Any]) -> dict[str, Any]:
     profile = profile if isinstance(profile, Mapping) else {}
     cpu = profile.get("cpu")
     cpu = cpu if isinstance(cpu, Mapping) else {}
+    android = profile.get("android")
+    android = android if isinstance(android, Mapping) else {}
     ram = profile.get("ram")
     ram = ram if isinstance(ram, Mapping) else {}
+    memory = profile.get("memory")
+    memory = memory if isinstance(memory, Mapping) else {}
+    gib = 1024 ** 3
+
+    if "physical_cores" in cpu:
+        physical_cores = _safe_int(cpu["physical_cores"])
+    elif "cpu_cores" in android:
+        physical_cores = None
+    else:
+        physical_cores = 0
+    logical_cores = _safe_int(cpu.get("logical_cores", android.get("cpu_cores", 0)))
+    total_ram_gb = _safe_float(ram.get("total_gb", 0))
+    if total_ram_gb == 0:
+        total_ram_gb = round(_safe_float(memory.get("total_bytes", 0)) / gib, 3)
+    available_ram_gb = _safe_float(ram.get("available_gb", 0))
+    if available_ram_gb == 0:
+        available_ram_gb = round(_safe_float(memory.get("available_bytes", 0)) / gib, 3)
     raw_gpus = profile.get("gpus")
     if isinstance(raw_gpus, list) and raw_gpus:
         gpus = [gpu for gpu in raw_gpus if isinstance(gpu, Mapping)]
@@ -732,12 +751,12 @@ def _project_resources(raw: Mapping[str, Any]) -> dict[str, Any]:
         "state": state,
         "available": available,
         "cpu": {
-            "physical_cores": _safe_int(cpu.get("physical_cores", 0)),
-            "logical_cores": _safe_int(cpu.get("logical_cores", 0)),
+            "physical_cores": physical_cores,
+            "logical_cores": logical_cores,
         },
         "ram": {
-            "total_gb": _safe_float(ram.get("total_gb", 0)),
-            "available_gb": _safe_float(ram.get("available_gb", 0)),
+            "total_gb": total_ram_gb,
+            "available_gb": available_ram_gb,
         },
         "gpu": {
             "count": len(gpus),
@@ -764,7 +783,10 @@ def build_aggregate_resource_view(
     available_remote = [node for node in remote if node["available"]]
 
     totals = {
-        "physical_cores": sum(node["cpu"]["physical_cores"] for node in available),
+        "physical_cores": (
+            None if any(node["cpu"]["physical_cores"] is None for node in available)
+            else sum(node["cpu"]["physical_cores"] for node in available)
+        ),
         "logical_cores": sum(node["cpu"]["logical_cores"] for node in available),
         "ram_total_gb": round(sum(node["ram"]["total_gb"] for node in available), 3),
         "ram_available_gb": round(

@@ -109,6 +109,17 @@ def test_unknown_envelope_or_payload_fields_are_rejected(golden):
     assert payload_error.value.code == "invalid_fields"
 
 
+def test_control_certificate_is_not_part_of_task_worker_protocol(golden):
+    message = copy.deepcopy(golden["messages"][0])
+    message["control_certificate"] = {"term": 7, "proof": "signed"}
+
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(message)
+
+    assert captured.value.code == "invalid_fields"
+    assert captured.value.field == "message"
+
+
 def test_offer_input_digest_detects_tampering(golden):
     offer = copy.deepcopy(golden["messages"][2])
     offer["payload"]["root_input"]["message"] = "tampered"

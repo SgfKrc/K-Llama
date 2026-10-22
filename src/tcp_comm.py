@@ -380,6 +380,28 @@ def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFe
     return payload
 
 
+def _admit_inbound_control_message(
+    msg: dict, fence: ControlFence | None, *, peer: bool = False,
+) -> None:
+    msg_type = msg.get("type", "")
+    if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
+        return
+    data = msg.get("data")
+    certificate = data.get("control_certificate") if isinstance(data, dict) else None
+    action = f"tcp.receive.{msg_type}"
+    if peer:
+        fence.admit_peer(certificate, action=action, observe=True)
+    else:
+        fence.admit(certificate, action=action, source="tcp")
+
+    # The certificate belongs to the TCP control wrapper, not the task-worker
+    # protocol envelope. Remove it only after the fence has admitted it.
+    if msg_type == MessageType.TASK_WORKER.value and isinstance(data, dict):
+        sanitized_data = dict(data)
+        sanitized_data.pop("control_certificate", None)
+        msg["data"] = sanitized_data
+
+
 def detect_network_type() -> str:
     """
     检测当前节点的主要网络连接类型。
@@ -1248,13 +1270,7 @@ class TCPServer:
         self._control_fence = fence
 
     def _admit_inbound_control(self, msg: dict) -> None:
-        fence = self._control_fence
-        msg_type = msg.get("type", "")
-        if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
-            return
-        data = msg.get("data")
-        certificate = data.get("control_certificate") if isinstance(data, dict) else None
-        fence.admit(certificate, action=f"tcp.receive.{msg_type}", source="tcp")
+        _admit_inbound_control_message(msg, self._control_fence)
 
     def start(self, on_message: Callable = None,
               on_disconnect: Callable = None,
@@ -1387,6 +1403,18 @@ class TCPServer:
             data["client_id"] = client_id
         if reason:
             data["reason"] = reason
+        fence = self._control_fence
+        if status == "registered" and fence is not None and fence.enabled:
+            certificate = fence.current_certificate()
+            if certificate is None:
+                raise ControlFenceError(
+                    "control_certificate_missing",
+                    "fenced registration requires a current control certificate",
+                    action="tcp.register_ack",
+                )
+            fence.admit(certificate, action="tcp.register_ack", source="tcp")
+            data["control_fence_required"] = True
+            data["control_certificate"] = certificate
         conn.sendall(build_message(MessageType.REGISTER, data))
 
     def confirm_registration(self, client_id: str) -> bool:
@@ -1415,8 +1443,8 @@ class TCPServer:
                 if self._pending_registrations.get(client_id) is client:
                     self._pending_registrations.pop(client_id, None)
             return True
-        except OSError as e:
-            logger.warning(f"注册确认发送失败: {e}", exc_info=True)
+        except (OSError, ControlFenceError) as e:
+            logger.warning("注册确认发送失败: %s", e, exc_info=True)
             return False
 
     def reject_client(self, client_id: str, reason: str) -> None:
@@ -1647,7 +1675,12 @@ class TCPServer:
                                 "registered",
                                 client_id=client_id,
                             )
-                        except OSError:
+                        except (OSError, ControlFenceError) as exc:
+                            if isinstance(exc, ControlFenceError):
+                                logger.warning(
+                                    "fenced REGISTER ACK unavailable: client=%s code=%s",
+                                    client_id, exc.code,
+                                )
                             self._pop_client_if_same(client_id, current)
                             break
                         else:
@@ -2270,13 +2303,7 @@ class TCPClient:
         self._control_fence = fence
 
     def _admit_inbound_control(self, msg: dict) -> None:
-        fence = self._control_fence
-        msg_type = msg.get("type", "")
-        if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
-            return
-        data = msg.get("data")
-        certificate = data.get("control_certificate") if isinstance(data, dict) else None
-        fence.admit_peer(certificate, action=f"tcp.receive.{msg_type}", observe=True)
+        _admit_inbound_control_message(msg, self._control_fence, peer=True)
 
     def _transport_runtime_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         runtime = self.transport_runtime

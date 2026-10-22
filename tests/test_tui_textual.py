@@ -303,6 +303,40 @@ def test_live_backend_shapes_render_every_page():
     _run(_main())
 
 
+def test_android_resource_projection_displays_unknown_physical_cores_as_dash():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause()
+            app.screen.fill_resources({
+                "scope": "cluster",
+                "node_count": 1,
+                "available_node_count": 1,
+                "available": {
+                    "local": {
+                        "node_id": "y700", "role": "client", "available": True,
+                        "cpu": {"physical_cores": None, "logical_cores": 8},
+                        "ram": {"total_gb": 12.0, "available_gb": 5.0},
+                        "gpu": {"count": 0, "cuda_count": 0},
+                    },
+                    "remote": [],
+                },
+                "totals": {
+                    "physical_cores": None, "logical_cores": 8,
+                    "ram_total_gb": 12.0, "ram_available_gb": 5.0,
+                },
+            })
+            rows = _rows(app.screen, "#resources-table")
+            assert rows[0][2] == "— / 8", rows
+            assert rows[0][3] == "12.0 / 5.0 GB", rows
+            assert rows[-1][2] == "— / 8", rows
+
+    _run(_main())
+
+
 def test_ha_projection_is_read_only_and_fail_closed_for_missing_quorum():
     from tui_textual import KoakumaApp
 
