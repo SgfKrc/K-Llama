@@ -290,7 +290,7 @@ class ProductionLoopback:
         self.peer.close()
 
 
-def _step(head, tail, tokens, past, *, multi, vocabulary, roundtrip=None):
+def _step(head, tail, tokens, past, *, multi, vocabulary, roundtrip=None, capture=None):
     import numpy as np
     positions = list(range(past, past + len(tokens)))
     begin = time.perf_counter_ns()
@@ -299,6 +299,8 @@ def _step(head, tail, tokens, past, *, multi, vocabulary, roundtrip=None):
     if (not isinstance(hidden, np.ndarray) or hidden.dtype != np.float32
             or hidden.shape != (len(tokens), head.n_embd) or not np.isfinite(hidden).all()):
         raise BenchError("head must return a finite float32 [input_tokens, n_embd] matrix")
+    if capture is not None:
+        capture(hidden.copy())
     # These row hashes are diagnostics only. The singleton reference obtains its
     # own hidden by calling head.forward_tokens_to_hidden([input_token]).
     row_hashes = [hashlib.sha256(np.asarray(row, dtype="<f4").tobytes()).hexdigest() for row in hidden]
@@ -312,8 +314,9 @@ def _step(head, tail, tokens, past, *, multi, vocabulary, roundtrip=None):
             positions=positions, seq_ids=[0] * len(tokens))]
     tail_ns = time.perf_counter_ns() - begin
     _check_tokens(result, vocabulary, "tail argmax")
-    if len(result) != len(tokens):
-        raise BenchError("tail argmax must return exactly one token for every input row")
+    expected_outputs = len(tokens) if multi else 1
+    if len(result) != expected_outputs:
+        raise BenchError("tail argmax count differs from the selected output mode")
     if roundtrip is not None:
         wire["result"] = roundtrip.result(result, positions, vocabulary, multi=multi)
     return {"n_past": past, "input_tokens": list(tokens), "positions": positions,
@@ -324,17 +327,227 @@ def _step(head, tail, tokens, past, *, multi, vocabulary, roundtrip=None):
             "measure": {"head_wall_ms": head_ns / 1e6, "tail_wall_ms": tail_ns / 1e6}, "wire": wire}
 
 
-def _run_pass(head, tail, prefix, tokens, gamma, *, bulk, vocabulary, progress, roundtrip=None):
-    progress.update(reset=False, prefix=[], steps=[])
+def _run_pass(head, tail, prefix, tokens, gamma, *, bulk, vocabulary, progress,
+              roundtrip=None, prefill_batch=False, capture=None):
+    progress.update(reset=False, prefix=[], steps=[], prefill_batch=prefill_batch)
     head.reset()
     tail.reset()
     progress["reset"] = True
-    for past, token in enumerate(prefix):
-        progress["prefix"].append(_step(head, tail, [token], past, multi=False, vocabulary=vocabulary, roundtrip=roundtrip))
+    if prefill_batch:
+        progress["prefix"].append(_step(head, tail, prefix, 0, multi=False,
+                                         vocabulary=vocabulary, roundtrip=roundtrip,
+                                         capture=capture))
+    else:
+        for past, token in enumerate(prefix):
+            progress["prefix"].append(_step(head, tail, [token], past, multi=False,
+                                             vocabulary=vocabulary, roundtrip=roundtrip,
+                                             capture=capture))
     width = gamma if bulk else 1
     for offset in range(0, len(tokens), width):
         progress["steps"].append(_step(head, tail, tokens[offset:offset + width], len(prefix) + offset,
-                                       multi=bulk, vocabulary=vocabulary, roundtrip=roundtrip))
+                                       multi=bulk, vocabulary=vocabulary, roundtrip=roundtrip,
+                                       capture=capture))
+
+
+def _validated_prefill(step, prefix, vocabulary, *, require_loopback=False):
+    positions = list(range(len(prefix)))
+    if (step.get("n_past") != 0 or step.get("input_tokens") != prefix
+            or step.get("positions") != positions or step.get("seq_ids") != [0] * len(prefix)
+            or step.get("head_calls") != 1 or step.get("tail_calls") != 1
+            or step.get("tail_api") != "forward_hidden_to_token"
+            or step.get("hidden_shape", [None])[0] != len(prefix)
+            or len(step.get("hidden_row_sha256", [])) != len(prefix)):
+        raise BenchError("product prefill evidence must contain one full-prefix head/tail operation")
+    _check_tokens(step.get("tokens"), vocabulary, "prefill argmax")
+    if len(step["tokens"]) != 1:
+        raise BenchError("product prefill must return only its final argmax")
+    if require_loopback:
+        wire = step.get("wire") or {}
+        if (wire.get("roundtrip_passed") is not True or wire.get("format") != "binary"
+                or wire.get("hidden_raw_bytes") != len(prefix) * step["hidden_shape"][1] * 4
+                or wire.get("input_sha256") != wire.get("output_sha256")
+                or (wire.get("result") or {}).get("n_tokens") != 1):
+            raise BenchError("product prefill protocol evidence is incomplete")
+    return [{"position": position, "input_token": token, "hidden_sha256": digest}
+            for position, token, digest in zip(positions, prefix, step["hidden_row_sha256"])] + [
+                {"position": len(prefix), "token": step["tokens"][0]}]
+
+
+def _tail_schedule_compare(tail, prefix_hidden, chunk_hidden, tokens, gamma,
+                           vocabulary, expected_bulk):
+    import numpy as np
+
+    def run(*, bulk):
+        tail.reset()
+        tail.forward_hidden_to_token(prefix_hidden, n_past=0,
+            positions=list(range(len(prefix_hidden))), seq_ids=[0] * len(prefix_hidden))
+        output, cursor = [], 0
+        for hidden in chunk_hidden:
+            if bulk:
+                positions = list(range(len(prefix_hidden) + cursor,
+                                       len(prefix_hidden) + cursor + len(hidden)))
+                output.extend(tail.forward_hidden_to_tokens(hidden, n_past=positions[0],
+                    positions=positions, seq_ids=[0] * len(hidden)))
+            else:
+                for row in hidden:
+                    position = len(prefix_hidden) + cursor
+                    output.append(tail.forward_hidden_to_token(row[None, :], n_past=position,
+                        positions=[position], seq_ids=[0]))
+                    cursor += 1
+                continue
+            cursor += len(hidden)
+        _check_tokens(output, vocabulary, "isolated tail argmax")
+        return output
+
+    bulk_tokens = run(bulk=True)
+    sequential_tokens = run(bulk=False)
+    mismatches = [{"position": len(prefix_hidden) + index, "input_token": tokens[index],
+                   "bulk_token": bulk_tokens[index], "sequential_token": sequential_tokens[index]}
+                  for index in range(len(tokens)) if bulk_tokens[index] != sequential_tokens[index]]
+    raw_hidden = np.concatenate([prefix_hidden, *chunk_hidden], axis=0).astype("<f4", copy=False)
+    return {"same_head_hidden_rows": True, "gamma": gamma, "compared_rows": len(tokens),
+            "input_hidden_sha256": hashlib.sha256(raw_hidden.tobytes()).hexdigest(),
+            "matches_end_to_end_bulk": bulk_tokens == expected_bulk,
+            "mismatch_count": len(mismatches), "mismatches": mismatches}
+
+
+def _speculation_replay_probe(head, tail, prefix, greedy_tokens, vocabulary,
+                              force_rejection_position=None):
+    import numpy as np
+    from qlh_core.execution.speculative import draft_ngram, greedy_accept
+
+    head.reset()
+    tail.reset()
+    prefix_hidden = head.forward_tokens_to_hidden(prefix, n_past=0)
+    if (prefix_hidden.dtype != np.float32 or prefix_hidden.shape != (len(prefix), head.n_embd)
+            or not np.isfinite(prefix_hidden).all()):
+        raise BenchError("replay probe prompt prefill returned invalid hidden")
+    current = tail.forward_hidden_to_token(prefix_hidden, n_past=0,
+        positions=list(range(len(prefix))), seq_ids=[0] * len(prefix))
+    if current != greedy_tokens[0]:
+        raise BenchError("replay probe prompt prefill differs from the recorded greedy first token")
+    generated = [current]
+    rounds = []
+    forward_schedule = [{"position": 0, "ids": list(prefix), "all_tokens": False}]
+    while len(generated) < len(greedy_tokens):
+        remaining = len(greedy_tokens) - len(generated)
+        position = len(prefix) + len(generated) - 1
+        forced_rejection = position == force_rejection_position
+        draft = draft_ngram(prefix + generated, min(1, remaining - 1))
+        if forced_rejection:
+            draft = [(greedy_tokens[len(generated)] + 1) % vocabulary]
+        if not draft:
+            hidden = head.forward_tokens_to_hidden([generated[-1]], n_past=position)
+            target = tail.forward_hidden_to_token(hidden, n_past=position,
+                positions=[position], seq_ids=[0])
+            forward_schedule.append({"position": position, "ids": [generated[-1]],
+                                     "all_tokens": False})
+            if target != greedy_tokens[len(generated)]:
+                return {"passed": False, "reason": "target_token_divergence",
+                        "position": position, "target_token": target,
+                        "greedy_token": greedy_tokens[len(generated)], "rounds": rounds}
+            generated.append(target)
+            continue
+
+        inputs = [generated[-1], *draft]
+        verify_hidden = head.forward_tokens_to_hidden(inputs, n_past=position)
+        verify_tokens = tail.forward_hidden_to_tokens(verify_hidden, n_past=position,
+            positions=list(range(position, position + len(inputs))), seq_ids=[0] * len(inputs))
+        forward_schedule.append({"position": position, "ids": inputs,
+                                 "all_tokens": True})
+        accepted, correction = greedy_accept(draft, verify_tokens)
+        entry = {"position": position, "inputs": inputs, "draft": draft,
+                 "verified_tokens": verify_tokens, "accepted": accepted,
+                 "correction": correction, "forced_rejection": forced_rejection}
+        if accepted < len(draft):
+            replay_ids = prefix + generated + draft[:accepted]
+            head.reset()
+            tail.reset()
+            whole_hidden = head.forward_tokens_to_hidden(replay_ids, n_past=0)
+            whole_token = tail.forward_hidden_to_token(whole_hidden, n_past=0,
+                positions=list(range(len(replay_ids))), seq_ids=[0] * len(replay_ids))
+            whole_difference = float(np.max(np.abs(verify_hidden[accepted] - whole_hidden[-1])))
+            head.reset()
+            tail.reset()
+            cursor, replay_token, replay_hidden = 0, None, None
+            replay_schedule = []
+            for call in forward_schedule:
+                if cursor == len(replay_ids):
+                    break
+                if call["position"] != cursor:
+                    raise BenchError("replay probe schedule is not contiguous")
+                count = min(len(call["ids"]), len(replay_ids) - cursor)
+                replay_chunk = replay_ids[cursor:cursor + count]
+                if replay_chunk != call["ids"][:count]:
+                    raise BenchError("replay probe schedule differs from committed tokens")
+                replay_hidden = head.forward_tokens_to_hidden(replay_chunk, n_past=cursor)
+                positions = list(range(cursor, cursor + count))
+                if call["all_tokens"]:
+                    replay_outputs = tail.forward_hidden_to_tokens(replay_hidden,
+                        n_past=cursor, positions=positions, seq_ids=[0] * count)
+                    replay_token = replay_outputs[-1]
+                else:
+                    replay_token = tail.forward_hidden_to_token(replay_hidden,
+                        n_past=cursor, positions=positions, seq_ids=[0] * count)
+                replay_schedule.append({"position": cursor, "ids": replay_chunk,
+                                        "all_tokens": call["all_tokens"]})
+                cursor += count
+            if cursor != len(replay_ids) or replay_hidden is None:
+                raise BenchError("replay probe schedule does not cover committed tokens")
+            entry.update(replay_input_tokens=len(replay_ids),
+                whole_prefix_replay={"token": whole_token,
+                    "hidden_max_abs_difference": whole_difference},
+                same_schedule_replay={"token": replay_token,
+                    "hidden_bitwise_equal": bool(np.array_equal(
+                        verify_hidden[accepted], replay_hidden[-1])),
+                    "hidden_max_abs_difference": float(np.max(np.abs(
+                        verify_hidden[accepted] - replay_hidden[-1]))),
+                    "matches_correction": replay_token == correction,
+                    "calls": len(replay_schedule)})
+            rounds.append(entry)
+            if replay_token != correction:
+                return {"passed": False, "reason": "speculation_replay_mismatch",
+                        "position": position + accepted, "greedy_token": correction,
+                        "replay_token": replay_token, "rounds": rounds}
+            forward_schedule = replay_schedule
+        else:
+            rounds.append(entry)
+
+        committed = [*draft[:accepted], correction]
+        for token in committed:
+            if len(generated) == len(greedy_tokens):
+                break
+            if token != greedy_tokens[len(generated)]:
+                return {"passed": False, "reason": "target_token_divergence",
+                        "position": len(prefix) + len(generated), "target_token": token,
+                        "greedy_token": greedy_tokens[len(generated)], "rounds": rounds}
+            generated.append(token)
+    rejections = [entry for entry in rounds if entry.get("accepted", len(entry["draft"])) < len(entry["draft"])]
+    forced_observed = force_rejection_position is None or any(
+        entry.get("forced_rejection") for entry in rejections)
+    return {"passed": forced_observed, "generated_tokens": len(generated),
+            "rejection_count": len(rejections), "forced_rejection_observed": forced_observed,
+            "rounds": rounds}
+
+
+def _greedy_reference(head, tail, prefix, token_count, vocabulary):
+    if type(token_count) is not int or token_count < 1:
+        raise BenchError("greedy reference requires a positive token count")
+    head.reset()
+    tail.reset()
+    hidden = head.forward_tokens_to_hidden(prefix, n_past=0)
+    current = tail.forward_hidden_to_token(hidden, n_past=0,
+        positions=list(range(len(prefix))), seq_ids=[0] * len(prefix))
+    _check_tokens([current], vocabulary, "greedy prefill argmax")
+    generated = [current]
+    while len(generated) < token_count:
+        position = len(prefix) + len(generated) - 1
+        hidden = head.forward_tokens_to_hidden([generated[-1]], n_past=position)
+        current = tail.forward_hidden_to_token(hidden, n_past=position,
+            positions=[position], seq_ids=[0])
+        _check_tokens([current], vocabulary, "greedy decode argmax")
+        generated.append(current)
+    return generated
 
 
 def _validated_rows(steps, tokens, start, width, multi, vocabulary, require_loopback=False):
@@ -375,7 +588,8 @@ def _validated_rows(steps, tokens, start, width, multi, vocabulary, require_loop
     return rows
 
 
-def compare_groups(groups, prefix, tokens, vocabulary, *, require_loopback=False):
+def compare_groups(groups, prefix, tokens, vocabulary, *, require_loopback=False,
+                   prefill_batch=False):
     if (not prefix or len(tokens) < 24 or len(tokens) % 8
             or [group["gamma"] for group in groups] != list(GAMMAS)):
         raise BenchError("complete gamma=2,4,8 evidence with nonzero prefix and >=3 gamma=8 batches is required")
@@ -388,7 +602,13 @@ def compare_groups(groups, prefix, tokens, vocabulary, *, require_loopback=False
             branch = group[name]
             if branch.get("reset") is not True:
                 raise BenchError("each branch must reset both owners before prefix replay")
-            prefix_rows = _validated_rows(branch["prefix"], prefix, 0, 1, False, vocabulary, require_loopback)
+            if branch.get("prefill_batch", False) != prefill_batch:
+                raise BenchError("bulk and sequential prefill mode must match the requested product schedule")
+            prefix_rows = (_validated_prefill(branch["prefix"][0], prefix, vocabulary,
+                                               require_loopback=require_loopback)
+                           if prefill_batch else
+                           _validated_rows(branch["prefix"], prefix, 0, 1, False,
+                                           vocabulary, require_loopback))
             if initial is None:
                 initial = prefix_rows
             if prefix_rows != initial:
@@ -414,27 +634,63 @@ def compare_groups(groups, prefix, tokens, vocabulary, *, require_loopback=False
             "mismatches": mismatches}
 
 
-def numerical_bench(head, tail, prefix, tokens, vocabulary, progress, *, roundtrip=None):
+def numerical_bench(head, tail, prefix, tokens, vocabulary, progress, *, roundtrip=None,
+                    prefill_batch=False, replay_probe=False, force_rejection_position=None):
+    import numpy as np
+
     _check_tokens(prefix, vocabulary, "prefix tokens")
     _check_tokens(tokens, vocabulary, "fixed input tokens")
     progress["protocol_loopback"] = {"enabled": roundtrip is not None, "format": "binary" if roundtrip is not None else None}
+    progress["prefill_batch"] = prefill_batch
     progress["groups"] = []
     for gamma in GAMMAS:
         group = {"gamma": gamma, "bulk": {}, "sequential": {}}
         progress["groups"].append(group)
+        captured = {}
         for name, bulk in (("bulk", True), ("sequential", False)):
+            hidden_rows = []
             _run_pass(head, tail, prefix, tokens, gamma, bulk=bulk,
-                      vocabulary=vocabulary, progress=group[name], roundtrip=roundtrip)
+                      vocabulary=vocabulary, progress=group[name], roundtrip=roundtrip,
+                      prefill_batch=prefill_batch, capture=hidden_rows.append)
+            captured[name] = hidden_rows
+        if prefill_batch:
+            bulk_hidden = np.concatenate(captured["bulk"][1:], axis=0)
+            sequential_hidden = np.concatenate(captured["sequential"][1:], axis=0)
+            differences = np.abs(bulk_hidden - sequential_hidden)
+            group["head_hidden"] = {
+                "different_rows": int(np.count_nonzero(np.any(differences != 0, axis=1))),
+                "compared_rows": len(tokens),
+                "max_abs_difference": float(differences.max(initial=0)),
+                "relative_l2_difference": float(np.linalg.norm(bulk_hidden - sequential_hidden)
+                    / max(float(np.linalg.norm(sequential_hidden)), 1e-30)),
+            }
+            expected_bulk = [token for step in group["bulk"]["steps"] for token in step["tokens"]]
+            group["tail_schedule"] = _tail_schedule_compare(
+                tail, captured["bulk"][0], captured["bulk"][1:], tokens, gamma,
+                vocabulary, expected_bulk)
         print(f"gamma={gamma}: {len(tokens) // gamma} bulk batches, {len(tokens)} singleton reference steps", flush=True)
-    progress["gate"] = compare_groups(progress["groups"], prefix, tokens, vocabulary, require_loopback=roundtrip is not None)
-    return progress["gate"]["passed"]
+    progress["gate"] = compare_groups(progress["groups"], prefix, tokens, vocabulary,
+        require_loopback=roundtrip is not None, prefill_batch=prefill_batch)
+    if replay_probe:
+        if not prefill_batch:
+            raise BenchError("speculation replay probe requires product-style batched prefill")
+        greedy_tokens = _greedy_reference(head, tail, prefix, len(tokens), vocabulary)
+        progress["greedy_reference"] = {"source": "native_prompt_recomputation",
+                                        "token_count": len(greedy_tokens),
+                                        "tokens": greedy_tokens}
+        progress["replay_probe_gamma2"] = _speculation_replay_probe(
+            head, tail, prefix, greedy_tokens, vocabulary,
+            force_rejection_position=force_rejection_position)
+    return (progress["gate"]["passed"]
+            and (not replay_probe or progress["replay_probe_gamma2"]["passed"]))
 
 
 def native_bench(args, progress, *, factory=None):
     prefix, tokens = _workload(args)
     progress.update(prefix_tokens=prefix, fixed_tokens=tokens, gammas=list(GAMMAS),
                     n_ctx=args.ctx, n_threads=args.threads, n_seq_max=1,
-                    scope="fixed inputs; real head token->hidden and tail hidden->argmax; wall measurements are not performance claims")
+                    scope="fixed inputs; real head token->hidden and tail hidden->argmax; wall measurements are not performance claims",
+                    prefill_batch=bool(getattr(args, "prefill_batch", False)))
     # edge_bench's POSIX protection makes a private model copy. This tool must
     # never enter that branch: Windows FILE_SHARE_READ keeps verified bytes in place.
     if os.name != "nt":
@@ -476,7 +732,10 @@ def native_bench(args, progress, *, factory=None):
                         "sha256": declarations[0]["source_model_sha256"]}
             roundtrip = ProductionLoopback(identity, segments[1]["layer_range"])
             stack.callback(roundtrip.close)
-        passed = numerical_bench(*runners, prefix, tokens, vocabulary, progress, roundtrip=roundtrip)
+        passed = numerical_bench(*runners, prefix, tokens, vocabulary, progress,
+            roundtrip=roundtrip, prefill_batch=bool(getattr(args, "prefill_batch", False)),
+            replay_probe=bool(getattr(args, "speculation_replay_probe", False)),
+            force_rejection_position=getattr(args, "force_rejection_position", None))
         if hashes != {str(path): _sha256(path) for path in binaries}:
             raise BenchError("native binaries changed during numerical comparison")
         progress["binary_integrity_passed"] = True
@@ -492,6 +751,9 @@ def main(argv=None):
     parser.add_argument("--shim", help="explicit new shim; mandatory for native execution")
     parser.add_argument("--verify-only", action="store_true", help="check files without loading shim; numerical passed stays false")
     parser.add_argument("--protocol-loopback", action="store_true", help="route every real head hidden through negotiated production binary TCP before tail")
+    parser.add_argument("--prefill-batch", action="store_true", help="prefill the full prompt in one call, matching product execution")
+    parser.add_argument("--speculation-replay-probe", action="store_true", help="compare product-style greedy generation and gamma2 replay")
+    parser.add_argument("--force-rejection-position", type=int, help="force a gamma2 draft rejection at this absolute input position")
     parser.add_argument("--gammas", default="2,4,8")
     parser.add_argument("--batches", type=int, default=4, help="number of gamma=8 batches; shared stream has 8*batches tokens (>=3)")
     parser.add_argument("--tokens", help="fixed input token IDs as comma list or JSON array")

@@ -67,8 +67,8 @@ class Runner:
         return result
 
     def forward_hidden_to_token(self, hidden, **kwargs):
-        assert len(hidden) == 1, "reference must compute genuine singleton hidden"
-        return self._tail(hidden, multi=False, **kwargs)[0]
+        assert len(hidden) == 1 or kwargs.get("n_past") == 0
+        return self._tail(hidden, multi=False, **kwargs)[-1]
 
     def forward_hidden_to_tokens(self, hidden, **kwargs):
         return self._tail(hidden, multi=True, **kwargs)
@@ -118,6 +118,67 @@ def test_mismatch_retains_every_row_and_continues_all_gammas():
         mismatch = next(row for row in group["rows"] if not row["matched"])
         assert mismatch["bulk_token"] != mismatch["sequential_token"]
         assert mismatch["bulk_hidden_sha256"] == mismatch["sequential_hidden_sha256"]
+
+
+def test_product_prefill_batches_prompt_and_tail_comparison_reuses_head_hidden():
+    head, tail, report = Runner(), Runner(), {}
+    passed = bench.numerical_bench(head, tail, PREFIX, TOKENS, 128, report, prefill_batch=True)
+    assert passed and report["prefill_batch"] is True
+    for group in report["groups"]:
+        assert group["bulk"]["prefill_batch"] is True
+        assert len(group["bulk"]["prefix"]) == len(group["sequential"]["prefix"]) == 1
+        assert group["bulk"]["prefix"][0]["input_tokens"] == PREFIX
+        assert group["head_hidden"]["different_rows"] == 0
+        assert group["tail_schedule"]["same_head_hidden_rows"] is True
+        assert group["tail_schedule"]["matches_end_to_end_bulk"] is True
+        assert group["tail_schedule"]["mismatch_count"] == 0
+
+
+def test_scalar_prefill_argmax_uses_the_final_input_row():
+    head, tail = Runner(), Runner()
+    hidden = head.forward_tokens_to_hidden(PREFIX, n_past=0)
+    expected = Runner()._tail(hidden, multi=False, n_past=0,
+        positions=list(range(len(PREFIX))), seq_ids=[0] * len(PREFIX))[-1]
+    actual = tail.forward_hidden_to_token(hidden, n_past=0,
+        positions=list(range(len(PREFIX))), seq_ids=[0] * len(PREFIX))
+    assert actual == expected
+
+
+def test_product_prefill_tail_schedule_isolates_tail_batch_shape_mismatch():
+    head, tail, report = Runner(), Runner(mismatch=True), {}
+    passed = bench.numerical_bench(head, tail, PREFIX, TOKENS, 128, report, prefill_batch=True)
+    assert not passed
+    gamma_two = report["groups"][0]
+    assert gamma_two["tail_schedule"]["same_head_hidden_rows"] is True
+    assert gamma_two["tail_schedule"]["matches_end_to_end_bulk"] is True
+    assert gamma_two["tail_schedule"]["mismatch_count"] == 1
+    assert gamma_two["tail_schedule"]["mismatches"][0]["position"] == 12
+
+
+def test_replay_probe_builds_greedy_reference_from_prompt_not_fixed_inputs():
+    head, tail, report = Runner(), Runner(), {}
+    passed = bench.numerical_bench(head, tail, PREFIX, TOKENS, 128, report,
+        prefill_batch=True, replay_probe=True)
+    assert passed
+    reference = report["greedy_reference"]
+    assert reference["source"] == "native_prompt_recomputation"
+    assert reference["token_count"] == len(TOKENS)
+    assert reference["tokens"] != TOKENS
+    assert report["replay_probe_gamma2"]["passed"] is True
+
+
+def test_replay_probe_forced_rejection_replays_the_original_batch_schedule():
+    head, tail = Runner(), Runner()
+    greedy = bench._greedy_reference(head, tail, PREFIX, len(TOKENS), 128)
+    report = bench._speculation_replay_probe(head, tail, PREFIX, greedy, 128,
+        force_rejection_position=len(PREFIX))
+    assert report["passed"] is True
+    assert report["forced_rejection_observed"] is True
+    rejected = next(row for row in report["rounds"] if row["forced_rejection"])
+    assert rejected["accepted"] == 0
+    assert rejected["same_schedule_replay"]["matches_correction"] is True
+    assert rejected["same_schedule_replay"]["hidden_bitwise_equal"] is True
+    assert rejected["same_schedule_replay"]["calls"] == 2
 
 
 @pytest.mark.parametrize("fault", ["missing_gamma", "duplicate_gamma", "missing_batch", "missing_singleton",
