@@ -65,10 +65,14 @@ def is_model_api_source_trusted(
     return False
 
 
-def require_model_api_source(request: Request | None) -> str:
+def require_model_api_source(
+    request: Request | None,
+    *,
+    trusted_cidrs: str | None = None,
+) -> str:
     """Fail closed before model paths, registry rows, or download jobs are read."""
     host = request_client_host(request)
-    if is_model_api_source_trusted(request):
+    if is_model_api_source_trusted(request, trusted_cidrs=trusted_cidrs):
         return host
     raise HTTPException(
         status_code=403,

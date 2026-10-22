@@ -12,6 +12,7 @@ from tests.test_model_intent import native_intent, stage_case, retirement_case  
 def api(monkeypatch):
     import api_server
     from api import routes_model_intent
+    monkeypatch.setenv("QLH_MODEL_API_TRUSTED_CIDRS", "")
     monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
     fake = SimpleNamespace(current=lambda: None, get=lambda op_id: {"operation_id": op_id, "status": "ready"},
                            create=AsyncMock(return_value={"operation_id": "supply_" + "a" * 32, "status": "queued"}),

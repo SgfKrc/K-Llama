@@ -84,7 +84,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
-from model_api_access import require_model_api_source
+from model_api_access import require_model_api_source as _require_model_api_source
 from model_intent_access import (
     is_path_free_intent_request, is_registered_chat_request,
     mark_registered_chat_request, require_model_intent_source,
@@ -728,6 +728,15 @@ def _get_app_runtime():
         _runtime_startup_done = _app_runtime.startup_done
         _runtime_lifecycle_lock = _app_runtime._lock
     return _app_runtime
+
+
+def require_model_api_source(request):
+    """Use the resolved settings snapshot for the HTTP source boundary."""
+    environment = _get_app_runtime().resolve_config().environment_snapshot()
+    return _require_model_api_source(
+        request,
+        trusted_cidrs=environment.get("QLH_MODEL_API_TRUSTED_CIDRS"),
+    )
 
 
 scheduler = LazyResource(lambda: _get_app_runtime().services.scheduler)
