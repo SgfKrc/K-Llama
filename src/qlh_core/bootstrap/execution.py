@@ -157,6 +157,7 @@ class NativePorts:
         self.scheduler = application.scheduler
         self.host = self.scheduler._host
         self.cache = None
+        self.forward_schedule = []
         self.used = []
         self.lock_held = False
         self.native_thinking = False
@@ -271,16 +272,48 @@ class NativePorts:
         if all_tokens:
             from qlh_core.contracts.token_output import validate_token_output
             validate_token_output(hidden, n_tokens=len(ids), positions=positions, require_all=True)
+        self.forward_schedule.append({"position": position, "ids": list(ids),
+                                      "all_tokens": all_tokens})
         return hidden
 
-    def restore_prefix(self, plan, record, ids, step):
-        """Reset every owner, then rebuild KV using only committed input tokens."""
+    def _restore_chunks(self, ids):
+        if not isinstance(ids, list) or not ids:
+            raise ExecutionError("speculative_restore_schedule_invalid")
+        chunks, cursor = [], 0
+        for call in self.forward_schedule:
+            if cursor == len(ids):
+                break
+            if call["position"] != cursor:
+                raise ExecutionError("speculative_restore_schedule_invalid")
+            count = min(len(call["ids"]), len(ids) - cursor)
+            selected = call["ids"][:count]
+            if selected != ids[cursor:cursor + count]:
+                raise ExecutionError("speculative_restore_schedule_mismatch")
+            chunks.append({"position": cursor, "ids": selected,
+                           "all_tokens": call["all_tokens"]})
+            cursor += count
+        if cursor != len(ids):
+            raise ExecutionError("speculative_restore_schedule_incomplete")
+        return chunks
+
+    def restore_operation_count(self, ids):
+        return len(self._restore_chunks(ids))
+
+    def restore_prefix(self, plan, record, ids, step, *, operation_steps):
+        """Reset every owner, then replay the request's committed batch schedule."""
         self._receipt_guard._check(plan, record)
+        chunks = self._restore_chunks(ids)
+        if operation_steps != len(chunks):
+            raise ExecutionError("speculative_restore_schedule_invalid")
         if not self._drain_attempts(record):
             raise ExecutionError("speculative_restore_cleanup_pending")
         self._reset_pipeline_kv(record, tag=f"restore:{step}", check=True)
         self._receipt_guard._check(plan, record)
-        output = self.forward_tokens(plan, record, ids, 0, step, all_tokens=False)
+        self.forward_schedule = []
+        output = None
+        for offset, chunk in enumerate(chunks):
+            output = self.forward_tokens(plan, record, chunk["ids"], chunk["position"],
+                step + offset, all_tokens=chunk["all_tokens"])
         from qlh_core.contracts.token_output import tail_token
         return tail_token(output)
 

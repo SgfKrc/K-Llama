@@ -165,10 +165,18 @@ class SpeculativeExecutor(LinearExecutor):
         def restore(ids):
             nonlocal operation_step
             step = operation_step
-            operation_step += 1
+            count = getattr(self.ports, "restore_operation_count", None)
+            operation_steps = count(ids) if callable(count) else 1
+            if type(operation_steps) is not int or operation_steps < 1:
+                raise ExecutionError("speculation_restore_schedule_invalid")
+            operation_step += operation_steps
             speculation["replay_calls"] += 1
             speculation["replayed_input_tokens"] += len(ids)
-            return timed("restore_seconds", self.ports.restore_prefix, plan, record, ids, step=step)
+            if callable(count):
+                return timed("restore_seconds", self.ports.restore_prefix, plan, record,
+                             ids, step=step, operation_steps=operation_steps)
+            return timed("restore_seconds", self.ports.restore_prefix,
+                         plan, record, ids, step=step)
 
         def commit(token, *, draft_token=False):
             self._check(plan, record)

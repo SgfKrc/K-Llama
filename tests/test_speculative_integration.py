@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from qlh_core.contracts.speculation import resolve_speculative_gamma
+from qlh_core.contracts.execution import ExecutionError
+from qlh_core.bootstrap.execution import NativePorts
 from tests.helpers.linear_application import make_application
 from tests.test_comm_multipos_bench import _gguf
 
@@ -101,6 +103,23 @@ def test_production_batch_matches_greedy_after_rejection_and_next_request(pipeli
     assert any(c[0] == "stage" and c[-1] is True and len(c[2]) > 1 for c in pipeline.calls)
     again = app.run("same", max_new_tokens=16, speculative_gamma=1)
     assert again["response"] == baseline["response"]
+
+
+def test_restore_schedule_truncates_rejected_batch_after_committed_prefix():
+    ports = NativePorts.__new__(NativePorts)
+    ports.forward_schedule = [
+        {"position": 0, "ids": [1, 2, 3], "all_tokens": False},
+        {"position": 3, "ids": [4, 5], "all_tokens": True},
+    ]
+    assert ports.restore_operation_count([1, 2, 3, 4]) == 2
+    assert ports._restore_chunks([1, 2, 3, 4]) == [
+        {"position": 0, "ids": [1, 2, 3], "all_tokens": False},
+        {"position": 3, "ids": [4], "all_tokens": True},
+    ]
+    with pytest.raises(ExecutionError, match="speculative_restore_schedule_mismatch"):
+        ports.restore_operation_count([1, 2, 3, 9])
+    with pytest.raises(ExecutionError, match="speculative_restore_schedule_incomplete"):
+        ports.restore_operation_count([1, 2, 3, 4, 5, 6])
 
 
 @pytest.mark.parametrize("change,code", [
