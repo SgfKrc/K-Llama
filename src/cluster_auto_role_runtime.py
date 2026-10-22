@@ -31,6 +31,7 @@ from cluster_control_contract import (
 )
 from cluster_fence import ControlFence
 from cluster_quorum import (
+    QUORUM_ERROR_CODES,
     QuorumCollector,
     QuorumError,
     QuorumPolicy,
@@ -135,11 +136,7 @@ class HTTPRemoteVoter:
             # ★ #93（真机演练暴露）：白名单**必须**含水位类错误码，否则「voter 不持有被
             #   提议的已提交前缀」会被降级成通用的 quorum_unavailable，主节点就无法区分
             #   「多数不可用」与「多数不持有」—— 这正是本票要消除的歧义。
-            if code not in {
-                "quorum_unavailable", "quorum_vote_rejected", "quorum_active_lease",
-                "quorum_term_stale", "quorum_duplicate_vote", "quorum_expiry_regressed",
-                "quorum_watermark_unheld", "quorum_watermark_unavailable",
-            }:
+            if code not in QUORUM_ERROR_CODES:
                 code = "quorum_unavailable"
             raise QuorumError(code, "voter peer rejected the request")
         return value

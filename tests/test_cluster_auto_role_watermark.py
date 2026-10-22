@@ -263,8 +263,11 @@ def test_voter_rpc_keeps_the_watermark_code(tmp_path):
     assert result["code"] == "quorum_watermark_unavailable"
 
 
-def test_remote_voter_call_propagates_watermark_code(monkeypatch):
-    """`HTTPRemoteVoter` 不得把水位码降级成通用码（白名单必须放行它）。"""
+@pytest.mark.parametrize("code", [
+    "quorum_watermark_unheld", "quorum_term_conflict", "quorum_ledger_corrupt",
+])
+def test_remote_voter_call_propagates_protocol_error_codes(monkeypatch, code):
+    """HTTP voter replies retain every stable quorum protocol error code."""
     import json as _json
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -283,7 +286,7 @@ def test_remote_voter_call_propagates_watermark_code(monkeypatch):
             return
 
         def do_POST(self):  # noqa: N802 - http.server API
-            body = _json.dumps({"ok": False, "code": "quorum_watermark_unheld"}).encode()
+            body = _json.dumps({"ok": False, "code": code}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -299,7 +302,7 @@ def test_remote_voter_call_propagates_watermark_code(monkeypatch):
         remote = HTTPRemoteVoter("rog-voter", f"http://{host}:{port}", secret="s" * 40, timeout=3.0)
         with pytest.raises(QuorumError) as excinfo:
             remote.snapshot()
-        assert excinfo.value.code == "quorum_watermark_unheld", repr(excinfo.value.__cause__)
+        assert excinfo.value.code == code, repr(excinfo.value.__cause__)
     finally:
         server.shutdown()
         server.server_close()
