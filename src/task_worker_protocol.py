@@ -850,14 +850,19 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         #   直接判为非法 hello。实测 ROG 在一次供给里裁出 `[8,16)` 之后，每次 hello
         #   都 `invalid_capabilities`，供给便永远停在 `waiting_nodes`。
         #   正确约束是**包含**：现成工件必须落在声明的可承担区间内。
-        advertised_ranges = (
-            {tuple(item) for item in capabilities.get("layer_ranges", [])}
-            if "layer_ranges" in capabilities else set()
+        advertised_ranges = [
+            (int(item[0]), int(item[1]))
+            for item in capabilities.get("layer_ranges", [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        ] if "layer_ranges" in capabilities else []
+        covered = all(
+            any(lo <= start and end <= hi for lo, hi in advertised_ranges)
+            for start, end in artifact_ranges
         )
-        if "layer_ranges" not in capabilities or not set(artifact_ranges) <= advertised_ranges:
+        if "layer_ranges" not in capabilities or not covered:
             raise _error(
                 "invalid_capabilities", field,
-                "layer_artifacts must be a subset of layer_ranges",
+                "every layer_artifact range must be covered by layer_ranges",
             )
         if (
             "segment_mode" in capabilities
