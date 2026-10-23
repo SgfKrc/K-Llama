@@ -2601,7 +2601,18 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 expected_sha256 = str(
                     planned_artifact.get("artifact_sha256", "") or ""
                 )
-                current_artifact = next((
+                # ★ 2026-10-23（#117）：自裁节点（`layer_budget.local_cut`）的工件是
+                #   **供给阶段按本次分配区间新裁出来的**，不可能出现在 worker 上一轮
+                #   通告的 `layer_artifacts` 里（那里是旧切点的段）。此前要求逐字段
+                #   完全匹配 ⇒ 恒返回 None ⇒ prepare 以
+                #   `prepare_stage_model_identity_missing` 失败，即使段已裁好并校验。
+                #   此时身份已由供给收据权威写入 planned_artifact，直接采用。
+                local_cut = bool(
+                    isinstance(capabilities, dict)
+                    and isinstance(capabilities.get("layer_budget"), dict)
+                    and capabilities["layer_budget"].get("local_cut") is True
+                )
+                current_artifact = None if local_cut else next((
                     item for item in artifacts
                     if isinstance(item, dict)
                     and item.get("layer_range") == planned_artifact.get("layer_range")
@@ -2616,7 +2627,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         )
                     )
                 ), None) if isinstance(artifacts, list) else None
-                if current_artifact is None:
+                if not local_cut and current_artifact is None:
                     return None
             elif assignment is not None and isinstance(artifacts, list) and artifacts:
                 requested = (
