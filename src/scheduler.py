@@ -2829,6 +2829,29 @@ class Scheduler(
                 relay_claims=relay_claims,
                 prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
             )
+            if (not result.get("admitted")
+                    and any("candidate_layer_ranges" in node for node in capacity_nodes or [])):
+                # ★ 2026-10-23（#117）：候选区间来自**供给时的切点**（用于锁定复用，
+                #   见 model_supply_capacity 的证据投影）。容量确实不再满足时才放开，
+                #   允许重新切分布局 —— 即"可用内存增加就不动切点、减少才重切"。
+                released_nodes = [
+                    {key: value for key, value in node.items()
+                     if key != "candidate_layer_ranges"}
+                    for node in capacity_nodes
+                ]
+                logger.info(
+                    "锁定的切点不再满足容量，放开候选约束重排: locked=%s",
+                    [node.get("candidate_layer_ranges") for node in capacity_nodes or []],
+                )
+                result = solve_pipeline_capacity(
+                    descriptor,
+                    released_nodes,
+                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                    require_distributed=require_distributed,
+                    local_layer_budget=local_layer_budget,
+                    relay_claims=relay_claims,
+                    prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
+                )
         except PipelineCapacityError as exc:
             # ★ 2026-10-23（#117）：把**具体**原因打出来。此前调用方只记
             #   reason_code，"描述器非法"到底是缺 total_layers、缺

@@ -302,6 +302,15 @@ class SupplyCapacityEvidence:
                 record["retained_component_bytes"] = assignment["retained_component_bytes"]
             # Preserve advertised ranges/artifact contracts and the configured
             # reserve. Only the selected runtime's memory authority changes.
+            # ★ 2026-10-23（#117）：把**供给时的切点**转成候选约束，锁定本次布局。
+            #   否则 prepare 会重新自由求解：内存波动一次就可能选出不同切点（实测
+            #   rog 供给 [8,20)、prepare 却算出 [8,21)）⇒ 与已裁好的段对不上 ⇒
+            #   `prepare_artifact_identity_missing`。容量确实不再满足时，求解入口会
+            #   去掉这个约束重排（见 scheduler 的容量求解），即"内存增加不动切点、
+            #   减少才重切"。
+            record["candidate_layer_ranges"] = [
+                [int(assignment["start_layer"]), int(assignment["end_layer"])]
+            ]
             result.append(record)
             item = {"node_id": node_id, "engine": engine, "execution_device": device,
                     "capacity_bytes": available, "capacity_source": source,

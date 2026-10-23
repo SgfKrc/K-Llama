@@ -77,6 +77,19 @@ class WorkerPrepareCoordinatorMixin:
                 result, receipt, (model_info or {}).get("total_layers"),
             )
             if artifact is None:
+                # ★ 2026-10-23（#117）：合成失败必须留现场 —— 收据里到底是状态、
+                #   摘要还是区间对不上，此前只有一个错误码。
+                logger.warning(
+                    "prepare_artifact_identity_missing node=%s range=[%s,%s) "
+                    "operation=%s receipt_status=%s receipt_range=%s "
+                    "artifact_sha=%s manifest_sha=%s",
+                    node, result.get("start_layer"), result.get("end_layer"),
+                    operation_id or "<none>",
+                    (receipt or {}).get("status"),
+                    (receipt or {}).get("layer_range"),
+                    str((receipt or {}).get("artifact_sha256", ""))[:12],
+                    str((receipt or {}).get("manifest_sha256", ""))[:12],
+                )
                 raise WorkerPrepareError("prepare_artifact_identity_missing")
             result["layer_artifact"] = artifact
         model = result.get("stage_model_identity")
