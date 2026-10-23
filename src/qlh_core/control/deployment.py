@@ -206,25 +206,38 @@ class DeploymentService:
                     if (not terminal_observation
                             or any(prior.get(key) != lifecycle.get(key)
                                    for key in ("config_id", "generation", "phase"))):
-                        # ★ 2026-10-23（#117）：**重新选同一个模型**会算出同样的
-                        #   确定性 `config_id`，而该 id 的旧部署已是终态
-                        #   （retired / aborted）。这是完全正常的操作，应视为**新一轮
-                        #   部署**并把状态机重置到起点；否则该 id 被永久占用，用户每次
-                        #   重新选模都拿到 409（实测 `INTENT_RETIRE_FAILED` →
-                        #   `deployment_transition_invalid` 连环失败，且因为"没有已加载
-                        #   的模型"而无法走正常的 retire 路径，形成死锁）。
-                        if target not in {"preparing", "candidate"}:
-                            raise ModelControlError("deployment_transition_invalid")
-                        deployment.update(
-                            status="candidate",
-                            boot_id=self.boot_id,
-                            created_at=self.clock(),
-                            authority=deepcopy(authority),
-                            connections=deepcopy(connections),
-                            assignments=deepcopy(expected),
-                            input_revisions=deepcopy(lifecycle.get("input_revisions", {})),
+                        # ★ 2026-10-23（#117）：**放弃一次已失效的生命周期**。模型换了
+                        #   之后这次恢复就没有意义，`_recovery_model_matches` 会主动把
+                        #   lifecycle 写成 `invalidated / published=False` 并持久化。
+                        #   但那个 `prior` 恰恰就是待写入的目标本身（库里仍是
+                        #   `ready`），于是 `prior.phase != lifecycle.phase` 恒成立 ⇒
+                        #   持久化必然失败 ⇒ 恢复围栏清不掉 ⇒ 供给恒报
+                        #   `pipeline_transaction_not_started`，鸡生蛋。
+                        #   判据**不能依赖 `recovery_input`**：它要求
+                        #   `_pipeline_load_transaction is None`，而失败现场完全可能是
+                        #   另一种组合 —— 实测该标志为 False，于是落进普通分支，
+                        #   `invalidated` 不被允许 ⇒ 依旧抛错（日志里 `failed to
+                        #   persist pipeline lifecycle state` 反复出现）。
+                        #   本质只是"把已处于终态的生命周期落成 invalidated"，与是否
+                        #   处于恢复输入无关；它不重开部署，故不走下面的新一轮部署重置。
+                        abandon_recovery = (
+                            target == "invalidated"
+                            and lifecycle.get("published") is False
+                            and previous in DEPLOYMENT_TERMINAL
                         )
-                        previous = "candidate"
+                        if not abandon_recovery and target not in {"preparing", "candidate"}:
+                            raise ModelControlError("deployment_transition_invalid")
+                        if not abandon_recovery:
+                            deployment.update(
+                                status="candidate",
+                                boot_id=self.boot_id,
+                                created_at=self.clock(),
+                                authority=deepcopy(authority),
+                                connections=deepcopy(connections),
+                                assignments=deepcopy(expected),
+                                input_revisions=deepcopy(lifecycle.get("input_revisions", {})),
+                            )
+                            previous = "candidate"
                     else:
                         target = previous
                 if native and not recovery_input:
