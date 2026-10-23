@@ -22,6 +22,7 @@ from config import (
     PIPELINE_RELAY_SEGMENTS,
     PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    pipeline_stage_lease_seconds,
 )
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
@@ -2835,7 +2836,11 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 exc_info=True,
             )
             raise
-        lease_expires_at = time.time() + 60.0
+        # ★ 2026-10-24（#117）：租约此前硬编码 60 秒。远端每个 stage 尝试只有这一段
+        #   租约，三机首次推理（冷启动 + KV 初始化 + 网络往返）必然超过它 ⇒ 租约到期
+        #   ⇒ `/api/chat` 实测 63 秒返回 `lease_expired`（60 s + 开销，完全吻合）。
+        #   改为设置（默认 300 s，见 `config.pipeline_stage_lease_seconds`）。
+        lease_expires_at = time.time() + pipeline_stage_lease_seconds()
         if request_deadline is not None:
             request_deadline.require_remaining()
             lease_expires_at = min(

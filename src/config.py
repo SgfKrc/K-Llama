@@ -455,6 +455,31 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     MODEL_SUPPLY_BUDGET_AGE_S = _env_float(
         "QLH_MODEL_SUPPLY_BUDGET_AGE_S", 300.0, min_val=5.0, max_val=3600.0,
     )
+    # ★ 2026-10-24（#117）：**Route-A stage 租约**（秒）。此前
+    #   `scheduler_pipeline.py` 硬编码 `time.time() + 60.0`，而远端每个 stage 尝试
+    #   只有这一段租约，三机首次推理（冷启动 + KV 初始化 + 网络往返）必然超过它 ⇒
+    #   租约到期 ⇒ `/api/chat` 实测 63 秒返回 `lease_expired`（60 s + 开销，完全吻合）。
+    #   做成设置，默认 300 秒。读取请用 `pipeline_stage_lease_seconds()`，见其说明。
+    PIPELINE_STAGE_LEASE_SECONDS = _env_float(
+        "QLH_PIPELINE_STAGE_LEASE_SECONDS", 300.0, min_val=5.0, max_val=86400.0,
+    )
+
+    def pipeline_stage_lease_seconds() -> float:
+        """★ 2026-10-24（#117）：**运行时**读取 Route-A stage 租约秒数。
+
+        与 `capacity_planning_mode()` 同理：本函数与各设置同处 `build_settings()` 内，
+        文件末尾才由 `globals().update(...)` 投影成模块属性，所以必须经 `globals()`
+        读模块值，否则读到函数局部旧值，覆盖（含 monkeypatch）不生效。
+        """
+        raw = (os.environ.get("QLH_PIPELINE_STAGE_LEASE_SECONDS") or "").strip()
+        if raw:
+            try:
+                value = float(raw)
+            except ValueError:
+                value = 0.0
+            if value >= 5.0:
+                return value
+        return float(globals().get("PIPELINE_STAGE_LEASE_SECONDS", PIPELINE_STAGE_LEASE_SECONDS))
 
     def capacity_planning_mode() -> str:
         """★ 2026-10-24（#117）：**运行时**读取求解器模式。
