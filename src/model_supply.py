@@ -864,7 +864,26 @@ class ModelSupplyCoordinator:
                             op_id, node_id, engine, base.get("execution_device"), base.get("capacity_bytes"),
                             base.get("reserve_bytes"), base.get("runtime_multiplier"), base.get("score"))
                 if engine == "pytorch" and device == "cuda":
-                    base["host_capacity_bytes"] = int(inventory.get("memory_available_bytes", 0))
+                    # ★ 2026-10-23（#117）：**主机内存按物理总量封顶**（默认 60%）。
+                    from config import HOST_RAM_MAX_FRACTION
+                    #   主节点还要跑别的程序，不能把"当前可用内存"整块当成可分配容量
+                    #   —— 此前实测一次供给吃掉 ~14 GB / 31.6 GB（45%）。上限取
+                    #   `min(当前可用, 物理总量 × HOST_RAM_MAX_FRACTION)`，其余留给
+                    #   系统与其他程序；总量未知时退回可用内存（保持旧行为不更差）。
+                    available_ram = int(inventory.get("memory_available_bytes", 0))
+                    total_ram = int(inventory.get("memory_total_bytes", 0) or 0)
+                    if total_ram > 0:
+                        allowed = int(total_ram * HOST_RAM_MAX_FRACTION)
+                        base["host_capacity_bytes"] = max(0, min(available_ram, allowed))
+                        base["host_capacity_source"] = "host_ram_total_x_fraction"
+                    else:
+                        base["host_capacity_bytes"] = max(0, available_ram)
+                    logger.info(
+                        "event=host_ram_budget operation=%s node=%s available_gb=%.1f "
+                        "total_gb=%.1f fraction=%.2f host_capacity_gb=%.1f",
+                        op_id, node_id, available_ram / 1024**3, total_ram / 1024**3,
+                        HOST_RAM_MAX_FRACTION, base["host_capacity_bytes"] / 1024**3,
+                    )
                 records.append(base)
             from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
             from model_supply_host_capacity import allowed_host_layer_ranges
@@ -1109,9 +1128,18 @@ class ModelSupplyCoordinator:
                     self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
                 continue
             available_sources = inventories[node_id].get("sources") or []
+            # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
+            #   源身份的核心是权重摘要 `source_model_sha256`，tokenizer 摘要是附加
+            #   校验。此前用 `entry.get("tokenizer_sha256", default)` 判等，当 worker
+            #   上报的键**存在但值为 None/""**（实测安卓那份整模 GGUF：
+            #   `read_gguf_tokenizer_sha256` 读不到元数据 ⇒ tokenizer_sha256=None）
+            #   时不会回退到默认值 ⇒ 被判"无匹配本地源" ⇒ 明明握着整模却只能从网络
+            #   以 ~0.67 MB/s 拉 4 层（实测卡 `bytes=0` 超过 10 分钟）。
+            #   现在：源没给出 tokenizer 就不据此否决它。
             matching_source = any(
                 entry.get("source_model_sha256") == sources["source_model_sha256"]
-                and entry.get("tokenizer_sha256", sources["tokenizer_sha256"]) == sources["tokenizer_sha256"]
+                and (not entry.get("tokenizer_sha256")
+                     or entry.get("tokenizer_sha256") == sources["tokenizer_sha256"])
                 for entry in available_sources)
             can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
             requested = intent.get("strategy", "auto")

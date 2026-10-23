@@ -423,6 +423,16 @@ def apply_node_config_to_env(
             features.get("task_worker_experimental_enabled"),
             overwrite=True,
         )
+    # ★ 2026-10-23（#117）：**主机内存使用上限是"一台机器一个偏好"**，不该固化成
+    #   魔法数。0.6 只是**默认建议值**：32 GB 工作站给 60% 合理，8 GB 小机器同样
+    #   比例可能太激进，且各节点（工作站 / 平板 / 手机）需要留的余量本就不同。
+    #   因此做成节点设置 —— 与上面的开发开关同一机制，写进该节点自己的
+    #   `node_config.json.features`，缺省时才回落到 `config.HOST_RAM_MAX_FRACTION`。
+    _set_env_value(
+        "QLH_HOST_RAM_MAX_FRACTION",
+        features.get("host_ram_max_fraction"),
+        overwrite=True,
+    )
     return data
 
 

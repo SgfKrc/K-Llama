@@ -407,6 +407,15 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     PIPELINE_CAPACITY_RESERVE_MB = _env_float(
         "QLH_PIPELINE_CAPACITY_RESERVE_MB", 512.0, min_val=0.0, max_val=32768.0,
     )
+    # ★ 2026-10-23（#117）：**主节点主机内存的使用上限**。`safetensors_layer_offload`
+    #   让 master 用主机内存承载层段，而主节点同时还要跑别的程序（编辑器、浏览器…），
+    #   所以不能把"当前可用内存"整块当作可分配容量 —— 此前 `host_capacity_bytes`
+    #   直接等于可用内存（实测一次供给就吃掉 ~14 GB / 31.6 GB）。
+    #   约定：K-Llama 最多使用**物理总内存的这个比例**，其余留给系统与其他程序。
+    #   上限取 `min(当前可用, 物理总内存 × 该比例)`。
+    HOST_RAM_MAX_FRACTION = _env_float(
+        "QLH_HOST_RAM_MAX_FRACTION", 0.6, min_val=0.05, max_val=0.95,
+    )
     # ★ 2026-10-03：容量求解器的默认准则是「节点数最少」（省网络开销，对普通请求合理），
     #   因此多段拓扑（如 master + 中间段 + 尾段）永远不会被选中 —— 两段总是更少。
     #   打开这个开关后，可行解之间改为**优先用尽可用节点**。验证多段链路时需要它。

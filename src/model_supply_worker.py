@@ -649,9 +649,15 @@ class ModelSupplyWorker:
         node_id = "master" if callable(role) and role() == "master" else str(self.scheduler.get_effective_node_id())
         try:
             import psutil
-            available_memory = int(psutil.virtual_memory().available)
+            virtual = psutil.virtual_memory()
+            available_memory = int(virtual.available)
+            # ★ 2026-10-23（#117）：主机内存的**物理总量**也要上报 —— 主节点的
+            #   offload 承载上限按"总量 × HOST_RAM_MAX_FRACTION"封顶（默认 60%），
+            #   而不是把当前可用内存整块交出去，否则一次供给就能吃掉大半 RAM。
+            total_memory = int(virtual.total)
         except (ImportError, OSError):
             available_memory = 0
+            total_memory = 0
         runtime = None
         if "pytorch" in engines:
             try:
@@ -674,6 +680,7 @@ class ModelSupplyWorker:
                 runtime = None
         return {"node_id": node_id, "distributed": self._distributed(),
                 "disk_free_bytes": max(0, free), "memory_available_bytes": max(0, available_memory),
+                "memory_total_bytes": max(0, total_memory),
                 "local_cut": local_cut, "engines": engines,
                 "execution_device": str(getattr(config, "DEVICE", "cpu")), "pytorch_runtime": runtime,
                 "sources": sources}
