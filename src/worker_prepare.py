@@ -588,7 +588,15 @@ class WorkerPrepareController:
                         self._candidate_phase = "failed"
                 code = getattr(exc, "reason_code", "worker_prepare_runtime_failed")
                 error = code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,256}", code) else "worker_prepare_runtime_failed"
-                logger.info("worker prepare action failed: action=%s code=%s", command.payload["action"], error)
+                # ★ 2026-10-23：原始异常必须留痕。此前只记错误码，于是
+                #   "reason_code 非法 ⇒ 降级成 worker_prepare_runtime_failed" 的真因
+                #   被彻底吞掉（实测 ROG 在 prepare [8,16) 时 297 ms 失败，日志里
+                #   没有任何堆栈，只能反推）。降级本身保持原样，只是不再丢现场。
+                logger.warning(
+                    "worker prepare action failed: action=%s code=%s raw_code=%s",
+                    command.payload["action"], error, getattr(exc, "reason_code", "<none>"),
+                    exc_info=True,
+                )
             self._send(command, self._ack(command, error=error))
 
     def check_stage(self, offer):
