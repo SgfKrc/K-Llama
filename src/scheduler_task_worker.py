@@ -628,6 +628,57 @@ class SchedulerTaskWorkerMixin:
             logger.debug("multi-position argmax capability probe failed", exc_info=True)
             return False
 
+    def _task_worker_local_cut_available(self) -> bool:
+        """True when this node can cut a layer segment out of a complete GGUF.
+
+        Mirrors `model_supply_worker`'s probe so the advertised capability and the
+        supply path can never disagree about whether cutting is possible.
+        """
+        try:
+            assets = importlib.import_module("model_supply_assets")
+            capability = getattr(assets, "local_cut_available", None)
+            if callable(capability):
+                return bool(capability())
+        except (ImportError, OSError, ValueError):
+            return False
+        try:
+            from pathlib import Path
+            return bool(importlib.util.find_spec("gguf") is not None and (
+                getattr(sys, "frozen", False)
+                or (Path(__file__).resolve().parent.parent / "scripts" / "cut_layers.py").is_file()))
+        except (ImportError, OSError, ValueError):
+            return False
+
+    def _task_worker_local_full_layers(self) -> int | None:
+        """Layer count of the installed *complete* local GGUF source, if any.
+
+        A node holding a whole GGUF can host any contiguous range, so it may join
+        the layer pool without a pre-cut segment. Only cheap header reads are
+        used (`verify_hashes=False`); nothing is hashed on this path.
+        """
+        try:
+            from pathlib import Path
+            from local_model_assets import discover_local_model_assets, _app_root
+            from relay_segment_info import read_gguf_layer_info
+            root = Path(_app_root())
+            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
+                relative = asset.get("gguf_path")
+                if not isinstance(relative, str) or not relative:
+                    continue
+                path = (root / relative).resolve()
+                if not path.is_file():
+                    continue
+                info = read_gguf_layer_info(path) or {}
+                total = info.get("n_layer")
+                if isinstance(total, int) and total > 0:
+                    return total
+        except Exception:
+            logger.debug("local full GGUF source probe failed", exc_info=True)
+        return None
+
+    def _task_worker_local_full_source_available(self) -> bool:
+        return self._task_worker_local_full_layers() is not None
+
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
         engine_schema = self._task_worker_engine_schema()
@@ -642,8 +693,28 @@ class SchedulerTaskWorkerMixin:
         full_model_identity = self._task_worker_full_model_identity(engines)
         models = [full_model_identity] if full_model_identity is not None else []
         active_layer_config = getattr(self, "_active_layer_config", None) or {}
+        # ★ 2026-10-23（已知问题记录 #117 修正）：**持有完整 GGUF 源且能本地裁层**的节点
+        #   也必须进入层段池。原判据只看「是否已有层段配置」⇒ 没有段的新节点永不广告
+        #   `layer_forward`，master 于是永不分配新段（鸡生蛋），历史上乱切的旧段因此
+        #   永远清理不掉。这是"worker 自持整模、任意切点自裁"落地的前提。
+        try:
+            host_has_model = bool(
+                getattr(self._host, "model_loaded", False)
+                or self._host.has_loaded_model()
+            )
+        except Exception:
+            host_has_model = bool(getattr(self._host, "model_loaded", False))
+        # 只在**没有在跑整模**的节点上启用自裁路径：正在整模推理的节点保持原有
+        # full_inference 语义，避免把线程池/内存同时押在两套执行路径上。
+        local_cut_only = bool(
+            not host_has_model
+            and self._task_worker_local_cut_available()
+            and self._task_worker_local_full_source_available()
+        )
         layer_worker = bool(
-            active_layer_config or getattr(self._host, "layer_range", None)
+            active_layer_config
+            or getattr(self._host, "layer_range", None)
+            or local_cut_only
         )
         layer_ranges: list[list[int]] = []
         # ★ #28：**工件身份**（「我手上有哪份权重」）与**就绪区间**（「我现在能跑哪几层」）
@@ -667,6 +738,12 @@ class SchedulerTaskWorkerMixin:
             # beside the per-artifact contract.
             layer_worker = bool(artifact.get("runtime_supported", True))
             layer_ranges.append([artifact["start"], artifact["end"]])
+        elif local_cut_only:
+            # 自裁节点没有具体段，但能承担任意连续层段 ⇒ 声明整域 [0, total)，
+            # 让容量求解按能力自由分配，而不是被历史切点绑死。
+            total = self._task_worker_local_full_layers()
+            if total:
+                layer_ranges.append([0, int(total)])
         elif layer_worker:
             layer_range = active_layer_config.get("layer_range")
             if (
