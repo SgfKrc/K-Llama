@@ -732,18 +732,20 @@ class SchedulerTaskWorkerMixin:
             # An explicitly configured but missing/corrupt GGUF must not keep
             # advertising a stale active range from the previous generation.
             layer_worker = False
-        if artifact is not None:
+        if local_cut_only:
+            # ★ 持整模 + 能自裁 ⇒ 声明整域 [0, total)，让容量求解按能力自由分配，
+            #   而不是被某个历史段绑死。已注册的段仍作为可复用工件存在，但**分发
+            #   契约**以"能承担任意连续层段"为准（否则早期乱切的段会永久固化布局）。
+            total = self._task_worker_local_full_layers()
+            if total:
+                layer_ranges.append([0, int(total)])
+            layer_worker = True
+        elif artifact is not None:
             # A registered segment is executable only for the exact manifest
             # range.  Never let a stale active config publish a second range
             # beside the per-artifact contract.
             layer_worker = bool(artifact.get("runtime_supported", True))
             layer_ranges.append([artifact["start"], artifact["end"]])
-        elif local_cut_only:
-            # 自裁节点没有具体段，但能承担任意连续层段 ⇒ 声明整域 [0, total)，
-            # 让容量求解按能力自由分配，而不是被历史切点绑死。
-            total = self._task_worker_local_full_layers()
-            if total:
-                layer_ranges.append([0, int(total)])
         elif layer_worker:
             layer_range = active_layer_config.get("layer_range")
             if (
