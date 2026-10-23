@@ -1489,6 +1489,28 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 "pipeline recovery model mismatch: expected=%s/%s actual=%s/%s",
                 expected_id, expected_type, actual_id, actual_type,
             )
+            # ★ 2026-10-23（#117）：**模型已经换了，这次恢复就没有意义**。此前只设
+            #   failure 并返回 False，而清围栏只在"恢复成功"或"本地模型替换"路径发生
+            #   ⇒ `_pipeline_recovery_pending` 永久为真 ⇒ 层配置推送在 L2054 直接
+            #   `return None` ⇒ 供给恒报 `pipeline_transaction_not_started`，用户再也
+            #   无法选模（实测：expected/actual 的 model_id 与 model_type 完全相同，
+            #   仅 `model_sha256` 因跨格式（HF 持久化 vs 当前 GGUF）而不同）。
+            #   这里主动放弃恢复并持久化失效：native 清理债仍由 cleanup ledger 持有，
+            #   不会因此丢失。
+            persisted_state = self._pipeline_recovery_state
+            if isinstance(persisted_state, dict):
+                self._pipeline_recovery_state = {
+                    **persisted_state,
+                    "phase": "invalidated",
+                    "published": False,
+                    "updated_at": time.time(),
+                }
+            try:
+                self._persist_pipeline_lifecycle_locked()
+            except Exception:
+                logger.warning("放弃恢复时持久化失败，保留围栏", exc_info=True)
+                return False
+            self._clear_pipeline_recovery_fence()
             return False
         return True
 
