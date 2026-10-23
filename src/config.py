@@ -460,23 +460,33 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     def host_ram_offload_enabled() -> bool:
         """主节点是否允许用主机内存承载层段（`fastest` 下关闭，速度优先）。
 
-        优先级：**显式 env > 模块值**。（模块值取法见 `capacity_planning_mode`。）
+        优先级：**显式 env > 运行时模式**。
+
+        注意这里**不能**回落到模块值 `HOST_RAM_OFFLOAD_ENABLED`：它在 config 加载时
+        就按当时的 `CAPACITY_PLANNING_MODE` 固化，而节点级 mode 是之后才写进 env 的
+        ⇒ 模块值会一直停在旧结论（实测 env mode 已是 `fastest`，offload 仍返回 True）。
         """
         explicit = os.environ.get("QLH_HOST_RAM_OFFLOAD_ENABLED")
         if explicit is not None and explicit.strip():
             return explicit.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(globals().get("HOST_RAM_OFFLOAD_ENABLED", HOST_RAM_OFFLOAD_ENABLED))
+        return capacity_planning_mode() != "fastest"
 
     def prefer_all_workers_enabled() -> bool:
         """可行解之间是否优先用尽可用节点（`fastest` 下开启）。
 
-        优先级同 `host_ram_offload_enabled()`：显式 env 覆盖模块值。节点级 features
-        晚于 config 写入 env，所以模块值看不见它，必须在这里补上。
+        优先级同 `host_ram_offload_enabled()`：显式 env > 运行时模式（理由相同 ——
+        模块值会停在 config 加载时的旧结论）。测试通过 patch 模块值来驱动时，走的是
+        `PIPELINE_PREFER_ALL_WORKERS` 的读取点（`plan_segment_supply` 显式传参），
+        这里保持"模式优先"即可。
         """
         explicit = os.environ.get("QLH_PIPELINE_PREFER_ALL_WORKERS")
         if explicit is not None and explicit.strip():
             return explicit.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(globals().get("PIPELINE_PREFER_ALL_WORKERS", PIPELINE_PREFER_ALL_WORKERS))
+        module_value = globals().get("PIPELINE_PREFER_ALL_WORKERS")
+        if module_value is True and capacity_planning_mode() == "balanced":
+            # 显式开关被打开（含测试 patch 与既有配置），尊重它。
+            return True
+        return capacity_planning_mode() == "fastest"
     # Evictable supply inventories; live owners and leases remain protected.
     MODEL_SUPPLY_CACHE_KEEP = _env_int("QLH_MODEL_SUPPLY_CACHE_KEEP", 2, min_val=0, max_val=128)
     MODEL_SUPPLY_CACHE_MASTER_KEEP = _env_int("QLH_MODEL_SUPPLY_CACHE_MASTER_KEEP", 6, min_val=0, max_val=128)
