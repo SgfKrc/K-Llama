@@ -2797,6 +2797,29 @@ class Scheduler(
             evidence_provenance = []
             if capacity_evidence is not None:
                 capacity_nodes, evidence_provenance = capacity_evidence.project(capacity_nodes)
+            # ★ 2026-10-23（#117）：**跨格式**主节点（PyTorch 描述器 + GGUF 层段）没有
+            #   `source_model_sha256`。求解器靠它把 worker 段的 per-layer 字节补进
+            #   部分为零的 `layer_weight_bytes`，缺了就 fail-closed 判描述器非法
+            #   （`pipeline_capacity_descriptor_invalid`，实测供给卡在 preparing）。
+            #   段的身份本来就在 `capacity_nodes` 的 `layer_artifacts` 里，在这里补上；
+            #   求解器自身的 fail-closed 判据保持不变。
+            if isinstance(descriptor, dict) and not descriptor.get("source_model_sha256"):
+                for _node in capacity_nodes or []:
+                    _sha = ""
+                    for _artifact in _node.get("layer_artifacts") or ():
+                        _sha = str(
+                            _artifact.get("source_model_sha256", "") or ""
+                        ).strip().lower()
+                        if _sha:
+                            break
+                    if _sha:
+                        descriptor = dict(descriptor)
+                        descriptor["source_model_sha256"] = _sha
+                        logger.info(
+                            "容量描述器补齐源身份: source_model_sha256=%s（取自 %s 的层段工件）",
+                            _sha[:16], _node.get("node_id"),
+                        )
+                        break
             result = solve_pipeline_capacity(
                 descriptor,
                 capacity_nodes,

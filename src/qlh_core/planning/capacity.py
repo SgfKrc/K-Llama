@@ -677,6 +677,9 @@ def _merge_source_layer_bytes(
         return descriptor
     expected_source = str(descriptor.get("source_model_sha256", "") or "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{64}", expected_source) is None:
+        # Fail-closed on purpose: with part of `layer_weight_bytes` unknown we cannot
+        # account for those layers at all. 跨格式主节点（PyTorch 描述器 + GGUF 层段）
+        # 由调用点补齐该凭据（见 `scheduler` 的容量求解入口），这里不放宽。
         raise PipelineCapacityError(
             "partial layer_weight_bytes requires source_model_sha256"
         )
