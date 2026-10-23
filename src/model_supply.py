@@ -887,8 +887,8 @@ class ModelSupplyCoordinator:
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
             from model_supply_plan_reuse import plan_segment_supply_reuse
-            def capacity_plan(*, preferred_ranges, constrain_host=True):
-                return plan_segment_supply(sources["descriptors"], records,
+            def capacity_plan(*, preferred_ranges, constrain_host=True, plan_records=None):
+                return plan_segment_supply(sources["descriptors"], plan_records or records,
                     master_engine=sources["master_engine"], alignment=sources["alignment"],
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                     runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
@@ -898,24 +898,66 @@ class ModelSupplyCoordinator:
                 source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
                 engine_by_node={record["node_id"]:record["engine"] for record in records},
                 alignment=sources["alignment"])
-            if not plan.get("admitted"):
-                # Prefer resident execution when feasible. A supported CUDA
-                # master may retry with CPU mmap ownership and one staged unit;
-                # RAM and VRAM remain independent admission domains.
-                local_runtime = inventories["master"].get("pytorch_runtime") or {}
-                local_projection = runtime_descriptors.get("master") or {}
-                if (sources["master_engine"] == "pytorch"
-                        and local_runtime.get("execution_device") == "cuda"
-                        and "safetensors_layer_offload" in local_runtime.get("materializations", [])
-                        and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
-                    resident_diagnostic = copy.deepcopy(plan.get("capacity_diagnostic"))
-                    records = [{**record, "materialization": "safetensors_layer_offload"}
-                               if record["node_id"] == "master" else record for record in records]
-                    plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
-                        planner=capacity_plan, source_model_id=sources["source_model_id"],
-                        source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
-                        engine_by_node={record["node_id"]:record["engine"] for record in records},
-                        alignment=sources["alignment"])
+            # ★ 2026-10-23（#117）：**本机 RAM 是一等承载资源，不是失败兜底**。
+            #   此前只在 resident 规划**失败之后**才尝试 `safetensors_layer_offload`
+            #   （注释原文 "Prefer resident execution when feasible"），而 resident
+            #   几乎总能"成功"，于是本机那 ~32 GB 主机内存全程闲置、层段被整体压给
+            #   远端 —— 实测 master 只拿 `[0,8)`，android 被迫扛 `[8,32)` 共 24 层，
+            #   新接入的 surface 只分到 2 层。
+            #   这里把两种物化**并列求解**，再按"本机承担更多层"选优：本机（独显 +
+            #   大内存 + 多核）算力最强，让它多跑，整体吞吐更高，也顺带把远端从
+            #   超配中解放出来。
+            local_runtime = inventories["master"].get("pytorch_runtime") or {}
+            local_projection = runtime_descriptors.get("master") or {}
+            if (sources["master_engine"] == "pytorch"
+                    and local_runtime.get("execution_device") == "cuda"
+                    and "safetensors_layer_offload" in local_runtime.get("materializations", [])
+                    and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
+                resident_plan = plan
+                resident_diagnostic = copy.deepcopy(plan.get("capacity_diagnostic"))
+                offload_records = [
+                    {**record, "materialization": "safetensors_layer_offload"}
+                    if record["node_id"] == "master" else record
+                    for record in records
+                ]
+                offload_plan = plan_segment_supply_reuse(
+                    sources["descriptors"], capacity, offload_records,
+                    planner=lambda *, preferred_ranges, constrain_host=True: capacity_plan(
+                        preferred_ranges=preferred_ranges, constrain_host=constrain_host,
+                        plan_records=offload_records),
+                    source_model_id=sources["source_model_id"],
+                    source_model_sha256=sources["source_model_sha256"],
+                    tokenizer_sha256=sources["tokenizer_sha256"],
+                    engine_by_node={record["node_id"]: record["engine"] for record in offload_records},
+                    alignment=sources["alignment"])
+
+                def _local_layers(candidate):
+                    """本机承担的层数；越大越优（本机算力最强）。"""
+                    total = 0
+                    for item in candidate.get("assignments", []) or []:
+                        if item.get("node_id") == "master":
+                            total += max(0, int(item.get("end_layer", 0)) - int(item.get("start_layer", 0)))
+                    return total
+
+                if offload_plan.get("admitted") and (
+                        not plan.get("admitted")
+                        or _local_layers(offload_plan) > _local_layers(resident_plan)):
+                    plan = offload_plan
+                    plan["resident_capacity_diagnostic"] = resident_diagnostic
+                    logger.info(
+                        "本机 RAM 参与承载: materialization=safetensors_layer_offload "
+                        "resident_local_layers=%s offload_local_layers=%s",
+                        _local_layers(resident_plan), _local_layers(offload_plan),
+                    )
+                elif resident_plan.get("admitted"):
+                    plan = resident_plan
+                    if offload_plan is not None:
+                        plan["offload_capacity_diagnostic"] = copy.deepcopy(
+                            offload_plan.get("capacity_diagnostic"))
+                else:
+                    # 两种物化都不可行：保留 offload 的诊断（它把主机内存计入，
+                    # 更接近"真正差多少"的真相）。
+                    plan = offload_plan
                     plan["resident_capacity_diagnostic"] = resident_diagnostic
             if not plan.get("admitted"):
                 diagnostic = plan["capacity_diagnostic"]
