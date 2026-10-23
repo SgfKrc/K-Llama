@@ -844,12 +844,20 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "invalid_capabilities", field,
                 "layer_artifacts must not contain duplicate layer_range values",
             )
-        if "layer_ranges" not in capabilities or set(artifact_ranges) != {
-            tuple(item) for item in capabilities.get("layer_ranges", [])
-        }:
+        # ★ 2026-10-23（#117）：`layer_ranges` 是"本节点**能承担**哪些层段"（自裁
+        #   节点声明整域 `[0, total)`），`layer_artifacts` 是"**现成**有哪些段工件"。
+        #   二者**不必相等**：要求相等会把"能自裁、且手上恰好还留着一个旧段"的节点
+        #   直接判为非法 hello。实测 ROG 在一次供给里裁出 `[8,16)` 之后，每次 hello
+        #   都 `invalid_capabilities`，供给便永远停在 `waiting_nodes`。
+        #   正确约束是**包含**：现成工件必须落在声明的可承担区间内。
+        advertised_ranges = (
+            {tuple(item) for item in capabilities.get("layer_ranges", [])}
+            if "layer_ranges" in capabilities else set()
+        )
+        if "layer_ranges" not in capabilities or not set(artifact_ranges) <= advertised_ranges:
             raise _error(
                 "invalid_capabilities", field,
-                "layer_artifacts and layer_ranges must advertise the same ranges",
+                "layer_artifacts must be a subset of layer_ranges",
             )
         if (
             "segment_mode" in capabilities

@@ -2104,7 +2104,11 @@ class Scheduler(
             logger.info(
                 "容量节点层段投影: ranges=%s budget=%s segment_mode=%s",
                 {k: v for k, v in layer_ranges_by_node.items()},
-                {k: v.get("max_layers") for k, v in layer_budget_by_node.items()},
+                # ★ 2026-10-23：打印**完整** budget，而不是只看 max_layers。
+                #   `local_cut` 决定 `layer_ranges` 是硬约束还是仅"当前已就绪"的信息
+                #   （capacity.py:918）；只打 max_layers 时，它到底是 false 还是缺失
+                #   完全不可见，排查"预置段钉死切点"时白走了一大圈。
+                layer_budget_by_node,
                 segment_mode_by_node,
             )
 
