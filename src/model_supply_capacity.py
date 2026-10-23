@@ -50,7 +50,16 @@ def _assignment_capability_matches(capabilities, assignment, query):
     expected_sha = query["artifacts"][node_id]
     artifacts = capabilities.get("layer_artifacts") or []
     models = capabilities.get("models") or []
-    if layer_range not in (capabilities.get("layer_ranges") or []):
+    # ★ 2026-10-23（#117）：自裁节点声明的是"**能承担**"的整域（如 [0, total)），
+    #   而分配给它的是其中一个子区间。精确相等会把它判成"没有广告这个段"，
+    #   供给便永远卡在 SUPPLY_RUNTIME_CAPABILITY_TIMEOUT（实测 ROG 声明 [0,32]、
+    #   分配 [8,16)，反复超时）。判据应为**区间覆盖**。
+    advertised_ranges = capabilities.get("layer_ranges") or []
+    if not any(
+        isinstance(item, (list, tuple)) and len(item) == 2
+        and item[0] <= layer_range[0] and layer_range[1] <= item[1]
+        for item in advertised_ranges
+    ):
         return False
     for artifact in artifacts:
         if (artifact.get("layer_range") != layer_range
