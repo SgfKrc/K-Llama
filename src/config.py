@@ -447,6 +447,14 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     MODEL_SUPPLY_INVENTORY_TIMEOUT_S = _env_float(
         "QLH_MODEL_SUPPLY_INVENTORY_TIMEOUT_S", 300.0, min_val=10.0, max_val=3600.0,
     )
+    # ★ 2026-10-24（#117）：**运行时准入证据的时效**（秒）。此前
+    #   `model_supply_capacity.MAX_BUDGET_AGE_SECONDS` 硬编码 30 秒，而 `local_cut`
+    #   节点要在准入前按分配区间把段裁出来（实测 3 GB 级远超 30 秒）⇒ 必然
+    #   `SUPPLY_RUNTIME_BUDGET_EXPIRED`（实测三段布局已全部 available 后仍因此失败）。
+    #   做成设置，默认与清点等待同量级（300 秒）。
+    MODEL_SUPPLY_BUDGET_AGE_S = _env_float(
+        "QLH_MODEL_SUPPLY_BUDGET_AGE_S", 300.0, min_val=5.0, max_val=3600.0,
+    )
 
     def capacity_planning_mode() -> str:
         """★ 2026-10-24（#117）：**运行时**读取求解器模式。

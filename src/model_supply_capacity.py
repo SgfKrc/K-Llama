@@ -13,7 +13,10 @@ import time
 import uuid
 
 logger = logging.getLogger(__name__)
-MAX_BUDGET_AGE_SECONDS = 30.0
+# ★ 2026-10-24（#117）：时效改为可调（默认 300 s）。此前硬编码 30 秒，而 `local_cut`
+# 节点要在准入前按分配区间把段裁出来（实测 3 GB 级远超 30 秒）⇒ 三段布局已经全部
+# `available` 之后仍会以 `SUPPLY_RUNTIME_BUDGET_EXPIRED` 失败。
+from config import MODEL_SUPPLY_BUDGET_AGE_S as MAX_BUDGET_AGE_SECONDS
 
 
 def _error(code, message):
