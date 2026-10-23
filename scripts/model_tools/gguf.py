@@ -9,7 +9,7 @@ import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 MAGIC = b"GGUF"
 MAX_STRING_BYTES = 64 * 1024 * 1024
@@ -306,8 +306,14 @@ def _read_sidecar(sidecar: Path, target: Path) -> str | None:
     return fallback
 
 
-def verify_gguf(path: str | Path, *, full_hash: bool = False) -> dict[str, Any]:
-    """Verify GGUF structure and an adjacent sha256 sidecar when present."""
+def verify_gguf(path: str | Path, *, full_hash: bool = False,
+                digest: Callable[[Path], str] | None = None) -> dict[str, Any]:
+    """Verify GGUF structure and an adjacent sha256 sidecar when present.
+
+    ``digest`` optionally supplies the content digest implementation; callers
+    that already hold a size/mtime-guarded digest may inject it so one file is
+    not re-read. The default reads the whole file, unchanged.
+    """
     target = Path(path).expanduser()
     try:
         inspection = inspect_gguf(target)
@@ -328,7 +334,7 @@ def verify_gguf(path: str | Path, *, full_hash: bool = False) -> dict[str, Any]:
                 sidecar_errors.append("conflicting sha256 sidecars")
             expected = expected or value
             sidecar_path = candidate
-    actual = _sha256(target) if (full_hash or expected) else None
+    actual = (digest or _sha256)(target) if (full_hash or expected) else None
     errors = list(inspection.get("errors", [])) + sidecar_errors
     if expected and actual and expected != actual:
         errors.append(f"sha256 mismatch: expected {expected}, actual {actual}")

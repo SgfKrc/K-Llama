@@ -13,7 +13,7 @@ import math
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DESCRIPTOR_SCHEMA_VERSION = 1
@@ -313,13 +313,18 @@ def _source_manifest_identity(root: Path) -> dict[str, str]:
     }
 
 
-def cross_format_pipeline_identity(root: Path) -> dict[str, str]:
+def cross_format_pipeline_identity(root: Path, *,
+                                   digest: Callable[[Path], str] | None = None) -> dict[str, str]:
     """Return a verified GGUF identity explicitly bound to a Safetensors tree.
 
     Merely placing a GGUF next to a Hugging Face model is not evidence that the
     two contain the same weights. This optional record binds the verified
     source manifest to one immutable converted GGUF. A present but invalid
     record fails closed instead of silently falling back to the source identity.
+
+    ``digest`` optionally supplies the target-GGUF digest implementation for a
+    caller that already holds a size/mtime-guarded digest of the same file; the
+    default re-reads the file, unchanged.
     """
 
     provenance_path = root / _CROSS_FORMAT_PROVENANCE
@@ -413,7 +418,7 @@ def cross_format_pipeline_identity(root: Path) -> dict[str, str]:
     target_tokenizer_sha256 = str(target.get("tokenizer_sha256", "") or "").lower()
     if (
         _SHA256_PATTERN.fullmatch(target_artifact_sha256) is None
-        or _sha256_file(target_path) != target_artifact_sha256
+        or (digest or _sha256_file)(target_path) != target_artifact_sha256
     ):
         raise PipelineModelDescriptorError("cross-format target GGUF digest mismatch")
     try:

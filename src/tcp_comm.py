@@ -1263,11 +1263,29 @@ class TCPServer:
         # socket.  Scheduler-side layer/config pushes must wait for this edge.
         self.on_registration_confirmed: Optional[Callable] = None
         self._control_fence: ControlFence | None = None
+        # ★ #106/#114：本集群要求 task-worker 协商的节点。主节点在加 fence 的
+        #   同一边沿写入这里，REGISTER ACK 据此带上声明；否则客户端只能靠自己的
+        #   本地实验开关猜——没开的节点永远不发 hello，而 fence 只能由 hello
+        #   解除，它的 release 债务就永远投递不出去。
+        self._task_worker_hello_required: set[str] = set()
 
     def set_control_fence(self, fence: ControlFence | None) -> None:
         if fence is not None and not isinstance(fence, ControlFence):
             raise TypeError("control fence must be a ControlFence or None")
         self._control_fence = fence
+
+    def set_task_worker_hello_required(self, client_id: str, required: bool) -> None:
+        """声明（或撤销）一次注册的 task-worker 握手要求。
+
+        每次 REGISTER 都显式覆写，因此主节点开关关闭或节点类型不符合时不会
+        残留上一次的要求。该字段只在 REGISTER ACK 的 `data` 里多带一个
+        `task_worker_hello_required`，旧客户端与 Android 忽略未知键即可。
+        """
+        with self._clients_lock:
+            if required:
+                self._task_worker_hello_required.add(str(client_id))
+            else:
+                self._task_worker_hello_required.discard(str(client_id))
 
     def _admit_inbound_control(self, msg: dict) -> None:
         _admit_inbound_control_message(msg, self._control_fence)
@@ -1403,6 +1421,13 @@ class TCPServer:
             data["client_id"] = client_id
         if reason:
             data["reason"] = reason
+        if status == "registered" and client_id:
+            with self._clients_lock:
+                requires_handshake = str(client_id) in self._task_worker_hello_required
+            if requires_handshake:
+                # 声明在先、ACK 在后：客户端在 connect() 返回前就能据它决定是否
+                # 发 hello，从而不再依赖客户端本地的实验开关（#106/#114）。
+                data["task_worker_hello_required"] = True
         fence = self._control_fence
         if status == "registered" and fence is not None and fence.enabled:
             certificate = fence.current_certificate()
@@ -2247,6 +2272,10 @@ class TCPClient:
         self._connection_generation = 0
         self._registration_epoch = 0
         self._registered = False
+        # ★ #106/#114：本代连接上协调方（REGISTER ACK）是否声明了 task-worker
+        #   协商要求。每次注册前重置、只在注册 ACK 明确声明后置位；调度侧据此
+        #   在本地实验开关关闭时也发 hello，解掉只有在 hello 后才会解开的 fence。
+        self.task_worker_hello_required = False
         self.last_register_error: str = ""
         # 注册确认等待期间，本代连接可能被别的线程（上一代心跳/接收的收尾，或显式
         # disconnect()）关闭或置换。那种情况这一代已经作废，不是一次注册失败。
@@ -2544,6 +2573,9 @@ class TCPClient:
                     with self._disconnect_callback_lock:
                         register_sock = self.sock
                         register_generation = self._connection_generation
+                    # A stale requirement from a previous coordinator must not
+                    # authorize a hello before this ACK says so.
+                    self.task_worker_hello_required = False
                     self.send_data(reg_data, MessageType.REGISTER)
 
                     # 等待注册确认
@@ -2562,6 +2594,9 @@ class TCPClient:
                                 ack_data = ack_msg.get("data", {})
                                 if ack_data.get("status") == "registered":
                                     registered = True
+                                    self.task_worker_hello_required = (
+                                        ack_data.get("task_worker_hello_required") is True
+                                    )
                                     logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
                                 else:
                                     status = ack_data.get("status") or "unknown"

@@ -849,19 +849,37 @@ class SchedulerTaskWorkerMixin:
     def _advertises_layer_forward(self) -> bool:
         return advertisement_supports(self._task_worker_engine_schema(), FORWARD_LAYERS)
 
+    def _master_requires_task_worker_hello(self, client=None) -> bool:
+        """协调方（REGISTER ACK）是否声明了 task-worker 协商要求。
+
+        ★ #106/#114：主节点在 `TASK_WORKER_EXPERIMENTAL_ENABLED` 下对每个
+        pc/android 连接加 fence，而 fence **只能**由 hello 解除。此前是否发
+        hello 完全取决于**客户端本地**的同一开关 ⇒ 没开的节点永远被 fence，
+        release 债务（outbox `state=pending, attempts=0`）永远投递不出去，
+        再经 `model_intent._retirement_state` 把整集群 `/api/models/load` 卡成
+        503。声明在 REGISTER ACK 里，旧协调方不带该字段 ⇒ 保持原行为。
+        """
+        target = client if client is not None else getattr(self, "_tcp_client", None)
+        return getattr(target, "task_worker_hello_required", False) is True
+
+    def _task_worker_handshake_required(self, client=None) -> bool:
+        """本地实验开关或协调方声明，任一成立都必须协商。"""
+        if self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+            return True
+        return self._master_requires_task_worker_hello(client)
 
     def _send_task_worker_hello(
         self, client=None, refresh_generation: int = 0,
         registration_owner: tuple | None = None,
     ) -> bool:
         """Send hello for exactly one authenticated client/epoch/socket owner."""
+        target = client or getattr(self, "_tcp_client", None)
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
-            or not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
+            or not self._task_worker_handshake_required(target)
         ):
             return False
-        target = client or getattr(self, "_tcp_client", None)
         if not target:
             return False
         message = None
@@ -945,7 +963,7 @@ class SchedulerTaskWorkerMixin:
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
-            or not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
+            or not self._task_worker_handshake_required(client)
             or not client
             or not getattr(client, "is_registered", False)
         ):

@@ -236,9 +236,28 @@ class SupplyCapacityEvidence:
         self._query = deepcopy(query)
         self._inventories = deepcopy(inventories)
 
+    def touch(self) -> None:
+        """★ 2026-10-23（#116）：把准入年龄窗口的基准推到「最后一次实际进展」。
+
+        工件传输（实测 5.4 GB、数十分钟）是供给流程的正常组成。窗口若只从证据
+        准备时刻起算，任何大工件的准入都会以 SUPPLY_RUNTIME_BUDGET_EXPIRED 失败；
+        改以「最近一次传输进展」起算后，**停滞**仍会被原样检出（窗口长度不变）。
+        """
+        self._query["started_monotonic"] = time.monotonic()
+
     def project(self, records):
         c, query = self._coordinator, self._query
         with c._condition:
+            # ★ 2026-10-23（已知问题记录 #116）：年龄检查**必须保留** —— 证据是
+            #   "一次不可变的 inventory 快照，在 solve 边界再校验一次"（类注释），
+            #   放宽会削弱"准入必须基于新鲜容量"的合同（由
+            #   test_pipeline_capacity_freshness 与 test_supply_capacity_evidence 断言）。
+            #   缺陷从来不是这个检查，而是**证据在工件传输前准备、却在传输后被使用**：
+            #   实测把 5.4 GB 层段传给 ROG 需数十分钟，于是 11:12:25 出的预算到
+            #   11:16:35 准入时必然超过 MAX_BUDGET_AGE_SECONDS ⇒ 任何大工件的供给
+            #   都以 SUPPLY_RUNTIME_BUDGET_EXPIRED 失败。
+            #   修法：传输进展即续期（touch()），窗口长度不变、基准跟随最后一次实际
+            #   进展；传输停滞超过窗口仍会正常失败。
             _validate(c, query)
             # A selection change must not reuse a budget for another manifest.
             operation = c._operations[query["operation_id"]]
@@ -344,7 +363,10 @@ def prepare_capacity_evidence(coordinator, operation_id):
                 _validate(c, query)
                 if all(node in query["replies"] for node in worker_ids):
                     inventories = {"master": local, **query["replies"]}
-                    return SupplyCapacityEvidence(c, query, inventories)
+                    evidence = SupplyCapacityEvidence(c, query, inventories)
+                    # ★ 2026-10-23（#116）：登记，以便工件传输期间续期准入窗口。
+                    c.register_capacity_evidence(operation_id, evidence)
+                    return evidence
                 remaining = MAX_BUDGET_AGE_SECONDS - (time.monotonic() - query["started_monotonic"])
                 c._condition.wait(min(remaining, 0.25))
     finally:

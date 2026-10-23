@@ -1222,9 +1222,13 @@ class Scheduler(
                     "device_info": info.device_info or {},
                 })
         manager = self._host
-        model_path = os.path.abspath(
-            getattr(manager, "_model_path", "") or ""
-        ) if manager else ""
+        # ★ 空路径必须**保持为空**：`os.path.abspath("")` 返回当前工作目录，
+        #   会让下面的 `os.walk` 递归整个工作树（实测单次 200s+，把
+        #   `/api/cluster/config` 拖成分钟级；见 `已知问题记录.md` #111）。
+        raw_model_path = (
+            (getattr(manager, "_model_path", "") or "") if manager else ""
+        )
+        model_path = os.path.abspath(raw_model_path) if raw_model_path else ""
         weight_fingerprint = []
         if model_path and os.path.isdir(model_path):
             try:
@@ -3491,11 +3495,20 @@ class Scheduler(
 
             # Arm the fence before TCPServer confirms REGISTER. Unconfirmed
             # sockets are also excluded by the generation-bound send path.
-            if (
+            task_worker_handshake_pending = (
                 self._effective_role() == "master"
                 and TASK_WORKER_EXPERIMENTAL_ENABLED
                 and data.get("node_type", "pc") in {"pc", "android"}
-            ):
+            )
+            # ★ #106/#114：fence **只能**由 task-worker HELLO 解除，所以同一个
+            #   边沿必须把"本集群要求协商"写进 REGISTER ACK。否则没开本地实验
+            #   开关的节点永远不发 hello ⇒ 它的 release 债务永远投递不出去，
+            #   并经 _retirement_state 把整集群 /api/models/load 卡成 503。
+            #   声明与加 fence 共用同一条件，两者恒等。
+            declare_handshake = getattr(self._tcp_server, "set_task_worker_hello_required", None)
+            if callable(declare_handshake):
+                declare_handshake(client_id, task_worker_handshake_pending)
+            if task_worker_handshake_pending:
                 # This callback precedes REGISTER ACK. Use the exact inbound
                 # registration epoch even while that socket is unconfirmed.
                 epoch_getter = getattr(self._tcp_server, "get_registration_peer_epoch", None)

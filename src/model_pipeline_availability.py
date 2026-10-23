@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -17,6 +18,52 @@ from relay_segment_info import read_gguf_layer_info, read_gguf_tensor_bytes, rea
 _MAX_JSON_BYTES = 8 * 1024 * 1024
 _RUNTIME_UNSUPPORTED = "SUPPLY_MODEL_RUNTIME_UNSUPPORTED"
 _FULL_SOURCE_REQUIRED = "SUPPLY_FULL_SOURCE_REQUIRED"
+
+# ★ 2026-10-23（已知问题记录 #113）：catalog 每次请求都重扫全部 GGUF 头
+#   （14 个文件、约 2370 万次 Python 级 read），只读到文件 0.05% 处却独占 4.2 s，
+#   在 TUI 5 s 轮询下被三个 CPU 消费者抢 GIL 放大到 12–14 s。这里按「文件指纹」
+#   缓存解析结果：key 含每个被读取文件的 (path, st_size, st_mtime_ns)，
+#   文件一变（大小或 mtime）即失效，因此不改变"读到的是什么"这一事实。
+#   `FormatAvailability` 是 frozen dataclass，可安全在调用方之间共享。
+_GGUF_MEMO_LOCK = threading.Lock()
+_GGUF_MEMO: dict[tuple, "FormatAvailability"] = {}
+_GGUF_MEMO_MAX = 256
+_TOKENIZER_MEMO_LOCK = threading.Lock()
+_TOKENIZER_MEMO: dict[tuple, str] = {}
+_TOKENIZER_MEMO_MAX = 64
+
+
+def _stamp(path: Path) -> tuple:
+    """(路径, 大小, mtime_ns)；不存在也留痕，避免"文件被删"读成旧缓存。"""
+    try:
+        info = path.stat()
+    except OSError:
+        return (str(path), None, None)
+    return (str(path), info.st_size, info.st_mtime_ns)
+
+
+def _gguf_artifacts(path: Path) -> tuple:
+    """`_inspect_gguf_path` 会读到的全部文件，确保 memo 不会读到过期结论。"""
+    return tuple(_stamp(candidate) for candidate in (
+        path,
+        path.with_suffix(".manifest.json"),
+        Path(str(path) + ".manifest.json"),
+        path.parent / "supply.manifest.json",
+    ))
+
+
+def _tokenizer_sha256_cached(path: Path) -> str:
+    key = _stamp(path)
+    with _TOKENIZER_MEMO_LOCK:
+        cached = _TOKENIZER_MEMO.get(key)
+    if cached is not None:
+        return cached
+    value = read_gguf_tokenizer_sha256(path)
+    with _TOKENIZER_MEMO_LOCK:
+        if len(_TOKENIZER_MEMO) >= _TOKENIZER_MEMO_MAX:
+            _TOKENIZER_MEMO.clear()
+        _TOKENIZER_MEMO[key] = value
+    return value
 
 
 class ModelPipelineAvailabilityError(ValueError):
@@ -104,6 +151,21 @@ def _inspect_hf(model: mc.ModelConfig) -> FormatAvailability:
 
 
 def _inspect_gguf_path(path: Path) -> FormatAvailability:
+    """Memoised wrapper: the answer is a pure function of the files it reads."""
+    key = _gguf_artifacts(path)
+    with _GGUF_MEMO_LOCK:
+        cached = _GGUF_MEMO.get(key)
+    if cached is not None:
+        return cached
+    result = _inspect_gguf_path_uncached(path)
+    with _GGUF_MEMO_LOCK:
+        if len(_GGUF_MEMO) >= _GGUF_MEMO_MAX:
+            _GGUF_MEMO.clear()
+        _GGUF_MEMO[key] = result
+    return result
+
+
+def _inspect_gguf_path_uncached(path: Path) -> FormatAvailability:
     info = read_gguf_layer_info(path) or {}
     model_type = canonical_pipeline_model_type(info.get("architecture"))
     total = _positive_integer(info.get("n_layer"))
@@ -160,7 +222,7 @@ def _provenance_target(model: mc.ModelConfig) -> Path | None:
                 return None
         if not resolved.is_file() or resolved.suffix.lower() != ".gguf":
             return None
-        if read_gguf_tokenizer_sha256(resolved) != target["tokenizer_sha256"]:
+        if _tokenizer_sha256_cached(resolved) != target["tokenizer_sha256"]:
             return None
         return resolved
     except (OSError, ValueError, RuntimeError):

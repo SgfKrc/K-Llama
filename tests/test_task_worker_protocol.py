@@ -593,6 +593,13 @@ def test_hello_capabilities_may_advertise_unusable_artifact_reasons():
         "layer_artifact_diagnostics"
     ] == [unreadable]
 
+    omitted_unknown_range = {
+        key: value for key, value in unreadable.items() if key != "layer_range"
+    }
+    assert hello([omitted_unknown_range]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [omitted_unknown_range]
+
     unavailable = {
         **identity_fields,
         "error_code": "fallback_storage_unavailable",

@@ -156,6 +156,15 @@ SUBTITLE_CHARS_PER_TICK = 3
 # slow cluster projection into a false "unreachable" state after five seconds.
 PAGE_READ_TIMEOUT = 15.0
 
+# ★ 2026-10-23（`docs/已知问题记录.md` #113-④）：``/api/models/intent/catalog`` 是
+#   唯一会触发主节点 GGUF 解析的重接口（冷启动 1.9–4.2 s，缓存未命中历史值
+#   12.8–13.8 s），而 ``PAGE_READ_TIMEOUT`` 只有 15 s。它不能再跟着 5 秒核心刷新
+#   走：一旦超时，服务端任务仍在跑而 TUI 已经重发 ⇒ 请求堆积、抢 GIL，把单请求
+#   从小几秒拖回 12 s（正反馈）。现在 catalog 只在「首次刷新 / 显式刷新（``r``、
+#   模型写操作收尾）/ 进入「模型」屏且数据已陈旧 / 距上次满 ``CATALOG_REFRESH_SECONDS``
+#   秒的兜底」时拉取，其余轮次复用上一次结果，语义与字段不变。
+CATALOG_REFRESH_SECONDS = 60.0
+
 #: 侧栏导航页表：(key, 页名, 一句话说明)
 PAGES: List[Tuple[str, str, str]] = [
     ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
@@ -1402,6 +1411,12 @@ class MainScreen(Screen):
         self.runtime_ready: Optional[bool] = None
         self._core_inflight = False
         self._core_refresh_pending = False
+        #: 分布式 catalog 的按需刷新状态（#113-④）：最后一次拉取时刻（单调时钟，
+        #: ``None`` = 从未拉过）与结果缓存。核心刷新只在到点时拉它。
+        self._catalog_fetched_at: Optional[float] = None
+        self._catalog_cache: Dict[str, Any] = {}
+        #: 缓存所属的后端（换端点即作废，不能让旧主节点的注册表留在屏上）。
+        self._catalog_endpoint: Optional[Tuple[str, int]] = None
         self._initial_page_data_started = False
         self._pages_inflight = False
         self._device_inflight = False
@@ -1548,7 +1563,8 @@ class MainScreen(Screen):
             + kv("port", api.port) + "\n"
             + kv("完整地址", api.base_url) + "\n"
             + kv("请求超时", f"{api.timeout:.0f} 秒") + "\n"
-            + kv("自动刷新", f"{self.app.interval:.0f} 秒（核心状态/模型注册表/资源）") + "\n"
+            + kv("自动刷新", f"{self.app.interval:.0f} 秒（核心状态/资源；分布式模型注册表"
+                            f"按需拉取，最多 {CATALOG_REFRESH_SECONDS:.0f} 秒一次）") + "\n"
             + kv("日志 Token", "已设置" if api.log_token else "未设置（聚合日志可能需要 --log-token）") + "\n"
             + kv("路由偏好", self.app.routing_preference) + "\n"
             + kv("thinking", "on" if self.app.show_thinking else "off") + "\n"
@@ -1614,7 +1630,13 @@ class MainScreen(Screen):
         self.action_reload(refresh_page=True)
 
     @work(thread=True, exclusive=True, group="main")
-    def action_reload(self, refresh_page: bool = False) -> None:
+    def action_reload(self, refresh_page: bool = False, refresh_catalog: bool = False) -> None:
+        """核心状态刷新。
+
+        ``refresh_catalog``（#113-④）只影响分布式模式：为 ``True`` 时本轮**强制**
+        重新拉 ``/models/intent/catalog``（显式刷新、模型写操作收尾），否则该重接口
+        按 ``CATALOG_REFRESH_SECONDS`` 节流，未到点复用上一次结果。
+        """
         with self._refresh_state_lock:
             if self._core_inflight:
                 self._core_refresh_pending = True
@@ -1662,7 +1684,8 @@ class MainScreen(Screen):
                     mode = status["run_mode"]
             intent = None
             if mode == "distributed":
-                registry = self.fetch_json(API_PATHS["models_intent_catalog"], timeout=PAGE_READ_TIMEOUT, api=api)
+                # #113-④：catalog 不再每 5 秒拉一次（见 distributed_catalog）。
+                registry = self.distributed_catalog(api, force=refresh_page or refresh_catalog)
                 # Current belongs to the master and can be replaced by another device,
                 # including after our previously observed operation became terminal.
                 intent = self.fetch_json(API_PATHS["models_intent_current"], timeout=PAGE_READ_TIMEOUT, api=api)
@@ -1680,7 +1703,44 @@ class MainScreen(Screen):
                 pending = self._core_refresh_pending
                 self._core_refresh_pending = False
             if pending and self.is_attached:
-                self.app.call_from_thread(self.action_reload, refresh_page)
+                self.app.call_from_thread(self.action_reload, refresh_page, refresh_catalog)
+
+    def distributed_catalog(self, api: Any, *, force: bool) -> Dict[str, Any]:
+        """分布式注册表：按需拉 ``/models/intent/catalog``，未到点复用上一次结果。
+
+        ``#113-④``：这个接口是唯一会触发主节点 GGUF 解析的重接口，而核心刷新只有
+        5 秒、``PAGE_READ_TIMEOUT`` 15 秒——超时后服务端任务仍在跑而 TUI 已重发，
+        并发堆积抢 GIL，会把单请求从小几秒拖回 12 秒。因此它被移出周期性刷新：
+
+        * ``force=True``：显式刷新（``r``）或模型写操作收尾，立刻拉；
+        * 其它轮次：距上次拉取不足 ``CATALOG_REFRESH_SECONDS`` 秒就用缓存。
+
+        成功与失败（含 15 秒超时）**都**记时，否则失败路径仍会 5 秒重发一次，
+        并发堆积照旧。返回的仍是联机拉到的同一份 dict（语义与字段不变）。
+        """
+        now = time.monotonic()
+        endpoint = (str(getattr(api, "base_url", "")), id(api))
+        if endpoint != self._catalog_endpoint:
+            force = True  # 首次或换了后端（换端点）：缓存作废，必须重新拉
+        if (not force and self._catalog_fetched_at is not None
+                and now - self._catalog_fetched_at < CATALOG_REFRESH_SECONDS):
+            return self._catalog_cache or {
+                "_error": "模型注册表尚未刷新，请按 r 或进入「模型」屏",
+                "_code": "INTENT_CATALOG_DEFERRED"}
+        registry = self.fetch_json(API_PATHS["models_intent_catalog"],
+                                   timeout=PAGE_READ_TIMEOUT, api=api)
+        self._catalog_fetched_at = now
+        self._catalog_cache = registry
+        self._catalog_endpoint = endpoint
+        return registry
+
+    def request_catalog_refresh(self) -> None:
+        """进入「模型」屏时的按需补拉（#113-④）：数据仍新鲜就不重复打主节点。"""
+        if self._catalog_fetched_at is None:
+            return  # 首轮核心刷新正在拉
+        if time.monotonic() - self._catalog_fetched_at < CATALOG_REFRESH_SECONDS:
+            return
+        self.action_reload(refresh_catalog=True)
 
     def fetch_json(self, path: str, *, timeout: Optional[float] = None,
                    api: Any = None) -> Dict[str, Any]:
@@ -1765,6 +1825,9 @@ class MainScreen(Screen):
         elif key == "models":
             if force or not self.model_aux:
                 self.load_model_aux()
+            if self.model_mode == "distributed":
+                # #113-④：注册表只在进入该屏（且已陈旧）时补拉，不再跟着核心刷新。
+                self.request_catalog_refresh()
         elif key == "cluster":
             if force or not self.cluster_aux:
                 self.load_cluster_aux()
@@ -3208,7 +3271,8 @@ class MainScreen(Screen):
         self.render_model_intent()
         self.query_one("#chat-pane", ChatPane).write_line(text)
         self.write_status(text)
-        self.action_reload()
+        # 写操作收尾必须立刻看到最新注册表/绑定，故本轮强制拉一次（#113-④）。
+        self.action_reload(refresh_catalog=True)
 
     def apply_model_intent(self, value: Dict[str, Any], *, authoritative_current: bool = False) -> None:
         # Core current reads have already passed the epoch and endpoint checks.

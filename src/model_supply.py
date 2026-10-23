@@ -187,6 +187,9 @@ class ModelSupplyCoordinator:
         self._preparing = ""
         self._prepare_cancelled = False
         self._capacity_queries: dict[str, dict] = {}
+        # ★ 2026-10-23（#116）：最近一次准入证据，供工件传输进度续期使用。
+        #   传输（可能数十分钟）是流程的正常组成，不应被读成"预算过期"。
+        self._capacity_evidence: dict[str, object] = {}
 
     @property
     def root(self) -> Path:
@@ -1174,6 +1177,22 @@ class ModelSupplyCoordinator:
     def prepare_capacity_evidence(self, op_id):
         from model_supply_capacity import prepare_capacity_evidence
         return prepare_capacity_evidence(self, op_id)
+
+    def register_capacity_evidence(self, operation_id: str, evidence) -> None:
+        """★ 2026-10-23（#116）：保留活动证据，使传输进展可以给它续期。"""
+        self._capacity_evidence[operation_id] = evidence
+        if len(self._capacity_evidence) > 32:
+            for stale in list(self._capacity_evidence)[:-32]:
+                self._capacity_evidence.pop(stale, None)
+
+    def touch_capacity_evidence(self, operation_id: str) -> None:
+        """传输有实际进展就续期；停滞超过窗口仍会被准入判为过期。"""
+        evidence = self._capacity_evidence.get(operation_id)
+        if evidence is not None:
+            evidence.touch()
+
+    def discard_capacity_evidence(self, operation_id: str) -> None:
+        self._capacity_evidence.pop(operation_id, None)
 
     def prepared_source(self, op_id) -> dict:
         self._check_master()

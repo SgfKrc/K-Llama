@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -80,6 +81,45 @@ def _sha(path: Path, cancelled: Callable[[], bool]) -> str:
             digest.update(chunk)
     _check(cancelled)
     return digest.hexdigest()
+
+
+# Bounded, process-local content-digest reuse. A digest is only reused while the
+# recorded ``st_size`` and ``st_mtime_ns`` still match, so a replaced, appended
+# or rewritten file always re-hashes. This is the same trust model already used
+# by ``model_sync.compute_file_sha256`` (and by the persisted ``model.sha256`` +
+# ``model.sha256.meta.json`` pair). It exists because one supply preparation
+# otherwise re-reads the identical 18 GB source several times. The converter and
+# quantizer double check deliberately keeps using ``_sha``.
+_DIGEST_MEMO_LIMIT = 4096
+_DIGEST_MEMO: dict[tuple[str, int, int], str] = {}
+_DIGEST_MEMO_LOCK = threading.Lock()
+
+
+def _content_sha(path: Path, cancelled: Callable[[], bool]) -> str:
+    """Rehash only when the file's size/mtime fingerprint changed."""
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    with _DIGEST_MEMO_LOCK:
+        cached = _DIGEST_MEMO.get(key)
+    if cached is not None:
+        _check(cancelled)
+        return cached
+    digest = _sha(path, cancelled)
+    with _DIGEST_MEMO_LOCK:
+        if len(_DIGEST_MEMO) >= _DIGEST_MEMO_LIMIT:
+            for stale in list(_DIGEST_MEMO)[: _DIGEST_MEMO_LIMIT // 4]:
+                _DIGEST_MEMO.pop(stale, None)
+        _DIGEST_MEMO[key] = digest
+    return digest
+
+
+def _not_cancelled() -> bool:
+    return False
+
+
+def _content_digest(path: Path) -> str:
+    """Digest callback for injected-hash APIs that have no cancellation hook."""
+    return _content_sha(path, _not_cancelled)
 
 
 def _canonical(payload: dict) -> str:
@@ -282,7 +322,7 @@ def _gguf_metadata(path: Path) -> dict:
     verify_gguf = _model_tools("gguf").verify_gguf
     from relay_segment_info import read_gguf_tokenizer_sha256
     mrv.validate_model_artifact("gguf", gguf_path=str(path))
-    report = verify_gguf(path, full_hash=True)
+    report = verify_gguf(path, full_hash=True, digest=_content_digest)
     if not report.get("valid") or not report.get("structure_valid"):
         raise ValueError("GGUF structure or SHA256 validation failed")
     tokenizer = read_gguf_tokenizer_sha256(path)
@@ -374,7 +414,7 @@ def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool
         if (isinstance(size, bool) or not isinstance(size, int) or size < 0
                 or not isinstance(digest, str) or not jobs._SHA256_RE.fullmatch(digest)):
             raise ValueError("invalid source manifest size or digest")
-        if size != path.stat().st_size or digest != _sha(path, cancelled):
+        if size != path.stat().st_size or digest != _content_sha(path, cancelled):
             raise ValueError("source manifest content changed")
         lines.append(f"{relative}\0{entry['size_bytes']}\0{entry['sha256']}")
     required = {item.relative_to(root).as_posix() for item in weights}
@@ -397,7 +437,7 @@ def _proof(root: Path, weights: list[Path], cancelled: Callable[[], bool],
     try:
         _live_manifest(root, weights, cancelled, external_files=external_files,
                        expected_identity=expected_identity)
-        identity = descriptor.cross_format_pipeline_identity(root)
+        identity = descriptor.cross_format_pipeline_identity(root, digest=_content_digest)
         if not identity:
             raise ValueError("missing cross-format identity")
         proof = _json(root / PROVENANCE)

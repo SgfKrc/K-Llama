@@ -122,6 +122,9 @@ async def supply_file(operation_id: str, node_id: str, filename: str, request: R
                         operation_id, node_id, filename, request.headers.get("X-QLH-Supply-Token", ""))
                 except ModelSupplyError:
                     return
+                # ★ 2026-10-23（#116）：真实传输进展即续期准入年龄窗口。
+                #   否则数十分钟的大工件传输必然在准入时被判为"预算过期"。
+                _api_module.scheduler._model_supply.touch_capacity_evidence(operation_id)
                 chunk = stream.read(min(1024 * 1024, remaining))
                 if not chunk:
                     return

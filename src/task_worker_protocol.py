@@ -524,14 +524,13 @@ def _validate_layer_artifact_diagnostics(value: Any) -> None:
     for index, entry in enumerate(value):
         item_field = f"{field}[{index}]"
         entry = _require_object(entry, item_field)
-        _require_exact_fields(
-            entry,
-            {
-                "error_code", "manifest", "architecture", "mode",
-                "layer_range", "artifact_present",
-            },
-            item_field,
-        )
+        expected_fields = {
+            "error_code", "manifest", "architecture", "mode",
+            "artifact_present",
+        }
+        if "layer_range" in entry:
+            expected_fields.add("layer_range")
+        _require_exact_fields(entry, expected_fields, item_field)
         error_code = _require_string(
             entry["error_code"], f"{item_field}.error_code",
             pattern=_SAFE_CODE, max_length=64,
@@ -557,7 +556,7 @@ def _validate_layer_artifact_diagnostics(value: Any) -> None:
                 "mode must be empty or one of head, middle, tail",
             )
         _require_bool(entry["artifact_present"], f"{item_field}.artifact_present")
-        layer_range = entry["layer_range"]
+        layer_range = entry.get("layer_range")
         if layer_range is None:
             continue
         if (
