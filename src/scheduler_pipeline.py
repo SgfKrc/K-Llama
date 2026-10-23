@@ -1488,10 +1488,17 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         actual_id = str(model_info.get("model_id", "") or "")
         actual_type = str(model_info.get("model_type", "") or "").lower()
         actual_sha256 = str(model_info.get("model_sha256", "") or "").lower()
+        # ★ 2026-10-23（#117）：**模型身份看 id/type，摘要不参与否决**。
+        #   持久化记录里的摘要与当前描述器的摘要来自**不同的格式域**（实测
+        #   `lifecycle.model_sha256 = d6e6d9ab…` 是 HF 侧，而当前 GGUF 侧是
+        #   `ada47e14…`），而 `model_id` / `model_type` **完全相同**
+        #   （`qwen3-5-9b` / `qwen3_5`）。这说明是**同一模型的不同量化/格式**，
+        #   不是换了模型。此前把摘要不等也算 mismatch ⇒ 恒判失败 ⇒ 层配置推送
+        #   恒 `return None` ⇒ 供给恒报 `pipeline_transaction_not_started`。
+        #   摘要不同只告警：真的换了模型时 id/type 也会变，仍会被下面拦下。
         if (
             (expected_id and actual_id != expected_id)
             or (expected_type and actual_type != expected_type)
-            or (expected_sha256 and actual_sha256 != expected_sha256)
         ):
             self._pipeline_recovery_failure = "pipeline_recovery_model_mismatch"
             logger.error(
@@ -1504,6 +1511,13 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             # 放弃 —— 本地模型替换失败的场景必须保留恢复身份，
             # `tests/test_pipeline_recovery_retirement.py` 对此有明确断言。
             return False
+        if expected_sha256 and actual_sha256 and expected_sha256 != actual_sha256:
+            # 同 id/type 但摘要不同：同一模型的不同量化或格式域，只记录不否决。
+            logger.info(
+                "pipeline recovery digest differs but identity matches: "
+                "model=%s type=%s persisted_sha=%s current_sha=%s",
+                actual_id, actual_type, expected_sha256[:16], actual_sha256[:16],
+            )
         return True
 
     def _maybe_finish_pipeline_recovery(self) -> None:
