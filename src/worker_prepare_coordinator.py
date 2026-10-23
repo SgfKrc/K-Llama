@@ -23,12 +23,62 @@ class WorkerPrepareCoordinatorMixin:
         self._abort_pipeline_load_transaction(config_id, "pipeline_prepare_cancelled", "model preparation cancelled by user")
         return True
 
+    @staticmethod
+    def _synthesize_self_cut_artifact(assignment, receipt, total_layers):
+        """Build the artifact identity that a self-cutting worker just produced.
+
+        A `local_cut` node has no pre-cut segment at planning time: the supply phase
+        cuts exactly the assigned range and reports it in the operation receipt.
+        Without this the coordinator raised `prepare_artifact_identity_missing` even
+        though the segment existed and had been verified.
+        """
+        if not isinstance(receipt, dict) or receipt.get("status") != "available":
+            return None
+        artifact_sha = str(receipt.get("artifact_sha256", "") or "")
+        manifest_sha = str(receipt.get("manifest_sha256", "") or "")
+        start = int(assignment.get("start_layer", 0) or 0)
+        end = int(assignment.get("end_layer", 0) or 0)
+        if not artifact_sha or not manifest_sha or receipt.get("layer_range") != [start, end]:
+            return None
+        total = int(total_layers or 0)
+        if start <= 0:
+            mode = "head" if 0 < end < total else "full"
+        elif total > 0 and end >= total:
+            mode = "tail"
+        else:
+            mode = "middle"
+        return {
+            "model_id": str(receipt.get("model_id", "") or ""),
+            "artifact_sha256": artifact_sha,
+            "manifest_sha256": manifest_sha,
+            "layer_range": [start, end],
+            "source_model_id": str(receipt.get("source_model_id", "") or ""),
+            "source_model_sha256": str(receipt.get("source_model_sha256", "") or ""),
+            "tokenizer_sha256": str(receipt.get("tokenizer_sha256", "") or ""),
+            "hidden_size": int(receipt.get("hidden_size", 0) or 0),
+            "segment_mode": mode,
+            "layer_weight_bytes": list(receipt.get("layer_weight_bytes") or []),
+        }
+
     def _build_worker_prepare_assignment(self, assignment, *, config_id, generation, model_info, operation_id=""):
         result = deepcopy(assignment)
         node = result["node_id"]
         artifact = result.get("layer_artifact")
+        operation = None
+        receipt = {}
+        if operation_id:
+            operation = self._model_supply.get(operation_id)
+            receipt = operation.get("nodes", {}).get(node, {})
         if not isinstance(artifact, dict):
-            raise WorkerPrepareError("prepare_artifact_identity_missing")
+            # ★ 2026-10-23（#117）：自裁节点在**分配时**没有现成工件 —— 段是供给阶段
+            #   才裁出来的（切点还可能随容量账变化，所以不能指望"分配时就持有"）。
+            #   用本次供给的**收据**合成工件身份，而不是直接判身份缺失。
+            artifact = self._synthesize_self_cut_artifact(
+                result, receipt, (model_info or {}).get("total_layers"),
+            )
+            if artifact is None:
+                raise WorkerPrepareError("prepare_artifact_identity_missing")
+            result["layer_artifact"] = artifact
         model = result.get("stage_model_identity")
         if not isinstance(model, dict):
             value = self._route_a_stage_model_identity(node, result)
@@ -37,8 +87,6 @@ class WorkerPrepareCoordinatorMixin:
             model = {key: getattr(value, key) for key in ("model_id", "engine", "format", "revision", "sha256")}
         manifest_sha = ""
         if operation_id:
-            operation = self._model_supply.get(operation_id)
-            receipt = operation.get("nodes", {}).get(node, {})
             if (operation.get("status") != "available" or receipt.get("status") != "available"
                     or receipt.get("artifact_sha256") != artifact.get("artifact_sha256")
                     or receipt.get("layer_range") != [result["start_layer"], result["end_layer"]]):
