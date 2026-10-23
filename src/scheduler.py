@@ -2830,6 +2830,13 @@ class Scheduler(
                 prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
             )
         except PipelineCapacityError as exc:
+            # ★ 2026-10-23（#117）：把**具体**原因打出来。此前调用方只记
+            #   reason_code，"描述器非法"到底是缺 total_layers、缺
+            #   source_model_sha256 还是别的，排查时完全不可见。
+            logger.warning(
+                "容量求解拒绝: reason_code=pipeline_capacity_descriptor_invalid detail=%s",
+                exc, exc_info=True,
+            )
             return {
                 "status": "rejected",
                 "admitted": False,

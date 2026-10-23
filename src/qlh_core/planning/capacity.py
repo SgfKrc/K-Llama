@@ -490,13 +490,24 @@ def _normalize_nodes(
                 total_layers=total_layers,
             )
             if "layer_ranges" in normalized:
-                advertised_ranges = set(normalized["layer_ranges"])
-                artifact_ranges = {
-                    item["layer_range"] for item in normalized["layer_artifacts"]
-                }
-                if artifact_ranges != advertised_ranges:
+                # ★ 2026-10-23（#117）：`layer_ranges` 是"**能承担**哪些层段"，
+                #   `layer_artifacts` 是"**现成**有哪些段工件" —— 二者不必相等。
+                #   自裁节点声明整域 `[0, total)`、手上可能只留着一个旧段，要求
+                #   集合相等会直接判描述器非法（实测 `node[rog-5060].layer_artifacts
+                #   and layer_ranges must match`，供给恒失败）。正确约束是**区间
+                #   覆盖**：每个现成工件都要落在声明的可承担区间内。
+                advertised_ranges = [
+                    tuple(item) for item in normalized["layer_ranges"]
+                ]
+                if not all(
+                    any(
+                        low <= item["layer_range"][0] and item["layer_range"][1] <= high
+                        for low, high in advertised_ranges
+                    )
+                    for item in normalized["layer_artifacts"]
+                ):
                     raise PipelineCapacityError(
-                        f"node[{node_id}].layer_artifacts and layer_ranges must match"
+                        f"node[{node_id}].layer_artifacts must be covered by layer_ranges"
                     )
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。
         if "layer_budget" in raw:
