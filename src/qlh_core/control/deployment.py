@@ -206,8 +206,27 @@ class DeploymentService:
                     if (not terminal_observation
                             or any(prior.get(key) != lifecycle.get(key)
                                    for key in ("config_id", "generation", "phase"))):
-                        raise ModelControlError("deployment_transition_invalid")
-                    target = previous
+                        # ★ 2026-10-23（#117）：**重新选同一个模型**会算出同样的
+                        #   确定性 `config_id`，而该 id 的旧部署已是终态
+                        #   （retired / aborted）。这是完全正常的操作，应视为**新一轮
+                        #   部署**并把状态机重置到起点；否则该 id 被永久占用，用户每次
+                        #   重新选模都拿到 409（实测 `INTENT_RETIRE_FAILED` →
+                        #   `deployment_transition_invalid` 连环失败，且因为"没有已加载
+                        #   的模型"而无法走正常的 retire 路径，形成死锁）。
+                        if target not in {"preparing", "candidate"}:
+                            raise ModelControlError("deployment_transition_invalid")
+                        deployment.update(
+                            status="candidate",
+                            boot_id=self.boot_id,
+                            created_at=self.clock(),
+                            authority=deepcopy(authority),
+                            connections=deepcopy(connections),
+                            assignments=deepcopy(expected),
+                            input_revisions=deepcopy(lifecycle.get("input_revisions", {})),
+                        )
+                        previous = "candidate"
+                    else:
+                        target = previous
                 if native and not recovery_input:
                     if frozen_assignments(deployment["assignments"]) != frozen_assignments(expected):
                         raise ModelControlError("deployment_assignment_changed")

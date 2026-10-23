@@ -295,9 +295,17 @@ class ModelIntentCoordinator:
         with self.scheduler._layer_config_lock:
             transaction = self.scheduler._pipeline_load_transaction or {}
             plan = self.scheduler._active_pipeline_capacity_plan or {}
+            # ★ 2026-10-23（#117）：**"待恢复"不等于"已发布"**。此前把
+            #   `_pipeline_recovery_pending` 也算作 published，而重启后的恢复必然因
+            #   供给身份不一致被拒（实测 `pipeline_supply_identity_mismatch:
+            #   source_model_sha256`，`selected_operation` 指向一次失败的供给）⇒
+            #   该标志永远是 True ⇒ `_retire_before_supply` 恒报"没有完成证据"
+            #   （INTENT_RETIRE_FAILED）⇒ 每次重新选模都 409；又因为"没有已加载的
+            #   模型"，正常 retire 也产生不了完成证据，形成死锁。
+            #   恢复围栏由 `retire_pipeline_recovery_for_model_change()` 清理，
+            #   不应在这里冒充发布状态。
             published = (transaction.get("phase") == "ready"
-                         or plan.get("transaction_phase") == "ready"
-                         or bool(getattr(self.scheduler, "_pipeline_recovery_pending", False)))
+                         or plan.get("transaction_phase") == "ready")
             ledger = getattr(self.scheduler, "_pipeline_model_cleanup_ledger", None)
             pending = None if ledger is None else any(
                 record.get("node_id") == "master" or record.get("node_id") in connected_for_cleanup
