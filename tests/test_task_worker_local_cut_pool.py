@@ -12,6 +12,8 @@ from scheduler import Scheduler
 
 def _capabilities(monkeypatch, *, cut: bool, layers: int | None):
     scheduler = Scheduler()
+    # 本用例正是要验证自裁路径本身，显式打开（conftest 默认关闭以保持隔离）。
+    monkeypatch.setenv("QLH_LOCAL_CUT_SELF", "1")
     monkeypatch.setattr(
         scheduler, "_host",
         SimpleNamespace(model_loaded=False, layer_range=None),

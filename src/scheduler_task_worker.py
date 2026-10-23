@@ -759,8 +759,14 @@ class SchedulerTaskWorkerMixin:
             host_has_model = bool(getattr(self._host, "model_loaded", False))
         # 只在**没有在跑整模**的节点上启用自裁路径：正在整模推理的节点保持原有
         # full_inference 语义，避免把线程池/内存同时押在两套执行路径上。
+        # `QLH_LOCAL_CUT_SELF=0` 可显式关闭自裁广告（测试默认关闭：该判据要探测
+        # 本地完整 GGUF 源，而开发机 `models/` 里就有整模，否则每个用例都会被
+        # 误判成自裁节点）。生产侧默认开启，无需配置。
         local_cut_only = bool(
             not host_has_model
+            and not os.environ.get("QLH_LAYER_GGUF", "").strip()
+            and os.environ.get("QLH_LOCAL_CUT_SELF", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
             and self._task_worker_local_cut_available()
             and self._task_worker_local_full_source_available()
         )

@@ -230,6 +230,13 @@ def test_supply_capabilities_reject_mixed_engine_format(tiny_supply, engine, fmt
 @pytest.mark.parametrize("full_loaded", [False, True])
 def test_metadata_only_architecture_does_not_advertise_layer_forward(tiny_supply, monkeypatch, full_loaded):
     tiny_supply.activate(2)
+    # ★ 2026-10-23（#117）：自裁判据会扫真实的 `models/` 目录（开发机上有完整
+    #   GGUF）⇒ 会把 fixture 节点误判成自裁节点。该用例关心的是"架构元数据不足以
+    #   广告层段"，显式关闭自裁探测以保持与真实文件系统隔离。
+    monkeypatch.setattr(
+        tiny_supply.scheduler, "_task_worker_local_full_source_available",
+        lambda: False,
+    )
     full_identity = ModelIdentity(model_id="full-model", engine="pytorch", format="safetensors",
                                   revision="1", sha256="a" * 64)
     if full_loaded:

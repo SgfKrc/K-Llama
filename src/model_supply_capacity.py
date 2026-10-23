@@ -144,9 +144,22 @@ def project_inventory_capacity(record, inventory, engine, *, source_prefix="inve
     if type(available) is not int or available <= 0:
         raise _error("SUPPLY_RUNTIME_BUDGET_MISSING", f"Selected runtime on {node_id} has no positive free-memory sample")
     source = runtime_capacity_source(runtime, device, prefix=source_prefix)
+    # ★ 2026-10-23（#117）：×2.0 只适用于**未投影**的执行描述符（本函数自己的
+    #   约定，见 docstring）—— PyTorch 在 CPU 上把 fp16 权重展开成 fp32，所以按
+    #   描述符字节算完必须翻倍。GGUF 段是 `gguf_segment` 物化：按**原生量化宽度**
+    #   （Q4_K_M）就地使用、不 upcast，字节账已经是执行宽度，再乘 2 会把 5.78GB 的
+    #   整模算成 11.6GB ⇒ 三机容量账凭空减半（实测 rog 只算得出 2 层、android 13
+    #   层、master 8 层，合计 23 < 32）⇒ 求解器永远搜不出可行解，`waiting_nodes`
+    #   每 20~30 秒重算一次直到超时。
+    supplied_spec = record.get("load_spec")
+    projected = (
+        isinstance(supplied_spec, dict)
+        and str(supplied_spec.get("materialization", "") or "") == "gguf_segment"
+    )
+    runtime_multiplier = 1.0 if (device == "cuda" or projected) else 2.0
     result = {**deepcopy(record), "capacity_bytes": available, "capacity_source": source,
               "execution_device": device, "engine": engine,
-              "runtime_multiplier": 1.0 if device == "cuda" else 2.0}
+              "runtime_multiplier": runtime_multiplier}
     if device == "cuda" and isinstance(runtime.get("budget_observations"), dict):
         result["capacity_observations"] = deepcopy(runtime["budget_observations"])
     if "load_spec" in result:

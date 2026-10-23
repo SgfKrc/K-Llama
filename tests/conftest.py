@@ -213,6 +213,11 @@ def _isolate_local_store(tmp_path):
         with pytest.MonkeyPatch.context() as isolation:
             for name, value in _persistence_environment(tmp_path).items():
                 isolation.setenv(name, value)
+            # ★ 2026-10-23（#117）：自裁节点的判据要探测本地完整 GGUF 源，而开发机的
+            #   `models/` 里就有整模 ⇒ 每个用例都会被误判成自裁节点，层段能力与
+            #   stage_types 断言随之全线失败。默认关闭该探测；需要自裁行为的用例
+            #   自行 `monkeypatch.setenv("QLH_LOCAL_CUT_SELF", "1")` 打开。
+            isolation.setenv("QLH_LOCAL_CUT_SELF", "0")
             import local_store
             import config
 
