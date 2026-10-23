@@ -810,8 +810,15 @@ class ModelSupplyCoordinator:
                 if not engine:
                     raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No compatible source for {node_id}")
                 if engine == "llama_cpp":
+                    # ★ 2026-10-23（#117）：**自裁节点按原生量化宽度物化**。GGUF 段是
+                    #   从整模按原生 Q4_K_M 直接切出来的，worker 侧没有 fp16→fp32 的
+                    #   投影，所以不该乘 2。此前对 llama_cpp 一律硬编码
+                    #   `runtime_multiplier=2.0`，把自裁 worker 的可用内存凭空减半
+                    #   ⇒ 三机只凑得出 18 层 < 32 ⇒ 求解器恒无解、`waiting_nodes`
+                    #   反复空转。非自裁路径保留既有倍率，避免改动无关行为。
+                    multiplier = 1.0 if inventory.get("local_cut") else 2.0
                     base.update(capacity_bytes=int(inventory.get("memory_available_bytes", 0)),
-                                capacity_source="supply.ram.available_bytes_live", execution_device="cpu", runtime_multiplier=2.0)
+                                capacity_source="supply.ram.available_bytes_live", execution_device="cpu", runtime_multiplier=multiplier)
                 if engine == "pytorch":
                     from model_supply_runtime_capacity import project_runtime_descriptor
                     runtime = inventory.get("pytorch_runtime")
