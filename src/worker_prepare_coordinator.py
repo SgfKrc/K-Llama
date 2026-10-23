@@ -24,13 +24,18 @@ class WorkerPrepareCoordinatorMixin:
         return True
 
     @staticmethod
-    def _synthesize_self_cut_artifact(assignment, receipt, total_layers):
+    def _synthesize_self_cut_artifact(assignment, receipt, total_layers, capabilities=None):
         """Build the artifact identity that a self-cutting worker just produced.
 
         A `local_cut` node has no pre-cut segment at planning time: the supply phase
         cuts exactly the assigned range and reports it in the operation receipt.
         Without this the coordinator raised `prepare_artifact_identity_missing` even
         though the segment existed and had been verified.
+
+        The receipt carries the new segment's digests, but **source identity is a
+        property of the model, not of the range** — so `source_model_sha256` /
+        `tokenizer_sha256` / `source_model_id` / `hidden_size` are taken from whatever
+        artifact the worker advertises (its range may be stale; its source is not).
         """
         if not isinstance(receipt, dict) or receipt.get("status") != "available":
             return None
@@ -40,6 +45,16 @@ class WorkerPrepareCoordinatorMixin:
         end = int(assignment.get("end_layer", 0) or 0)
         if not artifact_sha or not manifest_sha or receipt.get("layer_range") != [start, end]:
             return None
+
+        def _field(name):
+            value = receipt.get(name)
+            if value not in (None, "", 0):
+                return value
+            for item in (capabilities or {}).get("layer_artifacts") or ():
+                if isinstance(item, dict) and item.get(name) not in (None, "", 0):
+                    return item[name]
+            return value
+
         total = int(total_layers or 0)
         if start <= 0:
             mode = "head" if 0 < end < total else "full"
@@ -48,14 +63,14 @@ class WorkerPrepareCoordinatorMixin:
         else:
             mode = "middle"
         return {
-            "model_id": str(receipt.get("model_id", "") or ""),
+            "model_id": str(_field("model_id") or ""),
             "artifact_sha256": artifact_sha,
             "manifest_sha256": manifest_sha,
             "layer_range": [start, end],
-            "source_model_id": str(receipt.get("source_model_id", "") or ""),
-            "source_model_sha256": str(receipt.get("source_model_sha256", "") or ""),
-            "tokenizer_sha256": str(receipt.get("tokenizer_sha256", "") or ""),
-            "hidden_size": int(receipt.get("hidden_size", 0) or 0),
+            "source_model_id": str(_field("source_model_id") or ""),
+            "source_model_sha256": str(_field("source_model_sha256") or ""),
+            "tokenizer_sha256": str(_field("tokenizer_sha256") or ""),
+            "hidden_size": int(_field("hidden_size") or 0),
             "segment_mode": mode,
             "layer_weight_bytes": list(receipt.get("layer_weight_bytes") or []),
         }
@@ -75,6 +90,7 @@ class WorkerPrepareCoordinatorMixin:
             #   用本次供给的**收据**合成工件身份，而不是直接判身份缺失。
             artifact = self._synthesize_self_cut_artifact(
                 result, receipt, (model_info or {}).get("total_layers"),
+                capabilities=(self._task_worker_control.worker_snapshot(node) or {}).get("capabilities") or {},
             )
             if artifact is None:
                 # ★ 2026-10-23（#117）：合成失败必须留现场 —— 收据里到底是状态、
@@ -113,7 +129,7 @@ class WorkerPrepareCoordinatorMixin:
         from qlh_core.planning.load_spec import assignment_load_spec
         spec = assignment_load_spec(result, artifact_format=model["format"])
         result.update(load_spec=spec.to_dict(), context_size=spec.context_size)
-        identity = validate_identity({
+        identity_input = {
             "load_spec_digest": spec.digest,
             "operation_id": operation_id or "prepare_" + config_id,
             "config_id": config_id, "generation": generation,
@@ -126,7 +142,28 @@ class WorkerPrepareCoordinatorMixin:
             "layer_range": [result["start_layer"], result["end_layer"]],
             "total_layers": model_info["total_layers"], "hidden_size": artifact.get("hidden_size", 0),
             "segment_mode": artifact.get("segment_mode", ""),
-        })
+        }
+        try:
+            identity = validate_identity(identity_input)
+        except WorkerPrepareError as _exc:
+            # ★ 2026-10-23（#117）：身份被拒时必须能看到**具体哪个字段**不合规 ——
+            #   该判据有十余个抛点，此前只有一个错误码，自裁路径上白绕了好几轮。
+            logger.warning(
+                "prepare identity rejected: code=%s node=%s range=%s "
+                "model_id=%r model_sha=%r artifact_sha=%r manifest_sha=%r "
+                "source_model_id=%r source_model_sha=%r tokenizer_sha=%r "
+                "total_layers=%r hidden_size=%r segment_mode=%r stage_model=%s",
+                _exc.reason_code, node, identity_input["layer_range"],
+                identity_input["model_id"], str(identity_input["model_sha256"])[:16],
+                str(identity_input["artifact_sha256"])[:16],
+                str(identity_input["manifest_sha256"])[:16],
+                identity_input["source_model_id"],
+                str(identity_input["source_model_sha256"])[:16],
+                str(identity_input["tokenizer_sha256"])[:16],
+                identity_input["total_layers"], identity_input["hidden_size"],
+                identity_input["segment_mode"], model,
+            )
+            raise
         result.update(config_id=config_id, generation=generation, assignment_id=identity["assignment_id"],
                       phase="prepare", worker_prepare_identity=identity, prepare_identity=stage_identity(identity),
                       plan_id=assignment.get("plan_id", ""))
