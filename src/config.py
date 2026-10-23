@@ -440,6 +440,14 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
         "QLH_PIPELINE_PREFER_ALL_WORKERS", CAPACITY_PLANNING_MODE == "fastest",
     )
 
+    # ★ 2026-10-24（#117）：**清点阶段的等待上限**（秒）。此前 `model_supply.py` 里
+    #   硬编码 `min(90, ...)`，而"未登记候选"的本地源核对需要对整模做一次全量
+    #   sha256（5.78 GB，实测 90~120 s）⇒ 首次清点必然 `SUPPLY_WORKER_TIMEOUT`。
+    #   做成设置，默认放宽到 300 秒；缓存命中后后续清点只需毫秒级。
+    MODEL_SUPPLY_INVENTORY_TIMEOUT_S = _env_float(
+        "QLH_MODEL_SUPPLY_INVENTORY_TIMEOUT_S", 300.0, min_val=10.0, max_val=3600.0,
+    )
+
     def capacity_planning_mode() -> str:
         """★ 2026-10-24（#117）：**运行时**读取求解器模式。
 

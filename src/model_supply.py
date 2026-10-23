@@ -574,8 +574,13 @@ class ModelSupplyCoordinator:
                     self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
                                                "source_model_sha256": ""})
                 for node_id in added:
+                    # ★ 2026-10-24（#117）：清点等待做成设置（默认 300 s）。此前硬编码
+                    #   90 s，而"未登记候选"的本地源核对要对整模做一次全量 sha256
+                    #   （5.78 GB，实测 90~120 s）⇒ 首次清点必然 SUPPLY_WORKER_TIMEOUT。
+                    from config import MODEL_SUPPLY_INVENTORY_TIMEOUT_S
                     inventory = self._wait(op_id, node_id, "inventory_result",
-                                           min(90, max(0, deadline - time.monotonic())))
+                                           min(MODEL_SUPPLY_INVENTORY_TIMEOUT_S,
+                                               max(0, deadline - time.monotonic())))
                     if not inventory.get("distributed"):
                         raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
                     with self._condition:
