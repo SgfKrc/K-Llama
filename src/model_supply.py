@@ -541,6 +541,8 @@ class ModelSupplyCoordinator:
     def _extend_auto_inventory(self, op_id, intent, worker_ids, nodes, inventories, deadline, *,
                                wait_for_new=False, capacity_diagnostic=None):
         """Extend only the unpublished automatic pool, using the live join owners."""
+        # ★ 2026-10-24（#117）：本函数内的清点等待也用同一上限（见 `_execute` 顶部注释）。
+        from config import MODEL_SUPPLY_INVENTORY_TIMEOUT_S
         expanded = False
         next_refresh = time.monotonic() + 1.0
         while True:
@@ -577,7 +579,6 @@ class ModelSupplyCoordinator:
                     # ★ 2026-10-24（#117）：清点等待做成设置（默认 300 s）。此前硬编码
                     #   90 s，而"未登记候选"的本地源核对要对整模做一次全量 sha256
                     #   （5.78 GB，实测 90~120 s）⇒ 首次清点必然 SUPPLY_WORKER_TIMEOUT。
-                    from config import MODEL_SUPPLY_INVENTORY_TIMEOUT_S
                     inventory = self._wait(op_id, node_id, "inventory_result",
                                            min(MODEL_SUPPLY_INVENTORY_TIMEOUT_S,
                                                max(0, deadline - time.monotonic())))
@@ -602,7 +603,8 @@ class ModelSupplyCoordinator:
                                                "source_model_sha256": ""})
                 for node_id in worker_ids:
                     refreshed[node_id] = self._wait(op_id, node_id, "inventory_result",
-                                                   min(90, max(0, deadline - time.monotonic())))
+                                                   min(MODEL_SUPPLY_INVENTORY_TIMEOUT_S,
+                                                       max(0, deadline - time.monotonic())))
                     if not refreshed[node_id].get("distributed"):
                         raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
                 with self._condition:
@@ -729,6 +731,10 @@ class ModelSupplyCoordinator:
             self._cancel_receivers(op_id, list(self.get(op_id)["nodes"]))
 
     def _execute(self, op_id):
+        # ★ 2026-10-24（#117）：清点等待上限在此统一取一次，供本函数内所有
+        #   `inventory_result` 等待点使用（此前是散落的硬编码 90 秒，且改了一处漏了
+        #   另一处 ⇒ 主路径仍超时）。
+        from config import MODEL_SUPPLY_INVENTORY_TIMEOUT_S
         self._check(op_id)
         intent = self.get(op_id)["intent"]
         self._update(op_id, status="inspecting")
@@ -767,8 +773,12 @@ class ModelSupplyCoordinator:
             self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
                                      "source_model_sha256": ""})
         inventories = {"master": self.scheduler._model_supply_worker.inventory(model_id=intent["model_id"])}
+        # ★ 2026-10-24（#117）：这条**主路径**此前也硬编码 90 秒，而"未登记候选"的
+        #   本地源核对要对整模做一次全量 sha256（5.78 GB，实测 90~120 s）⇒ 首次清点
+        #   必然 SUPPLY_WORKER_TIMEOUT。与上面那处一起用同一设置（函数顶部已取）。
         for node_id in worker_ids:
-            inventories[node_id] = self._wait(op_id, node_id, "inventory_result", 90)
+            inventories[node_id] = self._wait(op_id, node_id, "inventory_result",
+                                              MODEL_SUPPLY_INVENTORY_TIMEOUT_S)
             if not inventories[node_id].get("distributed"):
                 raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
         want_gguf = intent.get("engine") != "pytorch" or any(
