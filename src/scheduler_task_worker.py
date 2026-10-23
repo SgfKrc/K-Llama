@@ -679,6 +679,59 @@ class SchedulerTaskWorkerMixin:
     def _task_worker_local_full_source_available(self) -> bool:
         return self._task_worker_local_full_layers() is not None
 
+    def _task_worker_local_full_source_bytes(self) -> int:
+        """Size of the installed complete local GGUF source, 0 when absent."""
+        try:
+            from pathlib import Path
+            from local_model_assets import discover_local_model_assets, _app_root
+            root = Path(_app_root())
+            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
+                relative = asset.get("gguf_path")
+                if not isinstance(relative, str) or not relative:
+                    continue
+                path = (root / relative).resolve()
+                if path.is_file():
+                    return int(path.stat().st_size)
+        except Exception:
+            logger.debug("local full GGUF size probe failed", exc_info=True)
+        return 0
+
+    def _task_worker_local_cut_layer_budget(self) -> dict | None:
+        """Device-advertised layer budget, mirroring Android's computeLayerBudget.
+
+        `layer_ranges=[[0, total]]` says "I can take any range" but **not** how many
+        layers this node can actually hold. Without the budget the solver hands the
+        node everything and only rejects it afterwards: 实测 rog 被分 [8,32)、预算
+        11.4GB、缺口 5.65GB，`waiting_nodes` 因此每 20~30 秒重算一次（白烧 4 分钟），
+        而空闲 9.6GB 的 android 反而一个层段都拿不到。
+        """
+        total = self._task_worker_local_full_layers()
+        size = self._task_worker_local_full_source_bytes()
+        if not total or not size:
+            return None
+        try:
+            import psutil
+
+            available = int(psutil.virtual_memory().available)
+        except (ImportError, OSError):
+            return None
+        if available <= 0:
+            return None
+        per_layer = int(size) // int(total)
+        if per_layer <= 0:
+            return None
+        # 与 Android 同系数：留 40% 给 KV 缓存与运行时。
+        budget_bytes = int(available * 0.6)
+        max_layers = budget_bytes // per_layer
+        if max_layers <= 0:
+            return None
+        return {
+            "available_bytes": budget_bytes,
+            "per_layer_bytes": per_layer,
+            "max_layers": int(max_layers),
+            "local_cut": True,
+        }
+
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
         engine_schema = self._task_worker_engine_schema()
@@ -804,6 +857,9 @@ class SchedulerTaskWorkerMixin:
             layer_ranges = []
         if not stage_types:
             stage_types = ["aggregate"]
+        local_cut_budget = (
+            self._task_worker_local_cut_layer_budget() if local_cut_only else None
+        )
         capabilities = {
             "engine_capabilities": engine_schema,
             "load_spec_version": 1,
@@ -819,6 +875,17 @@ class SchedulerTaskWorkerMixin:
             "layer_worker": layer_worker,
             # Exact registered/assigned ranges, without a loaded-ready ACK.
             "layer_ranges": layer_ranges,
+            # ★ 2026-10-23（#117）：自裁节点必须**同时**声明能装几层。只给
+            #   `layer_ranges=[[0,total]]` 等于宣称"我什么都能接"却不报上限，求解器
+            #   会先把它喂满（[8,32)）再事后按容量排除，于是算不出可行解、
+            #   `waiting_nodes` 每 20~30 秒重算一次。字段语义与 Android 的
+            #   `computeLayerBudget` 一致：`max_layers` 是承载上界，`local_cut=true`
+            #   表示"可按分配在本地裁层"（capacity.py 据此把 layer_ranges 降级为
+            #   "当前已就绪"的信息而非硬约束）。
+            **(
+                {"layer_budget": local_cut_budget}
+                if local_cut_budget is not None else {}
+            ),
             # ★ 2026-10-08（DIST-NEXT-2b）：声明**能接收分片 hidden**。接收侧
             #   （`_handle_task_worker_stage_chunk` + `hidden_ref` 装配）早已实现，但此前
             #   没有任何声明处 —— 于是 provider 的 `_maybe_send_stage_chunks` 直接跳过
