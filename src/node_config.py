@@ -433,6 +433,25 @@ def apply_node_config_to_env(
         features.get("host_ram_max_fraction"),
         overwrite=True,
     )
+    # ★ 2026-10-23（#117）：求解器默认准则是「节点数最少」，于是"本机 + 尾段"两段
+    #   永远胜过"本机 + 中间段 + 尾段"，多段拓扑（哪怕它更省内存、更容易复用已裁好
+    #   的段）永不被选中 —— 实测 surface 明明能承担 31 层却一分未得。
+    #   这是个**调度偏好**，做成节点设置：打开后可行解之间优先用尽可用节点。
+    _set_env_value(
+        "QLH_PIPELINE_PREFER_ALL_WORKERS",
+        features.get("pipeline_prefer_all_workers"),
+        overwrite=True,
+    )
+    # ★ 2026-10-24（#117）：**容量求解器模式是一台机器的使用意图**，不该靠散落的布尔
+    #   开关组合。`balanced`（默认，资源优先/均衡负载）或 `fastest`（速度优先：只用
+    #   显存、优先用尽节点、偏向算力最强）。它同时决定 `HOST_RAM_OFFLOAD_ENABLED` 与
+    #   `PIPELINE_PREFER_ALL_WORKERS` 的默认值，所以应在它们之前设置（node_config 在
+    #   进程最早期加载，此处按需覆盖）。
+    _set_env_value(
+        "QLH_CAPACITY_PLANNING_MODE",
+        features.get("capacity_planning_mode"),
+        overwrite=True,
+    )
     return data
 
 

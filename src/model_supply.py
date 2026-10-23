@@ -103,8 +103,8 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
     except RuntimeCapacityProjectionError as exc:
         raise ModelSupplyError(exc.code, exc.message) from exc
     if prefer_all_workers is None:
-        from config import PIPELINE_PREFER_ALL_WORKERS
-        prefer_all_workers = PIPELINE_PREFER_ALL_WORKERS
+        from config import prefer_all_workers_enabled
+        prefer_all_workers = prefer_all_workers_enabled()
     if type(prefer_all_workers) is not bool:
         raise ModelSupplyError("SUPPLY_PLACEMENT_POLICY_INVALID", "prefer_all_workers must be a boolean")
     reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
@@ -921,14 +921,19 @@ class ModelSupplyCoordinator:
             #   此前只在 resident 规划**失败之后**才尝试 `safetensors_layer_offload`
             #   （注释原文 "Prefer resident execution when feasible"），而 resident
             #   几乎总能"成功"，于是本机那 ~32 GB 主机内存全程闲置、层段被整体压给
-            #   远端 —— 实测 master 只拿 `[0,8)`，android 被迫扛 `[8,32)` 共 24 层，
-            #   新接入的 surface 只分到 2 层。
-            #   这里把两种物化**并列求解**，再按"本机承担更多层"选优：本机（独显 +
-            #   大内存 + 多核）算力最强，让它多跑，整体吞吐更高，也顺带把远端从
-            #   超配中解放出来。
+            #   远端 —— 实测 master 只拿 `[0,8)`，android 被迫扛 `[8,32)` 共 24 层。
+            #   这里把两种物化**并列求解**，再按"本机承担更多层"选优。
+            # ★ 2026-10-24（#117）：**但 offload 会显著拖慢推理** —— 权重放在主机内存
+            #   时每步前向都要跨 PCIe 搬运，实测 master 以 offload 扛 28 层时每 token
+            #   约 5 秒（master 成了串行瓶颈），而 17-18 点 resident（master 只占 8 层）
+            #   的三机明显更快。所以是否启用由 `CAPACITY_PLANNING_MODE` 决定：
+            #   `balanced` 允许（资源优先），`fastest` 关闭（速度优先）。
             local_runtime = inventories["master"].get("pytorch_runtime") or {}
             local_projection = runtime_descriptors.get("master") or {}
-            if (sources["master_engine"] == "pytorch"
+            # 运行时读（节点级 `capacity_planning_mode` 在 config 之后才写入 env）。
+            from config import host_ram_offload_enabled
+            if (host_ram_offload_enabled()
+                    and sources["master_engine"] == "pytorch"
                     and local_runtime.get("execution_device") == "cuda"
                     and "safetensors_layer_offload" in local_runtime.get("materializations", [])
                     and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):

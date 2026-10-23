@@ -2763,7 +2763,9 @@ class Scheduler(
                 "model_type": str(descriptor.get("model_type", "") or ""),
                 "assignments": [],
             }
-        from config import PIPELINE_CAPACITY_SAFETY_MARGIN, PIPELINE_PREFER_ALL_WORKERS
+        from config import PIPELINE_CAPACITY_SAFETY_MARGIN, prefer_all_workers_enabled
+        # ★ 2026-10-24（#117）：运行时读 —— 节点级 features 晚于 config 写入 env。
+        PIPELINE_PREFER_ALL_WORKERS = prefer_all_workers_enabled()
 
         # ★ Y 档第二条：relay 段认领的层由远端段执行 ⇒ 本机层节点的容量上界是 `k`
         #   （未被认领的前缀）。这里复用调度层的**同一套校验**（重叠 / 角色 / 连续性）；

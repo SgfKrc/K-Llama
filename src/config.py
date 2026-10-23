@@ -419,7 +419,64 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     # ★ 2026-10-03：容量求解器的默认准则是「节点数最少」（省网络开销，对普通请求合理），
     #   因此多段拓扑（如 master + 中间段 + 尾段）永远不会被选中 —— 两段总是更少。
     #   打开这个开关后，可行解之间改为**优先用尽可用节点**。验证多段链路时需要它。
-    PIPELINE_PREFER_ALL_WORKERS = _env_bool("QLH_PIPELINE_PREFER_ALL_WORKERS", False)
+    # ★ 2026-10-24（#117）：**容量求解器模式**。此前"节点数最少 vs 用尽节点""是否用
+    #   主机内存承载"是散落的布尔开关，语义不成体系。收敛成一个模式：
+    #     balanced（默认）：资源优先 —— 允许 `safetensors_layer_offload` 用主机内存
+    #                        承载，节点数最少（省网络往返），适合常驻/均衡负载。
+    #     fastest          ：速度优先 —— 只用显存（resident，避免每步跨 PCIe 从主机
+    #                        内存搬运权重），优先用尽节点并偏向算力最强的节点。
+    #   实测依据：`balanced` 下 master 以 offload 扛 28 层时每 token 约 5 秒（master
+    #   成了串行瓶颈）；17-18 点三机很快的那次是 resident（master 只占 8 层）。
+    CAPACITY_PLANNING_MODE = _env_first(
+        "QLH_CAPACITY_PLANNING_MODE", default="balanced",
+    ).strip().lower()
+    if CAPACITY_PLANNING_MODE not in {"balanced", "fastest"}:
+        CAPACITY_PLANNING_MODE = "balanced"
+    #: 主节点是否允许用主机内存承载层段（`fastest` 下关闭，换取每步全显存前向）。
+    HOST_RAM_OFFLOAD_ENABLED = _env_bool(
+        "QLH_HOST_RAM_OFFLOAD_ENABLED", CAPACITY_PLANNING_MODE != "fastest",
+    )
+    PIPELINE_PREFER_ALL_WORKERS = _env_bool(
+        "QLH_PIPELINE_PREFER_ALL_WORKERS", CAPACITY_PLANNING_MODE == "fastest",
+    )
+
+    def capacity_planning_mode() -> str:
+        """★ 2026-10-24（#117）：**运行时**读取求解器模式。
+
+        `node_config.json` 的 features 是在 `config` 模块**之后**才写进 env 的
+        （`api_server.py:70` 先 `import config`，`:195` 才 `load_node_config`），所以
+        模块级的 `CAPACITY_PLANNING_MODE` 看不到节点级设置。这里按需重读 env。
+
+        注意：本函数与各设置同处 `build_settings()` 内，文件末尾才
+        `globals().update(build_settings())` 把它们投影成模块属性。因此这里必须经
+        `globals()` 读**模块值**，否则读到的是函数局部旧值，`monkeypatch.setattr(config,
+        ...)` 之类的覆盖不会生效。
+        """
+        mode = (os.environ.get("QLH_CAPACITY_PLANNING_MODE") or "").strip().lower()
+        if mode in {"balanced", "fastest"}:
+            return mode
+        return str(globals().get("CAPACITY_PLANNING_MODE", CAPACITY_PLANNING_MODE)).strip().lower()
+
+    def host_ram_offload_enabled() -> bool:
+        """主节点是否允许用主机内存承载层段（`fastest` 下关闭，速度优先）。
+
+        优先级：**显式 env > 模块值**。（模块值取法见 `capacity_planning_mode`。）
+        """
+        explicit = os.environ.get("QLH_HOST_RAM_OFFLOAD_ENABLED")
+        if explicit is not None and explicit.strip():
+            return explicit.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(globals().get("HOST_RAM_OFFLOAD_ENABLED", HOST_RAM_OFFLOAD_ENABLED))
+
+    def prefer_all_workers_enabled() -> bool:
+        """可行解之间是否优先用尽可用节点（`fastest` 下开启）。
+
+        优先级同 `host_ram_offload_enabled()`：显式 env 覆盖模块值。节点级 features
+        晚于 config 写入 env，所以模块值看不见它，必须在这里补上。
+        """
+        explicit = os.environ.get("QLH_PIPELINE_PREFER_ALL_WORKERS")
+        if explicit is not None and explicit.strip():
+            return explicit.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(globals().get("PIPELINE_PREFER_ALL_WORKERS", PIPELINE_PREFER_ALL_WORKERS))
     # Evictable supply inventories; live owners and leases remain protected.
     MODEL_SUPPLY_CACHE_KEEP = _env_int("QLH_MODEL_SUPPLY_CACHE_KEEP", 2, min_val=0, max_val=128)
     MODEL_SUPPLY_CACHE_MASTER_KEEP = _env_int("QLH_MODEL_SUPPLY_CACHE_MASTER_KEEP", 6, min_val=0, max_val=128)
