@@ -715,6 +715,40 @@ def _merge_source_layer_bytes(
     return merged_descriptor
 
 
+def _self_cut_segment_bytes(node, start, end) -> list[int] | None:
+    """Per-layer byte quote for a self-cutting node, derived from its own artifacts.
+
+    Such a node holds no artifact matching the *requested* range, but every artifact
+    reports per-layer bytes for its own range — and per-layer size is a property of
+    the model, so the average is a sound quote for any range. Without this the solver
+    falls back to whole-model accounting and rejects every assignment.
+    """
+    total_layers = 0
+    total_bytes = 0
+    for artifact in node.get("layer_artifacts") or ():
+        quote = artifact.get("layer_weight_bytes")
+        if not isinstance(quote, (list, tuple)) or not quote:
+            continue
+        positive = []
+        for value in quote:
+            try:
+                size = int(value)
+            except (TypeError, ValueError):
+                continue
+            if size > 0:
+                positive.append(size)
+        if not positive:
+            continue
+        total_layers += len(positive)
+        total_bytes += sum(positive)
+    if total_layers <= 0 or total_bytes <= 0:
+        return None
+    per_layer = total_bytes // total_layers
+    if per_layer <= 0:
+        return None
+    return [per_layer] * max(0, int(end) - int(start))
+
+
 def solve_pipeline_capacity(
     descriptor: dict[str, Any],
     nodes: list[dict[str, Any]],
@@ -1013,8 +1047,16 @@ def solve_pipeline_capacity(
             if segment_bytes is None and "layer_weight_bytes" in node:
                 segment_bytes = node["layer_weight_bytes"][cursor:end]
             if segment_bytes is None and missing_prefix[end] != missing_prefix[cursor]:
-                exclude(node, cursor, end, "node_artifact_byte_quote_missing")
-                continue
+                # ★ 2026-10-23（#117）：自裁节点（`local_cut`）没有匹配请求区间的
+                #   工件，此前唯一的字节来源是 master 描述符的逐层前缀和；只要区间
+                #   跨过零字节层（embedding / norm 等）就被判"报价缺失"并排除 ⇒
+                #   求解器退回按**整模**计费（实测 1 层要 4.96GB、三机只凑得出 18 层
+                #   < 32），而"去掉段约束就能解"正是这个失真造成的假象。改为用本节点
+                #   任意工件的逐层字节求每层平均，再按区间长度估算。
+                segment_bytes = _self_cut_segment_bytes(node, cursor, end)
+                if segment_bytes is None:
+                    exclude(node, cursor, end, "node_artifact_byte_quote_missing")
+                    continue
             raw_bytes = (
                 sum(segment_bytes) if segment_bytes is not None
                 else prefix[end] - prefix[cursor]
