@@ -37,7 +37,7 @@ class RequestService:
         with self._condition:
             if self._started:
                 return
-            recovery = self.repository.recovery_status()
+            recovery = getattr(self.repository, "prepare_recovery", self.repository.recovery_status)()
             if recovery.get("corrupt"):
                 raise ExecutionError("request_journal_corrupt")
             def recover(state):

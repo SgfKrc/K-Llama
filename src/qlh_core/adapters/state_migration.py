@@ -74,6 +74,16 @@ def _database(path):
                            for r in connection.execute('PRAGMA table_info(' + table + ')')}
                 if not all(columns.get(name) == definition for name, definition in expected.items()):
                     raise MigrationError('migration_database_schema_unknown')
+        # Verify the complete chain before creating either backup or staging.
+        from qlh_core.adapters.model_control_repository import SqliteModelControlRepository
+        from qlh_core.adapters.request_repository import SqliteRequestRepository
+        for domain_tables, adapter in (
+                (('model_control_state', 'model_control_events', 'model_control_events_checkpoint'), SqliteModelControlRepository),
+                (('request_journal_state', 'request_journal_events', 'request_journal_events_checkpoint'), SqliteRequestRepository)):
+            if tables.intersection(domain_tables):
+                repository = adapter(connect=lambda: _connect(path), transaction=None)
+                if not repository.recovery_status()['verified']:
+                    raise MigrationError('migration_database_journal_missing')
         for table in ('model_control_state', 'request_journal_state'):
             if table in tables:
                 row = connection.execute('SELECT payload FROM ' + table + ' WHERE id=1').fetchone()
@@ -82,14 +92,6 @@ def _database(path):
                 for record in state.get('requests', {}).values():
                     if record.get('execution_state') not in {'stopped', 'waiting'}:
                         raise MigrationError('migration_runtime_reconciliation_required')
-        # Verify the complete chain before creating either backup or staging.
-        from qlh_core.adapters.model_control_repository import SqliteModelControlRepository
-        from qlh_core.adapters.request_repository import SqliteRequestRepository
-        for table, adapter in (('model_control_state', SqliteModelControlRepository), ('request_journal_state', SqliteRequestRepository)):
-            if table in tables:
-                repository = adapter(connect=lambda: _connect(path), transaction=None)
-                if not repository.recovery_status()['verified']:
-                    raise MigrationError('migration_database_journal_missing')
         return sorted(tables)
     except MigrationError:
         raise

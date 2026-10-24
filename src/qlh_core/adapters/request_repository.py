@@ -4,7 +4,8 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from qlh_core.contracts.execution import REQUEST_DOMAIN, ExecutionError
-from qlh_core.contracts.deployment import canonical, digest
+from qlh_core.contracts.deployment import canonical
+from qlh_core.adapters.sqlite_journal import SnapshotJournal
 
 
 def empty_state():
@@ -12,9 +13,11 @@ def empty_state():
 
 
 class SqliteRequestRepository:
-    def __init__(self, *, connect, transaction):
+    def __init__(self, *, connect, transaction, max_events=64, max_event_bytes=8 * 1024 * 1024):
         self._connect = connect
         self._transaction = transaction
+        self._journal = SnapshotJournal("request_journal_events", domain=REQUEST_DOMAIN,
+            error=lambda: ExecutionError("request_journal_corrupt"), max_events=max_events, max_bytes=max_event_bytes)
 
     @staticmethod
     def _initialize(connection):
@@ -41,43 +44,33 @@ class SqliteRequestRepository:
     def transact(self, mutation, *, domain=REQUEST_DOMAIN):
         with self._transaction() as connection:
             self._initialize(connection)
+            self._journal.initialize(connection)
+            self._journal.compact(connection, self._read)
             state = self._read(connection)
+            self._journal.verify_head(connection, state)
             before = canonical(state)
             mutation(state)
             if canonical(state) == before:
                 return deepcopy(state)
             state["revision"] += 1
-            previous = connection.execute("SELECT sequence,digest FROM request_journal_events ORDER BY sequence DESC LIMIT 1").fetchone()
-            sequence = int(previous["sequence"]) + 1 if previous else 1
-            previous_digest = previous["digest"] if previous else "0" * 64
-            event = {"sequence": sequence, "domain_id": domain, "previous_digest": previous_digest, "state": state}
-            event_digest = digest(event)
-            connection.execute("INSERT INTO request_journal_events VALUES (?,?,?,?,?)", (sequence, domain, previous_digest, event_digest, canonical(event)))
+            self._journal.append(connection, state, domain=domain)
             connection.execute("INSERT INTO request_journal_state VALUES (1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", (canonical(state),))
+            self._journal.compact(connection, self._read)
         return deepcopy(state)
+
+    def prepare_recovery(self):
+        with self._transaction() as connection:
+            status = self._journal.verify(connection, self._read)
+            self._initialize(connection)
+            self._journal.initialize(connection)
+            self._journal.compact(connection, self._read, verified=True)
+            return status
 
     def recovery_status(self):
         connection = self._connect()
         try:
-            present = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_journal_events'").fetchone()
-            if not present:
-                return {"verified": False, "commit_scope": "local_sqlite"}
             connection.execute("BEGIN")
-            previous = "0" * 64
-            sequence = 0
-            last = None
-            for row in connection.execute("SELECT * FROM request_journal_events ORDER BY sequence"):
-                value = json.loads(row["payload"])
-                if (row["sequence"] != sequence + 1 or row["domain_id"] != REQUEST_DOMAIN
-                        or row["previous_digest"] != previous or value.get("previous_digest") != previous
-                        or value.get("sequence") != row["sequence"] or value.get("domain_id") != REQUEST_DOMAIN
-                        or digest(value) != row["digest"]):
-                    raise ExecutionError("request_journal_corrupt")
-                sequence, previous, last = row["sequence"], row["digest"], value["state"]
-            if last is not None and last != self._read(connection):
-                raise ExecutionError("request_journal_corrupt")
-            return {"verified": sequence > 0, "durable_sequence": sequence,
-                    "checkpoint_digest": previous, "commit_scope": "local_sqlite"}
+            return self._journal.verify(connection, self._read)
         finally:
             connection.rollback()
             connection.close()

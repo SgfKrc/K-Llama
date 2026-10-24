@@ -43,7 +43,9 @@ class DeploymentService:
         if self._started:
             return self.snapshot()
         existing = self.snapshot()
-        if existing["revision"] and not self.repository.recovery_status().get("verified"):
+        recovery = getattr(self.repository, "prepare_recovery", self.repository.recovery_status)
+        verified = recovery().get("verified")
+        if existing["revision"] and not verified:
             raise ModelControlError("model_control_journal_unverified")
         def recover(state):
             if state["boot_id"] == self.boot_id:
@@ -360,7 +362,12 @@ class DeploymentService:
                 raise ModelControlError("cleanup_receipt_mismatch")
             state["cleanup"].pop(cleanup_id)
             for command in state["outbox"].values():
-                if command["payload"].get("cleanup_id") == cleanup_id:
+                payload = command["payload"]
+                command_cleanup_id = payload.get("cleanup_id") or (
+                    payload.get("config_id") if payload.get("cleanup_action") else None)
+                if (command_cleanup_id == cleanup_id and command["node_id"] == debt["node_id"]
+                        and (payload.get("action") or payload.get("cleanup_action")) == debt["action"]
+                        and payload.get("identity", payload.get("worker_prepare_identity")) == identity):
                     command["state"] = "acknowledged"
             lifecycle = state.get("lifecycle")
             if lifecycle:

@@ -7,7 +7,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN, canonical, digest, ModelControlError
+from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN, canonical, ModelControlError
+from qlh_core.adapters.sqlite_journal import SnapshotJournal
+from qlh_core.adapters.model_control_retention import (
+    guard_retired_records, initialize_retention, retain_model_control,
+)
 
 
 def empty_state():
@@ -17,9 +21,12 @@ def empty_state():
 
 
 class SqliteModelControlRepository:
-    def __init__(self, *, connect, transaction):
+    def __init__(self, *, connect, transaction, max_events=64, max_event_bytes=8 * 1024 * 1024):
         self._connect = connect
         self._transaction = transaction
+        self._journal = SnapshotJournal("model_control_events", domain=MODEL_CONTROL_DOMAIN,
+            error=lambda: ModelControlError("model_control_journal_corrupt"),
+            max_events=max_events, max_bytes=max_event_bytes)
 
     @staticmethod
     def _initialize(connection):
@@ -46,43 +53,37 @@ class SqliteModelControlRepository:
     def transact(self, mutation, *, domain=MODEL_CONTROL_DOMAIN):
         with self._transaction() as connection:
             self._initialize(connection)
+            self._journal.initialize(connection)
+            self._journal.compact(connection, self._read)
+            initialize_retention(connection)
             state = self._read(connection)
+            self._journal.verify_head(connection, state)
+            before_state = deepcopy(state)
             before = canonical(state)
             mutation(state)
+            guard_retired_records(connection, before_state, state)
+            retain_model_control(connection, state)
             if canonical(state) == before:
                 return deepcopy(state)
             state["revision"] += 1
-            previous = connection.execute("SELECT sequence,digest FROM model_control_events ORDER BY sequence DESC LIMIT 1").fetchone()
-            sequence = int(previous["sequence"]) + 1 if previous else 1
-            previous_digest = previous["digest"] if previous else "0" * 64
-            event = {"sequence": sequence, "domain_id": domain, "previous_digest": previous_digest, "state": state}
-            event_digest = digest(event)
-            connection.execute("INSERT INTO model_control_events VALUES (?,?,?,?,?)", (sequence, domain, previous_digest, event_digest, canonical(event)))
+            self._journal.append(connection, state, domain=domain)
             connection.execute("INSERT INTO model_control_state VALUES (1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", (canonical(state),))
+            self._journal.compact(connection, self._read)
         return deepcopy(state)
+
+    def prepare_recovery(self):
+        with self._transaction() as connection:
+            status = self._journal.verify(connection, self._read)
+            self._initialize(connection)
+            self._journal.initialize(connection)
+            self._journal.compact(connection, self._read, verified=True)
+            return status
 
     def recovery_status(self):
         connection = self._connect()
         try:
-            present = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_control_events'").fetchone()
-            if not present:
-                return {"verified": False, "commit_scope": "local_sqlite"}
             connection.execute("BEGIN")
-            previous = "0" * 64
-            sequence = 0
-            last = None
-            for row in connection.execute("SELECT * FROM model_control_events ORDER BY sequence"):
-                value = json.loads(row["payload"])
-                if (row["sequence"] != sequence + 1 or row["domain_id"] != MODEL_CONTROL_DOMAIN
-                        or row["previous_digest"] != previous or value.get("previous_digest") != previous
-                        or value.get("sequence") != row["sequence"] or value.get("domain_id") != MODEL_CONTROL_DOMAIN
-                        or digest(value) != row["digest"]):
-                    raise ModelControlError("model_control_journal_corrupt")
-                sequence, previous, last = row["sequence"], row["digest"], value["state"]
-            if last is not None and last != self._read(connection):
-                raise ModelControlError("model_control_journal_corrupt")
-            return {"verified": sequence > 0, "durable_sequence": sequence,
-                    "checkpoint_digest": previous, "commit_scope": "local_sqlite"}
+            return self._journal.verify(connection, self._read)
         finally:
             connection.rollback()
             connection.close()
