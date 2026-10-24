@@ -276,9 +276,14 @@ def test_failed_local_change_preserves_recovery_identity_and_digest_check(recove
     assert master._pipeline_model_cleanup_ledger == case.debts
     assert case.saved == [] and case.settings[LIFECYCLE_KEY] == durable_before
     assert master._recovery_model_matches(OLD_MODEL) is True
-    assert master._recovery_model_matches({**OLD_MODEL, "model_sha256": "b" * 64}) is False
-    assert master._pipeline_recovery_failure == "pipeline_recovery_model_mismatch"
+    # 2026-10-23（#117）：恢复身份只看 id/type。持久化摘要与当前描述器摘要来自
+    # 不同格式域（HF 侧 vs GGUF 侧），同 id/type 下摘要不等属"同模型不同量化"，
+    # 只告警不否决 —— 否则恒判 mismatch ⇒ 层配置恒不推送。
+    failure_before = master._pipeline_recovery_failure
+    assert master._recovery_model_matches({**OLD_MODEL, "model_sha256": "b" * 64}) is True
+    assert master._pipeline_recovery_failure == failure_before
     assert master._recovery_model_matches(NEW_MODEL) is False
+    assert master._pipeline_recovery_failure == "pipeline_recovery_model_mismatch"
 
 
 @pytest.mark.parametrize("reason", ["pipeline_recovery_state_invalid", "pipeline_recovery_state_unavailable"])

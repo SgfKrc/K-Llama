@@ -1670,6 +1670,10 @@ def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch, hos
                 "pipeline_runtime_supported": True,
             }
 
+        def get_model_info(self):
+            # segment 已物化时生产代码会读 inference_switches（routes_models.py:52）
+            return {"inference_switches": {"streaming_mode": "fast"}}
+
     monkeypatch.setattr(api_server, "model_manager", PartialManager())
     monkeypatch.setattr(model_host, "model_loaded", host_loaded)
     monkeypatch.setattr(model_host, "current_quant", "fp32")

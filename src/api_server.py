@@ -5500,16 +5500,18 @@ def _run_log_retention_cleanup() -> None:
                     except OSError:
                         pass
 
-        if deleted_age > 0 or deleted_size > 0:
-            remaining = len(kept) - deleted_size
-            remaining_bytes = total_size if max_bytes > 0 else sum(f["size"] for f in kept)
-            logger.info(
-                "event=log_retention_cleanup deleted_age=%d deleted_size=%d "
-                "remaining_files=%d total_size_mb=%.1f",
-                deleted_age, deleted_size,
-                remaining,
-                remaining_bytes / (1024 * 1024),
-            )
+        # ★ 2026-10-24（#125）：**无论是否删除都留痕**。此前只在真删了文件时才打日志，
+        #   于是「清理到底跑没跑」完全不可观测 —— 线程失效 7 天无人发现就是这个原因。
+        #   现在每次扫描都打一条 examined/remaining/total，便于确认策略真的在生效。
+        survivors = [fi for fi in files_info if os.path.exists(fi["path"])]
+        logger.info(
+            "event=log_retention_scan examined=%d deleted_age=%d deleted_size=%d "
+            "remaining_files=%d total_size_mb=%.1f max_age_days=%d max_total_mb=%d",
+            len(files_info), deleted_age, deleted_size,
+            len(survivors),
+            sum(fi["size"] for fi in survivors) / (1024 * 1024),
+            LOG_MAX_AGE_DAYS, LOG_MAX_TOTAL_SIZE_MB,
+        )
 
 
 def _start_log_retention_thread() -> None:
@@ -5520,6 +5522,7 @@ def _start_log_retention_thread() -> None:
 
     from config import (
         LOG_RETENTION_CHECK_INTERVAL, LOG_MAX_AGE_DAYS, LOG_MAX_TOTAL_SIZE_MB,
+        LOG_RETENTION_STARTUP_DELAY,
     )
 
     # 双维度禁用时跳过启动（无清理任务可执行）
@@ -5529,15 +5532,21 @@ def _start_log_retention_thread() -> None:
     _log_retention_thread_started = True
 
     def _retention_loop() -> None:
-        # 启动后等待 5 分钟再首次清理（避免干扰初始化）
-        if _runtime_background_stop.wait(300):
+        # ★ 2026-10-24（#125）：此前固定 `wait(300)` 才做首次清理。开发期进程常在同一
+        #   分钟内重启，于是线程每次重新数 300 s ⇒ **首次清理永远等不到**。日志实证：
+        #   `日志保留策略已启动` 出现几十次，而 `event=log_retention_cleanup` 在
+        #   2026-10-17 之后 7 天里一次都没出现，日志因此堆到 20 GB（200 MB 上限失效）。
+        #   现在默认 0 = 启动即清理一次，此后按间隔巡检。
+        if LOG_RETENTION_STARTUP_DELAY and _runtime_background_stop.wait(
+                LOG_RETENTION_STARTUP_DELAY):
             return
         while not _runtime_background_stop.is_set():
             try:
                 _run_log_retention_cleanup()
             except Exception:
                 logger.warning("日志保留清理异常", exc_info=True)
-            _runtime_background_stop.wait(LOG_RETENTION_CHECK_INTERVAL)
+            if _runtime_background_stop.wait(LOG_RETENTION_CHECK_INTERVAL):
+                return
 
     t = threading.Thread(target=_retention_loop, daemon=True, name="log-retention")
     _runtime_background_threads.append(t)

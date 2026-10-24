@@ -707,10 +707,15 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     LOG_LEVEL = "INFO"               # 日志级别: DEBUG | INFO | WARNING | ERROR
     LOG_DIR = os.path.join(_APP_ROOT, "logs")  # 日志文件目录（绝对路径）
 
-    # L5: 日志保留策略（双维度控制 — 天数 + 总空间）
-    LOG_MAX_AGE_DAYS = 30                # 单个日志文件最大保留天数（0 = 不限）
-    LOG_MAX_TOTAL_SIZE_MB = 200          # 日志目录总大小上限（MB，0 = 不限）
-    LOG_RETENTION_CHECK_INTERVAL = 3600  # 清理检查间隔（秒），默认每小时检查一次
+    # L5: 日志保留策略（双维度控制 — 天数 + 总空间），全部可用 QLH_* 覆盖
+    LOG_MAX_AGE_DAYS = _env_int("QLH_LOG_MAX_AGE_DAYS", 30, min_val=0, max_val=3650)
+    LOG_MAX_TOTAL_SIZE_MB = _env_int("QLH_LOG_MAX_TOTAL_SIZE_MB", 200, min_val=0, max_val=1048576)
+    LOG_RETENTION_CHECK_INTERVAL = _env_int("QLH_LOG_RETENTION_CHECK_INTERVAL", 3600, min_val=60, max_val=86400)
+    # ★ 2026-10-24（#125）：首次清理此前**硬编码等 300 s**，而开发期进程常在同一分钟内
+    #   重启 ⇒ 线程每次重新数 300 s，首次清理永远等不到。日志实证：`日志保留策略已启动`
+    #   出现几十次，而 `event=log_retention_cleanup` 在 2026-10-17 之后 7 天里一次都没有
+    #   ⇒ 200 MB 上限形同虚设，日志堆到 20 GB。默认 0 = **启动即清理一次**。
+    LOG_RETENTION_STARTUP_DELAY = _env_int("QLH_LOG_RETENTION_STARTUP_DELAY", 0, min_val=0, max_val=3600)
 
     # ============================================================
     # 8. 可视化配置（Streamlit 已移除，统一使用 FastAPI + React 前端）

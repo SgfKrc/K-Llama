@@ -656,6 +656,31 @@ class TestLogRetentionCleanup:
         # 当天文件应保留
         assert os.path.exists(today_file)
 
+    def test_retention_runs_immediately_after_startup(self, monkeypatch, log_dir_temp):
+        """启动即清理：不得再等固定延迟。
+
+        曾固定 `wait(300)` 才首次清理，而开发期进程常在同一分钟内重启 ⇒ 线程每次重新
+        数 300 s，**首次清理永远等不到**。实测 `event=log_retention_cleanup` 在
+        2026-10-17 之后 7 天里一次都没出现，日志因此堆到 20 GB。
+        """
+        import threading as _threading
+        import time as _time
+        import api_server
+
+        calls = []
+        monkeypatch.setattr(api_server, "_run_log_retention_cleanup",
+                            lambda: calls.append(1))
+        monkeypatch.setattr(api_server, "_log_retention_thread_started", False)
+        monkeypatch.setattr(api_server, "_runtime_background_stop", _threading.Event())
+
+        api_server._start_log_retention_thread()
+        deadline = _time.time() + 3.0
+        while not calls and _time.time() < deadline:
+            _time.sleep(0.02)
+        api_server._runtime_background_stop.set()  # 让后台线程退出
+
+        assert calls, "日志保留线程未在启动后立即执行清理"
+
 
 # ================================================================
 # L5: 多节点日志聚合
