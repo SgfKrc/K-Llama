@@ -224,6 +224,66 @@ def _file_sha(path: Path, cancelled=None) -> str:
     return digest.hexdigest()
 
 
+# ★ 2026-10-24（#125）：整模 sha256 是必需的源身份证明，但**不必每轮重算**。
+#   实测清点（inventory）阶段对 5.78 GB 的 GGUF 做全量 sha256 需约 200 s，占整个
+#   供给近三分之一；#119 加的进程内摘要缓存**重启即失效、跨 op 也不复用** ⇒ 每次
+#   供给都重付一遍。这里以 `_file_stamp`（size/mtime_ns/ctime_ns/ino/change_time）
+#   作为失效判据，把结果**持久化**到 worker root，跨重启与跨供给复用。
+_SOURCE_DIGEST_CACHE_NAME = "source-digests.json"
+_source_digest_cache: dict | None = None
+
+
+def _load_source_digest_cache(root: Path) -> dict:
+    global _source_digest_cache
+    if _source_digest_cache is not None:
+        return _source_digest_cache
+    import json
+    cache: dict = {}
+    try:
+        payload = json.loads((root / _SOURCE_DIGEST_CACHE_NAME).read_text(encoding="utf-8"))
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and payload.get("schema_version") == 1 and isinstance(entries, dict):
+            cache = {key: value for key, value in entries.items() if isinstance(value, dict)}
+    except (OSError, ValueError):
+        cache = {}
+    _source_digest_cache = cache
+    return cache
+
+
+def _store_source_digest_cache(root: Path) -> None:
+    import json
+    import os
+    cache = _source_digest_cache
+    if cache is None:
+        return
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        temp = root / (_SOURCE_DIGEST_CACHE_NAME + ".tmp")
+        temp.write_text(json.dumps({"schema_version": 1, "entries": cache},
+                                   ensure_ascii=True, sort_keys=True), encoding="utf-8")
+        os.replace(temp, root / _SOURCE_DIGEST_CACHE_NAME)
+    except OSError:
+        pass
+
+
+def _file_sha_cached(root: Path, path: Path) -> str:
+    """Full-file sha256, reusing the persisted digest while the file is unchanged."""
+    cache = _load_source_digest_cache(root)
+    key = str(path)
+    try:
+        stamp = list(_file_stamp(path))
+    except OSError:
+        return _file_sha(path)
+    entry = cache.get(key)
+    if (isinstance(entry, dict) and entry.get("stamp") == stamp
+            and isinstance(entry.get("sha256"), str) and _sha(entry["sha256"])):
+        return str(entry["sha256"])
+    digest = _file_sha(path)
+    cache[key] = {"stamp": stamp, "sha256": digest}
+    _store_source_digest_cache(root)
+    return digest
+
+
 def _verify_files(manifest: dict, directory: Path, cancelled=None) -> Path:
     directory = directory.resolve(strict=True)
     paths = []
@@ -624,7 +684,10 @@ class ModelSupplyWorker:
                     tokenizer = read_gguf_tokenizer_sha256(path)
                     if not info or not _sha(tokenizer):
                         continue
-                    digest = _file_sha(path)
+                    # ★ 2026-10-24（#125）：清点阶段对整模做全量 sha256 约需 200 s
+                    #   （5.78 GB），改为带**持久化**缓存的摘要：文件未变即复用，
+                    #   跨重启与跨供给都生效。
+                    digest = _file_sha_cached(self.root, path)
                     verified[(source_id, digest, tokenizer)] = path
                     sources.append({"source_model_id": source_id, "source_model_sha256": digest,
                                     "tokenizer_sha256": tokenizer, "size_bytes": path.stat().st_size})
