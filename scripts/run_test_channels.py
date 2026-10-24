@@ -185,6 +185,15 @@ def _unit_args(
         "-q",
         "-m",
         "not external and not requires_db and not real_model and not slow and not requires_gpu",
+        # 覆盖 pytest.ini 的 --maxfail=3（0 = 不设上限，跑完为止）。两者一起用时
+        # `--maxfail` 与 `--junitxml` 会互相拆台：pytest 提前停止后
+        # <testsuite tests=N> 仍写**全部收集数**，而 <testcase> 只有**已执行的**，
+        # 于是 summarize_test_channels 判定 "JUnit tests count disagrees with testcase
+        # outcomes" 并**放弃解析**，总结里只剩 `passed=? failed=? errors=?`。
+        # 结果是 CI 越红给出的信息越少：2026-10-24 排查 unit 通道时，只能靠本机
+        # 跑 20 分钟全量（`run_test_channels.py --channel unit`）才拿到失败清单。
+        # 代价是失败时多跑几分钟，换来每次红都能在日志里直接看到失败测试名。
+        "--maxfail=0",
     ]
     if importlib.util.find_spec("xdist") is None:
         print(
