@@ -787,8 +787,18 @@ class ModelSupplyCoordinator:
         #   本地源核对要对整模做一次全量 sha256（5.78 GB，实测 90~120 s）⇒ 首次清点
         #   必然 SUPPLY_WORKER_TIMEOUT。与上面那处一起用同一设置（函数顶部已取）。
         for node_id in worker_ids:
+            # ★ 2026-10-24（#125）：**这才是主路径**（上面 L582 那处是另一条分支）。
+            #   清点是「并行发送、逐个 `_wait`」，故总耗时 = 最慢节点，此前完全没有
+            #   日志可查（实测 master 自身约 0.4 s、android 读 2 GiB 不到 1 s，而整个
+            #   inventory 阶段仍要 108~142 s）。逐节点记录往返耗时以定位瓶颈。
+            _inventory_started = time.monotonic()
             inventories[node_id] = self._wait(op_id, node_id, "inventory_result",
                                               MODEL_SUPPLY_INVENTORY_TIMEOUT_S)
+            logger.info(
+                "event=supply_inventory_done node=%s elapsed_ms=%d sources=%d",
+                node_id, int((time.monotonic() - _inventory_started) * 1000),
+                len(inventories[node_id].get("sources") or []),
+            )
             if not inventories[node_id].get("distributed"):
                 raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
         want_gguf = intent.get("engine") != "pytorch" or any(
