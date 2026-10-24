@@ -183,7 +183,12 @@ def inventory_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "RUN_MODE", "distributed")
     monkeypatch.setattr(config, "INFERENCE_ENGINE", "llama_cpp")
     monkeypatch.setattr(torch_runtime, "torch_available", lambda: True)
-    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=100 * MIB))
+    # model_supply_worker 自 #117 起还要读 virtual.total（主节点 offload 上限按
+    # 「物理总量 × 比例」封顶），桩必须同时给出该字段，否则 AttributeError。
+    monkeypatch.setattr(
+        psutil, "virtual_memory",
+        lambda: SimpleNamespace(available=100 * MIB, total=1024 * MIB),
+    )
     scheduler = SimpleNamespace(_effective_role=lambda: "master",
                                 get_effective_node_id=lambda: "master",
                                 get_distributed_inference_enabled=lambda: True)
