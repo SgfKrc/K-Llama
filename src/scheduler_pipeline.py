@@ -8438,6 +8438,19 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 full_text_parts = []
                 visible_buffer = ""
                 suppress_thinking = bool(native_thinking_prompt and not show_thinking)
+                # ★ 2026-10-24（#125）：**思考必须边想边出**。
+                #   此前只在 `suppress_thinking`（= 有思考模板但未要求展示）时把整段思考
+                #   攒进 `visible_buffer`，直到 `</think>` 出现才吐正文；而 `show_thinking`
+                #   为真时虽然不抑制，却把 `<think>…</think>` 原文当成正文 token 推出去。
+                #   两种情况下客户端都**看不到"正在思考"的独立信号**：实测一个 prompt_len=2
+                #   的请求，首字节等了 88.7 s（= 纯思考时长），期间界面完全空转。
+                #
+                #   现在：`show_thinking` 为真时按标签**分流**——思考增量发
+                #   `{"thinking": …}`，正文发 `{"token": …}`，客户端可即时渲染思考区。
+                #   `show_thinking` 为假时保持原行为（抑制思考，仅发正文）。
+                split_thinking = bool(show_thinking)
+                think_state = False      # 当前是否处于 <think> 区段
+                think_pending = ""       # 跨 chunk 的标签残留缓冲
                 t0 = time.time()
                 for chunk in mgr.chat_stream(
                     messages=messages,
@@ -8447,19 +8460,50 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 ):
-                    if chunk:
-                        full_text_parts.append(chunk)
-                        if suppress_thinking:
-                            visible_buffer += chunk
-                            marker = visible_buffer.lower().find("</think>")
-                            if marker >= 0:
-                                visible = visible_buffer[marker + len("</think>"):]
-                                suppress_thinking = False
-                                visible_buffer = ""
-                                if visible:
-                                    _stream_callback({"token": visible})
+                    if not chunk:
+                        continue
+                    full_text_parts.append(chunk)
+                    if suppress_thinking:
+                        visible_buffer += chunk
+                        marker = visible_buffer.lower().find("</think>")
+                        if marker >= 0:
+                            visible = visible_buffer[marker + len("</think>"):]
+                            suppress_thinking = False
+                            visible_buffer = ""
+                            if visible:
+                                _stream_callback({"token": visible})
+                        continue
+                    if not split_thinking:
+                        _stream_callback({"token": chunk})
+                        continue
+                    # 分流：把 chunk 按 <think> / </think> 切成 thinking / token 片段。
+                    think_pending += chunk
+                    segments = []
+                    while think_pending:
+                        if not think_state:
+                            index = think_pending.lower().find("<think>")
+                            if index < 0:
+                                # 无开标签 ⇒ 全是正文（模型没走思考模板时也安全）。
+                                segments.append(("token", think_pending))
+                                think_pending = ""
+                                break
+                            if index > 0:
+                                segments.append(("token", think_pending[:index]))
+                            think_pending = think_pending[index + len("<think>"):]
+                            think_state = True
                         else:
-                            _stream_callback({"token": chunk})
+                            index = think_pending.lower().find("</think>")
+                            if index < 0:
+                                segments.append(("thinking", think_pending))
+                                think_pending = ""
+                                break
+                            if index > 0:
+                                segments.append(("thinking", think_pending[:index]))
+                            think_pending = think_pending[index + len("</think>"):]
+                            think_state = False
+                    for kind, text in segments:
+                        if text:
+                            _stream_callback({kind: text})
                 raw_response_text = "".join(full_text_parts)
                 terminal = _request_terminal_result(
                     cancel_event=cancel_event,
