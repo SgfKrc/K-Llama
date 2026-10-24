@@ -26,6 +26,11 @@ from pipeline_capacity import solve_pipeline_capacity
 
 logger = logging.getLogger(__name__)
 
+# ★ 2026-10-24（#125）：`_worker_handshake_ready` 的诊断限流表（node_id -> 上次打印
+#   的 monotonic 时刻）。握手判据不满足时每 5 秒最多打一条，避免 `waiting_nodes`
+#   循环把日志刷爆，同时保留"卡在哪个条件上"的证据。
+_HANDSHAKE_DIAG: dict[str, float] = {}
+
 
 _STRATEGY_REASON_CODES = frozenset({
     "SUPPLY_CACHE_REUSED", "SUPPLY_LOCAL_CUT_PREFERRED", "SUPPLY_DISTRIBUTE_REQUESTED",
@@ -463,7 +468,7 @@ class ModelSupplyCoordinator:
         try:
             epoch = server.get_authenticated_peer_epoch(node_id)
             worker = control.worker_snapshot(node_id)
-            return bool(
+            ready = bool(
                 type(epoch) is int and epoch > 0
                 and epoch == connection.get("registration_epoch")
                 and worker.get("manual_stage_dispatch_enabled") is True
@@ -476,6 +481,29 @@ class ModelSupplyCoordinator:
             )
         except (AttributeError, KeyError, TypeError, ValueError):
             return False
+        if not ready:
+            # ★ 2026-10-24（#125）：供给曾在 `waiting_nodes` 与 `planning` 之间反复
+            #   循环（实测 6→58→63→172→177 s），却**没有任何日志**说明卡在六个判据的
+            #   哪一个上。这里把各自的实际值打出来（限流 5 秒一次，避免刷屏）。
+            now = time.monotonic()
+            if now - _HANDSHAKE_DIAG.get(node_id, 0.0) >= 5.0:
+                _HANDSHAKE_DIAG[node_id] = now
+                try:
+                    pending = node_id in control.pending_worker_ids()
+                except (AttributeError, TypeError):
+                    pending = None
+                logger.info(
+                    "event=supply_handshake_not_ready node=%s epoch=%r conn_epoch=%r "
+                    "manual_stage=%r layer_stage=%r healthy=%r connected=%r accepted=%r "
+                    "selected_version=%r pending=%r hello_received_at=%r connected_at=%r",
+                    node_id, epoch, connection.get("registration_epoch"),
+                    worker.get("manual_stage_dispatch_enabled"),
+                    worker.get("layer_stage_dispatch_enabled"),
+                    worker.get("healthy"), worker.get("connected"), worker.get("accepted"),
+                    worker.get("selected_version"), pending,
+                    worker.get("hello_received_at"), connection.get("connected_at"),
+                )
+        return ready
 
     def _send(self, op_id, node_id, payload):
         from transport_port import MessageType
@@ -845,6 +873,12 @@ class ModelSupplyCoordinator:
             raise ModelSupplyError("SUPPLY_WORKERS_UNAVAILABLE", "No joined supply workers")
         nodes = {node_id: {"status": "inventory"} for node_id in ["master", *worker_ids]}
         self._update(op_id, status="inventory", nodes=nodes)
+        # ★ 2026-10-24（#125）：记录**整个清点阶段**的耗时。实测存在一段 45 s 的
+        #   静默空档（最后一个 worker 的 inventory_done 之后、planning 之前），
+        #   期间 supply 内部没有任何日志，无法判断是二次观察、wait_for_new 轮询
+        #   还是别的等待。这里给出阶段总耗时，配合每节点的
+        #   `supply_inventory_done` 即可算出空档归属。
+        _inventory_phase_started = time.monotonic()
         for node_id in worker_ids:
             self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
                                      "source_model_sha256": ""})
@@ -867,6 +901,10 @@ class ModelSupplyCoordinator:
             )
             if not inventories[node_id].get("distributed"):
                 raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
+        logger.info(
+            "event=supply_inventory_phase_done nodes=%d elapsed_ms=%d",
+            len(inventories), int((time.monotonic() - _inventory_phase_started) * 1000),
+        )
         want_gguf = intent.get("engine") != "pytorch" or any(
             "pytorch" not in inventories[node_id].get("engines", []) for node_id in worker_ids)
         sources = self._sources(op_id, intent, want_gguf=want_gguf)
