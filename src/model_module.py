@@ -1530,6 +1530,24 @@ class ModelManager:
         调用后 is_loaded 返回 False，可安全加载新模型。
         """
         logger.info(f"卸载模型: {self._active_model_id} (引擎={self._engine_type})")
+        # ★ 2026-10-24（#125）：卸载会清掉 `_pipeline_descriptor` /
+        #   `_pipeline_distributed_only`，而它们正是"已 prepared"的唯一判据
+        #   （`is_pipeline_prepared` = `_pipeline_distributed_only and _pipeline_descriptor`）。
+        #   一旦被清，下一轮供给必然重新加载段并重跑 torch.compile（实测 138 s，
+        #   内容与上一轮完全相同）。此前不知道供给链路里是谁触发的卸载，这里在
+        #   **仅当确有 pipeline 状态被丢弃时**记录调用栈，便于定位并消除无谓卸载。
+        if self._pipeline_descriptor is not None or self._pipeline_distributed_only:
+            try:
+                import traceback
+                stack = " <- ".join(
+                    line.strip() for line in traceback.format_stack()[-6:-1]
+                ).replace("\n", " ")
+                logger.info(
+                    "event=pipeline_descriptor_cleared_by_unload active_model=%s stack=%s",
+                    self._active_model_id, stack[:400],
+                )
+            except Exception:
+                pass
 
         # --- llama.cpp 引擎清理 ---
         # Release native owners before clearing their state projection. A
