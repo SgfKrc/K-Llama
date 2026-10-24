@@ -74,6 +74,51 @@ def sha256_file(path: str | Path) -> str:
     return _hash_file(path)
 
 
+_DIGEST_CACHE: dict[tuple, str] = {}
+
+
+def _hash_file_cached(path: str | Path, cancelled: Callable[[], bool] | None = None) -> str:
+    """★ 2026-10-24（#125）：同一整模的全量 sha256 在一次供给里会被反复请求。
+
+    `build_gguf_segment` 内部就有 3 处对 source 做全量 sha256（入口验证、复用验证
+    之后、裁切之后），而 building 阶段又对**每个 assignment** 各调用一次 builder；
+    一份 5.78 GB 的 GGUF 全量哈希约 30 s，实测 building 的 72 s 几乎全耗在重复哈希。
+
+    以 `(dev, ino, size, mtime_ns)` 为缓存键 —— 与 `_hash_file` 自身用来检测
+    "哈希期间文件被改动"的 signature 完全一致，故缓存命中与重新计算的结论等价。
+    master 进程常驻，因此该缓存同时跨 operation 生效。
+
+    **仅用于源的固有身份验证**（源不因供给而改变）。"操作期间是否被改动"这类检查
+    需要真实的时间顺序证据，请用 `_file_identity` 做前后对比，不要用本函数。
+    """
+    try:
+        resolved = Path(path).resolve()
+        info = resolved.stat()
+        key = (str(resolved), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    except OSError:
+        return _hash_file(path, cancelled)
+    cached = _DIGEST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digest = _hash_file(path, cancelled)
+    _DIGEST_CACHE[key] = digest
+    return digest
+
+
+def _file_identity(path: str | Path) -> tuple | None:
+    """Cheap change detector for "did this file change during the operation?".
+
+    Uses the same `(dev, ino, size, mtime_ns)` signature as `_hash_file`, but reads
+    no bytes. A caller that needs to prove a file was untouched across a window can
+    compare this before/after instead of re-hashing gigabytes a second time.
+    """
+    try:
+        info = Path(path).stat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def _hash_file(path: str | Path, cancelled: Callable[[], bool] | None = None) -> str:
     digest = hashlib.sha256()
     try:
@@ -1169,8 +1214,11 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
     source = Path(source).resolve()
     if not source.is_file():
         _fail("source_missing", "source GGUF is missing")
-    if _hash_file(source, stopped) != source_model_sha256:
+    # ★ 2026-10-24（#125）：源身份是固有属性，用缓存避免每个 assignment 重算 5.78 GB。
+    #   同时记下此时的文件身份，供后面"期间是否被改动"的检查廉价对比。
+    if _hash_file_cached(source, stopped) != source_model_sha256:
         _fail("source_digest_mismatch", "source GGUF digest mismatch")
+    source_identity = _file_identity(source)
     from relay_segment_info import read_gguf_tokenizer_sha256
     try:
         metadata, tensors = _gguf_table(source)
@@ -1219,7 +1267,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                     or _range_hash(source, entry[0], entry[1], cancelled=stopped)
                     != _range_hash(cached_path, output[0], output[1], cancelled=stopped)):
                 _fail("tensor_digest_mismatch", "cached GGUF tensor differs from source")
-        if _hash_file(source, stopped) != source_model_sha256:
+        if _file_identity(source) != source_identity:
             _fail("source_digest_mismatch", "source GGUF changed during cache verification")
 
     rebound = _rebind_cached_segment(root, final, {
@@ -1282,7 +1330,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                 _fail("tensor_digest_mismatch", "cut GGUF tensor bytes differ from source")
         if _layer_sizes(out_tensors, total_layers, start_layer, end_layer, local=True) != layer_bytes:
             _fail("layer_bytes_mismatch", "cut GGUF per-layer bytes differ from source")
-        if _hash_file(source, stopped) != source_model_sha256:
+        if _file_identity(source) != source_identity:
             _fail("source_digest_mismatch", "source GGUF changed during segment generation")
         if decoder_only_tail:
             # The role comes from the verified source range/tensor set, rather
