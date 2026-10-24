@@ -125,12 +125,17 @@ def test_bad_token_lists_fail_before_native(text):
 
 
 def test_ready_to_apply_source_cannot_reach_native_or_cache(monkeypatch, tmp_path):
+    # 平台门是 _preflight 的第一步，而本用例验的是补丁状态判定 —— 该判定与平台无关，
+    # 不绕过它就只能在 Windows 上跑到断言（CI 是 Linux，会先抛 platform BenchError）。
+    monkeypatch.setattr(bench, "_require_pinned_platform", lambda: None)
     monkeypatch.setattr(bench, "inspect_sync", lambda **kw: {"state": "ready_to_apply", "patches": []})
     with pytest.raises(bench.BenchError, match="committed, applied"):
         bench._preflight(SimpleNamespace(build_root=tmp_path, model=tmp_path / "absent.gguf"))
 
 
 def test_worktree_patch_source_cannot_reach_native_or_cache(monkeypatch, tmp_path):
+    # 同上：绕过平台门，让补丁状态判定在 Linux 上也被真正执行。
+    monkeypatch.setattr(bench, "_require_pinned_platform", lambda: None)
     monkeypatch.setattr(bench, "inspect_sync", lambda **kw: {"state": "applied", "patches": [{"state": "applied"}]})
     with pytest.raises(bench.BenchError, match="committed, applied"):
         bench._preflight(SimpleNamespace(build_root=tmp_path, model=tmp_path / "absent.gguf"))

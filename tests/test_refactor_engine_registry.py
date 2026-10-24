@@ -52,7 +52,10 @@ import builtins, sys
 sys.path.insert(0, 'src')
 original = builtins.__import__
 def guarded(name, *args, **kwargs):
-    if name.split('.')[0] not in sys.stdlib_module_names and not name.startswith('qlh_core'):
+    # 相对导入（from . import _compiler）传入的 name 为空串，它必然属于某个已被
+    # 放行的包，不能当成「非 stdlib 导入」误报 —— Python 3.12 的 re/__init__.py
+    # 正是用 ``from . import _compiler`` 导入，漏掉这个判断会让该门永远红。
+    if name and name.split('.')[0] not in sys.stdlib_module_names and not name.startswith('qlh_core'):
         raise AssertionError('non-stdlib/legacy import: ' + name)
     return original(name, *args, **kwargs)
 builtins.__import__ = guarded

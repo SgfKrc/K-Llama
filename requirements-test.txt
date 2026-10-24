@@ -16,3 +16,5 @@ textual==8.2.8
 # 此前未声明 ⇒ 这些用例在 `.venv-test` 里**一直 skip**；2026-09-19 补上后真跑通过。
 # 注：Windows 上 PyPI 无预编译 wheel 时会走源码构建（需 MSVC Build Tools）。
 llama-cpp-python==0.3.35
+# packaging/keep_head_resources._inspect_pe 用 pefile 解析 PE 头（纯 Python，跨平台可装）
+pefile

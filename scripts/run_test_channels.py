@@ -185,15 +185,6 @@ def _unit_args(
         "-q",
         "-m",
         "not external and not requires_db and not real_model and not slow and not requires_gpu",
-        # 覆盖 pytest.ini 的 --maxfail=3（0 = 不设上限，跑完为止）。两者一起用时
-        # `--maxfail` 与 `--junitxml` 会互相拆台：pytest 提前停止后
-        # <testsuite tests=N> 仍写**全部收集数**，而 <testcase> 只有**已执行的**，
-        # 于是 summarize_test_channels 判定 "JUnit tests count disagrees with testcase
-        # outcomes" 并**放弃解析**，总结里只剩 `passed=? failed=? errors=?`。
-        # 结果是 CI 越红给出的信息越少：2026-10-24 排查 unit 通道时，只能靠本机
-        # 跑 20 分钟全量（`run_test_channels.py --channel unit`）才拿到失败清单。
-        # 代价是失败时多跑几分钟，换来每次红都能在日志里直接看到失败测试名。
-        "--maxfail=0",
     ]
     if importlib.util.find_spec("xdist") is None:
         print(
@@ -206,6 +197,17 @@ def _unit_args(
         arguments.extend(["-n", str(workers), "--dist", dist])
     if junitxml is not None and order_seed is not None:
         arguments.extend(_quality_args(junitxml=junitxml, order_seed=order_seed))
+    # 覆盖 pytest.ini 的 --maxfail=3（0 = 不设上限，跑完为止）。
+    # 追加在最末尾，**不要**插到前面的位置：已有测试断言 args[4:8] 是
+    # -n/--dist，插在 mid 会移动索引并破坏那个契约。
+    # 为什么必须覆盖：--maxfail 与 --junitxml 一起用会互相拆台 —— pytest 提前
+    # 停止后 <testsuite tests=N> 仍写**全部收集数**，而 <testcase> 只有**已执行的**，
+    # 于是 summarize_test_channels 判定 "JUnit tests count disagrees with testcase
+    # outcomes" 并**放弃解析**，总结里只剩 `passed=? failed=? errors=?`。
+    # 结果是 CI 越红给出的信息越少：2026-10-24 排查 unit 通道时，annotations 只有
+    # 那三行摘要，最终靠本机跑 11 分钟全量才拿到失败清单。
+    # 代价是失败时多跑几分钟，换来每次红都能在日志里直接看到失败测试名。
+    arguments.append("--maxfail=0")
     return arguments
 
 

@@ -57,9 +57,16 @@ def _cache(path):
     return values
 
 
-def _preflight(args):
+def _require_pinned_platform():
+    """本实验的固定基线只在 Windows x64 上成立。"""
     if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise BenchError("this pinned AVX2 experiment requires Windows x64")
+
+
+def _preflight(args):
+    # 平台门单独成函数：os.name 是只读属性、monkeypatch 改不动，测试要单独验证
+    # 它**之后**的判定（补丁状态、CMake cache 基线）就只能替换这个函数。
+    _require_pinned_platform()
     source = ROOT / "android/app/src/main/cpp/llama.cpp"
     sync = inspect_sync(android_root=ROOT / "android", dry_run=True)
     if sync["state"] != "applied" or any(p["state"] != "applied_committed" for p in sync["patches"]):

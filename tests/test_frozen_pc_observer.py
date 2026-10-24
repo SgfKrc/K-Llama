@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -307,6 +308,7 @@ def test_independent_rehash_rejects_actual_cwd_drift_during_package_hashing(pack
     assert calls == [101, 101]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 路径规范化语义（大写 + 反斜杠）")
 def test_independent_rehash_normalizes_actual_process_cwd_before_comparing_to_executable_parent(package):
     package.process.cwd = lambda: str(package.root).upper().replace("/", "\\")
     assert observer.rehash_installed_exe(package.os_root)["source_root"] == str(package.root)
