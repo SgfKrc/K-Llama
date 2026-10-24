@@ -1170,6 +1170,58 @@ class ModelSupplyCoordinator:
                       "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
                       "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
                       "SUPPLY_NODE_CUTTER_UNAVAILABLE")
+            # ★ 2026-10-24（#124）：**复用显式参与决策**。此前 master 只在
+            #   local_cut / distribute 间二选一，从不告知节点"复用你已有的段"：
+            #   Python worker 好在收到 local_cut 时会先试 `reuse_segment`，而 Kotlin
+            #   worker（android）的 local_cut 路径**没有任何复用检查** ⇒ 每轮白裁约
+            #   3 GB（实测 ~105 s），即使它磁盘上已有身份完全一致的同段缓存
+            #   （已用两轮 marker 逐字段 diff 证明仅 manifest_sha256/operation_id 两个
+            #   收据字段不同，而这两者不在接收端 `sameContentIdentity` 判据内）。
+            #
+            #   接收端的复用能力挂在 distribute 路径上（`ModelSupplyReceiver.receive()`
+            #   在下载前会先按 `sameContentIdentity` 扫已发布段并 hardlink），所以这里
+            #   把命中的节点改判为 distribute ⇒ 零网络传输地复用已有段。
+            #
+            #   只在此处**确认**层段与三项摘要全等时才切换：若复用意外未命中，
+            #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
+            cached_hit = False
+            if strategy == "local_cut" and requested == "auto":
+                try:
+                    control = getattr(self.scheduler, "_task_worker_control", None)
+                    snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
+                    # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
+                    caps = snapshot.get("capabilities") or snapshot
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    caps = {}
+                want_range = list(manifest.get("layer_range") or [])
+                for artifact in caps.get("layer_artifacts") or []:
+                    if (isinstance(artifact, dict)
+                            and list(artifact.get("layer_range") or []) == want_range
+                            and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
+                            and artifact.get("source_model_id") == manifest.get("source_model_id")
+                            and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
+                            and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")):
+                        cached_hit = True
+                        break
+            if cached_hit:
+                strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
+                logger.info(
+                    "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
+                    "reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
+                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12], reason,
+                )
+            elif strategy == "local_cut" and requested == "auto":
+                # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
+                logger.info(
+                    "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
+                    "advertised=%d artifact_shas=%s ranges=%s",
+                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12],
+                    len(caps.get("layer_artifacts") or []),
+                    [str(item.get("artifact_sha256"))[:12]
+                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                    [item.get("layer_range")
+                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                )
             # Do not attempt a new local cut when its staging reserve is already
             # known infeasible; the receiver can still reuse its cached files.
             if (strategy == "local_cut" and requested == "auto" and
