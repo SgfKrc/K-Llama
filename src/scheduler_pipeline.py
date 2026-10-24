@@ -3272,6 +3272,29 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             item for item in plan.get("assignments", [])
             if item.get("node_id") in master_ids
         ), None)
+        # ★ 2026-10-24（#125）：**取证"跨事务能否跳过本地物化"**。
+        #   `materialize_pipeline_candidate` 的幂等只在**单个事务内**有效（靠
+        #   `transaction.materialization_key`），而每个新供给都是新事务 ⇒ 总要对同一份
+        #   配置重新加载段并重跑 torch.compile（实测 138 s，占供给最大头，且与上一轮
+        #   完全重复）。这里先记录"当前已加载状态"与"本次要加载的候选/区间"，用真实
+        #   供给确认二者一致后再启用跳过 —— 直接跳过若判据不严会导致静默加载错段。
+        try:
+            _local_range = (
+                [local_assignment.get("start_layer"), local_assignment.get("end_layer")]
+                if isinstance(local_assignment, dict) else None
+            )
+            _active_plan = self._active_pipeline_capacity_plan or {}
+            logger.info(
+                "event=pipeline_candidate_materialize_probe config=%s candidate=%s "
+                "host_prepared=%s local_range=%s active_config=%s active_generation=%s "
+                "active_phase=%s",
+                config_id, candidate_id,
+                bool(getattr(self._host, "is_pipeline_prepared", False)),
+                _local_range, _active_plan.get("config_id"), _active_plan.get("generation"),
+                _active_plan.get("transaction_phase"),
+            )
+        except Exception:  # 诊断本身绝不影响主流程
+            pass
         try:
             if candidate_id:
                 materialize_candidate = getattr(
