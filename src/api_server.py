@@ -1389,6 +1389,24 @@ class ChatRequest(BaseModel):
             raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
         return self
 
+    @model_validator(mode="after")
+    def thinking_must_be_visible(self):
+        """★ 2026-10-24（#125）：**思考一旦开启就必须可见**。
+
+        此前 `show_thinking`（展示）与 `enable_thinking`（是否思考）是两个完全独立的
+        字段，于是"要多想、但不给看"这种组合是被允许的 —— 而它恰是最坏的组合：模型在
+        内部生成上百个 thinking token（实测 0.64 s/step，182 步 ≈ 116 s），客户端
+        （TUI/Web）在整个过程中**一个字都收不到**，表现为干等，且无法判断是在思考
+        还是卡死。
+
+        现在联动：只要显式要求思考（`enable_thinking is True`），就自动开启展示。
+        显式 `show_thinking=True` 保持原样；只有 `enable_thinking` 为 `False`/`None`
+        时才允许展示关闭（此时模型本就不应产生思考内容）。
+        """
+        if self.enable_thinking is True and not self.show_thinking:
+            self.show_thinking = True
+        return self
+
 
 class ChatResponse(BaseModel):
     role: str = "assistant"

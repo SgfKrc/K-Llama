@@ -524,10 +524,31 @@ async def chat_stream(req: ChatRequest, request: Request):
             loop = _asyncio.get_running_loop()
 
             def _token_frame(event: dict) -> Optional[str]:
-                """token 事件 → SSE 帧；非 token 事件返回 None。"""
+                """把 token / thinking 事件转成 SSE 帧；两者都没有时返回 None。
+
+                ★ 2026-10-24（#125）：**思考必须边想边出**。
+
+                此前这里只认 `token`，而 `thinking` 仅由 `_append_event` 收进
+                `thinking_parts`、**攒到整个生成结束才一次性返回**（见下方
+                `"thinking_content": "".join(thinking_parts)`）。于是开启思考时客户端在
+                整个生成期**收不到任何字节** —— 实测 0.64 s/step、182 步 ≈ 116 s 的纯
+                干等，且无法区分"在思考"与"卡死"。
+
+                现在把思考增量实时下发为独立事件 `{"thinking": "<增量>"}`（与
+                `{"token": ...}` 形状区分，客户端可分别渲染思考区与正文区）。一个
+                SSE yield 允许携带多个 `data:` 帧，因此调用点无需任何改动。
+                """
+                frames = []
+                thinking = event.get("thinking")
+                if thinking:
+                    frames.append(
+                        f"data: {_json.dumps({'thinking': str(thinking)}, ensure_ascii=False)}\n\n"
+                    )
                 if event.get("token") is not None:
-                    return f"data: {_json.dumps({'token': event['token']}, ensure_ascii=False)}\n\n"
-                return None
+                    frames.append(
+                        f"data: {_json.dumps({'token': event['token']}, ensure_ascii=False)}\n\n"
+                    )
+                return "".join(frames) or None
 
             try:
                 # ---- 外部路由（数据作用域门控，与 fast/full 同语义）----
