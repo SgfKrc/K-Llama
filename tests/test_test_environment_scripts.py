@@ -270,11 +270,11 @@ def test_classify_places_quality_gate_and_contract_files():
     # 质量门文件进 quality_gate 类（marker 入口），不被其他类截胡
     # 契约类文件（命名启发式）
     assert any("contract" in name for name in files_by_class["contract"])
-    # 每个文件恰好落入一个分类（不重不漏：顶层 + simulation 子目录）
-    top_level = len(list(Path("tests").glob("test_*.py")))
-    sub_level = len(list(Path("tests/simulation").glob("test_*.py")))
+    # 每个文件恰好落入一个分类（不重不漏）。用递归统计，别只数顶层 + simulation：
+    # tests/ 下还有 native/ 等子目录，写死目录清单会在新增子目录时误报。
+    expected_total = len(list(Path("tests").rglob("test_*.py")))
     total_classified = sum(len(v) for v in files_by_class.values())
-    assert total_classified == top_level + sub_level
+    assert total_classified == expected_total
 
 
 def test_classify_unit_is_fallback_for_unmatched_files():

@@ -140,7 +140,8 @@ class TestNotLoaded:
         monkeypatch.setattr(
             eng,
             "_load_model_runtime",
-            lambda path: setattr(eng, "_model_path", str(path)),
+            # 票 20（a465ce3d）给 _load_model_runtime 加了 calibration_allowed 关键字参数。
+            lambda path, calibration_allowed=True: setattr(eng, "_model_path", str(path)),
         )
 
         eng.load_layer_range(0, 8, has_embedding=True, has_lm_head=False)

@@ -388,7 +388,9 @@ def _llama_fixture(tmp_path, monkeypatch, *, changed_on_load=False):
                                    "total_layers": 4}
     engine._pipeline_distributed_only = True
     monkeypatch.setattr(engine, "_find_layer_artifact", lambda start, end: str(path))
-    def load(path_text):
+    def load(path_text, calibration_allowed=True):
+        # 票 20（a465ce3d）给 _load_model_runtime 加了关键字参数 calibration_allowed，
+        # 这里的替身必须接受它，否则 load_layer_range 调用时 TypeError。
         engine._model_path = path_text
         engine._pipeline_descriptor = None
         engine._layer_load_proof = None

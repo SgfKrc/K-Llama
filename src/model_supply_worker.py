@@ -226,7 +226,7 @@ def _file_sha(path: Path, cancelled=None) -> str:
 
 # ★ 2026-10-24（#125）：整模 sha256 是必需的源身份证明，但**不必每轮重算**。
 #   实测清点（inventory）阶段对 5.78 GB 的 GGUF 做全量 sha256 需约 200 s，占整个
-#   供给近三分之一；#119 加的进程内摘要缓存**重启即失效、跨 op 也不复用** ⇒ 每次
+#   供给近三分之一；#133 加的进程内摘要缓存**重启即失效、跨 op 也不复用** ⇒ 每次
 #   供给都重付一遍。这里以 `_file_stamp`（size/mtime_ns/ctime_ns/ino/change_time）
 #   作为失效判据，把结果**持久化**到 worker root，跨重启与跨供给复用。
 _SOURCE_DIGEST_CACHE_NAME = "source-digests.json"

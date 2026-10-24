@@ -691,6 +691,18 @@
         "prefer_external": {
           "type": "boolean",
           "default": false
+        },
+        "speculative_gamma": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "maximum": 8.0,
+              "minimum": 1.0
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "type": "object",
