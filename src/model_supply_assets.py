@@ -403,7 +403,17 @@ def _verify_files(root: Path, payload: dict, *, cancelled=None) -> None:
         path = _safe_path(root, item["path"])
         if not path.is_file() or path.stat().st_size != item["size_bytes"]:
             _fail("file_size_mismatch", "segment file is absent or has the wrong size")
-        if _hash_file(path, cancelled) != item["sha256"]:
+        # ★ 2026-10-24（#125，按用户决策去掉过度的 live-hash 要求）：
+        #   段的完整性校验曾是 supplying 阶段的主开销 —— 每个复用命中的节点仍要对
+        #   2.5~5.5 GB 的段重算一遍全量 sha256（实测三节点合计约 121 s/轮），即使
+        #   这些段是本进程刚发布、发布后只读的本地缓存产物。
+        #
+        #   契约调整：段目录是本机不可变缓存、不是外部输入通道；对「同一
+        #   (dev, ino, size, mtime_ns) 反复做 GB 级重算」的安全收益与成本不相称
+        #   （发布/接收路径仍各自以 `_finish`/`_rebind` 重建目录并逐字节校验）。
+        #   因此改为：文件身份未变即复用既有摘要；一旦 size 或 stamp 变化就重新计算
+        #   并与清单比对，语义仍是"内容不符即失败"。
+        if _hash_file_cached(path, cancelled) != item["sha256"]:
             _fail("file_digest_mismatch", "segment file digest mismatch")
     expected = {item["path"] for item in payload["files"]} | {_MARKER}
     directories = {parent.as_posix() for name in expected

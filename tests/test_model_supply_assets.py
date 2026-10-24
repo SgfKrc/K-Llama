@@ -203,7 +203,28 @@ def test_gguf_rejects_source_identity(gguf_source, tmp_path, field, value, code)
     assert not list((tmp_path / "out").glob("segment-*"))
 
 
-def test_gguf_reuse_hashes_live_file_even_with_preserved_stat(gguf_source, tmp_path, monkeypatch):
+def test_gguf_reuse_detects_tamper_when_identity_changes(gguf_source, tmp_path, monkeypatch):
+    """身份（size/mtime_ns）一旦变化，必须重算摘要并拒绝被篡改的段。"""
+    out = tmp_path / "out"
+    first = build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
+    monkeypatch.setattr(assets, "_run_cut", lambda *args: pytest.fail("reuse must not cut again"))
+    assert build_gguf_segment(gguf_source, out, **_kwargs(gguf_source)) == first
+    artifact = Path(first["local_files"]["segment.gguf"])
+    data = bytearray(artifact.read_bytes())
+    data[-1] ^= 1
+    artifact.write_bytes(data)          # 写入会刷新 mtime_ns ⇒ 缓存必须失效
+    with pytest.raises(SupplyError, match="digest mismatch"):
+        build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
+
+
+def test_gguf_reuse_skips_rehash_when_identity_unchanged(gguf_source, tmp_path, monkeypatch):
+    """★ 2026-10-24（#125，用户决策）：段是本机不可变缓存，身份未变即复用摘要。
+
+    此前要求"复用也必须 live hash"，使每个复用命中的节点每轮都要对 2.5~5.5 GB
+    重算 sha256（实测三节点合计约 121 s/轮）。取消该要求后：篡改内容但**保留
+    size/mtime_ns** 的段会被当作未变（这是已知且被接受的取舍），因此这里断言
+    "仍能正常复用、且不重新裁剪"，用于固化新契约的行为边界。
+    """
     out = tmp_path / "out"
     first = build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
     monkeypatch.setattr(assets, "_run_cut", lambda *args: pytest.fail("reuse must not cut again"))
@@ -214,9 +235,8 @@ def test_gguf_reuse_hashes_live_file_even_with_preserved_stat(gguf_source, tmp_p
     data[-1] ^= 1
     artifact.write_bytes(data)
     import os
-    os.utime(artifact, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-    with pytest.raises(SupplyError, match="digest mismatch"):
-        build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
+    os.utime(artifact, ns=(stat.st_atime_ns, stat.st_mtime_ns))   # 恢复身份
+    assert build_gguf_segment(gguf_source, out, **_kwargs(gguf_source)) == first
 
 
 def _finished_cut(returncode=0, stderr=""):
