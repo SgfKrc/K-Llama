@@ -137,7 +137,7 @@
 - [SD 1.5引擎与分布式图像生成实施计划.md](media/SD 1.5引擎与分布式图像生成实施计划.md)
 - [SD 1.5离线资产包与签名源站发布计划.md](media/SD 1.5离线资产包与签名源站发布计划.md)
 
-### 杂项（`misc/`，23 篇）
+### 杂项（`misc/`，24 篇）
 
 - [Koakumix子项目定位与增强路线计划-2026-09-14.md](misc/Koakumix子项目定位与增强路线计划-2026-09-14.md)
 - [frontend_cybergothic功能复核与页面重构清单.md](misc/frontend_cybergothic功能复核与页面重构清单.md)
@@ -162,6 +162,7 @@
 - [ci-release-followup-2026-10-15.md](misc/ci-release-followup-2026-10-15.md)（2026-10-20 归档：票 13 续验过程记录，状态行自述「票 13 尚不能关闭」，已被 10-16 记录取代）
 - [ci-release-followup-2026-10-16.md](misc/ci-release-followup-2026-10-16.md)（2026-10-20 归档：§14「票13收口与重构基线」＝使命完成，产品验收由 [R6 报告](../重构产品验收-R6-2026-10-19.md) 接管）
 - [容量诊断与MTP预算修复-2026-10-15.md](misc/容量诊断与MTP预算修复-2026-10-15.md)（2026-10-20 归档：15 号续验的配套记录，仅被同批归档件引用）
+- [控制面数据库膨胀-治理方案-2026-10-24.md](misc/控制面数据库膨胀-治理方案-2026-10-24.md)（2026-10-24 归档：**方案已实现**——L1 热历史有界 / L2 journal checkpoint / L3 离线压缩，见 `model_control_retention.py`、`sqlite_journal.py`、`compact_control_db.py`）
 
 ### 重构（`refactor/`，1 篇）
 
