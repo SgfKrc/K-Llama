@@ -1627,6 +1627,7 @@ class ModelManager:
         may load the master's assigned range, but full-model fallback remains
         disabled until the caller performs a normal model load.
         """
+        from model_supply_assets import _hash_file_cached
         from model_sync import compute_model_sha256
         from pipeline_model_descriptor import inspect_pipeline_model
 
@@ -1638,6 +1639,7 @@ class ModelManager:
             resolved_path,
             model_id=model_id,
             layer_range=layer_range,
+            digest=_hash_file_cached,
         )
         if not descriptor.get("pipeline_runtime_supported", False):
             raise RuntimeError(
@@ -1645,7 +1647,7 @@ class ModelManager:
                 or "该模型架构尚未实现流水线执行 adapter"
             )
         if not model_sha256:
-            model_sha256 = compute_model_sha256(resolved_path)
+            model_sha256 = compute_model_sha256(resolved_path, digest=_hash_file_cached)
         if not model_sha256:
             raise RuntimeError("无法计算流水线模型摘要")
         descriptor["model_sha256"] = model_sha256
@@ -1692,14 +1694,16 @@ class ModelManager:
         model_path = self._full_model_path or self._model_path or ""
         if not model_path or not os.path.isdir(model_path):
             return {}
+        from model_supply_assets import _hash_file_cached
         from model_sync import compute_model_sha256
         from pipeline_model_descriptor import inspect_pipeline_model
 
         descriptor = inspect_pipeline_model(
             model_path,
             model_id=self._active_model_id,
+            digest=_hash_file_cached,
         )
-        descriptor["model_sha256"] = compute_model_sha256(model_path)
+        descriptor["model_sha256"] = compute_model_sha256(model_path, digest=_hash_file_cached)
         self._pipeline_descriptor = dict(descriptor)
         return dict(descriptor)
 

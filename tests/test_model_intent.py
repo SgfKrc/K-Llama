@@ -28,7 +28,7 @@ class Supply:
             raise ModelSupplyError("SUPPLY_MASTER_REQUIRED", "master required")
         if not self.scheduler.get_distributed_inference_enabled():
             raise ModelSupplyError("SUPPLY_LOCAL_MODE", "local mode")
-    def create(self, intent, *, wait_for_nodes=False):
+    def create(self, intent, *, wait_for_nodes=False, idempotency_key=""):
         self._check_master()
         assert wait_for_nodes
         op_id = "supply_" + format(len(self.operations) + 1, "032x")
@@ -727,6 +727,56 @@ def test_ready_projection_rejects_same_node_reconnect_without_fresh_native_commi
         assert result["status"] == "ready" and not result["loaded_ready"]
         assert result["deployment_reason_code"] == "worker_native_ready_identity_mismatch"
     assert case.scheduler._pipeline_load_transaction["phase"] == "ready"
+
+
+def test_reselect_ready_intent_keeps_native_plan_without_supply_or_prepare(ready_intent):
+    async def scenario():
+        case = ready_intent
+        initial = case.c.current()
+        old_transaction = case.scheduler._pipeline_load_transaction
+        old_plan = case.scheduler._active_pipeline_capacity_plan
+        selected = await case.c.create(initial["intent"])
+        assert selected["operation_id"] == case.op
+        assert selected["loaded_ready"] and selected["runnable"]
+        assert case.scheduler._pipeline_load_transaction is old_transaction
+        assert case.scheduler._active_pipeline_capacity_plan is old_plan
+        assert len(case.supply.operations) == 1
+        assert not case.supply.cancellations and not case.c._tasks
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["model", "options", "reconnect", "join", "cleanup", "retired", "key"])
+def test_reselect_ready_intent_rebuilds_when_live_inputs_change(ready_intent, change):
+    async def scenario():
+        case = ready_intent
+        requested = deepcopy(case.c.current()["intent"])
+        retired = []
+        async def retire():
+            retired.append(case.op)
+            case.scheduler._pipeline_load_transaction = None
+            case.scheduler._active_pipeline_capacity_plan = None
+            case.scheduler._pipeline_model_cleanup_ledger.clear()
+        case.c.retire = retire
+        if change == "model":
+            requested["model_id"] = "replacement"
+        elif change == "options":
+            requested["engine"] = "llama_cpp"
+        elif change == "reconnect":
+            case.scheduler._assignment_connection_generation = lambda node: 12
+        elif change == "join":
+            case.scheduler._connected_client_ids = lambda: {"tail", "worker", "new-worker"}
+        elif change == "cleanup":
+            case.scheduler._pipeline_model_cleanup_ledger["cleanup"] = {"node_id": "master"}
+        elif change == "retired":
+            case.scheduler._active_pipeline_capacity_plan = None
+        selected = await case.c.create(requested, **({"idempotency_key": "new-selection"} if change == "key" else {}))
+        assert selected["operation_id"] != case.op
+        assert not selected["loaded_ready"]
+        assert retired == [case.op]
+        assert len(case.supply.operations) == 2
+        case.c.cancel(selected["operation_id"])
+        await finish_tasks(case.c)
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("evidence", ["owner_missing", "owner_error", "missing_worker", "empty_expected",

@@ -239,6 +239,300 @@ def test_gguf_reuse_skips_rehash_when_identity_unchanged(gguf_source, tmp_path, 
     assert build_gguf_segment(gguf_source, out, **_kwargs(gguf_source)) == first
 
 
+def _track_file_hashes(monkeypatch):
+    calls = []
+    original = assets._hash_file
+    def tracked(path, cancelled=None):
+        calls.append(Path(path))
+        return original(path, cancelled)
+    monkeypatch.setattr(assets, "_hash_file", tracked)
+    return calls
+
+
+@pytest.mark.parametrize("cold", [False, True])
+def test_gguf_cross_operation_hashes_each_immutable_inode_at_most_once(gguf_source, tmp_path, monkeypatch, cold):
+    monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
+    args = _kwargs(gguf_source)
+    root = tmp_path / "operations"
+    first = build_gguf_segment(gguf_source, root / "op-1" / "worker-1", **args, reuse_root=root)
+    if cold:
+        monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
+    calls = _track_file_hashes(monkeypatch)
+    monkeypatch.setattr(assets, "_run_cut", lambda *args, **kwargs: pytest.fail("cache reuse started a cutter"))
+    monkeypatch.setattr(assets, "_range_hash", lambda *args, **kwargs: pytest.fail("cache reuse read tensor bytes"))
+    for operation in ("op-2", "op-3"):
+        result = build_gguf_segment(gguf_source, root / operation / "worker-1",
+                                    **{**args, "operation_id": operation}, reuse_root=root)
+        assert result["files"] == first["files"]
+        assert result["_reused_bytes"] == sum(entry["size_bytes"] for entry in first["files"])
+        for name, path in result["local_files"].items():
+            assert os.path.samefile(path, first["local_files"][name])
+            entry = next(entry for entry in result["files"] if entry["path"] == name)
+            assert assets._hash_file_cached(path) == entry["sha256"]
+        directory = Path(result["local_files"]["segment.gguf"]).parent
+        assert assets._reuse(directory, validate_supply_manifest(result))["files"] == first["files"]
+        if cold and operation == "op-2":
+            assert len(calls) == 1 + len(first["files"])
+            assert set(calls) == {gguf_source, *(Path(path) for path in first["local_files"].values())}
+            calls.clear()
+        else:
+            assert calls == []
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_gguf_rebind_copy_fallback_hashes_new_inode_even_with_cached_digest(gguf_source, tmp_path, monkeypatch, corrupt):
+    args = _kwargs(gguf_source)
+    root = tmp_path / "cache"
+    first = build_gguf_segment(gguf_source, root, **args)
+    weight = Path(first["local_files"]["segment.gguf"])
+    original_bytes = weight.read_bytes()
+    copied_weights, cuts = [], []
+    copyfile, run_cut = assets.shutil.copyfile, assets._run_cut
+    def unsupported_link(*args, **kwargs):
+        raise OSError("hardlinks unavailable")
+    def copy(source, target):
+        result = copyfile(source, target)
+        if Path(source) == weight:
+            copied_weights.append(Path(target))
+            if corrupt:
+                damaged = bytearray(Path(target).read_bytes())
+                damaged[-1] ^= 1
+                Path(target).write_bytes(damaged)
+            assets._DIGEST_CACHE[assets._file_identity(target)] = first["artifact_sha256"]
+        return result
+    def cut(*args, **kwargs):
+        cuts.append(args)
+        return run_cut(*args, **kwargs)
+    monkeypatch.setattr(assets.os, "link", unsupported_link)
+    monkeypatch.setattr(assets.shutil, "copyfile", copy)
+    monkeypatch.setattr(assets, "_run_cut", cut)
+    calls = _track_file_hashes(monkeypatch)
+    second = build_gguf_segment(gguf_source, root, **{**args, "operation_id": "op-2"})
+    assert len(copied_weights) == 1
+    assert calls.count(copied_weights[0]) == 1
+    assert weight not in calls and gguf_source not in calls
+    assert len(cuts) == int(corrupt)
+    assert second["files"] == first["files"]
+    assert not os.path.samefile(weight, second["local_files"]["segment.gguf"])
+    assert weight.read_bytes() == original_bytes
+    assert Path(second["local_files"]["segment.gguf"]).read_bytes() == original_bytes
+    calls.clear()
+    for entry in second["files"]:
+        assert assets._hash_file_cached(second["local_files"][entry["path"]]) == entry["sha256"]
+    assert calls == []
+    assert not list(root.glob(".supply-build-*"))
+
+
+def test_local_receipt_rebind_shares_digests_with_registration(gguf_segment, monkeypatch):
+    root = Path(gguf_segment["local_files"]["segment.gguf"]).parent.parent
+    calls = _track_file_hashes(monkeypatch)
+    for operation in ("op-2", "op-3"):
+        payload = validate_supply_manifest(gguf_segment)
+        payload.update(operation_id=operation, node_id="worker-2")
+        result = assets.reuse_segment(_sign(payload), root)
+        assert result is not None
+        assert result["manifest"]["operation_id"] == operation
+        for entry in result["manifest"]["files"]:
+            path = result["local_files"][entry["path"]]
+            assert os.path.samefile(path, gguf_segment["local_files"][entry["path"]])
+            assert assets._hash_file_cached(path) == entry["sha256"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("rebind", [False, True])
+def test_publication_rejects_tampering_after_verification(gguf_source, tmp_path, monkeypatch, rebind):
+    args = _kwargs(gguf_source)
+    root = tmp_path / "cache"
+    if rebind:
+        first = build_gguf_segment(gguf_source, root, **args)
+        original_bytes = Path(first["local_files"]["segment.gguf"]).read_bytes()
+        args["operation_id"] = "op-2"
+    finish = assets._finish
+    tampered = []
+    def tampered_finish(stage, final, payload, names, **options):
+        weight = stage / "segment.gguf"
+        before = weight.stat()
+        damaged = bytearray(weight.read_bytes())
+        damaged[-1] ^= 1
+        if options.get("verified_files") is not None:
+            replacement = stage / "replacement.gguf"
+            replacement.write_bytes(damaged)
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.replace(replacement, weight)
+        else:
+            weight.write_bytes(damaged)
+            os.utime(weight, ns=(before.st_atime_ns, before.st_mtime_ns))
+        tampered.append(weight)
+        return finish(stage, final, payload, names, **options)
+    monkeypatch.setattr(assets, "_finish", tampered_finish)
+    calls = _track_file_hashes(monkeypatch)
+    with pytest.raises(SupplyError) as error:
+        build_gguf_segment(gguf_source, root, **args)
+    assert error.value.code == "native_manifest_mismatch"
+    assert calls.count(tampered[-1]) >= 1
+    assert not list(root.glob(".supply-build-*"))
+    if rebind:
+        assert len(tampered) == 2
+        assert calls.count(tampered[0]) == 1
+        assert list(root.glob("segment-*")) == [Path(first["local_files"]["segment.gguf"]).parent]
+        assert Path(first["local_files"]["segment.gguf"]).read_bytes() == original_bytes
+    else:
+        assert not list(root.glob("segment-*"))
+
+
+@pytest.mark.parametrize("change", ["mtime", "size", "inode"])
+def test_gguf_cross_operation_changed_cache_is_rebuilt(gguf_source, tmp_path, monkeypatch, change):
+    args = _kwargs(gguf_source)
+    root = tmp_path / "cache"
+    first = build_gguf_segment(gguf_source, root, **args)
+    weight = Path(first["local_files"]["segment.gguf"])
+    before = weight.stat()
+    original_bytes = weight.read_bytes()
+    damaged = bytearray(original_bytes)
+    damaged[-1] ^= 1
+    if change == "inode":
+        replacement = tmp_path / "replacement.gguf"
+        replacement.write_bytes(damaged)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, weight)
+        assert weight.stat().st_ino != before.st_ino
+    else:
+        weight.write_bytes(damaged + (b"extra" if change == "size" else b""))
+        os.utime(weight, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    cuts = []
+    run_cut = assets._run_cut
+    def cut(*args, **kwargs):
+        cuts.append(args)
+        return run_cut(*args, **kwargs)
+    monkeypatch.setattr(assets, "_run_cut", cut)
+    calls = _track_file_hashes(monkeypatch)
+    second = build_gguf_segment(gguf_source, root, **{**args, "operation_id": "op-2"})
+    assert len(cuts) == 1
+    assert calls.count(weight) == int(change != "size")
+    assert second["files"] == first["files"]
+    assert not os.path.samefile(weight, second["local_files"]["segment.gguf"])
+    assert Path(second["local_files"]["segment.gguf"]).read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("change", ["source", "target"])
+def test_cached_hardlink_rejects_identity_changes_during_link(tmp_path, monkeypatch, change):
+    source, target = tmp_path / "source.bin", tmp_path / "target.bin"
+    source.write_bytes(b"verified immutable bytes")
+    before = source.stat()
+    entry = {"size_bytes": before.st_size, "sha256": sha256_file(source)}
+    link = assets.os.link
+    def changed_link(original, destination):
+        link(original, destination)
+        if change == "source":
+            os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        else:
+            replacement = tmp_path / "replacement.bin"
+            replacement.write_bytes(source.read_bytes())
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.replace(replacement, destination)
+    monkeypatch.setattr(assets.os, "link", changed_link)
+    calls = _track_file_hashes(monkeypatch)
+    assert not assets._link_verified(source, target, entry, lambda: False, cached=True)
+    assert calls == []
+    assert not target.exists()
+    assert source.read_bytes() == b"verified immutable bytes"
+
+
+def test_cached_digest_hit_honors_cancellation(tmp_path, monkeypatch):
+    path = tmp_path / "weight.bin"
+    path.write_bytes(b"verified")
+    expected = sha256_file(path)
+    calls = _track_file_hashes(monkeypatch)
+    assert assets._hash_file_cached(path, lambda: False) == expected
+    with pytest.raises(SupplyError) as error:
+        assets._hash_file_cached(path, lambda: True)
+    assert error.value.code == "cancelled"
+    assert calls == []
+
+
+def test_digest_cache_is_bounded_and_evicts_old_entries_in_batches(tmp_path, monkeypatch):
+    limit = assets._DIGEST_CACHE_LIMIT
+    monkeypatch.setattr(assets, "_DIGEST_CACHE", {
+        (-1, index, 0, 0): "0" * 64 for index in range(limit)
+    })
+    path = tmp_path / "weight.bin"
+    path.write_bytes(b"new immutable bytes")
+    calls = _track_file_hashes(monkeypatch)
+    digest = assets._hash_file_cached(path)
+    assert len(assets._DIGEST_CACHE) == limit - limit // 4 + 1
+    assert (-1, 0, 0, 0) not in assets._DIGEST_CACHE
+    assert (-1, limit - 1, 0, 0) in assets._DIGEST_CACHE
+    assert assets._hash_file_cached(path) == digest
+    assert calls == [path]
+
+
+@pytest.mark.parametrize("phase", ["link", "inventory", "publish"])
+@pytest.mark.parametrize("callback_error", [False, True])
+def test_warm_rebind_stops_without_replacing_previous_publication(gguf_source, tmp_path, monkeypatch, phase, callback_error):
+    args = _kwargs(gguf_source)
+    root = tmp_path / "cache"
+    first = build_gguf_segment(gguf_source, root, **args)
+    previous = Path(first["local_files"]["segment.gguf"]).parent
+    previous_bytes = {path.name: path.read_bytes() for path in previous.iterdir()}
+    stop = [False]
+    if phase == "link":
+        original = assets.os.link
+        def link(*args, **kwargs):
+            original(*args, **kwargs)
+            stop[0] = True
+        monkeypatch.setattr(assets.os, "link", link)
+    elif phase == "inventory":
+        original = assets._inventory
+        def inventory(*args, **kwargs):
+            stop[0] = True
+            return original(*args, **kwargs)
+        monkeypatch.setattr(assets, "_inventory", inventory)
+    else:
+        original = assets._write_json
+        def write(path, payload):
+            original(path, payload)
+            if path.name == assets._MARKER:
+                stop[0] = True
+        monkeypatch.setattr(assets, "_write_json", write)
+    def cancelled():
+        if stop[0] and callback_error:
+            raise RuntimeError("owner check failed")
+        return stop[0]
+    calls = _track_file_hashes(monkeypatch)
+    monkeypatch.setattr(assets, "_run_cut", lambda *args, **kwargs: pytest.fail("stopped reuse started a cutter"))
+    with pytest.raises(RuntimeError if callback_error else SupplyError) as error:
+        build_gguf_segment(gguf_source, root, **{**args, "operation_id": "op-2"}, cancelled=cancelled)
+    if not callback_error:
+        assert error.value.code == "cancelled"
+    assert calls == []
+    assert list(root.glob("segment-*")) == [previous]
+    assert not list(root.glob(".supply-build-*"))
+    assert {path.name: path.read_bytes() for path in previous.iterdir()} == previous_bytes
+
+
+def test_receive_rechecks_live_bytes_after_download_even_if_digest_is_cached(gguf_segment, tmp_path, monkeypatch):
+    download = assets._download
+    def tampered_download(*args, **kwargs):
+        result = download(*args, **kwargs)
+        target, entry = args[2:4]
+        if entry["kind"] == "weights":
+            before = target.stat()
+            assert assets._hash_file_cached(target) == entry["sha256"]
+            damaged = bytearray(target.read_bytes())
+            damaged[-1] ^= 1
+            target.write_bytes(damaged)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return result
+    monkeypatch.setattr(assets, "_download", tampered_download)
+    root = tmp_path / "received"
+    with _server(gguf_segment) as (url, _):
+        with pytest.raises(SupplyError) as error:
+            _receive(gguf_segment, root, url)
+    assert error.value.code == "file_digest_mismatch"
+    assert not list(root.glob("segment-*"))
+    assert not list(root.rglob(assets._MARKER))
+
+
 def _finished_cut(returncode=0, stderr=""):
     return SimpleNamespace(returncode=returncode, communicate=lambda **kw: ("", stderr), poll=lambda: returncode)
 
@@ -700,6 +994,120 @@ def _cross_format_fixture(root, target, *, omit_optional=False):
     args.update(source_model_sha256=proof["target"]["artifact_sha256"],
                 tokenizer_sha256=proof["target"]["tokenizer_sha256"], conversion_proof=proof)
     return args
+
+
+@pytest.mark.parametrize("cross_format", [False, True])
+def test_safetensors_hot_build_never_rehashes_source_or_cached_weights(tmp_path, monkeypatch, cross_format):
+    import pipeline_model_descriptor as descriptor
+    source, target, root = tmp_path / "hf", tmp_path / "converted.gguf", tmp_path / "supply"
+    if cross_format:
+        args = _cross_format_fixture(source, target)
+    else:
+        _safetensors_fixture(source, sharded=True)
+        args = _kwargs(source)
+    monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
+    descriptor_hash = descriptor._sha256_file
+    def no_default_gguf_hash(path):
+        assert Path(path).suffix != ".gguf", "conversion descriptor bypassed the shared digest"
+        return descriptor_hash(path)
+    monkeypatch.setattr(descriptor, "_sha256_file", no_default_gguf_hash)
+    calls = _track_file_hashes(monkeypatch)
+    first = build_safetensors_segment(source, root, **args)
+    weights = set(source.glob("*.safetensors")) | ({target} if cross_format else set())
+    assert all(calls.count(path) == 1 for path in weights)
+    calls.clear()
+    monkeypatch.setattr(assets, "_copy_selected", lambda *args, **kwargs: pytest.fail("hot build repacked weights"))
+    monkeypatch.setattr(assets, "_range_hash", lambda *args, **kwargs: pytest.fail("hot build read tensor bytes"))
+    for operation in ("op-1", "op-2", "op-3"):
+        result = build_safetensors_segment(source, root, **{**args, "operation_id": operation})
+        assert result["files"] == first["files"]
+        for entry in result["files"]:
+            if entry["kind"] == "weights":
+                path = result["local_files"][entry["path"]]
+                assert os.path.samefile(path, first["local_files"][entry["path"]])
+                assert assets._hash_file_cached(path) == entry["sha256"]
+    assert not [path for path in calls if path.suffix in {".safetensors", ".gguf"}]
+
+
+@pytest.mark.parametrize("artifact", ["source", "target"])
+@pytest.mark.parametrize("replace", [False, True])
+def test_cross_format_cached_source_identity_change_is_revalidated(tmp_path, monkeypatch, artifact, replace):
+    source, target, root = tmp_path / "hf", tmp_path / "converted.gguf", tmp_path / "supply"
+    args = _cross_format_fixture(source, target)
+    first = build_safetensors_segment(source, root, **args)
+    path = next(source.glob("*.safetensors")) if artifact == "source" else target
+    before = path.stat()
+    damaged = bytearray(path.read_bytes())
+    damaged[-1] ^= 1
+    if replace:
+        replacement = tmp_path / "replacement.bin"
+        replacement.write_bytes(damaged)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, path)
+        assert path.stat().st_ino != before.st_ino
+    else:
+        path.write_bytes(damaged)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    calls = _track_file_hashes(monkeypatch)
+    with pytest.raises(SupplyError) as error:
+        build_safetensors_segment(source, root, **{**args, "operation_id": "op-2"})
+    assert error.value.code == ("source_digest_mismatch" if artifact == "source" else "conversion_proof_invalid")
+    assert calls.count(path) == 1
+    assert list(root.glob("segment-*")) == [Path(first["local_files"]["config.json"]).parent]
+
+
+@pytest.mark.parametrize("cross_format,artifact", [(False, "source"), (True, "source"), (True, "target")])
+@pytest.mark.parametrize("phase", ["copy", "reuse", "rebind"])
+def test_safetensors_source_snapshot_rejects_changes_during_build(tmp_path, monkeypatch, cross_format, artifact, phase):
+    source, target, root = tmp_path / "hf", tmp_path / "converted.gguf", tmp_path / "supply"
+    if cross_format:
+        args = _cross_format_fixture(source, target)
+    else:
+        _safetensors_fixture(source, sharded=True)
+        args = _kwargs(source)
+    first = build_safetensors_segment(source, root, **args) if phase != "copy" else None
+    path = next(source.glob("*.safetensors")) if artifact == "source" else target
+    changed = []
+    def mutate():
+        if changed:
+            return
+        before = path.stat()
+        damaged = bytearray(path.read_bytes())
+        if artifact == "source":
+            damaged.extend(b"changed outside selected tensor ranges")
+        else:
+            damaged[-1] ^= 1
+        path.write_bytes(damaged)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        changed.append(path)
+    if phase == "copy":
+        original = assets._copy_selected
+        def copy(*args, **kwargs):
+            original(*args, **kwargs)
+            mutate()
+        monkeypatch.setattr(assets, "_copy_selected", copy)
+    elif phase == "reuse":
+        original = assets._reuse
+        def reuse(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if result is not None:
+                mutate()
+            return result
+        monkeypatch.setattr(assets, "_reuse", reuse)
+    else:
+        original = assets.os.link
+        def link(*args, **kwargs):
+            original(*args, **kwargs)
+            mutate()
+        monkeypatch.setattr(assets.os, "link", link)
+        monkeypatch.setattr(assets, "_copy_selected", lambda *args, **kwargs: pytest.fail("changed source was repacked"))
+        args["operation_id"] = "op-2"
+    with pytest.raises(SupplyError) as error:
+        build_safetensors_segment(source, root, **args)
+    assert error.value.code == "source_digest_mismatch"
+    assert changed == [path]
+    assert not list(root.glob(".supply-build-*"))
+    assert list(root.glob("segment-*")) == ([Path(first["local_files"]["config.json"]).parent] if first else [])
 
 
 def test_cross_format_safetensors_binds_gguf_identity_and_source_tokenizer(tmp_path):

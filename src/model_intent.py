@@ -365,6 +365,23 @@ class ModelIntentCoordinator:
                         return self.get(prior["operation_id"])
             with self._lock:
                 current = self.current()
+                if (current and not idempotency_key and current.get("intent") == intent
+                        and current.get("status") == "ready" and current.get("runnable") is True
+                        and current.get("validity") == "valid"):
+                    saved = self.scheduler._model_supply.get(current["operation_id"])
+                    connected = set(self.scheduler._connected_client_ids())
+                    _, cleanup_pending = self._retirement_state()
+                    with self.scheduler._layer_config_lock:
+                        transaction = self.scheduler._pipeline_load_transaction or {}
+                        candidates = saved.get("candidate_node_ids")
+                        observed = (set(candidates) - {"master"} if candidates is not None
+                                    else set(transaction.get("worker_ids") or ()))
+                        if connected == observed and cleanup_pending is False:
+                            reused = self.get(current["operation_id"])
+                            if reused.get("runnable") is True and reused.get("validity") == "valid":
+                                logger.info("event=model_intent_ready_reused operation=%s config=%s generation=%s",
+                                            reused["operation_id"], reused["config_id"], reused["generation"])
+                                return reused
                 if current and current["status"] not in TERMINAL:
                     if current["intent"] == intent:
                         return current

@@ -323,7 +323,8 @@ class ModelSupplyCoordinator:
     def _update(self, op_id, **values):
         with self._condition:
             operation = self._operations[op_id]
-            if operation["status"] in {"failed", "cancelled", "available"}:
+            if (operation["status"] in {"failed", "cancelled"}
+                    or operation["status"] == "available" and set(values) != {"retention"}):
                 return
             if self._events[op_id].is_set() and values.get("status") not in {"cancelled", "failed"}:
                 return
@@ -687,10 +688,11 @@ class ModelSupplyCoordinator:
     def _sources(self, op_id, intent, *, want_gguf=True):
         import model_config as mc
         import local_store
-        from model_sync import compute_model_sha256, compute_file_sha256
+        from model_sync import compute_model_sha256
         from pipeline_model_descriptor import inspect_pipeline_model
         from llama_engine import LlamaCppEngine
         from relay_segment_info import read_gguf_layer_info
+        from model_supply_assets import _hash_file_cached
         model_id = intent["model_id"]
         from model_supply_sources import ensure_registered_sources
         source_result = ensure_registered_sources(
@@ -704,15 +706,15 @@ class ModelSupplyCoordinator:
         proof = source_result.get("conversion_proof")
         descriptors = {}
         if hf and (hf / "config.json").is_file():
-            descriptor = inspect_pipeline_model(hf, model_id=model_id)
-            descriptor.setdefault("model_sha256", compute_model_sha256(str(hf)))
+            descriptor = inspect_pipeline_model(hf, model_id=model_id, digest=_hash_file_cached)
+            descriptor.setdefault("model_sha256", compute_model_sha256(str(hf), digest=_hash_file_cached))
             descriptors["pytorch"] = descriptor
         if gguf and gguf.is_file():
             info = read_gguf_layer_info(gguf) or {}
             engine = LlamaCppEngine()
             engine._model_path = str(gguf)
             engine.active_model_id = model_id
-            descriptor = engine.get_pipeline_descriptor()
+            descriptor = engine.get_pipeline_descriptor(digest=_hash_file_cached)
             if not descriptor or any(value <= 0 for value in descriptor.get("layer_weight_bytes", [])):
                 raise ModelSupplyError("SUPPLY_FULL_SOURCE_REQUIRED", "Supply needs a complete on-disk source, not a pre-cut segment")
             descriptor["source_model_id"] = model_id
@@ -1383,10 +1385,12 @@ class ModelSupplyCoordinator:
                 self._leases.pop((op_id, node_id), None)
                 self._update(op_id, nodes=nodes)
         self._check(op_id)
-        self._collect_garbage(op_id)
-        self._check(op_id)
         self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
                      loaded_ready=False, requires_prepare=True)
+        try:
+            self._collect_garbage(op_id)
+        except Exception:
+            logger.exception("event=supply_cache_collection_failed operation=%s", op_id)
 
     def _collect_garbage(self, op_id):
         collector = getattr(self.scheduler._model_supply_worker, "collect_garbage", None)
@@ -1396,6 +1400,8 @@ class ModelSupplyCoordinator:
         # storage and must leave status, progress and cancellation responsive.
         # The receiver holds native owner admission throughout collection.
         with self._condition:
+            if self._preparing:
+                return
             protected = [self.root / op_id]
             preparing = self._preparing
             event = self._events[op_id]

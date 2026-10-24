@@ -36,12 +36,16 @@ def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple
     path = Path(path)
     size = path.stat().st_size
     with path.open("rb") as handle:
+        position = 0
+
         def read(count):
-            if count < 0 or handle.tell() + count > min(size, _MAX_HEADER):
+            nonlocal position
+            if count < 0 or position + count > min(size, _MAX_HEADER):
                 _invalid("GGUF header is truncated")
             data = handle.read(count)
             if len(data) != count:
                 _invalid("GGUF header is truncated")
+            position += count
             return data
 
         def unpack(fmt):
@@ -54,6 +58,7 @@ def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple
             return read(count).decode("utf-8")
 
         def value(kind, depth=0, *, retain=False):
+            nonlocal position
             if depth > 2:
                 _invalid("GGUF arrays are nested too deeply")
             if kind == 8:
@@ -66,9 +71,10 @@ def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple
                     return [value(subtype, depth + 1, retain=True) for _ in range(count)]
                 if subtype in _GGUF_SCALAR_TYPES:
                     length = count * _GGUF_SCALAR_TYPES[subtype][1]
-                    if handle.tell() + length > min(size, _MAX_HEADER):
+                    if position + length > min(size, _MAX_HEADER):
                         _invalid("GGUF array is truncated or exceeds metadata limit")
                     handle.seek(length, 1)
+                    position += length
                 else:
                     for _ in range(count):
                         value(subtype, depth + 1)
@@ -107,7 +113,7 @@ def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple
             if elements % block or offset % alignment:
                 _invalid("GGUF tensor has invalid block alignment")
             tensors[name] = (offset, elements // block * width, shape, kind)
-        data_start = (handle.tell() + alignment - 1) // alignment * alignment
+        data_start = (position + alignment - 1) // alignment * alignment
         last_end = data_start
         for name, (offset, length, shape, kind) in sorted(tensors.items(), key=lambda item: item[1][0]):
             absolute = data_start + offset

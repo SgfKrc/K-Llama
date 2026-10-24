@@ -69,6 +69,39 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
     assert descriptor["source_model_id"] == "qwen3-5-2b"
     assert descriptor["source_model_sha256"] == "e" * 64
     assert descriptor["layer_weight_bytes"] == [4, 4]
+    engine._pipeline_descriptor = None
+    monkeypatch.setattr(engine, "_pipeline_file_sha256", lambda *args: pytest.fail("supply rehashed GGUF"))
+    inspected = []
+    def shared_digest(path):
+        inspected.append(path)
+        return descriptor["model_sha256"]
+    assert engine.get_pipeline_descriptor(digest=shared_digest) == descriptor
+    assert inspected == [model]
+
+
+def test_pipeline_file_digest_survives_engine_replacement_and_fresh_checks(tmp_path, monkeypatch):
+    import model_supply_assets as assets
+
+    path = tmp_path / "segment.gguf"
+    path.write_bytes(b"GGUF shared digest")
+    expected = assets._hash_file_cached(path)
+    original = assets._hash_file
+    reads = []
+
+    def counted(*args, **kwargs):
+        reads.append(Path(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(assets, "_hash_file", counted)
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == expected
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == expected
+    assert reads == []
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path), use_cache=False) == expected
+    assert reads == [path]
+    path.write_bytes(b"changed GGUF bytes")
+    changed = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == changed
+    assert reads == [path, path]
 
 
 def test_prepare_pipeline_model_is_metadata_only(monkeypatch, tmp_path):

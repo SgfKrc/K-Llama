@@ -565,7 +565,8 @@ def iter_chat_payloads(
     try:
         with urllib.request.urlopen(req, timeout=effective_read_timeout) as resp:
             while True:
-                chunk = resp.read(4096)
+                # Return available bytes without waiting for 4096 bytes or stream EOF.
+                chunk = resp.read1(4096)
                 if not chunk:
                     break
                 for event in decoder.feed(chunk):

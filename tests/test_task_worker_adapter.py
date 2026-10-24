@@ -28,6 +28,7 @@ from execution_provider import (
     DEPENDENCY_FAILURES_KEY,
     ModelIdentity,
     ProviderExecutionError,
+    ProviderReservationError,
     ProviderUnavailable,
     StageAttempt,
     StageRequest,
@@ -416,6 +417,220 @@ def _start_accepted_remote_attempt(suffix):
     return (
         provider, reservation, attempt, identity, outcome, finished, thread, sent,
     )
+
+
+def _rejected_stage_accept(identity, *, message_id="msg_drain_rejected01"):
+    return build_message(
+        "stage_accept",
+        {
+            **identity,
+            "accepted": False,
+            "reason_code": "worker_experiment_disabled",
+            "retryable": True,
+        },
+        message_id=message_id,
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot()
+
+
+@pytest.mark.parametrize("wrong_field", [
+    None, "workflow_id", "stage_id", "attempt_id", "lease_id",
+    "lease_epoch", "provider_id",
+])
+def test_remote_provider_rejection_proves_drained_after_identity_check_and_release(
+    monkeypatch, wrong_field,
+):
+    coordinator_control, _worker_control = _admitted_control_plane()
+
+    def reject_offer(offer):
+        assert offer.message_type == "stage_offer"
+        identity = _response_identity(offer.payload)
+        if wrong_field is not None:
+            wrong_identity = dict(identity)
+            wrong_identity[wrong_field] = (
+                identity[wrong_field] + 1 if wrong_field == "lease_epoch"
+                else identity[wrong_field] + "_wrong"
+            )
+            with pytest.raises(WorkerProtocolError) as mismatch:
+                provider.handle_message(_rejected_stage_accept(
+                    wrong_identity, message_id="msg_drain_wrong_identity01",
+                ))
+            assert mismatch.value.code == (
+                "unknown_attempt" if wrong_field == "attempt_id"
+                else "attempt_identity_mismatch"
+            )
+            pending = provider._pending[attempt.attempt_id]
+            assert pending.terminal_snapshot() == ("", None, None)
+            assert not pending.accept_event.is_set()
+            assert not pending.result_event.is_set()
+            assert provider.execution_drained(attempt.attempt_id) is False
+        provider.handle_message(_rejected_stage_accept(identity))
+
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=reject_offer,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_drain_rejected01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_drain_rejected01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5.0,
+    )
+    try:
+        assert provider.execution_drained(attempt.attempt_id) is False
+        with pytest.raises(ProviderReservationError) as rejected:
+            provider.execute(attempt, reservation, threading.Event())
+        assert rejected.value.code == "worker_experiment_disabled"
+        assert rejected.value.retryable is True
+        pending = provider._pending[attempt.attempt_id]
+        assert pending.terminal_snapshot() == (
+            "reservation_rejected", None, rejected.value,
+        )
+        assert pending.accepted is False
+        assert pending.cancel_execution_stopped is False
+        assert provider.execution_drained(attempt.attempt_id) is True
+        assert provider.inspect().active_reservations == 1
+
+        # Match the layer-stage finally: release the slot before draining.
+        provider.release(reservation.reservation_id)
+        assert provider.inspect().active_reservations == 0
+        assert reservation.reservation_id not in provider._executed_reservations
+        assert reservation.reservation_id not in provider._reservation_attempts
+        assert provider.execution_drained(attempt.attempt_id) is True
+        next_reservation = provider.reserve(request)
+        provider.release(next_reservation.reservation_id)
+
+        # Stop proof currently lives only in the released pending's 5s cache.
+        with monkeypatch.context() as clock:
+            clock.setattr(task_worker_adapter_mod, "time", SimpleNamespace(
+                time=time.time, monotonic=lambda: pending.released_at + 4.999,
+            ))
+            provider.inspect()
+            assert provider.execution_drained(attempt.attempt_id) is True
+            clock.setattr(
+                task_worker_adapter_mod.time, "monotonic",
+                lambda: pending.released_at + 5.0,
+            )
+            provider.inspect()
+            assert attempt.attempt_id not in provider._pending
+            assert provider.execution_drained(attempt.attempt_id) is False
+        assert provider.execution_drained("att_unknown_drain01") is False
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize("scenario, expected_code", [
+    ("accept_timeout", "remote_accept_timeout"),
+    ("lease_expired", "lease_expired"),
+    ("request_deadline", "request_deadline_exceeded"),
+    ("disconnect", "remote_worker_disconnected"),
+    ("offer_send_failure", "remote_worker_disconnected"),
+    ("cancel_without_ack", "provider_cancelled"),
+    ("cancel_unknown_ack", "provider_cancelled"),
+    ("cancel_in_flight", "provider_cancelled"),
+])
+def test_remote_provider_without_stop_proof_stays_undrained_after_release_and_ttl(
+    monkeypatch, scenario, expected_code,
+):
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+
+    def send(message):
+        sent.append(message)
+        if message.message_type != "stage_offer":
+            return
+        if scenario == "offer_send_failure":
+            raise ConnectionError("offer send failed without a stop receipt")
+        if scenario != "accept_timeout":
+            provider.handle_message(build_message(
+                "stage_accept",
+                {
+                    **_response_identity(message.payload),
+                    "accepted": True, "reason_code": "", "retryable": False,
+                },
+                message_id="msg_drain_accept01",
+                sent_at_ms=int(time.time() * 1000),
+                version=3,
+            ).snapshot())
+        if scenario == "disconnect":
+            provider.notify_disconnect()
+        elif scenario.startswith("cancel_"):
+            provider.cancel(attempt.attempt_id)
+
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=send,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_drain_unproven01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_drain_unproven01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + (0.02 if scenario == "lease_expired" else 5.0),
+        accept_timeout_seconds=0.02 if scenario == "accept_timeout" else 5.0,
+        request_deadline=(
+            RequestDeadline.start(0.02) if scenario == "request_deadline" else None
+        ),
+    )
+    try:
+        with pytest.raises(ProviderExecutionError) as failed:
+            provider.execute(attempt, reservation, threading.Event())
+        assert failed.value.code == expected_code
+        identity = _response_identity(sent[0].payload)
+        if scenario in {"cancel_unknown_ack", "cancel_in_flight"}:
+            provider.handle_message(_cancelled_ack(
+                identity,
+                execution_state=(
+                    "execution_in_flight" if scenario == "cancel_in_flight" else None
+                ),
+            ))
+        assert provider.execution_drained(attempt.attempt_id) is False
+
+        # A rejection that loses to an earlier terminal cannot supply stop proof.
+        pending = provider._pending[attempt.attempt_id]
+        first_terminal = pending.terminal_snapshot()
+        provider.handle_message(_rejected_stage_accept(identity))
+        assert pending.terminal_snapshot() == first_terminal
+        assert provider.execution_drained(attempt.attempt_id) is False
+        provider.release(reservation.reservation_id)
+        assert provider.inspect().active_reservations == 0
+        assert provider.execution_drained(attempt.attempt_id) is False
+        with monkeypatch.context() as clock:
+            clock.setattr(task_worker_adapter_mod, "time", SimpleNamespace(
+                time=time.time, monotonic=lambda: pending.released_at + 6.0,
+            ))
+            provider.inspect()
+            assert provider._pending[attempt.attempt_id] is pending
+            assert provider.execution_drained(attempt.attempt_id) is False
+    finally:
+        provider.close()
+
+
+def test_remote_provider_rejection_after_acceptance_cannot_prove_execution_drained():
+    (
+        provider, _reservation, attempt, identity, outcome, finished, thread, _sent,
+    ) = _start_accepted_remote_attempt("rejection_after_accept01")
+    try:
+        with pytest.raises(WorkerProtocolError) as rejected:
+            provider.handle_message(_rejected_stage_accept(identity))
+        assert rejected.value.code == "duplicate_stage_response"
+        assert provider.execution_drained(attempt.attempt_id) is False
+        assert not finished.is_set()
+    finally:
+        provider.close()
+        thread.join(2.0)
+    assert finished.is_set()
+    assert outcome["error"].code == "remote_worker_disconnected"
 
 
 def test_remote_provider_request_deadline_caps_accept_wait():

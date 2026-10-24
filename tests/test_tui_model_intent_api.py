@@ -172,11 +172,11 @@ def test_chat_invalid_streaming_mode_never_reaches_network(monkeypatch):
 def test_full_chat_uses_finite_prefill_budget_and_keeps_caller_override(monkeypatch, mode, override, expected):
     budgets = []
     class PrefillResponse(io.BytesIO):
-        def read(self, size=-1):
+        def read1(self, size=-1):
             # Simulate an otherwise valid full response whose first answer needs 70s.
             if mode == "full" and override is None and budgets[-1] < 70:
                 raise TimeoutError("prefill exceeded socket read budget")
-            return super().read(size)
+            return super().read1(size)
     def open_response(request, timeout):
         budgets.append(timeout)
         return PrefillResponse(b': processing\n\ndata: {"done":true,"response":"2"}\n\n')

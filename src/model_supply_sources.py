@@ -17,7 +17,6 @@ import os
 import shutil
 import sys
 import tempfile
-import threading
 from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -83,34 +82,14 @@ def _sha(path: Path, cancelled: Callable[[], bool]) -> str:
     return digest.hexdigest()
 
 
-# Bounded, process-local content-digest reuse. A digest is only reused while the
-# recorded ``st_size`` and ``st_mtime_ns`` still match, so a replaced, appended
-# or rewritten file always re-hashes. This is the same trust model already used
-# by ``model_sync.compute_file_sha256`` (and by the persisted ``model.sha256`` +
-# ``model.sha256.meta.json`` pair). It exists because one supply preparation
-# otherwise re-reads the identical 18 GB source several times. The converter and
-# quantizer double check deliberately keeps using ``_sha``.
-_DIGEST_MEMO_LIMIT = 4096
-_DIGEST_MEMO: dict[tuple[str, int, int], str] = {}
-_DIGEST_MEMO_LOCK = threading.Lock()
-
-
 def _content_sha(path: Path, cancelled: Callable[[], bool]) -> str:
-    """Rehash only when the file's size/mtime fingerprint changed."""
-    stat = path.stat()
-    key = (str(path), stat.st_size, stat.st_mtime_ns)
-    with _DIGEST_MEMO_LOCK:
-        cached = _DIGEST_MEMO.get(key)
-    if cached is not None:
+    """Share verified immutable source identities with builders and preparation."""
+    from model_supply_assets import _hash_file_cached
+    def check_cancelled():
         _check(cancelled)
-        return cached
-    digest = _sha(path, cancelled)
-    with _DIGEST_MEMO_LOCK:
-        if len(_DIGEST_MEMO) >= _DIGEST_MEMO_LIMIT:
-            for stale in list(_DIGEST_MEMO)[: _DIGEST_MEMO_LIMIT // 4]:
-                _DIGEST_MEMO.pop(stale, None)
-        _DIGEST_MEMO[key] = digest
-    return digest
+        return False
+    _check(cancelled)
+    return _hash_file_cached(path, check_cancelled)
 
 
 def _not_cancelled() -> bool:

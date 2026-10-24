@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -75,34 +76,24 @@ def sha256_file(path: str | Path) -> str:
 
 
 _DIGEST_CACHE: dict[tuple, str] = {}
+_DIGEST_CACHE_LIMIT = 4096
+_DIGEST_CACHE_LOCK = threading.Lock()
 
 
 def _hash_file_cached(path: str | Path, cancelled: Callable[[], bool] | None = None) -> str:
-    """★ 2026-10-24（#125）：同一整模的全量 sha256 在一次供给里会被反复请求。
+    """Reuse a verified immutable file's digest across renames and hardlinks.
 
-    `build_gguf_segment` 内部就有 3 处对 source 做全量 sha256（入口验证、复用验证
-    之后、裁切之后），而 building 阶段又对**每个 assignment** 各调用一次 builder；
-    一份 5.78 GB 的 GGUF 全量哈希约 30 s，实测 building 的 72 s 几乎全耗在重复哈希。
-
-    以 `(dev, ino, size, mtime_ns)` 为缓存键 —— 与 `_hash_file` 自身用来检测
-    "哈希期间文件被改动"的 signature 完全一致，故缓存命中与重新计算的结论等价。
-    master 进程常驻，因此该缓存同时跨 operation 生效。
-
-    **仅用于源的固有身份验证**（源不因供给而改变）。"操作期间是否被改动"这类检查
-    需要真实的时间顺序证据，请用 `_file_identity` 做前后对比，不要用本函数。
+    File identity includes device, inode, size and nanosecond mtime. Boundary
+    validation uses _hash_file; operation windows use _file_identity comparisons.
     """
-    try:
-        resolved = Path(path).resolve()
-        info = resolved.stat()
-        key = (str(resolved), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-    except OSError:
-        return _hash_file(path, cancelled)
-    cached = _DIGEST_CACHE.get(key)
+    if cancelled is not None:
+        _cancelled(cancelled)
+    key = _file_identity(path)
+    with _DIGEST_CACHE_LOCK:
+        cached = _DIGEST_CACHE.get(key)
     if cached is not None:
         return cached
-    digest = _hash_file(path, cancelled)
-    _DIGEST_CACHE[key] = digest
-    return digest
+    return _hash_file(path, cancelled)
 
 
 def _file_identity(path: str | Path) -> tuple | None:
@@ -141,7 +132,14 @@ def _hash_file(path: str | Path, cancelled: Callable[[], bool] | None = None) ->
             _cancelled(cancelled)
     except OSError as exc:
         raise SupplyError("file_unavailable", "artifact cannot be read") from exc
-    return digest.hexdigest()
+    result = digest.hexdigest()
+    key = signature(current)
+    with _DIGEST_CACHE_LOCK:
+        if key not in _DIGEST_CACHE and len(_DIGEST_CACHE) >= _DIGEST_CACHE_LIMIT:
+            for expired in list(islice(_DIGEST_CACHE, max(1, _DIGEST_CACHE_LIMIT // 4))):
+                _DIGEST_CACHE.pop(expired, None)
+        _DIGEST_CACHE[key] = result
+    return result
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -385,10 +383,21 @@ def _write_json(path: Path, payload: Any) -> None:
         os.fsync(handle.fileno())
 
 
-def _inventory(root: Path, names: dict[str, str]) -> list[dict]:
-    return [{"path": name, "size_bytes": _safe_path(root, name).stat().st_size,
-             "sha256": sha256_file(_safe_path(root, name)), "kind": kind}
-            for name, kind in sorted(names.items())]
+def _inventory(root: Path, names: dict[str, str], *, verified_files=None,
+               cancelled=None) -> list[dict]:
+    verified = {entry["path"]: entry for entry in verified_files or ()}
+    inventory = []
+    for name, kind in sorted(names.items()):
+        path = _safe_path(root, name)
+        size = path.stat().st_size
+        digest = (_hash_file_cached if name in verified else _hash_file)(path, cancelled)
+        if name in verified:
+            if size != verified[name]["size_bytes"]:
+                _fail("file_size_mismatch", "cache changed before publication")
+            if digest != verified[name]["sha256"]:
+                _fail("file_digest_mismatch", "cache changed before publication")
+        inventory.append({"path": name, "size_bytes": size, "sha256": digest, "kind": kind})
+    return inventory
 
 
 def _attach_local(payload: dict, root: Path) -> dict:
@@ -398,22 +407,12 @@ def _attach_local(payload: dict, root: Path) -> dict:
     }}
 
 
-def _verify_files(root: Path, payload: dict, *, cancelled=None) -> None:
+def _verify_files(root: Path, payload: dict, *, cancelled=None, fresh=False) -> None:
     for item in payload["files"]:
         path = _safe_path(root, item["path"])
         if not path.is_file() or path.stat().st_size != item["size_bytes"]:
             _fail("file_size_mismatch", "segment file is absent or has the wrong size")
-        # ★ 2026-10-24（#125，按用户决策去掉过度的 live-hash 要求）：
-        #   段的完整性校验曾是 supplying 阶段的主开销 —— 每个复用命中的节点仍要对
-        #   2.5~5.5 GB 的段重算一遍全量 sha256（实测三节点合计约 121 s/轮），即使
-        #   这些段是本进程刚发布、发布后只读的本地缓存产物。
-        #
-        #   契约调整：段目录是本机不可变缓存、不是外部输入通道；对「同一
-        #   (dev, ino, size, mtime_ns) 反复做 GB 级重算」的安全收益与成本不相称
-        #   （发布/接收路径仍各自以 `_finish`/`_rebind` 重建目录并逐字节校验）。
-        #   因此改为：文件身份未变即复用既有摘要；一旦 size 或 stamp 变化就重新计算
-        #   并与清单比对，语义仍是"内容不符即失败"。
-        if _hash_file_cached(path, cancelled) != item["sha256"]:
+        if (_hash_file if fresh else _hash_file_cached)(path, cancelled) != item["sha256"]:
             _fail("file_digest_mismatch", "segment file digest mismatch")
     expected = {item["path"] for item in payload["files"]} | {_MARKER}
     directories = {parent.as_posix() for name in expected
@@ -541,24 +540,33 @@ def _segment_content_key(manifest: dict) -> str:
                     if key not in {"operation_id", "node_id", "manifest_sha256"}})
 
 
-def _link_verified(source: Path, target: Path, entry: dict, cancelled) -> bool:
+def _link_verified(source: Path, target: Path, entry: dict, cancelled, *, cached=False) -> bool:
     if any(_link(p) for p in (source, *source.parents)) or not source.is_file():
         return False
-    before = source.stat()
-    if before.st_size != entry["size_bytes"] or _hash_file(source, cancelled) != entry["sha256"]:
+    before = _file_identity(source)
+    if (before is None or before[2] != entry["size_bytes"]
+            or (_hash_file_cached if cached else _hash_file)(source, cancelled) != entry["sha256"]):
         return False
     _cancelled(cancelled)
     target.parent.mkdir(parents=True, exist_ok=True)
     _safe_path(target.parent, target.name)
+    linked = True
     try:
         os.link(source, target)
     except OSError:
         # Never mutate a published source; copy if hardlinks are unsupported.
+        linked = False
         shutil.copyfile(source, target)
-    after = source.stat()
-    stamp = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-    if (stamp(before) != stamp(after) or _hash_file(target, cancelled) != entry["sha256"]
-            or any(_link(p) for p in (source, *source.parents))):
+    target_identity = _file_identity(target)
+    if (before != _file_identity(source) or target_identity is None
+            or target_identity[2] != entry["size_bytes"]
+            or (linked and target_identity != before)
+            or (not linked and _hash_file(target, cancelled) != entry["sha256"])):
+        target.unlink(missing_ok=True)
+        return False
+    _cancelled(cancelled)
+    if (before != _file_identity(source) or target_identity != _file_identity(target)
+            or any(_link(p) for p in (source, *source.parents, target, *target.parents))):
         target.unlink(missing_ok=True)
         return False
     return True
@@ -567,7 +575,7 @@ def _link_verified(source: Path, target: Path, entry: dict, cancelled) -> bool:
 def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: Path,
                            cancelled=lambda: False, support_files=None,
                            gguf_metadata=None, gguf_source_metadata=None,
-                           verify_source=None) -> dict | None:
+                           verify_source=None, check_source=None) -> dict | None:
     for candidate in _segment_candidates(reuse_root, cancelled):
         if candidate == final:
             continue
@@ -624,9 +632,12 @@ def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: 
                     _write_json(_safe_path(stage, native_name), upgraded_native)
                     continue
                 if not _link_verified(_safe_path(candidate, entry["path"]),
-                                      _safe_path(stage, entry["path"]), entry, cancelled):
+                                      _safe_path(stage, entry["path"]), entry, cancelled, cached=True):
                     _fail("file_digest_mismatch", "cache changed while rebinding")
-            result = _finish(stage, final, payload, {e["path"]: e["kind"] for e in old["files"]})
+            result = _finish(stage, final, payload, {entry["path"]: entry["kind"] for entry in old["files"]},
+                             verified_files=[entry for entry in old["files"]
+                                             if upgraded_native is None or entry["path"] != native_name],
+                             cancelled=cancelled, check_source=check_source)
             result["_reused_bytes"] = sum(e["size_bytes"] for e in old["files"]
                                           if upgraded_native is None or e["path"] != native_name)
             return result
@@ -685,7 +696,7 @@ def reuse_segment(manifest: dict, destination_root: Path, *, cancelled=lambda: F
             stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
             for entry in payload["files"]:
                 if not _link_verified(_safe_path(candidate, entry["path"]),
-                                      _safe_path(stage, entry["path"]), entry, cancelled):
+                                      _safe_path(stage, entry["path"]), entry, cancelled, cached=True):
                     _fail("file_digest_mismatch", "cache changed while rebinding")
             _verify_segment(stage, payload)
             _write_json(stage / _MARKER, payload)
@@ -809,7 +820,7 @@ def _collect_covered_partials(root: Path, protected, *, max_remove, max_hash_byt
                         continue
                     if cost:
                         report["hashed_bytes"] += cost
-                        _verify_files(directory, complete, cancelled=cancelled)
+                        _verify_files(directory, complete, cancelled=cancelled, fresh=True)
                         _verify_segment(directory, complete)
                         if snapshots != {name: stamp(directory / name) for name in snapshots}:
                             _fail("file_digest_mismatch", "complete witness changed during verification")
@@ -945,7 +956,7 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
                 skip("hash_budget")
                 break
             hashed += size
-            _verify_files(directory, manifest, cancelled=cancelled)
+            _verify_files(directory, manifest, cancelled=cancelled, fresh=True)
             _verify_segment(directory, manifest)
             _cancelled(cancelled)
             # Recheck all members after hashing. Owner locks prevent another
@@ -983,11 +994,14 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
     return report
 
 
-def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str]) -> dict:
+def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str], *,
+            verified_files=None, cancelled=None, check_source=None) -> dict:
     for name in names:
+        if cancelled is not None:
+            _cancelled(cancelled)
         with _safe_path(stage, name).open("r+b") as handle:
             os.fsync(handle.fileno())
-    payload["files"] = _inventory(stage, names)
+    payload["files"] = _inventory(stage, names, verified_files=verified_files, cancelled=cancelled)
     payload["artifact_sha256"] = (
         next(item["sha256"] for item in payload["files"] if item["kind"] == "weights")
         if payload["format"] == "gguf" else _weight_digest(payload["files"])
@@ -996,11 +1010,19 @@ def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str]) -> d
     payload["manifest_sha256"] = _digest(payload)
     payload = validate_supply_manifest(payload)
     _verify_segment(stage, payload)
+    if check_source is not None:
+        check_source()
+    if cancelled is not None:
+        _cancelled(cancelled)
     _write_json(stage / _MARKER, payload)
+    if check_source is not None:
+        check_source()
+    if cancelled is not None:
+        _cancelled(cancelled)
     try:
         os.replace(stage, final)
     except OSError:
-        existing = _reuse(final, payload)
+        existing = _reuse(final, payload, cancelled=cancelled)
         if existing is None:
             raise
         return existing
@@ -1356,7 +1378,8 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         _write_json(native, generated)
         payload.update(layer_weight_bytes=layer_bytes, hidden_size=hidden, model_type=arch)
         stopped()
-        return _finish(stage, final, payload, {artifact.name: "weights", native.name: "manifest"})
+        return _finish(stage, final, payload, {artifact.name: "weights", native.name: "manifest"},
+                       cancelled=stopped)
     except OSError as exc:
         code = "insufficient_disk" if exc.errno == 28 else "artifact_io_error"
         raise SupplyError(code, "GGUF segment publication failed") from exc
@@ -1417,17 +1440,26 @@ def _safetensors_header(path: Path) -> tuple[dict, int]:
     return tensors, 8 + length
 
 
-def _model_digest(root: Path) -> str:
-    """model_sync's aggregate recipe, without modifying source/cache files."""
-    digest = hashlib.sha256()
+def _model_files(root: Path):
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         if (not path.is_file() or path.name in {"model.sha256", "model.sha256.meta.json"}
                 or path.name.endswith(".part") or not path.name.lower().endswith(_MODEL_SUFFIXES)
                 or any(part.startswith(".") for part in path.relative_to(root).parts)):
             continue
-        safe = _safe_path(root, relative)
-        digest.update(f"{relative}\0{safe.stat().st_size}\0{sha256_file(safe)}\n".encode("utf-8"))
+        yield _safe_path(root, relative)
+
+
+def _model_identity(root: Path) -> dict[Path, tuple | None]:
+    return {path: _file_identity(path) for path in _model_files(root)}
+
+
+def _model_digest(root: Path) -> str:
+    """model_sync's aggregate recipe, without modifying source/cache files."""
+    digest = hashlib.sha256()
+    for path in _model_files(root):
+        relative = path.relative_to(root).as_posix()
+        digest.update(f"{relative}\0{path.stat().st_size}\0{_hash_file_cached(path)}\n".encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -1546,7 +1578,7 @@ def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_
     if _read_json(root / "cross_format.provenance.json") != payload["conversion_proof"]:
         _fail("conversion_proof_invalid", "supplied proof differs from source provenance")
     try:
-        identity = cross_format_pipeline_identity(root)
+        identity = cross_format_pipeline_identity(root, digest=_hash_file_cached)
     except (PipelineModelDescriptorError, OSError, ValueError) as exc:
         raise SupplyError("conversion_proof_invalid", "source conversion binding could not be verified") from exc
     if (identity.get("source_model_sha256") != payload["source_model_sha256"]
@@ -1561,7 +1593,7 @@ def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_
         declared.add(relative)
         path = _safe_path(root, relative)
         if (not path.is_file() or path.stat().st_size != entry["size_bytes"]
-                or sha256_file(path) != entry["sha256"]):
+                or _hash_file_cached(path) != entry["sha256"]):
             _fail("source_digest_mismatch", "full source file differs from conversion proof")
     required = set(weight_map.values()) | {"config.json", "tokenizer.json"}
     if (root / "tokenizer_config.json").is_file():
@@ -1602,6 +1634,16 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
         _fail("source_missing", "source Safetensors directory is missing")
     from pipeline_assignment_manifest import _selected_keys, _support_files
     from pipeline_model_descriptor import _ARCHITECTURE_LAYOUTS, _component_for_key, _decoder_config
+    proof_source = _proof_source(payload)
+    source_identity = _model_identity(root_source)
+    proof_target = (root_source / conversion_proof["target"]["path"]).resolve() if proof_source else None
+    target_identity = _file_identity(proof_target) if proof_target is not None else None
+    def check_source():
+        if (_model_identity(root_source) != source_identity
+                or (proof_target is not None and (
+                    (root_source / conversion_proof["target"]["path"]).resolve() != proof_target
+                    or _file_identity(proof_target) != target_identity))):
+            _fail("source_digest_mismatch", "source model changed during segment generation")
     config, weight_map, headers = _source_safetensors(root_source)
     decoder = _decoder_config(config)
     actual_source = _model_digest(root_source)
@@ -1609,11 +1651,11 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
         if not isinstance(conversion_proof, dict) or conversion_proof.get("kind") != "qlh.cross_format_pipeline_identity.v1":
             _fail("source_digest_mismatch", "source model aggregate digest mismatch")
         _verify_cross_format_source(root_source, payload, config, weight_map)
-    proof_source = _proof_source(payload)
     expected_tokenizer = proof_source["tokenizer_sha256"] if proof_source else tokenizer_sha256
     tokenizer_path = _safe_path(root_source, "tokenizer.json")
-    if not tokenizer_path.is_file() or sha256_file(tokenizer_path) != expected_tokenizer:
+    if not tokenizer_path.is_file() or _hash_file_cached(tokenizer_path) != expected_tokenizer:
         _fail("tokenizer_digest_mismatch", "source tokenizer.json digest mismatch")
+    check_source()
     if decoder["num_hidden_layers"] != total_layers:
         _fail("layer_range_mismatch", "source config layer count differs from assignment")
     model_type = str(config["model_type"]).lower()
@@ -1641,6 +1683,7 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
     final = _generation(root, payload)
     reused = _reuse(final, payload)
     if reused:
+        check_source()
         return reused
     support = [relative for relative in _support_files(root_source)
                if Path(relative).name not in {
@@ -1663,15 +1706,15 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
                         or _range_hash(root_source / filename, data_start + lo, hi - lo)
                         != _range_hash(_safe_path(directory, cached_name), output_start + out_lo, out_hi - out_lo)):
                     _fail("tensor_digest_mismatch", "cached tensor differs from source")
-        if _model_digest(root_source) != actual_source:
-            _fail("source_digest_mismatch", "source model changed during cache verification")
+        check_source()
 
     rebound = _rebind_cached_segment(root, final, {
         **payload, "model_type": model_type, "hidden_size": decoder["hidden_size"],
         "layer_weight_bytes": layer_bytes, "has_embedding": start_layer == 0,
         "has_lm_head": end_layer == total_layers, "tie_word_embeddings": tied,
-    }, reuse_root or root, verify_source=verify_cached_source,
+    }, reuse_root or root, verify_source=verify_cached_source, check_source=check_source,
         support_files={name: _safe_path(root_source, name) for name in ["config.json", *support]})
+    check_source()
     if rebound:
         return rebound
     support_bytes = sum(_safe_path(root_source, name).stat().st_size for name in support)
@@ -1710,14 +1753,13 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(original, destination)
             names[relative] = "support"
-        if _model_digest(root_source) != actual_source:
-            _fail("source_digest_mismatch", "source model changed during segment generation")
+        check_source()
         payload.update(
             model_type=model_type, hidden_size=decoder["hidden_size"],
             layer_weight_bytes=layer_bytes, has_embedding=start_layer == 0,
             has_lm_head=end_layer == total_layers, tie_word_embeddings=tied,
         )
-        return _finish(stage, final, payload, names)
+        return _finish(stage, final, payload, names, check_source=check_source)
     except OSError as exc:
         code = "insufficient_disk" if exc.errno == 28 else "artifact_io_error"
         raise SupplyError(code, "Safetensors segment publication failed") from exc
@@ -2289,7 +2331,7 @@ def receive_segment(manifest: dict, destination_root: Path, *, base_url: str, to
         completed += entry["size_bytes"]
     _cancelled(cancelled)
     journal.discard()
-    _verify_files(stage, payload, cancelled=cancelled)
+    _verify_files(stage, payload, cancelled=cancelled, fresh=True)
     _verify_segment(stage, payload)
     _cancelled(cancelled)
     try:

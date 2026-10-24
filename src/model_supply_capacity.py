@@ -375,6 +375,8 @@ def prepare_capacity_evidence(coordinator, operation_id):
                 if _supplied_capabilities_ready(c, query):
                     break
                 c._condition.wait(min(remaining, 0.25))
+            logger.info("event=supply_prepare_capabilities_ready operation=%s query=%s elapsed_ms=%d",
+                        operation_id, query_id, (time.monotonic() - query["started_monotonic"]) * 1000)
             query["started_monotonic"], query["requested_at"] = time.monotonic(), time.time()
             _validate(c, query)
             for node in worker_ids:
@@ -400,6 +402,8 @@ def prepare_capacity_evidence(coordinator, operation_id):
                     evidence = SupplyCapacityEvidence(c, query, inventories)
                     # ★ 2026-10-23（#116）：登记，以便工件传输期间续期准入窗口。
                     c.register_capacity_evidence(operation_id, evidence)
+                    logger.info("event=supply_prepare_resources_ready operation=%s query=%s elapsed_ms=%d",
+                                operation_id, query_id, (time.monotonic() - query["started_monotonic"]) * 1000)
                     return evidence
                 remaining = MAX_BUDGET_AGE_SECONDS - (time.monotonic() - query["started_monotonic"])
                 c._condition.wait(min(remaining, 0.25))

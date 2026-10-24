@@ -528,6 +528,7 @@ def inspect_pipeline_model(
     *,
     model_id: str = "",
     layer_range: tuple[int, int] | None = None,
+    digest=None,
 ) -> dict[str, Any]:
     """Build an exact, weight-free pipeline descriptor for a local model."""
 
@@ -706,7 +707,7 @@ def inspect_pipeline_model(
                           tokenizer_sha256=expected_tokenizer,
                           supply_manifest_sha256=supply_manifest["manifest_sha256"])
     else:
-        descriptor.update(cross_format_pipeline_identity(root))
+        descriptor.update(cross_format_pipeline_identity(root, digest=digest))
     return descriptor
 
 

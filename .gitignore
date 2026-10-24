@@ -40,6 +40,7 @@ local_docs/evidence/torch-hetero-plan/*
 !local_docs/audits/
 local_docs/audits/*
 !local_docs/audits/2026-09-26-r-rx-rr3-commit-review.md
+video-remotion/
 
 # OS
 .DS_Store

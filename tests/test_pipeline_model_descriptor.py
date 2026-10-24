@@ -202,6 +202,12 @@ def test_cross_format_provenance_maps_safetensors_to_verified_gguf(
     assert descriptor["source_model_sha256"] == hashlib.sha256(
         target.read_bytes()
     ).hexdigest()
+    reads = []
+    def shared_digest(path):
+        reads.append(path)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    assert inspect_pipeline_model(source, model_id="fixture", digest=shared_digest) == descriptor
+    assert reads == [target]
     assert descriptor["tokenizer_sha256"] == gguf_tokenizer_sha256
     assert descriptor["source_tokenizer_sha256"] == hashlib.sha256(
         (source / "tokenizer.json").read_bytes()
@@ -217,6 +223,67 @@ def test_cross_format_provenance_maps_safetensors_to_verified_gguf(
     assert public["cross_format_provenance_sha256"] == provenance[
         "provenance_sha256"
     ]
+
+
+@pytest.mark.parametrize("mode", ["prepare", "describe"])
+def test_model_manager_reuses_verified_cross_format_and_bundle_digests(tmp_path, monkeypatch, mode):
+    import model_supply_assets as assets
+    import model_sync
+    import pipeline_model_descriptor
+    from model_module import ModelManager
+
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "gguf" / "converted.gguf"
+    target.parent.mkdir()
+    target.write_bytes(b"converted-gguf")
+    _write_qwen2_fixture(source)
+    _write_cross_format_provenance(source, target, target_tokenizer_sha256="e" * 64)
+    monkeypatch.setattr("relay_segment_info.read_gguf_tokenizer_sha256", lambda path: "e" * 64)
+    for path in [target, *source.iterdir()]:
+        assets._hash_file_cached(path)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("metadata preparation reread verified weight bytes")
+
+    original_digest = pipeline_model_descriptor._sha256_file
+    def metadata_digest(path):
+        assert Path(path).suffix not in {".gguf", ".safetensors"}
+        return original_digest(path)
+
+    monkeypatch.setattr(assets, "_hash_file", unexpected)
+    monkeypatch.setattr(model_sync, "compute_file_sha256", unexpected)
+    monkeypatch.setattr(pipeline_model_descriptor, "_sha256_file", metadata_digest)
+    manager = ModelManager()
+    if mode == "prepare":
+        descriptor = manager.prepare_pipeline_model(model_id="fixture", model_path=str(source))
+    else:
+        manager._engine_type = "pytorch"
+        manager._model_path = str(source)
+        manager._active_model_id = "fixture"
+        descriptor = manager.get_pipeline_descriptor()
+    assert descriptor["source_model_sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert len(descriptor["model_sha256"]) == 64
+    assert manager.get_pipeline_descriptor() == descriptor
+    assert manager.model is None
+
+
+def test_model_manager_rejects_changed_cross_format_target_after_cached_prepare(tmp_path, monkeypatch):
+    from model_module import ModelManager
+
+    source = tmp_path / "source"
+    source.mkdir()
+    target = tmp_path / "gguf" / "converted.gguf"
+    target.parent.mkdir()
+    target.write_bytes(b"converted-gguf")
+    _write_qwen2_fixture(source)
+    _write_cross_format_provenance(source, target, target_tokenizer_sha256="e" * 64)
+    monkeypatch.setattr("relay_segment_info.read_gguf_tokenizer_sha256", lambda path: "e" * 64)
+    manager = ModelManager()
+    manager.prepare_pipeline_model(model_id="fixture", model_path=str(source))
+    target.write_bytes(b"tampered")
+    with pytest.raises(PipelineModelDescriptorError, match="GGUF digest mismatch"):
+        manager.prepare_pipeline_model(model_id="fixture", model_path=str(source))
 
 
 def test_cross_format_provenance_fails_closed_after_target_tamper(

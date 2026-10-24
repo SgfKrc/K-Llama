@@ -918,6 +918,7 @@ def test_default_local_cut_precedence_and_named_distribution(startup_pool_case, 
     monkeypatch.setattr(server, "send_to_client", send)
     observed = []
     def collect(**kwargs):
+        assert case.c.get(case.op)["status"] == "available"
         observed.append(kwargs)
         return {"removed": 1, "reclaimed_bytes": 7, "skipped": {}, "examined": 2}
     case.scheduler._model_supply_worker.collect_garbage = collect

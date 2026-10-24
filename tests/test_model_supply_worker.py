@@ -585,7 +585,7 @@ def test_inventory_filters_real_registry_and_discovery_before_weight_io(setup, t
     assert str(tmp_path) not in repr(reply)
 
 
-@pytest.mark.parametrize("selected_id", ["not-registered", "", True, {}, ["source-one"]])
+@pytest.mark.parametrize("selected_id", ["not-registered", True, {}, ["source-one"]])
 def test_inventory_unknown_or_invalid_id_skips_hash_and_clears_prior_sources(setup, tmp_path, monkeypatch, selected_id):
     import relay_segment_info
     worker, scheduler, client = setup
@@ -599,6 +599,24 @@ def test_inventory_unknown_or_invalid_id_skips_hash_and_clears_prior_sources(set
     monkeypatch.setattr(relay_segment_info, "read_gguf_tokenizer_sha256", reject)
     assert worker.inventory(model_id=selected_id)["sources"] == []
     assert worker._sources == {}
+
+
+def test_resource_inventory_skips_source_discovery_preserves_registration_and_resamples_memory(setup, monkeypatch):
+    worker, scheduler, client = setup
+    registered = {("source-one", "a" * 64, "b" * 64): Path("existing.gguf")}
+    worker._sources = registered
+    monkeypatch.setattr(worker, "_source_candidates", lambda: pytest.fail("resource refresh discovered sources"))
+    monkeypatch.setattr("torch_runtime.torch_available", lambda: False)
+    memory = SimpleNamespace(available=100, total=500)
+    monkeypatch.setattr("psutil.virtual_memory", lambda: memory)
+    first = worker.inventory(model_id="")
+    memory.available = 200
+    second = worker.inventory(model_id="")
+    assert first["sources"] == second["sources"] == []
+    assert first["memory_available_bytes"] == 100
+    assert second["memory_available_bytes"] == 200
+    assert second["memory_total_bytes"] == 500
+    assert worker._sources is registered
 
 
 def test_inventory_without_model_id_keeps_all_registered_sources(setup, tmp_path, monkeypatch):
@@ -747,7 +765,7 @@ def test_busy_is_rechecked_after_waiting_for_stage_admission(setup, tmp_path, mo
     assert not (worker.root / "current.json").exists()
 
 
-def test_changed_pointer_bytes_rehash_once_and_detach_cached_results(setup, tmp_path, monkeypatch):
+def test_changed_pointer_bytes_revalidate_without_rehash_and_detach_cached_results(setup, tmp_path, monkeypatch):
     worker, scheduler, client = setup
     source = tmp_path / "source"
     manifest = segment(source)
@@ -759,20 +777,46 @@ def test_changed_pointer_bytes_rehash_once_and_detach_cached_results(setup, tmp_
     first["manifest"]["source_model_id"] = "mutated-return-value"
     assert get_selected_model(worker.root)["manifest"]["source_model_id"] == "source-one"
     calls = []
-    original = module._file_sha
+    original = assets._hash_file
     def record(path, *args, **kwargs):
         calls.append(path)
         return original(path, *args, **kwargs)
-    monkeypatch.setattr(module, "_file_sha", record)
+    monkeypatch.setattr(assets, "_hash_file", record)
     pointer = worker.root / "current.json"
     pointer.write_bytes(pointer.read_bytes() + b"\n")
     assert get_selected_model(worker.root) is not None
-    assert any(path.suffix == ".gguf" for path in calls)
+    assert not any(path.suffix == ".gguf" for path in calls)
     count = len(calls)
     assert get_selected_model(worker.root) is not None and len(calls) == count
 
 
-def test_registration_forces_live_hash_even_when_selection_cached(tmp_path, monkeypatch):
+@pytest.mark.parametrize("strategy", ["distribute", "local_cut"])
+def test_worker_reuses_verified_segment_before_transfer_or_local_cut(setup, tmp_path, monkeypatch, strategy):
+    worker, scheduler, client = setup
+    old = segment(worker.root / ("segment-" + "a" * 64))
+    manifest = deepcopy(old)
+    manifest["operation_id"] = "op-two"
+    manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = digest(manifest)
+    monkeypatch.setattr(assets, "receive_segment", lambda *args, **kwargs: pytest.fail("verified cache started HTTP transfer"))
+    monkeypatch.setattr(worker, "_local_cut", lambda *args, **kwargs: pytest.fail("verified cache started local cutting"))
+    original = assets._hash_file
+    def no_weight_reads(path, *args, **kwargs):
+        assert Path(path).suffix != ".gguf", "verified cache reread weight bytes"
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(assets, "_hash_file", no_weight_reads)
+    worker.handle(command(manifest, strategy=strategy))
+    result = client.wait(operation="op-two")
+    assert result["status"] == "available" and result["strategy"] == "reuse"
+    assert result["actual_downloaded_bytes"] == 0
+    assert result["reused_bytes"] == sum(entry["size_bytes"] for entry in manifest["files"])
+    finish(worker)
+    selected = get_selected_model(worker.root)
+    assert selected["manifest"] == manifest
+    assert os.path.samefile(selected["model_path"], worker.root / ("segment-" + "a" * 64) / "segment.gguf")
+
+
+def test_registration_reuses_verified_immutable_file_digest(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "RUN_MODE", "distributed")
     scheduler = Scheduler("master")
     worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
@@ -782,13 +826,53 @@ def test_registration_forces_live_hash_even_when_selection_cached(tmp_path, monk
     assert worker.activate_local(manifest, directory)["status"] == "available"
     assert get_selected_model(worker.root) is not None
     calls = []
-    original = module._file_sha
+    original = assets._hash_file
     def record(path, *args, **kwargs):
         calls.append(path)
         return original(path, *args, **kwargs)
-    monkeypatch.setattr(module, "_file_sha", record)
+    monkeypatch.setattr(assets, "_hash_file", record)
     assert worker.activate_local(manifest, directory)["status"] == "available"
-    assert any(path.suffix == ".gguf" for path in calls)
+    assert not any(path.suffix == ".gguf" for path in calls)
+
+
+def test_model_identity_reuses_registration_digests_without_changing_bundle_hash(tmp_path, monkeypatch):
+    from model_sync import compute_model_sha256
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    scheduler.worker = worker
+    directory = worker.root.parent / "built"
+    manifest = segment(directory, node="master", fmt="safetensors")
+    expected = hashlib.sha256()
+    for path in sorted(directory.iterdir()):
+        expected.update(f"{path.name}\0{path.stat().st_size}\0{assets.sha256_file(path)}\n".encode())
+    assert worker.activate_local(manifest, directory)["status"] == "available"
+    original = assets._hash_file
+    def no_weight_reads(path, *args, **kwargs):
+        assert Path(path).suffix != ".safetensors", "prepare rehashed an already verified weight"
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(assets, "_hash_file", no_weight_reads)
+    assert compute_model_sha256(str(directory)) == expected.hexdigest()
+    assert not (directory / "model.sha256").exists()
+
+
+@pytest.mark.parametrize("preserve_mtime", [False, True])
+def test_registration_rejects_changed_previously_selected_weights(tmp_path, monkeypatch, preserve_mtime):
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    scheduler.worker = worker
+    directory = worker.root.parent / "built"
+    manifest = segment(directory, node="master")
+    assert worker.activate_local(manifest, directory)["status"] == "available"
+    weight = directory / "segment.gguf"
+    before = weight.stat()
+    original = weight.read_bytes()
+    weight.write_bytes(original[:-1] + b"x")
+    if preserve_mtime:
+        os.utime(weight, ns=(before.st_atime_ns, before.st_mtime_ns))
+    result = worker.activate_local(manifest, directory)
+    assert result["status"] == "failed" and result["reason_code"] == "artifact_sha256_mismatch"
 
 
 def test_local_cut_real_builder_contract(setup, tmp_path, monkeypatch):

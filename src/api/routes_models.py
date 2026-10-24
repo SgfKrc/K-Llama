@@ -297,6 +297,9 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id="", cap
             )
 
     try:
+        metadata_started = _api_module.time.monotonic()
+        _api_module.logger.info("event=pipeline_candidate_metadata_begin operation=%s candidate=%s",
+                                operation_id, candidate_id)
         result = await _api_module.run_in_threadpool(
             lambda: _api_module.model_host.prepare_pipeline_candidate(
                 candidate_id,
@@ -306,6 +309,8 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id="", cap
             )
         )
         candidate_prepared = True
+        _api_module.logger.info("event=pipeline_candidate_metadata_ready operation=%s candidate=%s elapsed_ms=%d",
+                                operation_id, candidate_id, (_api_module.time.monotonic() - metadata_started) * 1000)
         capacity_plan = await _api_module.run_in_threadpool(
             lambda: _api_module.scheduler.start_pipeline_model_transaction(
                 candidate_id=candidate_id,

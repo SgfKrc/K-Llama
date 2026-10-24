@@ -2044,8 +2044,9 @@ class RemoteFullWorkerProvider:
             if pending is None:
                 return False
             kind, result, error = pending.terminal_snapshot()
+            # An identity-checked rejection proves the remote offer never ran.
             return bool(result is not None or getattr(pending, "physical_result_received", False) or pending.cancel_execution_stopped
-                        or kind in {"remote_error", "send_failure"})
+                        or kind in {"reservation_rejected", "remote_error", "send_failure"})
 
     def release(self, reservation_id: str) -> None:
         with self._lock:

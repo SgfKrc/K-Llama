@@ -284,17 +284,25 @@ def _file_sha_cached(root: Path, path: Path) -> str:
     return digest
 
 
-def _verify_files(manifest: dict, directory: Path, cancelled=None) -> Path:
+def _verify_files(manifest: dict, directory: Path, cancelled=None, *, fresh=False) -> Path:
     directory = directory.resolve(strict=True)
-    paths = []
+    try:
+        from model_supply_assets import _hash_file_cached, _verify_segment
+    except ImportError:
+        raise SupplyError("supply_assets_unavailable") from None
     for entry in manifest["files"]:
+        if cancelled is not None and cancelled():
+            raise SupplyError("cancelled")
         path = _within(directory / _relative(entry["path"]), directory)
         if not path.is_file() or path.stat().st_size != entry.get("size_bytes", entry.get("size")):
             raise SupplyError("artifact_size_mismatch")
-        if _file_sha(path, cancelled) != entry["sha256"]:
+        try:
+            actual = (_file_sha if fresh else _hash_file_cached)(path, cancelled)
+        except ValueError as exc:
+            raise SupplyError(_error_code(exc, "artifact_sha256_mismatch")) from None
+        if actual != entry["sha256"]:
             raise SupplyError("artifact_sha256_mismatch")
     try:
-        from model_supply_assets import _verify_segment
         _verify_segment(directory, manifest)
     except ImportError:
         raise SupplyError("supply_assets_unavailable") from None
@@ -331,6 +339,11 @@ def _remember_selection(root: Path, pointer_bytes: bytes, directory: Path, manif
         if len(_SELECTION_CACHE) >= 64:
             _SELECTION_CACHE.clear()
         _SELECTION_CACHE[str(root.resolve())] = (key, value)
+
+
+def _selection_files_changed(cached, fingerprint) -> bool:
+    previous = {item[0]: item[1:] for item in cached[0][1]} if cached is not None else {}
+    return any(item[0] in previous and previous[item[0]] != item[1:] for item in fingerprint)
 
 
 def _selection_distributed(root: Path) -> bool:
@@ -377,7 +390,9 @@ def get_selected_model(root: Path | None = None) -> dict | None:
             if cached is not None and cached[0] == key:
                 result = deepcopy(cached[1])
             else:
-                model_path = _verify_files(manifest, directory)
+                changed = _selection_files_changed(cached, key[1])
+                model_path = (_verify_files(manifest, directory, fresh=True) if changed
+                              else _verify_files(manifest, directory))
                 if key != _selection_key(root, pointer_bytes, directory, manifest):
                     return None
                 result = {"model_path": str(model_path), "directory": str(directory),
@@ -639,7 +654,7 @@ class ModelSupplyWorker:
                     yield asset["model_id"], path
 
     def inventory(self, model_id: str | None = None) -> dict:
-        """Verify only the selected source identity, or all sources for legacy callers."""
+        """Verify selected sources; an empty ID samples resources without discovery."""
         import shutil
         import config
         from torch_runtime import torch_available
@@ -667,8 +682,8 @@ class ModelSupplyWorker:
         verified = {}
         selected_id = (_canonical_id(model_id)
                        if isinstance(model_id, str) and _ID.fullmatch(model_id) else "")
-        with self._inventory_lock:
-            for source_id, path in self._source_candidates():
+        with (self._inventory_lock if model_id != "" else nullcontext()):
+            for source_id, path in (() if model_id == "" else self._source_candidates()):
                 # Discovery pairs a registered *-gguf asset with its canonical
                 # model ID. Compare those source IDs before any weight I/O;
                 # filenames and paths never supply model identity.
@@ -693,8 +708,9 @@ class ModelSupplyWorker:
                                     "tokenizer_sha256": tokenizer, "size_bytes": path.stat().st_size})
                 except (OSError, ValueError):
                     continue
-            with self._lock:
-                self._sources = verified
+            if model_id != "":
+                with self._lock:
+                    self._sources = verified
         # Tool availability is independent of the selected execution engine.
         try:
             assets = importlib.import_module("model_supply_assets")
@@ -828,38 +844,36 @@ class ModelSupplyWorker:
             except ImportError:
                 raise SupplyError("supply_assets_unavailable") from None
             self.root.mkdir(parents=True, exist_ok=True)
-            if op.strategy == "local_cut":
-                # A cached exact inventory wins before source hashing/cutting.
-                cached = assets.reuse_segment(manifest, self.root,
-                    cancelled=lambda: self._cancelled(op))
-                if cached is not None:
-                    result = cached
-                    op.strategy = "reuse"
-                    op.strategy_reason_code = "SUPPLY_CACHE_REUSED"
-                    self._record_transfer_counts(op, cached)
-                    directory = _within(self._directory(cached, self.root), self.root)
-                else:
-                    stage = "local_cut_failed"
-                    op.strategy_reason_code = "SUPPLY_LOCAL_CUT_PREFERRED"
-                    try:
-                        directory = self._local_cut(op, assets)
-                    except Exception as exc:
-                        fallback = {
-                            "local_source_unavailable": "SUPPLY_LOCAL_SOURCE_UNAVAILABLE",
-                            "cut_tool_unavailable": "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
-                            "insufficient_disk": "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT",
-                            "cut_timeout": "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
-                            "unsupported_local_cut": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
-                            "unsupported_range": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
-                        }.get(_error_code(exc, stage))
-                        if not op.allow_fallback or fallback is None:
-                            raise
-                        self._check(op)
-                        op.strategy = "distribute"
-                        op.strategy_reason_code = fallback
-                        stage = "transfer_failed"
-                        self._progress(op, {"phase": "receiving"})
-                        directory = self._receive(op, assets)
+            reuse = getattr(assets, "reuse_segment", None)
+            cached = (reuse(manifest, self.root, cancelled=lambda: self._cancelled(op))
+                      if callable(reuse) else None)
+            if cached is not None:
+                op.strategy = "reuse"
+                op.strategy_reason_code = "SUPPLY_CACHE_REUSED"
+                self._record_transfer_counts(op, cached)
+                directory = _within(self._directory(cached, self.root), self.root)
+            elif op.strategy == "local_cut":
+                stage = "local_cut_failed"
+                op.strategy_reason_code = "SUPPLY_LOCAL_CUT_PREFERRED"
+                try:
+                    directory = self._local_cut(op, assets)
+                except Exception as exc:
+                    fallback = {
+                        "local_source_unavailable": "SUPPLY_LOCAL_SOURCE_UNAVAILABLE",
+                        "cut_tool_unavailable": "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
+                        "insufficient_disk": "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT",
+                        "cut_timeout": "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
+                        "unsupported_local_cut": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
+                        "unsupported_range": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
+                    }.get(_error_code(exc, stage))
+                    if not op.allow_fallback or fallback is None:
+                        raise
+                    self._check(op)
+                    op.strategy = "distribute"
+                    op.strategy_reason_code = fallback
+                    stage = "transfer_failed"
+                    self._progress(op, {"phase": "receiving"})
+                    directory = self._receive(op, assets)
             else:
                 if not op.strategy_reason_code:
                     op.strategy_reason_code = "SUPPLY_DISTRIBUTE_REQUESTED"
@@ -1143,7 +1157,11 @@ class ModelSupplyWorker:
         self._check(op)
         verified_files = _selection_key(self.root, b"", directory, op.manifest)[1]
         self._check(op)
-        model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op))
+        with _SELECTION_CACHE_LOCK:
+            cached = _SELECTION_CACHE.get(str(self.root.resolve()))
+            changed = _selection_files_changed(cached, verified_files)
+        model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op),
+                                  **({"fresh": True} if changed else {}))
         self._check(op)
         if _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
             raise SupplyError("artifact_changed")

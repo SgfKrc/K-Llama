@@ -292,7 +292,6 @@ class LlamaCppEngine:
         self._inference_switches = None
         self._pipeline_descriptor: Dict[str, Any] | None = None
         self._layer_load_proof: NativeLayerLoadProof | None = None
-        self._pipeline_sha_cache: Dict[str, Any] = {}
         self._pipeline_distributed_only: bool = False
         # RAG embedding is opt-in. A normal text-generation load is never
         # silently reused as an embedding model.
@@ -395,39 +394,12 @@ class LlamaCppEngine:
     # ================================================================
 
     def _pipeline_file_sha256(self, path: str, *, use_cache: bool = True) -> str:
-        """整文件 sha256，按 `(path, mtime, size)` 记忆 —— 大 GGUF 只读一次。
-
-        与 PyTorch 侧 `model_sync.compute_model_sha256`（目录内 artifact 的稳定序
-        联合哈希）**语义不同**：那里是「一组文件」，这里是「单个 GGUF」。两者都只用于
-        「各节点是否握着同一份权重」的自证，由**主节点的描述器单独定口径**，因此
-        混合部署时以主节点为准，不需要跨引擎可比。
-        """
+        """Share verified file digests with supply; explicit fresh checks read bytes."""
+        from model_supply_assets import _hash_file_cached, sha256_file
         try:
-            stat = os.stat(path)
+            return (_hash_file_cached if use_cache else sha256_file)(path)
         except OSError:
             return ""
-        key = (
-            path,
-            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
-            int(stat.st_size),
-        )
-        cache = getattr(self, "_pipeline_sha_cache", None)
-        if not isinstance(cache, dict):
-            cache = {}
-            self._pipeline_sha_cache = cache
-        if use_cache and cache.get("key") == key:
-            return str(cache.get("value", ""))
-        digest = hashlib.sha256()
-        try:
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            return ""
-        value = digest.hexdigest()
-        cache["key"] = key
-        cache["value"] = value
-        return value
 
     def configure_catalog(self, catalog_prepare, *, model_id: str = "") -> None:
         self._catalog_prepare = catalog_prepare
@@ -442,7 +414,7 @@ class LlamaCppEngine:
         self._resolved_artifact = resolved
         return resolved
 
-    def get_pipeline_descriptor(self) -> dict:
+    def get_pipeline_descriptor(self, *, digest=None) -> dict:
         """流水线描述器：**零依赖**读 GGUF 头，不加载模型、不需要 torch。
 
         与 `ModelManager.get_pipeline_descriptor()`（PyTorch 侧）同一契约。主节点的
@@ -555,7 +527,7 @@ class LlamaCppEngine:
             weight_bytes = int(os.path.getsize(path))
         except OSError:
             weight_bytes = 0
-        model_sha256 = self._pipeline_file_sha256(path)
+        model_sha256 = digest(Path(path)) if digest is not None else self._pipeline_file_sha256(path)
         artifact_manifest_info = None
         tokenizer_sha256 = read_gguf_tokenizer_sha256(path) or ""
         for manifest_path in (
@@ -690,7 +662,6 @@ class LlamaCppEngine:
         self._quant_type = str(quant_type or "GGUF")
         self._pipeline_descriptor = None
         self._layer_load_proof = None
-        self._pipeline_sha_cache = {}
         descriptor = self.get_pipeline_descriptor()
         if not descriptor.get("pipeline_runtime_supported", False):
             raise RuntimeError("GGUF 工件缺少可执行的流水线描述元数据")
@@ -1043,7 +1014,6 @@ class LlamaCppEngine:
         # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
         self._pipeline_descriptor = None
         self._layer_load_proof = None
-        self._pipeline_sha_cache = {}
         # KV 是新 context 的，占用计数跟着归零（见 `_kv_used_cells`）。
         self._kv_used = 0
         model_profile = model_profile if isinstance(model_profile, dict) else {}
@@ -1574,7 +1544,6 @@ class LlamaCppEngine:
         self._chat_template_kwargs = {}
         self._pipeline_descriptor = None
         self._layer_load_proof = None
-        self._pipeline_sha_cache = {}
         self._pipeline_distributed_only = False
         self._model_path = ""
         logger.info("GGUF 模型已卸载")

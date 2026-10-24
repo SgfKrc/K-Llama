@@ -53,26 +53,84 @@ print(json.dumps(result))
     assert json.loads(marker.read_text())["operation_id"] == "op-restarted"
 
 
-def test_builder_damaged_live_sha_rebuilds_even_with_restored_mtime(tmp_path, monkeypatch):
+@pytest.mark.parametrize("change", ["mtime", "size", "inode"])
+def test_builder_damaged_cache_rebuilds_when_identity_changes(change, tmp_path, monkeypatch):
     source = tmp_path / "full.gguf"
     _make_gguf(source)
     kwargs = _kwargs(source)
     first = assets.build_gguf_segment(source, tmp_path / "cache", **kwargs)
     weight = Path(first["local_files"]["segment.gguf"])
     stamp = weight.stat()
-    damaged = bytearray(weight.read_bytes()); damaged[-1] ^= 1
-    weight.write_bytes(damaged); os.utime(weight, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    identity = assets._file_identity(weight)
+    original_bytes = weight.read_bytes()
+    damaged = bytearray(original_bytes)
+    damaged[-1] ^= 1
+    if change == "inode":
+        replacement = tmp_path / "replacement.gguf"
+        replacement.write_bytes(damaged)
+        os.utime(replacement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        os.replace(replacement, weight)
+        assert weight.stat().st_ino != stamp.st_ino
+        assert weight.stat().st_size == stamp.st_size
+        assert weight.stat().st_mtime_ns == stamp.st_mtime_ns
+    else:
+        if change == "size":
+            damaged.extend(b"extra")
+        weight.write_bytes(damaged)
+        mtime = stamp.st_mtime_ns + 1_000_000_000 if change == "mtime" else stamp.st_mtime_ns
+        os.utime(weight, ns=(stamp.st_atime_ns, mtime))
+        assert weight.stat().st_ino == stamp.st_ino
+        if change == "mtime":
+            assert weight.stat().st_size == stamp.st_size
+        else:
+            assert weight.stat().st_mtime_ns == stamp.st_mtime_ns
+    assert assets._file_identity(weight) != identity
     calls = []
     original = assets._run_cut
     def cut(*args, **kw):
         calls.append(args)
         return original(*args, **kw)
+    hashed = []
+    original_hash = assets._hash_file
+    def hash_file(path, cancelled=None):
+        hashed.append(Path(path))
+        return original_hash(path, cancelled)
     monkeypatch.setattr(assets, "_run_cut", cut)
+    monkeypatch.setattr(assets, "_hash_file", hash_file)
     second = assets.build_gguf_segment(source, tmp_path / "cache", **{**kwargs, "operation_id": "op-repair"})
     assert len(calls) == 1
+    assert hashed.count(weight) == int(change != "size")
+    assert second["files"] == first["files"]
     assert assets.sha256_file(second["local_files"]["segment.gguf"]) == second["artifact_sha256"]
+    assert Path(second["local_files"]["segment.gguf"]).read_bytes() == original_bytes
     assert not os.path.samefile(weight, second["local_files"]["segment.gguf"])
     assert weight.read_bytes() == damaged
+
+
+def test_builder_rebinds_hot_cache_when_same_length_tamper_restores_mtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
+    source = tmp_path / "full.gguf"
+    _make_gguf(source)
+    kwargs = _kwargs(source)
+    first = assets.build_gguf_segment(source, tmp_path / "cache", **kwargs)
+    weight = Path(first["local_files"]["segment.gguf"])
+    stamp = weight.stat()
+    identity = assets._file_identity(weight)
+    damaged = bytearray(weight.read_bytes())
+    damaged[-1] ^= 1
+    weight.write_bytes(damaged)
+    os.utime(weight, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert assets._file_identity(weight) == identity
+    monkeypatch.setattr(assets, "_run_cut", lambda *args, **kwargs: pytest.fail("hot cache must not cut"))
+    monkeypatch.setattr(assets, "_hash_file", lambda *args, **kwargs: pytest.fail("unchanged identity must reuse digest"))
+    assert assets._hash_file_cached(weight) == first["artifact_sha256"]
+    second = assets.build_gguf_segment(source, tmp_path / "cache", **{**kwargs, "operation_id": "op-reuse"})
+    assert second["operation_id"] == "op-reuse"
+    assert second["manifest_sha256"] != first["manifest_sha256"]
+    assert second["files"] == first["files"]
+    assert second["_reused_bytes"] == sum(entry["size_bytes"] for entry in first["files"])
+    assert os.path.samefile(weight, second["local_files"]["segment.gguf"])
+    assert Path(second["local_files"]["segment.gguf"]).read_bytes() == damaged
 
 
 @pytest.mark.parametrize("change", ["range", "proof"])
@@ -111,10 +169,14 @@ def test_gc_is_bounded_and_refuses_undeclared_members_and_corrupt_sha(tmp_path):
     _, current = _generation(tmp_path, "current")
     _, undeclared = _generation(tmp_path, "undeclared")
     (undeclared / "unknown-empty-directory").mkdir()
-    _, corrupt = _generation(tmp_path, "corrupt")
+    manifest, corrupt = _generation(tmp_path, "corrupt")
     bad = corrupt / "segment.gguf"; before = bad.stat()
+    identity = assets._file_identity(bad)
+    assert assets._hash_file_cached(bad) == manifest["artifact_sha256"]
     data = bytearray(bad.read_bytes()); data[-1] ^= 1; bad.write_bytes(data)
     os.utime(bad, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert assets._file_identity(bad) == identity
+    assert assets._hash_file_cached(bad) == manifest["artifact_sha256"]
     normal = [_generation(tmp_path, "stale-" + str(i))[1] for i in range(5)]
     report = assets.collect_supply_segments(tmp_path, protected_paths=[current],
         native_paths=[native / "segment.gguf"], keep=0, max_remove=2)
