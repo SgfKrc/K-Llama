@@ -43,7 +43,28 @@ class WorkerPrepareCoordinatorMixin:
         manifest_sha = str(receipt.get("manifest_sha256", "") or "")
         start = int(assignment.get("start_layer", 0) or 0)
         end = int(assignment.get("end_layer", 0) or 0)
-        if not artifact_sha or not manifest_sha or receipt.get("layer_range") != [start, end]:
+        if not artifact_sha or not manifest_sha:
+            return None
+        # ★ 2026-10-24（#125）：**同一供给内存在两次容量求解，结果会漂移**。
+        #   实测：供给阶段求得 rog-5060=[8,24) 并真的裁出了 24 层；准备阶段
+        #   （worker_prepare）又求解一次，得到 [8,19)，于是下面的区间相等判据失败，
+        #   抛 `prepare_artifact_identity_missing`（409），整个 660 s 的供给白费。
+        #   **收据是唯一的事实源**：它记录的就是刚裁出并已验证的那个段。因此这里以
+        #   收据区间为准，而不是用 assignment 的区间去否决一个已存在的段。
+        receipt_range = receipt.get("layer_range")
+        if (isinstance(receipt_range, (list, tuple)) and len(receipt_range) == 2
+                and all(type(bound) is int for bound in receipt_range)):
+            if [int(receipt_range[0]), int(receipt_range[1])] != [start, end]:
+                logger.warning(
+                    "prepare_assignment_range_drift node=%s assignment=[%s,%s) "
+                    "receipt=%s operation=%s —— 同一供给内两次求解漂移，以供给收据为准",
+                    assignment.get("node_id"), start, end, list(receipt_range),
+                    receipt.get("operation_id") or "<none>",
+                )
+            start, end = int(receipt_range[0]), int(receipt_range[1])
+            # 让调用方拿到的 assignment 与收据一致（下游按它加载段）。
+            assignment["start_layer"], assignment["end_layer"] = start, end
+        elif receipt.get("layer_range") != [start, end]:
             return None
 
         def _field(name):
