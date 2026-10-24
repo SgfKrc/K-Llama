@@ -717,6 +717,63 @@ class ModelSupplyCoordinator:
                 "source_model_id": model_id, "source_model_sha256": identity,
                 "tokenizer_sha256": tokenizer, "conversion_proof": proof}
 
+    def collect_operation_directories(self, *, keep_operation_ids=(), keep_recent=None) -> dict:
+        """★ 2026-10-24（#125）：回收历史供给操作目录。
+
+        `self._root` 下每个 `<op_id>/` 都是一次供给为各节点构建的段工件（单次
+        3~15 GB），而**此前从不回收**：实测本机积压 **146 个目录、453.78 GB**，
+        C 盘一度只剩 108 GB 可用（内存里的 `_operations` 只淘汰记录，不碰磁盘）。
+
+        保留策略（全部保留，其余整目录删除）：
+          - 显式给出的 `keep_operation_ids`（正在服务的那次）；
+          - 仍登记在内存 `_operations` 中的（尚未终结）；
+          - 按 mtime 最新的 `keep_recent` 个，默认取设置
+            `MODEL_SUPPLY_KEEP_OPERATIONS`（0 = 清空全部历史）。
+
+        只处理本根目录的**直接子目录**，跳过符号链接；删除失败只记数不抛错，
+        因为回收是维护动作，绝不能让一次已成功的供给因此失败。
+        """
+        import shutil
+        from config import MODEL_SUPPLY_KEEP_OPERATIONS
+        recent = MODEL_SUPPLY_KEEP_OPERATIONS if keep_recent is None else int(keep_recent)
+        keep = {str(value) for value in keep_operation_ids if value}
+        with self._condition:
+            keep.update(str(key) for key in self._operations)
+        try:
+            candidates = [path for path in self._root.iterdir() if path.is_dir()]
+        except OSError:
+            return {"removed": 0, "reclaimed_bytes": 0, "kept": sorted(keep),
+                    "examined": 0, "failed": 0}
+        try:
+            candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError:
+            pass
+        for path in candidates[:max(0, recent)]:
+            keep.add(path.name)
+        removed, reclaimed, failed = 0, 0, 0
+        for path in candidates:
+            if path.name in keep or path.is_symlink() or path.parent != self._root:
+                continue
+            size = 0
+            try:
+                for child in path.rglob("*"):
+                    if child.is_file() and not child.is_symlink():
+                        size += child.stat().st_size
+                shutil.rmtree(path)
+            except OSError:
+                failed += 1
+                continue
+            removed += 1
+            reclaimed += size
+        if removed or failed:
+            logger.info(
+                "event=supply_operations_reclaimed removed=%d reclaimed_bytes=%d "
+                "failed=%d kept=%d examined=%d",
+                removed, reclaimed, failed, len(keep), len(candidates),
+            )
+        return {"removed": removed, "reclaimed_bytes": reclaimed, "kept": sorted(keep),
+                "examined": len(candidates), "failed": failed}
+
     def _run(self, op_id):
         try:
             self._execute(op_id)
@@ -739,6 +796,15 @@ class ModelSupplyCoordinator:
                          reason_code="SUPPLY_CANCELLED" if cancelled else code, reason=message,
                          capacity_diagnostic=None if cancelled else getattr(exc, "diagnostic", None))
             self._cancel_receivers(op_id, list(self.get(op_id)["nodes"]))
+        finally:
+            # ★ 2026-10-24（#125）：**无论成败都回收历史操作目录**。此前每次供给都会在
+            #   `operations/<op_id>/` 留下 3~15 GB 的段工件且从不回收（实测积压
+            #   146 个 / 453.78 GB）。保留当前这次与设置指定的最近若干次。
+            try:
+                self.collect_operation_directories(keep_operation_ids=(op_id,))
+            except Exception:
+                logger.exception("event=supply_operations_reclaim_failed operation_id=%s", op_id)
+
 
     def _execute(self, op_id):
         # ★ 2026-10-24（#117）：清点等待上限在此统一取一次，供本函数内所有

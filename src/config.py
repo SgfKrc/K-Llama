@@ -464,6 +464,17 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
         "QLH_PIPELINE_STAGE_LEASE_SECONDS", 300.0, min_val=5.0, max_val=86400.0,
     )
 
+    # ★ 2026-10-24（#125）：**历史供给操作目录的保留数**。
+    #   `model_supply` 每次供给都会在 `<state>/model-supply/operations/<op_id>/` 下构建
+    #   各节点的段工件，而**这些目录此前从不回收**：实测本机积压 **146 个目录、
+    #   453.78 GB**（C 盘一度只剩 108 GB 可用）。这里把「保留当前操作 + 最近 N 个」
+    #   固化为设置（0 = 供给成功后清空全部历史），由
+    #   `ModelSupplyCoordinator.collect_operation_directories()` 在供给成功后执行，
+    #   并在日志里报告回收的目录数与字节数，避免再次静默堆积。
+    MODEL_SUPPLY_KEEP_OPERATIONS = int(_env_float(
+        "QLH_MODEL_SUPPLY_KEEP_OPERATIONS", 2.0, min_val=0.0, max_val=64.0,
+    ))
+
     def pipeline_stage_lease_seconds() -> float:
         """★ 2026-10-24（#117）：**运行时**读取 Route-A stage 租约秒数。
 
