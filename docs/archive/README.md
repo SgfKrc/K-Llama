@@ -86,7 +86,7 @@
 - [worker-prepare-acceptance-2026-10-13.md](distributed/worker-prepare-acceptance-2026-10-13.md)（2026-10-15 归档：票 12c 完成）
 - [任务图降级为实验路径-决策-2026-10-08.md](distributed/任务图降级为实验路径-决策-2026-10-08.md)（2026-10-20 归档：自标历史参考；任务图编排已按 R4/R5 裁撤，零引用）
 
-### 运行时与容量（`runtime/`，7 篇）
+### 运行时与容量（`runtime/`，8 篇）
 
 - [2bit与4bit量化调研与实施计划.md](runtime/2bit与4bit量化调研与实施计划.md)
 - [PyTorch层流水线加载峰值优化方案.md](runtime/PyTorch层流水线加载峰值优化方案.md)
@@ -95,6 +95,7 @@
 - [缓存单元对齐实验-2026-09-14.md](runtime/缓存单元对齐实验-2026-09-14.md)
 - [缓存机制专项计划-2026-09-13.md](runtime/缓存机制专项计划-2026-09-13.md)
 - [capacity-freshness-rog-acceptance-2026-10-15.md](runtime/capacity-freshness-rog-acceptance-2026-10-15.md)（2026-10-15 归档：票 17/18 容量事实源与 9B 两节点验收）
+- [控制面数据库膨胀-治理方案-2026-10-24.md](runtime/控制面数据库膨胀-治理方案-2026-10-24.md)（2026-10-24 归档：**方案已实现**——L1 热历史有界 / L2 journal checkpoint / L3 离线压缩，见 `model_control_retention.py`、`sqlite_journal.py`、`compact_control_db.py`）
 
 ### TUI（`tui/`，8 篇）
 
