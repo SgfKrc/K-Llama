@@ -677,11 +677,22 @@ def capacity_domains(usable: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 raise PipelineCapacityError(
                     f"capacity domain {domain_id!r} declares conflicting "
                     f"domain_total_bytes ({entry['domain_total_bytes']} vs {total})")
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**域账必须用同一类资源**。
+        #   `capacity_bytes` 对 CUDA 节点是 **VRAM**（`capacity_source="gpu.vram_free_gb"`），
+        #   对纯 CPU/GGUF 执行器是 **RAM** —— 直接把两者相加会把两种资源混成一份总账。
+        #   实测：主段 VRAM 6.0 GB + 本机 CPU 段 RAM 10.2 GB = 16.2 GB > 总账 14.6 GB
+        #   ⇒ 报 `pipeline_capacity_domain_exceeded` 超额 1.56 GB，而物理上并不冲突
+        #   （VRAM 与 RAM 是两份独立资源）。
+        #   共享**内存**域的本质是"同一份 RAM"，所以域内每个执行器都用它的
+        #   `host_capacity_bytes`（主机内存额度）记账；没有该项时退化为 `capacity_bytes`
+        #   ——对纯 CPU/GGUF 节点两者同义，因此既有拓扑逐字节不变。
+        host_budget = node.get("host_capacity_bytes")
+        if host_budget is None:
+            host_budget = node["capacity_bytes"]
         entry["executors"].append({
             "node_id": node["node_id"],
             "executor_id": str(node.get("executor_id") or ""),
-            "allocatable_bytes": max(0, int(node["capacity_bytes"])
-                                     - int(node["reserve_bytes"])),
+            "allocatable_bytes": max(0, int(host_budget) - int(node["reserve_bytes"])),
         })
     return domains
 

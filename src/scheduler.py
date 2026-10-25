@@ -2541,6 +2541,30 @@ class Scheduler(
             if base_record is not None:
                 cpu_record = self._local_cpu_executor_record(base_record)
                 records.append(cpu_record)
+                # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**两段分摊同一份主机内存总账**。
+                #   域校验按 `host_capacity_bytes` 记账（同一类资源，见
+                #   `capacity_domains`），若主段仍保留整份额度，两段之和就会超过总账
+                #   ⇒ `pipeline_capacity_domain_exceeded`（实测超额 1.56 GB）。
+                #   物理上本机 RAM 只有一份，所以把划给 CPU 段的份额**从主段扣掉**。
+                #   注意扣的是 `host_capacity_bytes`（主机额度）而**不是**
+                #   `capacity_bytes` —— 后者对 CUDA 主段是 VRAM，扣它会凭空削掉显存。
+                if "host_capacity_bytes" in base_record:
+                    base_record["host_capacity_bytes"] = max(
+                        0,
+                        int(base_record["host_capacity_bytes"])
+                        - int(cpu_record["capacity_bytes"]),
+                    )
+                # ★ 2026-10-25：把分摊结果记下来。域校验按 `host_capacity_bytes` 记账，
+                #   只有两段之和落在总账内才不会再报 `domain_exceeded`；而这一行是
+                #   唯一能看出"扣了没有、扣了多少"的地方（实测出现过扣了却没生效的情形，
+                #   因为 `_get_pipeline_capacity_nodes` 会被多次调用、每次重建记录）。
+                logger.info(
+                    "event=local_host_budget_split primary_host_capacity=%s "
+                    "cpu_share=%s domain_total=%s",
+                    base_record.get("host_capacity_bytes"),
+                    cpu_record["capacity_bytes"],
+                    cpu_record["domain_total_bytes"],
+                )
                 logger.info(
                     "event=local_cpu_executor_declared node_id=%s executor_id=%s "
                     "capacity_bytes=%s domain_total_bytes=%s layer_cost_ms=%s",

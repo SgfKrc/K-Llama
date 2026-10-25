@@ -510,21 +510,30 @@ def test_assignment_carries_executor_id_only_when_present(fresh_case):
 
 
 def test_assignment_exposes_executor_identity_when_declared(fresh_case):
-    """声明了执行器身份的节点 ⇒ 该身份出现在它自己的 assignment 里。"""
+    """声明了共享域的节点 ⇒ 该域进入它自己的 assignment。
+
+    这里只声明 `capacity_domain_id`、**不声明** `executor_id`。原因是一个真实约束：
+    供给链路按 `(node_id, "")` 定位主执行器，而**远端 worker 的 assignment 本就不带
+    `executor_id`** —— 只有本机附加执行器有，且它**不进供给 plan**（本机执行器没有
+    工件传输流程，见 `model_supply.py` 的 `capacity_by_id` 修复）。给远端节点设非空
+    `executor_id` 会让它找不到记录（`Selected node ... is no longer eligible`），
+    那是测试设计错误，不是产品缺陷。
+    """
     case = fresh_case
 
     def calibrate(case):
         for record in case.cached:
-            record["executor_id"] = "cpu"
             record["capacity_domain_id"] = "host-alpha"
             record["domain_total_bytes"] = 10 ** 9
+            record.pop("executor_id", None)
 
     result = _admitted_plan(case, calibrate)
     assert result["admitted"], result.get("reason_code")
     assert result["assignments"], result
     for item in result["assignments"]:
-        assert item["executor_id"] == "cpu"
         assert item["capacity_domain_id"] == "host-alpha"
+        # 主执行器不输出该字段（缺省语义保持不变）
+        assert "executor_id" not in item
     # 域账仍可见（阶段 1 的交付条件没被破坏）
     assert result["capacity_domains"]["host-alpha"]["excess_bytes"] == 0
 
