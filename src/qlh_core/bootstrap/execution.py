@@ -33,6 +33,19 @@ def build_requests(scheduler, store=None):
     return ExecutionApplication(scheduler, service)
 
 
+def stage_identity(segment) -> str:
+    """一个执行段的 **stage 标识前缀**（`node_id` 或 `node_id#executor_id`）。
+
+    ★ 2026-10-25（LOCAL-EXECUTORS-01）：必须把 `executor_id` 编进去。同一物理节点上的
+    两个执行器（GPU 段 + CPU 段）`node_id` **相同**，只用 `node_id` 组 stage_id 会让
+    两段的标识撞车，而它同时被用作请求追踪与清理回执关联的键（`stage()` 与
+    `_reset_pipeline_kv()` **必须**用同一套规则，否则清理回执会关联到错误的 stage）。
+    `executor_id` 缺省空串 ⇒ 拼出的值与改动前**逐字相同**。
+    """
+    executor_id = getattr(segment, "executor_id", "") or ""
+    return f"{segment.node_id}#{executor_id}" if executor_id else str(segment.node_id)
+
+
 class ExecutionApplication:
     def __init__(self, scheduler, requests):
         self.scheduler = scheduler
@@ -392,7 +405,7 @@ class NativePorts:
         value = self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
             hidden_states=hidden, model_identity=ModelIdentity(**frozen["stage_model_identity"]),
             workflow_id="wf_" + record["request_id"], request_id=f'{record["request_id"]}:step:{identity.step}',
-            stage_id=f'{segment.node_id}:step:{identity.step}', context_size=self.context_size,
+            stage_id=f'{stage_identity(segment)}:step:{identity.step}', context_size=self.context_size,
             want_hidden=not segment.head,
             want_all_tokens=segment.head and all_tokens,
             middle_channel="keep_head_layer_out", positions=positions,
@@ -462,11 +475,13 @@ class NativePorts:
                     record["deadline"].require_remaining()
                     assignment = json.loads(segment.payload)
                     frozen = assignment["worker_prepare_identity"]
+                    # 与 `stage()` 共用 `stage_identity()`：同 node 两段的清理回执
+                    # 必须关联到各自的 stage，不能因为 node_id 相同而撞车。
                     receipt = self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
                         hidden_states=np.zeros((1, frozen["hidden_size"]), dtype=np.float32),
                         model_identity=ModelIdentity(**frozen["stage_model_identity"]),
                         workflow_id="wf_" + record["request_id"], request_id=record["request_id"] + ":" + tag,
-                        stage_id=segment.node_id + ":" + tag, context_size=self.context_size,
+                        stage_id=stage_identity(segment) + ":" + tag, context_size=self.context_size,
                         want_hidden=not segment.head, middle_channel="keep_head_layer_out",
                         seq_ids=[0], positions=[0], cancel_event=record["cancel"] if check else threading.Event(),
                         request_deadline=record["deadline"], cleanup_only=True,

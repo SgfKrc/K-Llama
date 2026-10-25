@@ -357,3 +357,44 @@ def test_pipeline_node_executor_id_is_omitted_when_default():
     secondary = PipelineNode(node_id="master", executor_id="cpu", **common)
     assert secondary.to_dict()["executor_id"] == "cpu"
     assert secondary.identity_key == ("master", "cpu")
+
+
+# --------------------------------------------------------------------------
+# KV 生命周期：同 node 两段的 stage 标识必须可区分
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("executor_id,expected", [
+    ("", "master"),              # 主执行器（缺省）⇒ 与改动前逐字相同
+    ("cpu", "master#cpu"),       # 同机 CPU 段
+])
+def test_stage_identity_includes_the_executor(executor_id, expected):
+    """`stage_identity` 是 `stage()` 与 `_reset_pipeline_kv()` **共用**的规则。
+
+    同 node 两段的 `node_id` 相同，只用 node_id 组 stage 标识会让两段撞车 —— 而它同时
+    是请求追踪与**清理回执关联**的键。撞车的后果是 `_reset_pipeline_kv` 把清理命令
+    关联到错误的 stage（实测中该函数按 `segment.node_id` 定位 owner）。
+    """
+    from types import SimpleNamespace
+
+    from qlh_core.bootstrap.execution import stage_identity
+
+    assert stage_identity(SimpleNamespace(node_id="master", executor_id=executor_id)) == expected
+
+
+def test_stage_identity_tolerates_segments_without_the_field():
+    """没有 `executor_id` 属性的对象（旧形态）⇒ 退化为 `node_id`，不抛错。"""
+    from types import SimpleNamespace
+
+    from qlh_core.bootstrap.execution import stage_identity
+
+    assert stage_identity(SimpleNamespace(node_id="worker")) == "worker"
+
+
+def test_same_node_segments_get_distinct_stage_identities():
+    """同 node 两段的 stage 标识**必须**互不相同（本测试锁住那个不变量本身）。"""
+    from qlh_core.bootstrap.execution import stage_identity
+
+    primary, secondary = _segment("master", "", 0, 4), _segment("master", "cpu", 4, 8)
+    assert stage_identity(primary) != stage_identity(secondary)
+    assert primary.node_id == secondary.node_id      # 同一台物理机
+    assert primary.identity_key != secondary.identity_key
