@@ -1,6 +1,6 @@
 """TUI 端到端 flow 的 **step 引擎**（`--mode assert` / `--mode demo` 共用同一份剧本）。
 
-计划来源：`docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md`（具名票 `CORE-TUI-E2E-01`）。
+计划来源：`docs/archive/tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md`（具名票 `CORE-TUI-E2E-01`）。
 剧本单一来源：`fixtures/tui_e2e_flow.json`（`actions` / `expect` / `caption` 分离）。
 
 为什么引擎放在 `tests/` 而不是 `scripts/`
@@ -414,7 +414,7 @@ async def _action_confirm(session, spec, flow, sink):
 #
 # 只**调用**既有脚本（`scripts/relay_mid_service.py` / `scripts/relay_health.py`），不改它们；
 # 段服务强制 loopback（脚本自身也强制）。用途与边界见
-# `docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md` §4.2 D-a / §6.1 风险 6。
+# `docs/archive/tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md` §4.2 D-a / §6.1 风险 6。
 
 
 def _free_loopback_port() -> int:

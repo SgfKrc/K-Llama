@@ -6,11 +6,11 @@ K-Llama (Llama for Koakuma) is a distributed inference core for heterogeneous ed
 
 > Status: **current**
 >
-> Updated: 2026-10-19
+> Updated: 2026-10-25
 >
 > This README describes only the current boundary of the main repository and its reproducible entry points. Experiment logs, historical implementations and external sub-projects are not equivalent to production capability.
 >
-> The single-source-of-truth refactor (ticket 14) passed its R0–R5 software gates on 2026-10-18/19; its R6 product gate is still pending. The mainline moved from task-graph scheduling / standalone speculative PoC / preemptive queues / a standalone Launcher to **linear relay + versioned snapshots**. See the [refactor design](单一事实源重构设计-2026-10-18.md) and the [R5 delivery report](重构客户端切换-R5-2026-10-19.md).
+> The single-source-of-truth refactor (ticket 14) passed its R0–R5 software gates on 2026-10-18/19; its R6 product acceptance was carried out on 2026-10-19 (the remaining device and gain gates are tracked in the [R6 report](重构产品验收-R6-2026-10-19.md)), and the current focus is the [PERF performance series](异构推理吞吐瓶颈与外部技术调研-2026-10-24.md#6-实验排期与退出判据). The mainline moved from task-graph scheduling / standalone speculative PoC / preemptive queues / a standalone Launcher to **linear relay + versioned snapshots**. See the [refactor design](单一事实源重构设计-2026-10-18.md) and the [R5 delivery report](重构客户端切换-R5-2026-10-19.md).
 >
 > 中文: [../README.md](../README.md) - this file: docs/README.en.md
 

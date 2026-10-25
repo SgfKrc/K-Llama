@@ -2,7 +2,7 @@
 
 > 状态：**历史参考**（归档区索引，不在链接质量门内）
 >
-> 更新日期：2026-10-20
+> 更新日期：2026-10-25
 
 这里是历史文档：已被新方案取代、或已完成使命的计划与调研原始材料，保留目的是让结论可回溯（当初为什么这么决定、当时的证据是什么）。现行口径以 [docs/ 上层](../README.en.md) 与 [仓库 README](../../README.md) 为准。
 
@@ -86,7 +86,7 @@
 - [worker-prepare-acceptance-2026-10-13.md](distributed/worker-prepare-acceptance-2026-10-13.md)（2026-10-15 归档：票 12c 完成）
 - [任务图降级为实验路径-决策-2026-10-08.md](distributed/任务图降级为实验路径-决策-2026-10-08.md)（2026-10-20 归档：自标历史参考；任务图编排已按 R4/R5 裁撤，零引用）
 
-### 运行时与容量（`runtime/`，8 篇）
+### 运行时与容量（`runtime/`，7 篇）
 
 - [2bit与4bit量化调研与实施计划.md](runtime/2bit与4bit量化调研与实施计划.md)
 - [PyTorch层流水线加载峰值优化方案.md](runtime/PyTorch层流水线加载峰值优化方案.md)
@@ -95,9 +95,8 @@
 - [缓存单元对齐实验-2026-09-14.md](runtime/缓存单元对齐实验-2026-09-14.md)
 - [缓存机制专项计划-2026-09-13.md](runtime/缓存机制专项计划-2026-09-13.md)
 - [capacity-freshness-rog-acceptance-2026-10-15.md](runtime/capacity-freshness-rog-acceptance-2026-10-15.md)（2026-10-15 归档：票 17/18 容量事实源与 9B 两节点验收）
-- [控制面数据库膨胀-治理方案-2026-10-24.md](runtime/控制面数据库膨胀-治理方案-2026-10-24.md)（2026-10-24 归档：**方案已实现**——L1 热历史有界 / L2 journal checkpoint / L3 离线压缩，见 `model_control_retention.py`、`sqlite_journal.py`、`compact_control_db.py`）
 
-### TUI（`tui/`，8 篇）
+### TUI（`tui/`，9 篇）
 
 - [Patchouli知识库管理TUI专项计划-2026-09-14.md](tui/Patchouli知识库管理TUI专项计划-2026-09-14.md)
 - [TUI接入层段协议-10F落地后-2026-09-17.md](tui/TUI接入层段协议-10F落地后-2026-09-17.md)
@@ -107,6 +106,7 @@
 - [TUI重写方案-2026-09-16.md](tui/TUI重写方案-2026-09-16.md)
 - [主线票据-CORE-TUI-01-2026-09-15.md](tui/主线票据-CORE-TUI-01-2026-09-15.md)
 - [QLH-TUI跨平台基调-2026-09-14.md](tui/QLH-TUI跨平台基调-2026-09-14.md)（2026-10-07 归档：核心基调「不引入 Textual」已被现行 Textual 外壳取代）
+- [TUI端到端flow测试与答辩演示复用计划-2026-09-24.md](tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md)（2026-10-25 归档：F1 headless 假后端与 F2 单机真模型此前已落地，F3 真实双机档由 R6 产品验收记录「真实双机TUI为单独1项通过」⇒ 三档全部完成，使命已毕）
 
 ### 边缘与 Android（`edge/`，10 篇）
 
@@ -170,8 +170,19 @@
 
 - [大文件拆解计划-scheduler与api_server-2026-09-23.md](refactor/大文件拆解计划-scheduler与api_server-2026-09-23.md)
 
-合计 **116** 篇。
+合计 **118** 篇。
 
+## 2026-10-25 归档批次
+
+本批归档 1 篇：计划三档全部落地，使命完成。
+
+- `TUI端到端flow测试与答辩演示复用计划-2026-09-24.md` → `tui/`（F1 headless 假后端与 F2 单机真模型此前已落地；F3 真实双机档由 [R6 §6](../重构产品验收-R6-2026-10-19.md) 记录「真实双机TUI为单独1项通过」（2026-10-21），`tests/test_tui_e2e_flow_distributed.py` 在双机在线时执行 ⇒ 计划不再有待办）。
+
+移动时同步修正的引用：`docs/TUI使用指南.md`、`fixtures/tui_e2e_flow.json`／`tui_e2e_flow_da.json`／`tui_e2e_flow_real.json`（3 处 `plan` 字段）、`tests/tui_e2e_flow.py`（2 处）、`tests/test_tui_e2e_flow.py`／`test_tui_e2e_flow_da.py`／`test_tui_e2e_flow_real.py`，共 9 处改指 `archive/tui/` 前缀；`docs/遗留清单-2026-10-07.md` 的 F3 条目同时移入其 §3「已过时项」。`python scripts/run_doc_checks.py` 全绿。
+
+本批另复核并修正过时状态行：`重构客户端切换-R5-2026-10-19.md`（原「R6产品门待验」）、`单一事实源重构设计-2026-10-18.md`（原「R6产品门进行中」）、`彻查后修复与重构排票计划-2026-10-09.md`（票 14 状态段改为 R6 已验收并指向 PERF 系列）、`README.md` 与 `docs/README.en.md`（R6 表述）、`验收清单与资源限制登记.md` D30（原「F3 待外部集群」）。
+
+索引计数修正：`runtime/` 段曾把 `控制面数据库膨胀-治理方案-2026-10-24.md` 重复登记（该文件实际在 `misc/`），本批删除该行并把该段计数改为 7；合计 116 → 118，与各段清单及磁盘实际文件数一致。
 ## 2026-10-20 归档批次
 
 本批归档 5 篇：票 13 收口后其过程记录完成使命，另有两篇自标历史参考或结论已被推翻的材料。

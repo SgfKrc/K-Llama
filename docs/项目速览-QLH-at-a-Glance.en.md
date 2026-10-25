@@ -49,7 +49,7 @@ Full matrix, setups and report paths: [cross-framework relay — current baselin
 
 ## Outstanding work
 
-- R6 collects new-architecture evidence for actual package startup, production-data migration and multi-device 9B LL/DL. Historical device figures retain their table dates; criteria are in the [refactor design](单一事实源重构设计-2026-10-18.md#12-验收与退出标准).
+- The R6 product acceptance was carried out on 2026-10-19 and is documented in the [R6 report](重构产品验收-R6-2026-10-19.md) (actual package startup, production-data migration and multi-device 9B LL/DL are covered by evidence); the remaining device and gain gates are tracked in its §7. Historical device figures retain their table dates; criteria are in the [refactor design](单一事实源重构设计-2026-10-18.md#12-验收与退出标准).
 - Cross-master majority replication, physical fault recovery and trusted signed releases retain separate external gates; current status is in the [ticket plan](彻查后修复与重构排票计划-2026-10-09.md).
 - Distributed speculation still requires a local draft, multi-position output and verifiable state rollback. Standalone PoCs have been retired; native local n-gram remains. See the [capability audit](当前功能与事实归属审计-2026-10-18.md#5-推理优化与图依赖边界).
 - Network latency directly affects stepwise relay. Deployment decisions use measured RTT and capacity; comparisons use the same model, quantization, build and sampling setup.

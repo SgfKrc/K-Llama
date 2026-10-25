@@ -142,4 +142,4 @@ qlh models --json           # 机读输出
 ## 九、测试
 
 - TUI 定向回归：`.\.venv-test\Scripts\python.exe -m pytest -q tests/test_tui_textual.py tests/test_tui_write_ops.py tests/test_tui_shared.py tests/test_tui_sse.py`。
-- 端到端 flow 与演示复用见 [TUI 端到端 flow 测试与答辩演示复用计划](TUI端到端flow测试与答辩演示复用计划-2026-09-24.md)。
+- 端到端 flow 与演示复用见 [TUI 端到端 flow 测试与答辩演示复用计划](archive/tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md)（已归档：F1/F2/F3 三档全部落地）。
