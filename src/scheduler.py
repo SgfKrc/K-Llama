@@ -2445,6 +2445,59 @@ class Scheduler(
                     local_mode = str(local_artifact.get("segment_mode") or local_artifact.get("mode", "") or "").lower()
                     if local_mode in {"head", "middle", "tail"}:
                         record["segment_mode"] = local_mode
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机节点如实声明"能按分配本地裁层"**。
+            #
+            #   远端节点的 `layer_budget` 来自 v3 hello capabilities；本机**没有** hello
+            #   握手，于是在求解器里 `advertised_budget` 为 None ⇒ 走 `layer_ranges`
+            #   **硬约束**分支（`capacity.py` 的判据：
+            #   `if advertised_budget is None or not advertised_budget.get("local_cut")`）。
+            #   而本机的 `layer_ranges` 来自 `_configured_layer_artifact`
+            #   （`scheduler_task_worker.py:365`），它读的是 `get_selected_model()`
+            #   —— **上一轮供给留下的段** ⇒ 循环依赖：规划被旧段约束，于是永远切不出
+            #   新段。
+            #
+            #   实测后果：master 声明 `[0,8)`、本机 CPU 段声明 `[4,24)`，在 `[4,8)`
+            #   重叠 ⇒ 37 个候选被 `node_layer_range_not_advertised` 排除 ⇒ 无解。
+            #   而同一份日志显示 `allocatable_bytes=15370092544`、域超额全为 0
+            #   ⇒ **容量根本不是瓶颈**，卡住的是这个循环依赖。
+            #
+            #   本机**确实**具备本地裁层能力（`materialize_pipeline_candidate` 会按分配
+            #   区间裁段），所以声明 `local_cut=True` 是**如实声明既有能力**，语义与远端
+            #   `local_cut=true` 完全一致 —— 声明后 `layer_ranges` 降级为"当前已就绪"的
+            #   信息，而不是硬约束。
+            #
+            #   `per_layer_bytes` 取不到 descriptor 时**不声明**（不填占位值）：额度必须
+            #   有依据，塞一个 1 会让 `max_layers` 变成天文数字，比不声明更坏。
+            try:
+                local_descriptor = self._host.get_pipeline_descriptor()
+                # ⚠️ 键名是 `layer_weight_bytes`（`pipeline_model_descriptor.py:659`
+                #    的 `inspect_pipeline_model` 返回），**不是** `layer_bytes` ——
+                #    第一版写错，取到 0 ⇒ 判定"无依据" ⇒ 不声明 ⇒ 循环依赖照旧。
+                #    两个键都试是为了容忍不同引擎（llama_engine 侧）的表述差异。
+                descriptor_layers = list(
+                    local_descriptor.get("layer_weight_bytes")
+                    or local_descriptor.get("layer_bytes") or []
+                )
+                per_layer_bytes = int(descriptor_layers[0]) if descriptor_layers else 0
+            except Exception:
+                per_layer_bytes = 0
+            if per_layer_bytes > 0:
+                record["layer_budget"] = {
+                    "available_bytes": int(record["capacity_bytes"]),
+                    "per_layer_bytes": per_layer_bytes,
+                    "max_layers": max(1, int(record["capacity_bytes"]) // per_layer_bytes),
+                    "local_cut": True,
+                }
+            if node_id in {"master", local_node_id} and not record.get("executor_id"):
+                logger.info(
+                    "event=local_primary_budget_declared has_budget=%s local_cut=%s "
+                    "per_layer_bytes=%s max_layers=%s ranges=%s",
+                    record.get("layer_budget") is not None,
+                    (record.get("layer_budget") or {}).get("local_cut"),
+                    per_layer_bytes,
+                    (record.get("layer_budget") or {}).get("max_layers"),
+                    record.get("layer_ranges"),
+                )
             records.append(record)
         # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机 CPU 执行器（同机第二个执行器）**。
         #   由 `QLH_LOCAL_CPU_EXECUTOR=1` 开启（默认关 ⇒ 既有拓扑逐位不变）。
