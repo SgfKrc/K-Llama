@@ -23,13 +23,17 @@ from qlh_core.adapters.model_control_retention import (
 #   计数器，而票要的正是这两个数，所以在这里放一个**受环境变量控制、默认零开销**的探针：
 #       QLH_PROFILE_CONTROL_READS=<输出文件路径>
 #   设置后，每次 `read()`（新建连接 + sqlite_master 探测）与 `_read()`（读整行 payload
-#   并 json.loads）各记一条 `monotonic 时间戳 / 类别 / payload 字节`；按 decode step 的
-#   时间窗口聚合，即可得到「每步 N 次、合计 M 字节」。不设置时
-#   `_profile_control_read` 立即返回，判定代价只是一个字符串真值测试。
-#   记录先在内存攒批，满 4096 条或进程退出时落盘，避免每次读都开文件。
+#   并 json.loads）各记一条 `monotonic 时间戳 / 类别 / payload 字节 / 线程名`；按 decode
+#   step 的时间窗口聚合可得「每步 N 次、合计 M 字节」，按**线程名**聚合则直接分出
+#   「查询读取」（`qlh-tui-backend`：TUI 轮询投影）与「执行读取」（`linear-request-executor`
+#   / 请求线程：逐步校验）各自的份额 —— 这正是票要求「分开测试执行读取、查询读取及
+#   两者组合」的那两个量，且无需重启进程或做外部 A/B。
+#   不设置时 `_profile_control_read` 立即返回，判定代价只是一个字符串真值测试。
+#   记录先在内存攒批（阈值取小，保证长会话也能连续落盘），或进程退出时写盘。
 _PROFILE_PATH = os.environ.get("QLH_PROFILE_CONTROL_READS", "")
-_PROFILE_RECORDS: list[tuple[float, str, int]] = []
+_PROFILE_RECORDS: list[tuple[float, str, int, str]] = []
 _PROFILE_LOCK = threading.Lock()
+_PROFILE_BATCH = 256
 
 
 def _flush_profile_control_reads() -> None:
@@ -37,8 +41,8 @@ def _flush_profile_control_reads() -> None:
         return
     try:
         with open(_PROFILE_PATH, "a", encoding="utf-8") as handle:
-            handle.writelines(f"{stamp:.6f}\t{kind}\t{size}\n"
-                              for stamp, kind, size in _PROFILE_RECORDS)
+            handle.writelines(f"{stamp:.6f}\t{kind}\t{size}\t{thread}\n"
+                              for stamp, kind, size, thread in _PROFILE_RECORDS)
         _PROFILE_RECORDS.clear()
     except OSError:
         pass
@@ -47,9 +51,10 @@ def _flush_profile_control_reads() -> None:
 def _profile_control_read(kind: str, size: int) -> None:
     if not _PROFILE_PATH:
         return
+    thread = threading.current_thread().name
     with _PROFILE_LOCK:
-        _PROFILE_RECORDS.append((time.monotonic(), kind, size))
-        if len(_PROFILE_RECORDS) >= 4096:
+        _PROFILE_RECORDS.append((time.monotonic(), kind, size, thread))
+        if len(_PROFILE_RECORDS) >= _PROFILE_BATCH:
             _flush_profile_control_reads()
 
 
