@@ -428,6 +428,19 @@ def _normalize_nodes(
                 raise PipelineCapacityError(
                     f"node[{node_id}].layer_cost_ms must be a positive number")
             normalized["layer_cost_ms"] = float(cost)
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**执行器身份与共享内存域**。
+        #   `executor_id` 缺省 ""（= 该节点的默认/主执行器 = 今天的行为）；
+        #   `capacity_domain_id` 缺省 = `node_id`（= 每节点一个独立域 = 今天的行为）。
+        #   只有显式给出 `capacity_domain_id` **且** 同域有多个执行器时，容量才按
+        #   **物理机总账**校验（见 `validate_capacity_domains`）—— 否则同一台物理机上的
+        #   两个执行器会各自按整机可用内存记账，静默给出物理上装不下的计划。
+        if "executor_id" in raw:
+            normalized["executor_id"] = str(raw["executor_id"] or "")
+        if raw.get("capacity_domain_id"):
+            normalized["capacity_domain_id"] = str(raw["capacity_domain_id"])
+        if "domain_total_bytes" in raw:
+            normalized["domain_total_bytes"] = _non_negative_int(
+                raw["domain_total_bytes"], "domain_total_bytes")
         if "configured_reserve_bytes" in raw or "retained_component_reserve_bytes" in raw:
             for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
                 if type(raw.get(field)) is not int or raw[field] < 0:
@@ -628,6 +641,76 @@ def _node_budget(raw_bytes: int, node: dict[str, Any], safety_margin: float) -> 
 def _required_bytes(raw_bytes: int, node: dict[str, Any], safety_margin: float) -> int:
     """Compatibility for manual plans and existing budget channels."""
     return _node_budget(raw_bytes, node, safety_margin)["required_bytes"]
+
+
+def capacity_domains(usable: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """One entry per **shared physical budget**.
+
+    ★ 2026-10-25（LOCAL-EXECUTORS-01）：一台物理机可以承载多个执行器（例如
+    master 的 GPU 段 + 同一台机器的 CPU 段）。它们共享同一份 RAM，但容量是按
+    `node_id` 记账的 ⇒ 两个执行器会各自按整机可用内存申报，求解器则把它们当成
+    两台独立物理机，于是给出**物理上装不下**的计划却 `admitted=True`（实测：
+    两节点各 200 容量、合计需求 242，仍被准入，且每段都显示 headroom=79）。
+
+    `capacity_domain_id` 就是这个共享域的键；**缺省 = `node_id`**，即每个节点自成一域
+    ——这正是今天的行为，所以既有调用方的记账**逐字节不变**。
+    """
+    domains: dict[str, dict[str, Any]] = {}
+    for node in usable:
+        domain_id = str(node.get("capacity_domain_id") or node["node_id"])
+        entry = domains.get(domain_id)
+        if entry is None:
+            entry = domains[domain_id] = {"domain_total_bytes": None, "executors": []}
+        total = node.get("domain_total_bytes")
+        if total is not None:
+            total = int(total)
+            if entry["domain_total_bytes"] is None:
+                entry["domain_total_bytes"] = total
+            elif int(entry["domain_total_bytes"]) != total:
+                raise PipelineCapacityError(
+                    f"capacity domain {domain_id!r} declares conflicting "
+                    f"domain_total_bytes ({entry['domain_total_bytes']} vs {total})")
+        entry["executors"].append({
+            "node_id": node["node_id"],
+            "executor_id": str(node.get("executor_id") or ""),
+            "allocatable_bytes": max(0, int(node["capacity_bytes"])
+                                     - int(node["reserve_bytes"])),
+        })
+    return domains
+
+
+def validate_capacity_domains(
+    usable: list[dict[str, Any]],
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Fail closed when one domain's executors claim more than its total.
+
+    只对**显式声明了总账**的域校验（`domain_total_bytes is not None`）：单执行器域与
+    未声明总账的域一律视为"无需跨执行器校验"，因此既有拓扑与既有测试零影响。
+    方向是**宁可多拒**（安全方向）：过度拒绝只是少用一台机器，静默超配会让部署在
+    真实内存压力下崩掉。
+    """
+    domains = capacity_domains(usable)
+    report: dict[str, dict[str, Any]] = {}
+    admitted = True
+    for domain_id, entry in domains.items():
+        total = entry["domain_total_bytes"]
+        claimed = sum(item["allocatable_bytes"] for item in entry["executors"])
+        excess = 0 if total is None else max(0, claimed - int(total))
+        if excess:
+            admitted = False
+        report[domain_id] = {
+            "domain_total_bytes": total,
+            "claimed_allocatable_bytes": claimed,
+            "excess_bytes": excess,
+            "executors": entry["executors"],
+        }
+    return admitted, report
+
+
+def _domain_report_is_informative(report: dict[str, dict[str, Any]]) -> bool:
+    """有无**跨执行器**域需要报告（单执行器域不占篇幅、也不改变既有输出形态）。"""
+    return any(entry["domain_total_bytes"] is not None or len(entry["executors"]) > 1
+               for entry in report.values())
 
 
 def _relay_zero_layer_assignments(
@@ -908,6 +991,30 @@ def solve_pipeline_capacity(
         "capacity_checks": capacity_checks,
         "candidate_exclusions": candidate_exclusions,
     }
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**同机容量去重**。
+    #   一台物理机可以承载多个执行器（master 的 GPU 段 + 同机 CPU 段），它们共享同一份
+    #   RAM，但容量按 `node_id` 记账 ⇒ 两个执行器各自按整机可用内存申报，求解器把它们
+    #   当成两台独立物理机，于是给出**物理上装不下**的计划却 `admitted=True`（实测：
+    #   两节点各 200 容量、合计需求 242，仍被准入，且每段都显示 headroom=79）。
+    #   位置：relay 已剔除（relay 段不占层、不计容量，不该参与域账），且 `base` 已构造
+    #   （拒绝分支与既有分支保持同形）。
+    #   生效条件：只对**显式声明总账**的域校验（`domain_total_bytes`）。未声明 ⇒ 每节点
+    #   自成一域、一律不校验 ⇒ 既有拓扑与既有测试零影响；域报告也只在"有跨执行器域"
+    #   时才写进结果，避免改动既有输出形态。
+    domains_admitted, domain_report = validate_capacity_domains(usable)
+    if _domain_report_is_informative(domain_report):
+        base["capacity_domains"] = domain_report
+    if not domains_admitted:
+        return {
+            **base,
+            "status": "rejected",
+            "admitted": False,
+            "reason_code": "pipeline_capacity_domain_exceeded",
+            "reason": ("同一物理内存域内的执行器申报额度之和超过该域总账；"
+                       "按节点分别记账会让同机多执行器各自按整机可用内存申报。"),
+            "assignments": [],
+            "control_only_nodes": [node["node_id"] for node in usable],
+        }
     required_node_index = next((index for index, node in enumerate(usable)
                                 if node["node_id"] == required_node_id), None)
     if required_node_id is not None and required_node_index is None:

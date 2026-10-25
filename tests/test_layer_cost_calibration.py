@@ -195,3 +195,79 @@ def test_uncalibrated_segments_are_declared_not_guessed(fresh_case):
                for seg in uncalibrated)
     # 瓶颈只能取自**已标定**段
     assert est["bottleneck_node_id"] not in est["uncalibrated_segments"]
+
+
+# --------------------------------------------------------------------------
+# 同机容量去重（LOCAL-EXECUTORS-01 的交付条件："容量无重复计数"）
+# --------------------------------------------------------------------------
+
+def test_no_domain_declaration_keeps_todays_accounting(fresh_case):
+    """**不声明共享域** ⇒ 结果里不出现 `capacity_domains`。
+
+    这是回归门：域机制必须对既有拓扑零影响（`capacity_domain_id` 缺省 = 每节点自成一域）。
+    """
+    result = _admitted_plan(fresh_case)
+    assert result["admitted"], result.get("reason_code")
+    assert "capacity_domains" not in result
+
+
+def test_capacity_domain_rejects_overclaimed_shared_budget(fresh_case):
+    """同域内执行器申报之和 > 域总账 ⇒ fail closed，并给出可审计的域报告。
+
+    这锁住的正是实测缺口：一台物理机上的两个执行器各自按整机可用内存申报，求解器把
+    它们当成两台独立机器，于是给出**物理上装不下**的计划却 `admitted=True`
+    （实测两节点各 200、合计需求 242，每段还显示 headroom=79）。
+    """
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            record["capacity_domain_id"] = "host-alpha"
+            record["domain_total_bytes"] = 250          # 远小于 10000 + 1500
+
+    result = _admitted_plan(case, calibrate)
+    assert not result["admitted"]
+    assert result["reason_code"] == "pipeline_capacity_domain_exceeded"
+    report = result["capacity_domains"]["host-alpha"]
+    assert report["domain_total_bytes"] == 250
+    assert report["claimed_allocatable_bytes"] > 250
+    assert report["excess_bytes"] == report["claimed_allocatable_bytes"] - 250
+    assert len(report["executors"]) == 2
+    assert {item["node_id"] for item in report["executors"]} == {"master", "worker"}
+    assert result["assignments"] == []
+
+
+def test_capacity_domain_admits_when_within_total(fresh_case):
+    """总账足够 ⇒ 照常准入，且域报告仍可审计（写明总账与申报额）。"""
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            record["capacity_domain_id"] = "host-alpha"
+            record["domain_total_bytes"] = 10 ** 9
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    report = result["capacity_domains"]["host-alpha"]
+    assert report["domain_total_bytes"] == 10 ** 9
+    assert report["excess_bytes"] == 0
+    assert report["claimed_allocatable_bytes"] <= 10 ** 9
+
+
+def test_conflicting_domain_totals_are_rejected_loudly():
+    """同域内两个执行器声明了**不同**的总账 ⇒ 直接报错，不静默取其一。
+
+    静默取 min/max 会让"这台机器到底有多少内存"变成一个随节点顺序变化的值。
+    """
+    from qlh_core.planning.capacity import (
+        PipelineCapacityError, validate_capacity_domains,
+    )
+
+    nodes = [
+        {"node_id": "a", "capacity_bytes": 100, "reserve_bytes": 0,
+         "capacity_domain_id": "host-x", "domain_total_bytes": 1000},
+        {"node_id": "b", "capacity_bytes": 100, "reserve_bytes": 0,
+         "capacity_domain_id": "host-x", "domain_total_bytes": 2000},
+    ]
+    with pytest.raises(PipelineCapacityError):
+        validate_capacity_domains(nodes)
