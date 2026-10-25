@@ -1506,6 +1506,15 @@ def solve_pipeline_capacity(
             "execution_device": node["execution_device"],
             "capacity_source": node["capacity_source"],
             "score": node["score"],
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**执行器身份与共享内存域必须随
+            #   assignment 一起流到部署侧**。否则下游（`scheduler_pipeline` 的部署构造）
+            #   无法把"同一物理节点上的第二个执行器"认出来，本机 CPU 段永远不会被规划
+            #   出来 —— 执行通路虽然接好了，却没有任何东西会去用它。
+            #   仅**非空**时输出 ⇒ 既有计划的 assignment 形态与逐位内容不变（回归门）。
+            **({"executor_id": str(node.get("executor_id") or "")}
+               if node.get("executor_id") else {}),
+            **({"capacity_domain_id": str(node["capacity_domain_id"])}
+               if node.get("capacity_domain_id") else {}),
             "placement_weight": placement_weight(node["score"]),
             # 必须与 `placement_objective` 用**同一个**成本倍数，否则报告与实际选择
             # 脱节（这个字段被下游当"该段占了多大份额"读）。

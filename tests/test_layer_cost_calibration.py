@@ -487,3 +487,43 @@ def test_local_provider_executor_is_the_engine_host_stage_entry():
     assert parameters[:3] == ["self", "stage_request", "provider_cancel_event"]
     assert ProviderExecutor is not None
     assert "layer_forward" in inspect.getsource(EngineHost.execute_task_worker_stage)
+
+
+# --------------------------------------------------------------------------
+# producer：执行器身份必须随 assignment 流到部署侧
+# --------------------------------------------------------------------------
+
+def test_assignment_carries_executor_id_only_when_present(fresh_case):
+    """`assignment` 带 `executor_id`/`capacity_domain_id`，但**仅非空时**。
+
+    这是 producer 链的第一环：容量规划把"同机第二个执行器"的身份交给部署侧，否则
+    `scheduler_pipeline` 无法把本机 CPU 段认出来 —— 执行通路接好了却没人用它。
+
+    既有计划（每节点单执行器）不声明这两个字段 ⇒ assignment 形态与逐位内容不变。
+    """
+    case = fresh_case
+    baseline = _admitted_plan(case)
+    assert baseline["admitted"], baseline.get("reason_code")
+    for item in baseline["assignments"]:
+        assert "executor_id" not in item
+        assert "capacity_domain_id" not in item
+
+
+def test_assignment_exposes_executor_identity_when_declared(fresh_case):
+    """声明了执行器身份的节点 ⇒ 该身份出现在它自己的 assignment 里。"""
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            record["executor_id"] = "cpu"
+            record["capacity_domain_id"] = "host-alpha"
+            record["domain_total_bytes"] = 10 ** 9
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    assert result["assignments"], result
+    for item in result["assignments"]:
+        assert item["executor_id"] == "cpu"
+        assert item["capacity_domain_id"] == "host-alpha"
+    # 域账仍可见（阶段 1 的交付条件没被破坏）
+    assert result["capacity_domains"]["host-alpha"]["excess_bytes"] == 0
