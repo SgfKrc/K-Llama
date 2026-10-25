@@ -119,6 +119,12 @@ def _enumerate_candidates(descriptor, nodes, *, safety_margin=1.0,
     Byte scaling and objective arithmetic use rational numbers. All multipliers
     and margins in this suite are dyadic, so a rational ceiling also agrees
     with the solver's single floating-point multiplication/ceiling at this size.
+
+    ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`candidate_layer_ranges` 是硬约束**，本枚举
+    按此建模（受 `test_candidate_ranges_and_layer_limits_remain_hard_with_local_cut`
+    约束）。一度试过在这里也枚举"去掉候选"的解空间以迁就真机上的自锁，但那方向是错的：
+    候选表达的是"**我手上确实有这个段**"，放宽它等于把设备规划到并不存在的工件上。
+    真机自锁要修的是**写入侧**（谁把上一轮切点写成了这一轮的候选）。
     """
     sizes = descriptor["layer_weight_bytes"]
     total_layers, total_work = len(sizes), sum(sizes)

@@ -1273,9 +1273,29 @@ def solve_pipeline_capacity(
                         # safely as an executable segment.
                         exclude(node, cursor, end, "node_layer_artifact_unavailable")
                         continue
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`local_cut` 让段类型失效，前提是它真有整模**。
+            #
+            #   原判据：只要 `local_cut` 为真，`segment_mode` 就取 `None` ⇒ head/middle/tail
+            #   约束**全部跳过**。这对"手上有整模、能按分配裁出任意段"的 worker 是对的。
+            #   但**只持有裁好的部分工件**的执行器（本机 CPU 段的 `mid8-24.gguf`）不能当
+            #   首段/末段 —— 它没有 embedding、也没有 `lm_head`/`final_norm`。若因为
+            #   `local_cut` 而跳过段类型检查，求解器可能把它摆到 tail 位置，而那种失败
+            #   发生在**执行期**（缺 `lm_head` ⇒ `Stage error`），不是规划期报错。
+            #   实测（2026-10-26，`scripts/probe_local_executor_placement.py` 场景 E/F）：
+            #   本机 CPU 段正是靠 `local_cut` 才被允许拿非 middle 位置。
+            #
+            #   判据：`layer_budget` 带了**可切边界**（`min_layer`/`max_layer`）⇒ 说明它
+            #   只有部分工件 ⇒ 段类型**仍然生效**；没带边界（整模）⇒ 保持原行为跳过。
+            has_partial_artifact = bool(
+                advertised_budget is not None
+                and advertised_budget.get("min_layer") is not None
+                and advertised_budget.get("max_layer") is not None
+            )
             segment_mode = (
                 matching_artifact.get("segment_mode")
                 if matching_artifact is not None
+                else node.get("segment_mode")
+                if has_partial_artifact
                 else None if advertised_budget is not None
                 and advertised_budget.get("local_cut")
                 else node.get("segment_mode")
@@ -1404,6 +1424,16 @@ def solve_pipeline_capacity(
     solved = search(0, 0, False, 0, "")
     capacity_checks.extend(checks[key] for key in sorted(checks))
     candidate_exclusions.extend(exclusions[key] for key in sorted(exclusions))
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：这里**不**放宽 `candidate_layer_ranges`。
+    #
+    #   一度想让"带候选 / 去掉候选"两种都解、按目标取优，理由是真机上 `android [[8,20]]`
+    #   + `TABLET [[20,32]]` 把 `[8,32)` 占满、本机 CPU 段挤不进去。但那是**方向错了**：
+    #   候选区间表达的是"**我手上确实有这个段**"这个事实，它**就该是硬约束**
+    #   （`test_candidate_ranges_and_layer_limits_remain_hard_with_local_cut` 这个名字
+    #   就是设计意图的直述），放宽它等于允许把一个设备的算力规划到它并没有的工件上。
+    #
+    #   真正的问题在**写入侧**：`model_supply_capacity` 把**上一轮**的切点当成这一轮的
+    #   候选，于是每轮沿用上轮切点、布局被锁死。要修的是"谁写了这个候选、凭什么"。
     if solved is None:
         allocatable_bytes = sum(
             _node_budget(0, node, safety_margin)["allocatable_bytes"]

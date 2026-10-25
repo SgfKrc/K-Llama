@@ -142,6 +142,10 @@ def main() -> int:
              local_cut=True, bounds=(8, 24)),
         # 两个远端都是 tail（生产日志 segment_mode={'android':'tail','rog-5060':'tail'}）
         # ⇒ 只有一个能当末段，另一个必然闲置。这是既有拓扑的真实约束。
+        #
+        # ★ 真机形态：远端带 `candidate_layer_ranges`（来自**上一轮**供给的切点）。
+        #   它们逐轮沿用，会把 `[8,32)` 占满 ⇒ 本机 CPU 段永远挤不进自己的工件区间。
+        #   放宽逻辑（`solve_pipeline_capacity` 里"两种都解、取优"）应当在此生效。
         node("rog-5060", capacity=int(4.3 * GB), layer_ranges=[[0, 32]],
              cost_ms=8.7, score=1.0, local_cut=True, segment_mode="tail"),
         node("android-542cd254", capacity=int(7.2 * GB), layer_ranges=[[24, 32]],
@@ -169,6 +173,27 @@ def main() -> int:
             item["layer_ranges"] = [[0, 32]]
     scenario("E) CPU 段区间放宽为 [0,32)（middle 约束仍在），看是否入选",
              wide, total_layers=32)
+
+    # F) ★ 真机形态：远端带上一轮留下的 candidate 锁，把 [8,32) 占满。
+    #    放宽逻辑应能放弃这些锁、把 CPU 段安置进它工件覆盖的 [8,24)，实现"主段 + CPU 段并存"。
+    locked = [
+        node("master", capacity=int(6.0 * GB), layer_ranges=[[0, 8]],
+             engine="pytorch", host_capacity=host_total, segment_mode="head",
+             domain_total=host_total, domain_allocatable=primary_alloc,
+             candidate=[[0, 8]], score=1.0),
+        node("master", executor_id="cpu", capacity=cpu_share, layer_ranges=[[8, 24]],
+             engine="llama_cpp", cost_ms=6.84, segment_mode="middle",
+             domain_total=host_total, domain_allocatable=cpu_share, score=1.0,
+             local_cut=True, bounds=(8, 24)),
+        node("android-542cd254", capacity=int(7.2 * GB), layer_ranges=[[24, 32]],
+             cost_ms=20.1, score=1.0, local_cut=True, segment_mode="tail",
+             candidate=[[8, 20]]),
+        node("TABLET-2TLUCNU8", capacity=int(7.2 * GB), layer_ranges=[[20, 32]],
+             cost_ms=20.1, score=1.0, local_cut=True, segment_mode="tail",
+             candidate=[[20, 32]]),
+    ]
+    scenario("F) 真机形态：远端带上一轮 candidate 锁 [8,20)+[20,32)，看放宽后能否并存",
+             locked, total_layers=32)
 
     return 0
 

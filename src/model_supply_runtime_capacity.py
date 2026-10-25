@@ -443,7 +443,17 @@ def project_supply_capacity_nodes(
     for raw in nodes:
         node = copy.deepcopy(raw)
         node_id = node.get("node_id")
-        if not isinstance(node_id, str) or not node_id or node_id in by_id:
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：身份是 `(node_id, executor_id)`。
+        #   同一台物理机可以承载多个执行器（master 的 GPU 段 + 本机 CPU 段），它们**共用
+        #   `node_id`**、共享同一份主机内存，但各持有**不同的裁层工件** ⇒ 各自能承载的
+        #   区间不同，必须分别建模。此前只认 `node_id`，本机 CPU 段一进来就撞
+        #   "identities must be unique"（`SUPPLY_CAPACITY_INVALID`）。
+        #   `executor_id` 缺省为空串 ⇒ 键退化为 `(node_id, "")` ⇒ 既有拓扑逐位等价。
+        executor_id = str(node.get("executor_id") or "")
+        if not isinstance(node_id, str) or not node_id:
+            fail("SUPPLY_CAPACITY_INVALID", "Supply nodes must have unique nonempty identities")
+        identity = (node_id, executor_id)
+        if identity in by_id:
             fail("SUPPLY_CAPACITY_INVALID", "Supply nodes must have unique nonempty identities")
         engine = master_engine if node_id == "master" else node.get("engine")
         if engine not in {"llama_cpp", "pytorch"} or engine not in descriptors:
@@ -505,9 +515,27 @@ def project_supply_capacity_nodes(
         overhead = sum(components.get(key, 0) for key in keys)
         for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models", "range_weight_bytes"):
             node.pop(key, None)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**"必须以 0 开头"是主执行器的性质，不是
+        #   `node_id` 的性质**。
+        #
+        #   本机 CPU 段与主段**共用 `node_id="master"`**，但它是 `middle`
+        #   （`mid8-24.gguf` 里没有 embedding，也没有 `lm_head`/`final_norm`），必须能
+        #   `start > 0`。此前判据写作 `node_id != "master"`，于是本机 CPU 段被限制成只能
+        #   `start == 0` ⇒ 它的候选与主段完全一样（都是 `[0,k)`）⇒ **两段都只能当首段**
+        #   ⇒ 32 层的中段与末段无人覆盖 ⇒ 整盘无解。
+        #
+        #   实测（2026-10-26 03:23，`event=supply_capacity_input`）：
+        #     master       候选数=7   末项=[0,7]      ← 首段，正确
+        #     TABLET       候选数=35  末项=[7,8]
+        #     android      候选数=35  末项=[7,8]
+        #     master#cpu   候选数=7   末项=[0,7]      ← 错：middle 段被卡死在首段
+        #   而 `supply_capacity_exclusions` 显示只有 master 被排除
+        #   （`node_candidate_layer_range_unavailable` 14 + `node_capacity_insufficient` 5）
+        #   ⇒ 远端全可用、只有本机两段互相堵死，症状与证据完全吻合。
+        is_primary_master = (node_id == "master" and not executor_id)
         candidates = [[start, end] for start in range(0, total, alignment)
                       for end in range(start + alignment, total + 1, alignment)
-                      if end - start < total and (node_id != "master" or start == 0)]
+                      if end - start < total and (not is_primary_master or start == 0)]
         for mapping, code in ((preferred_ranges, "SUPPLY_PREFERRED_RANGE_INVALID"),
                               (runtime_host_ranges, "SUPPLY_RUNTIME_HOST_BUDGET_INVALID")):
             if mapping is None or node_id not in mapping:
@@ -521,6 +549,22 @@ def project_supply_capacity_nodes(
                            or span[0] % alignment or span[1] % alignment for span in spans)
                     or (mapping is preferred_ranges and (node_id == "master" or not spans))):
                 fail(code, "Invalid explicit candidate range constraint")
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**两个 mapping 都是层空间，直接比较**。
+            #
+            #   * `runtime_host_ranges` 来自 `allowed_host_layer_ranges`，值域是层。
+            #   * `preferred_ranges` 由 `model_supply_plan_reuse._candidates` 构造，其
+            #     `_span` 判据是 `0 <= start < end <= total`（`total` 是**层数**）⇒ 也是层。
+            #   * `candidates` 由 `range(0, total, alignment)` 生成 ⇒ 仍是层。
+            #   **只有输出** `candidate_layer_ranges` 时才 `// alignment` 转成组。
+            #
+            #   我在这上面错了两次，各自打掉一个既有测试，特此记下以免重蹈：
+            #     第一次给 host 区间除了 `alignment` ⇒ 主段只剩 1 个候选
+            #       （`test_alignment_and_explicit_host_ranges_are_preserved_in_exact_quotes`、
+            #        `test_source_host_budget_constrains_gpu_plan_and_intersects_reuse_preferences`）；
+            #     第二次给 preferred 乘了 `alignment` ⇒ `tail` 拿不到它的段
+            #       （`test_existing_range_preference_is_grouped_without_imposing_old_inventory`）。
+            #   教训：**先读那个字段的构造方判据（`_span` / `allowed_host_layer_ranges`），
+            #   而不是从名字或调用位置猜它的空间。**
             candidates = [span for span in candidates if span in spans]
         configured_reserve = node.get("reserve_bytes", 0)
         if type(configured_reserve) is not int or configured_reserve < 0:
@@ -567,7 +611,7 @@ def project_supply_capacity_nodes(
         if preferred_ranges and node_id in preferred_ranges:
             node["layer_ranges"] = [[start // alignment, end // alignment]
                                     for start, end in preferred_ranges[node_id]]
-        by_id[node_id] = {**copy.deepcopy(raw), "engine": engine, "overhead_bytes": overhead}
+        by_id[identity] = {**copy.deepcopy(raw), "engine": engine, "overhead_bytes": overhead}
         projected.append(node)
     grouped = copy.deepcopy(reference)
     grouped.update(total_layers=len(group_sizes), layer_weight_bytes=group_sizes,

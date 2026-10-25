@@ -7,11 +7,14 @@ ranges describe registered assets; they never establish a loaded-ready ACK.
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
@@ -213,6 +216,27 @@ def plan_segment_supply_reuse(
     )
     baseline = planner(preferred_ranges={})
     if not baseline.get("admitted"):
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**连无偏好的 baseline 都无解 ⇒ 放开切点锁**。
+        #
+        #   `candidate_layer_ranges` 由上一轮供给写入（锁定布局、避免 prepare 重切，见
+        #   #117）。但拓扑变化时它是死锁：旧切点把区间占满，新执行器（本机 CPU 段）或
+        #   换过段的设备（surface 取代 ROG）挤不进自己工件覆盖的区间 ⇒ baseline 无解
+        #   ⇒ 供给直接失败，而设备手上还拿着**过期工件**。
+        #   scheduler 侧的同名机制早已放开重排（`get_pipeline_capacity_plan` 里
+        #   "锁定的切点不再满足容量，放开候选约束重排"），供给侧此前缺这一步。
+        #   planner 未声明该关键字时退化为原行为，保持对旧调用方的兼容。
+        try:
+            released = planner(preferred_ranges={}, release_candidates=True)
+        except TypeError:
+            released = baseline
+        logger.info(
+            "event=supply_plan_release_candidates baseline_admitted=%s "
+            "released_admitted=%s baseline_reason=%s released_reason=%s",
+            baseline.get("admitted"), released.get("admitted"),
+            baseline.get("reason_code"), released.get("reason_code"),
+        )
+        if released.get("admitted"):
+            return _annotate(released, {}, "released_candidates")
         return _annotate(baseline, {}, "unrestricted")
     if candidates:
         joint = {}

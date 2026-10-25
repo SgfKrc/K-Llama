@@ -2483,7 +2483,27 @@ class Scheduler(
                 and "layer_ranges" not in record
                 and node_id not in layer_ranges_by_node
             ):
-                local_artifact = self._configured_layer_artifact()
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机 CPU 段启用时，主段不得借用它的工件声明**。
+                #
+                #   `QLH_LAYER_GGUF` 指向的是 **CPU 段**的裁层工件（`mid8-24`）；
+                #   `_configured_layer_artifact()` 读 `get_selected_model()`，也会落到那份
+                #   工件上。若主段据此声明 `[[8,24]] + segment_mode="middle"`，它就**当不了
+                #   首段**（head 要求 `cursor == 0`），而 `[0,8)` 无人承担 ⇒ 整盘无解。
+                #
+                #   实测（2026-10-26 02:55）：
+                #     event=supply_release_candidates_supplied
+                #     nodes=[('master','',[[8,24]],None), ..., ('master','cpu',[[8,24]],None)]
+                #     ⇒ baseline/released 双双 `pipeline_candidate_layer_range_unsatisfied`
+                #   （注意 `had=[False,False,False,False]` —— **候选压根不是原因**，最初几轮
+                #   我一直朝候选锁的方向查，方向错了。）
+                #
+                #   ⇒ CPU 段启用时，主段的区间留给它**自己的运行时**决定：它在 CUDA 上跑
+                #   PyTorch、按显存规划（这正是 `local_executor_entered_supply_plan` 之后的
+                #   正常路径）。CPU 段的工件只描述 CPU 段自己。
+                local_cpu_executor_on = bool(LOCAL_CPU_EXECUTOR_ENABLED)
+                local_artifact = (
+                    None if local_cpu_executor_on else self._configured_layer_artifact()
+                )
                 if local_artifact:
                     record["layer_ranges"] = [
                         [int(local_artifact["start"]), int(local_artifact["end"])],

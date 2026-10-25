@@ -114,19 +114,86 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         raise ModelSupplyError("SUPPLY_PLACEMENT_POLICY_INVALID", "prefer_all_workers must be a boolean")
     reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
     total = int(reference["total_layers"])
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**描述符层数必须与目标模型一致**。
+    #   实测（03:05）供给侧 `candidate_layer_ranges` 只有 `[[0,1]..[7,8]]` —— 那是**8 层**
+    #   模型的全集，而目标是 32 层 ⇒ 求解器认为每个执行器都只能装 8 层 ⇒ 整盘无解。
+    #   层数来自 `descriptors`（各引擎的源描述符）；把 reference 与各引擎的长度一起打出，
+    #   才能确认是哪一份跑偏（llama_cpp 来自 CPU 段的裁层 GGUF，pytorch 来自主段）。
+    logger.info(
+        "event=supply_descriptor_reference master_engine=%s reference_total_layers=%s "
+        "reference_layer_bytes=%s descriptors=%s",
+        master_engine, total, len(reference.get("layer_weight_bytes") or []),
+        {key: [value.get("total_layers"), len(value.get("layer_weight_bytes") or [])]
+         for key, value in (descriptors or {}).items()},
+    )
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：打印**供给侧**真正喂给求解器的输入与结果。
+    #   排查连续几轮都在两套视图之间推测（scheduler 侧的 `容量输入区间` 与供给侧的
+    #   `projected` 不是同一份数据）。把它打出来，才能一次看清"谁持有什么工件、
+    #   谁声明了什么段类型、求解器最终选了谁"。
+    logger.info(
+        "event=supply_capacity_input nodes=%s",
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          item.get("layer_ranges"), item.get("segment_mode"),
+          item.get("candidate_layer_ranges"), bool(item.get("layer_budget")))
+         for item in projected],
+    )
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
                                     require_distributed=True, prefer_all_workers=prefer_all_workers,
                                     required_node_id="master")
+    logger.info(
+        "event=supply_capacity_result admitted=%s reason=%s assignments=%s "
+        "excluded_nodes=%s",
+        result.get("admitted"), result.get("reason_code"),
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          item.get("start_layer"), item.get("end_layer"))
+         for item in (result.get("assignments") or [])],
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          item.get("reason_code"))
+         for item in (result.get("excluded_nodes") or [])],
+    )
+    # 候选被逐条排除的理由（按 (node, reason) 去重计数），无解时必须看它。
+    _excl: dict[tuple, int] = {}
+    for _item in (result.get("candidate_exclusions") or []):
+        _key = (_item.get("node_id"), str(_item.get("executor_id") or ""),
+                _item.get("reason_code"))
+        _excl[_key] = _excl.get(_key, 0) + 1
+    if _excl and not result.get("admitted"):
+        logger.info("event=supply_capacity_exclusions %s",
+                    sorted((f"{k[0]}#{k[1]}:{k[2]}", v) for k, v in _excl.items()))
     if result.get("reason_code") == "pipeline_required_node_unavailable":
         result = {**result, "reason_code": "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
                   "reason": "主节点当前可用容量不足以执行接力的首段。"}
     if not result.get("admitted"):
         from model_supply_diagnostics import explain_supply_capacity
-        diagnostic = explain_supply_capacity(
-            result, grouped_descriptor=grouped, projected_nodes=projected,
-            alignment=alignment, total_layers=total, safety_margin=safety_margin,
-            prefer_all_workers=prefer_all_workers,
-        )
+        try:
+            diagnostic = explain_supply_capacity(
+                result, grouped_descriptor=grouped, projected_nodes=projected,
+                alignment=alignment, total_layers=total, safety_margin=safety_margin,
+                prefer_all_workers=prefer_all_workers,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 诊断绝不该改变控制流
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**诊断只解释原因，不该让供给失败**。
+            #
+            #   同机多执行器（本机 CPU 段与主段共用 `node_id`）会让诊断内部的
+            #   `{node["node_id"]: ...}` 索引互相覆盖 —— 拿一个执行器的层区间去比另一个
+            #   执行器的投影 ⇒ 抛 `HostCapacityProjectionError`。
+            #
+            #   而它发生在 `plan_segment_supply_reuse` **第一次尝试失败**时的诊断路径上
+            #   ⇒ **已经解出来的并存计划会被这条诊断异常杀掉**。实测（2026-10-26 03:46）：
+            #     supply_capacity_result admitted=True
+            #       [('master','',0,2), ('master','cpu',2,4), ('android','',4,6), ('TABLET','',6,8)]
+            #     model_supply_failed SUPPLY_RUNTIME_HOST_CAPACITY_INVALID
+            #   —— 计划是对的，"失败"完全来自解释失败。
+            #
+            #   诊断失败时退化为最小可用的诊断，保留原始 reason_code。
+            logger.warning(
+                "event=supply_diagnostic_failed err=%s: %s", type(exc).__name__, exc,
+            )
+            diagnostic = {
+                "reason_code": str(result.get("reason_code") or "SUPPLY_CAPACITY_INVALID"),
+                "reason": "容量求解未通过（诊断不可用）",
+                "nodes": [],
+            }
         return {**result, "total_layers": total, "loaded_ready": False, "supply_only": True,
                 "capacity_diagnostic": diagnostic}
     assignments = []
@@ -140,7 +207,11 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                 "layer_range": [item["start_layer"], item["end_layer"]]}
         if "layer_ranges" in item:
             item["layer_ranges"] = [[start * alignment, end * alignment] for start, end in item["layer_ranges"]]
-        selected_node = by_id[item["node_id"]]
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：`by_id` 的键已改为 `(node_id, executor_id)`
+        #   —— 同一物理机的多个执行器（主段 + 本机 CPU 段）各持有不同工件、能承载的区间
+        #   不同，必须分别查表；按 `node_id` 查会取到同机**另一个**执行器的载荷规格。
+        identity = (item["node_id"], str(item.get("executor_id") or ""))
+        selected_node = by_id[identity]
         item["engine"] = selected_node["engine"]
         if selected_node.get("materialization") == "safetensors_layer_offload":
             from model_supply_runtime_capacity import runtime_range_capacity
@@ -161,7 +232,7 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         if item["engine"] == "llama_cpp":
             # Native cut artifacts retain all non-block tensors on every node.
             # Keep this header-derived quote for the later prepare admission.
-            item["retained_component_bytes"] = by_id[item["node_id"]]["overhead_bytes"]
+            item["retained_component_bytes"] = by_id[identity]["overhead_bytes"]
         item["segment_mode"] = ("head" if item["start_layer"] == 0 else
                                 "tail" if item["end_layer"] == total else "middle")
         assignments.append(item)
@@ -934,7 +1005,7 @@ class ModelSupplyCoordinator:
                          tokenizer_sha256=sources["tokenizer_sha256"], reason_code="", reason="",
                          capacity_diagnostic=None)
             capacity = self.scheduler._get_pipeline_capacity_nodes(set(worker_ids) | {"master"})
-            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**供给流程只处理"有工件传输的"执行器**。
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：索引按 `(node_id, executor_id)`。
             #   本机附加执行器（CPU 段）与主段**共用 `node_id`**，用
             #   `{record["node_id"]: record}` 建索引会让它**静默覆盖**主段。实测后果：
             #   供给 plan 里 master 的 assignment 被标成 `executor_id='cpu'`，层区间却
@@ -942,9 +1013,6 @@ class ModelSupplyCoordinator:
             #   `SupplyCapacityEvidence.project()`，于是 CPU 段拿到主段的切点
             #   `candidate_layer_ranges=[[0,8]]`，与自身声明的 `[8,24)` 冲突 ⇒ 求解器
             #   永远不选它（"同机两段"名存实亡）。
-            #   修法：索引按 `(node_id, executor_id)`，且这里**只取主执行器**
-            #   （`executor_id` 为空）—— 本机附加执行器没有供给流程（无工件传输、
-            #   无 inventory、无回执），它该由容量规划而非供给来安置。
             capacity_by_id = {
                 (record["node_id"], str(record.get("executor_id") or "")): record
                 for record in capacity
@@ -990,7 +1058,7 @@ class ModelSupplyCoordinator:
                         # Selective loaders read Safetensors on CPU and transfer one
                         # tensor at a time. Charge target weights to VRAM, source
                         # staging separately to RAM, never RAM bytes to VRAM.
-                        runtime_host_descriptors[node_id] = projection
+                        runtime_host_descriptors[(node_id, "")] = projection
                         projection = {**projection,
                             "weight_bytes": projection["runtime_weight_bytes"],
                             "layer_weight_bytes": projection["runtime_layer_weight_bytes"],
@@ -1040,29 +1108,116 @@ class ModelSupplyCoordinator:
                         HOST_RAM_MAX_FRACTION, base["host_capacity_bytes"] / 1024**3,
                     )
                 records.append(base)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机附加执行器必须参与切点求解**。
+            #
+            #   上面的循环按 `inventories`（worker 上报）构建记录，而本机附加执行器
+            #   （CPU 段）**没有 inventory** —— 它不做工件传输，所以在"谁上报了什么"
+            #   这个视角下它不存在。但它**有容量、有裁好的工件、有可切范围**
+            #   （`layer_ranges` + `layer_budget` 的 `min_layer`/`max_layer`）。
+            #
+            #   漏掉它的后果不是"少一个候选"，而是**它没有发言人**：远端会先把
+            #   `[8,24)` 这些它本该承担的区间算进自己的切点、进而锁成
+            #   `candidate_layer_ranges`（那是"我手上确实有这个段"的事实，**本就该是
+            #   硬约束**）。之后的轮次里 CPU 段只能在自己工件覆盖的区间里挑，而那里
+            #   已经被占死 ⇒ 永远挤不进来（真机实测：`android [[8,20]]` +
+            #   `TABLET [[20,32]]` 占满 `[8,32)`，CPU 段在候选里却从未被选）。
+            #
+            #   注意它**只进容量规划、不进部署**：`scheduler_pipeline` 把带
+            #   `executor_id` 的 assignment 归入 `deployment["local_executors"]`，
+            #   不走工件传输与回执 —— 那些是**物理节点之间**的义务，本机执行器没有。
+            local_executor_seen: set[str] = set()
+            for record in capacity:
+                executor_id = str(record.get("executor_id") or "")
+                if not executor_id or record["node_id"] in local_executor_seen:
+                    continue
+                if record["node_id"] not in inventories:
+                    continue
+                local_executor_seen.add(record["node_id"])
+                records.append(dict(record))
+                logger.info(
+                    "event=local_executor_entered_supply_plan operation=%s node=%s "
+                    "executor=%s layer_ranges=%s bounds=(%s,%s)",
+                    op_id, record["node_id"], executor_id,
+                    record.get("layer_ranges"),
+                    (record.get("layer_budget") or {}).get("min_layer"),
+                    (record.get("layer_budget") or {}).get("max_layer"),
+                )
             from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
             from model_supply_host_capacity import allowed_host_layer_ranges
             runtime_host_ranges = {}
-            for node_id, projection in runtime_host_descriptors.items():
+            for (node_id, _host_executor), projection in runtime_host_descriptors.items():
+                _avail = int(inventories[node_id].get("memory_available_bytes", 0))
+                _reserve = int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0))
                 runtime_host_ranges[node_id] = allowed_host_layer_ranges(
                     projection, node_id=node_id,
-                    available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                    reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
+                    available_bytes=_avail,
+                    reserve_bytes=_reserve,
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                )
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：host 区间为空时，上面的错误信息只说
+                #   "layer_range must be an aligned proper source segment"（来自诊断函数），
+                #   完全看不出是"预算不够"还是"投影层数不对"。把输入一起打出来。
+                logger.info(
+                    "event=host_layer_ranges node=%s total_layers=%s layer_bytes=%s "
+                    "available=%s reserve=%s alignment=%s ranges=%s max_end=%s",
+                    node_id, projection.get("total_layers"),
+                    len(projection.get("source_layer_weight_bytes") or []),
+                    _avail, _reserve, sources["alignment"],
+                    len(runtime_host_ranges[node_id]),
+                    max((end for _, end in runtime_host_ranges[node_id]), default=None),
                 )
                 if not runtime_host_ranges[node_id]:
                     from model_supply_diagnostics import explain_host_capacity
-                    diagnostic = explain_host_capacity(
-                        projection, node_id=node_id,
-                        available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                        reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
-                        safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
-                    )
+                    try:
+                        diagnostic = explain_host_capacity(
+                            projection, node_id=node_id,
+                            available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                            reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
+                            safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                        )
+                    except Exception as exc:  # noqa: BLE001 —— 诊断失败不该掩盖真正原因
+                        logger.warning("event=host_diagnostic_failed node=%s err=%s: %s",
+                                       node_id, type(exc).__name__, exc)
+                        diagnostic = {
+                            "reason_code": "SUPPLY_RUNTIME_HOST_CAPACITY_INVALID",
+                            "reason": "主机 RAM 无法暂存该节点候选计划的源权重（诊断不可用）",
+                            "nodes": [],
+                        }
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
             from model_supply_plan_reuse import plan_segment_supply_reuse
-            def capacity_plan(*, preferred_ranges, constrain_host=True, plan_records=None):
-                return plan_segment_supply(sources["descriptors"], plan_records or records,
+            def capacity_plan(*, preferred_ranges, constrain_host=True, plan_records=None,
+                              release_candidates=False):
+                chosen = list(plan_records or records)
+                if release_candidates:
+                    before = [bool(record.get("candidate_layer_ranges")) for record in chosen]
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**放开上一轮的切点锁**。
+                    #
+                    #   `candidate_layer_ranges` 由上一轮供给写入（见
+                    #   `model_supply_capacity.SupplyCapacityEvidence.project`），目的是
+                    #   锁定布局、避免 prepare 重新求解时切点漂移（#117）。但**拓扑变化**
+                    #   时它会变成死锁：旧切点把区间占满，新执行器（本机 CPU 段）或换过段
+                    #   的设备（surface 取代 ROG）挤不进自己工件覆盖的区间 ⇒ 连无偏好的
+                    #   baseline 都无解 ⇒ 供给直接失败，而设备手上还拿着**过期工件**。
+                    #
+                    #   scheduler 侧的同名机制（`get_pipeline_capacity_plan` 里
+                    #   "锁定的切点不再满足容量，放开候选约束重排"）早已这样做，**供给侧
+                    #   此前缺这一步**。放开后由求解器给出新布局，供给流程据此重推工件 ——
+                    #   这正是"拓扑变了要重裁"应有的机制路径，而不是要求人工去清设备文件。
+                    chosen = [
+                        {k: v for k, v in record.items() if k != "candidate_layer_ranges"}
+                        for record in chosen
+                    ]
+                    logger.info(
+                        "event=supply_release_candidates_supplied had=%s "
+                        "after=%s nodes=%s",
+                        before,
+                        [bool(record.get("candidate_layer_ranges")) for record in chosen],
+                        [(r.get("node_id"), r.get("executor_id", ""),
+                          r.get("layer_ranges"), r.get("candidate_layer_ranges"))
+                         for r in chosen],
+                    )
+                return plan_segment_supply(sources["descriptors"], chosen,
                     master_engine=sources["master_engine"], alignment=sources["alignment"],
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                     runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
@@ -1170,15 +1325,20 @@ class ModelSupplyCoordinator:
                         shortages = []
                         for assignment in unconstrained["assignments"]:
                             node_id = assignment["node_id"]
-                            if node_id not in runtime_host_descriptors:
+                            if (node_id, "") not in runtime_host_descriptors:
                                 continue
-                            explanation = explain_host_capacity(
-                                runtime_host_descriptors[node_id], node_id=node_id,
-                                available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                                reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
-                                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
-                                layer_range=[assignment["start_layer"], assignment["end_layer"]],
-                            )
+                            try:
+                                explanation = explain_host_capacity(
+                                    runtime_host_descriptors[(node_id, "")], node_id=node_id,
+                                    available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                    reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
+                                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                                    layer_range=[assignment["start_layer"], assignment["end_layer"]],
+                                )
+                            except Exception as exc:  # noqa: BLE001 —— 诊断失败不该改变控制流
+                                logger.warning("event=host_diagnostic_failed node=%s err=%s: %s",
+                                               node_id, type(exc).__name__, exc)
+                                continue
                             shortages.extend(item for item in explanation["nodes"] if item.get("deficit_bytes", 0) > 0)
                         if shortages:
                             diagnostic = {**explanation, "nodes": shortages,
@@ -1197,17 +1357,49 @@ class ModelSupplyCoordinator:
             # complete source bytes against real RAM plus the configured reserve.
             for assignment in plan["assignments"]:
                 node_id = assignment["node_id"]
-                projection = runtime_host_descriptors.get(node_id)
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**按 `(node_id, executor_id)` 取宿主投影**。
+                #
+                #   这一段算的是"把源权重暂存到主机内存要多少 RAM"——它只适用于**需要跨
+                #   PCIe 暂存**的物化（CUDA 上的 safetensors）。本机 CPU 段（llama.cpp）
+                #   的权重**本来就常驻主机内存、就地计算**，不存在"暂存"这回事。
+                #
+                #   此前按 `node_id` 取投影 ⇒ 本机 CPU 段（`node_id` 同样是 `master`）拿到
+                #   **主段的 PyTorch 投影** ⇒ 拿它去算 `safetensors_key_filtered` 的暂存需求
+                #   ⇒ `runtime_range_capacity` 抛 `HostCapacityProjectionError`
+                #   ⇒ 整次供给以 `SUPPLY_RUNTIME_HOST_CAPACITY_INVALID` 失败。
+                #   实测（03:37）：求解**已经**给出了正确的并存计划
+                #     [('master','',0,2), ('master','cpu',2,4), ('android','',4,6), ('TABLET','',6,8)]
+                #   却在随后这一步被误杀 —— 失败发生在求解**之后**，与规划无关。
+                #
+                #   按身份查表后，非主执行器天然取不到投影（那本就是个按物理机上报的量）
+                #   ⇒ `continue` ⇒ 正确地跳过与它无关的校验。
+                projection = runtime_host_descriptors.get(
+                    (node_id, str(assignment.get("executor_id") or ""))
+                )
                 if projection is None:
                     continue
                 from model_supply_runtime_capacity import runtime_range_capacity
                 from qlh_core.planning.load_spec import assignment_load_spec
                 materialization = assignment.get("runtime_materialization", "safetensors_key_filtered")
-                quote = runtime_range_capacity(
-                    projection, assignment["start_layer"], assignment["end_layer"],
-                    has_embedding=assignment["has_embedding"], has_lm_head=assignment["has_lm_head"],
-                    materialization=materialization,
-                )
+                try:
+                    quote = runtime_range_capacity(
+                        projection, assignment["start_layer"], assignment["end_layer"],
+                        has_embedding=assignment["has_embedding"], has_lm_head=assignment["has_lm_head"],
+                        materialization=materialization,
+                    )
+                except Exception as exc:  # noqa: BLE001 —— 只为把真实原因打出来，随后原样抛
+                    logger.error(
+                        "event=runtime_range_quote_failed node=%s executor=%s range=%s "
+                        "materialization=%s embedding=%s lm_head=%s projection_total=%s "
+                        "projection_layers=%s err=%s: %s",
+                        node_id, str(assignment.get("executor_id") or ""),
+                        [assignment["start_layer"], assignment["end_layer"]],
+                        materialization, assignment["has_embedding"], assignment["has_lm_head"],
+                        projection.get("total_layers"),
+                        len(projection.get("source_layer_weight_bytes") or []),
+                        type(exc).__name__, exc,
+                    )
+                    raise
                 source_bytes = quote["host_source_bytes"]
                 conversion_bytes = quote["host_conversion_bytes"]
                 reserve = int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0))
@@ -1229,15 +1421,38 @@ class ModelSupplyCoordinator:
                 if host_budget is None:
                     host_budget = inventories[node_id].get("memory_available_bytes", 0)
                 host_budget = int(host_budget)
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：打印每个 assignment 的实际 host 账。
+                #   `projection` 按 `node_id` 取（`runtime_host_descriptors` 只有主执行器有），
+                #   而 assignment 可能属于**同机的另一个执行器** ⇒ 用错了投影或用错了账本
+                #   时，只有在数字上才看得出来。
+                logger.info(
+                    "event=assignment_host_budget node=%s executor=%s range=%s "
+                    "source=%s conversion=%s required=%s budget=%s projection_total=%s "
+                    "materialization=%s has_embedding=%s has_lm_head=%s",
+                    node_id, str(assignment.get("executor_id") or ""),
+                    [assignment["start_layer"], assignment["end_layer"]],
+                    source_bytes, conversion_bytes, required, host_budget,
+                    projection.get("total_layers"), materialization,
+                    assignment["has_embedding"], assignment["has_lm_head"],
+                )
                 if required > host_budget:
                     from model_supply_diagnostics import explain_host_capacity
-                    diagnostic = explain_host_capacity(
-                        projection, node_id=node_id,
-                        available_bytes=host_budget,
-                        reserve_bytes=reserve, safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
-                        alignment=sources["alignment"],
-                        layer_range=[assignment["start_layer"], assignment["end_layer"]],
-                    )
+                    try:
+                        diagnostic = explain_host_capacity(
+                            projection, node_id=node_id,
+                            available_bytes=host_budget,
+                            reserve_bytes=reserve, safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                            alignment=sources["alignment"],
+                            layer_range=[assignment["start_layer"], assignment["end_layer"]],
+                        )
+                    except Exception as exc:  # noqa: BLE001 —— 诊断失败不该掩盖真正原因
+                        logger.warning("event=host_diagnostic_failed node=%s err=%s: %s",
+                                       node_id, type(exc).__name__, exc)
+                        diagnostic = {
+                            "reason_code": "SUPPLY_RUNTIME_HOST_CAPACITY_INVALID",
+                            "reason": "主机 RAM 不足以暂存该段源权重（诊断不可用）",
+                            "nodes": [],
+                        }
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
                 # Freeze the exact runtime quote as well as the source identity.
