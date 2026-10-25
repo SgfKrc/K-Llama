@@ -2034,6 +2034,7 @@ class Scheduler(
         """Project live layer-worker profiles into explicit free-memory budgets."""
         from contextlib import nullcontext
         from config import (
+            HOST_RAM_MAX_FRACTION,
             LOCAL_CPU_EXECUTOR_ENABLED,
             LOCAL_CPU_EXECUTOR_HOST_FRACTION,
             LOCAL_CPU_EXECUTOR_ID,
@@ -2377,6 +2378,33 @@ class Scheduler(
             node_cost_ms = layer_cost_ms_by_node().get(node_id, LAYER_COST_MS_DEFAULT)
             if node_cost_ms and node_cost_ms > 0:
                 record["layer_cost_ms"] = float(node_cost_ms)
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**主机内存额度**。
+            #   此前**只有** `model_supply.py:1018` 会产生 `host_capacity_bytes`，而
+            #   `scheduler` 的记录从不填它 ⇒ 下游（例如本机 CPU 执行器记录的域总账
+            #   `domain_total_bytes`）只能回落到 `capacity_bytes`（即时 available RAM）。
+            #   两者语义不同：额度是"这台机器允许多少 RAM 给模型"，而 available 会被
+            #   **上一轮供给尚未释放的残留**压低 —— 实测同一份配置在规划期与加载期两次
+            #   取值相差一倍（18.6 GB → 8.6 GB），直接把本机 CPU 段挤到无解。
+            #   这里按 `model_supply.py` 的**同一公式**补上，保证来源单一。
+            if node_id == local_node_id or node.role == NodeRole.MASTER:
+                try:
+                    import psutil
+
+                    memory = psutil.virtual_memory()
+                    # ⚠️ 用 `getattr` 取值：既有测试会 mock `psutil.virtual_memory()`
+                    #    成一个只带 `available` 的 `SimpleNamespace`（见
+                    #    tests/test_pipeline_execution_capacity.py），直接取 `.total`
+                    #    会 `AttributeError` 打断整条规划路径。
+                    total_ram = int(getattr(memory, "total", 0) or 0)
+                    available_ram = int(getattr(memory, "available", 0) or 0)
+                    if total_ram > 0:
+                        allowed = int(total_ram * HOST_RAM_MAX_FRACTION)
+                        record["host_capacity_bytes"] = max(
+                            0, min(available_ram, allowed))
+                    elif available_ram > 0:
+                        record["host_capacity_bytes"] = available_ram
+                except (ImportError, OSError, ValueError):
+                    pass
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
             if node_id in layer_artifacts_by_node:
@@ -2474,11 +2502,12 @@ class Scheduler(
             LOCAL_CPU_EXECUTOR_HOST_FRACTION,
             LOCAL_CPU_EXECUTOR_ID,
             LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            local_cpu_executor_layer_range,
         )
 
         host_total = int(base_record.get("host_capacity_bytes")
                          or base_record["capacity_bytes"])
-        return {
+        record = {
             "node_id": base_record["node_id"],
             "role": base_record["role"],
             "executor_id": LOCAL_CPU_EXECUTOR_ID,
@@ -2496,6 +2525,22 @@ class Scheduler(
             "layer_cost_ms": LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
             "segment_mode": "middle",
         }
+        # ★ 2026-10-25：把**裁好的 GGUF 工件的层区间**钉给求解器
+        #   （`QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`，例 `4,24` 对应
+        #   `q35-9b-local-mid4-24.gguf`）。不给它约束的话，求解器可能切出工件不覆盖的
+        #   层 —— 而那种失败表现为**运行期**层号越界/权重缺失，不是规划期报错，属于
+        #   "部署看起来成功、第一次推理才炸"的最坏形态。
+        #   判据与远端 worker 的 `layer_ranges` 同源（那里来自 hello capabilities）。
+        layer_range = local_cpu_executor_layer_range()
+        if layer_range is not None:
+            record["layer_ranges"] = [[int(layer_range[0]), int(layer_range[1])]]
+        else:
+            logger.warning(
+                "event=local_cpu_executor_layer_range_unconstrained executor_id=%s "
+                "hint=请设 QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=start,end 与本机裁层 GGUF 对齐",
+                LOCAL_CPU_EXECUTOR_ID,
+            )
+        return record
 
     def _pipeline_node_metadata(self) -> dict[str, dict]:
         """Project live scheduler nodes into opaque layout-location metadata."""
@@ -2990,10 +3035,21 @@ class Scheduler(
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
         logger.info(
-            "容量求解结果: admitted=%s reason=%s assignments=%s",
+            "容量求解结果: admitted=%s reason=%s assignments=%s "
+            "allocatable_bytes=%s deficit_bytes=%s uncovered=%s domains=%s",
             result.get("admitted"), result.get("reason_code"),
-            [(a.get("node_id"), a.get("start_layer"), a.get("end_layer"))
-             for a in result.get("assignments", [])],
+            [(a.get("node_id"), a.get("executor_id", ""), a.get("start_layer"),
+              a.get("end_layer")) for a in result.get("assignments", [])],
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：这三个字段是"为什么没解"的**唯一**
+            #   现场证据 —— 只有 `admitted=False reason=...insufficient` 时，无法区分
+            #   "总容量不足"（deficit>0）与"总容量够但切分后某节点不够"（deficit==0，
+            #   见 assert 那段注释里的实测教训），也无法看出是不是域校验拦下的。
+            result.get("allocatable_bytes"),
+            result.get("raw_capacity_deficit_bytes"),
+            result.get("uncovered_layer_ranges"),
+            {key: value.get("excess_bytes")
+             for key, value in (result.get("capacity_domains") or {}).items()
+             if isinstance(value, dict)},
         )
         if result.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
             result["reason"] = (
