@@ -514,6 +514,31 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     LOCAL_CPU_EXECUTOR_HOST_FRACTION = _env_float(
         "QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION", 0.5, min_val=0.0, max_val=1.0,
     )
+    # ★ 2026-10-25：该执行器承载的**层区间**（`"start,end"`，闭开）。
+    #   本机 keep-head 用的是**裁好的 GGUF 工件**（例：`q35-9b-local-mid4-24.gguf`
+    #   对应 `4,24`），求解器**必须**被钉到该区间：否则它可能切出工件不覆盖的层，
+    #   而那种失败表现为**运行期**的层号越界 / 权重缺失，不是规划期的清晰报错 ——
+    #   属于"部署看起来成功、第一次推理才炸"的最坏形态。
+    #   空 = 不约束（求解器自由切），此时应由使用者自行保证工件覆盖被分到的区间。
+    LOCAL_CPU_EXECUTOR_LAYER_RANGE = (
+        os.environ.get("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE") or ""
+    ).strip()
+
+    def local_cpu_executor_layer_range() -> tuple[int, int] | None:
+        """解析 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`（`"start,end"`）。
+
+        非法输入返回 None（并在调用处退化为"不约束"）而不是抛错：这是运行期配置，
+        一次手误不该让整次供给失败 —— 但**不静默假装约束有效**，调用处会记日志。
+        """
+        raw = LOCAL_CPU_EXECUTOR_LAYER_RANGE
+        if not raw:
+            return None
+        parts = [piece.strip() for piece in raw.replace(":", ",").replace("-", ",").split(",")]
+        try:
+            start, end = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            return None
+        return (start, end) if 0 <= start < end else None
 
     # ★ 2026-10-24（#117）：**清点阶段的等待上限**（秒）。此前 `model_supply.py` 里
     #   硬编码 `min(90, ...)`，而"未登记候选"的本地源核对需要对整模做一次全量

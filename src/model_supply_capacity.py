@@ -310,16 +310,28 @@ class SupplyCapacityEvidence:
             operation = c._operations[query["operation_id"]]
             if not _supplied_capabilities_ready(c, query):
                 raise _error("SUPPLY_RUNTIME_CAPABILITY_CHANGED", "Worker segment capabilities changed before runtime admission")
-        by_id = {record["node_id"]: record for record in records}
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**按 `(node_id, executor_id)` 索引**。
+        #   同机两个执行器（GPU 段 + CPU 段）**共用 `node_id`**，用
+        #   `{record["node_id"]: record}` 建索引会让后者**静默覆盖**前者。实测：
+        #   本机 CPU 段覆盖了主段 ⇒ ① 主记录从结果里消失（求解器看不到 master 的
+        #   GPU 段）② CPU 段被当成 master 的段处理，拿到主段的切点
+        #   `candidate_layer_ranges=[[0,8]]`，与它自己声明的 `[8,24)` 冲突 ⇒ 无解。
+        #   `executor_id` 缺省 "" ⇒ 键退化为 `(node_id, "")` ⇒ 与改动前逐位等价。
+        def _executor_key(record):
+            return (record["node_id"], str(record.get("executor_id") or ""))
+
+        by_id = {_executor_key(record): record for record in records}
         result, provenance = [], []
+        handled: set[tuple[str, str]] = set()
         for assignment in query["plan"]["assignments"]:
             node_id, engine = assignment["node_id"], assignment["engine"]
-            if node_id not in by_id:
+            key = (node_id, str(assignment.get("executor_id") or ""))
+            if key not in by_id:
                 raise _error("SUPPLY_RUNTIME_NODE_UNAVAILABLE", f"Selected node {node_id} is no longer eligible")
-            if node_id != "master" and not _assignment_capability_matches(by_id[node_id], assignment, query):
+            if node_id != "master" and not _assignment_capability_matches(by_id[key], assignment, query):
                 raise _error("SUPPLY_RUNTIME_CAPABILITY_CHANGED", "Worker capacity projection does not match the supplied segment")
             inventory = self._inventories[node_id]
-            selected_record = bind_supplied_runtime_capacity(by_id[node_id], assignment, inventory)
+            selected_record = bind_supplied_runtime_capacity(by_id[key], assignment, inventory)
             record = project_inventory_capacity(selected_record, inventory, engine)
             available, device, source = (record["capacity_bytes"], record["execution_device"],
                                          record["capacity_source"])
@@ -337,6 +349,7 @@ class SupplyCapacityEvidence:
                 [int(assignment["start_layer"]), int(assignment["end_layer"])]
             ]
             result.append(record)
+            handled.add(key)
             item = {"node_id": node_id, "engine": engine, "execution_device": device,
                     "capacity_bytes": available, "capacity_source": source,
                     "requested_at": query["requested_at"], "received_at": query["received_at"][node_id],
@@ -355,6 +368,15 @@ class SupplyCapacityEvidence:
             logger.info("event=pipeline_runtime_budget operation=%s query=%s node=%s engine=%s device=%s capacity_bytes=%s capacity_source=%s reserve_bytes=%s multiplier=%s registration_epoch=%s layer_ranges=%s",
                         query["operation_id"], query["query_id"], node_id, engine, device, available, source,
                         record.get("reserve_bytes"), record["runtime_multiplier"], item["registration_epoch"], record.get("layer_ranges"))
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**未被本次 assignment 覆盖的记录也要保留**。
+        #   本机附加执行器（CPU 段）**不在供给 plan 里** —— 它由本进程自己执行、没有
+        #   工件传输流程，所以 `query["plan"]["assignments"]` 永远不会提到它。若在此
+        #   按旧行为只返回"被处理过的"记录，求解器就永远看不到它，"同机两段"无法成立。
+        #   注意用 `deepcopy`：`by_id` 里的是调用方传入的记录对象，直接塞进结果会让
+        #   下游的原地修改（如补身份字段）反向污染调用方的列表。
+        for leftover_key, leftover in by_id.items():
+            if leftover_key not in handled:
+                result.append(deepcopy(leftover))
         return result, provenance
 
 

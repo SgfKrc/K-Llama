@@ -359,14 +359,21 @@ def _normalize_nodes(
         raise PipelineCapacityError("nodes must be a list")
     usable: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for raw in nodes:
         if not isinstance(raw, dict):
             raise PipelineCapacityError("each node capacity record must be an object")
         node_id = str(raw.get("node_id", "") or "").strip()
-        if not node_id or node_id in seen:
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：唯一性判据由 `node_id` 放宽到
+        #   `(node_id, executor_id)` —— 同一物理节点上的 GPU 段与 CPU 段**必须**能共存
+        #   （本票的目标形态）。这与阶段 2 对 `ExecutionPlan` / `validate_pipeline_nodes`
+        #   的改动**同源**；那两处改了、这里漏了，实测环境门就卡在
+        #   `pipeline_capacity_descriptor_invalid: node_id must be non-empty and unique`。
+        #   `executor_id` 缺省 "" ⇒ 键退化为 `(node_id, "")` ⇒ 与改动前逐位等价。
+        executor_id = str(raw.get("executor_id") or "").strip()
+        if not node_id or (node_id, executor_id) in seen:
             raise PipelineCapacityError("node_id must be non-empty and unique")
-        seen.add(node_id)
+        seen.add((node_id, executor_id))
         capacity_bytes = _non_negative_int(raw.get("capacity_bytes", 0), "capacity_bytes")
         reserve_bytes = _non_negative_int(raw.get("reserve_bytes", 0), "reserve_bytes")
         capacity_source = str(raw.get("capacity_source", "explicit") or "explicit")

@@ -3052,6 +3052,18 @@ class Scheduler(
                 relay_claims=relay_claims,
                 prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
             )
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**打印真正喂给求解器的区间**。
+            #   排查持续了几轮的原因正是这里：scheduler 侧自己的诊断
+            #   （`local_primary_layer_ranges`）显示 `[[0,8]]`，而求解器却把 `(0,8)`
+            #   也判为 `node_layer_range_not_advertised` —— 两边看到的**不是同一个值**
+            #   （`_normalize_nodes` 会做规范化、`candidate_layer_ranges` 另有来源）。
+            #   把入口值打出来，才能停止在两侧各自的视图里推测。
+            logger.info(
+                "容量输入区间: %s",
+                [(item.get("node_id"), item.get("executor_id", ""),
+                  item.get("layer_ranges"), item.get("candidate_layer_ranges"))
+                 for item in (capacity_nodes or [])],
+            )
             if (not result.get("admitted")
                     and any("candidate_layer_ranges" in node for node in capacity_nodes or [])):
                 # ★ 2026-10-23（#117）：候选区间来自**供给时的切点**（用于锁定复用，
