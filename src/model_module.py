@@ -2261,6 +2261,14 @@ class ModelManager:
             # the one-unit placement contract. The eager loop owns transfers.
             self._compiled_transformer = None
             self._compiled_layer_loop = None
+            # ★ 2026-10-25（PERF-NATIVE-COST-01）：**只跳过 compile，仍应用融合 RMSNorm**。
+            #   融合 RMSNorm 是**算子级替换**（`_apply_fused_rmsnorm` 只换前向实现，
+            #   不持有 GPU 权重、不跨调用驻留显存），与「一次一个执行单元」的放置契约
+            #   不冲突；它省下的正是 offload 每步都要付的 `2 × 层数` 次 `.to(float32)`
+            #   往返，而 offload 恰恰是"每步都慢"的场景。原实现在此直接 return，把
+            #   同样受益的融合也一并关掉了。仍受 `USE_FUSED_RMSNORM` 开关约束
+            #   （默认关闭 ⇒ 行为与改动前一致）。
+            self._maybe_apply_fused_rmsnorm()
             return
         self._maybe_apply_compile()
         # ★ R-R7 rank3：层分段路径（load_layer_range）同样应用融合 RMSNorm —— 与本方法并列，
