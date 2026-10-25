@@ -2348,6 +2348,19 @@ class Scheduler(
                 "engine": engine,
                 "score": self._compute_node_weight(device_info, execution_device=execution_device),
             }
+            # ★ 2026-10-25：**按节点标定的每层推理成本**（毫秒，相对量）。切点求解原先
+            #   按解码器**字节**份额均衡，把最慢的设备当成和最快的设备一样贵 —— 实测
+            #   三机每层差 2.3 倍（master 12.6 / rog-5060 8.7 / android-542cd254 20.1 ms，
+            #   见 docs/本机跨框架层段成本与干扰实测-2026-10-25.md），典型后果是 rog 扛
+            #   24 层成瓶颈而最慢的 android 只扛 8 层。
+            #   读取点必须在这里：`qlh_core.planning.capacity` 是**纯求解器**，契约禁止
+            #   它访问 ambient state（tests/test_refactor_capacity_load_spec.py 会把
+            #   `logging.Logger._log` patch 成 forbidden 来断言这一点），所以标定值由
+            #   调用方填进节点记录。未标定 ⇒ 不填 ⇒ 求解器按 1.0，与旧行为逐字节等价。
+            from config import LAYER_COST_MS_DEFAULT, layer_cost_ms_by_node
+            node_cost_ms = layer_cost_ms_by_node().get(node_id, LAYER_COST_MS_DEFAULT)
+            if node_cost_ms and node_cost_ms > 0:
+                record["layer_cost_ms"] = float(node_cost_ms)
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
             if node_id in layer_artifacts_by_node:

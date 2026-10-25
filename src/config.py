@@ -18,6 +18,7 @@ AppRuntime 通过 build_settings(environment) 解析独立快照。
 
 import os
 import sys
+import math
 import socket
 import hashlib
 
@@ -452,6 +453,44 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     OFFLOAD_LAYER_COST_RATIO = _env_float(
         "QLH_OFFLOAD_LAYER_COST_RATIO", 6.0, min_val=1.0, max_val=64.0,
     )
+    # ★ 2026-10-25：**按节点标定的每层推理成本（毫秒）**，供切点求解按实测成本均衡。
+    #   求解器原先按"解码器**字节**份额"均衡（`capacity.py` 的 `placement_work_fraction`），
+    #   于是把最慢的设备当成和最快的设备一样贵 —— 实测三机每层成本差 2.3 倍
+    #   （docs/本机跨框架层段成本与干扰实测-2026-10-25.md）：
+    #       master（pytorch+cuda，resident）  12.6 ms/层
+    #       rog-5060（llama_cpp）             8.7 ms/层
+    #       android-542cd254（llama_cpp）    20.1 ms/层
+    #   典型后果：`rog` 扛 24 层成为瓶颈，而最慢的 `android` 却只扛 8 层。
+    #   格式 `QLH_LAYER_COST_MS="rog-5060=8.7,android-542cd254=20.1"`（逗号分隔 `node=ms`）。
+    #   未列出的节点用 `LAYER_COST_MS_DEFAULT`（默认 0 ⇒ 倍数 1.0 ⇒ 与旧行为**逐字节
+    #   等价**，这是可回归的保证）。求解器只比较**相对**成本。
+    LAYER_COST_MS_DEFAULT = _env_float(
+        "QLH_LAYER_COST_MS_DEFAULT", 0.0, min_val=0.0, max_val=100000.0,
+    )
+
+    def layer_cost_ms_by_node() -> dict[str, float]:
+        """`QLH_LAYER_COST_MS` 的解析结果：`{node_id: ms_per_layer}`。
+
+        只解析、不校验节点是否存在（求解器按 node_id 查表，缺省走
+        `LAYER_COST_MS_DEFAULT`）。非法项被忽略而不是抛错：标定值属于**运行期调优
+        参数**，一个手误不应该让整次供给失败；但如果**所有**项都非法，会退化成
+        全部走 default ⇒ 与未配置等价，仍是安全方向。
+        """
+        raw = os.environ.get("QLH_LAYER_COST_MS") or ""
+        out: dict[str, float] = {}
+        for item in raw.split(","):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            node_id, _, value = item.partition("=")
+            node_id = node_id.strip()
+            try:
+                cost = float(value.strip())
+            except (TypeError, ValueError):
+                continue
+            if node_id and math.isfinite(cost) and cost > 0:
+                out[node_id] = cost
+        return out
 
     # ★ 2026-10-24（#117）：**清点阶段的等待上限**（秒）。此前 `model_supply.py` 里
     #   硬编码 `min(90, ...)`，而"未登记候选"的本地源核对需要对整模做一次全量

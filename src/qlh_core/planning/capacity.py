@@ -415,6 +415,19 @@ def _normalize_nodes(
         if "host_capacity_bytes" in raw:
             normalized["host_capacity_bytes"] = _non_negative_int(
                 raw["host_capacity_bytes"], "host_capacity_bytes")
+        # ★ 2026-10-25：**每层推理成本标定值**（毫秒，相对量）。求解器原先按解码器
+        #   **字节**份额均衡，把最慢的设备当成和最快的设备一样贵 —— 实测三机每层成本
+        #   差 2.3 倍（master 12.6 / rog-5060 8.7 / android 20.1 ms），典型后果是 rog
+        #   扛 24 层成为瓶颈而最慢的 android 只扛 8 层。标定值由**调用方**（读
+        #   `QLH_LAYER_COST_MS`）填入：本模块是纯求解器，不读环境（见
+        #   tests/test_refactor_capacity_load_spec.py 的 ambient-state 契约）。
+        #   缺省不填 ⇒ 求解器按 1.0，与旧行为逐字节等价。
+        if "layer_cost_ms" in raw:
+            cost = raw["layer_cost_ms"]
+            if type(cost) not in (int, float) or not math.isfinite(cost) or cost <= 0:
+                raise PipelineCapacityError(
+                    f"node[{node_id}].layer_cost_ms must be a positive number")
+            normalized["layer_cost_ms"] = float(cost)
         if "configured_reserve_bytes" in raw or "retained_component_reserve_bytes" in raw:
             for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
                 if type(raw.get(field)) is not int or raw[field] < 0:
@@ -930,6 +943,31 @@ def solve_pipeline_capacity(
         }
 
     work_total = prefix[layer_budget] or 1
+    # ★ 2026-10-25：切点求解的**成本加权**。`placement_work_fraction` 原先只按解码器
+    #   **字节**算份额，于是求解器把"每层 20.1 ms 的 android"和"每层 8.7 ms 的 rog"
+    #   当成同等昂贵，均衡结果与真实端到端步时脱节（实测：rog 扛 24 层成瓶颈，最慢的
+    #   android 却只扛 8 层）。这里把每个执行器的字节份额乘以它的**每层成本倍数**，
+    #   `stage_placement_cost` 本身不改 —— 它的均衡条件 `w_i/w_j = weight_i/weight_j`
+    #   于是作用于"成本"而非"字节"，这正是我们要的。
+    #
+    #   归一化与缺省：
+    #     * 全部未标定（`costs` 为空）⇒ 所有倍数恒为 1.0 ⇒ **与旧行为逐字节等价**
+    #       （可作回归门）。
+    #     * 有标定时以**最快**者为基准 1.0；未标定的执行器取"已标定中最慢"的倍数，
+    #       避免它因为没有数据反而被当成最快而被**过度分配**（安全方向）。
+    #     * `work_total` 保持**未加权**：它是同一候选空间里的公共常数，公共缩放不改变
+    #       argmin（目标第一项整体乘同一个因子），而让它随分配变化会破坏
+    #       `placement.py` 的可加性论证（suffix optimum 依赖目标可加）。
+    _calibrated = [float(node["layer_cost_ms"]) for node in usable
+                   if node.get("layer_cost_ms")]
+    _cost_reference = min(_calibrated) if _calibrated else 1.0
+
+    def layer_cost_multiplier(node):
+        cost = node.get("layer_cost_ms")
+        if not cost:
+            return (max(_calibrated) / _cost_reference) if _calibrated else 1.0
+        return float(cost) / _cost_reference
+
     range_quotes = {
         node["node_id"]: {quote["layer_range"]: quote for quote in node["range_weight_bytes"]}
         for node in usable if "range_weight_bytes" in node
@@ -940,7 +978,8 @@ def solve_pipeline_capacity(
     @lru_cache(maxsize=None)
     def placement_objective(candidate):
         costs = [stage_placement_cost(
-            (prefix[value[2]] - prefix[value[1]]) / work_total,
+            ((prefix[value[2]] - prefix[value[1]]) / work_total)
+            * layer_cost_multiplier(usable[value[0]]),
             usable[value[0]]["score"], value[4], usable[value[0]]["capacity_bytes"],
         ) for value in candidate]
         return (
@@ -1361,7 +1400,10 @@ def solve_pipeline_capacity(
             "capacity_source": node["capacity_source"],
             "score": node["score"],
             "placement_weight": placement_weight(node["score"]),
-            "placement_work_fraction": (prefix[end] - prefix[start]) / work_total,
+            # 必须与 `placement_objective` 用**同一个**成本倍数，否则报告与实际选择
+            # 脱节（这个字段被下游当"该段占了多大份额"读）。
+            "placement_work_fraction": ((prefix[end] - prefix[start]) / work_total)
+            * layer_cost_multiplier(node),
             **_node_budget(raw_bytes, node, safety_margin),
         }
         for field in ("configured_reserve_bytes", "retained_component_reserve_bytes",
