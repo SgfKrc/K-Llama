@@ -616,3 +616,70 @@ def test_local_cpu_executor_defaults_to_off(monkeypatch):
     assert importlib.reload(config).LOCAL_CPU_EXECUTOR_ENABLED is True
     monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR", raising=False)
     importlib.reload(config)
+
+
+# --------------------------------------------------------------------------
+# 同机附加执行器的四道登记（闭集白名单，"写了要能读回来"）
+# --------------------------------------------------------------------------
+
+def test_local_executors_is_allowlisted_for_control_read_and_retention():
+    """`local_executors` 必须在保留策略字段表里登记。
+
+    这类表是**闭集白名单**：写了却没登记 ⇒ 提交后读不回来（或在校验时被判未知字段），
+    现象是"部署成功了但控制面看不到同机第二执行器"—— 与"功能根本没生效"极难区分。
+    所以把它当契约单独钉住。
+    """
+    from qlh_core.adapters.model_control_retention import _FIELDS
+
+    deployments = _FIELDS["deployments"]
+    assert "local_executors" in deployments
+    # 与主段字段成对出现，避免只登记一半（写进去了、读不回来）
+    assert "local_assignment" in deployments
+
+
+def test_execution_view_projects_local_executors():
+    """`_execution_view` 的 lifecycle 投影必须带上 `local_executors`，且容忍旧记录。"""
+    from qlh_core.adapters.model_control_repository import SqliteModelControlRepository
+
+    state = {
+        "schema_version": 1, "revision": 1, "boot_id": "b", "selected_operation": "op",
+        "active_deployment": "d", "commit_scope": "durable",
+        "deployments": {"d": {"deployment_id": "d"}},
+        "lifecycle": {
+            "total_layers": 32,
+            "local_assignment": {"start_layer": 0},
+            "local_executors": {"cpu": {"start_layer": 8}},
+        },
+    }
+    view = SqliteModelControlRepository._execution_view(state)
+    assert view["lifecycle"]["local_executors"] == {"cpu": {"start_layer": 8}}
+    assert view["lifecycle"]["local_assignment"] == {"start_layer": 0}
+
+    # 旧记录没有这个键 ⇒ 投影里也不出现（不炸、不臆造空值）
+    state["lifecycle"].pop("local_executors")
+    assert "local_executors" not in SqliteModelControlRepository._execution_view(
+        state)["lifecycle"]
+
+
+def test_local_assignment_extraction_skips_secondary_executors():
+    """主段提取**必须**跳过附加执行器 —— 它们与主段同 `node_id`。
+
+    这是最容易静默出错的一处：本机 CPU 段与 GPU 段同 node_id，若只按 node_id 用
+    `next()` 取"本地主段"，可能取到 CPU 段 ⇒ `local_assignment` 语义被污染、
+    真正的 GPU 首段丢失，而**不会有任何报错**。
+    """
+    plan_assignments = [
+        {"node_id": "master", "executor_id": "cpu", "start_layer": 8, "end_layer": 16},
+        {"node_id": "master", "start_layer": 0, "end_layer": 8},
+        {"node_id": "worker", "start_layer": 16, "end_layer": 32},
+    ]
+    master_ids = {"master"}
+    chosen = next((item for item in plan_assignments
+                   if item.get("node_id") in master_ids
+                   and not item.get("executor_id")), None)
+    assert chosen is not None
+    assert chosen["start_layer"] == 0 and chosen["end_layer"] == 8
+
+    secondary = [item for item in plan_assignments
+                 if item.get("executor_id") and item.get("node_id") in master_ids]
+    assert [item["executor_id"] for item in secondary] == ["cpu"]

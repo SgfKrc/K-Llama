@@ -148,7 +148,8 @@ class SqliteModelControlRepository:
         return {**{field: state[field] for field in (
                     "schema_version", "revision", "boot_id", "selected_operation", "active_deployment", "commit_scope")},
                 "deployments": {key: state["deployments"][key]} if key in state["deployments"] else {},
-                "lifecycle": {field: lifecycle[field] for field in ("total_layers", "local_assignment")
+                "lifecycle": {field: lifecycle[field] for field in (
+                                  "total_layers", "local_assignment", "local_executors")
                               if field in lifecycle} if lifecycle else None}
 
     def _read_view(self, kind, operation_id=None):

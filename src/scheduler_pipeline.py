@@ -2338,16 +2338,42 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             for payload in configs.values():
                 payload.setdefault("assignment_id", new_assignment_id())
         local_frozen = None
+        local_executors_frozen: dict[str, dict] = {}
         if capacity_plan is not None and candidate is not None:
-            local = next((item for item in capacity_plan.get("assignments", [])
-                          if item.get("node_id") in {"master", self.get_effective_node_id()}), None)
+            master_ids = {"master", self.get_effective_node_id()}
             freeze = getattr(self._host, "freeze_pipeline_candidate_assignment", None)
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**必须排除附加执行器**。本机 CPU 段与
+            #   主段**同 node_id**（同一台物理机），若不加这个过滤，`next()` 可能把 CPU 段
+            #   当成"本地主段" ⇒ `local_assignment` 语义被污染、主段丢失。
+            local = next((item for item in capacity_plan.get("assignments", [])
+                          if item.get("node_id") in master_ids
+                          and not item.get("executor_id")), None)
             if local is not None and callable(freeze):
                 try:
                     local_frozen = freeze(candidate["candidate_id"], local, config_id=config_id, generation=generation)
                 except Exception as exc:
                     return {"status": "rejected", "admitted": False, "reason_code": str(exc),
                             "assignments": [], "transaction_phase": "rejected"}
+            # ★ 同机**附加执行器**（例如 CPU 段）进 `local_executors`，**进不了**
+            #   `assignments`：后者同时是 wire 目的地、连接世代、incarnation 来源与
+            #   readiness 关联四种语义，而本机执行器**没有 TCP 连接** —— 进去必然被要求
+            #   ACK（`deployment_commit_receipts_missing`）。它们与 `local_assignment`
+            #   共用 master 的 node_id/boot_id 作 incarnation，因此传输身份与故障归属
+            #   仍是"这台机器"，而不是续航一台虚拟物理机。
+            if callable(freeze):
+                for item in capacity_plan.get("assignments", []):
+                    executor_id = str(item.get("executor_id") or "")
+                    if not executor_id or item.get("node_id") not in master_ids:
+                        continue
+                    try:
+                        frozen_executor = freeze(candidate["candidate_id"], item,
+                                                 config_id=config_id, generation=generation)
+                    except Exception as exc:
+                        return {"status": "rejected", "admitted": False,
+                                "reason_code": str(exc), "assignments": [],
+                                "transaction_phase": "rejected"}
+                    if frozen_executor is not None:
+                        local_executors_frozen[executor_id] = frozen_executor
         if capacity_plan is not None:
             if not assignments and not stage_assignments:
                 capacity_plan = dict(capacity_plan)
@@ -2398,6 +2424,9 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     },
                     "prepared_nodes": set(),
                     "local_assignment": local_frozen,
+                    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：同一物理节点上的**附加执行器**
+                    #   （`{executor_id: frozen_assignment}`）。空 ⇒ 与改动前逐位相同。
+                    "local_executors": local_executors_frozen,
                     "local_receipt": None,
                     "candidate_id": (
                         str(candidate.get("candidate_id", "") or "")

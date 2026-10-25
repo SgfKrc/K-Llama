@@ -38,7 +38,8 @@ _FIELDS = {
     }),
     "deployments": frozenset({
         "deployment_id", "boot_id", "authority", "connections", "created_at", "assignments",
-        "input_revisions", "local_assignment", "status", "published", "validity", "observed_at",
+        "input_revisions", "local_assignment", "local_executors", "status", "published",
+        "validity", "observed_at",
         "reason_code", "receipts",
     }),
     "outbox": frozenset({
