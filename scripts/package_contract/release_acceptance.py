@@ -1,4 +1,14 @@
-"""Require all three real artifact reports plus the complete DL/LL product bundle."""
+"""Require the current release scope's real artifact reports plus the complete DL/LL product bundle.
+
+2026-10-25 裁决：**发行范围只含 Android 与 Windows，Linux 暂不发行（延后）**。
+依据 `docs/边缘最小发行包审计清单-2026-09-26.md` 的 2026-09-28 修订：
+「只发行 Android 与 Windows。**Linux 发行变体不做**（`.deb` 变体 / 离线 bootstrap /
+Ubuntu-Debian 原生机证据）」。
+恢复 Linux 发行时取消 `PLATFORMS` 与 `MANDATORY` 中的 linux 注释，并同步
+`.github/workflows/release-build.yml`／`release-acceptance.yml` 的 linux 矩阵项与
+acceptance 的 `--report linux=...`。Linux 诊断仍可单独跑
+`scripts/package_contract/release_artifacts_gate.py --platforms linux`。
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,13 +22,22 @@ ROOT = Path(__file__).resolve().parents[2]
 PRODUCT_SPEC = importlib.util.spec_from_file_location("release_product_gate", ROOT / "scripts/product_relay_gate.py")
 product_gate = importlib.util.module_from_spec(PRODUCT_SPEC)
 PRODUCT_SPEC.loader.exec_module(product_gate)
-PLATFORMS = ("windows", "linux", "android")
+PLATFORMS = (
+    "windows",
+    # linux 暂不发行（2026-10-25 裁决；见 docs/边缘最小发行包审计清单-2026-09-26.md
+    # 的 2026-09-28 修订「只发行 Android 与 Windows，Linux 发行变体不做」）。
+    # 恢复 Linux 发行时取消下一行注释，并一并恢复 MANDATORY 的 linux 项、
+    # 两份 workflow 的 linux 矩阵项与 acceptance 的 --report linux=...。
+    # "linux",
+    "android",
+)
 MANDATORY = {
     "windows": {f"windows.{variant}.{check}" for variant in ("cpu", "launcher")
                 for check in ("version", "integrity", "contract", "revision", "dependencies", "roles", "startup")},
-    "linux": {f"linux.cpu.{check}" for check in (
-        "package.version", "package.install", "package.audit", "bundle.integrity",
-        "bundle.contract", "bundle.revision", "runtime.dependencies", "runtime.clean", "runtime.worker")},
+    # linux 暂不发行（同上 2026-10-25 裁决）：判据定义原样保留，恢复发行时取消注释。
+    # "linux": {f"linux.cpu.{check}" for check in (
+    #     "package.version", "package.install", "package.audit", "bundle.integrity",
+    #     "bundle.contract", "bundle.revision", "runtime.dependencies", "runtime.clean", "runtime.worker")},
     "android": {f"android.{check}" for check in (
         "version", "revision", "dependencies", "signature", "roles", "startup", "native-runtime")},
 }
@@ -30,7 +49,7 @@ def summarize_release(reports: dict[str, Path], bundle: Path, revision: str,
               "source_revision": revision, "passed": False, "errors": [], "platforms": {}}
     try:
         if set(reports) != set(PLATFORMS):
-            raise ValueError("exactly windows,linux,android reports are required")
+            raise ValueError(f"exactly {','.join(PLATFORMS)} reports are required")
         contract_bytes = contract_path.read_bytes()
         contract_hash = hashlib.sha256(contract_bytes).hexdigest()
         contract = json.loads(contract_bytes)
@@ -99,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     for entry in args.report:
         name, separator, path = entry.partition("=")
         if not separator or not path or name not in PLATFORMS or name in reports:
-            parser.error("--report must uniquely name windows,linux,android as PLATFORM=PATH")
+            parser.error(f"--report must uniquely name {','.join(PLATFORMS)} as PLATFORM=PATH")
         reports[name] = Path(path)
     result = summarize_release(reports, args.bundle, args.require_revision)
     rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
