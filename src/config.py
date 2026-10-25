@@ -439,6 +439,19 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     PIPELINE_PREFER_ALL_WORKERS = _env_bool(
         "QLH_PIPELINE_PREFER_ALL_WORKERS", CAPACITY_PLANNING_MODE == "fastest",
     )
+    # ★ 2026-10-25（#117 收尾）：**offload 单层相对 resident 单层的成本比**。
+    #   `model_supply` 在 `resident` 与 `safetensors_layer_offload` 两种物化间并列求解后
+    #   要选优，而原先的准则只数"本机承担层数多"、**完全不含速度项** ⇒ 它会主动选中
+    #   每步慢一个数量级的 offload（20 层 > 8 层）。offload 每层都要把权重从主机内存
+    #   搬过 PCIe 再算，单层代价远高于就地计算。实测（本机 RTX 4060 Laptop，链路
+    #   Gen2 x8 ≈ 4 GB/s）：
+    #       resident  8 层 ⇒ 101 ms/步  ⇒ 12.6 ms/层
+    #       offload  20 层 ⇒ 1535 ms/步 ⇒ 76.8 ms/层   ⇒ 约 6.1 倍
+    #   取 6.0 作默认。这是**硬件相关量**（链路代次/宽度、主机内存带宽），换机器应重测；
+    #   置 1.0 即恢复旧行为（纯按层数选优）。
+    OFFLOAD_LAYER_COST_RATIO = _env_float(
+        "QLH_OFFLOAD_LAYER_COST_RATIO", 6.0, min_val=1.0, max_val=64.0,
+    )
 
     # ★ 2026-10-24（#117）：**清点阶段的等待上限**（秒）。此前 `model_supply.py` 里
     #   硬编码 `min(90, ...)`，而"未登记候选"的本地源核对需要对整模做一次全量

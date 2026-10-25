@@ -1097,11 +1097,32 @@ class ModelSupplyCoordinator:
                     alignment=sources["alignment"])
 
                 def _local_layers(candidate):
-                    """本机承担的层数；越大越优（本机算力最强）。"""
-                    total = 0
+                    """本机承担的**等效**层数；越大越优。
+
+                    ★ 2026-10-25（#117 收尾）：**必须按每层成本折算，不能只数层数**。
+                    `safetensors_layer_offload` 每层都要把权重从主机内存搬过 PCIe 再算，
+                    单层代价远高于 resident（原地计算）。实测（本机 RTX 4060 Laptop，
+                    链路 Gen2 x8 ≈ 4 GB/s）：
+                        resident  8 层 ⇒ 101 ms/步  ⇒ 12.6 ms/层
+                        offload  20 层 ⇒ 1535 ms/步 ⇒ 76.8 ms/层   ⇒ 约 6.1 倍
+                    而原准则只数"本机层数多"，于是**主动选中每步慢一个数量级的方案**
+                    （offload 20 层 > resident 8 层），把 `host_ram_offload_enabled()`
+                    打开的这条路变成了自伤。这里给 offload 的层数除以每层成本比
+                    `OFFLOAD_LAYER_COST_RATIO`，使比较反映**端到端步时**而非账面容量：
+                    20/6.0 ≈ 3.3 < 8 ⇒ resident 胜出。比值经 `QLH_OFFLOAD_LAYER_COST_RATIO`
+                    配置（默认 6.0，硬件相关量）；置 1.0 即恢复旧的纯层数比较。
+                    """
+                    from config import OFFLOAD_LAYER_COST_RATIO
+                    total = 0.0
                     for item in candidate.get("assignments", []) or []:
-                        if item.get("node_id") == "master":
-                            total += max(0, int(item.get("end_layer", 0)) - int(item.get("start_layer", 0)))
+                        if item.get("node_id") != "master":
+                            continue
+                        layers = max(0, int(item.get("end_layer", 0))
+                                     - int(item.get("start_layer", 0)))
+                        if (item.get("runtime_materialization")
+                                == "safetensors_layer_offload"):
+                            layers = layers / OFFLOAD_LAYER_COST_RATIO
+                        total += layers
                     return total
 
                 if offload_plan.get("admitted") and (
