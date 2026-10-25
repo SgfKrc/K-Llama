@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from inference_svc_main import build_app  # noqa: E402
 from inference_service.engine_host import EngineHost  # noqa: E402
+from inference_service.protocol import ChatRequest  # noqa: E402
 from tests.test_inference_service_protocol import FakeEngineHost  # noqa: E402
 
 
@@ -46,14 +47,9 @@ def _req(**overrides):
         client_node_type=None,
         client_mode=None,
         client_app_variant=None,
-        workflow_id=None,
-        task_graph_template="dual_candidate",
-        task_graph_remote_stage="",
-        task_graph_remote_provider_id="",
-        task_graph_auto_remote=False,
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    return ChatRequest(**base)
 
 
 @pytest.fixture

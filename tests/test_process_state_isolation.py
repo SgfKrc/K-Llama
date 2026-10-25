@@ -1,6 +1,7 @@
 """Exercise the real conftest and ModelHost without native engines or local config."""
 import json
 import sqlite3
+import shutil
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ def _isolated_suite(pytester, *, audit_teardown=True):
     # Each child suite uses one Python process per worker across multiple tests.
     for name in ("model_host", "koakuma_engine", "model_load_resolver", "local_store"):
         pytester.makepyfile(**{name: (_REPO / "src" / f"{name}.py").read_text(encoding="utf-8")})
+    shutil.copytree(_REPO / "src/qlh_core", pytester.path / "qlh_core")
     pytester.makeini("[pytest]\naddopts = -q\n")
     pytester.makepyfile(
         transformers5_compat="def install(): pass",
@@ -40,7 +42,7 @@ def _isolated_suite(pytester, *, audit_teardown=True):
             _request_id_ctx = ContextVar("isolation_request_id", default="")
             _chat_context = SimpleNamespace(
                 _lock=RLock(), _committed_operations={}, _revisions={},
-                histories={}, _history_generations={}, active_session_id=None,
+                histories={}, _history_generations={}, _active_by_client={},
             )
             model_host.configure_scheduler_callbacks(object())
         """,
@@ -88,7 +90,7 @@ def _isolated_suite(pytester, *, audit_teardown=True):
                 assert not service._revisions
                 assert not service.histories
                 assert not service._history_generations
-                assert service.active_session_id is None
+                assert not service._active_by_client
         """,
     )
     conftest = (_REPO / "tests" / "conftest.py").read_text(encoding="utf-8")
@@ -132,7 +134,7 @@ _SEQUENCE = """
         service = api_server._chat_context
         for name in ("_committed_operations", "_revisions", "histories", "_history_generations"):
             getattr(service, name)["leftover"] = "test-only"
-        service.active_session_id = "leftover"
+        service._active_by_client["test-client"] = "leftover"
 
     def test_02_observe_after_host_changes():
         assert_clean()
@@ -141,7 +143,7 @@ _SEQUENCE = """
         assert_clean()
         # Forwarded setattr materializes the actual lazy proxy. If isolation
         # runs before monkeypatch.undo(), undo will materialize it a second time.
-        monkeypatch.setattr(state.host, "is_loaded", True)
+        monkeypatch.setattr(state.host._manager, "is_loaded", True)
         assert object.__getattribute__(state.manager, "_instance") is not None
         monkeypatch.setattr(host_module, "_LazyModelManager", lambda: None)
 
@@ -525,7 +527,7 @@ def _node_isolated_suite(pytester):
     """Real bootstrap/credentials/journal, with lightweight runtime consumers."""
     _isolated_suite(pytester, audit_teardown=False)
     for name in ("node_config", "node_runtime", "local_secret_store", "network_address",
-                 "release_contract", "task_journal"):
+                 "release_contract", "recovery_journal"):
         pytester.makepyfile(**{name: (_REPO / "src" / f"{name}.py").read_text(encoding="utf-8")})
     pytester.makefile(".json", **{
         "release-contract": (_REPO / "release-contract.json").read_text(encoding="utf-8"),
@@ -543,7 +545,7 @@ SERVER_PORT = 8888
 HEARTBEAT_INTERVAL = 10
 _NODE_CONFIG = {"node": {"role": "master"}, "cluster": {"epochs": [1]}}
 STATE_DIR = os.environ["QLH_STATE_DIR"]
-TASK_GRAPH_JOURNAL_PATH = os.path.join(STATE_DIR, "task-graph.sqlite3")
+LEGACY_RECOVERY_JOURNAL_PATH = os.path.join(STATE_DIR, "task-graph.sqlite3")
 JOURNAL_REPLICATION_REPLICA_PATH = os.environ["QLH_JOURNAL_REPLICATION_REPLICA_PATH"]
 KV_COLD_CACHE_ROOT = os.environ["QLH_KV_COLD_CACHE_ROOT"]
 """, encoding="utf-8")
@@ -589,7 +591,7 @@ KV_COLD_CACHE_ROOT = os.environ["QLH_KV_COLD_CACHE_ROOT"]
     )
     api_file = pytester.path / "api_server.py"
     api_file.write_text(api_file.read_text(encoding="utf-8") + """
-from config import NODE_ID, NODE_ROLE, SERVER_PORT, TASK_GRAPH_JOURNAL_PATH
+from config import NODE_ID, NODE_ROLE, SERVER_PORT, LEGACY_RECOVERY_JOURNAL_PATH
 """, encoding="utf-8")
     return pytester.path / "conftest.py"
 
@@ -683,15 +685,15 @@ def test_node_config_credentials_and_journal_exclude_shared_runner_state(
         import api_server
         import config
         import node_config
-        from task_journal import SQLiteTaskJournal
+        from recovery_journal import SQLiteTaskJournal
 
         @pytest.mark.parametrize("iteration", range(12))
         def test_bootstrap_and_journal_are_per_test(iteration, tmp_path):
             assert node_config.load_node_config() == {{}}
             assert not node_config.get_node_secret_store_path().exists()
             assert Path(config.STATE_DIR) == tmp_path / "state"
-            assert api_server.TASK_GRAPH_JOURNAL_PATH == config.TASK_GRAPH_JOURNAL_PATH
-            assert not Path(config.TASK_GRAPH_JOURNAL_PATH).exists()
+            assert api_server.LEGACY_RECOVERY_JOURNAL_PATH == config.LEGACY_RECOVERY_JOURNAL_PATH
+            assert not Path(config.LEGACY_RECOVERY_JOURNAL_PATH).exists()
             response = {{
                 "node": {{"node_id": "node-" + str(iteration), "role": "client"}},
                 "cluster": {{"cluster_secret": "secret-" + str(iteration)}},
@@ -701,7 +703,7 @@ def test_node_config_credentials_and_journal_exclude_shared_runner_state(
             assert node_config.get_local_cluster_secret() == "secret-" + str(iteration)
             assert node_config.load_node_config()["node"]["node_id"] == "node-" + str(iteration)
             assert node_config.get_node_secret_store_path().with_suffix(".json.key").is_file()
-            for path in (config.TASK_GRAPH_JOURNAL_PATH, config.JOURNAL_REPLICATION_REPLICA_PATH):
+            for path in (config.LEGACY_RECOVERY_JOURNAL_PATH, config.JOURNAL_REPLICATION_REPLICA_PATH):
                 assert not Path(path).is_relative_to(Path({str(shared)!r}))
                 journal = SQLiteTaskJournal(path)
                 journal.close()
@@ -729,7 +731,7 @@ def test_late_bootstrap_and_journal_thread_uses_session_fallback(pytester, worke
         import api_server
         import config
         import node_config
-        from task_journal import SQLiteTaskJournal
+        from recovery_journal import SQLiteTaskJournal
 
         pending = []
 
@@ -745,15 +747,15 @@ def test_late_bootstrap_and_journal_thread_uses_session_fallback(pytester, worke
                     session = Path(conftest._session_store_dir).resolve()
                     for path in (node_config.get_node_config_path(),
                                  node_config.get_node_secret_store_path(),
-                                 Path(config.STATE_DIR), Path(config.TASK_GRAPH_JOURNAL_PATH),
-                                 Path(api_server.TASK_GRAPH_JOURNAL_PATH)):
+                                 Path(config.STATE_DIR), Path(config.LEGACY_RECOVERY_JOURNAL_PATH),
+                                 Path(api_server.LEGACY_RECOVERY_JOURNAL_PATH)):
                         assert path.resolve().is_relative_to(session), str(path)
                         assert not path.resolve().is_relative_to(function_root)
                     node_config.persist_bootstrap_response({
                         "node": {"node_id": "late-session-client", "role": "client"},
                         "cluster": {"cluster_secret": "late-session-secret"},
                     })
-                    journal = SQLiteTaskJournal(api_server.TASK_GRAPH_JOURNAL_PATH)
+                    journal = SQLiteTaskJournal(api_server.LEGACY_RECOVERY_JOURNAL_PATH)
                     journal.close()
                 except BaseException as exc:
                     errors.append(exc)
@@ -821,23 +823,6 @@ def test_scheduler_runtime_role_keeps_client_management_denied(monkeypatch):
 _seen_default_journals = []
 
 
-@pytest.mark.parametrize("iteration", range(2))
-def test_default_task_graph_journal_has_a_test_lifetime(monkeypatch, tmp_path, iteration):
-    import api_server
-    import config
-
-    for previous in _seen_default_journals:
-        assert previous._closed is True
-    coordinator = api_server.task_graph_coordinator
-    assert type(coordinator) is api_server._LazyTaskGraphCoordinator
-    assert coordinator._is_materialized() is False
-    monkeypatch.setattr(api_server, "TASK_GRAPH_ENABLED", True)
-    status = coordinator.journal_status()
-    assert status["available"] is True
-    assert status["backend"] == "sqlite"
-    assert Path(status["path"]) == Path(config.TASK_GRAPH_JOURNAL_PATH)
-    assert Path(status["path"]).is_relative_to(tmp_path)
-    _seen_default_journals.append(vars(coordinator)["_coordinator"]._journal)
 
 
 

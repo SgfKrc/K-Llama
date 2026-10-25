@@ -1,7 +1,7 @@
 {
   "schema": "qlh.tui.e2e.flow.v1",
   "title": "QLH TUI 端到端 flow（F3 档：真后端 + 真模型 + 真分布式层段）",
-  "plan": "docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md",
+  "plan": "docs/archive/tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md",
   "ticket": "CORE-TUI-E2E-01",
   "tier": "F3",
   "topology": "dual_host_physical",

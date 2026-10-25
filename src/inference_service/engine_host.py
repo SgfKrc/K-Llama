@@ -561,12 +561,15 @@ def _fallback_followups(history: list, existing: list[str]) -> list[str]:
 class EngineHost:
     """推理宿主：进程内模型托管 + 执行段宿主 + generation 取消注册表。"""
 
-    def __init__(self):
+    _environment = None
+
+    def __init__(self, *, environment=None):
+        self._environment = None if environment is None else dict(environment)
         # 延迟 import：保持模块顶层轻量（config 69ms 可接受，model_module 不在此触发）
         import config as runtime_config
         from model_host import ModelHost
 
-        self._host: ModelHost = ModelHost()
+        self._host: ModelHost = ModelHost(environment=self._environment)
         self._model_change_lock = threading.RLock()
         self._layers: List[str] = []  # 已加载层段（1.2 与 model 侧真实状态对齐）
         # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
@@ -603,21 +606,17 @@ class EngineHost:
             load_history=self._load_conversation_history,
             persist_turn=self._persist_conversation_turn,
         )
-        self._active_session_id: Optional[str] = None
-        self._session_histories: Dict[str, list] = self._chat_context.histories
         self._kv_cache: Any = None  # PagedKVCache 单例（惰性，_init_kv_cache）
         self._device_profile: Optional[dict] = None  # 惰性探测（_ensure_device_profile）
         self._device_profile_started = False
         # 1.4 注入：scheduler-svc 客户端接口（None = 单机基线：分布式/流水线禁用）
         self._scheduler: Any = None
         self._run_mode: str = str(
-            getattr(runtime_config, "RUN_MODE", "standalone") or "standalone"
+            self._environment.get("QLH_RUN_MODE", "distributed") if self._environment is not None
+            else getattr(runtime_config, "RUN_MODE", "standalone") or "standalone"
         ).strip().lower()
         self._on_task_error = None  # 1.4 注入：任务失败回调
         self.role: str = "master"  # master / client（1.3 角色感知，1.5 peer 使用）
-        # 1.2d task_graph 状态（api_server 全局 → 实例属性，惰性创建）
-        self._task_graph_coordinator: Any = None
-        self._task_graph_execution_slot = threading.BoundedSemaphore(1)
 
     # ------------------------------------------------------------------
     # 模型生命周期（委托 ModelHost / ModelManager）
@@ -690,14 +689,7 @@ class EngineHost:
             for row in rows
         ]
 
-    def _sync_chat_context_facade(self) -> None:
-        self._chat_context.adopt_facade_state(
-            self._active_session_id, self._session_histories,
-        )
 
-    def _publish_chat_context_facade(self) -> None:
-        self._active_session_id = self._chat_context.active_session_id
-        self._session_histories = self._chat_context.histories
 
     def _prepare_chat_context(
         self,
@@ -705,13 +697,13 @@ class EngineHost:
         first_message: Optional[str] = None,
         *,
         force_reload: bool = False,
+        client_id: Optional[str] = None,
+        runtime_kv: bool = True,
     ) -> PreparedChatContext:
-        self._sync_chat_context_facade()
         prepared = self._chat_context.prepare(
-            requested_session_id, force_reload=force_reload,
+            requested_session_id, force_reload=force_reload, client_id=client_id, runtime_kv=runtime_kv,
         )
-        self._publish_chat_context_facade()
-        if prepared.session_changed or prepared.reloaded:
+        if runtime_kv and (prepared.session_changed or prepared.reloaded):
             if self._kv_cache:
                 self._kv_cache.clear()
             if backend_id_for(self._host) == "pytorch":
@@ -732,7 +724,6 @@ class EngineHost:
         expected_revision: Optional[int] = None,
         operation_id: Optional[str] = None,
     ) -> bool:
-        self._sync_chat_context_facade()
         resolved_operation_id = operation_id or _request_id_ctx.get("")
         request_token = None
         if operation_id:
@@ -757,8 +748,16 @@ class EngineHost:
         finally:
             if request_token is not None:
                 _request_id_ctx.reset(request_token)
-        self._publish_chat_context_facade()
         return persisted
+
+    def _uses_linear_execution(self, req):
+        application = getattr(self._scheduler, "_execution_app", None)
+        return bool(req.routing_preference != "local_only" and application is not None and application.handles())
+
+    def _chat_execution_context(self, req, deadline):
+        from contextlib import nullcontext
+        return (nullcontext() if self._uses_linear_execution(req) else hold_lock_until_deadline(
+            self._model_lifecycle_lock(), deadline, operation="full chat execution lock"))
 
     def chat_full_with_operation_id(
         self,
@@ -768,13 +767,10 @@ class EngineHost:
         request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """Run one complete chat transaction with an explicit HTTP identity."""
+        req.session_id = self._chat_context.resolve_session(req.session_id, client_id=req.client_id or req.client_node_id)
 
-        with self._chat_context.transaction(deadline=request_deadline):
-            with hold_lock_until_deadline(
-                self._model_lifecycle_lock(),
-                request_deadline,
-                operation="full chat execution lock",
-            ):
+        with self._chat_context.transaction(deadline=request_deadline, serialize=not self._uses_linear_execution(req)):
+            with self._chat_execution_context(req, request_deadline):
                 token = _request_id_ctx.set(operation_id or "-")
                 try:
                     return _call_with_optional_request_deadline(
@@ -802,6 +798,7 @@ class EngineHost:
         this generator only consumes its bounded queue.
         """
 
+        req.session_id = self._chat_context.resolve_session(req.session_id, client_id=req.client_id or req.client_node_id)
         import queue
         import time as _time
 
@@ -826,12 +823,8 @@ class EngineHost:
 
         def produce() -> None:
             try:
-                with self._chat_context.transaction(deadline=request_deadline):
-                    with hold_lock_until_deadline(
-                        self._model_lifecycle_lock(),
-                        request_deadline,
-                        operation="full chat execution lock",
-                    ):
+                with self._chat_context.transaction(deadline=request_deadline, serialize=not self._uses_linear_execution(req)):
+                    with self._chat_execution_context(req, request_deadline):
                         token = _request_id_ctx.set(operation_id or "-")
                         try:
                             iterable = _call_with_optional_request_deadline(
@@ -1032,10 +1025,9 @@ class EngineHost:
     def close(self) -> None:
         with self._model_lifecycle_lock():
             self.release_worker_runtime()
-        coordinator = self._task_graph_coordinator
-        self._task_graph_coordinator = None
-        if coordinator is not None:
-            coordinator.close()
+        unload = getattr(self._host, "unload_model", None)
+        if callable(unload):
+            unload()
 
     def current_model(self) -> Dict[str, Any]:
         """当前模型信息（/v1/models/current，对齐 api_server.py:2188-2207 完整字段）。"""
@@ -1497,10 +1489,10 @@ class EngineHost:
 
         with self._gen_lock:
             return {
-                "active_session_id": self._active_session_id,
+                "active_session_id": self._chat_context.active_session_id,
                 "session_message_counts": {
                     session_id: len(history)
-                    for session_id, history in self._session_histories.items()
+                    for session_id, history in self._chat_context.histories.items()
                 },
                 "stats": dict(self._conversation_stats),
             }
@@ -1509,7 +1501,7 @@ class EngineHost:
         """Return a defensive copy of one in-memory session history."""
 
         with self._gen_lock:
-            return [dict(message) for message in self._session_histories.get(session_id, [])]
+            return [dict(message) for message in self._chat_context.histories.get(session_id, [])]
 
     def kv_cache_status(self) -> Dict[str, Any]:
         """Return non-content metadata for the local paged KV cache."""
@@ -1564,18 +1556,6 @@ class EngineHost:
         )
         request_deadline.require_remaining()
 
-        # ---- task_graph 分支（1.2d：对齐 api_server._execute_requested_chat）----
-        if req.execution_mode == "task_graph":
-            try:
-                return self.execute_task_graph_chat(
-                    req,
-                    cancel_event,
-                    request_deadline=request_deadline,
-                )
-            except TypeError as exc:
-                if "request_deadline" not in str(exc):
-                    raise
-                return self.execute_task_graph_chat(req, cancel_event)
 
         # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
         routing_gate = self._routing_gate_error(req)
@@ -1586,7 +1566,7 @@ class EngineHost:
         _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
         # ---- 多会话支持 ----
-        prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        prepared_context = self._prepare_chat_context(req.session_id, req.message, client_id=req.client_id or req.client_node_id, runtime_kv=not self._uses_linear_execution(req))
         request_deadline.require_remaining()
         target_session_id = prepared_context.session_id
         history = prepared_context.history
@@ -1668,8 +1648,8 @@ class EngineHost:
                 result = sched.forward_inference_to_master(
                     message=req.message,
                     max_new_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
+                    temperature=req.pipeline_sampling()[0],
+                    top_p=req.pipeline_sampling()[1],
                     show_thinking=req.show_thinking,
                     routing_preference=req.routing_preference,
                     session_id=req.session_id,
@@ -1771,12 +1751,16 @@ class EngineHost:
                 and sched._effective_role() == "master"
                 and runtime_supports(self._host, Capability.FORWARD_LAYERS)):
             pipeline_attempted = True
+            application = getattr(sched, "_execution_app", None)
+            linear_execution = bool(application and application.handles())
+            pipeline_result = {}
             try:
                 pipeline_result = sched.run_pipeline_safe(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
+                    temperature=req.pipeline_sampling()[0],
+                    top_p=req.pipeline_sampling()[1],
+                    _context_revision=prepared_context.revision,
                     session_id=req.session_id,
                     messages=list(history) + [{"role": "user", "content": req.message}],
                     show_thinking=req.show_thinking,
@@ -1787,6 +1771,10 @@ class EngineHost:
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 if pipeline_result.get("error"):
+                    if pipeline_result.get("execution_owner") == "linear":
+                        code = pipeline_result.get("reason_code") or "request_execution_failed"
+                        raise coded_http_error(504 if code == REQUEST_DEADLINE_EXCEEDED else 503,
+                                               code, pipeline_result["error"])
                     if (
                         pipeline_result.get("reason_code")
                         == REQUEST_DEADLINE_EXCEEDED
@@ -1804,7 +1792,7 @@ class EngineHost:
                     )
                 else:
                     response_text = pipeline_result.get("response", "")
-                    if not response_text:
+                    if not response_text and pipeline_result.get("execution_owner") != "linear":
                         logger.warning("流水线返回空响应，回退到本地推理")
                         self._enforce_distributed_required(
                             req, detail="流水线返回空响应",
@@ -1840,7 +1828,9 @@ class EngineHost:
                         if not pipeline_metrics.get("distributed_used"):
                             self._record_task_complete()
 
-                        if backend_id_for(self._host) in ("llama_cpp", "island"):
+                        if pipeline_result.get("execution_owner") == "linear":
+                            followups = _fallback_followups(history, [])
+                        elif backend_id_for(self._host) in ("llama_cpp", "island"):
                             followups = self.generate_followups_llama(history)
                         elif backend_id_for(self._host) == "pytorch":
                             followups = _fallback_followups(history, [])
@@ -1859,6 +1849,8 @@ class EngineHost:
                 raise
             except Exception as e:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if linear_execution or pipeline_result.get("execution_owner") == "linear":
+                    raise coded_http_error(503, getattr(e, "code", "request_execution_failed"), str(e)) from e
                 pipeline_failure_reason = str(e)
                 logger.warning(f"流水线推理异常: {e}，回退到本地推理")
                 self._enforce_distributed_required(req, detail=str(e))
@@ -2218,7 +2210,7 @@ class EngineHost:
         )
         if getattr(req, "image_data_urls", []):
             raise RuntimeError("图像请求仅支持 full 响应模式，禁止忽略图片后执行文本流式推理")
-        prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        prepared_context = self._prepare_chat_context(req.session_id, req.message, client_id=req.client_id or req.client_node_id, runtime_kv=not self._uses_linear_execution(req))
         request_deadline.require_remaining()
         messages = [
             *prepared_context.history,
@@ -2286,21 +2278,6 @@ class EngineHost:
             "_context_revision": prepared_context.revision,
         }
 
-    def speculative_run(self, req) -> Dict[str, Any]:
-        """投机解码实验端点（1.2b 复制自 api_server._run_speculative_experiment
-        api_server.py:2506-2519；SPEC_ENABLED 门控与异常映射在 routes 层）。"""
-        from speculative import run_speculative_chat
-
-        return run_speculative_chat(
-            req.message,
-            allow_external=bool(req.allow_external),
-            max_new_tokens=int(req.max_new_tokens),
-            gamma=(int(req.gamma) if req.gamma > 0 else None),
-            max_rounds=(int(req.max_rounds) if req.max_rounds > 0 else None),
-            temperature=(float(req.temperature) if req.temperature >= 0 else None),
-            seed=int(req.seed),
-            draft_hint=req.draft_hint or "",
-        )
 
     # ------------------------------------------------------------------
     # 追问生成（1.2b 复制自 api_server._generate_followups_llama
@@ -2391,8 +2368,7 @@ class EngineHost:
         provider_cancel_event: threading.Event,
     ) -> Dict[str, Any]:
         """Execute the shared local/remote Stage contract on a full model."""
-        from task_graph import DEPENDENCY_FAILURES_KEY, TaskGraphError
-        from task_provider import ProviderError, ProviderExecutionError
+        from execution_provider import ProviderError, ProviderExecutionError
 
         # Every public Route-A execution enters the committed prepare gate.
         # The internal helper remains usable for legacy native unit fixtures.
@@ -2400,10 +2376,11 @@ class EngineHost:
             with self._worker_layer_lock():
                 self._check_worker_runtime_stage(stage_request, required=True)
                 return self._execute_layer_forward_stage_locked(stage_request, provider_cancel_event)
+        from execution_errors import DEPENDENCY_FAILURES_KEY, StageExecutionError
         root_input = stage_request.root_input
         options = root_input.get("task_options", {})
         if not isinstance(options, dict):
-            raise TaskGraphError("任务 Stage 缺少有效执行参数")
+            raise StageExecutionError("任务 Stage 缺少有效执行参数")
         try:
             candidate_budget = max(
                 1, min(int(options.get("candidate_max_tokens", 512)), 512)
@@ -2416,7 +2393,7 @@ class EngineHost:
             )
             top_p = max(0.0, min(float(options.get("top_p", 0.9)), 1.0))
         except (TypeError, ValueError) as exc:
-            raise TaskGraphError("任务 Stage 执行参数无效") from exc
+            raise StageExecutionError("任务 Stage 执行参数无效") from exc
         show_thinking = bool(options.get("show_thinking", False))
         model_manager = self._host
 
@@ -2456,7 +2433,7 @@ class EngineHost:
                         provider_id=stage_request.provider_id,
                         same_provider_retryable=True,
                     )
-                raise TaskGraphError("完整模型返回空 Stage 结果")
+                raise StageExecutionError("完整模型返回空 Stage 结果")
             return {
                 "content": content,
                 "thinking_content": thinking_content,
@@ -2480,7 +2457,7 @@ class EngineHost:
             instruction = candidate_instructions.get(stage_request.stage_id)
             messages = root_input.get("messages")
             if instruction is None or not isinstance(messages, list):
-                raise TaskGraphError("完整推理 Stage 输入无效")
+                raise StageExecutionError("完整推理 Stage 输入无效")
             if show_thinking:
                 instruction = f"{instruction}\n\n{THINKING_SYSTEM_PROMPT}"
             return run_model(
@@ -2490,7 +2467,7 @@ class EngineHost:
         if stage_request.stage_type == "aggregate":
             message = str(root_input.get("message", "") or "")
             if not message:
-                raise TaskGraphError("聚合 Stage 缺少原始问题")
+                raise StageExecutionError("聚合 Stage 缺少原始问题")
             candidate_payload = {
                 stage_id: value.get("content", "")
                 for stage_id, value in stage_request.dependencies.items()
@@ -2499,7 +2476,7 @@ class EngineHost:
                 and str(value.get("content", "") or "").strip()
             }
             if not candidate_payload:
-                raise TaskGraphError("聚合 Stage 没有可用候选")
+                raise StageExecutionError("聚合 Stage 没有可用候选")
             failure_payload = stage_request.dependencies.get(
                 DEPENDENCY_FAILURES_KEY, {},
             )
@@ -2537,7 +2514,7 @@ class EngineHost:
             return self._execute_layer_forward_stage(
                 stage_request, provider_cancel_event,
             )
-        raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+        raise StageExecutionError(f"不支持的 Stage 类型: {stage_request.stage_type}")
 
     # ------------------------------------------------------------------
     # v3 层段 Stage（`layer_forward`）—— PC 侧执行
@@ -2612,13 +2589,34 @@ class EngineHost:
             if all(runtime is not old for old in orphans):
                 orphans.append(runtime)
 
-    def _build_supplied_layer_manager(self, selected, provider_cancel_event, runtime_owner=None):
-        from worker_prepare_contract import WorkerPrepareError
-        import config
+    def _build_supplied_layer_manager(self, selected, provider_cancel_event, runtime_owner=None,
+                                      *, load_spec=None):
+        from worker_prepare_contract import WorkerPrepareError, validate_load_spec
         from model_module import ModelManager
         manifest = selected["manifest"]
         start, end = manifest["layer_range"]
         model_id = "supply-" + manifest["artifact_sha256"][:24]
+        spec = validate_load_spec(load_spec) if load_spec is not None else None
+        if spec is None:
+            # Legacy commands use one deterministic compatibility policy.
+            # New deployments negotiate and require the complete frozen spec.
+            quant_type = "fp32"
+        else:
+            expected_components = {"layers", "final_norm"}
+            if manifest.get("has_embedding", start == 0):
+                expected_components.add("embedding")
+            if manifest.get("has_lm_head", end == manifest["total_layers"]):
+                expected_components.add("lm_head")
+            if (spec.materialization not in {"safetensors_key_filtered", "safetensors_layer_offload"}
+                    or (spec.materialization == "safetensors_layer_offload"
+                        and not spec.device.startswith("cuda:"))
+                    or {"fp16": "float16", "fp32": "float32"}.get(spec.quant_type) != spec.dtype
+                    or set(spec.components) != expected_components
+                    or spec.kv_policy != "dynamic" or spec.sequence_count != 1
+                    or spec.kv_device != spec.device or spec.kv_dtype != spec.dtype
+                    or spec.quant_type not in {"fp16", "fp32"}):
+                raise WorkerPrepareError("worker_prepare_load_spec_unsupported")
+            quant_type = spec.quant_type
         manager = ModelManager()
         if runtime_owner is not None:
             runtime_owner.manager = manager
@@ -2627,7 +2625,7 @@ class EngineHost:
                 raise WorkerPrepareError("worker_prepare_cancelled")
             manager.prepare_pipeline_model(
                 model_id=model_id, model_path=selected["directory"],
-                quant_type=config.QUANT_TYPE, layer_range=(start, end),
+                quant_type=quant_type, layer_range=(start, end),
                 model_sha256=manifest["artifact_sha256"],
             )
             if provider_cancel_event.is_set():
@@ -2636,13 +2634,37 @@ class EngineHost:
                 start_layer=start, end_layer=end,
                 has_embedding=manifest.get("has_embedding", start == 0),
                 has_lm_head=manifest.get("has_lm_head", end == manifest["total_layers"]),
-                model_path=selected["directory"], quant_type=config.QUANT_TYPE,
+                model_path=selected["directory"], quant_type=quant_type,
                 total_layers=manifest["total_layers"], model_id=model_id,
+                **({"load_spec": spec.to_dict()} if spec is not None else {}),
             )
             if provider_cancel_event.is_set():
                 raise WorkerPrepareError("worker_prepare_cancelled")
             if tuple(manager.layer_range or ()) != (start, end) or not manager.is_loaded:
                 raise WorkerPrepareError("worker_prepare_layer_range_mismatch")
+            if spec is not None:
+                model = getattr(manager, "model", None)
+                parameters = (list(model.parameters())
+                              if callable(getattr(model, "parameters", None)) else [])
+                floating = [parameter for parameter in parameters if parameter.is_floating_point()]
+                if spec.materialization == "safetensors_layer_offload":
+                    try:
+                        placement = manager.layer_offload_observation()
+                    except (AttributeError, ValueError) as exc:
+                        raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch") from exc
+                    valid = (placement["execution_device"] == spec.device
+                             and placement["execution_dtype"] == spec.dtype
+                             and placement["resident_source_bytes"] > 0
+                             and placement["device_weight_bytes"] > 0)
+                else:
+                    valid = not any(str(parameter.device) != spec.device
+                                    or str(parameter.dtype).removeprefix("torch.") != spec.dtype
+                                    for parameter in floating)
+                if not floating or manager.quant_type != spec.quant_type or not valid:
+                    raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch")
+                # Internal policy snapshot only; actual materialization receipts
+                # and assignment budget reconciliation are a deployment concern.
+                manager.runtime_load_spec = spec
             return manager
         except Exception:
             if runtime_owner is None:
@@ -2658,25 +2680,47 @@ class EngineHost:
     def _build_worker_runtime(self, command, selected, cancel_event):
         from copy import deepcopy
         from worker_prepare import LayerRuntime, close_layer_runtime
-        from worker_prepare_contract import WorkerPrepareError
+        from worker_prepare_contract import WorkerPrepareError, validate_command, validate_load_spec
+        command = validate_command(command)
         identity = command["identity"]
+        spec = (validate_load_spec(command["load_spec"], identity=identity,
+                                   context_size=command["context_size"])
+                if "load_spec" in command else None)
         runtime = LayerRuntime(deepcopy(identity), deepcopy(selected))
+        if spec is not None:
+            runtime.load_spec = spec
         try:
             if cancel_event.is_set():
                 raise WorkerPrepareError("worker_prepare_cancelled")
             if identity["stage_model_identity"]["format"] == "safetensors":
-                runtime.manager = self._build_supplied_layer_manager(selected, cancel_event, runtime)
+                runtime.manager = self._build_supplied_layer_manager(
+                    selected, cancel_event, runtime, **({"load_spec": spec} if spec is not None else {}),
+                )
             else:
+                if spec is not None:
+                    expected_components = {"layers"}
+                    if identity["segment_mode"] == "head":
+                        expected_components.add("embedding")
+                    if identity["segment_mode"] == "tail":
+                        expected_components.update(("final_norm", "lm_head"))
+                    if (spec.materialization != "gguf_segment" or spec.device != "cpu"
+                            or spec.dtype != "artifact" or spec.quant_type != "artifact"
+                            or spec.kv_device != "cpu" or spec.kv_dtype != "float16"
+                            or spec.kv_policy != "preallocated"
+                            or set(spec.components) != expected_components):
+                        raise WorkerPrepareError("worker_prepare_load_spec_unsupported")
                 from keep_head_shim import resolve_keep_head_shim
                 from llama_keep_head import KeepHeadUpstream
                 import numpy as np
-                shim = resolve_keep_head_shim()
+                shim = resolve_keep_head_shim(**({"environment": self._environment} if self._environment is not None else {}))
                 if not shim:
                     raise WorkerPrepareError("worker_prepare_shim_unavailable")
                 runtime.upstream = KeepHeadUpstream(
                     shim, selected["model_path"], mode="nextn",
-                    n_ctx=command["context_size"], n_batch=min(command["context_size"], 2048),
-                    n_threads=8, n_seq_max=1,
+                    n_ctx=spec.context_size if spec is not None else command["context_size"],
+                    n_batch=spec.batch_size if spec is not None else min(command["context_size"], 2048),
+                    n_threads=8, n_seq_max=spec.sequence_count if spec is not None else 1,
+                    **({"environment": self._environment} if self._environment is not None else {}),
                 )
                 upstream = runtime.upstream
                 if (not upstream.is_available or upstream.n_embd != identity["hidden_size"]
@@ -2697,6 +2741,36 @@ class EngineHost:
                 upstream.reset()
             if cancel_event.is_set() or not runtime.loaded:
                 raise WorkerPrepareError("worker_prepare_cancelled")
+            if spec is not None:
+                placement = None
+                if runtime.manager is not None:
+                    if spec.materialization == "safetensors_layer_offload":
+                        placement = runtime.manager.layer_offload_observation()
+                        materialized = placement["resident_source_bytes"]
+                    else:
+                        parameters = list(runtime.manager.model.parameters())
+                        buffers = list(runtime.manager.model.buffers()) if callable(getattr(runtime.manager.model, "buffers", None)) else []
+                        materialized = sum(p.numel() * p.element_size() for p in parameters + buffers)
+                else:
+                    observation = runtime.upstream.materialization_observation()
+                    for field in ("context_size", "batch_size", "device", "dtype", "quant_type", "kv_device", "kv_dtype", "sequence_count"):
+                        if observation.get(field) != getattr(spec, field):
+                            raise WorkerPrepareError("worker_prepare_load_spec_runtime_mismatch")
+                    materialized = observation["materialized_bytes"]
+                runtime.materialization_receipt = {
+                    "load_spec": spec.to_dict(), "materialized_bytes": materialized,
+                    "memory_scope": "weight_tensors", "layer_range": deepcopy(identity["layer_range"]),
+                    "artifact_sha256": identity["artifact_sha256"],
+                }
+                if placement is not None:
+                    # Worker commands bind identity/policy but carry no budget.
+                    # The coordinator reconciles these actual measurements
+                    # against the frozen assignment's host and CUDA budgets.
+                    runtime.materialization_receipt.update(
+                        device_weight_bytes=placement["device_weight_bytes"],
+                        host_source_bytes=placement["resident_source_bytes"],
+                        host_conversion_bytes=placement["host_conversion_bytes"],
+                    )
             return runtime
         except Exception as exc:
             if runtime.upstream is None:
@@ -2707,6 +2781,15 @@ class EngineHost:
                 self._retain_failed_worker_runtime(runtime)
                 raise
             raise
+
+    def worker_runtime_receipt(self, identity):
+        from copy import deepcopy
+        for runtime in self._owned_worker_runtimes():
+            if runtime.identity == identity and runtime.loaded:
+                receipt = getattr(runtime, "materialization_receipt", None)
+                if receipt is not None:
+                    return deepcopy(receipt)
+        return None
 
     def prepare_worker_runtime(self, command, selected, cancel_event):
         from copy import deepcopy
@@ -2910,16 +2993,20 @@ class EngineHost:
                 raise WorkerPrepareError("worker_prepare_runtime_unavailable")
             return active.upstream
 
-        # 本函数体要用 TaskGraphError，而该文件惯用函数内 import（同 :1802 / :2016 /
+        # 本函数体要用 StageExecutionError，而该文件惯用函数内 import（同 :1802 / :2016 /
         # :2140），此前漏了这一处 ⇒ 层段 keep-head 上游缺 env 或绑定失败时抛的是
-        # `NameError: name 'TaskGraphError' is not defined`，而不是真正的错误信息
+        # `NameError: name 'StageExecutionError' is not defined`，而不是真正的错误信息
         # （2026-10-06 用 Edge 包当 layer worker 入网时实测踩到）。
-        from task_graph import TaskGraphError
+        from qlh_core.contracts.execution import ExecutionError as StageExecutionError
         # ★ 2026-10-08（#53）：与 master 侧共用 shim 定位（含"仓库默认构建产物"一档）。
         from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 
         from model_supply_worker import selected_gguf_path
-        model_path = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
+        environment = os.environ if self._environment is None else self._environment
+        if self._environment is None:
+            model_path = selected_gguf_path() or environment.get("QLH_LAYER_GGUF", "").strip()
+        else:
+            model_path = environment.get("QLH_LAYER_GGUF", "").strip()
         if self._layer_upstream is not None:
             previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
             if (not previous_path or previous_path == model_path) and self._layer_upstream.is_available:
@@ -2929,7 +3016,7 @@ class EngineHost:
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
-        shim_path = resolve_keep_head_shim()
+        shim_path = resolve_keep_head_shim(**({"environment": self._environment} if self._environment is not None else {}))
         if not model_path or not shim_path:
             # 具名错误：分别指出**缺哪一个**，并列出 shim 已尝试过的路径。
             missing = []
@@ -2937,11 +3024,11 @@ class EngineHost:
                 missing.append("QLH_LAYER_GGUF（裁层 GGUF 路径）")
             if not shim_path:
                 missing.append(missing_shim_hint())
-            raise TaskGraphError("层段 Stage 缺少必要配置：" + "；".join(missing))
+            raise StageExecutionError("层段 Stage 缺少必要配置：" + "；".join(missing))
         from llama_keep_head import KeepHeadUnavailable, KeepHeadUpstream
 
         def _env_int(name: str, default: int) -> int:
-            raw = os.environ.get(name, "").strip()
+            raw = environment.get(name, "").strip()
             try:
                 return max(1, int(raw)) if raw else default
             except ValueError:
@@ -2957,12 +3044,13 @@ class EngineHost:
                 n_batch=_env_int("QLH_LAYER_N_BATCH", 2048),
                 n_threads=_env_int("QLH_LAYER_THREADS", 8),
                 n_seq_max=_env_int("QLH_LAYER_N_SEQ_MAX", 1),
+                **({"environment": self._environment} if self._environment is not None else {}),
             )
         except KeepHeadUnavailable as exc:
             owner = getattr(exc, "cleanup_owner", None)
             if owner is not None:
                 self._layer_upstream = owner
-            raise TaskGraphError(f"层段 keep-head 上游不可用：{exc}") from exc
+            raise StageExecutionError(f"层段 keep-head 上游不可用：{exc}") from exc
         return self._layer_upstream
 
     def _unload_supplied_layer_manager(self) -> None:
@@ -2983,7 +3071,7 @@ class EngineHost:
 
     def _supplied_layer_manager_for(self, selected: dict, provider_cancel_event):
         """Materialize only the registered range, never a complete-model load."""
-        from task_graph import TaskGraphError as _StageError
+        from qlh_core.contracts.execution import ExecutionError as _StageError
 
         if provider_cancel_event.is_set():
             raise _StageError("supplied_stage_cancelled")
@@ -3010,11 +3098,11 @@ class EngineHost:
 
     def _execute_supplied_layer_forward(
         self, selected, stage_request, hidden, *, want_hidden, n_past,
-        positions, seq_ids, provider_cancel_event,
+        positions, seq_ids, provider_cancel_event, want_all_tokens=False,
     ):
         """Adapt v3 hidden/KV to ModelManager's existing batched forward API."""
         import torch
-        from task_graph import TaskGraphError as _StageError
+        from qlh_core.contracts.execution import ExecutionError as _StageError
 
         manifest = selected["manifest"]
         fields = stage_request.stage_fields or {}
@@ -3075,6 +3163,7 @@ class EngineHost:
             states = torch.from_numpy(hidden.copy()).unsqueeze(0)
             output = torch.empty((n_tokens, hidden.shape[1]), dtype=torch.float32) if want_hidden else None
             token = None
+            token_output = None
             for seq, indices in groups.items():
                 if provider_cancel_event.is_set():
                     raise _StageError("supplied_stage_cancelled")
@@ -3099,8 +3188,18 @@ class EngineHost:
                 if want_hidden:
                     output.index_copy_(0, index_tensor, out[0].detach().to(device="cpu", dtype=torch.float32))
                 elif seq == seq_ids[-1]:
-                    logits = manager.forward_lm_head(out[:, -1:, :])
+                    logits = manager.forward_lm_head(out if want_all_tokens else out[:, -1:, :])
+                    if (logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[-1] < 1
+                            or logits.shape[1] != (len(indices) if want_all_tokens else 1)
+                            or not bool(torch.isfinite(logits).all().item())):
+                        raise _StageError("supplied_logits_invalid")
                     token = int(logits[0, -1].argmax().item())
+                    if want_all_tokens:
+                        token_output = {"token_argmax": token,
+                            "token_argmax_by_position": logits[0].argmax(dim=-1).tolist(),
+                            "positions": list(positions), "n_tokens": n_tokens, "n_vocab": int(logits.shape[-1])}
+                        from qlh_core.contracts.token_output import validate_token_output
+                        validate_token_output(token_output, n_tokens=n_tokens, positions=positions, require_all=True)
             if provider_cancel_event.is_set():
                 raise _StageError("supplied_stage_cancelled")
         except Exception:
@@ -3108,7 +3207,28 @@ class EngineHost:
             self._supplied_layer_caches = {}
             raise
         self._supplied_layer_caches = caches
-        return output.numpy() if want_hidden else token
+        return output.numpy() if want_hidden else (token_output if want_all_tokens else token)
+
+    def supports_layer_multi_position_argmax(self):
+        """Inspect installed execution support without materializing any weights."""
+        import os
+        environment = self._environment if getattr(self, "_environment", None) is not None else os.environ
+        if str(environment.get("QLH_MULTI_POSITION_ARGMAX", "1")).strip().lower() in {"0", "false", "off", "no"}:
+            return False
+        active = getattr(self, "_worker_runtime_active", None)
+        if active is not None and getattr(active, "loaded", False):
+            if active.upstream is not None:
+                return getattr(active.upstream, "supports_multi_position_argmax", False) is True
+            if active.selected is not None:
+                return active.selected["manifest"]["format"] == "safetensors"
+        from model_supply_worker import get_selected_model
+        selected = get_selected_model()
+        if selected is not None and selected["manifest"]["format"] == "safetensors":
+            return True
+        from keep_head_shim import resolve_keep_head_shim
+        from llama_keep_head import keep_head_multi_position_available
+        shim = resolve_keep_head_shim(environment=environment)
+        return bool(shim and keep_head_multi_position_available(shim, environment=environment))
 
     def _execute_layer_forward_stage(self, stage_request, provider_cancel_event):
         with self._worker_layer_lock():
@@ -3136,16 +3256,27 @@ class EngineHost:
 
         import numpy as np
 
-        from task_graph import TaskGraphError as _StageError
+        from qlh_core.contracts.execution import ExecutionError as _StageError
 
         if provider_cancel_event.is_set():
             raise _StageError("层段 Stage 在开始前已被取消")
 
         root_input = stage_request.root_input or {}
+        if root_input.get("cleanup_only") is True:
+            active = getattr(self, "_worker_runtime_active", None)
+            if active is None:
+                raise _StageError("execution_kv_cleanup_runtime_missing")
+            if active.upstream is not None:
+                active.upstream.reset()
+            self._supplied_layer_caches = {}
+            self._supplied_layer_workflow = None
+            return {"kv_cleared": True}
         encoded = root_input.get("hidden_f32")
         if not isinstance(encoded, str):
             raise _StageError("层段 Stage 缺少 root_input.hidden_f32")
         stage_fields = stage_request.stage_fields or {}
+        from qlh_core.contracts.token_output import validate_token_output_request, validate_token_output
+        want_all_tokens = validate_token_output_request(stage_fields, root_input)
         spec = stage_fields.get("hidden_spec") or {}
         n_tokens = int(spec.get("n_tokens", 0) or 0)
         n_embd = int(spec.get("n_embd", 0) or 0)
@@ -3188,8 +3319,10 @@ class EngineHost:
             out = self._execute_supplied_layer_forward(
                 selected, stage_request, hidden, want_hidden=want_hidden,
                 n_past=n_past, positions=positions, seq_ids=seq_ids,
-                provider_cancel_event=provider_cancel_event,
+                provider_cancel_event=provider_cancel_event, want_all_tokens=want_all_tokens,
             )
+            if want_all_tokens:
+                return out
             if not want_hidden:
                 return {"token_argmax": int(out)}
             out_raw = np.ascontiguousarray(out, dtype=np.float32).tobytes()
@@ -3199,6 +3332,8 @@ class EngineHost:
                 "token_argmax": None,
             }
         upstream = self._layer_forward_upstream()
+        if want_all_tokens and getattr(upstream, "supports_multi_position_argmax", False) is not True:
+            raise _StageError("multi_position_argmax_unavailable")
 
         # ★ 2026-10-03：批次**从位置 0 开始**就说明这是新 prompt 的 prefill ⇒ 必须先清
         #   子进程的 KV。否则下一个请求会带着上一个请求残留的位置（实测：
@@ -3222,106 +3357,25 @@ class EngineHost:
                 "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
                 "token_argmax": None,
             }
+        if want_all_tokens:
+            tokens = upstream.forward_hidden_to_tokens(
+                hidden, n_past=n_past, seq_ids=seq_ids, positions=positions)
+            output = {"token_argmax": tokens[-1] if isinstance(tokens, (list, tuple)) and tokens else None, "token_argmax_by_position": tokens,
+                      "positions": list(positions), "n_tokens": n_tokens, "n_vocab": upstream.n_vocab}
+            validate_token_output(output, n_tokens=n_tokens, positions=positions, require_all=True)
+            return output
         token = upstream.forward_hidden_to_token(
             hidden, n_past=n_past, seq_ids=seq_ids, positions=positions,
         )
         return {"token_argmax": int(token)}
 
     # ------------------------------------------------------------------
-    # 1.2d task_graph 执行段（复制自 api_server.py:2571-3321，源文件不动）
-    # 入口：execute_task_graph_chat（slot/journal/角色门控）→
-    #       execute_task_graph_chat_with_slot（主体 448 行）
     # ------------------------------------------------------------------
-    def _ensure_task_graph_coordinator(self) -> Any:
-        """1.2d 惰性创建任务图协调器（复制自 api_server._create_task_graph_coordinator
-        api_server.py:354-395；全局实例 → 实例属性，首次访问时创建并缓存）。"""
-        if self._task_graph_coordinator is not None:
-            return self._task_graph_coordinator
-        import config as _cfg
-        from task_graph import TaskGraphCoordinator, TaskGraphUnavailable
-        from task_journal import SQLiteTaskJournal, TaskJournalError
-
-        if not _cfg.TASK_GRAPH_ENABLED:
-            coordinator = TaskGraphCoordinator(
-                max_records=_cfg.TASK_GRAPH_MAX_RECORDS,
-                max_parallel_stages=_cfg.TASK_GRAPH_MAX_PARALLEL_STAGES,
-            )
-            self._task_graph_coordinator = coordinator
-            return coordinator
-        journal = None
-        try:
-            journal = SQLiteTaskJournal(_cfg.TASK_GRAPH_JOURNAL_PATH)
-            coordinator = TaskGraphCoordinator(
-                max_records=_cfg.TASK_GRAPH_MAX_RECORDS,
-                journal=journal,
-                max_parallel_stages=_cfg.TASK_GRAPH_MAX_PARALLEL_STAGES,
-            )
-            recovery = coordinator.recover_persisted_workflows()
-            cleanup = coordinator.cleanup_journal(
-                max_age_days=_cfg.TASK_GRAPH_RETENTION_DAYS,
-                max_records=_cfg.TASK_GRAPH_RETENTION_MAX_RECORDS,
-            )
-            if recovery.get("recovered_workflows", 0):
-                logger.warning("任务图启动恢复完成: %s", recovery)
-            if cleanup.get("deleted_workflows", 0):
-                logger.info("任务图 journal 保留清理完成: %s", cleanup)
-            self._task_graph_coordinator = coordinator
-            return coordinator
-        except (TaskJournalError, TaskGraphUnavailable) as exc:
-            if journal is not None:
-                try:
-                    journal.close()
-                except Exception:
-                    pass
-            coordinator = TaskGraphCoordinator(
-                max_records=_cfg.TASK_GRAPH_MAX_RECORDS,
-                max_parallel_stages=_cfg.TASK_GRAPH_MAX_PARALLEL_STAGES,
-                availability_error=f"task journal unavailable: {exc}",
-            )
-            logger.error(
-                "任务图 journal 初始化失败，任务图已禁用: %s",
-                exc,
-                exc_info=True,
-            )
-            self._task_graph_coordinator = coordinator
-            return coordinator
-
-
-    def _dispatch_local_task_provider(
-        self, request, cancel_event: threading.Event,
-    ) -> Dict[str, Any]:
-        """1.2d 复制自 api_server._dispatch_local_task_provider（api_server.py:2603-2612）。"""
-        from task_graph import TaskGraphError
-        from task_provider import ProviderExecutor
-        from typing import cast
-        executor = request.runtime_context.get("local_provider_executor")
-        if not callable(executor):
-            raise TaskGraphError("本地任务 Provider 缺少请求执行上下文")
-        result = cast(ProviderExecutor, executor)(request, cancel_event)
-        if not isinstance(result, dict):
-            raise TaskGraphError("本地任务 Provider 返回值必须是 dict")
-        return result
 
 
 
-    def _ensure_local_task_provider(
-        self,
-    ) -> Dict[str, Any]:
-        """1.2d 复制自 api_server._ensure_local_task_provider（api_server.py:2616-2629）；
-        宿主适配：self._ensure_task_graph_coordinator() → 实例、scheduler → self._scheduler。"""
-        from task_provider import LocalFullModelProvider, ProviderError
-        if self._ensure_task_graph_coordinator().has_provider("local_full_model"):
-            return
-        try:
-            self._ensure_task_graph_coordinator().register_provider(LocalFullModelProvider(
-                self._dispatch_local_task_provider,
-                provider_id="local_full_model",
-                node_id=(self._scheduler.get_effective_node_id() if self._scheduler is not None else ""),
-                max_concurrency=1,
-            ))
-        except ProviderError:
-            if not self._ensure_task_graph_coordinator().has_provider("local_full_model"):
-                raise
+
+
 
 
 
@@ -3332,7 +3386,7 @@ class EngineHost:
         / 模型 id / 路径 / 引擎）留在了宿主上 ⇒ 身份从那里取。否则 Route A 会陷入
         "要活动身份就必须先物化权重、而 distributed-only 路径按设计不加载"的死锁。
         """
-        from task_provider import ModelIdentity
+        from execution_provider import ModelIdentity
 
         host = self._host
         if not getattr(host, "is_pipeline_prepared", False):
@@ -3360,13 +3414,13 @@ class EngineHost:
             logger.warning("已准备的流水线模型身份非法", exc_info=True)
             return None
 
-    def _active_task_graph_model_identity(
+    def _active_execution_model_identity(
         self,
     ) -> Dict[str, Any]:
-        """1.2d 复制自 api_server._active_task_graph_model_identity（api_server.py:2631-2679）；
+        """1.2d 复制自 api_server._active_execution_model_identity（api_server.py:2631-2679）；
         宿主适配：model_host/model_manager → self._host。"""
         import hashlib
-        from task_provider import ModelIdentity
+        from execution_provider import ModelIdentity
         if not self._host.model_loaded or not self._host.is_loaded:
             return self._prepared_pipeline_model_identity()
         engine = backend_id_for(self._host)
@@ -3416,703 +3470,15 @@ class EngineHost:
 
 
 
-    def _sync_remote_task_worker_providers(
-        self,
-    ) -> list[str]:
-        """1.2d 复制自 api_server._sync_remote_task_worker_providers（api_server.py:2680-2692）；
-        宿主适配：scheduler → self._scheduler（None 时无远端 provider）。"""
-        from task_provider import ProviderError
-        registered = []
-        if self._scheduler is None:
-            return []
-        for provider in self._scheduler.remote_task_worker_providers():
-            if not self._ensure_task_graph_coordinator().has_provider(provider.provider_id):
-                try:
-                    self._ensure_task_graph_coordinator().register_provider(provider)
-                except ProviderError:
-                    if not self._ensure_task_graph_coordinator().has_provider(provider.provider_id):
-                        raise
-            registered.append(provider.provider_id)
-        return sorted(registered)
 
 
 
-    def _eligible_remote_task_worker_provider_ids(
-        self, model_identity, stage_type: str, *, limit: int = 4,
-    ) -> list[str]:
-        """1.2d 复制自 api_server._eligible_remote_task_worker_provider_ids
-        （api_server.py:2694-2718）；宿主适配：_cfg.TASK_WORKER_EXPERIMENTAL_ENABLED
-        → config、scheduler → self._scheduler。"""
-        import config as _cfg
-        if not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
-            return []
-        if self._scheduler is None:
-            return []
-        providers = {
-            provider.provider_id: provider
-            for provider in self._scheduler.remote_task_worker_providers()
-        }
-        self._sync_remote_task_worker_providers()
-        statuses = {
-            str(item.get("provider_id", "")): item
-            for item in self._ensure_task_graph_coordinator().provider_status()
-        }
-        eligible = []
-        for provider_id, provider in providers.items():
-            status = statuses.get(provider_id, {})
-            if (
-                status.get("provider_kind") != "remote_full_worker"
-                or not status.get("healthy")
-                or not status.get("available")
-                or stage_type not in status.get("supported_stage_types", [])
-                or not provider.supports_model_identity(model_identity, stage_type)
-            ):
-                continue
-            max_concurrency = max(1, int(status.get("max_concurrency", 1) or 1))
-            active = max(0, int(status.get("active_reservations", 0) or 0))
-            eligible.append((
-                active / max_concurrency,
-                active,
-                provider_id,
-            ))
-        eligible.sort()
-        return [item[2] for item in eligible[:max(0, int(limit))]]
 
 
 
-    def execute_task_graph_chat(
-        self,
-        req: ChatRequest,
-        cancel_event: Optional[threading.Event] = None,
-        request_deadline: Optional[RequestDeadline] = None,
-    ) -> Dict[str, Any]:
-        """Run the fixed local task graph without claiming multi-device execution.
-        1.2d 复制自 api_server._execute_task_graph_chat（api_server.py:2571-2614）；
-        宿主适配：TASK_GRAPH_ENABLED → config、task_graph_coordinator/
-        self._task_graph_execution_slot/model_host → 实例状态、scheduler →
-        self._scheduler（None = 单机基线视为 master）。"""
-        import config as _cfg
-        from fastapi import HTTPException
-        from api_errors import coded_http_error
-        if not _cfg.TASK_GRAPH_ENABLED:
-            raise coded_http_error(
-                409,
-                "TASK_GRAPH_DISABLED",
-                "任务链实验未启用。请设置 QLH_TASK_GRAPH_ENABLED=true 后重启。",
-            )
-        journal = self._ensure_task_graph_coordinator().journal_status()
-        if not journal.get("available", False):
-            raise HTTPException(
-                503,
-                {
-                    "message": "任务链 journal 不可用，已拒绝不可恢复执行。",
-                    "reason": journal.get("error", "journal health check failed"),
-                },
-            )
-        if self._scheduler is not None and self._scheduler._effective_role() != "master":
-            raise HTTPException(409, "任务链协调器当前只允许在主节点运行。")
-
-        if not self._task_graph_execution_slot.acquire(blocking=False):
-            raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
-        try:
-            with hold_lock_until_deadline(
-                self._model_lifecycle_lock(),
-                request_deadline,
-                operation="full chat execution lock",
-            ):
-                return self.execute_task_graph_chat_with_slot(
-                    req, cancel_event, request_deadline,
-                )
-        finally:
-            self._task_graph_execution_slot.release()
 
 
 
-    def execute_task_graph_chat_with_slot(
-        self,
-        req: ChatRequest,
-        cancel_event: Optional[threading.Event] = None,
-        request_deadline: Optional[RequestDeadline] = None,
-    ) -> Dict[str, Any]:
-        """Execute one workflow while the process-wide task-graph slot is held.
-        1.2d 复制自 api_server._execute_task_graph_chat_with_slot
-        （api_server.py:2874-3321）；宿主适配：scheduler → self._scheduler、
-        task_graph_coordinator → self._ensure_task_graph_coordinator()、
-        model_host/model_manager → self._host、self._gen_lock →
-        self._gen_lock、conversation_stats/self._active_session_id → 实例属性、
-        record_task_complete → self._record_task_complete()。"""
-        import config as _cfg
-        import local_store as _local_store
-        from api_errors import coded_http_error
-        from dataclasses import replace
-        from distributed_completion import (
-            DistributedCompletionError,
-            validate_distributed_completion,
-        )
-        from fastapi import HTTPException
-        from task_graph import (
-            StageSpec,
-            TaskGraphError,
-            TaskGraphUnavailable,
-            WorkflowCancelled,
-            WorkflowDeadlineExceeded,
-            WorkflowExecutionError,
-            dual_candidate_template,
-        )
-        from task_provider import ProviderError
-        request_deadline = coerce_request_deadline(
-            request_deadline,
-            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
-        )
-        request_deadline.require_remaining()
-
-        remote_stage_id = str(req.task_graph_remote_stage or "")
-        remote_provider_id = str(req.task_graph_remote_provider_id or "")
-        distributed_task_required = (
-            req.routing_preference == "distributed_required"
-        )
-        auto_remote = bool(
-            req.task_graph_auto_remote
-            or (
-                not remote_stage_id
-                and req.routing_preference in {
-                    "distributed_preferred", "distributed_required",
-                }
-            )
-        )
-        if bool(remote_stage_id) != bool(remote_provider_id):
-            raise coded_http_error(
-                400,
-                "TASK_GRAPH_MANUAL_REMOTE_FIELDS_INCOMPLETE",
-                "N2.1 手动远端执行必须同时指定 Stage 和 Provider ID。",
-            )
-        if auto_remote and remote_stage_id:
-            raise coded_http_error(
-                400,
-                "TASK_GRAPH_REMOTE_POLICY_CONFLICT",
-                "N2.3 自动 Worker 选择不能与 N2.1 手动远端 Stage 同时启用。",
-            )
-        if remote_stage_id and not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
-            raise coded_http_error(
-                409,
-                "TASK_WORKER_EXPERIMENT_DISABLED",
-                "PC Full Worker 实验调度未启用。请设置 "
-                "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
-            )
-        if auto_remote and not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
-            if distributed_task_required:
-                raise coded_http_error(
-                    503,
-                    "TASK_WORKER_EXPERIMENT_DISABLED",
-                    "distributed_required 需要已启用的 PC Full Worker 实验调度。",
-                )
-
-        prepared_context = self._prepare_chat_context(req.session_id, req.message)
-        target_session_id = prepared_context.session_id
-        history = prepared_context.history
-        request_deadline.require_remaining()
-
-        base_messages = list(history) + [{"role": "user", "content": req.message}]
-        root_input = {
-            "message": req.message,
-            "messages": base_messages,
-            "task_options": {
-                "candidate_max_tokens": max(1, min(req.max_new_tokens, 512)),
-                "final_max_tokens": max(1, min(req.max_new_tokens, 1024)),
-                "temperature": req.temperature,
-                "top_p": req.top_p,
-                "show_thinking": req.show_thinking,
-            },
-        }
-
-        try:
-            self._ensure_local_task_provider()
-        except ProviderError as exc:
-            raise HTTPException(
-                503,
-                {
-                    "message": "本地任务 Provider 注册失败。",
-                    "reason": f"{exc.code}: {exc}",
-                },
-            ) from exc
-
-        model_identity = None
-        stages: Optional[list[StageSpec]] = None
-        final_stage_id = ""
-        auto_provider_ids: list[str] = []
-        auto_fallback_reason = ""
-        if remote_stage_id:
-            remote_providers = {
-                provider.provider_id: provider
-                for provider in (self._scheduler.remote_task_worker_providers() if self._scheduler is not None else [])
-            }
-            self._sync_remote_task_worker_providers()
-            remote_provider = remote_providers.get(remote_provider_id)
-            if remote_provider is None:
-                raise HTTPException(
-                    404, "The selected remote PC Full Worker does not exist."
-                )
-            remote_status = next((
-                item for item in self._ensure_task_graph_coordinator().provider_status()
-                if item.get("provider_id") == remote_provider_id
-                and item.get("provider_kind") == "remote_full_worker"
-            ), None)
-            if remote_status is None:
-                raise HTTPException(404, "指定的远端 PC Full Worker Provider 不存在。")
-            if not remote_status.get("healthy") or not remote_status.get("available"):
-                raise HTTPException(503, "指定的远端 PC Full Worker 当前不可用或正忙。")
-            model_identity = self._active_task_graph_model_identity()
-            if model_identity is None:
-                raise HTTPException(409, "手动远端 Stage 要求主节点先加载完整模型并生成精确身份。")
-            template_stages, final_stage_id = dual_candidate_template()
-            selected_stage = next((
-                stage for stage in template_stages
-                if stage.stage_id == remote_stage_id
-            ), None)
-            if (
-                selected_stage is None
-                or not remote_provider.supports_model_identity(
-                    model_identity, selected_stage.stage_type,
-                )
-            ):
-                raise HTTPException(
-                    409,
-                    {
-                        "message": (
-                            "The selected remote PC Full Worker does not have "
-                            "the exact active model required by this Stage."
-                        ),
-                        "reason_code": "model_identity_mismatch",
-                        "provider_id": remote_provider_id,
-                        "stage_id": remote_stage_id,
-                    },
-                )
-            stages = [
-                replace(
-                    stage,
-                    provider=remote_provider_id,
-                    fallback_providers=(),
-                    pure=False,
-                    max_same_provider_retries=0,
-                )
-                if stage.stage_id == remote_stage_id else stage
-                for stage in template_stages
-            ]
-        elif auto_remote:
-            if not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
-                auto_fallback_reason = "task_worker_experiment_disabled"
-            else:
-                model_identity = self._active_task_graph_model_identity()
-            if _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED and model_identity is None:
-                auto_fallback_reason = "model_identity_unavailable"
-                if distributed_task_required:
-                    raise coded_http_error(
-                        409,
-                        "TASK_WORKER_MODEL_IDENTITY_UNAVAILABLE",
-                        "distributed_required 需要主节点已加载完整模型并生成精确身份。",
-                    )
-            elif _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
-                auto_provider_ids = self._eligible_remote_task_worker_provider_ids(
-                    model_identity,
-                    "full_inference",
-                )
-                if not auto_provider_ids:
-                    auto_fallback_reason = "no_eligible_remote_provider"
-                    if distributed_task_required:
-                        raise coded_http_error(
-                            503,
-                            "TASK_WORKER_NO_ELIGIBLE_REMOTE_PROVIDER",
-                            "distributed_required 没有可用且模型身份精确匹配的 PC Full Worker。",
-                        )
-                else:
-                    template_stages, final_stage_id = dual_candidate_template()
-                    candidate_index = 0
-                    planned_stages = []
-                    for stage in template_stages:
-                        if stage.stage_type != "full_inference":
-                            planned_stages.append(stage)
-                            continue
-                        if candidate_index >= len(auto_provider_ids):
-                            planned_stages.append(replace(
-                                stage,
-                                provider="local_full_model",
-                                fallback_providers=(),
-                                pure=True,
-                            ))
-                            candidate_index += 1
-                            continue
-                        primary = auto_provider_ids[candidate_index]
-                        other_remotes = [
-                            provider_id for provider_id in auto_provider_ids
-                            if provider_id != primary
-                        ][:3]
-                        planned_stages.append(replace(
-                            stage,
-                            provider=primary,
-                            fallback_providers=tuple(
-                                [
-                                    *other_remotes,
-                                    *(
-                                        [] if distributed_task_required
-                                        else ["local_full_model"]
-                                    ),
-                                ]
-                            ),
-                            pure=True,
-                        ))
-                        candidate_index += 1
-                    stages = planned_stages
-
-        request_id = str(_request_id_ctx.get("-") or "-")
-        runtime_context = {
-            "local_provider_executor": self.execute_task_worker_stage,
-            "task_graph_remote_policy": (
-                "manual" if remote_stage_id else "auto" if auto_remote else "local"
-            ),
-        }
-        try:
-            if stages is None:
-                final_output, workflow = self._ensure_task_graph_coordinator().run_template(
-                    template=req.task_graph_template,
-                    root_input=root_input,
-                    request_id=request_id,
-                    session_id=target_session_id or "default",
-                    model_identity=model_identity,
-                    runtime_context=runtime_context,
-                    workflow_id=req.workflow_id,
-                    cancel_event=cancel_event,
-                    request_deadline=request_deadline,
-                )
-            else:
-                final_output, workflow = self._ensure_task_graph_coordinator().run(
-                    stages=stages,
-                    final_stage_id=final_stage_id,
-                    template=req.task_graph_template,
-                    root_input=root_input,
-                    request_id=request_id,
-                    session_id=target_session_id or "default",
-                    model_identity=model_identity,
-                    runtime_context=runtime_context,
-                    workflow_id=req.workflow_id,
-                    cancel_event=cancel_event,
-                    request_deadline=request_deadline,
-                )
-        except WorkflowCancelled as exc:
-            raise HTTPException(
-                409,
-                {"message": "任务链已取消", "workflow_id": exc.workflow_id},
-            ) from exc
-        except WorkflowExecutionError as exc:
-            status_code = 504 if exc.code == "request_deadline_exceeded" else 500
-            raise coded_http_error(
-                status_code,
-                exc.code,
-                {
-                    "message": str(exc),
-                    "workflow_id": exc.workflow_id,
-                    "stage_id": exc.stage_id,
-                },
-            ) from exc
-        except WorkflowDeadlineExceeded as exc:
-            raise coded_http_error(
-                504,
-                exc.code,
-                {
-                    "message": str(exc),
-                    "workflow_id": exc.workflow_id,
-                },
-            ) from exc
-        except TaskGraphUnavailable as exc:
-            raise HTTPException(
-                503,
-                {
-                    "message": "任务链 journal 写入失败，执行已停止。",
-                    "reason": str(exc),
-                },
-            ) from exc
-        except TaskGraphError as exc:
-            raise HTTPException(400, f"任务链请求无效: {exc}") from exc
-
-        response_text = str(final_output.get("content", "") or "").strip()
-        thinking_content = final_output.get("thinking_content")
-        if not response_text:
-            raise HTTPException(500, "任务链最终聚合结果为空。")
-
-        if distributed_task_required:
-            precommit_attempts = [
-                attempt
-                for stage in workflow.get("stages", [])
-                for attempt in stage.get("attempts", [])
-                if attempt.get("state") == "completed"
-            ]
-            precommit_remote_attempts = [
-                attempt
-                for attempt in precommit_attempts
-                if attempt.get("provider_kind") == "remote_full_worker"
-            ]
-            if not precommit_remote_attempts:
-                try:
-                    self._ensure_task_graph_coordinator().discard_result(
-                        workflow["workflow_id"],
-                        terminal_reason_code=REASON_REQUEST_REFUSED,
-                    )
-                except TaskGraphUnavailable as exc:
-                    raise HTTPException(
-                        503,
-                        {
-                            "message": "distributed_required 校验失败且结果无法丢弃。",
-                            "reason": str(exc),
-                        },
-                    ) from exc
-                raise coded_http_error(
-                    503,
-                    "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
-                    "distributed_required 未执行任何远端 Full Worker Stage。",
-                )
-            try:
-                validate_distributed_completion(
-                    req.routing_preference,
-                    {
-                        "distributed_used": True,
-                        "execution_mode": "task_graph",
-                        "workers_used": [
-                            str(attempt.get("provider_node_id", "") or "")
-                            for attempt in precommit_remote_attempts
-                            if attempt.get("provider_node_id")
-                        ],
-                    },
-                )
-            except DistributedCompletionError as exc:
-                try:
-                    self._ensure_task_graph_coordinator().discard_result(
-                        workflow["workflow_id"],
-                        terminal_reason_code=REASON_REQUEST_REFUSED,
-                    )
-                except TaskGraphUnavailable as discard_exc:
-                    raise HTTPException(
-                        503,
-                        {
-                            "message": "发行 profile 拒绝任务图结果且结果无法丢弃。",
-                            "reason": str(discard_exc),
-                        },
-                    ) from discard_exc
-                raise coded_http_error(
-                    503,
-                    "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN",
-                    f"distributed_required 发行路线校验失败：{exc}",
-                ) from exc
-
-        try:
-            with hold_lock_until_deadline(
-                self._gen_lock,
-                request_deadline,
-                operation="generation commit lock",
-            ):
-                _raise_if_generation_cancelled(cancel_event, req.generation_id)
-                if cancel_event is not None and cancel_event.is_set():
-                    _raise_if_generation_cancelled(cancel_event, req.generation_id)
-                try:
-                    workflow = self._ensure_task_graph_coordinator().commit_result(
-                        workflow["workflow_id"],
-                    )
-                except WorkflowCancelled as exc:
-                    raise ChatGenerationCancelled(
-                        req.generation_id or "gen_unknown",
-                    ) from exc
-                except WorkflowDeadlineExceeded as exc:
-                    raise coded_http_error(
-                        504, REQUEST_DEADLINE_EXCEEDED, str(exc),
-                    ) from exc
-                except TaskGraphUnavailable:
-                    raise
-        except ChatGenerationCancelled:
-            try:
-                self._ensure_task_graph_coordinator().discard_result(workflow["workflow_id"])
-            except TaskGraphUnavailable as exc:
-                raise HTTPException(
-                    503,
-                    {
-                        "message": "任务链取消无法写入 journal。",
-                        "reason": str(exc),
-                    },
-                ) from exc
-            raise
-        except TaskGraphUnavailable as exc:
-            raise HTTPException(
-                503,
-                {
-                    "message": "任务链 journal 写入失败，结果未提交。",
-                    "reason": str(exc),
-                },
-            ) from exc
-
-        attempts = [
-            attempt
-            for stage in workflow.get("stages", [])
-            for attempt in stage.get("attempts", [])
-            if attempt.get("state") == "completed"
-        ]
-        usages = [
-            dict(attempt.get("result_metadata", {}).get("usage", {}) or {})
-            for attempt in attempts
-        ]
-        prompt_tokens = sum(int(usage.get("prompt_tokens", 0) or 0) for usage in usages)
-        completion_tokens = sum(
-            int(usage.get("completion_tokens", 0) or 0) for usage in usages
-        )
-        providers = sorted({
-            str(attempt.get("provider", "") or "")
-            for attempt in attempts
-            if attempt.get("provider")
-        })
-        serving_node_id = (self._scheduler.get_effective_node_id() if self._scheduler is not None else "")
-        participating_nodes = sorted({
-            str(attempt.get("provider_node_id", "") or serving_node_id)
-            for attempt in attempts
-        }) or [serving_node_id]
-        remote_attempts = [
-            attempt for attempt in attempts
-            if attempt.get("provider_kind") == "remote_full_worker"
-        ]
-        remote_nodes = sorted({
-            str(attempt.get("provider_node_id", "") or "")
-            for attempt in remote_attempts
-            if attempt.get("provider_node_id")
-        })
-        remote_used = bool(remote_attempts)
-        if distributed_task_required and not remote_used:
-            raise coded_http_error(
-                503,
-                "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
-                "distributed_required 未执行任何远端 Full Worker Stage。",
-            )
-        provider_status_by_id = {
-            str(item.get("provider_id", "")): item
-            for item in self._ensure_task_graph_coordinator().provider_status()
-        }
-        planned_remote_nodes = sorted({
-            str(provider_status_by_id.get(provider_id, {}).get("node_id", "") or "")
-            for provider_id in auto_provider_ids
-            if provider_status_by_id.get(provider_id, {}).get("node_id")
-        })
-        retried_stages = [
-            stage for stage in workflow.get("stages", [])
-            if int(stage.get("retry_count", 0) or 0) > 0
-        ]
-        retry_error_codes = [
-            str(stage.get("last_retry_error_code", "") or "")
-            for stage in retried_stages
-            if stage.get("last_retry_error_code")
-        ]
-        same_provider_retry_count = sum(
-            int(stage.get("same_provider_retry_count", 0) or 0)
-            for stage in retried_stages
-        )
-        total_retry_count = sum(
-            int(stage.get("retry_count", 0) or 0)
-            for stage in retried_stages
-        )
-        reassignment_count = max(
-            0, total_retry_count - same_provider_retry_count,
-        )
-        fallback_used = reassignment_count > 0 or bool(
-            auto_remote and not auto_provider_ids
-        )
-        retry_reason = retry_error_codes[0] if retry_error_codes else ""
-        fallback_reason = (
-            retry_reason if reassignment_count > 0 else auto_fallback_reason
-        )
-        metrics = _augment_chat_metrics(
-            {
-                "engine": backend_id_for(self._host),
-                "execution_mode": "task_graph",
-                "provider": (
-                    providers[0] if len(providers) == 1 else "task_graph"
-                ),
-                "orchestrator": "task_graph",
-                "subproviders": providers,
-                "workflow_id": workflow["workflow_id"],
-                "workflow_template": workflow["template"],
-                "workflow_state": workflow["state"],
-                "partial_result": bool(workflow.get("partial_result", False)),
-                "stage_retry_count": total_retry_count,
-                "same_provider_retry_count": same_provider_retry_count,
-                "reassignment_count": reassignment_count,
-                "retry_reason": retry_reason,
-                "stage_count": workflow["stage_count"],
-                "stage_attempt_count": workflow["attempt_count"],
-                "nodes_planned": (
-                    1 + len(planned_remote_nodes)
-                    if auto_remote else len(participating_nodes)
-                ),
-                "nodes_participated": len(participating_nodes),
-                "participating_nodes": participating_nodes,
-                "distributed_requested": bool(remote_stage_id or auto_remote),
-                "distributed_used": remote_used,
-                "distributed_kind": (
-                    "task_graph_remote_manual"
-                    if remote_used and remote_stage_id
-                    else "task_graph_remote_auto"
-                    if remote_used and auto_remote
-                    else "task_graph_local_fallback"
-                    if auto_remote
-                    else "task_graph_local_poc"
-                ),
-                "workers_used": remote_nodes,
-                "manual_remote_stage": remote_stage_id,
-                "manual_remote_provider": remote_provider_id,
-                "auto_remote_enabled": auto_remote,
-                "auto_remote_providers": auto_provider_ids,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-                "usage_estimated": any(
-                    bool(attempt.get("result_metadata", {}).get(
-                        "usage_estimated", False,
-                    ))
-                    for attempt in attempts
-                ),
-                "elapsed_seconds": workflow["duration_seconds"],
-                "fallback": fallback_used,
-                "fallback_reason": fallback_reason,
-            },
-            req,
-            route=(
-                f"{_chat_origin(req)}_to_task_graph_manual_remote"
-                if remote_stage_id
-                else f"{_chat_origin(req)}_to_task_graph_auto_remote"
-                if auto_remote
-                else f"{_chat_origin(req)}_to_local_task_graph"
-            ),
-        )
-        completed_history = [
-            *history,
-            {"role": "user", "content": req.message},
-            {"role": "assistant", "content": response_text},
-        ]
-        followups = _fallback_followups(completed_history, [])
-        save_metrics = dict(metrics)
-        save_metrics["followups"] = followups
-        self._commit_chat_context_turn(
-            target_session_id, req.message, response_text, save_metrics,
-            expected_revision=prepared_context.revision,
-        )
-
-        self._conversation_stats["total_prompt_tokens"] += prompt_tokens
-        self._conversation_stats["total_generated_tokens"] += completion_tokens
-        self._conversation_stats["total_time_seconds"] += workflow["duration_seconds"]
-        self._conversation_stats["rounds"] += 1
-        try:
-            self._record_task_complete()
-        except Exception:
-            pass
-
-        return {
-            "content": response_text,
-            "thinking_content": thinking_content,
-            "metrics": metrics,
-            "followups": followups,
-        }
 
 
 
@@ -4126,9 +3492,7 @@ class EngineHost:
         如果没有活跃会话，返回空列表（不自动创建会话）。
         返回的列表对象可被原地修改（append、clear 等）。
         """
-        self._sync_chat_context_facade()
         history = self._chat_context.active_history()
-        self._publish_chat_context_facade()
         return history
 
     def _ensure_device_profile(self) -> Optional[dict]:
@@ -4207,9 +3571,7 @@ class EngineHost:
         if self._kv_cache:
             self._kv_cache.clear()
         self._kv_cache = None
-        self._sync_chat_context_facade()
         self._chat_context.invalidate(clear_histories=clear_histories)
-        self._publish_chat_context_facade()
         self._conversation_stats = {
             "total_prompt_tokens": 0,
             "total_generated_tokens": 0,

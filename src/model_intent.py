@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-import json
 import logging
 from pathlib import Path
 import threading
@@ -16,7 +15,6 @@ import time
 from fastapi import HTTPException
 
 from api_errors import error_code_from_exception
-from atomic_json import atomic_write_json
 from model_supply import ModelSupplyError
 
 TERMINAL = {"ready", "failed", "cancelled", "superseded"}
@@ -31,6 +29,7 @@ class ModelIntentCoordinator:
         self.retire_timeout = retire_timeout
         self._selection_lane = asyncio.Lock()
         self._retire_task = None
+        self._retire_requested = False
         self._closed = False
         self._root = root
         self.poll_interval = poll_interval
@@ -44,38 +43,25 @@ class ModelIntentCoordinator:
         return Path(self._root) if self._root else self.scheduler._model_supply.root
 
     def _persist(self, record):
-        # Record and current pointer share the owner lock through all retries;
-        # a late write must not overwrite cancellation or a newer selection.
         with self._lock:
-            directory = self.root / record["operation_id"]
-            directory.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(directory / "intent.json", record)
-            atomic_write_json(self.root / "current-intent.json", {"operation_id": self._current})
+            owner = self.scheduler._model_control
+            owner.start()
+            snapshot = owner.snapshot()
+            updating = record["operation_id"] in snapshot["operations"]
+            owner.save_operation(record, select=self._current == record["operation_id"],
+                                 expected_selected=record["operation_id"] if updating else snapshot["selected_operation"],
+                                 idempotency_key=record.get("idempotency_key", ""))
 
     def _record(self, operation_id):
-        # The supply owner validates the identifier before any path access.
         self.scheduler._model_supply.get(operation_id)
-        with self._lock:
-            record = self._records.get(operation_id)
-            if record is None:
-                path = self.root / operation_id / "intent.json"
-                if not path.is_file():
-                    raise ModelSupplyError("INTENT_OPERATION_NOT_FOUND", "Model selection operation not found")
-                record = json.loads(path.read_text(encoding="utf-8"))
-                if record["status"] not in TERMINAL:
-                    record.update(status="failed", reason_code="INTENT_MASTER_RESTARTED",
-                                  reason="The master restarted during model selection; retry the selection")
-                self._records[operation_id] = record
-            return deepcopy(record)
+        saved = self.scheduler._model_control.snapshot()["operations"].get(operation_id)
+        if saved is None:
+            raise ModelSupplyError("INTENT_OPERATION_NOT_FOUND", "Model selection operation not found")
+        return deepcopy(saved)
 
     def current(self):
-        with self._lock:
-            if not self._current:
-                pointer = self.root / "current-intent.json"
-                if pointer.is_file():
-                    self._current = str(json.loads(pointer.read_text(encoding="utf-8")).get("operation_id", ""))
-            operation_id = self._current
-        return self.get(operation_id) if operation_id else None
+        selected = self.scheduler._model_control.snapshot()["selected_operation"]
+        return self.get(selected) if selected else None
 
     def _transaction(self, operation_id, candidate_id):
         with self.scheduler._layer_config_lock:
@@ -96,14 +82,44 @@ class ModelIntentCoordinator:
             return value, active
 
     def get(self, operation_id):
-        record = self._record(operation_id)
-        supply = self.scheduler._model_supply.get(operation_id)
+        from qlh_core.contracts.snapshots import envelope, reason
+        owner = getattr(self.scheduler, "_model_control", None)
+        for _ in range(3):
+            before = owner.snapshot() if owner is not None else None
+            result = self._project(operation_id)
+            after = owner.snapshot() if owner is not None else None
+            if before is not None and (before["revision"] != after["revision"] or before["boot_id"] != after["boot_id"]):
+                continue
+            code = result.get("reason_code") or result.get("deployment_reason_code", "")
+            return envelope(result, revision=after["revision"] if after is not None else 0,
+                identity={"operation_id": operation_id, "boot_id": after["boot_id"] if after is not None else "legacy"},
+                observed_at=time.time(), validity="valid" if after is None or after["boot_id"] == owner.boot_id else "invalid",
+                reason=reason("model_operation", code, "model_control", details={"message": result.get("reason", "")}, cause=result.get("cause")))
+        return envelope({"operation_id": operation_id, "status": "pending", "runnable": False, "loaded_ready": False},
+                        revision=None, identity={"operation_id": operation_id}, observed_at=time.time(), validity="pending",
+                        reason=reason("snapshot", "snapshot_revision_changed", "model_control", retryability="retry"))
+
+    def _project(self, operation_id):
+        owner = getattr(self.scheduler, "_model_control", None)
+        snapshot = owner.snapshot() if owner is not None else None
+        if snapshot is not None and operation_id in snapshot["operations"] and operation_id in snapshot["supplies"]:
+            record = snapshot["operations"][operation_id]
+            supply = snapshot["supplies"][operation_id]
+        else:
+            record = self._record(operation_id)
+            supply = self.scheduler._model_supply.get(operation_id)
         result = {key: deepcopy(supply[key]) for key in (
             "operation_id", "intent", "status", "reason_code", "reason", "created_at", "updated_at",
             "nodes", "plan", "source_progress", "capacity_diagnostic",
         ) if key in supply}
         result.update(config_id=record.get("config_id", ""), generation=record.get("generation", 0),
                       loaded_ready=False, reason=result.get("reason", ""), reason_code=result.get("reason_code", ""))
+        result["runnable"] = False
+        result["cause"] = deepcopy(record.get("cause"))
+        if snapshot is not None:
+            result.update(revision=snapshot["revision"], boot_id=snapshot["boot_id"],
+                          commit_scope=record.get("commit_scope", snapshot["commit_scope"]),
+                          durable=record.get("durable", True), deployment_id=result["config_id"])
         # Inventory candidates are not necessarily participants in the admitted
         # plan. Project only assigned nodes once the supply owner publishes it;
         # a global ready phase must never promote an unused candidate to ready.
@@ -121,6 +137,10 @@ class ModelIntentCoordinator:
                 node["status"] = "downloading"
             if node.get("phase") in {"verify", "verifying", "registering"} and node.get("status") != "available":
                 node["status"] = "verifying"
+        if record["status"] == "waiting_capacity":
+            result.update(status="waiting_capacity", phase="waiting_capacity", reason_code=record.get("reason_code", ""),
+                          reason=record.get("reason", ""))
+            return result
         if record["status"] in {"cancelled", "superseded"}:
             result.update(status=record["status"], reason_code=record.get("reason_code", ""), reason=record.get("reason", ""))
             return result
@@ -157,12 +177,28 @@ class ModelIntentCoordinator:
             result.update(status="preparing", reason_code="", reason="")
         if record["status"] == "failed":
             result.update(status="failed", loaded_ready=False, reason_code=record.get("reason_code", ""), reason=record.get("reason", ""))
+        if record["status"] == "ready":
+            result["status"] = "ready"
+            if not result["loaded_ready"]:
+                result["deployment_reason_code"] = result.get("reason_code", "INTENT_PLAN_RETIRED")
+                result["reason_code"], result["reason"] = "", ""
+        result["runnable"] = result["loaded_ready"]
+        if snapshot is not None:
+            result["deployment_id"] = result["config_id"]
         return result
 
     def _native_readiness(self, transaction):
         # Called under the native owner's lock; this is a projection, never a receipt.
-        if self._retire_task is not None:
+        if self._retire_task is not None or self._retire_requested:
             return False, "INTENT_PLAN_RETIRING", "The previous inference plan is being retired; retry the selection"
+        execution = getattr(self.scheduler, "_execution_app", None)
+        if execution is not None:
+            try:
+                plan = execution.freeze()
+                if plan.deployment_id != transaction.get("config_id"):
+                    return False, "execution_deployment_mismatch", "The current deployment changed"
+            except Exception as exc:
+                return False, getattr(exc, "code", "execution_deployment_unavailable"), "Deployment admission is unavailable"
         loaded = getattr(self.scheduler, "_worker_prepare_assignment_loaded", None)
         expected = transaction.get("expected") or {}
         workers = transaction.get("worker_ids") or set()
@@ -189,6 +225,9 @@ class ModelIntentCoordinator:
         try:
             self._persist(record)
         except Exception:
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None:
+                owner.fence_operation_failure(record)
             logger.exception("event=model_intent_persist_failed operation_id=%s", record["operation_id"])
 
     def _revoke(self, operation_id):
@@ -208,15 +247,19 @@ class ModelIntentCoordinator:
                 return
             raise ModelSupplyError("INTENT_CANCEL_FAILED", "Model selection cancellation failed; retry cancellation") from exc
 
-    def _fail(self, operation_id, code, reason):
+    def _fail(self, operation_id, code, reason, *, cause=None):
         try:
             self._revoke(operation_id)
         except Exception:
             logger.exception("event=model_intent_cancel_failed operation_id=%s", operation_id)
         with self._lock:
-            record = self._records.get(operation_id)
+            try:
+                record = self._record(operation_id)
+            except ModelSupplyError:
+                record = self._records.get(operation_id)
             if record is None:
                 return
+            self._records[operation_id] = record
             if record["status"] not in {"cancelled", "failed", "superseded"}:
                 transaction, active = self._transaction(operation_id, record.get("candidate_id", ""))
                 if self._is_ready(transaction, active):
@@ -225,7 +268,7 @@ class ModelIntentCoordinator:
                     record.update(status="ready", config_id=transaction["config_id"],
                                   generation=transaction["generation"], reason_code="", reason="")
                 else:
-                    record.update(status="failed", reason_code=code, reason=reason)
+                    record.update(status="failed", reason_code=code, reason=reason, cause=deepcopy(cause))
             self._persist_terminal(record)
 
     def _task_done(self, operation_id, task):
@@ -252,9 +295,17 @@ class ModelIntentCoordinator:
         with self.scheduler._layer_config_lock:
             transaction = self.scheduler._pipeline_load_transaction or {}
             plan = self.scheduler._active_pipeline_capacity_plan or {}
+            # ★ 2026-10-23（#117）：**"待恢复"不等于"已发布"**。此前把
+            #   `_pipeline_recovery_pending` 也算作 published，而重启后的恢复必然因
+            #   供给身份不一致被拒（实测 `pipeline_supply_identity_mismatch:
+            #   source_model_sha256`，`selected_operation` 指向一次失败的供给）⇒
+            #   该标志永远是 True ⇒ `_retire_before_supply` 恒报"没有完成证据"
+            #   （INTENT_RETIRE_FAILED）⇒ 每次重新选模都 409；又因为"没有已加载的
+            #   模型"，正常 retire 也产生不了完成证据，形成死锁。
+            #   恢复围栏由 `retire_pipeline_recovery_for_model_change()` 清理，
+            #   不应在这里冒充发布状态。
             published = (transaction.get("phase") == "ready"
-                         or plan.get("transaction_phase") == "ready"
-                         or bool(getattr(self.scheduler, "_pipeline_recovery_pending", False)))
+                         or plan.get("transaction_phase") == "ready")
             ledger = getattr(self.scheduler, "_pipeline_model_cleanup_ledger", None)
             pending = None if ledger is None else any(
                 record.get("node_id") == "master" or record.get("node_id") in connected_for_cleanup
@@ -263,6 +314,7 @@ class ModelIntentCoordinator:
             return published, pending
 
     async def _retire_before_supply(self):
+        self._retire_requested = True
         if self._retire_task is None:
             if not callable(self.retire):
                 raise ModelSupplyError("INTENT_RETIRE_UNAVAILABLE", "Native plan retirement is unavailable; retry the selection")
@@ -289,6 +341,7 @@ class ModelIntentCoordinator:
                     raise ModelSupplyError("INTENT_RETIRE_FAILED", "Native model retirement has no completed owner evidence; retry the selection")
                 if not ledger:
                     self._retire_task = None
+                    self._retire_requested = False
                     return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -298,16 +351,44 @@ class ModelIntentCoordinator:
             else:
                 await asyncio.wait({task}, timeout=min(self.poll_interval, remaining))
 
-    async def create(self, intent):
+    async def create(self, intent, *, idempotency_key=""):
         # Serialize asynchronous retirement as well as the supply->prepare gap.
         async with self._selection_lane:
             self._check_selection_current()
+            owner = getattr(self.scheduler, "_model_control", None)
+            if idempotency_key and owner is not None:
+                for prior in owner.snapshot()["operations"].values():
+                    if prior.get("idempotency_key") == idempotency_key:
+                        saved = self.scheduler._model_supply.get(prior["operation_id"])
+                        if saved.get("intent") != intent:
+                            raise ModelSupplyError("INTENT_IDEMPOTENCY_CONFLICT", "Idempotency key belongs to another selection")
+                        return self.get(prior["operation_id"])
             with self._lock:
                 current = self.current()
+                if (current and not idempotency_key and current.get("intent") == intent
+                        and current.get("status") == "ready" and current.get("runnable") is True
+                        and current.get("validity") == "valid"):
+                    saved = self.scheduler._model_supply.get(current["operation_id"])
+                    connected = set(self.scheduler._connected_client_ids())
+                    _, cleanup_pending = self._retirement_state()
+                    with self.scheduler._layer_config_lock:
+                        transaction = self.scheduler._pipeline_load_transaction or {}
+                        candidates = saved.get("candidate_node_ids")
+                        observed = (set(candidates) - {"master"} if candidates is not None
+                                    else set(transaction.get("worker_ids") or ()))
+                        if connected == observed and cleanup_pending is False:
+                            reused = self.get(current["operation_id"])
+                            if reused.get("runnable") is True and reused.get("validity") == "valid":
+                                logger.info("event=model_intent_ready_reused operation=%s config=%s generation=%s",
+                                            reused["operation_id"], reused["config_id"], reused["generation"])
+                                return reused
                 if current and current["status"] not in TERMINAL:
                     if current["intent"] == intent:
                         return current
-                    raise ModelSupplyError("INTENT_OPERATION_BUSY", "Wait for or cancel the current model selection")
+                    record = self._record(current["operation_id"])
+                    record.update(status="superseded", reason_code="INTENT_SUPERSEDED", reason="A newer model selection replaced this operation")
+                    self._persist_terminal(record)
+                    self._revoke(current["operation_id"])
             published, ledger = self._retirement_state()
             if published or ledger or self._retire_task is not None:
                 try:
@@ -315,8 +396,8 @@ class ModelIntentCoordinator:
                 except ModelSupplyError as exc:
                     if current:
                         with self._lock:
-                            record = self._records[current["operation_id"]]
-                            if record["status"] not in {"cancelled", "failed"}:
+                            record = self._record(current["operation_id"])
+                            if record["status"] not in TERMINAL:
                                 record.update(status="superseded", reason_code=exc.code, reason=exc.message)
                                 self._persist_terminal(record)
                     raise
@@ -326,9 +407,18 @@ class ModelIntentCoordinator:
             with self._lock:
                 if current and current["status"] in {"failed", "cancelled", "superseded"}:
                     self._revoke(current["operation_id"])
-                supply = self.scheduler._model_supply.create(intent, wait_for_nodes=True)
+                supply_owner = self.scheduler._model_supply
+                accept = getattr(supply_owner, "accept", None)
+                options = {"wait_for_nodes": True, **({"idempotency_key": idempotency_key} if idempotency_key else {})}
+                if callable(accept):
+                    supply, created = accept(intent, **options)
+                    if not created:
+                        return self.get(supply["operation_id"])
+                else:
+                    supply = supply_owner.create(intent, **options)
                 operation_id = supply["operation_id"]
-                record = {"operation_id": operation_id, "status": "queued", "reason_code": "", "reason": ""}
+                record = {"operation_id": operation_id, "status": "queued", "reason_code": "", "reason": "",
+                          "idempotency_key": idempotency_key}
                 self._current = operation_id
                 self._records[operation_id] = record
                 try:
@@ -343,7 +433,10 @@ class ModelIntentCoordinator:
 
     def _update(self, operation_id, **values):
         with self._lock:
-            record = self._records[operation_id]
+            record = self._record(operation_id)
+            if record["status"] in TERMINAL:
+                return False
+            self._records[operation_id] = record
             if record["status"] in {"cancelled", "failed", "superseded"}:
                 return False
             record.update(values)
@@ -367,10 +460,38 @@ class ModelIntentCoordinator:
         if not task.cancelled():
             task.exception()
 
+    @staticmethod
+    def _retryable_prepare(code, reason=""):
+        return code in {"SUPPLY_RUNTIME_CONNECTION_CHANGED", "SUPPLY_RUNTIME_CAPABILITY_CHANGED",
+                        "SUPPLY_RUNTIME_NODE_UNAVAILABLE", "SUPPLY_CAPACITY_STALE", "SUPPLY_WORKER_DISCONNECTED",
+                        "pipeline_worker_disconnected", "MODEL_TXN_CLEANUP_PENDING"} or reason in {
+                            "deployment_input_revision_changed", "deployment_input_changed"}
+
+    async def _wait_for_replan(self, operation_id, deadline, *, code="", reason=""):
+        if not self._update(operation_id, status="waiting_capacity", candidate_id="",
+                            reason_code=code or "INTENT_INPUTS_CHANGED",
+                            reason=reason or "Deployment inputs changed; waiting to plan again"):
+            return False
+        while True:
+            self._check_selection_current()
+            if self._record(operation_id)["status"] in TERMINAL:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelSupplyError("INTENT_DEADLINE_EXCEEDED", "Model selection timed out while waiting to plan again")
+            await asyncio.sleep(min(self.poll_interval, remaining))
+            _, pending = self._retirement_state()
+            if not pending:
+                return True
+
     async def _advance(self, operation_id):
         prepare_task = None
         try:
-            deadline = time.monotonic() + self.scheduler._model_supply.get(operation_id)["intent"].get("timeout_seconds", 3600)
+            supply = self.scheduler._model_supply.get(operation_id)
+            saved = self._record(operation_id)
+            remaining = (saved["deadline"] - time.time() if saved.get("deadline") is not None
+                         else supply["intent"].get("timeout_seconds", 3600))
+            deadline = time.monotonic() + max(0, remaining)
             while True:
                 record = self._record(operation_id)
                 if record["status"] in {"cancelled", "failed", "superseded"}:
@@ -391,34 +512,53 @@ class ModelIntentCoordinator:
                 if supply["status"] == "available":
                     break
                 await asyncio.sleep(self.poll_interval)
-            self.scheduler._model_supply.ensure_prepare_not_cancelled(operation_id)
-            if not self._update(operation_id, status="preparing"):
-                return
-            prepare_task = asyncio.create_task(self.prepare(operation_id))
             while True:
-                if self._record(operation_id)["status"] in {"cancelled", "failed", "superseded"}:
-                    return
                 self.scheduler._model_supply.ensure_prepare_not_cancelled(operation_id)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._fail(operation_id, "INTENT_DEADLINE_EXCEEDED", "Model preparation timed out")
+                if not self._update(operation_id, status="preparing"):
                     return
-                if prepare_task.done():
-                    break
-                await asyncio.wait({prepare_task}, timeout=min(self.poll_interval, remaining))
-            result = prepare_task.result()
-            if not self._update(operation_id, candidate_id=result.get("transaction_id", "")):
-                return
-            while True:
-                projected = self.get(operation_id)
-                if projected["status"] in TERMINAL:
-                    self._update(operation_id, status=projected["status"], config_id=projected["config_id"],
-                                 generation=projected["generation"], reason_code=projected["reason_code"], reason=projected["reason"])
+                prepare_task = asyncio.create_task(self.prepare(operation_id))
+                while True:
+                    if self._record(operation_id)["status"] in {"cancelled", "failed", "superseded"}:
+                        return
+                    self.scheduler._model_supply.ensure_prepare_not_cancelled(operation_id)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._fail(operation_id, "INTENT_DEADLINE_EXCEEDED", "Model preparation timed out")
+                        return
+                    if prepare_task.done():
+                        break
+                    await asyncio.wait({prepare_task}, timeout=min(self.poll_interval, remaining))
+                try:
+                    result = prepare_task.result()
+                except Exception as exc:
+                    code = error_code_from_exception(exc) if isinstance(exc, HTTPException) else getattr(exc, "code", "")
+                    if not self._retryable_prepare(code):
+                        raise
+                    detail = getattr(exc, "detail", None)
+                    reason = (detail.get("message", "Waiting for fresh deployment inputs") if isinstance(detail, dict)
+                              else getattr(exc, "message", "Waiting for fresh deployment inputs"))
+                    if not await self._wait_for_replan(operation_id, deadline, code=code, reason=reason):
+                        return
+                    continue
+                if not self._update(operation_id, candidate_id=result.get("transaction_id", "")):
                     return
-                if time.monotonic() >= deadline:
-                    self._fail(operation_id, "INTENT_DEADLINE_EXCEEDED", "Model preparation timed out")
-                    return
-                await asyncio.sleep(self.poll_interval)
+                while True:
+                    projected = self.get(operation_id)
+                    transaction, _ = self._transaction(operation_id, self._record(operation_id).get("candidate_id", ""))
+                    if (projected["status"] == "failed" and self._retryable_prepare(
+                            projected.get("reason_code", ""), (transaction or {}).get("reason", ""))):
+                        if not await self._wait_for_replan(operation_id, deadline,
+                                code=projected.get("reason_code", ""), reason=projected.get("reason", "")):
+                            return
+                        break
+                    if projected["status"] in TERMINAL:
+                        self._update(operation_id, status=projected["status"], config_id=projected["config_id"],
+                                     generation=projected["generation"], reason_code=projected["reason_code"], reason=projected["reason"])
+                        return
+                    if time.monotonic() >= deadline:
+                        self._fail(operation_id, "INTENT_DEADLINE_EXCEEDED", "Model preparation timed out")
+                        return
+                    await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             self._fail(operation_id, "INTENT_MASTER_STOPPED", "The master stopped model selection")
             raise
@@ -431,7 +571,7 @@ class ModelIntentCoordinator:
             # Raw HTTP strings and unexpected exception text stay in diagnostics.
             reason = detail.get("message", "Model preparation failed") if isinstance(detail, dict) else getattr(exc, "message", "Model preparation failed; inspect master diagnostics")
             logger.exception("event=model_intent_prepare_failed operation_id=%s reason_code=%s", operation_id, code)
-            self._fail(operation_id, code, reason)
+            self._fail(operation_id, code, reason, cause=(detail.get("reason_detail") if isinstance(detail, dict) else getattr(exc, "reason_detail", None)))
         finally:
             if prepare_task is not None:
                 await self._drain_prepare(prepare_task)
@@ -453,9 +593,11 @@ class ModelIntentCoordinator:
             try:
                 self._revoke(operation_id)
             finally:
+                record = self._record(operation_id)
                 if current["status"] not in TERMINAL:
-                    self._records[operation_id].update(status="cancelled", reason_code="INTENT_CANCELLED", reason="Model selection cancelled")
-                self._persist_terminal(self._records[operation_id])
+                    record.update(status="cancelled", reason_code="INTENT_CANCELLED", reason="Model selection cancelled")
+                self._records[operation_id] = record
+                self._persist_terminal(record)
             return self.get(operation_id)
 
     async def close(self):

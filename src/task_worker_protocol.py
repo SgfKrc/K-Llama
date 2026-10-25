@@ -10,10 +10,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from task_worker_capabilities import validate_worker_engine_capabilities
+
 try:
-    from .task_provider import canonical_model_engine
+    from .execution_provider import canonical_model_engine
 except ImportError:  # pragma: no cover - top-level import in worker bundles
-    from task_provider import canonical_model_engine
+    from execution_provider import canonical_model_engine
 
 
 PROTOCOL_NAME = "qlh.task_worker"
@@ -83,13 +85,12 @@ _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LAYER_SEGMENT_MODES = frozenset({"head", "middle", "tail"})
 
-# 受支持的推理引擎标识（与 task_provider.ModelIdentity 的校验集保持一致）:
+# 受支持的推理引擎标识（与 execution_provider.ModelIdentity 的校验集保持一致）:
 #   pytorch / llama_cpp   本地引擎
 #   island                TP 孤岛（路线 A，指纹为端点摘要）
 #   external_api          外部推理服务（路线 B，指纹为外部端点摘要）
-#   speculative_assisted  投机解码（路线 C-1，本地 draft + 外部 verify）
 _SUPPORTED_ENGINES = frozenset({
-    "pytorch", "llama_cpp", "island", "external_api", "speculative_assisted",
+    "pytorch", "llama_cpp", "island", "external_api",
 })
 _TEXT_STAGE_TYPES = frozenset({"full_inference", "aggregate", "layer_forward"})
 
@@ -118,7 +119,7 @@ _LAYER_FORWARD_OFFER_FIELDS = {
 #: ⚠️ **不能**并入 `_LAYER_FORWARD_OFFER_FIELDS`：那里的字段集合是**精确**校验（缺失即
 #: `field_mismatch`）⇒ 会把可选字段变成必填、破坏既有对端（实测踩到）。可选字段在
 #: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
-_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions", "prepare_identity"}
+_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions", "prepare_identity", "token_output"}
 
 # Request deadlines are request-scoped and must not be encoded as worker
 # ownership leases. The field is optional so peers without an end-to-end
@@ -161,7 +162,7 @@ _STAGE_CANCELLED_EXECUTION_STATES = frozenset({
 #: 而 `output` / `metadata` 本就是自由对象（仅校验类型与摘要一致性），可安全承载。
 _LAYER_FORWARD_RESULT_FIELDS = {
     "hidden_out_sha256",
-    "token_argmax",
+    "token_argmax", "token_argmax_by_position", "positions", "n_vocab", "n_tokens",
 }
 
 _ENVELOPE_FIELDS = {
@@ -272,6 +273,18 @@ class WorkerMessage:
             "sent_at_ms": self.sent_at_ms,
             "payload": self.payload,
         }
+
+
+class InvalidTokenOutputResult(WorkerProtocolError):
+    """A rejected token group with an otherwise validated result receipt.
+
+    The receipt may only be used to fail its matching pending attempt. Envelope,
+    identity syntax, output digest, metadata and wire size have all been checked.
+    """
+
+    def __init__(self, message: WorkerMessage, error):
+        super().__init__(str(error), code=error.code, field="payload.output." + error.field)
+        self.message = message
 
 
 def _error(code: str, field: str, message: str) -> WorkerProtocolError:
@@ -434,7 +447,6 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
     _require_string(model["model_id"], f"{field}.model_id", pattern=_SAFE_ID)
     # "island": TP 孤岛引擎（网关整请求转发，指纹为端点摘要）
     # "external_api": 外部推理服务（路线 B，指纹为外部端点摘要）
-    # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify）
     engine = _require_string(
         model["engine"], f"{field}.engine", max_length=64,
     )
@@ -512,14 +524,13 @@ def _validate_layer_artifact_diagnostics(value: Any) -> None:
     for index, entry in enumerate(value):
         item_field = f"{field}[{index}]"
         entry = _require_object(entry, item_field)
-        _require_exact_fields(
-            entry,
-            {
-                "error_code", "manifest", "architecture", "mode",
-                "layer_range", "artifact_present",
-            },
-            item_field,
-        )
+        expected_fields = {
+            "error_code", "manifest", "architecture", "mode",
+            "artifact_present",
+        }
+        if "layer_range" in entry:
+            expected_fields.add("layer_range")
+        _require_exact_fields(entry, expected_fields, item_field)
         error_code = _require_string(
             entry["error_code"], f"{item_field}.error_code",
             pattern=_SAFE_CODE, max_length=64,
@@ -545,7 +556,7 @@ def _validate_layer_artifact_diagnostics(value: Any) -> None:
                 "mode must be empty or one of head, middle, tail",
             )
         _require_bool(entry["artifact_present"], f"{item_field}.artifact_present")
-        layer_range = entry["layer_range"]
+        layer_range = entry.get("layer_range")
         if layer_range is None:
             continue
         if (
@@ -570,6 +581,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # Optional for backwards compatibility with existing PC workers. Android
     # workers are admitted only when this gate is present and explicitly true;
     # the scheduler performs that role-specific check after hello validation.
+    if "engine_capabilities" in capabilities:
+        expected_fields.add("engine_capabilities")
+    if "load_spec_version" in capabilities:
+        expected_fields.add("load_spec_version")
+        if type(capabilities["load_spec_version"]) is not int or capabilities["load_spec_version"] != 1:
+            raise _error("invalid_capabilities", "payload.capabilities.load_spec_version", "unsupported load policy schema")
     if "resource_gate" in capabilities:
         expected_fields.add("resource_gate")
     if "layer_ranges" in capabilities:
@@ -623,12 +640,21 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   的 dispatch 前预检负责拒绝超预算请求）。两侧必须同时放行。
     if "stage_chunked_input" in capabilities:
         expected_fields.add("stage_chunked_input")
+    if "node_incarnation" in capabilities:
+        expected_fields.add("node_incarnation")
+        _require_string(capabilities["node_incarnation"], "payload.capabilities.node_incarnation")
+    if "stage_kv_cleanup" in capabilities:
+        expected_fields.add("stage_kv_cleanup")
+        _require_bool(capabilities["stage_kv_cleanup"], "payload.capabilities.stage_kv_cleanup")
     # ★ 票 21a（COMM-WIRE-01）：层段 hidden 的**二进制帧**接收能力（可选，默认关）。
     #   声明 `binary_hidden == true` 的对端，才可能收到 `format:"binary"` 的帧
     #   （见 `build_message` 的 `binary_body`）；未声明者继续走 base64 内联，
     #   字节与旧行为一致。与其余可选键同样按「出现才允许」处理 —— 两侧
     #   （主仓这里与 android `TaskWorkerProtocol`）必须**同时**放行，只改一边
     #   会让对端 hello 自校验失败（`segment_mode` 那次实测的静默断连坑）。
+    if "multi_position_argmax" in capabilities:
+        expected_fields.add("multi_position_argmax")
+        _require_bool(capabilities["multi_position_argmax"], "payload.capabilities.multi_position_argmax")
     if "binary_hidden" in capabilities:
         expected_fields.add("binary_hidden")
     _require_exact_fields(
@@ -818,12 +844,25 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "invalid_capabilities", field,
                 "layer_artifacts must not contain duplicate layer_range values",
             )
-        if "layer_ranges" not in capabilities or set(artifact_ranges) != {
-            tuple(item) for item in capabilities.get("layer_ranges", [])
-        }:
+        # ★ 2026-10-23（#117）：`layer_ranges` 是"本节点**能承担**哪些层段"（自裁
+        #   节点声明整域 `[0, total)`），`layer_artifacts` 是"**现成**有哪些段工件"。
+        #   二者**不必相等**：要求相等会把"能自裁、且手上恰好还留着一个旧段"的节点
+        #   直接判为非法 hello。实测 ROG 在一次供给里裁出 `[8,16)` 之后，每次 hello
+        #   都 `invalid_capabilities`，供给便永远停在 `waiting_nodes`。
+        #   正确约束是**包含**：现成工件必须落在声明的可承担区间内。
+        advertised_ranges = [
+            (int(item[0]), int(item[1]))
+            for item in capabilities.get("layer_ranges", [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        ] if "layer_ranges" in capabilities else []
+        covered = all(
+            any(lo <= start and end <= hi for lo, hi in advertised_ranges)
+            for start, end in artifact_ranges
+        )
+        if "layer_ranges" not in capabilities or not covered:
             raise _error(
                 "invalid_capabilities", field,
-                "layer_artifacts and layer_ranges must advertise the same ranges",
+                "every layer_artifact range must be covered by layer_ranges",
             )
         if (
             "segment_mode" in capabilities
@@ -935,6 +974,13 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         )
     if "resource_gate" in capabilities:
         _validate_resource_gate(capabilities["resource_gate"])
+    try:
+        validate_worker_engine_capabilities(capabilities)
+    except (ValueError, TypeError) as exc:
+        raise _error(
+            "invalid_capabilities", "payload.capabilities.engine_capabilities", str(exc),
+        ) from exc
+
 
 
 def _validate_resource_gate(value: Any) -> None:
@@ -1200,6 +1246,11 @@ def _validate_payload(
                             f"invalid_{field}", f"payload.{field}[{index}]",
                             f"{field} entries must be non-negative integers",
                         )
+            from qlh_core.contracts.token_output import validate_token_output_request, TokenOutputError
+            try:
+                validate_token_output_request(payload, root_input)
+            except TokenOutputError as exc:
+                raise _error(exc.code, "payload." + exc.field, str(exc)) from exc
         elif "layer_range" in payload or "handoff_at" in payload:
             # 非层段 stage 不得携带层段字段（精确字段集已拦，这里是双保险）
             raise _error(
@@ -1406,6 +1457,12 @@ def validate_message(
         raise _error(
             "message_too_large", "message", "message exceeds maximum size"
         )
+    if message_type == "stage_result":
+        from qlh_core.contracts.token_output import validate_token_output, TokenOutputError
+        try:
+            validate_token_output(payload["output"])
+        except TokenOutputError as exc:
+            raise InvalidTokenOutputResult(message, exc) from exc
     return message
 
 

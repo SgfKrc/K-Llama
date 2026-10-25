@@ -33,9 +33,16 @@ class _Manager:
         }
 
     def load_layer_range(self, **kwargs):
+        if "load_spec" in kwargs:
+            import torch
+            self.quant_type = kwargs["quant_type"]
+            self.model = torch.nn.Linear(2, 2, bias=False).to(dtype=getattr(torch, kwargs["load_spec"]["dtype"]))
         self.layer_range = (kwargs["start_layer"], kwargs["end_layer"])
         self.is_loaded = True
         return {"success": True}
+
+    def get_device(self):
+        return "cpu"
 
     def unload_model(self):
         self.unload_attempts += 1
@@ -328,7 +335,7 @@ def test_unpublished_candidate_invalidation_still_aborts(retirement_case, phase)
 
 
 @pytest.mark.parametrize("action", ["abort", "finalize"])
-def test_restart_drops_master_runtime_debt_but_preserves_remote_identity(retirement_case, action):
+def test_restart_retains_master_debt_until_independent_process_end_evidence(retirement_case, action, monkeypatch):
     import local_store
     from model_host import ModelHost
     from scheduler_pipeline import _PIPELINE_LIFECYCLE_STATE_KEY
@@ -361,7 +368,10 @@ def test_restart_drops_master_runtime_debt_but_preserves_remote_identity(retirem
     assert restarted._pipeline_recovery_pending is False
     assert restarted._pipeline_load_transaction is None
     assert restarted._host.pipeline_candidate_status()["phase"] == "idle"
-    assert set(restarted._pipeline_model_cleanup_ledger) == {remote["cleanup_id"]}
+    assert len(restarted._pipeline_model_cleanup_ledger) == 2
+    local, = [record for record in restarted._pipeline_model_cleanup_ledger.values() if record["node_id"] == "master"]
+    assert restarted._dispatch_pipeline_model_cleanup(local) is False
+    assert local["process_boot_id"] == master._model_control.boot_id
     restored = restarted._pipeline_model_cleanup_ledger[remote["cleanup_id"]]
     for key in (
         "cleanup_id", "node_id", "candidate_config_id", "assignment_id",
@@ -377,8 +387,8 @@ def test_restart_drops_master_runtime_debt_but_preserves_remote_identity(retirem
         model_path=str(case.model_path), quant_type="fp16",
     )
     assert blocked["reason_code"] == "MODEL_TXN_CLEANUP_PENDING"
-    assert blocked["transaction_id"] == "cfg-remote"
-    assert restarted._replay_pipeline_model_cleanup_for_node("master") is False
+    assert blocked["transaction_id"] == "candidate-dead-master"
+    assert restarted._replay_pipeline_model_cleanup_for_node("master") is True
     assert restarted._replay_pipeline_model_cleanup_for_node("worker") is True
     assert restarted_case.sent == [("worker", remote["payload"])]
     assert remote["cleanup_id"] in restarted._pipeline_model_cleanup_ledger
@@ -388,5 +398,13 @@ def test_restart_drops_master_runtime_debt_but_preserves_remote_identity(retirem
     }) is False
     assert remote["cleanup_id"] in restarted._pipeline_model_cleanup_ledger
     assert _ack_cleanup(restarted, restored)
+    assert set(restarted._pipeline_model_cleanup_ledger) == {local["cleanup_id"]}
+    import psutil
+    def ended(_pid):
+        raise psutil.NoSuchProcess(_pid)
+    original_process = psutil.Process
+    monkeypatch.setattr(psutil, "Process", ended)
+    assert restarted._dispatch_pipeline_model_cleanup(local) is True
     assert restarted._pipeline_model_cleanup_ledger == {}
+    monkeypatch.setattr(psutil, "Process", original_process)
     assert _start_candidate(case, "candidate-after-restart", master=restarted)["admitted"] is True

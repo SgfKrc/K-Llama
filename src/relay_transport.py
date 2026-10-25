@@ -68,7 +68,7 @@ RELAY_PROTOCOL_ERROR = "relay_protocol_error"
 RELAY_TRANSPORT_ERROR = "relay_transport_error"
 RELAY_INTERNAL_ERROR = "relay_internal_error"
 RELAY_RUNNER_ERROR = "runner_failed"
-REQUEST_DEADLINE_EXCEEDED = 'request_deadline_exceeded'
+from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED
 _RELAY_ERROR_CODES = frozenset({
     "client_closed",
     "connection_closed_mid_frame",

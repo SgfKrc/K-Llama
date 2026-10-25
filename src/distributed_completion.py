@@ -38,8 +38,8 @@ def validate_distributed_completion(
         raise DistributedCompletionError(
             f"发行 profile 不允许 execution_mode={execution_mode or '<missing>'}"
         )
-    if execution_mode == "route_a_stage_offer_v3" and not any(
+    if execution_mode == "distributed_pipeline" and not any(
         values.get(key)
         for key in ("workers_used", "layer_assignments", "layer_segments", "claimed_layers")
     ):
-        raise DistributedCompletionError("Route-A 成功结果缺少 worker/层段执行证据")
+        raise DistributedCompletionError("线性接力成功结果缺少 worker/层段执行证据")

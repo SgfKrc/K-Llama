@@ -166,6 +166,11 @@ def _quality_args(*, junitxml: Path, order_seed: int) -> list[str]:
     return [
         "--junitxml",
         str(junitxml),
+        # 刻意覆盖 pytest.ini 的 --maxfail=3：质量门这一趟必须跑完再汇总，
+        # 否则 pytest 提前停止后 <testsuite tests=N> 仍写全部收集数、而 <testcase>
+        # 只有已执行的，summarize_test_channels 会判 "JUnit tests count disagrees"
+        # 并放弃解析。**不要删这一项**（2026-10-24 曾误以为它缺失而在 _unit_args 里
+        # 重复追加了一次，见该提交说明）。
         "--maxfail=0",
         "--tb=long",
         "--qlh-order-seed",
@@ -197,6 +202,9 @@ def _unit_args(
         arguments.extend(["-n", str(workers), "--dist", dist])
     if junitxml is not None and order_seed is not None:
         arguments.extend(_quality_args(junitxml=junitxml, order_seed=order_seed))
+    # 注意：这里**不要**再追加 --maxfail=0。_quality_args 已经带了它，重复追加会
+    # 移动参数位置并破坏 test_test_channel_unit_args_can_enable_true_concurrency 的
+    # args[-6:] 断言（2026-10-24 实际发生过）。
     return arguments
 
 

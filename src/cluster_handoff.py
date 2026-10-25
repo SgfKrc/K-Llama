@@ -228,7 +228,9 @@ class HandoffCoordinator:
         now_ms: int | None = None,
         lease_id: str | None = None,
     ) -> HandoffRecord:
-        now = _now_ms(now_ms)
+        from qlh_core.control.clock import operation_clock
+        read_clock = operation_clock(now_ms)
+        now = read_clock()
         with self._lock:
             record = self._record
             if record is None:
@@ -257,7 +259,7 @@ class HandoffCoordinator:
             outcome = self.collector.acquire(
                 record.new_leader_id,
                 available_voter_ids=tuple(available_voter_ids),
-                now_ms=now,
+                now_ms=read_clock(),
                 lease_id=lease_id,
             )
         except (ControlContractError, ValueError, RuntimeError) as exc:
@@ -280,13 +282,13 @@ class HandoffCoordinator:
         certificate = outcome.certificate
         try:
             if self.new_role_controller is not None:
-                decision = self.new_role_controller.consume_certificate(certificate, now_ms=now, outcome=outcome)
+                decision = self.new_role_controller.consume_certificate(certificate, now_ms=read_clock(), outcome=outcome)
                 if not decision.accepted or decision.state != "leader":
                     raise HandoffError("handoff_target_rejected", decision.reason)
             elif self.fence is not None:
-                self.fence.install_certificate(certificate, now_ms=now)
+                self.fence.install_certificate(certificate, now_ms=read_clock())
             else:
-                self.authority.install_certificate(certificate, now_ms=now)
+                self.authority.install_certificate(certificate, now_ms=read_clock())
         except (HandoffError, ControlContractError, TypeError, ValueError) as exc:
             reason_text = getattr(exc, "code", "handoff_target_rejected")
             with self._lock:

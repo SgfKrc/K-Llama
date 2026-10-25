@@ -66,6 +66,7 @@ jobs:
             requirements-test.txt
 
       - name: Install test dependencies
+        id: deps
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-test.txt
@@ -73,6 +74,7 @@ jobs:
       # The native argmax regression compiles the real shim, without weights.
       # Fetch only locked headers; the patched vendor commit need not be hosted.
       - name: Prepare pinned native test headers
+        id: native-headers
         run: |
           python -B - <<'PY'
           import hashlib
@@ -100,10 +102,18 @@ jobs:
           git("apply", "--include=include/llama.h", str(patch_path))
           PY
 
+      - name: Run refactor import and write boundary gate
+        run: python -B scripts/check_refactor_boundaries.py
+
       - name: Run documentation checks
         run: python -B scripts/run_doc_checks.py
 
+      # 质量门（边界门 / 文档门）失败**不得连带废掉测试门**。
+      # 2026-10-18 起文档门因「链接指向未检出子模块」连挂 8 次，而它排在测试之前，
+      # 导致 pytest 通道被 skip 五天（run#46 起 tests 恒为 skipped），本 workflow 的存在意义
+      # 归零。故测试只以「依赖与 pinned native 头就绪」为前置条件，与质量门结论解耦。
       - name: Run test channels（unit -> external）
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && steps.native-headers.outcome == 'success' }}
         env:
           QLH_STATE_DIR: ${{ runner.temp }}/qlh-core-ci/state
           QLH_SQLITE_PATH: ${{ runner.temp }}/qlh-core-ci/local-store.sqlite3

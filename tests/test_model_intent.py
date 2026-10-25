@@ -28,7 +28,7 @@ class Supply:
             raise ModelSupplyError("SUPPLY_MASTER_REQUIRED", "master required")
         if not self.scheduler.get_distributed_inference_enabled():
             raise ModelSupplyError("SUPPLY_LOCAL_MODE", "local mode")
-    def create(self, intent, *, wait_for_nodes=False):
+    def create(self, intent, *, wait_for_nodes=False, idempotency_key=""):
         self._check_master()
         assert wait_for_nodes
         op_id = "supply_" + format(len(self.operations) + 1, "032x")
@@ -50,9 +50,26 @@ class Supply:
             self.operations[op_id]["status"] = "cancelled"
 
 
+class IntentOwner:
+    """Selection repository test double; native barriers have separate real-owner tests."""
+    boot_id = "intent-test"
+    def __init__(self):
+        self.state = {"boot_id":self.boot_id,"revision":0,"operations":{},"supplies":{},
+            "selected_operation":"", "commit_scope":"test"}
+    def runnable(self, *args, **kwargs): return True
+    def start(self): return self.snapshot()
+    def snapshot(self): return deepcopy(self.state)
+    def save_operation(self, record, *, select=False, **options):
+        self.state["revision"] += 1
+        self.state["operations"][record["operation_id"]] = deepcopy(record)
+        if select: self.state["selected_operation"] = record["operation_id"]
+    def fence_operation_failure(self, record): self.save_operation(record)
+
+
 def setup(tmp_path, prepare, *, retire=None, retire_timeout=300):
     supply = Supply(tmp_path)
-    scheduler = SimpleNamespace(_model_supply=supply, _layer_config_lock=threading.RLock(),
+    scheduler = SimpleNamespace(_model_supply=supply, _model_control=IntentOwner(), _model_control_authority=lambda: {}, _model_control_connections=lambda: {},
+                                _model_control_input_revisions=lambda transaction: {}, _layer_config_lock=threading.RLock(),
                                 _pipeline_load_transaction=None, _active_pipeline_capacity_plan=None,
                                 _pipeline_model_cleanup_ledger={}, _worker_assignments=WorkerAssignmentRegistry(),
                                 _effective_role=lambda: "master", get_distributed_inference_enabled=lambda: True,
@@ -124,7 +141,7 @@ def test_one_selection_automatically_supplies_then_prepares_but_files_are_not_re
         assert "master_model_path" not in ready
         assert not c._tasks
         scheduler._pipeline_load_transaction = None
-        assert c.get(op_id)["status"] == "superseded" and not c.get(op_id)["loaded_ready"]
+        assert c.get(op_id)["status"] == "ready" and not c.get(op_id)["loaded_ready"]
     asyncio.run(scenario())
 
 
@@ -137,10 +154,11 @@ def test_same_pending_selection_is_idempotent_and_other_selection_cannot_enter_p
         first = await c.create(intent)
         assert (await c.create(intent))["operation_id"] == first["operation_id"]
         supply.operations[first["operation_id"]]["status"] = "available"
-        with pytest.raises(ModelSupplyError) as error:
-            await c.create({"model_id": "other"})
-        assert error.value.code == "INTENT_OPERATION_BUSY"
-        c.cancel(first["operation_id"])
+        replacement = await c.create({"model_id": "other"})
+        assert replacement["operation_id"] != first["operation_id"]
+        assert c.get(first["operation_id"])["status"] == "superseded"
+        assert first["operation_id"] in supply.cancellations
+        c.cancel(replacement["operation_id"])
         await finish_tasks(c)
     asyncio.run(scenario())
 
@@ -207,9 +225,8 @@ def test_master_restart_does_not_replay_prepare_or_claim_old_ready(tmp_path):
         c, scheduler, supply = setup(tmp_path, prepare)
         op_id = (await c.create({"model_id": "fixture"}))["operation_id"]
         await finish_tasks(c)
-        # Simulate a crash with the durable invocation still pending.
-        path = tmp_path / op_id / "intent.json"
-        path.write_text(json.dumps({"operation_id": op_id, "status": "preparing"}))
+        # Recovery is an explicit owner command; GET only projects its terminal.
+        scheduler._model_control.state["operations"][op_id].update(status="failed", reason_code="INTENT_MASTER_RESTARTED")
         recovered = ModelIntentCoordinator(scheduler, prepare)
         assert recovered.current()["reason_code"] == "INTENT_MASTER_RESTARTED"
         assert recovered._tasks == {}
@@ -234,6 +251,11 @@ def native_intent(stage_case, monkeypatch):
     from api.routes_model_supply import prepare_supply
     case = stage_case
     supply = case.master._model_supply
+    snapshot_worker = case.master._task_worker_control.worker_snapshot
+    def worker_snapshot(node):
+        value = snapshot_worker(node) or {}
+        return {**value, "capabilities": {**value.get("capabilities", {}), "node_incarnation":node+"-boot", "stage_kv_cleanup":True, "load_spec_version":1}}
+    monkeypatch.setattr(case.master._task_worker_control, "worker_snapshot", worker_snapshot)
     # stage_case substitutes receipt lookup for its native-only tests. Restore
     # the actual lookup, cancellation events, and selected-asset prepare guard.
     monkeypatch.setattr(supply, "get", lambda op: ModelSupplyCoordinator.get(supply, op))
@@ -281,8 +303,8 @@ async def wait_until(predicate):
         "pipeline_remote_capacity_stale", "Worker capacity is stale", id="header-precedes-detail"),
     pytest.param(HTTPException(409, {"code": "SUPPLY_OPERATION_STALE", "message": "Selected asset changed"}),
         "SUPPLY_OPERATION_STALE", "Selected asset changed", id="legacy-detail-code"),
-    pytest.param(HTTPException(409, {"reason_code": "SUPPLY_WORKER_DISCONNECTED", "message": "Worker disconnected"}),
-        "SUPPLY_WORKER_DISCONNECTED", "Worker disconnected", id="legacy-detail-reason-code"),
+    pytest.param(HTTPException(409, {"reason_code": "SUPPLY_RECEIPT_MISMATCH", "message": "Worker returned another artifact"}),
+        "SUPPLY_RECEIPT_MISMATCH", "Worker returned another artifact", id="legacy-detail-reason-code"),
     pytest.param(ModelSupplyError("SUPPLY_PREPARE_CANCELLED", "Model preparation cancelled by user"),
         "SUPPLY_PREPARE_CANCELLED", "Model preparation cancelled by user", id="supply-error"),
     pytest.param(CodedHTTPException(400, "MODEL_TXN_PREPARE_FAILED",
@@ -319,7 +341,7 @@ def test_prepare_exception_preserves_code_and_safe_terminal_reason(native_intent
             with pytest.raises(ModelSupplyError) as cancelled:
                 supply.ensure_prepare_not_cancelled(op)
             assert cancelled.value.code == "SUPPLY_PREPARE_CANCELLED"
-            persisted = json.loads((c.root / op / "intent.json").read_text(encoding="utf-8"))
+            persisted = c.scheduler._model_control.snapshot()["operations"][op]
             recovered = ModelIntentCoordinator(case.master, prepare)
             for result in (c.get(op), c.current(), persisted, recovered.current()):
                 assert result["status"] == "failed"
@@ -364,7 +386,7 @@ def test_real_prepare_route_failure_keeps_code_without_private_details(native_in
                 assert case.host.pipeline_candidate_status()["phase"] == "aborted"
             assert master._active_pipeline_capacity_plan is None
             assert supply._events[op].is_set() and not supply._preparing and not c._tasks
-            persisted = json.loads((c.root / op / "intent.json").read_text(encoding="utf-8"))
+            persisted = c.scheduler._model_control.snapshot()["operations"][op]
             for result in (c.get(op), c.current(), persisted):
                 assert result["status"] == "failed"
                 assert result["reason_code"] == expected_code
@@ -382,12 +404,11 @@ def test_create_disk_failure_revokes_supply_and_allows_explicit_retry(native_int
     async def scenario():
         case = native_intent
         c, supply = case.coordinator, case.supply
-        original = Path.replace
-        def broken_replace(path, target):
-            if Path(target).name == failed_file:
-                raise OSError("injected disk failure")
-            return original(path, target)
-        monkeypatch.setattr(Path, "replace", broken_replace)
+        owner = case.master._model_control
+        original = owner.save_operation
+        def broken_save(*args, **kwargs):
+            raise OSError("injected atomic selection commit failure")
+        monkeypatch.setattr(owner, "save_operation", broken_save)
         with pytest.raises(ModelSupplyError) as error:
             await c.create(case.intent)
         assert error.value.code == "INTENT_PERSIST_FAILED"
@@ -395,7 +416,7 @@ def test_create_disk_failure_revokes_supply_and_allows_explicit_retry(native_int
         assert supply._events[old].is_set() and not c._tasks
         assert c.current()["status"] == "failed"
         assert c.current()["reason_code"] == "INTENT_PERSIST_FAILED"
-        monkeypatch.setattr(Path, "replace", original)
+        monkeypatch.setattr(owner, "save_operation", original)
         fresh = await c.create(case.intent)
         assert fresh["operation_id"] != old and fresh["status"] == "queued"
         c.cancel(fresh["operation_id"])
@@ -516,7 +537,7 @@ def test_stop_fences_late_real_threadpool_prepare(native_intent, monkeypatch, st
         else:
             monkeypatch.setattr(master, "start_pipeline_model_transaction", block)
         now = [0.0]
-        monkeypatch.setattr(model_intent, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        monkeypatch.setattr(model_intent, "time", SimpleNamespace(monotonic=lambda: now[0], time=__import__("time").time))
         op = (await c.create(case.intent))["operation_id"]
         task = c._tasks[op]
         case.available(op)
@@ -624,7 +645,7 @@ def test_ready_receipt_remains_authoritative_when_final_projection_save_fails(na
         ack(case.master, "android", "commit")
         await task
         projected = c.get(op)
-        assert projected["status"] == "ready" and projected["loaded_ready"]
+        assert projected["status"] == "ready" and projected["loaded_ready"], json.dumps(projected)
         assert not c._tasks
         assert case.master._pipeline_load_transaction["phase"] == "ready"
         assert case.host.pipeline_candidate_status()["phase"] == "finalized"
@@ -665,8 +686,8 @@ def test_persisted_ready_never_grants_readiness_after_owner_retirement(tmp_path,
             scheduler.get_distributed_inference_enabled = lambda: False
         recovered = ModelIntentCoordinator(scheduler, lambda op: pytest.fail("old prepare was replayed"))
         projected = recovered.current()
-        assert projected["status"] == "superseded" and not projected["loaded_ready"]
-        assert projected["reason_code"] == "INTENT_PLAN_RETIRED" and not recovered._tasks
+        assert projected["status"] == "ready" and not projected["loaded_ready"]
+        assert projected["deployment_reason_code"] == "INTENT_PLAN_RETIRED" and not recovered._tasks
     asyncio.run(scenario())
 
 
@@ -687,6 +708,7 @@ def ready_intent(tmp_path):
     scheduler._pipeline_load_transaction["expected"]["worker"] = assignment
     scheduler._pipeline_load_transaction["worker_ids"].add("worker")
     publish_ready(scheduler)
+    c._persist(c._records[op])
     return SimpleNamespace(c=c, scheduler=scheduler, supply=supply, op=op)
 
 
@@ -702,9 +724,59 @@ def test_ready_projection_rejects_same_node_reconnect_without_fresh_native_commi
         case.scheduler._worker_assignments.begin(node, config_id="config", connection_generation=12, expected_config=old)
     for read in (lambda: case.c.get(case.op), case.c.current):
         result = read()
-        assert result["status"] == "superseded" and not result["loaded_ready"]
-        assert result["reason_code"] == "worker_native_ready_identity_mismatch"
+        assert result["status"] == "ready" and not result["loaded_ready"]
+        assert result["deployment_reason_code"] == "worker_native_ready_identity_mismatch"
     assert case.scheduler._pipeline_load_transaction["phase"] == "ready"
+
+
+def test_reselect_ready_intent_keeps_native_plan_without_supply_or_prepare(ready_intent):
+    async def scenario():
+        case = ready_intent
+        initial = case.c.current()
+        old_transaction = case.scheduler._pipeline_load_transaction
+        old_plan = case.scheduler._active_pipeline_capacity_plan
+        selected = await case.c.create(initial["intent"])
+        assert selected["operation_id"] == case.op
+        assert selected["loaded_ready"] and selected["runnable"]
+        assert case.scheduler._pipeline_load_transaction is old_transaction
+        assert case.scheduler._active_pipeline_capacity_plan is old_plan
+        assert len(case.supply.operations) == 1
+        assert not case.supply.cancellations and not case.c._tasks
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["model", "options", "reconnect", "join", "cleanup", "retired", "key"])
+def test_reselect_ready_intent_rebuilds_when_live_inputs_change(ready_intent, change):
+    async def scenario():
+        case = ready_intent
+        requested = deepcopy(case.c.current()["intent"])
+        retired = []
+        async def retire():
+            retired.append(case.op)
+            case.scheduler._pipeline_load_transaction = None
+            case.scheduler._active_pipeline_capacity_plan = None
+            case.scheduler._pipeline_model_cleanup_ledger.clear()
+        case.c.retire = retire
+        if change == "model":
+            requested["model_id"] = "replacement"
+        elif change == "options":
+            requested["engine"] = "llama_cpp"
+        elif change == "reconnect":
+            case.scheduler._assignment_connection_generation = lambda node: 12
+        elif change == "join":
+            case.scheduler._connected_client_ids = lambda: {"tail", "worker", "new-worker"}
+        elif change == "cleanup":
+            case.scheduler._pipeline_model_cleanup_ledger["cleanup"] = {"node_id": "master"}
+        elif change == "retired":
+            case.scheduler._active_pipeline_capacity_plan = None
+        selected = await case.c.create(requested, **({"idempotency_key": "new-selection"} if change == "key" else {}))
+        assert selected["operation_id"] != case.op
+        assert not selected["loaded_ready"]
+        assert retired == [case.op]
+        assert len(case.supply.operations) == 2
+        case.c.cancel(selected["operation_id"])
+        await finish_tasks(case.c)
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("evidence", ["owner_missing", "owner_error", "missing_worker", "empty_expected",
@@ -742,8 +814,8 @@ def test_ready_projection_fails_closed_without_every_native_owner_proof(ready_in
             expected_config=assignment, acknowledgement=receipt)
         scheduler._worker_assignments.transition("worker", phase=PHASE_READY)
     result = case.c.current()
-    assert result["status"] == "superseded" and not result["loaded_ready"]
-    assert result["reason_code"]
+    assert result["status"] == "ready" and not result["loaded_ready"]
+    assert result["deployment_reason_code"]
 
 
 def test_normal_ready_and_reconnect_with_all_new_native_receipts_remain_ready(ready_intent):
@@ -760,7 +832,7 @@ def test_terminal_ready_is_superseded_instead_of_waiting_on_new_hello_transactio
     case.scheduler._pipeline_load_transaction["phase"] = "preparing"
     for _ in range(3):
         result = case.c.current()
-        assert result["status"] == "superseded" and result["reason_code"] == "INTENT_PLAN_RETIRED"
+        assert result["status"] == "ready" and result["deployment_reason_code"] == "INTENT_PLAN_RETIRED"
         assert not result["loaded_ready"] and not case.c._tasks
 
 
@@ -910,9 +982,9 @@ def test_selection_waits_real_owner_cleanup_before_new_inventory_and_serializes_
         await entered.wait()
         same = asyncio.create_task(case.c.create(intent))
         other = asyncio.create_task(case.c.create({"model_id": "other"}))
-        assert case.c.current()["status"] == "superseded" and not case.c.current()["loaded_ready"]
+        assert case.c.current()["status"] == "ready" and not case.c.current()["loaded_ready"]
         # Reads from another thread must not block behind an RLock held across await.
-        assert (await asyncio.wait_for(asyncio.to_thread(case.c.current), timeout=1))["status"] == "superseded"
+        assert (await asyncio.wait_for(asyncio.to_thread(case.c.current), timeout=1))["status"] == "ready"
         assert len(case.supply.operations) == 1
         released.set()
         await local_free.wait()
@@ -922,11 +994,11 @@ def test_selection_waits_real_owner_cleanup_before_new_inventory_and_serializes_
         case.scheduler._pipeline_model_cleanup_ledger.clear()
         fresh = await first
         assert (await same)["operation_id"] == fresh["operation_id"]
-        with pytest.raises(ModelSupplyError) as error:
-            await other
-        assert error.value.code == "INTENT_OPERATION_BUSY"
-        assert retire_calls == [case.op] and len(case.supply.operations) == 2
-        case.c.cancel(fresh["operation_id"])
+        replacement = await other
+        assert replacement["operation_id"] != fresh["operation_id"]
+        assert case.c.get(fresh["operation_id"])["status"] == "superseded"
+        assert retire_calls == [case.op] and len(case.supply.operations) == 3
+        case.c.cancel(replacement["operation_id"])
         await case.c.close()
     asyncio.run(scenario())
 
@@ -1070,4 +1142,85 @@ def test_unassigned_inventory_candidate_never_projects_as_loaded_participant(tmp
         if ready:
             assert all(node["status"] == "ready" for node in result["nodes"].values())
         await finish_tasks(c)
+    asyncio.run(scenario())
+
+
+def test_input_revision_change_replans_same_operation_after_exact_cleanup(tmp_path):
+    async def scenario():
+        calls = []
+        async def prepare(op_id):
+            calls.append(op_id)
+            scheduler._pipeline_load_transaction = transaction(op_id)
+            if len(calls) == 1:
+                scheduler._pipeline_load_transaction.update(phase="aborted", reason_code="pipeline_global_commit_failed",
+                    reason="deployment_input_revision_changed")
+                scheduler._pipeline_model_cleanup_ledger["old-runtime"] = {"node_id": "tail"}
+            return {"transaction_id": "candidate"}
+        c, scheduler, supply = setup(tmp_path, prepare)
+        op = (await c.create({"model_id": "fixture", "timeout_seconds": 30}))["operation_id"]
+        supply.operations[op]["status"] = "available"
+        await wait_until(lambda: c.get(op)["status"] == "waiting_capacity")
+        assert calls == [op] and len(supply.operations) == 1
+        scheduler._pipeline_model_cleanup_ledger.clear()  # Exact owner cleanup boundary fixture.
+        await wait_until(lambda: len(calls) == 2)
+        publish_ready(scheduler)
+        await c._tasks[op]
+        assert c.get(op)["status"] == "ready"
+        assert calls == [op, op] and len(supply.operations) == 1
+        await c.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline", "close"])
+def test_retryable_disconnect_keeps_cause_and_original_deadline(native_intent, stop):
+    async def scenario():
+        case = native_intent
+        c = case.coordinator
+        async def prepare(operation_id):
+            raise ModelSupplyError("SUPPLY_WORKER_DISCONNECTED", "Worker disconnected")
+        c.prepare = prepare
+        op = (await c.create({**case.intent, "timeout_seconds": 1 if stop == "deadline" else 30}))["operation_id"]
+        task = c._tasks[op]
+        case.master._pipeline_model_cleanup_ledger["waiting-runtime"] = {"node_id": "worker"}
+        case.available(op)
+        await wait_until(lambda: c.get(op)["status"] == "waiting_capacity")
+        result = c.get(op)
+        assert result["reason_code"] == "SUPPLY_WORKER_DISCONNECTED"
+        assert result["reason"] == "Worker disconnected"
+        assert result["commit_scope"] == "local_sqlite" and result["durable"] is True
+        assert result["runnable"] is False and result["boot_id"]
+        if stop == "cancel":
+            c.cancel(op)
+        elif stop == "close":
+            await c.close()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
+        result = c.get(op)
+        expected = {"cancel": "INTENT_CANCELLED", "deadline": "INTENT_DEADLINE_EXCEEDED", "close": "INTENT_MASTER_STOPPED"}[stop]
+        assert result["reason_code"] == expected
+        assert result["runnable"] is False
+        assert len(case.master._model_control.snapshot()["operations"]) == 1
+        await c.close()
+    asyncio.run(scenario())
+
+
+def test_second_selection_coordinator_reuses_durable_idempotency_receipt(native_intent):
+    async def scenario():
+        case = native_intent
+        first = case.coordinator
+        second = ModelIntentCoordinator(case.master, first.prepare)
+        try:
+            one = await first.create(case.intent, idempotency_key="same-user-key")
+            two = await second.create(case.intent, idempotency_key="same-user-key")
+            assert one["operation_id"] == two["operation_id"]
+            assert not second._tasks
+            state = case.master._model_control.snapshot()
+            assert len(state["operations"]) == len(state["supplies"]) == 1
+            case.supply._operations[one["operation_id"]]["reason_code"] = "UNCOMMITTED_CACHE"
+            assert case.supply.get(one["operation_id"])["reason_code"] != "UNCOMMITTED_CACHE"
+            with pytest.raises(ModelSupplyError) as conflict:
+                await second.create({**case.intent, "model_id": "another-model"}, idempotency_key="same-user-key")
+            assert conflict.value.code == "INTENT_IDEMPOTENCY_CONFLICT"
+        finally:
+            await first.close()
+            await second.close()
     asyncio.run(scenario())

@@ -31,7 +31,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 from transformers import AutoTokenizer
 
 from model_module import ModelManager
-from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState, NodeRole
+from scheduler import Scheduler, NodeInfo, NodeState, NodeRole
 
 # 用最小的 Qwen2 config，无需真实模型文件
 TINY_VOCAB_SIZE = 32000
@@ -156,19 +156,6 @@ class TestDistributedInferenceWorkflow:
         assert result["response"] == ""
         assert result["reason_code"] == "distributed_full_model_forbidden"
 
-    def test_fallback_inference_produces_response(self, scheduler, mgr):
-        """无流水线节点时，回退到全模型推理，应返回非空 response。"""
-        scheduler._tcp_server = None  # 确保无 TCP server，走回退
-        result = scheduler._run_full_model_inference(
-            prompt="Hello, how are you?",
-            max_new_tokens=32,
-            temperature=0.7,
-            top_p=0.9,
-        )
-        assert isinstance(result, dict)
-        assert "response" in result
-        assert len(result["response"]) > 0
-        assert "error" not in result
 
     def test_fallback_refuses_partial_artifact(self, scheduler, mgr, monkeypatch):
         """★ #38（2026-10-06）：master 只持有裁层工件时，整模回退必须 fail-closed。
@@ -198,60 +185,9 @@ class TestDistributedInferenceWorkflow:
         #   不是 reason_code；这里断言的是该分支的具名标识。
         assert "refusing_full_model_fallback_with_partial_artifact" in result["error"]
 
-    def test_stream_fallback_refuses_partial_artifact(self, scheduler, mgr, monkeypatch):
-        """#38: streaming fallback must reject a partial GGUF too."""
-        monkeypatch.setattr(
-            mgr,
-            "get_pipeline_descriptor",
-            lambda: {"lm_head": False, "assignment_layer_range": [0, 8]},
-            raising=False,
-        )
-        events = list(
-            scheduler._run_full_model_inference_stream(
-                prompt="Hello, how are you?",
-                max_new_tokens=8,
-            )
-        )
-        assert events
-        assert events[-1]["done"] is True
-        assert "refusing_full_model_fallback_with_partial_artifact" in events[-1]["error"]
 
-    def test_fallback_inference_with_metrics(self, scheduler, mgr):
-        """回退推理应返回 metrics（包含 mode 字段）。"""
-        result = scheduler._run_full_model_inference(
-            prompt="What is AI?",
-            max_new_tokens=16,
-        )
-        assert "metrics" in result
-        assert "mode" in result["metrics"]
 
-    def test_fallback_inference_empty_prompt(self, scheduler, mgr):
-        """空 prompt 也应安全返回。"""
-        result = scheduler._run_full_model_inference(
-            prompt="",
-            max_new_tokens=8,
-        )
-        assert "response" in result
-        assert "error" not in result
 
-    def test_fallback_inference_streaming_callback(self, scheduler, mgr):
-        """流式回调应逐 token 推送并接收 done 信号。"""
-        tokens = []
-        done = []
-
-        def cb(event):
-            if "token" in event:
-                tokens.append(event["token"])
-            if "done" in event:
-                done.append(event)
-
-        scheduler._run_full_model_inference(
-            prompt="Hello",
-            max_new_tokens=16,
-            _stream_callback=cb,
-        )
-        assert len(tokens) > 0
-        assert len(done) == 1
 
     def test_run_pipeline_safe_fallback(self, scheduler, mgr):
         """run_pipeline_safe 在无节点时走回退，应成功返回。"""
@@ -263,38 +199,7 @@ class TestDistributedInferenceWorkflow:
         assert isinstance(result, dict)
         assert "response" in result or "error" in result
 
-    def test_queue_worker_inference(self, scheduler, mgr):
-        """队列 worker → _process_queued_pipeline_task → 推理 → 返回结果。"""
-        scheduler._tcp_server = None
-        queue = scheduler.pipeline_queue
-        queue.start(process_fn=scheduler._process_queued_pipeline_task)
-        try:
-            tid = queue.enqueue(prompt="Hello world", max_new_tokens=16)
-            result = queue.wait_for_result(tid, timeout=30)
-            assert result["status"] == "done"
-            assert "response" in result["result"]
-            assert len(result["result"]["response"]) > 0
-        finally:
-            queue.stop()
 
-    def test_multiple_queued_requests(self, scheduler, mgr):
-        """连续入队多个请求，每个都应完成。"""
-        scheduler._tcp_server = None
-        queue = scheduler.pipeline_queue
-        queue.start(process_fn=scheduler._process_queued_pipeline_task)
-        tids = []
-        try:
-            for i in range(3):
-                tids.append(queue.enqueue(
-                    prompt="Quick test",
-                    max_new_tokens=8 + i * 4,
-                ))
-            for tid in tids:
-                r = queue.wait_for_result(tid, timeout=30)
-                assert r["status"] == "done", f"{tid}: {r}"
-                assert "response" in r["result"]
-        finally:
-            queue.stop()
 
 
 # ================================================================
@@ -584,88 +489,6 @@ class TestMasterNodeManagement:
 # ================================================================
 
 
-class TestQueueManagement:
-    """测试 PipelineQueue 的 pause/resume/clear/cancel 操作。"""
-
-    @pytest.fixture
-    def queue(self):
-        q = PipelineQueue(max_size=10, result_ttl=10)
-        return q
-
-    def test_pause_rejects_new_enqueue(self, queue):
-        """暂停后入队应抛 RuntimeError。"""
-        queue.pause()
-        with pytest.raises(RuntimeError, match="已暂停"):
-            queue.enqueue(prompt="test")
-
-    def test_pause_resume_cycle(self, queue):
-        """暂停后恢复应能继续入队。"""
-        queue.pause()
-        with pytest.raises(RuntimeError):
-            queue.enqueue(prompt="blocked")
-        queue.resume()
-        tid = queue.enqueue(prompt="ok")
-        assert tid
-
-    def test_enqueue_does_not_duplicate_explicit_generation_arguments(self, queue):
-        """QueueTask 的显式字段不能再次残留在 _extra_kwargs。"""
-        tid = queue.enqueue(
-            prompt="short", max_new_tokens=64, request_id="req-1",
-        )
-        task = next(task for task in queue._q0 if task.task_id == tid)
-        assert "max_new_tokens" not in task._extra_kwargs
-        assert "request_id" not in task._extra_kwargs
-        assert task.max_new_tokens == 64
-        assert task.request_id == "req-1"
-
-    def test_clear_cancels_all_queued(self, queue):
-        """clear 应取消所有排队任务。"""
-        tids = [queue.enqueue(prompt=f"task{i}") for i in range(5)]
-        count = queue.clear()
-        assert count == 5
-        for tid in tids:
-            r = queue.wait_for_result(tid, timeout=1)
-            assert r["status"] == "cancelled"
-
-    def test_cancel_single_task(self, queue):
-        """cancel_task 应取消指定排队任务。"""
-        tid = queue.enqueue(prompt="will be cancelled")
-        ok = queue.cancel_task(tid)
-        assert ok
-        r = queue.wait_for_result(tid, timeout=1)
-        assert r["status"] == "cancelled"
-
-    def test_cancel_running_task_signals_cooperative_cancellation(self, queue):
-        """执行中任务应收到协作取消信号并立即唤醒等待方。"""
-        import threading
-
-        started = threading.Event()
-        finish = threading.Event()
-        seen_cancel_event = []
-
-        def slow(**kw):
-            seen_cancel_event.append(kw.get("_cancel_event"))
-            started.set()
-            finish.wait(5)
-            return {"response": "ok"}
-
-        queue.start(process_fn=slow)
-        tid = queue.enqueue(prompt="running")
-        started.wait(2)
-        assert queue.cancel_task(tid)
-        result = queue.wait_for_result(tid, timeout=1)
-        assert result["status"] == "cancelled"
-        assert seen_cancel_event and seen_cancel_event[0].is_set()
-        finish.set()
-        queue.stop()
-
-    def test_get_queue_detail_includes_aging_params(self, queue):
-        """get_queue_detail 应包含老化参数和抢占统计。"""
-        detail = queue.get_queue_detail()
-        assert "aging_params" in detail
-        assert "q0_max_tokens" in detail["aging_params"]
-        assert "q1_max_tokens" in detail["aging_params"]
-        assert "preempt_stats" in detail
 
 
 # ================================================================
@@ -673,57 +496,6 @@ class TestQueueManagement:
 # ================================================================
 
 
-class TestSchedulingStrategy:
-    """MLFQ / FIFO 策略切换和老化测试。"""
-
-    @pytest.fixture
-    def queue(self):
-        return PipelineQueue(max_size=20, result_ttl=10, strategy="mlfq")
-
-    def test_mlfq_classifies_short_as_q0(self, queue):
-        """短任务 (≤128 tokens) 应进入 Q0。"""
-        assert queue._classify(64) == 0
-        assert queue._classify(128) == 0
-
-    def test_mlfq_classifies_medium_as_q1(self, queue):
-        """中等任务 (≤512 tokens) 应进入 Q1。"""
-        assert queue._classify(256) == 1
-        assert queue._classify(512) == 1
-
-    def test_mlfq_classifies_long_as_q2(self, queue):
-        """长任务 (>512 tokens) 应进入 Q2。"""
-        assert queue._classify(1024) == 2
-
-    def test_fifo_all_to_q1(self, queue):
-        """FIFO 模式下所有任务应进入 Q1 保持入队顺序。"""
-        queue.set_strategy("fifo")
-        assert queue._classify(64) == 1
-        assert queue._classify(1024) == 1
-
-    def test_set_invalid_strategy_raises(self, queue):
-        """无效策略应抛 ValueError。"""
-        with pytest.raises(ValueError):
-            queue.set_strategy("invalid")
-
-    def test_aging_q2_to_q1(self, queue):
-        """Q2 任务等待超时应自动提升到 Q1。"""
-        old = queue._aging_q2_to_q1
-        queue._aging_q2_to_q1 = 0  # 立即触发老化
-        queue.enqueue(prompt="long", max_new_tokens=600)
-        task = queue._get_next_task()
-        assert task is not None
-        assert task.original_level == 2  # 原始级别为 Q2
-        queue._aging_q2_to_q1 = old
-
-    def test_absolute_aging_max_wait(self, queue):
-        """超绝对上限的任务应被置顶 Q0。"""
-        old = queue._aging_max_wait
-        queue._aging_max_wait = 0
-        queue.enqueue(prompt="long", max_new_tokens=600)
-        task = queue._schedule_next()
-        assert task is not None
-        # 老化后任务级别变化
-        queue._aging_max_wait = old
 
 
 # ================================================================

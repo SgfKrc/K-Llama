@@ -113,24 +113,13 @@ def test_session_calls_quote_path_parameters():
     assert api.find("/sessions/sess%2F1", "DELETE") is not None
 
 
-def test_queue_calls_and_strategy_validation():
-    """队列控制端点 + 非法策略必须被本地拒绝（不发请求）。"""
+def test_fifo_queue_control_calls():
     api = RecordingApi()
     tui_api.pause_queue(api)
     tui_api.resume_queue(api)
-    tui_api.set_queue_strategy(api, "fifo")
     tui_api.clear_queue(api)
-
-    assert api.find("/cluster/queue/pause", "POST") is not None
-    assert api.find("/cluster/queue/resume", "POST") is not None
-    strategy = api.find("/cluster/queue/strategy", "POST")
-    assert strategy is not None and strategy["body"] == {"strategy": "fifo"}
-    assert api.find("/cluster/queue/clear", "POST") is not None
-
-    before = len(api.calls)
-    with pytest.raises(ValueError):
-        tui_api.set_queue_strategy(api, "bogus")
-    assert len(api.calls) == before, "非法策略不得发出请求"
+    for action in ("pause", "resume", "clear"):
+        assert api.find("/cluster/queue/" + action, "POST") is not None
 
 
 def test_list_sessions_accepts_bare_list_and_wrapped():
@@ -415,8 +404,8 @@ def test_write_keys_are_inert_outside_their_page():
     _run(_main())
 
 
-def test_queue_screen_pause_strategy_and_clear():
-    """队列屏：P 直接暂停（可逆），S 需确认，C 需确认且列出将清空内容。"""
+def test_queue_screen_pause_and_clear():
+    """队列屏：P 直接暂停（可逆），C 需确认且列出将清空内容。"""
     async def _main():
         app, api = _make_app()
         async with app.run_test(size=(120, 40)) as pilot:
@@ -427,14 +416,6 @@ def test_queue_screen_pause_strategy_and_clear():
 
             await pilot.press("p")
             assert await _wait_for(pilot, lambda: api.find("/cluster/queue/pause") is not None)
-
-            await pilot.press("s")
-            await pilot.pause()
-            assert isinstance(app.screen, ConfirmScreen)
-            await pilot.press("y")
-            assert await _wait_for(
-                pilot, lambda: api.find("/cluster/queue/strategy") is not None)
-            assert api.find("/cluster/queue/strategy")["body"] == {"strategy": "fifo"}
 
             await pilot.press("c")
             await pilot.pause()

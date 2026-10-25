@@ -36,6 +36,20 @@ def test_model_api_accepts_explicit_remote_cidr():
     assert is_model_api_source_trusted(request, trusted_cidrs="100.64.0.0/10") is True
 
 
+def test_api_server_uses_resolved_runtime_cidrs(monkeypatch):
+    from types import SimpleNamespace
+
+    runtime = SimpleNamespace(resolve_config=lambda: SimpleNamespace(
+        environment_snapshot=lambda: {"QLH_MODEL_API_TRUSTED_CIDRS": "100.64.0.0/10"}
+    ))
+    monkeypatch.setattr(api_server, "_get_app_runtime", lambda: runtime)
+
+    assert api_server.require_model_api_source(_request("100.64.10.20")) == "100.64.10.20"
+    with pytest.raises(HTTPException) as exc:
+        api_server.require_model_api_source(_request("192.0.2.10"))
+    assert exc.value.status_code == 403
+
+
 def test_model_api_rejects_untrusted_source_with_stable_code():
     with pytest.raises(HTTPException) as exc:
         require_model_api_source(_request("192.0.2.10"))

@@ -137,7 +137,7 @@ class TestSwitchModelAfterGgufEngine:
 
 def _callback_set(marker="default"):
     return SchedulerCallbackSet(
-        active_task_graph_model_identity=lambda: marker,
+        active_execution_model_identity=lambda: marker,
         execute_task_worker_stage=lambda request, cancel_event: {"marker": marker},
         build_model_chat_prompt=lambda tokenizer, messages, **kwargs: marker,
         thinking_system_prompt=f"thinking:{marker}",
@@ -162,7 +162,7 @@ class TestSchedulerCallbackInjection:
 
     def test_callback_bundle_keyword_order_does_not_change_wiring(self):
         values = {
-            "active_task_graph_model_identity": lambda: "identity",
+            "active_execution_model_identity": lambda: "identity",
             "execute_task_worker_stage": lambda request, cancel_event: {"ok": True},
             "build_model_chat_prompt": lambda tokenizer, messages, **kwargs: "prompt",
             "thinking_system_prompt": "thinking",
@@ -172,7 +172,7 @@ class TestSchedulerCallbackInjection:
         }
         callbacks = SchedulerCallbackSet(**dict(reversed(list(values.items()))))
 
-        assert callbacks.active_task_graph_model_identity() == "identity"
+        assert callbacks.active_execution_model_identity() == "identity"
         assert callbacks.execute_task_worker_stage(None, None) == {"ok": True}
         assert callbacks.build_model_chat_prompt(None, []) == "prompt"
         assert callbacks.thinking_system_prompt == "thinking"
@@ -213,6 +213,24 @@ class TestLazyModelManager:
         with pytest.raises(RuntimeError, match="没有可用的 ModelManager"):
             host.ensure_full_model()
         assert host.runtime_status()["manager_loaded"] is False
+
+    def test_range_probe_never_materializes_missing_torch(self, monkeypatch):
+        import model_host as model_host_module
+
+        def unavailable(self):
+            raise AssertionError("cold range observation constructed a manager")
+
+        monkeypatch.setattr(model_host_module._LazyModelManager, "_get_instance", unavailable)
+        host = ModelHost()
+        assert host.layer_range is None
+        assert host.peek_manager() is None
+        manager = types.SimpleNamespace(layer_range=(4, 8))
+        host.runtime_controller.install(manager)
+        assert host.layer_range == (4, 8)
+        manager.layer_range = None
+        assert host.layer_range is None
+        with pytest.raises(AttributeError):
+            host.layer_range = (0, 8)
 
     def test_explicit_torch_load_reports_missing_torch(self, monkeypatch):
         import model_host as model_host_module
@@ -726,10 +744,17 @@ class TestApiServerIntegration:
     def test_api_server_configures_explicit_scheduler_callbacks(self):
         import api_server
 
-        callbacks = api_server.scheduler.inference_callbacks
-        assert callbacks is model_host.scheduler_callbacks
-        assert callable(callbacks.execute_task_worker_stage)
-        assert callable(callbacks.active_task_graph_model_identity)
+        # R1 binds callbacks at explicit construction, so import stays inert.
+        resources = api_server._build_default_resources(
+            api_server._get_app_runtime().resolve_config(), host=model_host)
+        try:
+            callbacks = resources.scheduler.inference_callbacks
+            assert resources.host is model_host
+            assert callbacks is model_host.scheduler_callbacks
+            assert callable(callbacks.execute_task_worker_stage)
+            assert callable(callbacks.active_execution_model_identity)
+        finally:
+            resources.close()
 
     def test_no_reverse_import(self):
         # 阶段 0.5 验收项：scheduler 不再 import api_server
@@ -755,9 +780,77 @@ def test_host_unload_failure_preserves_direct_engine_projection():
     with pytest.raises(OSError, match="native owner still alive"):
         host.unload_model()
     assert host._manager is engine and host.model_loaded is True
-    assert host.__dict__["model_path"] == "head.gguf"
-    assert host.__dict__["active_model_id"] == "segment-model"
+    assert dict(host.runtime_controller.snapshot().metadata)["model_path"] == "head.gguf"
+    assert dict(host.runtime_controller.snapshot().metadata)["active_model_id"] == "segment-model"
     should_fail[0] = False
     host.unload_model()
     assert host.model_loaded is False
-    assert "model_path" not in host.__dict__ and "active_model_id" not in host.__dict__
+    assert not dict(host.runtime_controller.snapshot().metadata)
+
+
+class TestColdRuntimeObservation:
+    @staticmethod
+    def _cold_host(monkeypatch):
+        import model_host as module
+
+        attempts = []
+
+        def unavailable(_self):
+            attempts.append("torch manager construction")
+            raise ImportError("torch intentionally absent")
+
+        monkeypatch.setattr(module._LazyModelManager, "_get_instance", unavailable)
+        return ModelHost(), attempts
+
+    def test_state_readout_uses_unloaded_values_without_torch(self, monkeypatch):
+        host, attempts = self._cold_host(monkeypatch)
+        assert host.model is None
+        assert host.tokenizer is None
+        assert host._total_model_layers == 0
+        assert host._model_path is None
+        assert host._full_model_path is None
+        assert host._island_engine is None
+        assert host.get_pipeline_descriptor() == {}
+        assert host.runtime_status()["manager_loaded"] is False
+        assert attempts == []
+
+    def test_cluster_status_and_layer_planning_do_not_construct_cold_manager(
+        self, monkeypatch,
+    ):
+        from scheduler import Scheduler
+        from config import TOTAL_MODEL_LAYERS
+
+        host, attempts = self._cold_host(monkeypatch)
+        scheduler = Scheduler(host=host)
+        status = scheduler.get_status()
+        assert status["pipeline"]["active"] is False
+        assert status["pipeline"]["engine_compatible"] is False
+        assert scheduler.get_layer_assignments()["total"] == TOTAL_MODEL_LAYERS
+        assert host.peek_manager() is None
+        assert attempts == []
+
+    def test_state_readout_tracks_owner_replacement_and_explicit_writes(
+        self, monkeypatch,
+    ):
+        host, attempts = self._cold_host(monkeypatch)
+        descriptor = {"total_layers": 32, "pipeline_runtime_supported": True}
+        first = types.SimpleNamespace(
+            model=object(), tokenizer=object(), _total_model_layers=32,
+            _model_path="first", get_pipeline_descriptor=lambda: dict(descriptor),
+        )
+        second = types.SimpleNamespace(
+            model=None, tokenizer=None, _total_model_layers=8,
+            _model_path="second", get_pipeline_descriptor=lambda: {"total_layers": 8},
+        )
+        host.runtime_controller.install(first)
+        assert host.model is first.model
+        assert host.tokenizer is first.tokenizer
+        assert host.get_pipeline_descriptor() == descriptor
+        host._model_path = "updated"
+        assert first._model_path == "updated"
+        host.runtime_controller.install(second)
+        assert host.model is None
+        assert host._total_model_layers == 8
+        assert host._model_path == "second"
+        assert host.get_pipeline_descriptor() == {"total_layers": 8}
+        assert attempts == []

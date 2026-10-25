@@ -155,3 +155,32 @@ def write_manifest(root: Path, manifest: dict[str, Any], filename: str = "model.
     atomic_write_json(destination, manifest, ensure_ascii=True, sort_keys=True,
                       indent=2, trailing_newline=True)
     return destination
+
+
+def publish_registration_manifest(root: Path, manifest: dict[str, Any]) -> Path:
+    """Create registration evidence without replacing another published revision."""
+    import tempfile
+    root = _path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / "model.manifest.json"
+    payload = (json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=".qlh-register-", suffix=".part", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            try:
+                current = json.loads(destination.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError("registration_manifest_conflict") from exc
+            if current != manifest:
+                raise ValueError("registration_manifest_conflict")
+        return destination
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

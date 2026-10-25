@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "base_suite": "refactor_deployment_suite_v1.json",
+  "scope": "R4 FIFO, frozen linear executor, native lifecycle, request journal and stop policy; temporary state only",
+  "additional_targets": ["tests/test_refactor_execution.py", "tests/test_refactor_execution_integration.py"]
+}

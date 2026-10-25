@@ -388,8 +388,8 @@ def test_register_gguf_model_is_allowed_without_cuda(monkeypatch, tmp_path):
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
-        "save_local_experimental_model",
-        lambda model_id, config_json: saved.append((model_id, config_json)) or True,
+        "publish_local_model_registry",
+        lambda model_id, config_json, *, expected_revision: saved.append((model_id, config_json)) or True,
     )
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     gguf = tmp_path / "custom.Q4_K_M.gguf"
@@ -412,8 +412,8 @@ def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch, tmp_pat
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
-        "save_local_experimental_model",
-        lambda model_id, config_json: saved.append((model_id, config_json)) or True,
+        "publish_local_model_registry",
+        lambda model_id, config_json, *, expected_revision: saved.append((model_id, config_json)) or True,
     )
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     model_dir = tmp_path / "custom-hf"
@@ -808,7 +808,13 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     assert result["status"] == "ok"
 
 
-def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path):
+@pytest.fixture
+def real_api_services():
+    # Resolve the owning runtime before an API-only host stub replaces the facade.
+    return api_server._get_app_runtime().services
+
+
+def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path, real_api_services):
     calls = []
     transactions = []
     import config as cfg
@@ -896,7 +902,7 @@ def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp
 
 
 def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, real_api_services,
 ):
     aborted = []
     fake_host = types.SimpleNamespace(
@@ -959,7 +965,7 @@ def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
 
 
 def test_prepare_pipeline_model_rejects_synchronous_aborted_commit(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, real_api_services,
 ):
     aborted = []
     monkeypatch.setattr(api_server, "model_host", types.SimpleNamespace(
@@ -1167,7 +1173,7 @@ def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
     req = api_server.ChatRequest(message="hello", max_new_tokens=1)
     monkeypatch.setattr(api_server, "model_manager", Manager())
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups", lambda *a, **kw: [])
     monkeypatch.setattr(
         api_server._local_store,
@@ -1206,7 +1212,7 @@ def test_reserved_worker_forward_failure_does_not_restore_full_model(monkeypatch
         "forward_inference_to_master",
         lambda **kwargs: {"status": "disconnected", "error": "master offline"},
     )
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
 
     with pytest.raises(api_server.HTTPException) as exc_info:
         api_server._execute_chat_full(req)
@@ -1253,7 +1259,7 @@ def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
             "error": "route_a_mixed_legacy_execution_bridge_not_ready",
         },
     )
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
     monkeypatch.setattr(
         api_server,
         "_external_route_decision",
@@ -1466,7 +1472,7 @@ def test_local_native_image_chat_uses_mtmd_and_removes_temp_file(monkeypatch):
     )
     monkeypatch.setattr(api_server, "model_manager", NativeManager())
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
-    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server._chat_context, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups_llama", lambda *a, **kw: [])
     monkeypatch.setattr(
         api_server,
@@ -1664,6 +1670,10 @@ def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch, hos
                 "pipeline_runtime_supported": True,
             }
 
+        def get_model_info(self):
+            # segment 已物化时生产代码会读 inference_switches（routes_models.py:52）
+            return {"inference_switches": {"streaming_mode": "fast"}}
+
     monkeypatch.setattr(api_server, "model_manager", PartialManager())
     monkeypatch.setattr(model_host, "model_loaded", host_loaded)
     monkeypatch.setattr(model_host, "current_quant", "fp32")
@@ -1827,8 +1837,8 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        api_server,
-        "session_histories",
+        api_server._chat_context,
+        "histories",
         {"default": [{"role": "assistant", "content": "DeepSeek-R1 intro"}]},
     )
     monkeypatch.setattr(
@@ -1856,7 +1866,7 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
     assert len(switch_calls) == 1
     assert cleared == [True]
     assert api_server.kv_cache is None
-    assert api_server.session_histories == {}
+    assert api_server._chat_context.histories == {}
     assert api_server.conversation_stats == {
         "total_prompt_tokens": 0,
         "total_generated_tokens": 0,

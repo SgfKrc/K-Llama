@@ -10,7 +10,7 @@
    后续重构无法绕过
 3. best-effort 取消：OpenAI 端点无服务端取消原语，取消 = chunk 边界断流 +
    关闭连接，外部端可能继续算完（与调研方案 §2.2 的 cancel 缺口结论一致）
-4. ExternalOpenAIProvider 实现 task_provider.ExecutionProvider 契约，
+4. ExternalOpenAIProvider 实现 execution_provider.ExecutionProvider 契约，
    供任务链系统显式选择（PoC 不自动注册进聊天任务链，见接入指南）
 
 与路线 A（TP 孤岛）的关系:
@@ -47,7 +47,7 @@ from island_engine import (
     IslandUnreachableError,
     mask_island_url,
 )
-from task_provider import (
+from execution_provider import (
     LocalFullModelProvider,
     ModelIdentity,
     ProviderExecutionError,
@@ -752,7 +752,7 @@ class ExternalOpenAIProvider(LocalFullModelProvider):
         import json as _json
 
         from multimodal import normalize_openai_message_content
-        from task_provider import DEPENDENCY_FAILURES_KEY
+        from execution_provider import DEPENDENCY_FAILURES_KEY
 
         root_input = request.root_input or {}
         if request.stage_type == "aggregate":

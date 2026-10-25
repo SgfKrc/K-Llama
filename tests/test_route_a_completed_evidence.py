@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from scheduler_pipeline import SchedulerPipelineMixin
+from scheduler_pipeline import SchedulerPipelineMixin, logger
 
 
 @pytest.mark.parametrize("result_mode", ["success", "invalid_result", "provider_error"])
@@ -30,7 +30,7 @@ def test_completed_receipt_is_emitted_only_after_result_validation(caplog, resul
     identity = {"operation_id": "supply_fixture", "config_id": "cfg_fixture", "generation": 9,
                 "assignment_id": "asg_fixture", "artifact_sha256": "a" * 64}
     hidden = np.zeros((1, 4), dtype=np.float32)
-    with caplog.at_level(logging.INFO, logger="scheduler_pipeline"):
+    with caplog.at_level(logging.INFO, logger=logger.name):
         kwargs = dict(node_id="android", assignment={"start_layer": 8, "end_layer": 32,
                       "worker_prepare_identity": identity}, hidden_states=hidden, model_identity=None,
                       workflow_id="wf_fixture", request_id="fixture:step:0", stage_id="android:step:0",

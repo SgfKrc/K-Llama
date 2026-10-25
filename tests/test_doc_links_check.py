@@ -5,8 +5,13 @@
 1. **仓库外的相对路径不计入链接门**。`docs/` 里有形如 `../../qlh-release/docs/…` 的引用 ——
    它们是"本地工作区里与主仓并列的独立仓库"这一事实的记录，换台机器或 CI 上必然不存在。
    若把它们当死链，CI 会永久红灯（2026-09-23 实际发生过：一次 push 后 CI 报 16 处，其中 8 处是这类）。
-2. **子模块内的文档引用要靠"检出子模块"来满足**（`android/`），而不是靠放宽检查
-   —— 所以这里也断言 `android/…` 这类路径会被**正常校验**（在仓库内、必须存在）。
+2. **子模块内的目标按"是否检出"分流，而不是一律跳过或一律报错**。
+   子模块是主仓的正式组成部分（`.gitmodules` 声明、指针入库），文档链接其中的实现文件是
+   合理的；但**是否检出取决于 CI 配置**（`doc-checks` 只拉 `android`、`core-tests` 多拉
+   `packaging`、谁都不拉 `harness_workbench`）。若把"未检出"判成死链，同一份文档在本地全绿、
+   在 CI 必红，门禁变成 CI 配置的镜像（2026-10-18 起连挂 8 次，根因即此）。
+   因此：所属子模块**未检出 ⇒ 不判定并显式列出跳过项**；**已检出 ⇒ 照常校验**，
+   子模块内写错路径或改名仍会被抓。
 """
 
 from __future__ import annotations
@@ -91,18 +96,73 @@ def test_iter_md_files_excludes_archive() -> None:
 
 
 def test_android_submodule_documents_are_checked_in_repo() -> None:
-    """★ 约定 2：`android/…` 属于**仓库内**目标，必须正常校验（靠检出子模块满足，不放宽）。"""
+    """★ 约定 2 的「已检出」分支：`android/…` 检出后必须**正常校验**，不放宽。"""
     module = _load()
     android_doc = ROOT / "android" / "Android验证替代路径-2026-09-18.md"
     if not android_doc.exists():
-        # 未检出子模块（例如 CI 里没跑 git submodule update）——此时跳过，
-        # 但**不改变**检查逻辑：CI workflow 已负责按需拉这个子模块。
-        import pytest
-
+        # 未检出子模块 ⇒ 按约定 2 跳过该引用（check_file 不判定），这里直接跳过用例。
         pytest.skip("android 子模块未检出")
     result = module.check_file(str(ROOT / "README.md"))
     assert isinstance(result, list)
     assert not any("Android验证替代路径" in raw for _, raw, _ in result)
+
+
+def _stub_submodules(module, root: Path, declarations: list[tuple[str, bool]]) -> None:
+    """伪造子模块声明表，避免测试依赖真实子模块检出状态与 git 仓库布局。"""
+    module._SUBMODULE_CACHE = (str(root), declarations)
+    module.SKIPPED_SUBMODULES.clear()
+
+
+def test_unchecked_submodule_target_is_skipped(tmp_path, monkeypatch) -> None:
+    """★ 约定 2 的「未检出」分支：所属子模块未检出 ⇒ 不判定，并记录跳过项。"""
+    module = _load()
+    _stub_submodules(module, tmp_path, [("packaging", False)])
+    problems = _probe(module, tmp_path, monkeypatch,
+                      "[打包](../packaging/packaging/launcher.py)\n")
+    assert problems == []
+    assert module.SKIPPED_SUBMODULES == {"packaging"}
+
+
+def test_checked_submodule_target_is_still_validated(tmp_path, monkeypatch) -> None:
+    """★ 约定 2 的关键性质：子模块**已检出**时真死链仍必须被抓 —— 否则就是放宽检查。"""
+    module = _load()
+    _stub_submodules(module, tmp_path, [("packaging", True)])
+    problems = _probe(module, tmp_path, monkeypatch,
+                      "[缺](../packaging/packaging/no_such_module.py)\n")
+    assert [why for _, _, why in problems] == ["目标不存在"]
+    assert module.SKIPPED_SUBMODULES == set()
+
+
+def test_nested_submodule_under_checked_parent_is_skipped(tmp_path, monkeypatch) -> None:
+    """父模块已检出、嵌套子模块未检出（android + llama.cpp）也要取**最长匹配**判定。"""
+    module = _load()
+    _stub_submodules(module, tmp_path, [
+        ("android", True),
+        ("android/app/src/main/cpp/llama.cpp", False),
+    ])
+    nested = tmp_path / "android" / "app" / "src" / "main" / "cpp" / "llama.cpp"
+    nested.mkdir(parents=True)
+    problems = _probe(
+        module, tmp_path, monkeypatch,
+        "[repack](../android/app/src/main/cpp/llama.cpp/ggml/src/ggml-cpu/repack.cpp)\n")
+    assert problems == []
+    assert module.SKIPPED_SUBMODULES == {"android/app/src/main/cpp/llama.cpp"}
+
+
+def test_declared_submodule_paths_are_read_from_gitmodules(tmp_path) -> None:
+    """`.gitmodules` 解析是分层判定的输入，必须按声明顺序取到 path（不是 url/name）。"""
+    module = _load()
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "packaging"]\n\tpath = packaging\n\turl = https://example.invalid/a.git\n'
+        '[submodule "android"]\n\tpath = android\n\turl = https://example.invalid/b.git\n',
+        encoding="utf-8")
+    assert module._read_submodule_paths(str(tmp_path)) == ["packaging", "android"]
+
+
+def test_absent_gitmodules_declares_no_submodules(tmp_path) -> None:
+    """没有 `.gitmodules` 的仓库（或子目录）不能被误判出子模块。"""
+    module = _load()
+    assert module._read_submodule_paths(str(tmp_path)) == []
 
 
 def test_wrong_committed_reference_is_still_caught() -> None:

@@ -1,6 +1,6 @@
 """TUI 端到端 flow 测试（F1 档：假后端、零模型）。
 
-计划来源：`docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md`（具名票 `CORE-TUI-E2E-01`）。
+计划来源：`docs/archive/tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md`（具名票 `CORE-TUI-E2E-01`）。
 step 引擎与剧本：`tests/tui_e2e_flow.py` + `fixtures/tui_e2e_flow.json`（本文件只做 pytest 入口）。
 
 **第一阶段（探针）已完成** —— 计划 §6.1 风险 2 要求「先交 1 个探针用例，确认稳定后再铺全量剧本」。

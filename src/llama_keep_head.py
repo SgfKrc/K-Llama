@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import base64
 import ctypes
+from functools import lru_cache
 import json
 import os
+import operator
 from pathlib import Path
 import subprocess
 import sys
@@ -90,10 +92,10 @@ class KeepHeadUnavailable(RuntimeError):
     """shim 缺失、符号不对或加载/初始化失败（都属于「不能用」，绝不降级成 embeddings 通道）。"""
 
 
-def _add_dll_dirs(shim_dir: Path, extra: Sequence[str] = ()) -> tuple[list[str], list[object]]:
+def _add_dll_dirs(shim_dir: Path, extra: Sequence[str] = (), *, environment=None) -> tuple[list[str], list[object]]:
     dirs: list[str] = [str(shim_dir)]
     dirs.extend(extra)
-    dirs.extend(d for d in os.environ.get(EXTRA_DLL_DIRS_ENV, "").split(os.pathsep) if d)
+    dirs.extend(d for d in (os.environ if environment is None else environment).get(EXTRA_DLL_DIRS_ENV, "").split(os.pathsep) if d)
     added: list[str] = []
     handles: list[object] = []
     for candidate in dirs:
@@ -153,6 +155,50 @@ class KeepHeadCleanupError(KeepHeadUnavailable):
         self.cleanup_owner = owner
 
 
+def _keep_head_worker_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--keephead-worker"]
+    return [sys.executable, str(Path(__file__).with_name("llama_keep_head_worker.py"))]
+
+
+def keep_head_multi_position_available(shim_path: str | Path, *, environment=None) -> bool:
+    """Probe the optional ABI in a child process, without loading a model or host DLL.
+
+    Cache entries follow the resolved shim's mtime_ns/size and the child environment.
+    A probe timeout or any load/protocol failure means the capability is unavailable.
+    """
+    try:
+        path = Path(shim_path).resolve(strict=True)
+        if not path.is_file():
+            return False
+        stat = path.stat()
+        child_environment = dict(os.environ if environment is None else environment)
+        return _keep_head_multi_position_probe_cached(
+            str(path), stat.st_mtime_ns, stat.st_size,
+            tuple(sorted(child_environment.items())))
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+@lru_cache(maxsize=64)
+def _keep_head_multi_position_probe_cached(path, mtime_ns, size, environment) -> bool:
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            [*_keep_head_worker_command(), "--probe-shim", "--shim", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", env=dict(environment), timeout=15, **kwargs)
+        if result.returncode != 0:
+            return False
+        response = json.loads(result.stdout)
+        return (isinstance(response, dict) and response.get("ok") is True
+                and response.get("supports_multi_position_argmax") is True)
+    except (OSError, subprocess.TimeoutExpired, ValueError, UnicodeError):
+        return False
+
+
 class KeepHeadUpstream:
     """最小 keep-head 上游：吃 token → 吐「前 K 层输出」`[n_tokens, n_embd]` f32。
 
@@ -173,7 +219,9 @@ class KeepHeadUpstream:
         n_seq_max: int = 1,
         extra_dll_dirs: Sequence[str] = (),
         _worker_process: bool = False,
+        environment=None,
     ) -> None:
+        self._environment = dict(os.environ if environment is None else environment)
         if mode not in MODE_CODES:
             raise KeepHeadUnavailable(f"mode 必须是 {sorted(MODE_CODES)}，实得 {mode!r}")
         if mode == "layer_inp" and cut_layer is None:
@@ -190,6 +238,8 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(f"找不到模型：{self.model_path}")
 
         self._worker = None
+        self._supports_multi_position_argmax = False
+        self._n_vocab = 0
         self.n_seq_max = max(1, int(n_seq_max))
         self.n_batch = max(1, int(n_batch))
         # ★ 2026-09-24：**每序列可用 ctx** —— llama.cpp 把 `n_ctx` 按 `n_seq_max` **均分**，
@@ -222,7 +272,7 @@ class KeepHeadUpstream:
             return
 
         self._dll_dirs, self._dll_dir_handles = _add_dll_dirs(
-            self.shim_path.parent, extra_dll_dirs)
+            self.shim_path.parent, extra_dll_dirs, environment=self._environment)
         try:
             self._lib = ctypes.CDLL(str(self.shim_path))
         except OSError as exc:  # noqa: PERF203
@@ -265,6 +315,21 @@ class KeepHeadUpstream:
                 ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
             ]
             lib.qlh_kh_forward_embd_token.restype = ctypes.c_int32
+        if hasattr(lib, "qlh_kh_forward_embd_tokens"):
+            lib.qlh_kh_forward_embd_tokens.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+                ctypes.c_int32,
+            ]
+            lib.qlh_kh_forward_embd_tokens.restype = ctypes.c_int32
+        if hasattr(lib, "qlh_kh_finite_logits_guard"):
+            lib.qlh_kh_finite_logits_guard.argtypes = []
+            lib.qlh_kh_finite_logits_guard.restype = ctypes.c_int32
+        if hasattr(lib, "qlh_kh_n_vocab"):
+            lib.qlh_kh_n_vocab.argtypes = [ctypes.c_void_p]
+            lib.qlh_kh_n_vocab.restype = ctypes.c_int32
         lib.qlh_kh_forward_embd.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
             ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
@@ -274,6 +339,13 @@ class KeepHeadUpstream:
         lib.qlh_kh_n_embd.restype = ctypes.c_int32
         lib.qlh_kh_n_layer.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_n_layer.restype = ctypes.c_int32
+        for symbol, result_type in (("qlh_kh_model_bytes", ctypes.c_uint64),
+                                    ("qlh_kh_context_size", ctypes.c_uint32),
+                                    ("qlh_kh_batch_size", ctypes.c_uint32)):
+            if hasattr(lib, symbol):
+                function = getattr(lib, symbol)
+                function.argtypes = [ctypes.c_void_p]
+                function.restype = result_type
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_close.restype = None
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
@@ -302,10 +374,29 @@ class KeepHeadUpstream:
             self._close_failed_initialization(KeepHeadUnavailable("invalid native embedding size"))
             raise KeepHeadUnavailable("shim 报告 n_embd <= 0")
 
+        if hasattr(lib, "qlh_kh_n_vocab"):
+            self._n_vocab = max(0, int(lib.qlh_kh_n_vocab(handle)))
+        self._supports_multi_position_argmax = (
+            hasattr(lib, "qlh_kh_forward_embd_tokens")
+            and hasattr(lib, "qlh_kh_finite_logits_guard")
+            and self._n_vocab > 0
+            and lib.qlh_kh_finite_logits_guard() == 1)
+
+    @property
+    def supports_multi_position_argmax(self) -> bool:
+        return getattr(self, "_supports_multi_position_argmax", False)
+
+    @property
+    def n_vocab(self) -> int:
+        """Loaded vocabulary size; 0 when the old shim cannot report it."""
+        return getattr(self, "_n_vocab", 0)
+
     # ------------------------------------------------------------------ 前向
     def _init_isolated_worker(self, *, n_ctx: int, n_threads: int, n_batch: int,
                               n_seq_max: int, extra_dll_dirs: Sequence[str]) -> None:
         """Keep the patched llama.cpp ABI out of the pip llama.cpp process."""
+        environment = getattr(self, "_environment", None)
+        environment = dict(os.environ if environment is None else environment)
         worker = Path(__file__).with_name("llama_keep_head_worker.py")
         if not worker.is_file():
             raise KeepHeadUnavailable(f"keep-head worker missing: {worker}")
@@ -315,10 +406,7 @@ class KeepHeadUpstream:
         #   layer worker 实测踩到：子进程在、keephead-worker.log 为 0 字节、master 等满
         #   60s 超时）。冻结态改走 launcher 的 `--keephead-worker` 早期分派，把同一份
         #   worker 脚本当 __main__ 跑；源码态保持原样。
-        if getattr(sys, "frozen", False):
-            worker_command = [sys.executable, "--keephead-worker"]
-        else:
-            worker_command = [sys.executable, str(worker)]
+        worker_command = _keep_head_worker_command()
         command = [
             *worker_command,
             "--shim", str(self.shim_path), "--model", str(self.model_path),
@@ -335,8 +423,10 @@ class KeepHeadUpstream:
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         # worker 的 stderr 必须落盘：llama.cpp 的日志量很大，用 PIPE 会填满缓冲而死锁，
         # 用 DEVNULL 则失败时无信息。落盘后可随时 tail 诊断。
-        log_path = Path(os.environ.get("QLH_KEEP_HEAD_WORKER_LOG")
-                        or (Path.cwd() / "build" / "relay-records" / "_keephead_worker.err"))
+        log_path = Path(environment.get("QLH_KEEP_HEAD_WORKER_LOG")
+                        or ((Path(environment["QLH_STATE_DIR"]) / "native-logs" / f"keephead-{os.getpid()}-{id(self):x}.err")
+                            if environment.get("QLH_STATE_DIR") else
+                            (Path.cwd() / "build" / "relay-records" / f"keephead-{os.getpid()}-{id(self):x}.err")))
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             stderr_target: object = open(log_path, "w", encoding="utf-8", errors="replace")
@@ -346,9 +436,12 @@ class KeepHeadUpstream:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=stderr_target, text=True, encoding="utf-8",
-                bufsize=1, **popen_kwargs)
+                bufsize=1, env=environment, **popen_kwargs)
         except OSError as exc:
             raise KeepHeadUnavailable(f"keep-head worker start failed: {exc}") from exc
+        finally:
+            if hasattr(stderr_target, "close"):
+                stderr_target.close()
         self._worker = process
         self._worker_log = log_path
         try:
@@ -359,6 +452,13 @@ class KeepHeadUpstream:
                     f"（worker stderr: {log_path}）")
             self.n_embd = int(response["n_embd"])
             self.n_layer = int(response["n_layer"])
+            vocabulary = response.get("n_vocab", 0)
+            capability = response.get("supports_multi_position_argmax", False)
+            if (type(vocabulary) is not int or not 0 <= vocabulary <= 2**31 - 1
+                    or type(capability) is not bool or (capability and vocabulary == 0)):
+                raise KeepHeadUnavailable("keep-head worker returned invalid capability receipt")
+            self._n_vocab = vocabulary
+            self._supports_multi_position_argmax = capability
         except Exception as init_error:
             self._close_failed_initialization(init_error)
             raise
@@ -388,6 +488,18 @@ class KeepHeadUpstream:
         if not isinstance(value, dict):
             raise KeepHeadUnavailable("keep-head worker response is not an object")
         return value
+
+    def materialization_observation(self):
+        if self._worker is not None:
+            return self._worker_request({"op": "load_observation"})["observation"]
+        symbols = ("qlh_kh_model_bytes", "qlh_kh_context_size", "qlh_kh_batch_size")
+        if not self.is_available or not all(hasattr(self._lib, symbol) for symbol in symbols):
+            raise KeepHeadUnavailable("keep_head_load_observation_unsupported")
+        return {"materialized_bytes": int(self._lib.qlh_kh_model_bytes(self._handle)),
+                "context_size": int(self._lib.qlh_kh_context_size(self._handle)),
+                "batch_size": int(self._lib.qlh_kh_batch_size(self._handle)),
+                "device": "cpu", "dtype": "artifact", "quant_type": "artifact",
+                "kv_device": "cpu", "kv_dtype": "float16", "sequence_count": self.n_seq_max}
 
     @property
     def is_available(self) -> bool:
@@ -544,6 +656,102 @@ class KeepHeadUpstream:
                 f"keep-head 末段前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
                 f"{self._decode_error_suffix()}")
         return int(out_token.value)
+
+    def forward_hidden_to_tokens(self, hidden, *, n_past: int = 0,
+                                 seq_ids: Sequence[int] | None = None,
+                                 positions: Sequence[int] | None = None) -> list[int]:
+        """Return one finite-logit argmax per row of one contiguous sequence.
+
+        Explicit positions take precedence over n_past and must be contiguous
+        nonnegative int32 values. Their first value is the context-check base;
+        without positions the base is n_past. seq_ids may be a constant nonzero
+        sequence within n_seq_max. Old shims must use the scalar API.
+        """
+        import numpy as np
+
+        if not self.supports_multi_position_argmax:
+            raise KeepHeadUnavailable(
+                "multi-position argmax unavailable: requires qlh_kh_forward_embd_tokens, "
+                "qlh_kh_n_vocab and qlh_kh_finite_logits_guard == 1")
+        if not self.is_available:
+            raise KeepHeadUnavailable("keep-head unavailable")
+        arr = np.ascontiguousarray(np.asarray(hidden, dtype=np.float32))
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[1] != self.n_embd:
+            raise ValueError(f"hidden 形状应为 [n_tokens, {self.n_embd}]，实得 {arr.shape}")
+        n_tokens = int(arr.shape[0])
+        if n_tokens == 0:
+            raise ValueError("hidden 的 token 数不能为 0")
+        if not np.isfinite(arr).all():
+            raise ValueError("hidden contains NaN or Inf")
+        seq_list = self._multi_position_list(seq_ids, n_tokens, "seq_ids")
+        pos_list = self._multi_position_list(positions, n_tokens, "positions")
+        past = pos_list[0] if pos_list is not None else self._int32_value(n_past, "n_past")
+        if n_tokens > 2**31 - 1 or past < 0 or past + n_tokens - 1 > 2**31 - 1:
+            raise ValueError("n_tokens / position base outside nonnegative int32 range")
+        if seq_list is not None and (
+                min(seq_list) < 0 or max(seq_list) >= self.n_seq_max
+                or len(set(seq_list)) != 1):
+            raise ValueError("seq_ids must bind one sequence in [0, n_seq_max)")
+        if pos_list is not None and any(value != past + i for i, value in enumerate(pos_list)):
+            raise ValueError("positions must be continuous: positions[i] == positions[0] + i")
+        if n_tokens > self.n_batch:
+            raise KeepHeadUnavailable(
+                f"keep-head batch exceeds n_batch: tokens={n_tokens} limit={self.n_batch}")
+        if past + n_tokens > self.ctx_per_seq:
+            raise KeepHeadUnavailable(
+                f"keep-head context exceeds per-sequence limit: "
+                f"past={past} tokens={n_tokens} limit={self.ctx_per_seq}")
+
+        if self._worker is not None:
+            payload = {
+                "op": "hidden_tokens", "shape": list(arr.shape),
+                "data": base64.b64encode(arr.tobytes()).decode("ascii"), "n_past": past,
+            }
+            if seq_list is not None:
+                payload["seq_ids"] = seq_list
+            if pos_list is not None:
+                payload["positions"] = pos_list
+            tokens = self._worker_request(payload).get("tokens")
+        else:
+            output = (ctypes.c_int32 * n_tokens)(*([-1] * n_tokens))
+            rc = self._lib.qlh_kh_forward_embd_tokens(
+                self._handle, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                n_tokens, past, None,
+                (ctypes.c_int32 * n_tokens)(*seq_list) if seq_list is not None else None,
+                (ctypes.c_int32 * n_tokens)(*pos_list) if pos_list is not None else None,
+                output, n_tokens)
+            if rc != 0:
+                raise KeepHeadUnavailable(
+                    f"keep-head multi-position forward failed rc={rc}: "
+                    f"{FORWARD_ERRORS.get(rc, '未知错误码')}{self._decode_error_suffix()}")
+            tokens = list(output)
+        if (not isinstance(tokens, list) or len(tokens) != n_tokens
+                or any(type(value) is not int or not 0 <= value < self.n_vocab for value in tokens)):
+            raise KeepHeadUnavailable("keep-head returned invalid multi-position tokens (length / vocabulary)")
+        return tokens
+
+    @staticmethod
+    def _int32_value(value, field: str) -> int:
+        try:
+            if isinstance(value, bool):
+                raise TypeError
+            result = operator.index(value)
+        except TypeError as exc:
+            raise ValueError(f"{field} must contain int32 integers") from exc
+        if not -(2**31) <= result <= 2**31 - 1:
+            raise ValueError(f"{field} outside int32 range")
+        return result
+
+    @classmethod
+    def _multi_position_list(cls, values, n_tokens: int, field: str) -> list[int] | None:
+        if values is None:
+            return None
+        result = [cls._int32_value(value, field) for value in values]
+        if len(result) != n_tokens:
+            raise ValueError(f"{field} 长度 {len(result)} != n_tokens {n_tokens}")
+        return result
 
     def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
                                  seq_ids: Sequence[int] | None = None,

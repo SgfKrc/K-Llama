@@ -22,3 +22,5 @@ fixtures/prompt_sets/ps-qwen3-nothink/prompts.jsonl text eol=crlf
 fixtures/quality_rubrics/llm-objective-ps-v1-v2.json text eol=crlf
 fixtures/quality_rubrics/gemma-judge-counts-v1.json text eol=crlf
 fixtures/quality_reports/gemma-judge-counts-fixture-v1.json text eol=crlf
+# Managed patches carry raw LF SHA-256 pins; keep checkout bytes stable on Windows.
+scripts/model_tools/patches/*.patch text eol=lf

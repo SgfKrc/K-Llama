@@ -28,7 +28,9 @@ READ_ONLY_SUBCOMMANDS = ("status", "models", "nodes", "queue", "device", "logs",
 
 def _usage() -> str:
     return (
-        "QLH core TUI\n"
+        "QLH application\n"
+        "  qlh maintenance <command>  应用验签、版本切换、回退、修复与数据保留\n"
+        "  qlh migrate-state --source PATH --target PATH --backup PATH [--dry-run]\n"
         "  qlh                         进入交互外壳（Textual；本机后端自动启动）\n"
         "  qlh [options]               同上；选项直通（--port/--route/--host/--thinking/--log-token…）\n"
         "  qlh chat [--host URL] [--backend-host ADDRESS] [--route auto|local_only|distributed_preferred|distributed_required]\n"
@@ -89,6 +91,10 @@ def _chat_args(args: list[str]) -> list[str]:
                 raise ValueError("%s 缺少参数" % value)
             item = args[i + 1]
             if value == "--host":
+                # Internal dispatch parses the translated hostname again;
+                # bracket a bare IPv6 address before treating it as a URL.
+                if "://" not in item and item.count(":") > 1 and not item.startswith("["):
+                    item = "[" + item + "]"
                 parsed = urllib.parse.urlsplit(item if "://" in item else "http://" + item)
                 if parsed.hostname:
                     translated.extend(["--host", parsed.hostname])
@@ -123,15 +129,23 @@ def _shell_options(translated: list[str]) -> dict:
     def value_of(name: str, default):
         return translated[translated.index(name) + 1] if name in translated else default
 
+    environment = {}
+    if "--auto-start" in translated:
+        _ensure_src_on_path()
+        from qlh_core.adapters.settings import SettingsStore
+        from release_contract import DEFAULT_PACKAGED_NODE_ROLE
+        environment = SettingsStore(default_node_role=DEFAULT_PACKAGED_NODE_ROLE).load_listener()
+    default_port = environment.get("QLH_BACKEND_PORT") or environment.get("QLH_API_PORT") or 8000
     return {
         "host": value_of("--host", "127.0.0.1"),
         "bind_host": value_of("--backend-host", None),
-        "port": int(value_of("--port", 8000)),
+        "port": int(value_of("--port", default_port)),
         "route": value_of("--route", "auto"),
         "interval": float(value_of("--interval", 5.0)),
         "thinking": "--thinking" in translated,
         "log_token": value_of("--log-token", ""),
         "auto_start": "--auto-start" in translated,
+        "environment": environment,
     }
 
 
@@ -151,6 +165,7 @@ def _run_textual_shell(args: list[str]) -> int:
 
         supervisor = BackendSupervisor(
             host=options["host"], port=options["port"], bind_host=options["bind_host"],
+            environment=options["environment"],
         )
 
     from tui_textual import run as run_textual
@@ -198,6 +213,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     command = args.pop(0).lower()
+    if command == "migrate-state":
+        _ensure_src_on_path()
+        from qlh_core.adapters.state_migration import main as migrate_state
+        return migrate_state(args)
+    if command == "maintenance":
+        sys.path.insert(0, str(ROOT / "packaging" / "packaging"))
+        from app_maintenance import main as maintenance
+        return maintenance(args)
     if command == "chat":
         if args and args[0] in {"-h", "--help"}:
             print(

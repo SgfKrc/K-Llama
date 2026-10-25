@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Final
+from types import MappingProxyType
 
 from koakuma_engine import BackendId, normalize_backend_request
+from qlh_core.contracts.engines import (
+    ENGINE_REGISTRY, LEGACY_ENGINE_SPECS, FULL_REQUEST, LAYER_RANGE,
+    LAYER_RANGE_DYNAMIC, LAYER_RANGE_PRECUT_ARTIFACT, LAYER_RANGE_NONE,
+)
 
-
-LAYER_RANGE_DYNAMIC: Final = "dynamic"
-LAYER_RANGE_PRECUT_ARTIFACT: Final = "precut_artifact"
-LAYER_RANGE_NONE: Final = "none"
 
 OP_FULL_MODEL: Final = "full_model"
 OP_LAYER_RANGE: Final = "layer_range"
@@ -35,21 +36,10 @@ class EngineCapability:
     layer_range_mode: str
 
 
-ENGINE_CAPABILITIES: Final = {
-    BackendId.LLAMA_CPP: EngineCapability(
-        artifact_kind="gguf",
-        layer_range_mode=LAYER_RANGE_PRECUT_ARTIFACT,
-    ),
-    BackendId.PYTORCH: EngineCapability(
-        artifact_kind="safetensors",
-        layer_range_mode=LAYER_RANGE_DYNAMIC,
-    ),
-    BackendId.ISLAND: EngineCapability(
-        artifact_kind=None,
-        layer_range_mode=LAYER_RANGE_NONE,
-    ),
-}
-
+ENGINE_CAPABILITIES: Final = MappingProxyType({
+    family: EngineCapability(spec.artifact_kind, spec.layer_range_mode)
+    for family, spec in LEGACY_ENGINE_SPECS.items()
+})
 
 class ModelLoadResolutionError(ValueError):
     """Stable, transport-independent resolution failure."""
@@ -73,6 +63,12 @@ class ModelLoadFacts:
     cuda_available: bool = False
     island_enabled: bool = False
     island_base_url: str = ""
+    # Concrete runtime facts are supplied by the adapter; this pure resolver
+    # does not probe hardware, load libraries, or construct an engine.
+    runtime_kind: str = ""
+    runtime_abi: str = ""
+    model_architecture: str = ""
+    probed_operations: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +85,14 @@ class ModelLoadResolution:
     layer_range_mode: str
     reason_code: str
     reason: str
+    runtime_kind: str = ""
+    operations: tuple[str, ...] = ()
+
+    @property
+    def engine_capabilities(self) -> dict:
+        return ENGINE_REGISTRY.advertisement((
+            ENGINE_REGISTRY.narrow(self.engine, self.runtime_kind, self.operations),
+        ))
 
 
 def preferred_engine_for_artifacts(
@@ -281,6 +285,7 @@ def resolve_model_load(
     requested_engine: str | None,
     requested_quant: str | None,
     operation: str = OP_FULL_MODEL,
+    runtime_kind: str | None = None,
 ) -> ModelLoadResolution:
     """Resolve one complete, immutable model-load decision."""
 
@@ -313,7 +318,24 @@ def resolve_model_load(
         normalized_request,
         operation=operation,
     )
-    capability = ENGINE_CAPABILITIES[engine]
+    if runtime_kind and facts.runtime_kind and runtime_kind != facts.runtime_kind:
+        raise ModelLoadResolutionError("ENGINE_RUNTIME_MISMATCH", "请求的 runtime_kind 与事实不一致。")
+    default_kind = (RUNTIME_PYTORCH_CUDA if facts.cuda_available else RUNTIME_PYTORCH_CPU
+                    ) if engine == BackendId.PYTORCH else ENGINE_REGISTRY.default(engine).runtime_kind
+    kind = runtime_kind or facts.runtime_kind or default_kind
+    try:
+        capability = ENGINE_REGISTRY.narrow(engine, kind, facts.probed_operations)
+    except ValueError as exc:
+        raise ModelLoadResolutionError("ENGINE_RUNTIME_UNSUPPORTED", str(exc)) from exc
+    if facts.runtime_abi and facts.runtime_abi != capability.native_abi:
+        raise ModelLoadResolutionError("ENGINE_ABI_UNSUPPORTED", "未知或不匹配的引擎 native ABI。")
+    required_operation = FULL_REQUEST if operation == OP_FULL_MODEL else LAYER_RANGE
+    if not capability.supports(required_operation, architecture=facts.model_architecture):
+        code = ("LAYER_RANGE_MODE_UNSUPPORTED" if required_operation == LAYER_RANGE
+                else "ENGINE_OPERATION_UNSUPPORTED")
+        raise ModelLoadResolutionError(
+            code, f"运行时 {engine}/{kind} 不支持操作 {required_operation}。",
+        )
 
     if engine == BackendId.PYTORCH:
         path = facts.safetensors_path
@@ -340,7 +362,7 @@ def resolve_model_load(
                 "MODEL_PATH_ENGINE_MISMATCH",
                 "llama.cpp loader 只接受 GGUF 工件路径。",
             )
-        runtime = RUNTIME_LLAMA_CPP
+        runtime = kind if kind == "llama_server" else RUNTIME_LLAMA_CPP
     else:
         path = None
         runtime = RUNTIME_ISLAND
@@ -352,6 +374,14 @@ def resolve_model_load(
         cuda_available=facts.cuda_available,
         operation=operation,
     )
+    precision = runtime_quant if engine in {BackendId.PYTORCH, BackendId.LLAMA_CPP} else "remote"
+    # distributed_load resolves metadata and load policy; weights have not
+    # been materialized yet. Preserve the requested full-model quant policy
+    # until the actual layer operation converts it to fp16/fp32.
+    precision_operation = (FULL_REQUEST if operation == OP_DISTRIBUTED_LOAD
+                           and capability.supports(FULL_REQUEST) else required_operation)
+    if not capability.supports(precision_operation, precision=precision):
+        raise ModelLoadResolutionError("ENGINE_PRECISION_UNSUPPORTED", "运行时不支持所请求操作的实际精度。")
     quant_converted = bool(
         engine == BackendId.PYTORCH
         and _normalize_pytorch_quant(requested_quant_text or "int4") != quant
@@ -372,6 +402,8 @@ def resolve_model_load(
         layer_range_mode=capability.layer_range_mode,
         reason_code=reason_code,
         reason=f"{engine_reason}；{quant_reason}",
+        runtime_kind=kind,
+        operations=tuple(sorted(capability.operations)),
     )
 
 

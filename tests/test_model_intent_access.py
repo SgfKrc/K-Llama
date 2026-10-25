@@ -74,7 +74,7 @@ def peer(monkeypatch):
     )
     scheduler._effective_role = lambda: scheduler.role
     scheduler.get_distributed_inference_enabled = lambda: scheduler.enabled
-    scheduler._scheduler_facade_global = lambda name: scheduler.run_mode if name == "RUN_MODE" else None
+    scheduler._runtime_setting = lambda name: scheduler.run_mode if name == "RUN_MODE" else None
     return SimpleNamespace(scheduler=scheduler, server=server, sock=sock, connection=connection,
                            node_id=node_id, monkeypatch=monkeypatch, tcp=tcp_comm)
 
@@ -271,7 +271,7 @@ def test_headers_cannot_install_an_internal_peer_snapshot(peer):
 
 
 def test_missing_runtime_mode_authority_fails_closed(peer):
-    peer.scheduler._scheduler_facade_global = lambda _name: (_ for _ in ()).throw(RuntimeError("mode unavailable"))
+    peer.scheduler._runtime_setting = lambda _name: (_ for _ in ()).throw(RuntimeError("mode unavailable"))
     denied(peer)
 
 

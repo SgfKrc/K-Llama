@@ -21,19 +21,13 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
 ):
     model = tmp_path / "qwen35.gguf"
     model.write_bytes(b"GGUF fixture")
-    tokenizer_root = tmp_path / "tokenizer-asset"
-    tokenizer_root.mkdir()
     tokenizer_payload = b'{"version":1}'
-    (tokenizer_root / "tokenizer.json").write_bytes(tokenizer_payload)
     tokenizer_sha256 = hashlib.sha256(tokenizer_payload).hexdigest()
-    (tokenizer_root / ".qlh-model-asset.json").write_text(json.dumps({
-        "schema_version": 1,
-        "files": [{
-            "path": "tokenizer.json",
-            "size": len(tokenizer_payload),
-            "sha256": tokenizer_sha256,
-        }],
-    }), encoding="utf-8")
+    # Tokenizer evidence is read from the inspected GGUF revision. A builtin
+    # name cannot authorize a tokenizer asset in a different model directory.
+    monkeypatch.setattr(
+        "relay_segment_info.read_gguf_tokenizer_sha256", lambda _path: tokenizer_sha256,
+    )
     monkeypatch.setattr(
         "relay_segment_info.read_gguf_layer_info",
         lambda _path: {"architecture": "qwen35", "n_layer": 2, "n_embd": 2048},
@@ -47,7 +41,7 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
     )
     monkeypatch.setattr(
         "model_config.get_builtin_model",
-        lambda _model_id: types.SimpleNamespace(model_path=str(tokenizer_root)),
+        lambda _model_id: pytest.fail("builtin name is not tokenizer revision evidence"),
     )
     monkeypatch.setattr(
         "model_config.resolve_model_path", lambda value: value,
@@ -75,6 +69,39 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
     assert descriptor["source_model_id"] == "qwen3-5-2b"
     assert descriptor["source_model_sha256"] == "e" * 64
     assert descriptor["layer_weight_bytes"] == [4, 4]
+    engine._pipeline_descriptor = None
+    monkeypatch.setattr(engine, "_pipeline_file_sha256", lambda *args: pytest.fail("supply rehashed GGUF"))
+    inspected = []
+    def shared_digest(path):
+        inspected.append(path)
+        return descriptor["model_sha256"]
+    assert engine.get_pipeline_descriptor(digest=shared_digest) == descriptor
+    assert inspected == [model]
+
+
+def test_pipeline_file_digest_survives_engine_replacement_and_fresh_checks(tmp_path, monkeypatch):
+    import model_supply_assets as assets
+
+    path = tmp_path / "segment.gguf"
+    path.write_bytes(b"GGUF shared digest")
+    expected = assets._hash_file_cached(path)
+    original = assets._hash_file
+    reads = []
+
+    def counted(*args, **kwargs):
+        reads.append(Path(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(assets, "_hash_file", counted)
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == expected
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == expected
+    assert reads == []
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path), use_cache=False) == expected
+    assert reads == [path]
+    path.write_bytes(b"changed GGUF bytes")
+    changed = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == changed
+    assert reads == [path, path]
 
 
 def test_prepare_pipeline_model_is_metadata_only(monkeypatch, tmp_path):
@@ -525,7 +552,8 @@ def test_model_name_reports_actual_gguf_not_static_default(tmp_path):
 
     缺陷史：`get_model_info()` 原先**不报** `model_name` ⇒ 消费方（`/status`、`/models/current`）
     各自兜底到静态 `config.MODEL_NAME`（= 默认 0.6B）⇒ 实测加载 2B（`qwen35-2b-Q4_K_M.gguf`）
-    却对外报 `Qwen/Qwen3-0.6B`（见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。
+    却对外报 `Qwen/Qwen3-0.6B`（原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`，
+    2026-10-25 归档；原引「§4.8 B2」小节号已随该件重排失效，`遗留清单` 不登记该已修项）。
 
     「该红必须红」：若有人把 `model_name` 改回"取不到就返回 `MODEL_NAME`"，本用例立刻红。
     """

@@ -101,7 +101,7 @@ def preflight(root, platform, revision, event_sha):
     if platform == "windows":
         require(os.environ.get("QLH_BUILD_PROFILE") == "llama_cpp_only", "Explicit self-contained Windows edge profile required")
         require((root / "packaging/.venv-packaging/Scripts/python.exe").is_file(), "Provision packaging/.venv-packaging first")
-        for name in ("QLH-Edge-Inference", "QLH-Launcher"):
+        for name in ("QLH-Edge-Inference",):
             require(not (root / "packaging/dist" / name).exists(), "Old Windows output exists; use a fresh checkout")
     elif platform == "linux":
         require(not list((root / "packaging/packaging/linux").glob("qlh-edge-inference-cpu_*.deb")), "Old Debian output exists")
@@ -152,8 +152,8 @@ def verified_bundle(gate, app, platform, variant, contract, expected, work):
     report = gate.Report(platform)
     work.mkdir(parents=True, exist_ok=False)
     manifest = gate.check_bundle(report, app=app, contract=contract, platform=platform,
-                                 variant=variant, version_key="launcher" if variant == "launcher" else "product",
-                                 kind="launcher" if variant == "launcher" else "application", work=work,
+                                 variant=variant, version_key="product",
+                                 kind="application", work=work,
                                  required_revision=expected["source_revision"])
     require(manifest is not None and report.as_dict()["passed"] is True, "Trusted bundle/version/contract/revision verification failed")
     same_info(gate.read_object(app / "build-info.json"), expected)
@@ -170,7 +170,7 @@ def copy_file(source, target):
 
 
 def stage_windows(root, output, expected, gate, contract, work):
-    for variant, directory in (("cpu", "QLH-Edge-Inference"), ("launcher", "QLH-Launcher")):
+    for variant, directory in (("cpu", "QLH-Edge-Inference"),):
         app = root / "packaging/dist" / directory
         manifest = verified_bundle(gate, app, "windows", variant, contract, expected, work / variant)
         # Only the authenticated file set, plus its signed manifest, is uploaded.

@@ -437,6 +437,117 @@ def _select_layer_runtime(quant_type: str | None = None) -> Tuple[str, torch.dty
     return "cpu", torch.float32
 
 
+LAYER_OFFLOAD_MATERIALIZATION = "safetensors_layer_offload"
+
+
+def _layer_offload_device_available(device):
+    return (torch.cuda.is_available()
+            and int(str(device).partition(":")[2]) < torch.cuda.device_count())
+
+
+class _LayerOffloadRuntime:
+    """Stage one execution unit, restoring the original CPU mmap owners.
+
+    CPU source tensors keep their serialized dtype. Conversion happens on CPU
+    one tensor at a time, so CUDA holds target tensors only. KV/activations are
+    owned by the existing forward path on execution_device. No GPU copy is
+    retained by this owner after a call, including a failed transfer/forward.
+    """
+
+    def __init__(self, execution_device, dtype):
+        self.execution_device = torch.device(execution_device)
+        self.dtype = dtype
+        self.stage_count = 0
+        self.target_weight_peak_bytes = 0
+        self.host_conversion_peak_bytes = 0
+        self.active = False
+
+    def _promote(self, tensor, *, preserve_dtype=False):
+        dtype = self.dtype if tensor.is_floating_point() and not preserve_dtype else tensor.dtype
+        converted = None
+        try:
+            converted = tensor.to(dtype=dtype)
+            if converted is not tensor:
+                self.host_conversion_peak_bytes = max(
+                    self.host_conversion_peak_bytes, converted.numel() * converted.element_size(),
+                )
+            # Separating the CPU cast from the transfer prevents a source-dtype
+            # CUDA allocation in addition to the target-dtype allocation.
+            return converted.to(device=self.execution_device)
+        finally:
+            # Transfer errors may be retained for diagnostics after unloading.
+            converted = None
+
+    def call(self, module, *args, **kwargs):
+        if self.active:
+            raise RuntimeError("layer offload execution units must not overlap")
+        self.active = True
+        saved = []
+        promoted = {}
+        replacement = None
+        try:
+            with torch.no_grad():
+                for child in module.modules():
+                    for is_parameter, entries in ((True, child._parameters), (False, child._buffers)):
+                        for name, original in tuple(entries.items()):
+                            if original is None:
+                                continue
+                            if original.device.type != "cpu":
+                                raise RuntimeError("layer offload source tensor must reside on CPU")
+                            token = id(original)
+                            if token not in promoted:
+                                if not is_parameter and name in child._non_persistent_buffers_set:
+                                    # RoPE keeps its generated inverse frequencies
+                                    # in FP32 even when weight execution uses FP16.
+                                    replacement = self._promote(original, preserve_dtype=True)
+                                else:
+                                    replacement = self._promote(original)
+                                if is_parameter:
+                                    replacement = nn.Parameter(replacement, requires_grad=original.requires_grad)
+                                promoted[token] = replacement
+                            replacement = promoted[token]
+                            saved.append((entries, name, original, replacement, is_parameter))
+                            entries[name] = replacement
+                self.target_weight_peak_bytes = max(
+                    self.target_weight_peak_bytes,
+                    sum(t.numel() * t.element_size() for t in promoted.values()),
+                )
+                self.stage_count += 1
+                return module(*args, **kwargs)
+        except Exception as error:
+            # Forward/transfer frames can own views of staged weights even
+            # after restoring the module. Preserve traceback locations while
+            # clearing those locals before a caller retains the exception.
+            import traceback
+            traceback.clear_frames(error.__traceback__)
+            raise
+        finally:
+            for entries, name, original, staged, is_parameter in reversed(saved):
+                current = entries.get(name)
+                # Dynamic rotary modules may replace their generated buffers.
+                # Preserve that state on CPU along with their cached length.
+                if not is_parameter and current is not None and current is not staged:
+                    entries[name] = current.to(device="cpu")
+                else:
+                    entries[name] = original
+            promoted.clear()
+            saved.clear()
+            # An exception traceback can keep this frame alive. Drop every
+            # temporary weight reference even while the error is retained.
+            replacement = current = staged = None
+            self.active = False
+
+    def observation(self):
+        return {"materialization": LAYER_OFFLOAD_MATERIALIZATION,
+                "execution_device": str(self.execution_device),
+                "execution_dtype": str(self.dtype).removeprefix("torch."),
+                "source_device": "cpu", "source_dtype": "artifact",
+                "stage_count": self.stage_count,
+                "target_weight_peak_bytes": self.target_weight_peak_bytes,
+                "host_conversion_peak_bytes": self.host_conversion_peak_bytes,
+                "active": self.active}
+
+
 class _LayerRangeLoadTracker:
     """Enforce filtered safetensors materialization and capture load metrics."""
 
@@ -451,7 +562,9 @@ class _LayerRangeLoadTracker:
         layer_prefix: str,
         selected_prefixes: List[str],
         target_dtype: torch.dtype,
+        preserve_source_dtype: bool = False,
     ) -> None:
+        self.preserve_source_dtype = preserve_source_dtype
         self.architecture = architecture
         self.start_layer = int(start_layer)
         self.end_layer = int(end_layer)
@@ -499,13 +612,15 @@ class _LayerRangeLoadTracker:
         tensor = handle.get_tensor(key)
         self._tensor_metadata[key] = TensorMaterialization(
             name=key, shape=tuple(int(n) for n in tensor.shape),
-            element_size=int(self.target_element_size),
+            element_size=int(tensor.element_size() if self.preserve_source_dtype else self.target_element_size),
             source_element_size=int(tensor.element_size()),
             source_file=os.path.abspath(source_file) if source_file else "",
         )
         self.loaded_keys.add(key)
         self.source_tensor_bytes += tensor.numel() * tensor.element_size()
-        self.materialized_tensor_bytes += tensor.numel() * self.target_element_size
+        self.materialized_tensor_bytes += tensor.numel() * (
+            tensor.element_size() if self.preserve_source_dtype else self.target_element_size
+        )
 
         if key.startswith(self.layer_prefix):
             suffix = key[len(self.layer_prefix):]
@@ -852,7 +967,12 @@ def _resolve_pytorch_flash_attn() -> bool:
     try:
         from inference_switches import resolve_from_device_profile
 
-        return bool(resolve_from_device_profile().flash_attn)
+        # KV quantization is a llama.cpp option; its Flash dependency cannot
+        # enable a PyTorch kernel. Only the PyTorch Flash preference applies.
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ("QLH_INFER_KV_CACHE", "QLH_INFER_THREADS")}
+        return bool(resolve_from_device_profile(env=environment,
+                    execution_path="pytorch_remote_qwen").flash_attn)
     except Exception as exc:  # pragma: no cover - 依赖缺失时保持既有行为
         logger.warning("推理开关不可用，PyTorch flash-attn 保持关闭: %s", exc)
         return False
@@ -895,6 +1015,7 @@ class ModelManager:
         self._total_model_layers: int = 0    # 完整模型的总层数（加载时记录，load_layer_range 不覆盖）
         self._layer_architecture: str = ""   # "qwen" | "qwen2"，用于分层前向契约
         self._layer_load_metrics: Optional[Dict[str, Any]] = None
+        self._layer_offload = None
         self._pipeline_descriptor: Optional[Dict[str, Any]] = None
         self._pipeline_distributed_only: bool = False
         #: torch.compile 后的内部 transformer（2026-09-18）。**不替换 self.model**，
@@ -1023,6 +1144,23 @@ class ModelManager:
     # 模型加载（双引擎入口）
     # ================================================================
 
+    def configure_catalog(self, catalog_prepare, *, model_id: str = "") -> None:
+        """Inject the catalog's prepare validator; no global registry lookup."""
+        self._catalog_prepare = catalog_prepare
+
+    def _verify_catalog_artifact(self, model_id, model_path, rows=None, *, expected=None):
+        from qlh_core.adapters.artifacts import verify_registered_artifact
+
+        prepare = getattr(self, "_catalog_prepare", None)
+        resolved = prepare(model_id, model_path) if prepare is not None else None
+        if resolved is None:
+            resolved = verify_registered_artifact(model_id, model_path, rows=rows)
+        if expected is not None and resolved != expected:
+            from qlh_core.contracts.catalog import CatalogError
+            raise CatalogError("artifact_revision_mismatch", "source binding changed since pipeline preparation")
+        self._resolved_artifact = resolved
+        return resolved
+
     @staticmethod
     def _normalize_load_path(path: str | None) -> str:
         if not path:
@@ -1055,33 +1193,9 @@ class ModelManager:
         model_id: str,
         db_experimental_models: list[dict] | None,
     ) -> Dict[str, str]:
-        if mc.get_builtin_model(model_id) is not None or not db_experimental_models:
-            return {}
-        entry = next(
-            (
-                item for item in db_experimental_models
-                if isinstance(item, dict) and str(item.get("model_id", "")) == model_id
-            ),
-            None,
-        )
-        if entry is None:
-            return {}
-        identity: Dict[str, str] = {}
-        for key in (
-            "artifact_id", "sha256", "model_sha256", "artifact_sha256",
-            "manifest_sha256", "revision", "resolved_revision", "commit_hash",
-            "quantization",
-        ):
-            value = str(entry.get(key, "") or "").strip()
-            if value:
-                identity[key] = value
-        source = entry.get("source")
-        if isinstance(source, dict):
-            for key in ("provider", "repo_id", "requested_revision", "resolved_revision"):
-                value = str(source.get(key, "") or "").strip()
-                if value:
-                    identity[f"source_{key}"] = value
-        return identity
+        from qlh_core.contracts.catalog import registry_load_identity
+
+        return registry_load_identity(model_id, db_experimental_models)
 
     @classmethod
     def _artifact_load_identity(
@@ -1106,6 +1220,11 @@ class ModelManager:
             "size_bytes": int(stat_result.st_size),
             "mtime_ns": int(stat_result.st_mtime_ns),
         })
+        from qlh_core.adapters.artifacts import artifact_load_identity
+
+        identity.update(artifact_load_identity(
+            normalized, model_id=model_id, rows=db_experimental_models,
+        ))
         sidecar_sha256 = cls._read_sha256_sidecar(normalized)
         if sidecar_sha256:
             identity["sidecar_sha256"] = sidecar_sha256
@@ -1353,6 +1472,8 @@ class ModelManager:
         resolved_path = request["path"] or None
         resolved_id = request["model_id"]
         resolved_engine = request["engine"]
+        if resolved_engine != "island":
+            self._verify_catalog_artifact(resolved_id, resolved_path or "", db_experimental_models)
 
         # ---- TP 孤岛引擎：无本地模型文件，"加载" = 健康检查 + 解析后端模型名 ----
         # 孤岛模型不进本地注册表（无落盘 artifact），跳过注册表/文件校验。
@@ -1409,6 +1530,24 @@ class ModelManager:
         调用后 is_loaded 返回 False，可安全加载新模型。
         """
         logger.info(f"卸载模型: {self._active_model_id} (引擎={self._engine_type})")
+        # ★ 2026-10-24（#125）：卸载会清掉 `_pipeline_descriptor` /
+        #   `_pipeline_distributed_only`，而它们正是"已 prepared"的唯一判据
+        #   （`is_pipeline_prepared` = `_pipeline_distributed_only and _pipeline_descriptor`）。
+        #   一旦被清，下一轮供给必然重新加载段并重跑 torch.compile（实测 138 s，
+        #   内容与上一轮完全相同）。此前不知道供给链路里是谁触发的卸载，这里在
+        #   **仅当确有 pipeline 状态被丢弃时**记录调用栈，便于定位并消除无谓卸载。
+        if self._pipeline_descriptor is not None or self._pipeline_distributed_only:
+            try:
+                import traceback
+                stack = " <- ".join(
+                    line.strip() for line in traceback.format_stack()[-6:-1]
+                ).replace("\n", " ")
+                logger.info(
+                    "event=pipeline_descriptor_cleared_by_unload active_model=%s stack=%s",
+                    self._active_model_id, stack[:400],
+                )
+            except Exception:
+                pass
 
         # --- llama.cpp 引擎清理 ---
         # Release native owners before clearing their state projection. A
@@ -1438,6 +1577,7 @@ class ModelManager:
         self._total_model_layers = 0
         self._layer_architecture = ""
         self._layer_load_metrics = None
+        self._layer_offload = None
         self._pipeline_descriptor = None
         self._pipeline_distributed_only = False
         self._full_model_path = None
@@ -1487,16 +1627,19 @@ class ModelManager:
         may load the master's assigned range, but full-model fallback remains
         disabled until the caller performs a normal model load.
         """
+        from model_supply_assets import _hash_file_cached
         from model_sync import compute_model_sha256
         from pipeline_model_descriptor import inspect_pipeline_model
 
         resolved_path = os.path.abspath(model_path or "")
+        self._verify_catalog_artifact(model_id, resolved_path)
         # Assignment manifests contain only the worker's layer range. Validate
         # that range instead of treating the filtered directory as complete.
         descriptor = inspect_pipeline_model(
             resolved_path,
             model_id=model_id,
             layer_range=layer_range,
+            digest=_hash_file_cached,
         )
         if not descriptor.get("pipeline_runtime_supported", False):
             raise RuntimeError(
@@ -1504,7 +1647,7 @@ class ModelManager:
                 or "该模型架构尚未实现流水线执行 adapter"
             )
         if not model_sha256:
-            model_sha256 = compute_model_sha256(resolved_path)
+            model_sha256 = compute_model_sha256(resolved_path, digest=_hash_file_cached)
         if not model_sha256:
             raise RuntimeError("无法计算流水线模型摘要")
         descriptor["model_sha256"] = model_sha256
@@ -1551,14 +1694,16 @@ class ModelManager:
         model_path = self._full_model_path or self._model_path or ""
         if not model_path or not os.path.isdir(model_path):
             return {}
+        from model_supply_assets import _hash_file_cached
         from model_sync import compute_model_sha256
         from pipeline_model_descriptor import inspect_pipeline_model
 
         descriptor = inspect_pipeline_model(
             model_path,
             model_id=self._active_model_id,
+            digest=_hash_file_cached,
         )
-        descriptor["model_sha256"] = compute_model_sha256(model_path)
+        descriptor["model_sha256"] = compute_model_sha256(model_path, digest=_hash_file_cached)
         self._pipeline_descriptor = dict(descriptor)
         return dict(descriptor)
 
@@ -1593,6 +1738,7 @@ class ModelManager:
         self._model_layers = 0
         self._layer_architecture = ""
         self._layer_load_metrics = None
+        self._layer_offload = None
         import gc
 
         gc.collect()
@@ -1809,6 +1955,7 @@ class ModelManager:
         profile: dict = None,
         total_layers: int = None,
         model_id: str = None,
+        load_spec=None,
     ) -> None:
         """
         加载模型的指定层范围（分布式流水线节点专用）。
@@ -1837,6 +1984,27 @@ class ModelManager:
             mgr.load_layer_range(16, 24, has_embedding=False, has_lm_head=True)
         """
         import torch.nn as nn
+        from qlh_core.contracts.load import RuntimeLoadSpec
+        spec = RuntimeLoadSpec.from_dict(load_spec) if load_spec is not None else None
+        if spec is not None:
+            components = {"layers", "final_norm"}
+            if has_embedding:
+                components.add("embedding")
+            if has_lm_head:
+                components.add("lm_head")
+            if (spec.materialization not in {"safetensors_key_filtered", LAYER_OFFLOAD_MATERIALIZATION}
+                    or set(spec.components) != components
+                    or spec.quant_type not in {"fp16", "fp32"} or spec.kv_policy != "dynamic"
+                    or spec.kv_device != spec.device or spec.kv_dtype != spec.dtype
+                    or {"fp16": "float16", "fp32": "float32"}.get(spec.quant_type) != spec.dtype
+                    or (spec.materialization == LAYER_OFFLOAD_MATERIALIZATION
+                        and (not spec.device.startswith("cuda:") or spec.sequence_count != 1))):
+                raise ValueError("deployment_local_policy_unsupported")
+            if (spec.materialization == LAYER_OFFLOAD_MATERIALIZATION
+                    and not _layer_offload_device_available(spec.device)):
+                raise ValueError("deployment_layer_offload_device_unavailable")
+            quant_type = spec.quant_type
+            self.quant_type = spec.quant_type
 
         # ★ 2026-10-08：登记**上游层段**的量化档，供两侧精度对齐诊断（见 `src/relay_precision.py`）。
         #    只记录，**不改变任何加载行为**；优先级：路径标记（`*-f16-dequant` 等）> `quant_type` 意图。
@@ -1849,6 +2017,8 @@ class ModelManager:
         # has 28 layers while the legacy Qwen project default has 24, and the
         # master normally reuses ``_full_model_path`` without passing a path.
         path = model_path or self._full_model_path or self._model_path or MODEL_PATH
+        prepared = getattr(self, "_resolved_artifact", None)
+        self._verify_catalog_artifact(model_id or self._active_model_id, path, expected=prepared)
         config_path = os.path.join(path, "config.json")
         if os.path.isfile(config_path):
             try:
@@ -1894,10 +2064,14 @@ class ModelManager:
             f"embed={has_embedding}, lm_head={has_lm_head}"
         )
         self._layer_load_metrics = None
+        self._layer_offload = None
 
         # Qwen-1.8B 与 Qwen2/DeepSeek 分别使用 transformer.h 和
         # model.layers，两种架构都从 safetensors 中只物化本节点需要的权重。
         model_type = str(getattr(model_config, "model_type", "") or "").lower()
+        if (spec is not None and spec.materialization == LAYER_OFFLOAD_MATERIALIZATION
+                and model_type not in _QWEN_LAYER_RANGE_TYPES):
+            raise ValueError("deployment_layer_offload_architecture_unsupported")
         load_tracker = None
         # ★ A3：Qwen 系（qwen2 / qwen3 / qwen3_5 / qwen3_5_text）共享
         #   `<root>layers.<i>.` 的 key 形态（root 由 A2 探测得出），故复用同一按 key 过滤加载器。
@@ -1911,6 +2085,7 @@ class ModelManager:
                 quant_type=quant_type,
                 profile=profile,
                 model_config=model_config,
+                load_spec=spec,
             )
         elif model_type == "qwen":
             load_tracker = self._load_qwen_layer_range(
@@ -1922,6 +2097,7 @@ class ModelManager:
                 quant_type=quant_type,
                 profile=profile,
                 model_config=model_config,
+                load_spec=spec,
             )
         elif model_type in {"gemma", "gemma4_unified"}:
             raise RuntimeError(
@@ -1999,6 +2175,8 @@ class ModelManager:
             )
         target_device = materialized_parameters[0].device
         self.model.to(device=target_device)
+        if spec is not None and spec.materialization == LAYER_OFFLOAD_MATERIALIZATION:
+            self._layer_offload = _LayerOffloadRuntime(spec.device, getattr(torch, spec.dtype))
         self.model.eval()
         load_tracker.observe()
 
@@ -2059,6 +2237,12 @@ class ModelManager:
         # 此前本路径完全没有 compile 应用点；这里与 _load_pytorch 对齐。
         # 注意：forward_layers() 是**手动逐层**前向，吃不到整段 compile；
         # 此处注册的编译版本供 self.model(...) / 内部 transformer(...) 的整段调用使用。
+        if self._layer_offload is not None:
+            # Compiled layer loops retain GPU parameters across calls and break
+            # the one-unit placement contract. The eager loop owns transfers.
+            self._compiled_transformer = None
+            self._compiled_layer_loop = None
+            return
         self._maybe_apply_compile()
         # ★ R-R7 rank3：层分段路径（load_layer_range）同样应用融合 RMSNorm —— 与本方法并列，
         #   因为该路径的层循环同样吃不到整段 compile，但能吃到 RMSNorm 的算子合并。
@@ -2075,6 +2259,7 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
+        load_spec=None,
         architecture: str = "qwen2",
     ) -> _LayerRangeLoadTracker:
         """Materialize only selected parameters from safetensors shards.
@@ -2152,7 +2337,9 @@ class ModelManager:
 
         model_prefixes = [model_key_of(prefix) for prefix in selected_prefixes]
 
-        target_device, target_dtype = _select_layer_runtime(quant_type or QUANT_TYPE)
+        target_device, target_dtype = ((load_spec.device, getattr(torch, load_spec.dtype))
+                                       if load_spec is not None else _select_layer_runtime(quant_type or QUANT_TYPE))
+        offload = load_spec is not None and load_spec.materialization == LAYER_OFFLOAD_MATERIALIZATION
         load_tracker = _LayerRangeLoadTracker(
             architecture=architecture,
             start_layer=start_layer,
@@ -2160,6 +2347,7 @@ class ModelManager:
             layer_prefix=f"{qwen_root}layers.",
             selected_prefixes=selected_prefixes,
             target_dtype=target_dtype,
+            preserve_source_dtype=offload,
         )
 
         with init_empty_weights():
@@ -2224,9 +2412,9 @@ class ModelManager:
                     set_module_tensor_to_device(
                         model,
                         model_key_of(key),
-                        target_device,
+                        "cpu" if offload else target_device,
                         value=tensor,
-                        dtype=target_dtype,
+                        dtype=tensor.dtype if offload else target_dtype,
                     )
                     loaded_keys.add(model_key_of(key))
                     load_tracker.observe()
@@ -2300,6 +2488,7 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
+        load_spec=None,
     ) -> _LayerRangeLoadTracker:
         """Materialize one original Qwen-1.8B ``transformer.h`` segment."""
         import gc
@@ -2319,7 +2508,8 @@ class ModelManager:
         if total_layers <= 0:
             raise RuntimeError("Qwen config 缺少 num_hidden_layers")
 
-        target_device, target_dtype = _select_layer_runtime(quant_type or QUANT_TYPE)
+        target_device, target_dtype = ((load_spec.device, getattr(torch, load_spec.dtype))
+                                       if load_spec is not None else _select_layer_runtime(quant_type or QUANT_TYPE))
         use_cuda = target_device.startswith("cuda")
         runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE
@@ -2666,7 +2856,7 @@ class ModelManager:
                 # 却实际走了 server 路径，自相矛盾。
                 cuda_available=decision.cuda_available,
             )
-            self._llama_engine.load_model(model_path=gguf_path, n_ctx=n_ctx)
+            self._llama_engine.load_model(model_path=gguf_path, context_limit=n_ctx)
         else:
             if decision.cuda_available and decision.requested == AUTO:
                 # auto 降级必须可观测（有 GPU 却回落到 CPU 绑定，用户会奇怪为什么慢）
@@ -2674,7 +2864,7 @@ class ModelManager:
             self._llama_engine = LlamaCppEngine()
             self._llama_engine.load_model(
                 model_path=gguf_path,
-                n_ctx=n_ctx,
+                context_limit=n_ctx,
             )
         self._model_path = gguf_path
 
@@ -3004,6 +3194,7 @@ class ModelManager:
 
         self.layer_range = None
         self._layer_load_metrics = None
+        self._layer_offload = None
         self._layer_has_embedding = True
         self._layer_has_lm_head = True
 
@@ -3752,7 +3943,7 @@ class ModelManager:
         has_embed = getattr(transformer, "wte", None) is not None
         has_lm_head = getattr(self.model, "lm_head", None) is not None
         device = self.get_device()
-        dtype = next(self.model.parameters()).dtype
+        dtype = self._layer_compute_dtype()
 
         with torch.no_grad():
             if input_ids is not None:
@@ -3833,6 +4024,50 @@ class ModelManager:
             return result
 
     @_serialized_model_access
+    def layer_offload_observation(self):
+        """Observe CPU source ownership and the largest target execution unit."""
+        offload = getattr(self, "_layer_offload", None)
+        if offload is None or self.model is None or offload.active:
+            raise ValueError("layer_offload_runtime_unavailable")
+        transformer, layers_attr, embedding_attr = _locate_text_transformer(self.model)
+        units = list(getattr(transformer, layers_attr))
+        units += [getattr(transformer, name, None)
+                  for name in (embedding_attr, "norm", "rotary_emb")]
+        units.append(getattr(self.model, "lm_head", None))
+        tensors = list(self.model.parameters()) + list(self.model.buffers())
+        if any(t.device.type != "cpu" for t in tensors):
+            raise ValueError("layer_offload_source_device_mismatch")
+        size = torch.empty((), dtype=offload.dtype).element_size()
+        derived = {id(tensor) for module in self.model.modules()
+                   for name, tensor in module.named_buffers(recurse=False)
+                   if name in module._non_persistent_buffers_set}
+        def target_size(tensor):
+            return size if tensor.is_floating_point() and id(tensor) not in derived else tensor.element_size()
+        stage_weights = []
+        for unit in units:
+            if unit is not None:
+                unique = {id(t): t for t in (*unit.parameters(), *unit.buffers())}
+                stage_weights.append(sum(t.numel() * target_size(t) for t in unique.values()))
+        unique = {id(t): t for t in tensors}
+        return {**offload.observation(),
+                "resident_source_bytes": sum(t.numel() * t.element_size() for t in unique.values()),
+                "device_weight_bytes": max(stage_weights, default=0),
+                "host_conversion_bytes": max((t.numel() * size for t in unique.values()
+                                               if t.is_floating_point() and t.dtype != offload.dtype
+                                               and id(t) not in derived), default=0),
+                "target_weight_bytes": sum(t.numel() * target_size(t) for t in unique.values())}
+
+    def _layer_compute_dtype(self):
+        offload = getattr(self, "_layer_offload", None)
+        return offload.dtype if offload is not None else next(self.model.parameters()).dtype
+
+    def _call_layer_unit(self, module, *args, **kwargs):
+        offload = getattr(self, "_layer_offload", None)
+        if offload is None:
+            return module(*args, **kwargs)
+        return offload.call(module, *args, **kwargs)
+
+    @_serialized_model_access
     def forward_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the active architecture's final norm and language-model head."""
         if self.model is None or self._engine_type != "pytorch":
@@ -3864,10 +4099,11 @@ class ModelManager:
         if norm is None:
             raise RuntimeError(f"模型架构 {model_type or 'unknown'} 缺少最终 Norm")
         device = self.get_device()
-        dtype = next(self.model.parameters()).dtype
+        dtype = self._layer_compute_dtype()
         with torch.no_grad():
             states = hidden_states.to(device=device, dtype=dtype)
-            return lm_head(norm(states))
+            states = self._call_layer_unit(norm, states)
+            return self._call_layer_unit(lm_head, states)
 
     @_serialized_model_access
     def forward_layers(
@@ -3952,7 +4188,7 @@ class ModelManager:
         # ★ A3：用统一探测取文本 Transformer（支持 Qwen3.5 的 model.model.language_model）。
         #   到这里 model_type 已限定为本模块支持的 Qwen 系，其层属性均为 `layers`。
         transformer, _layers_attr, _embed_attr = _locate_text_transformer(self.model)
-        dtype = next(self.model.parameters()).dtype
+        dtype = self._layer_compute_dtype()
 
         # 检测节点角色
         has_embed = (
@@ -3982,7 +4218,7 @@ class ModelManager:
                     )
                 input_ids = input_ids.to(device)
                 batch_size, seq_len = input_ids.shape
-                hidden_states = transformer.embed_tokens(input_ids).to(dtype=dtype)
+                hidden_states = self._call_layer_unit(transformer.embed_tokens, input_ids).to(dtype=dtype)
             else:
                 batch_size = hidden_states.shape[0]
                 seq_len = hidden_states.shape[1]
@@ -4249,7 +4485,7 @@ class ModelManager:
                     if position_ids.ndim == 3 and position_ids.shape[0] == 4:
                         layer_position_ids = position_ids[0]
                         position_ids = position_ids[1:]
-                position_embeddings = transformer.rotary_emb(hidden_states, position_ids)
+                position_embeddings = self._call_layer_unit(transformer.rotary_emb, hidden_states, position_ids)
 
                 # ============================================================
                 # Step 6: Transformer 层前向传播（支持 KV cache）
@@ -4288,7 +4524,7 @@ class ModelManager:
                         }
                         if cache_arg_name is not None:
                             layer_kwargs[cache_arg_name] = cache
-                        layer_output = layer(hidden_states, **layer_kwargs)
+                        layer_output = self._call_layer_unit(layer, hidden_states, **layer_kwargs)
                         # transformers≥5.x: DecoderLayer 直接返回 tensor
                         # transformers 4.x: 返回 (hidden_states, present_key_value) 元组
                         if isinstance(layer_output, tuple):
@@ -4303,8 +4539,8 @@ class ModelManager:
                 result: Dict[str, torch.Tensor] = {}
 
                 if has_lm_head and apply_lm_head:
-                    hidden_states = transformer.norm(hidden_states)
-                    logits = self.model.lm_head(hidden_states)
+                    hidden_states = self._call_layer_unit(transformer.norm, hidden_states)
+                    logits = self._call_layer_unit(self.model.lm_head, hidden_states)
                     result["logits"] = logits
                 else:
                     result["hidden_states"] = hidden_states
@@ -4403,6 +4639,9 @@ class ModelManager:
 
     def get_device(self) -> torch.device:
         """获取当前模型所在设备（PyTorch 引擎）"""
+        offload = getattr(self, "_layer_offload", None)
+        if offload is not None:
+            return offload.execution_device
         if self.model is not None:
             model_device = getattr(self.model, "device", None)
             if model_device is not None:
@@ -4450,6 +4689,21 @@ class ModelManager:
             "loaded_layers": self._model_layers,
             "device": str(self.get_device()),
         }
+        actual_config = getattr(self.model, "config", None)
+        text_config = getattr(actual_config, "text_config", actual_config)
+        implementation = getattr(text_config, "_attn_implementation", None)
+        remote_flash = getattr(actual_config, "use_flash_attn", None)
+        info["inference_switches"] = ({
+            "schema_version": 2, "scope": "loaded_model", "execution_path": "pytorch",
+            "requested": {"flash_attn": remote_flash if type(remote_flash) is bool else "engine_policy"},
+            "effective": {"attention_implementation": implementation,
+                          "remote_qwen_use_flash_attn": remote_flash,
+                          "device": str(self.get_device())},
+            "sources": {"attention": "loaded_model_config"},
+            "selection": {"reason": "pytorch_independent_policy"},
+        } if self.model is not None else None)
+        if getattr(self, "_layer_offload", None) is not None:
+            info["layer_offload"] = self.layer_offload_observation()
         if self._layer_load_metrics is not None:
             info["layer_load_metrics"] = dict(self._layer_load_metrics)
             proof = info["layer_load_metrics"].get("materialization_proof")

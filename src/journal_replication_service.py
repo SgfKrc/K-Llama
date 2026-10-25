@@ -2,7 +2,7 @@
 
 **为什么只需要"接线"**：复制契约（`src/journal_replication.py`，`JournalCheckpoint` +
 `DurableJournalReplica`）、认证 TCP 帧（`src/journal_replication_transport.py`）与事件源
-（`src/task_journal.py` 的 `workflow_events`）**三者都已存在**，而且 `TaskJournal` 的
+（`src/recovery_journal.py` 的 `workflow_events`）**三者都已存在**，而且 `TaskJournal` 的
 `get_snapshot` / `list_events` **恰好就是** `ReplicationJournal` 契约要求的那两个方法 ——
 `build_checkpoint()` 可以直接吃 `SQLiteTaskJournal`，不需要适配器。缺的只是**生产侧消费者**
 （此前唯一消费者是 `tests/test_journal_replication.py`）。
@@ -377,6 +377,8 @@ def recover_journal_prefix(
     *,
     workflow_id: str,
     settings: JournalReplicationSettings | None = None,
+    mutation_guard=None,
+    permission_check=None,
 ) -> dict[str, Any]:
     """#93：让**落后的副本主动追赶** —— 从对端拉回一个已自洽的 checkpoint 并应用。
 
@@ -404,7 +406,9 @@ def recover_journal_prefix(
                 secret=resolved.secret_bytes,
                 timeout=resolved.timeout_s,
             )
-            result = replica.apply_checkpoint(checkpoint)
+            guarded = {"permission_check": permission_check} if permission_check is not None else {}
+            apply = lambda: replica.apply_checkpoint(checkpoint, **guarded)
+            result = mutation_guard(apply) if mutation_guard is not None else apply()
         except (JournalReplicationTransportError, JournalReplicationError, OSError) as exc:
             failures[label] = type(exc).__name__
             continue

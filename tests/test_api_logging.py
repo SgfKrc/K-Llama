@@ -38,6 +38,28 @@ def _patch_scheduler_for_test():
         yield mock_sched
 
 
+@pytest.fixture(autouse=True)
+def _explicit_memory_logging(_patch_scheduler_for_test):
+    """Memory logging is a startup resource, installed explicitly for API tests."""
+    import api_server
+    root = logging.getLogger()
+    original_level = root.level
+    handler = api_server.MemoryLogHandler()
+    handler.addFilter(api_server._request_id_filter)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    with api_server._log_buffer_lock:
+        api_server._log_buffer.clear()
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+        root.setLevel(original_level)
+        with api_server._log_buffer_lock:
+            api_server._log_buffer.clear()
+
+
 @pytest.fixture
 def log_dir_temp():
     """创建临时日志目录并 patch config.LOG_DIR。"""
@@ -396,7 +418,9 @@ class TestLogStatsApi:
         resp = client.get("/api/logs/stats")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["buffer_size"] > 0
+        assert data["buffer_size"] >= 2
+        recent = client.get("/api/logs/recent?name=test.stats&limit=50").json()["logs"]
+        assert {"stats test message one", "stats test message two"} <= {entry["message"] for entry in recent}
 
     def test_stats_empty_directory(self, log_dir_temp, client):
         """空日志目录 stats 应返回 0。"""
@@ -632,6 +656,31 @@ class TestLogRetentionCleanup:
         # 当天文件应保留
         assert os.path.exists(today_file)
 
+    def test_retention_runs_immediately_after_startup(self, monkeypatch, log_dir_temp):
+        """启动即清理：不得再等固定延迟。
+
+        曾固定 `wait(300)` 才首次清理，而开发期进程常在同一分钟内重启 ⇒ 线程每次重新
+        数 300 s，**首次清理永远等不到**。实测 `event=log_retention_cleanup` 在
+        2026-10-17 之后 7 天里一次都没出现，日志因此堆到 20 GB。
+        """
+        import threading as _threading
+        import time as _time
+        import api_server
+
+        calls = []
+        monkeypatch.setattr(api_server, "_run_log_retention_cleanup",
+                            lambda: calls.append(1))
+        monkeypatch.setattr(api_server, "_log_retention_thread_started", False)
+        monkeypatch.setattr(api_server, "_runtime_background_stop", _threading.Event())
+
+        api_server._start_log_retention_thread()
+        deadline = _time.time() + 3.0
+        while not calls and _time.time() < deadline:
+            _time.sleep(0.02)
+        api_server._runtime_background_stop.set()  # 让后台线程退出
+
+        assert calls, "日志保留线程未在启动后立即执行清理"
+
 
 # ================================================================
 # L5: 多节点日志聚合
@@ -707,18 +756,11 @@ class TestStructuredLogFormat:
         assert "event=test_event" in caplog.text
         assert "field1=value1" in caplog.text
 
-    def test_task_id_log_format(self, caplog):
-        """scheduler 的 task enqueue 日志应包含 task_id 和 request_id。"""
-        from scheduler import PipelineQueue
-
-        q = PipelineQueue(max_size=10, result_ttl=60)
-        with caplog.at_level(logging.INFO, logger="scheduler"):
-            q.enqueue(prompt="test", max_new_tokens=128, request_id="rid-test-001")
-            q.stop()
-
-        # 日志中应包含 task_id 和 request_id
-        assert any("task_id=" in r.getMessage() and "request_id=rid-test-001" in r.getMessage()
-                   for r in caplog.records)
+    def test_request_identity_projection(self):
+        from qlh_core.execution.requests import RequestService
+        value = RequestService._snapshot_record({"request_id": "request", "boot_id": "boot", "deployment_id": "deployment", "revision": 1})
+        assert value["identity"] == {"request_id": "request", "boot_id": "boot", "deployment_id": "deployment"}
+        assert value["schema_version"] == 2
 
     def test_log_retention_cleanup_log_format(self, log_dir_temp, caplog):
         """日志保留清理应输出 event=log_retention_cleanup。"""

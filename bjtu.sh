@@ -1,116 +1,26 @@
 #!/usr/bin/env bash
-# ============================================================
-#  QLH 全局 bjtu 命令 (Linux / macOS)
-#
-#  用法: bjtu [launcher|ui|tui|chat|tui_commands.py 参数...]
-#
-#  交互模式转发 start_tui.sh: 后端在当前进程内启动 (BackendSupervisor)，
-#  随 TUI 退出而停止; 需要常驻后端请直接运行 `python src/api_server.py`。
-#
-#  安装(任意一种):
-#     ln -s <项目根>/bjtu.sh /usr/local/bin/bjtu
-#     或把 <项目根> 加入 PATH
-#  本脚本支持被符号链接调用, 会解析回项目根目录。
-# ============================================================
-
-# 解析脚本真实路径(兼容符号链接; macOS 无 readlink -f 时退回 $0)
+# Application, TUI and signed maintenance entry for source checkouts.
 SELF="$0"
 if command -v readlink >/dev/null 2>&1 && readlink -f "$0" >/dev/null 2>&1; then
     SELF="$(readlink -f "$0")"
 fi
 PROJECT_ROOT="$(cd "$(dirname "$SELF")" && pwd)" || exit 1
 cd "$PROJECT_ROOT" || exit 1
-SHELL_ROOT="${QLH_SHELL_ROOT:-$PROJECT_ROOT/../qlh-shell}"
-RELEASE_ROOT="${QLH_RELEASE_ROOT:-$PROJECT_ROOT/../qlh-release}"
 export QLH_CORE_ROOT="${QLH_CORE_ROOT:-$PROJECT_ROOT}"
-export QLH_SHELL_ROOT="$SHELL_ROOT"
-export QLH_RELEASE_ROOT="$RELEASE_ROOT"
-RELEASE_LAUNCHER="$RELEASE_ROOT/packaging/qlh_launcher.py"
-
-if [ ! -f "src/api_server.py" ]; then
-    echo "[错误] 未找到 src/api_server.py —— bjtu 脚本必须位于 QLH 项目根目录。"
-    echo "       当前目录: $PROJECT_ROOT"
-    exit 1
-fi
-
-# ---- help: 仅打印命令集与参数帮助，不启动后端 ----
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo "QLH BJTU 统一入口:"
-    echo "  bjtu launcher   启动选择页（普通界面 / TUI）"
-    echo "  bjtu ui         直接启动普通 Web/原生界面"
-    echo "  bjtu tui        启动后端并进入 TUI 管理界面"
-    echo "  bjtu chat       进入终端对话页"
-    echo "  bjtu status     执行 TUI 单命令（不自动启动后端）"
-    echo
-    PY=""
-    if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
-        PY=python3
-    elif command -v python >/dev/null 2>&1; then
-        PY=python
-    else
-        echo "[错误] 未找到可用的 python3 / python。"
-        exit 1
-    fi
-    exec "$PY" "$PROJECT_ROOT/src/tui_commands.py" help
-fi
-
-# ---- unified launcher modes ----
-if [ "$1" = "launcher" ] || [ "$1" = "ui" ] || [ "$1" = "tui" ]; then
-    MODE="$1"
-    shift
-    PY=""
-    if [ -x "$RELEASE_ROOT/.venv-packaging/bin/python" ]; then
-        PY="$RELEASE_ROOT/.venv-packaging/bin/python"
-    elif command -v python3 >/dev/null 2>&1; then
-        PY=python3
-    else
-        PY=python
-    fi
-    export PYTHONIOENCODING=utf-8
-    if [ "$MODE" = "launcher" ]; then
-        exec "$PY" "$RELEASE_ROOT/packaging/launcher.py" --launcher "$@"
-    elif [ "$MODE" = "ui" ]; then
-        exec "$PY" "$RELEASE_ROOT/packaging/launcher.py" --ui "$@"
-    else
-        exec "$PY" "$RELEASE_ROOT/packaging/launcher.py" --tui "$@"
-    fi
-fi
-
-# UP-N4 Launcher maintenance always runs through the stable Bootstrap.
-case "${1:-}" in
-    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose|repair|data-status|retain-data|reassociate-data|reinstall)
-        if [ -x "$RELEASE_ROOT/.venv-packaging/bin/python" ]; then
-            PY="$RELEASE_ROOT/.venv-packaging/bin/python"
-        elif command -v python3 >/dev/null 2>&1; then
-            PY=python3
-        else
-            PY=python
-        fi
-        export PYTHONIOENCODING=utf-8
-        exec "$PY" "$RELEASE_LAUNCHER" "$@"
-        ;;
+export QLH_RELEASE_ROOT="${QLH_RELEASE_ROOT:-$PROJECT_ROOT/packaging}"
+export QLH_SHELL_ROOT="${QLH_SHELL_ROOT:-$PROJECT_ROOT/frontend_cybergothic}"
+PY="${PYTHON:-python3}"
+if [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then PY="$PROJECT_ROOT/.venv/bin/python"; fi
+export PYTHONIOENCODING=utf-8
+case "${1:-tui}" in
+    ui|web|headless)
+        mode="$1"; shift
+        exec "$PY" "$PROJECT_ROOT/src/app_bootstrap.py" "--$mode" "$@" ;;
+    update)
+        shift
+        exec "$PY" "$PROJECT_ROOT/qlh.py" maintenance check "$@" ;;
+    check|download|install|version-status|version-stage|version-activate|version-rollback|version-recover|diagnostics|verify|diagnose|repair|data-status|retain-data|reassociate-data|reinstall)
+        exec "$PY" "$PROJECT_ROOT/qlh.py" maintenance "$@" ;;
+    version) exec "$PY" -c 'import json; print(json.load(open("release-contract.json"))["version"]["product"])' ;;
+    *) exec "$PY" "$PROJECT_ROOT/qlh.py" "$@" ;;
 esac
-
-# ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
-if [ "$1" = "chat" ]; then
-    PY=""
-    if [ -x "$SHELL_ROOT/.venv-tui/bin/python" ]; then
-        PY="$SHELL_ROOT/.venv-tui/bin/python"
-    elif command -v python3 >/dev/null 2>&1; then
-        PY=python3
-    else
-        PY=python
-    fi
-    if ! "$PY" -c "import textual, httpx" >/dev/null 2>&1; then
-        echo "[T9] 聊天页缺少可选依赖 Textual/httpx。"
-        echo "     安装: python3 $SHELL_ROOT/scripts/setup_tui_env.py"
-        echo "     或:   pip install -r $SHELL_ROOT/requirements-tui.txt"
-        echo "     管理 TUI（bjtu / start_tui.sh）不受影响。"
-        exit 2
-    fi
-    shift
-    export PYTHONIOENCODING=utf-8
-    exec "$PY" "$PROJECT_ROOT/src/tui_chat.py" "$@"
-fi
-
-exec bash start_tui.sh "$@"

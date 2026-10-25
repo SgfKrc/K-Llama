@@ -1,0 +1,95 @@
+{
+  "schema": "qlh.placement_study.v1",
+  "descriptor": {
+    "model_id": "synthetic",
+    "model_type": "qwen2",
+    "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "total_layers": 6,
+    "layer_weight_bytes": [
+      100,
+      100,
+      100,
+      100,
+      100,
+      100
+    ],
+    "component_weight_bytes": {
+      "embedding": 10,
+      "final_norm": 10,
+      "lm_head": 10
+    }
+  },
+  "nodes": [
+    {
+      "node_id": "master",
+      "role": "master",
+      "capacity_bytes": 10000,
+      "reserve_bytes": 10,
+      "runtime_multiplier": 1.0,
+      "score": 4,
+      "engine": "llama_cpp",
+      "execution_device": "cpu"
+    },
+    {
+      "node_id": "tail",
+      "role": "worker",
+      "capacity_bytes": 10000,
+      "reserve_bytes": 10,
+      "runtime_multiplier": 1.0,
+      "score": 1,
+      "engine": "llama_cpp",
+      "execution_device": "cpu"
+    }
+  ],
+  "policy": {
+    "safety_margin": 1.0,
+    "require_distributed": true,
+    "required_node_id": "master",
+    "prefer_all_workers": false
+  },
+  "environment": {
+    "epoch": "synthetic-calibration-1",
+    "network_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "node_runtimes": {
+      "master": {
+        "engine": "llama_cpp",
+        "execution_device": "cpu",
+        "binary_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "threads": 4,
+        "load_spec_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "tail": {
+        "engine": "llama_cpp",
+        "execution_device": "cpu",
+        "binary_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "threads": 4,
+        "load_spec_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  },
+  "workload": {
+    "phase": "decode",
+    "batch_size": 1,
+    "sequence_count": 1,
+    "context_position": 16,
+    "input_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "kv_state_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "hidden_abi": "synthetic-pre-norm-f32",
+    "range_unit_layers": 1
+  },
+  "now_ms": 1100,
+  "max_profile_age_ms": 500,
+  "max_candidates": 256,
+  "transition": {
+    "trigger": "network_changed",
+    "expected_reuse_steps": 10,
+    "costs_ms": {
+      "drain": 1,
+      "materialize": 2,
+      "transfer": 1000,
+      "load": 1,
+      "warmup": 1,
+      "search": 2
+    }
+  }
+}

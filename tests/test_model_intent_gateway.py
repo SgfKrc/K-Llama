@@ -34,7 +34,7 @@ class Scheduler:
     def get_distributed_inference_enabled(self):
         return self.enabled
 
-    def _scheduler_facade_global(self, name):
+    def _runtime_setting(self, name):
         assert name == "RUN_MODE"
         return self.run_mode
 

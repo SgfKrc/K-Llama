@@ -175,7 +175,8 @@ def preflight_pipeline_artifacts(
 
     Workers that only advertise legacy ``layer_ranges`` remain outside this
     first-phase artifact preflight. Once an assignment selects a concrete
-    ``layer_artifact``, however, its v1 logical-model contract is mandatory.
+    ``layer_artifact``, its logical-model contract and unique physical identity
+    must agree with the selected PyTorch/Safetensors or llama.cpp/GGUF engine.
     """
 
     logical_model_id = str(model_id or "").strip()
@@ -414,14 +415,25 @@ def preflight_pipeline_artifacts(
                 or (source_sha and _SHA256.fullmatch(source_sha) is None)
             )
             models = node.get("models", []) if isinstance(node, Mapping) else []
-            physical_model = next((
+            formats = {"llama_cpp": "gguf", "pytorch": "safetensors"}
+            selected_engines = {
+                str(owner["engine"]).strip().lower()
+                for owner in (assignment, node or {}) if owner.get("engine")
+            }
+            # Legacy records may omit an engine. Resolve only from the exact
+            # physical model, never from installed engines or another artifact.
+            physical_matches = [
                 model for model in models
                 if isinstance(model, Mapping)
                 and str(model.get("model_id", "") or "") == artifact_model_id
                 and str(model.get("sha256", "") or "").lower() == artifact_sha
-                and str(model.get("engine", "") or "").lower() == "llama_cpp"
-                and str(model.get("format", "") or "").lower() == "gguf"
-            ), None) if isinstance(models, (list, tuple)) else None
+                and str(model.get("engine", "") or "").lower() in formats
+                and str(model.get("format", "") or "").lower()
+                    == formats[str(model.get("engine", "") or "").lower()]
+                and (not selected_engines or selected_engines == {
+                    str(model.get("engine", "") or "").lower()})
+            ] if isinstance(models, (list, tuple)) else []
+            physical_model = physical_matches[0] if len(physical_matches) == 1 else None
             if digest_invalid or not isinstance(physical_model, Mapping):
                 node_problems.append({
                     "node_id": node_id,

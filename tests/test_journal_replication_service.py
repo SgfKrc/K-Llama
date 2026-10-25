@@ -27,7 +27,7 @@ from journal_replication_service import (  # noqa: E402
     replicate_journal_once,
 )
 from journal_replication_transport import JournalReplicationTransportError  # noqa: E402
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 SECRET = b"r" * 40
 
@@ -205,51 +205,3 @@ def test_receiver_refuses_to_start_when_disabled():
 
 
 # ----------------------------------------------------------------------- 端点 fail-closed
-
-def _fake_api_module(monkeypatch, *, role: str, journal):
-    from api import routes_tasks
-
-    scheduler = types.SimpleNamespace(_effective_role=lambda: role)
-    coordinator = types.SimpleNamespace(journal=journal)
-    fake = types.SimpleNamespace(
-        scheduler=scheduler,
-        task_graph_coordinator=coordinator,
-        HTTPException=HTTPException,
-    )
-    monkeypatch.setattr(routes_tasks, "_api_module", fake)
-    return routes_tasks
-
-
-def test_api_endpoint_rejects_non_master_before_anything_else(monkeypatch, tmp_path):
-    """非主节点 ⇒ **403**，且**先于**开关判据（顺序本身是判据的一部分）。"""
-
-    routes = _fake_api_module(monkeypatch, role="client", journal=None)
-    monkeypatch.delenv("QLH_JOURNAL_REPLICATION_ENABLED", raising=False)
-
-    with pytest.raises(HTTPException) as excinfo:
-        asyncio.run(routes.replicate_journal(workflow_id="wf-1"))
-
-    assert excinfo.value.status_code == 403
-
-
-def test_api_endpoint_fails_closed_when_disabled(monkeypatch):
-    routes = _fake_api_module(monkeypatch, role="master", journal=object())
-    monkeypatch.delenv("QLH_JOURNAL_REPLICATION_ENABLED", raising=False)
-
-    with pytest.raises(HTTPException) as excinfo:
-        asyncio.run(routes.replicate_journal(workflow_id="wf-1"))
-
-    assert excinfo.value.status_code == 409
-
-
-def test_api_status_reports_disabled_without_leaking_secret(monkeypatch):
-    routes = _fake_api_module(monkeypatch, role="master", journal=None)
-    monkeypatch.delenv("QLH_JOURNAL_REPLICATION_ENABLED", raising=False)
-    monkeypatch.setenv("QLH_JOURNAL_REPLICATION_SECRET", "s" * 40)
-
-    payload = asyncio.run(routes.journal_replication_status())
-
-    assert payload["enabled"] is False
-    assert payload["journal_available"] is False
-    assert payload["settings"]["secret_present"] is True
-    assert "s" * 40 not in str(payload)

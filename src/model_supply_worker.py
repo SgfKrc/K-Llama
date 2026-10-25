@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import hashlib
 import importlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -32,6 +33,11 @@ _STRATEGY_REASONS = frozenset({
     "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT", "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
     "SUPPLY_LOCAL_CUT_UNSUPPORTED", "SUPPLY_NODE_CUTTER_UNAVAILABLE",
 })
+_LOG = logging.getLogger(__name__)
+# Keep product pointer readers out of atomic publish/restore, including bounded
+# Windows retries. WSL UNC can reject rename even with FILE_SHARE_DELETE.
+# Never hold this lock while hashing artifacts or refreshing capabilities.
+_POINTER_IO_LOCK = threading.RLock()
 _SELECTION_CACHE_LOCK = threading.Lock()
 _SELECTION_CACHE: dict[str, tuple[tuple, dict]] = {}
 _SELECTION_OWNERS_LOCK = threading.Lock()
@@ -61,6 +67,23 @@ def _json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise SupplyError("invalid_manifest")
     return value
+
+
+def _read_pointer(path: Path) -> bytes:
+    with _POINTER_IO_LOCK:
+        if path.is_symlink() or path.stat().st_size > _MAX_JSON_BYTES:
+            raise SupplyError("invalid_manifest")
+        return path.read_bytes()
+
+
+def _log_registration_error(op, phase: str, exc: Exception) -> None:
+    # Registration only touches validated local artifacts. Transport exceptions
+    # remain unlogged because they may contain credential-bearing URLs.
+    _LOG.error("Model supply %s failed (operation=%s, node=%s)",
+               phase, op.operation_id, op.node_id, exc_info=True,
+               extra={"supply_phase": phase, "supply_operation_id": op.operation_id,
+                      "supply_node_id": op.node_id, "supply_errno": getattr(exc, "errno", None),
+                      "supply_winerror": getattr(exc, "winerror", None)})
 
 
 def _sha(value: Any) -> bool:
@@ -201,17 +224,85 @@ def _file_sha(path: Path, cancelled=None) -> str:
     return digest.hexdigest()
 
 
-def _verify_files(manifest: dict, directory: Path, cancelled=None) -> Path:
+# ★ 2026-10-24（#125）：整模 sha256 是必需的源身份证明，但**不必每轮重算**。
+#   实测清点（inventory）阶段对 5.78 GB 的 GGUF 做全量 sha256 需约 200 s，占整个
+#   供给近三分之一；#133 加的进程内摘要缓存**重启即失效、跨 op 也不复用** ⇒ 每次
+#   供给都重付一遍。这里以 `_file_stamp`（size/mtime_ns/ctime_ns/ino/change_time）
+#   作为失效判据，把结果**持久化**到 worker root，跨重启与跨供给复用。
+_SOURCE_DIGEST_CACHE_NAME = "source-digests.json"
+_source_digest_cache: dict | None = None
+
+
+def _load_source_digest_cache(root: Path) -> dict:
+    global _source_digest_cache
+    if _source_digest_cache is not None:
+        return _source_digest_cache
+    import json
+    cache: dict = {}
+    try:
+        payload = json.loads((root / _SOURCE_DIGEST_CACHE_NAME).read_text(encoding="utf-8"))
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and payload.get("schema_version") == 1 and isinstance(entries, dict):
+            cache = {key: value for key, value in entries.items() if isinstance(value, dict)}
+    except (OSError, ValueError):
+        cache = {}
+    _source_digest_cache = cache
+    return cache
+
+
+def _store_source_digest_cache(root: Path) -> None:
+    import json
+    import os
+    cache = _source_digest_cache
+    if cache is None:
+        return
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        temp = root / (_SOURCE_DIGEST_CACHE_NAME + ".tmp")
+        temp.write_text(json.dumps({"schema_version": 1, "entries": cache},
+                                   ensure_ascii=True, sort_keys=True), encoding="utf-8")
+        os.replace(temp, root / _SOURCE_DIGEST_CACHE_NAME)
+    except OSError:
+        pass
+
+
+def _file_sha_cached(root: Path, path: Path) -> str:
+    """Full-file sha256, reusing the persisted digest while the file is unchanged."""
+    cache = _load_source_digest_cache(root)
+    key = str(path)
+    try:
+        stamp = list(_file_stamp(path))
+    except OSError:
+        return _file_sha(path)
+    entry = cache.get(key)
+    if (isinstance(entry, dict) and entry.get("stamp") == stamp
+            and isinstance(entry.get("sha256"), str) and _sha(entry["sha256"])):
+        return str(entry["sha256"])
+    digest = _file_sha(path)
+    cache[key] = {"stamp": stamp, "sha256": digest}
+    _store_source_digest_cache(root)
+    return digest
+
+
+def _verify_files(manifest: dict, directory: Path, cancelled=None, *, fresh=False) -> Path:
     directory = directory.resolve(strict=True)
-    paths = []
+    try:
+        from model_supply_assets import _hash_file_cached, _verify_segment
+    except ImportError:
+        raise SupplyError("supply_assets_unavailable") from None
     for entry in manifest["files"]:
+        if cancelled is not None and cancelled():
+            raise SupplyError("cancelled")
         path = _within(directory / _relative(entry["path"]), directory)
         if not path.is_file() or path.stat().st_size != entry.get("size_bytes", entry.get("size")):
             raise SupplyError("artifact_size_mismatch")
-        if _file_sha(path, cancelled) != entry["sha256"]:
+        try:
+            actual = (_file_sha if fresh else _hash_file_cached)(path, cancelled)
+        except ValueError as exc:
+            raise SupplyError(_error_code(exc, "artifact_sha256_mismatch")) from None
+        if actual != entry["sha256"]:
             raise SupplyError("artifact_sha256_mismatch")
     try:
-        from model_supply_assets import _verify_segment
         _verify_segment(directory, manifest)
     except ImportError:
         raise SupplyError("supply_assets_unavailable") from None
@@ -250,6 +341,11 @@ def _remember_selection(root: Path, pointer_bytes: bytes, directory: Path, manif
         _SELECTION_CACHE[str(root.resolve())] = (key, value)
 
 
+def _selection_files_changed(cached, fingerprint) -> bool:
+    previous = {item[0]: item[1:] for item in cached[0][1]} if cached is not None else {}
+    return any(item[0] in previous and previous[item[0]] != item[1:] for item in fingerprint)
+
+
 def _selection_distributed(root: Path) -> bool:
     if not _runtime_distributed():
         return False
@@ -257,7 +353,7 @@ def _selection_distributed(root: Path) -> bool:
     # participation check when present; this is a weak lookup, not mode state.
     with _SELECTION_OWNERS_LOCK:
         owners = list(_SELECTION_OWNERS.get(str(root.resolve()), ()))
-    return all(owner._distributed() for owner in owners)
+    return all(owner._distributed() and not owner._registration_blocked for owner in owners)
 
 
 def get_selected_model(root: Path | None = None) -> dict | None:
@@ -274,7 +370,7 @@ def get_selected_model(root: Path | None = None) -> dict | None:
         current = root / "current.json"
         if current.is_symlink() or current.stat().st_size > _MAX_JSON_BYTES:
             return None
-        pointer_bytes = current.read_bytes()
+        pointer_bytes = _read_pointer(current)
         pointer = json.loads(pointer_bytes)
         if not isinstance(pointer, dict) or pointer.get("kind") != "qlh.model_supply.current.v1":
             return None
@@ -294,7 +390,9 @@ def get_selected_model(root: Path | None = None) -> dict | None:
             if cached is not None and cached[0] == key:
                 result = deepcopy(cached[1])
             else:
-                model_path = _verify_files(manifest, directory)
+                changed = _selection_files_changed(cached, key[1])
+                model_path = (_verify_files(manifest, directory, fresh=True) if changed
+                              else _verify_files(manifest, directory))
                 if key != _selection_key(root, pointer_bytes, directory, manifest):
                     return None
                 result = {"model_path": str(model_path), "directory": str(directory),
@@ -303,7 +401,7 @@ def get_selected_model(root: Path | None = None) -> dict | None:
                 if len(_SELECTION_CACHE) >= 64:
                     _SELECTION_CACHE.clear()
                 _SELECTION_CACHE[str(root.resolve())] = (key, deepcopy(result))
-        if current.read_bytes() != pointer_bytes or not _selection_distributed(root):
+        if _read_pointer(current) != pointer_bytes or not _selection_distributed(root):
             return None
         return result
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
@@ -350,6 +448,7 @@ class ModelSupplyWorker:
         self._lock = threading.Lock()
         self._execution_lock = threading.RLock()
         self._inventory_lock = threading.Lock()
+        self._registration_blocked = False
         self._active: _Operation | None = None
         self._pending: _Operation | None = None
         self._runner: threading.Thread | None = None
@@ -555,7 +654,7 @@ class ModelSupplyWorker:
                     yield asset["model_id"], path
 
     def inventory(self, model_id: str | None = None) -> dict:
-        """Verify only the selected source identity, or all sources for legacy callers."""
+        """Verify selected sources; an empty ID samples resources without discovery."""
         import shutil
         import config
         from torch_runtime import torch_available
@@ -583,8 +682,8 @@ class ModelSupplyWorker:
         verified = {}
         selected_id = (_canonical_id(model_id)
                        if isinstance(model_id, str) and _ID.fullmatch(model_id) else "")
-        with self._inventory_lock:
-            for source_id, path in self._source_candidates():
+        with (self._inventory_lock if model_id != "" else nullcontext()):
+            for source_id, path in (() if model_id == "" else self._source_candidates()):
                 # Discovery pairs a registered *-gguf asset with its canonical
                 # model ID. Compare those source IDs before any weight I/O;
                 # filenames and paths never supply model identity.
@@ -600,14 +699,18 @@ class ModelSupplyWorker:
                     tokenizer = read_gguf_tokenizer_sha256(path)
                     if not info or not _sha(tokenizer):
                         continue
-                    digest = _file_sha(path)
+                    # ★ 2026-10-24（#125）：清点阶段对整模做全量 sha256 约需 200 s
+                    #   （5.78 GB），改为带**持久化**缓存的摘要：文件未变即复用，
+                    #   跨重启与跨供给都生效。
+                    digest = _file_sha_cached(self.root, path)
                     verified[(source_id, digest, tokenizer)] = path
                     sources.append({"source_model_id": source_id, "source_model_sha256": digest,
                                     "tokenizer_sha256": tokenizer, "size_bytes": path.stat().st_size})
                 except (OSError, ValueError):
                     continue
-            with self._lock:
-                self._sources = verified
+            if model_id != "":
+                with self._lock:
+                    self._sources = verified
         # Tool availability is independent of the selected execution engine.
         try:
             assets = importlib.import_module("model_supply_assets")
@@ -625,9 +728,15 @@ class ModelSupplyWorker:
         node_id = "master" if callable(role) and role() == "master" else str(self.scheduler.get_effective_node_id())
         try:
             import psutil
-            available_memory = int(psutil.virtual_memory().available)
+            virtual = psutil.virtual_memory()
+            available_memory = int(virtual.available)
+            # ★ 2026-10-23（#117）：主机内存的**物理总量**也要上报 —— 主节点的
+            #   offload 承载上限按"总量 × HOST_RAM_MAX_FRACTION"封顶（默认 60%），
+            #   而不是把当前可用内存整块交出去，否则一次供给就能吃掉大半 RAM。
+            total_memory = int(virtual.total)
         except (ImportError, OSError):
             available_memory = 0
+            total_memory = 0
         runtime = None
         if "pytorch" in engines:
             try:
@@ -638,13 +747,19 @@ class ModelSupplyWorker:
                 is_cuda = str(device).startswith("cuda")
                 runtime = {"execution_device": "cuda" if is_cuda else "cpu",
                            "target_element_size": torch.empty((), dtype=dtype).element_size(),
-                           "available_bytes": int(torch.cuda.mem_get_info(device)[0]) if is_cuda else max(0, available_memory)}
+                           "available_bytes": max(0, available_memory),
+                           "materializations": (["safetensors_key_filtered", "safetensors_layer_offload"]
+                                                if is_cuda else ["safetensors_key_filtered"])}
+                if is_cuda:
+                    from cuda_memory_budget import sample_cuda_memory_budget
+                    runtime.update(sample_cuda_memory_budget(torch, device))
             except (ImportError, OSError, RuntimeError):
                 # The engine remains discoverable, but a new supply plan cannot
                 # admit it without a real runtime dtype and memory budget.
                 runtime = None
         return {"node_id": node_id, "distributed": self._distributed(),
                 "disk_free_bytes": max(0, free), "memory_available_bytes": max(0, available_memory),
+                "memory_total_bytes": max(0, total_memory),
                 "local_cut": local_cut, "engines": engines,
                 "execution_device": str(getattr(config, "DEVICE", "cpu")), "pytorch_runtime": runtime,
                 "sources": sources}
@@ -729,38 +844,36 @@ class ModelSupplyWorker:
             except ImportError:
                 raise SupplyError("supply_assets_unavailable") from None
             self.root.mkdir(parents=True, exist_ok=True)
-            if op.strategy == "local_cut":
-                # A cached exact inventory wins before source hashing/cutting.
-                cached = assets.reuse_segment(manifest, self.root,
-                    cancelled=lambda: self._cancelled(op))
-                if cached is not None:
-                    result = cached
-                    op.strategy = "reuse"
-                    op.strategy_reason_code = "SUPPLY_CACHE_REUSED"
-                    self._record_transfer_counts(op, cached)
-                    directory = _within(self._directory(cached, self.root), self.root)
-                else:
-                    stage = "local_cut_failed"
-                    op.strategy_reason_code = "SUPPLY_LOCAL_CUT_PREFERRED"
-                    try:
-                        directory = self._local_cut(op, assets)
-                    except Exception as exc:
-                        fallback = {
-                            "local_source_unavailable": "SUPPLY_LOCAL_SOURCE_UNAVAILABLE",
-                            "cut_tool_unavailable": "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
-                            "insufficient_disk": "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT",
-                            "cut_timeout": "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
-                            "unsupported_local_cut": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
-                            "unsupported_range": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
-                        }.get(_error_code(exc, stage))
-                        if not op.allow_fallback or fallback is None:
-                            raise
-                        self._check(op)
-                        op.strategy = "distribute"
-                        op.strategy_reason_code = fallback
-                        stage = "transfer_failed"
-                        self._progress(op, {"phase": "receiving"})
-                        directory = self._receive(op, assets)
+            reuse = getattr(assets, "reuse_segment", None)
+            cached = (reuse(manifest, self.root, cancelled=lambda: self._cancelled(op))
+                      if callable(reuse) else None)
+            if cached is not None:
+                op.strategy = "reuse"
+                op.strategy_reason_code = "SUPPLY_CACHE_REUSED"
+                self._record_transfer_counts(op, cached)
+                directory = _within(self._directory(cached, self.root), self.root)
+            elif op.strategy == "local_cut":
+                stage = "local_cut_failed"
+                op.strategy_reason_code = "SUPPLY_LOCAL_CUT_PREFERRED"
+                try:
+                    directory = self._local_cut(op, assets)
+                except Exception as exc:
+                    fallback = {
+                        "local_source_unavailable": "SUPPLY_LOCAL_SOURCE_UNAVAILABLE",
+                        "cut_tool_unavailable": "SUPPLY_LOCAL_CUT_TOOL_UNAVAILABLE",
+                        "insufficient_disk": "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT",
+                        "cut_timeout": "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
+                        "unsupported_local_cut": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
+                        "unsupported_range": "SUPPLY_LOCAL_CUT_UNSUPPORTED",
+                    }.get(_error_code(exc, stage))
+                    if not op.allow_fallback or fallback is None:
+                        raise
+                    self._check(op)
+                    op.strategy = "distribute"
+                    op.strategy_reason_code = fallback
+                    stage = "transfer_failed"
+                    self._progress(op, {"phase": "receiving"})
+                    directory = self._receive(op, assets)
             else:
                 if not op.strategy_reason_code:
                     op.strategy_reason_code = "SUPPLY_DISTRIBUTE_REQUESTED"
@@ -829,7 +942,7 @@ class ModelSupplyWorker:
             start_layer=manifest["layer_range"][0], end_layer=manifest["layer_range"][1],
             total_layers=manifest["total_layers"], operation_id=op.operation_id, node_id=op.node_id,
             conversion_proof=manifest.get("conversion_proof"), reuse_root=self.root,
-            cut_timeout_seconds=op.cut_timeout_seconds)
+            cut_timeout_seconds=op.cut_timeout_seconds, cancelled=lambda: self._cancelled(op))
         if _manifest(result) != manifest:
             raise SupplyError("manifest_identity_mismatch")
         op.transfer_counts["reused_bytes"] = int(result.get("_reused_bytes", 0))
@@ -882,11 +995,11 @@ class ModelSupplyWorker:
             try:
                 state = vars(host)
                 candidate_lock = state.get("_pipeline_candidate_lock")
-                if candidate_lock is None or "_manager" not in state:
+                if candidate_lock is None:
                     raise UnknownOwner()
                 locks.enter_context(candidate_lock)
-                manager(state["_manager"])
-                path(state.get("model_path"))
+                manager(host.runtime_controller.manager())
+                path(dict(host.runtime_controller.snapshot().metadata).get("model_path"))
                 transaction = state.get("_pipeline_candidate_transaction")
                 if transaction is not None:
                     path(transaction.model_path)
@@ -974,10 +1087,18 @@ class ModelSupplyWorker:
                 if _link(pointer):
                     raise SupplyError("unsafe_path")
                 if pointer.is_file():
-                    protected.append(self.root.parent / _json(pointer)["directory"])
+                    protected.append(self.root.parent / json.loads(_read_pointer(pointer))["directory"])
+                import config
+                setting = getattr(self.scheduler, "_runtime_setting", None)
+                def cache_setting(name):
+                    return setting(name) if callable(setting) else getattr(config, name)
+                key = ("MODEL_SUPPLY_CACHE_KEEP" if root.resolve() == self.root.resolve()
+                       else "MODEL_SUPPLY_CACHE_MASTER_KEEP")
                 with self._native_gc_paths(root) as native:
                     return collect_supply_segments(root, protected_paths=protected,
-                        native_paths=native, keep=0, cancelled=invalidated, receive_idle=True)
+                        native_paths=native, keep=cache_setting(key),
+                        max_retained_bytes=cache_setting("MODEL_SUPPLY_CACHE_MAX_BYTES"),
+                        cancelled=invalidated, receive_idle=True)
         except Exception:
             # Retention is maintenance, never a second terminal supply result.
             return {"removed": 0, "reclaimed_bytes": 0,
@@ -997,10 +1118,18 @@ class ModelSupplyWorker:
             raise SupplyError("SUPPLY_ADMISSION_UNAVAILABLE")
         if not full.acquire(blocking=False):
             raise SupplyError("SUPPLY_WORKER_BUSY")
+        native = getattr(getattr(host, "runtime_controller", None), "execution_lock", None)
+        native_held = False
         try:
+            if native is not None:
+                native_held = native.acquire(blocking=False)
+                if not native_held:
+                    raise SupplyError("SUPPLY_WORKER_BUSY")
             with stage:
                 yield
         finally:
+            if native_held:
+                native.release()
             full.release()
 
     def _assert_idle(self, op: _Operation) -> None:
@@ -1009,6 +1138,13 @@ class ModelSupplyWorker:
             raise SupplyError("SUPPLY_WORKER_BUSY")
 
     def _register(self, op: _Operation, directory: Path) -> Path:
+        try:
+            return self._register_verified(op, directory)
+        except Exception as exc:
+            _log_registration_error(op, "registration", exc)
+            raise
+
+    def _register_verified(self, op: _Operation, directory: Path) -> Path:
         self._check(op)
         directory = _within(directory, self.root.parent)
         marker = directory / "supply.manifest.json"
@@ -1021,7 +1157,11 @@ class ModelSupplyWorker:
         self._check(op)
         verified_files = _selection_key(self.root, b"", directory, op.manifest)[1]
         self._check(op)
-        model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op))
+        with _SELECTION_CACHE_LOCK:
+            cached = _SELECTION_CACHE.get(str(self.root.resolve()))
+            changed = _selection_files_changed(cached, verified_files)
+        model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op),
+                                  **({"fresh": True} if changed else {}))
         self._check(op)
         if _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
             raise SupplyError("artifact_changed")
@@ -1053,37 +1193,44 @@ class ModelSupplyWorker:
                     # A reader without FILE_SHARE_DELETE can briefly block an
                     # otherwise valid pointer switch. Keep full -> stage held,
                     # but release the operation mutex during cancellable waits.
-                    for attempt in range(8):
-                        self._check(op)
-                        self._assert_idle(op)
-                        if current.is_symlink() or temporary.is_symlink():
-                            raise SupplyError("unsafe_path")
-                        if attempt and _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
-                            raise SupplyError("artifact_changed")
-                        with self._lock:
-                            if self._active is not op or op.cancelled.is_set():
-                                raise SupplyError("cancelled")
-                            op.previous_pointer = current.read_bytes() if current.exists() else None
-                            try:
-                                os.replace(temporary, current)
-                            except OSError as exc:
-                                if (sys.platform != "win32" or getattr(exc, "winerror", None) not in {5, 32, 33}
-                                        or attempt == 7):
-                                    raise
-                            else:
-                                op.committed = pointer
-                                break
-                        op.cancelled.wait(0.01 * 2 ** attempt)
+                    with _POINTER_IO_LOCK:
+                        for attempt in range(8):
+                            self._check(op)
+                            self._assert_idle(op)
+                            if current.is_symlink() or temporary.is_symlink():
+                                raise SupplyError("unsafe_path")
+                            if attempt and _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
+                                raise SupplyError("artifact_changed")
+                            with self._lock:
+                                if self._active is not op or op.cancelled.is_set():
+                                    raise SupplyError("cancelled")
+                                op.previous_pointer = _read_pointer(current) if current.exists() else None
+                                try:
+                                    os.replace(temporary, current)
+                                except OSError as exc:
+                                    if (sys.platform != "win32" or getattr(exc, "winerror", None) not in {5, 32, 33}
+                                            or attempt == 7):
+                                        raise
+                                else:
+                                    op.committed = pointer
+                                    break
+                            op.cancelled.wait(0.01 * 2 ** attempt)
                     self._check(op)
                     if _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
                         raise SupplyError("artifact_changed")
                     self._check(op)
-                    _remember_selection(self.root, current.read_bytes(), directory, op.manifest, model_path)
+                    published = _read_pointer(current)
+                    if json.loads(published) != pointer:
+                        raise SupplyError("registration_pointer_visibility_failed")
+                    _remember_selection(self.root, published, directory, op.manifest, model_path)
                     self._check(op)
                     self.scheduler.refresh_task_worker_capabilities()
                     self._check(op)
-                except Exception:
+                    self._registration_blocked = False
+                except Exception as exc:
                     self._revoke(op, admission_held=True)
+                    if getattr(exc, "reason_code", "") == "registration_pointer_visibility_failed":
+                        self._registration_blocked = True
                     raise
             return model_path
         finally:
@@ -1098,19 +1245,34 @@ class ModelSupplyWorker:
             self._assert_idle(op)
             current = self.root / "current.json"
             try:
-                if current.is_file() and _json(current) == op.committed:
-                    if op.previous_pointer is None:
-                        current.unlink()
-                    else:
-                        temporary = self.root / (".restore-" + uuid.uuid4().hex + ".tmp")
-                        try:
-                            temporary.write_bytes(op.previous_pointer)
-                            os.replace(temporary, current)
-                        finally:
-                            temporary.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                pass
+                with _POINTER_IO_LOCK:
+                    if current.is_file() and json.loads(_read_pointer(current)) == op.committed:
+                        if op.previous_pointer is None:
+                            current.unlink()
+                        else:
+                            temporary = self.root / (".restore-" + uuid.uuid4().hex + ".tmp")
+                            try:
+                                temporary.write_bytes(op.previous_pointer)
+                                pause = threading.Event()
+                                for attempt in range(8):
+                                    try:
+                                        os.replace(temporary, current)
+                                        break
+                                    except OSError as exc:
+                                        if (sys.platform != "win32" or getattr(exc, "winerror", None) not in {5, 32, 33}
+                                                or attempt == 7):
+                                            raise
+                                    pause.wait(0.01 * 2 ** attempt)
+                            finally:
+                                temporary.unlink(missing_ok=True)
+            except (OSError, ValueError) as exc:
+                self._registration_blocked = True
+                with _SELECTION_CACHE_LOCK:
+                    _SELECTION_CACHE.pop(str(self.root), None)
+                _log_registration_error(op, "rollback", exc)
+                raise SupplyError("registration_rollback_failed") from exc
             op.committed = None
+            self._registration_blocked = False
             with _SELECTION_CACHE_LOCK:
                 _SELECTION_CACHE.pop(str(self.root), None)
 

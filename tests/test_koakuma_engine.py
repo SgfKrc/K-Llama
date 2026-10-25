@@ -87,17 +87,22 @@ def test_backend_id_for_legacy_doubles_stays_at_boundary() -> None:
     assert canonical_backend("llama.cpp") == BackendId.LLAMA_CPP
 
 
-def test_runtime_supports_uses_capabilities_with_legacy_fallback() -> None:
+def test_runtime_supports_requires_concrete_static_contract_and_only_narrows() -> None:
     class LegacyLayerRuntime:
         _engine_type = "pytorch"
 
-    class ExplicitRuntime:
-        def supports(self, capability: str) -> bool:
-            return capability == "custom"
+    class ConcreteRuntime(LegacyLayerRuntime):
+        runtime_kind = "pytorch_cpu"
+        native_abi = "torch_module.v1"
 
-    assert runtime_supports(LegacyLayerRuntime(), Capability.FORWARD_LAYERS)
-    assert runtime_supports(ExplicitRuntime(), "custom")
-    assert not runtime_supports(ExplicitRuntime(), Capability.FORWARD_LAYERS)
+        def supports(self, capability: str) -> bool:
+            return capability in {Capability.FORWARD_LAYERS, "custom"}
+
+    # R2 explicitly removes the family-only fallback and arbitrary custom grants.
+    assert not runtime_supports(LegacyLayerRuntime(), Capability.FORWARD_LAYERS)
+    assert runtime_supports(ConcreteRuntime(), Capability.FORWARD_LAYERS)
+    assert not runtime_supports(ConcreteRuntime(), Capability.CHAT)
+    assert not runtime_supports(ConcreteRuntime(), "custom")
 
     class UnknownRuntime:
         _engine_type = "external_api"

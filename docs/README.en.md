@@ -6,9 +6,11 @@ K-Llama (Llama for Koakuma) is a distributed inference core for heterogeneous ed
 
 > Status: **current**
 >
-> Updated: 2026-10-14
+> Updated: 2026-10-25
 >
 > This README describes only the current boundary of the main repository and its reproducible entry points. Experiment logs, historical implementations and external sub-projects are not equivalent to production capability.
+>
+> The single-source-of-truth refactor (ticket 14) passed its R0–R5 software gates on 2026-10-18/19; its R6 product acceptance was carried out on 2026-10-19 (the remaining device and gain gates are tracked in the [R6 report](重构产品验收-R6-2026-10-19.md)), and the current focus is the [PERF performance series](异构推理吞吐瓶颈与外部技术调研-2026-10-24.md#6-实验排期与退出判据). The mainline moved from task-graph scheduling / standalone speculative PoC / preemptive queues / a standalone Launcher to **linear relay + versioned snapshots**. See the [refactor design](单一事实源重构设计-2026-10-18.md) and the [R5 delivery report](重构客户端切换-R5-2026-10-19.md).
 >
 > 中文: [../README.md](../README.md) - this file: docs/README.en.md
 
@@ -94,9 +96,10 @@ The layer pipeline reduces "who holds which layers, with which engine, where, an
 Implementation and endpoints:
 
 - `src/pipeline_node_contract.py`: the `PipelineNode` contract, mapping of existing artifacts, fail-closed layout validation;
-- `src/pipeline_capacity.py` for capacity solving, `src/pipeline_assignment_manifest.py` for the assignment manifest;
+- capacity solving now lives in `src/qlh_core/planning/capacity.py` (`src/pipeline_capacity.py` is a 21-line compatibility facade), `src/pipeline_assignment_manifest.py` for the assignment manifest;
 - `src/pipeline_reshard.py`: capacity re-solve + artifact readiness gate + atomic epoch commit;
-- `GET /api/cluster/layers`, `GET /api/cluster/pipeline-capacity`, `GET /api/cluster/pipeline-reshard`.
+- `GET /api/cluster/layers`, `GET /api/cluster/pipeline-capacity`, `GET /api/cluster/pipeline-reshard`;
+- clients consume `GET /api/client/state` and `GET /api/client/events` (versioned snapshots + revision cursor, see `src/api/routes_client_state.py` and `src/qlh_core/contracts/snapshots.py`).
 
 ### Cross-framework layer relay (D→L)
 
@@ -145,7 +148,7 @@ The TUI and API top level only need aggregate resources (GPU/CPU/memory) and whe
 
 | Capability | Current statement |
 | --- | --- |
-| Textual TUI | Unified `qlh` entry; chat, 9 functional screens and 1 debug fallback screen share one process and can start the backend on demand locally; write operations (model download/search/preflight/registration, cluster config, node management, log filtering/stats/export, device config, user settings) go through confirmation gates |
+| Textual TUI | Unified `qlh` entry; the chat page plus 8 functional screens (status / models / cluster / nodes / queue / logs / device / settings) and 1 debug fallback screen share one process and can start the backend on demand locally; write operations (model download/search/preflight/registration, cluster config, node management, log filtering/stats/export, device config, user settings) go through confirmation gates |
 | Edge <=1B single machine | Model profiling, the GGUF/llama.cpp path and edge preflight exist; torch is not loaded by default |
 | Same-host two-process RPC | llama host + `ggml-rpc-server` simulation and contract tests exist; not equivalent to cross-host production admission |
 | PC RPC | Device scoring, automatic layer planning, lease/disconnect fallback and artifact-sync contracts exist; throughput gains are not claimed, and capacity gains are verified separately from D→L |
@@ -154,7 +157,7 @@ The TUI and API top level only need aggregate resources (GPU/CPU/memory) and whe
 | PyTorch D track | The implementation of layer splitting, the layer pipeline and multi-node layer-segment hosting, and the control experiments; not part of the Edge default dependency set |
 | Relay R | L→L, D→L, the f32/sampling matrix and SSH cross-host evidence all passed correctness verification; capacity gains quantified; default routing does not replace directly runnable L/RPC |
 | Android | `qlh-android` P0 cross-compilation/JNI done; P1 device run, RPC worker, disconnect, thermal/power and security evidence outstanding |
-| Runtime | Version windows follow [`requirements.txt`](../requirements.txt) (`transformers>=5.17.0,<5.18.0`, `llama-cpp-python==0.3.35`); all PyTorch sidecars are on 5.17.0; `.venv-test` ships `triton-windows` so native Windows `torch.compile` is available |
+| Runtime | Version windows follow [`requirements.txt`](../requirements.txt) (`transformers>=5.17.0,<5.18.0`, `llama-cpp-python==0.3.35`); all PyTorch sidecars are on 5.17.0; native Windows `torch.compile` needs the `triton-windows` entry from [`requirements-compile.txt`](../requirements-compile.txt) (this machine's `.venv-test` has 3.8.0.post28; `requirements-test.txt` does not include it) |
 | Model assets | Model files are not committed (locally `models/` is a junction pointing outside the repository); the asset catalog covers registered models such as Qwen2.5-0.5B, Qwen3-0.6B, Qwen3.5-2B, Qwen3VL-4B, MiniCPM4-0.5B and DistilQwen2.5-DS3-0324-7B; Qwen3.6-35B-A3B and its community distill/derivative builds (both `qwen35moe` and `qwen3next` architecture headers) have been verified to load on llama.cpp `b10964` on this machine |
 | Model selection and supply intent | Unified entry `POST/GET/DELETE /api/models/intent` (with `/catalog`, `/current`, `/connect`): the user submits only a model ID, engine, quantization and auto strategy, and the master runs planning, transfer, verification, loading and commit along the existing supply and native-prepare transactions; the Web model page, the Textual TUI and the Android selection panel share one catalog and operation progress (`src/model_intent*.py`, `src/api/routes_model_intent.py`) |
 
@@ -179,16 +182,17 @@ The main project keeps no image-generation runtime or assets; image generation b
 | --- | --- |
 | `src/` | K-Llama main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
 | `tests/` | pytest suite (TUI, RPC/layer-segment, scheduling, contracts, doc gates) |
-| `scripts/` | Verification, experiment, environment and documentation tools (`edge_preflight.py`, `android_validation.py`, `llama_rpc_*.py`, `relay_*.py`, `run_doc_checks.py`, …) |
+| `scripts/` | Verification, experiment, environment and documentation tools (`edge_preflight.py`, `android_validation.py`, `llama_rpc_*.py`, `relay_*.py`, `run_doc_checks.py`, `run_test_channels.py`, `check_refactor_boundaries.py`, `run_refactor_contracts.py`, …) |
 | `docs/` | Current documents; history and migrated content under `docs/archive/` |
 | `schemas/` | Cross-process/cross-repo JSON Schema contracts (artifact-manifest, cluster-profile, experiment-record, …) |
 | `fixtures/` | Test fixtures (including offline chat event replay for `qlh chat --fixture`) |
 | `local_docs/` | Local experiment and acceptance raw records; not a public source interface |
 | `runtime/` | Runtime logs and the llama.cpp runtime directory |
 | `qlh.py` / `qlh_edge.py` | Interactive TUI/CLI entry and Edge entry |
-| `qlh.bat` / `qlh.sh` / `K-Llama.bat` / `K-Llama.sh` / `bjtu.*` / `koakuma.*` | Launchers; `K-Llama` is the recommended alias, `bjtu` and `koakuma` are compatibility aliases, and the single entry script is `qlh.py` |
+| `qlh.bat` / `qlh.sh` / `K-Llama.bat` / `K-Llama.sh` / `bjtu.*` / `koakuma.*` | Launchers; `K-Llama` is the recommended alias, `bjtu` and `koakuma` are compatibility aliases. The four thin wrappers `qlh` / `K-Llama` / `koakuma` forward to `qlh.py`; `bjtu.*` additionally dispatches app startup and maintenance (`src/app_bootstrap.py` with `--ui` / `--web` / `--headless`, and `qlh.py maintenance`) |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | One-shot startup and multi-environment install scripts |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` | Dependency manifests and tool config |
+| `refactor-boundaries.json` / `release-contract.json` | Static import-boundary manifest (listing retired modules that must not be imported) and the release contract |
 | `models/`, `chat_history/`, `dist/`, `build/`, `test-results/`, `logs/` | Local artifacts or archive areas, not committed |
 
 **Submodules (4)** — registered in `.gitmodules`, fetched with `git submodule update --init`:
@@ -214,14 +218,15 @@ The main project keeps no image-generation runtime or assets; image generation b
 
 | Group | Representative modules |
 | --- | --- |
-| Control plane and entry | `api_server.py`, `api_errors.py`, `config.py`, `bootstrap.py`, `model_api_access.py`, `review.py`, `local_store.py` |
+| Control plane and entry | `app_bootstrap.py` (single composition entry), `api_server.py`, `api_errors.py`, `execution_errors.py`, `config.py`, `bootstrap.py`, `model_api_access.py`, `review.py`, `local_store.py`, `api/routes_client_state.py` |
 | Scheduling and cluster | `scheduler.py`, `scheduler_svc_http.py`, `cluster_join.py`, `cluster_transport.py`, `edge_cluster.py`, `node_config.py`, `node_runtime.py`, `transport_runtime.py`, `transport_port.py`, `network_address.py`, `network_path.py`, `proxy_config.py`, `wss_loopback.py` |
-| Engines | `llama_engine.py` (tier L), `model_module.py` (tier D layer splitting), `island_engine.py`, `koakuma_engine.py`, `tcp_comm.py`, `inference_client.py`, `inference_svc_main.py`, `inference_service/`, `paged_kv_cache.py`, `external_provider.py`, `speculative*.py` |
+| Engines | `llama_engine.py` (tier L), `model_module.py` (tier D layer splitting), `island_engine.py`, `koakuma_engine.py`, `tcp_comm.py`, `inference_client.py`, `inference_svc_main.py`, `inference_service/`, `paged_kv_cache.py`, `external_provider.py` |
 | RPC and layer relay | `llama_rpc_contract.py`, `llama_rpc_device.py`, `llama_rpc_planner.py`, `relay_contract.py`, `relay_planner.py`, `relay_transport.py` |
-| Layer-segment/layer-pipeline contracts | `pipeline_node_contract.py`, `pipeline_capacity.py`, `pipeline_assignment_manifest.py`, `pipeline_model_descriptor.py`, `pipeline_reshard.py`, `cache_unit_layout.py` |
+| Layer-segment/layer-pipeline contracts | `pipeline_node_contract.py`, `pipeline_assignment_manifest.py`, `pipeline_model_descriptor.py`, `pipeline_reshard.py`, `cache_unit_layout.py`; capacity solving moved to `qlh_core/planning/capacity.py` (`pipeline_capacity.py` is a 21-line compatibility facade) |
 | Cross-framework/multimodal pipeline | `qwen3_pipeline_*.py`, `qwen3_multimodal_*.py`, `gemma4_pipeline_*.py`, `multimodal.py` |
-| Models and assets | `model_config.py`, `model_host.py`, `model_sync.py`, `model_downloader.py`, `model_download_jobs.py`, `model_search.py`, `model_registry_validation.py`, `model_runtime_contracts.py`, `local_model_assets.py` |
-| Task graph and workflows | `task_graph*.py`, `task_journal.py`, `task_provider.py`, `task_worker_*.py`, `graph_orchestrator.py` |
+| Models and assets | `model_config.py`, `model_host.py`, `model_sync.py`, `model_downloader.py`, `model_download_jobs.py`, `model_search.py`, `model_registry_validation.py`, `model_runtime_contracts.py`, `local_model_assets.py`, `model_supply*.py`, `model_intent*.py`, `model_preflight.py`, `model_load_resolver.py` |
+| Single-source core (`qlh_core/`) | `contracts/` (runtime / authority / catalog / engines / deployment / load / execution / deadline / outcome / snapshots), `control/` (authority / catalog / deployment / participation / clock), `adapters/` (settings / catalog_repository / model_control_repository / local_store / artifacts / llama_vocabulary / publication_cleanup / runtime_observation / request_repository / state_migration), `bootstrap/` (runtime / services / execution / model_control / client_snapshots), `planning/` (capacity / load_spec), `execution/` (linear / requests / runtime / stopping) |
+| Linear execution and request recovery | `execution_provider.py`, `recovery_journal.py`, `request_deadline.py`, `request_outcome.py` (the latter two are star-import facades over `qlh_core.contracts.*`), `task_worker_*.py`, `journal_replication*.py` |
 | TUI and interaction | `tui_textual.py`, `tui_api.py`, `tui_shared.py`, `tui_sse.py`, `tui_backend.py`, `tui_commands.py` |
 | Devices and soak | `device_profiler.py`, `provider_soak.py`; RAG now lives in `harness_workbench`/Koakumix |
 
@@ -276,9 +281,9 @@ python qlh.py status
 python qlh.py models
 ```
 
-`qlh chat` starts the backend in a daemon thread of the current process when no local backend is running, showing the probe phase on the splash screen; backend logs go to the log files and the log screen. Single commands such as `status` and `models` do not auto-start the backend, and `--fixture` is the offline chat event replay path. Write operations start from the shell: the model screen uses `L` to select a model (auto supply and prepare) / `U` to unload / `C` to cancel the selection, the queue screen `P` pause-resume / `S` policy / `C` clear queued items, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations show a confirmation dialog first. Model control endpoints are allowed by default over loopback; controlling a remote master requires `QLH_MODEL_API_TRUSTED_CIDRS` on that master.
+`qlh chat` starts the backend in a daemon thread of the current process when no local backend is running, showing the probe phase on the splash screen; backend logs go to the log files and the log screen. Single commands such as `status` and `models` do not auto-start the backend, and `--fixture` is the offline chat event replay path. Write operations start from the shell: the model screen uses `L` to select a model (auto supply and prepare) / `U` to unload / `C` to cancel the selection, the queue screen `P` pause/resume / `C` clear queued items (FIFO, no policy switching), and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations show a confirmation dialog first. Model control endpoints are allowed by default over loopback; controlling a remote master requires `QLH_MODEL_API_TRUSTED_CIDRS` on that master.
 
-On Windows use `qlh.bat` (or `K-Llama.bat`), on Linux/macOS `qlh.sh` (or `K-Llama.sh`); all forward to the same entry script `qlh.py`. Screens and command semantics: [TUI guide](TUI使用指南.md) and [TUI command set](TUI指令集.md).
+On Windows use `qlh.bat` (or `K-Llama.bat`), on Linux/macOS `qlh.sh` (or `K-Llama.sh`); all four thin wrappers forward to the same entry script `qlh.py` (`bjtu.*` additionally dispatches app startup and maintenance, see the directory layout above). Screens and command semantics: [TUI guide](TUI使用指南.md) and [TUI command set](TUI指令集.md).
 
 ## Models and Distribution
 
@@ -332,21 +337,24 @@ Targeted checks on high-risk mainlines:
 .\.venv-test\Scripts\python.exe -m pytest -q tests/test_pipeline_node_contract.py tests/test_pipeline_reshard.py tests/test_pipeline_capacity.py
 ```
 
-Serial full baseline: **6055 passed / 33 skipped / 0 failed** (`-n 0`, 2026-10-14, HEAD `b84522f3`). Occasional flakiness appears under xdist; the serial run is authoritative.
+Baselines are recorded in two tiers (2026-10-19): the refactor R0–R5 fixed set is **4309 passed / 27 skipped / 0 failed** (identical per-case status serially and with four workers); the root Python full run (four workers, filtering `real_model` / `external` / `requires_gpu`) is **8301 passed / 32 skipped**. Per repository: packaging **459 passed / 9 skipped**, Web Playwright **110 passed / 1 skipped**, Android JVM **710 passed / 4 skipped**. Occasional flakiness appears under xdist; the serial run is authoritative.
 
 Real hardware, cross-host networks, Android ARM64, performance and long-run soak must store the raw command, environment, model digest, topology, output and failure boundary; a green test suite is not a substitute. Test channel split and marker semantics: [test channel notes](测试通道运行说明.md); criteria and control groups: [testing and acceptance criteria](测试与评判标准.md).
 
 **Documentation checks** (static, standard library only): `python scripts/run_doc_checks.py` runs two checks — relative-link rot and README bilingual structure. The same set runs in CI ([`.github/workflows/checks.yml`](../.github/workflows/checks.yml)) and in the local pre-push hook ([`.githooks/`](../.githooks/README.md), enabled with `git config core.hooksPath .githooks`) — defined once, reused twice.
 
+**Static boundary gate**: `python scripts/check_refactor_boundaries.py` checks module import direction and write ownership (wired into [`core-tests.yml`](../.github/workflows/core-tests.yml); currently 48 modules, 0 violations). Refactor layer acceptance uses `python scripts/run_refactor_contracts.py --stage {contract,bootstrap,catalog,deployment,execution,client}`, six stacked tiers (each includes the previous tiers' targets).
+
 ## Documentation Index
 
 - [Overall architecture](整体架构.md) · [Module interfaces](模块接口说明.md) · [Core principles](核心技术原理.md) · [Distributed resource scheduling](分布式资源调度系统.md)
+- **Single-source-of-truth refactor (ticket 14)**: [design](单一事实源重构设计-2026-10-18.md) · [contracts and behaviour baseline R0](重构合同与行为基线-R0-2026-10-18.md) · [bootstrap and authority R1](重构启动与控制权-R1-2026-10-18.md) · [catalog and capabilities R2](重构模型目录与能力-R2-2026-10-18.md) · [supply and deployment R3](重构供给与部署-R3-2026-10-18.md) · [relay execution R4](重构接力执行-R4-2026-10-18.md) · [client cutover R5](重构客户端切换-R5-2026-10-19.md) · [fact-ownership audit](当前功能与事实归属审计-2026-10-18.md)
 - [Cross-framework relay — current baseline and follow-up plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) (index for the relay direction) · [project report](跨框架层接力-项目报告.md) · [capacity-gain measurements](跨框架层接力-容量收益实测-2026-09-21.md)
 - [TUI guide](TUI使用指南.md) · [TUI command set](TUI指令集.md)
 - [Testing and acceptance criteria](测试与评判标准.md) · [test channel notes](测试通道运行说明.md) · [release artifact gate](发行物门-RELEASE-ARTIFACTS.md)
 - [Mainline plan: distributed inference and edge optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5: dynamic master election and distributed management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Parallelism and cross-framework survey](archive/relay/分布式推理并行与跨框架路线调研汇总-2026-09-15.md) · [KTransformers migration survey](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
-- [Outstanding work ledger (current)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
+- [Outstanding work ledger (current)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](archive/misc/未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
 - [Document status and cleanup list](文档状态与清理清单.md) · [Archive index](archive/README.md)
 - [Android validation alternatives](../android/Android验证替代路径-2026-09-18.md)
 

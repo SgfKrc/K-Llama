@@ -2,7 +2,7 @@
 
 > 状态：**现行**
 >
-> 更新日期：2026-10-14
+> 更新日期：2026-10-19
 >
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
@@ -21,9 +21,9 @@ K-Llama 是面向异构边缘设备的**轻量化分布式大模型推理系统*
 | **L 档** | llama.cpp / GGUF（含裁层 GGUF + `embd` 注入） | 轻量、边缘、无 torch 的节点 |
 | **D 档** | PyTorch（层拆分、层间流水线、多节点层段） | 有 CUDA 的 PC；也是层切点搜索与实验的平台 |
 
-L 档内部再按能力分两条路径（`src/inference_path_selector.py` 的 `select_inference_path`，开关 `src/config.py` 的 `INFER_PATH`，默认 `auto`）：有 CUDA 且本机有 `llama-server` 二进制时走 `llama_server` 子进程，否则走 QLH 引擎内的 llama.cpp 绑定。因此 CUDA 的效果并不限于 D 档：无 CUDA 的机器也能跑 L 档绑定路径，有 CUDA 时 L 档改走子进程。
+L档的显式本地整模路径由`src/inference_path_selector.py`的`select_inference_path`选择binding或llama-server；LL层段使用keep-head／native前向，DL由PyTorch首段接llama.cpp后续段。当前路径及能力边界见[整体架构](整体架构.md#2-当前执行路径)。
 
-**三种节点同构**，共享同一套合同与 fail-closed 校验：`local`（进程内）、`remote_rpc`（网络借算力，Android/PC 上的 `ggml-rpc-server`）、`cross_framework`（跨引擎层段接力）。Relay R 轨道（裁层 GGUF + `embd` 注入，同机或跨机）用于**容量合并与异构能力组合**；接力是容量手段，同机 CUDA 整模更快，默认路由优先可直接整模的 L / RPC 路径（数字与口径见 [README §层流水线](../README.md#层流水线与跨框架逐层接力)）。
+分布式模式由master协调并转发各连续层段，worker保持星状连接。用户显式退出计算参与并完成层段退休后，可加载本地完整模型；分布式容量不足返回具名等待或拒绝。版本化客户端和迁移合同见[R5客户端切换](重构客户端切换-R5-2026-10-19.md)。
 
 核心设计原则：**数据不出集群、断网可自治、可复现验收**。
 
@@ -32,7 +32,7 @@ L 档内部再按能力分两条路径（`src/inference_path_selector.py` 的 `s
 | 能力 | 判据 / 日期 |
 |---|---|
 | 双机真机分层推理（QW1.8B 0-21 / 21-24，该模型已从内置候选列表退役） | 3 次 `distributed_required` 全过，RTT 6-12 ms（2026-08-20） |
-| 任务链重启 / 杀进程恢复 + Tailnet IPv6 | `wf_330d0aa1…`，重派 0（2026-08-21） |
+| 历史任务链重启 / 杀进程恢复 + Tailnet IPv6（该机制已于票 14 R5 裁撤，仅存历史证据） | `wf_330d0aa1…`，重派 0（2026-08-21） |
 | D→L 跨框架接力正确性 | 主仓双引擎矩阵 **27/27 逐 token 一致**（2026-09-21） |
 | D→L 容量收益 | qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×**（严格口径，`C` 只计不属于任何 `*.layers.<i>.*` 的张量；含视觉塔时为 1.613×）；同一受控 3.0 GB CUDA 预算下整模被拒而 12 层上游通过（2026-09-21） |
 | L→L keep-head 通道 | `--path l2l_keep_head` / `d2l2l_keep_head` **32/32**，含「1 torch 上游 + 2 llama 下游」三段（2026-09-21） |
@@ -49,12 +49,10 @@ L 档内部再按能力分两条路径（`src/inference_path_selector.py` 的 `s
 
 ## 未完成的部分
 
-- 跨机 RPC vs 接力的对照未测；跨机长时（LL/DL 三段 `gen=256`，256/256）与多段切点组合（G2/G3 32/32）已于 2026-09-26 通过，资产自动分发与故障注入验收仍在队列。
-- 中段必须与调用方同局域网：把中段放在跨网络节点（Surface 走 Tailscale DERP 中继、RTT 777 ms）时，每步一次往返，端到端从中位约 140 ms 涨到约 800 ms。
-- 生产路由准入（`task_dispatch` 关闭）、长时多轮与断电恢复、真实 443/WSS、IPv6-only 安装包、真实 7B/12B 三节点峰值，都在后置验收队列，本机门或模拟结果不能当通过。
-- Android 只到 P0（交叉编译/JNI + 层段数值验证）；设备运行、RPC worker、断线、热/电与安全证据未完成。
-- 张量并行仅作集群外 PoC；投机解码为实验路径。
-- 接力一致性只认 per-token argmax；分叉即标 FAIL。
+- R6产品验收已于2026-10-19实施并出具[报告](重构产品验收-R6-2026-10-19.md)（实际发行物首启、正式数据迁移和多设备9B LL／DL已取得证据）；其余设备与收益门按其§7登记。历史设备数字按表中日期保留，完成门见[重构设计](单一事实源重构设计-2026-10-18.md#12-验收与退出标准)。
+- 跨主多数复制、物理故障恢复和可信签名发行保持独立外部验收，当前状态以[排票计划](彻查后修复与重构排票计划-2026-10-09.md)为准。
+- 分布式投机仍需局部draft、多位置输出与可验证状态回滚；独立PoC已裁撤，本地原生n-gram保留，详见[能力审计](当前功能与事实归属审计-2026-10-18.md#5-推理优化与图依赖边界)。
+- 网络延迟直接影响逐步接力；部署应依据实测RTT与容量，比较使用相同模型、量化、构建和采样口径。
 
 ## 首次启动
 
@@ -70,10 +68,9 @@ L 档内部再按能力分两条路径（`src/inference_path_selector.py` 的 `s
 | NVIDIA 驱动 + CUDA（可选） | — | L 档 `llama_server` 路径（有 CUDA 且本机有 `llama-server` 时自动选）与 D 档 |
 
 ```bash
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
-cd LEDS_BJTU
-python scripts/setup_envs.py --all            # 主线 Python 环境（默认不含 Node）
-python scripts/setup_envs.py --all --with-node # 另行配置产品壳 Node 迁移源
+git clone --recurse-submodules https://github.com/SgfKrc/K-Llama
+cd K-Llama
+python scripts/setup_envs.py --all            # 主线 Python 环境（不含产品壳 Node，后者由 qlh-shell 自维护）
 python scripts/setup_envs.py --only test    # 只配指定环境（可选名见下）
 python scripts/setup_envs.py --check          # 只校验不安装（无副作用）
 ```
@@ -105,7 +102,7 @@ python scripts/setup_envs.py --check          # 只校验不安装（无副作�
 
 - **证据链优先**：每个"已完成"附测试/日志/真机证据，判据与日期缺一不可。
 - **判据纪律**：一致性只认 per-token argmax；分叉如实标 FAIL；区分 `mainrepo_end_to_end` / `raw_binding_probe` / `capacity_only` 三类记录，不混用。
-- **机制化而非绿化**：测试通道分单元/契约/浏览器/竞态/仿真/真机；修复必配负例。
+- **机制化而非绿化**：主仓测试通道为 `unit`（并行）/ `external`（串行）/ `smoke`（真实权重，显式 opt-in）；票 14 重构另有 R0–R5 固定 stage 合同集（`scripts/run_refactor_contracts.py --stage`）与静态边界门（`scripts/check_refactor_boundaries.py`）。修复必配负例。
 - **先测再解释**：性能结论先量出瓶颈在哪一环（分段耗时 / RTT / 离散度）。
 - **用户主权**：模型工件、密钥、知识库归用户；离线可恢复。
 

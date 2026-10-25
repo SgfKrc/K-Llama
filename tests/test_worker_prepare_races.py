@@ -325,7 +325,7 @@ def test_disconnect_then_unload_keeps_every_remote_release_debt(race_case):
     assert master._pipeline_load_transaction["phase"] == "invalidated"
     assert master._worker_prepare_assignment_loaded("worker", assignments["worker"])[0] is False
     debt_ids = _assert_debts(master, assignments, "release")
-    snapshot = deepcopy(case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY])
+    snapshot = deepcopy(master._model_control.snapshot()["lifecycle"])
     assert snapshot["published"] is True
     assert {record["cleanup_id"] for record in snapshot["cleanup_ledger"]} == debt_ids
 
@@ -333,7 +333,7 @@ def test_disconnect_then_unload_keeps_every_remote_release_debt(race_case):
     result = case.unload()
     assert result["success"] is True
     assert _assert_debts(master, assignments, "release") == debt_ids
-    persisted = case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY]
+    persisted = master._model_control.snapshot()["lifecycle"]
     assert {record["cleanup_id"] for record in persisted["cleanup_ledger"]} == debt_ids
     _assert_unpublished(master, assignments)
     # A reconnected peer receives the original operation identity for retirement.
@@ -352,7 +352,7 @@ def test_cancel_available_supply_aborts_prepare_and_preserves_verified_assets(ra
     case = race_case
     master = case.master
     supply = master._model_supply
-    operation_id = "supply_test"
+    operation_id = "supply_" + "a" * 32
     available = supply.get(operation_id)
     operation = {
         **available, "operation_id": operation_id,
@@ -368,7 +368,12 @@ def test_cancel_available_supply_aborts_prepare_and_preserves_verified_assets(ra
     segment = case.model_path / "verified-segment.bin"
     segment.write_bytes(b"verified segment must survive cancellation")
     before = segment.read_bytes()
-    case.start()
+    candidate = "candidate-cancel-supplied"
+    result = master.start_pipeline_model_transaction(candidate_id=candidate,
+        descriptor=case.host.prepare_pipeline_candidate(candidate, "retirement-model", str(case.model_path),
+            quant_type="fp16", model_sha256="a" * 64),
+        model_path=str(case.model_path), quant_type="fp16", operation_id=operation_id)
+    assert result["transaction_phase"] == "preparing"
     ack(master, "worker", "prepare")
     assignments = _assignments(master)
 
@@ -380,7 +385,7 @@ def test_cancel_available_supply_aborts_prepare_and_preserves_verified_assets(ra
     _assert_debts(master, assignments, "abort")
     assert result["status"] == "available"
     assert segment.read_bytes() == before
-    persisted_operation = json.loads((supply.root / operation_id / "operation.json").read_text(encoding="utf-8"))
+    persisted_operation = master._model_control.snapshot()["supplies"][operation_id]
     assert persisted_operation["status"] == "available"
     _replay_ready(master, assignments)
     _assert_unpublished(master, assignments)
@@ -406,7 +411,7 @@ def test_restart_rebuilds_abort_debt_without_losing_model_recovery_fence(race_ca
             assert deferred == [master._pipeline_load_transaction["config_id"]]
     assert master._pipeline_load_transaction["phase"] == phase
     assignments = _assignments(master)
-    original = deepcopy(case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY])
+    original = deepcopy(master._model_control.snapshot()["lifecycle"])
     assert original["phase"] == phase
     assert original["cleanup_ledger"] == []
 
@@ -421,8 +426,12 @@ def test_restart_rebuilds_abort_debt_without_losing_model_recovery_fence(race_ca
     assert recovered._pipeline_recovery_failure != "pipeline_recovery_state_invalid"
     _assert_unpublished(recovered, assignments)
     debt_ids = _assert_debts(recovered, assignments, "abort")
-    persisted = deepcopy(case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY])
-    assert {record["cleanup_id"] for record in persisted["cleanup_ledger"]} == debt_ids
+    persisted = deepcopy(recovered._model_control.snapshot()["lifecycle"])
+    assert {record["cleanup_id"] for record in persisted["cleanup_ledger"] if record["node_id"] != "master"} == debt_ids
+    if phase != "preparing":
+        local, = [record for record in persisted["cleanup_ledger"] if record["node_id"] == "master"]
+        assert local["process_boot_id"] == master._model_control.boot_id
+        assert recovered._dispatch_pipeline_model_cleanup(local) is False
     # Rebuilding debts with no live transaction must preserve the raw model and
     # generation fence; otherwise a second crash permits a different model.
     recovery_keys = (
@@ -438,7 +447,7 @@ def test_restart_rebuilds_abort_debt_without_losing_model_recovery_fence(race_ca
     assert recovered_again._pipeline_recovery_pending is True
     assert recovered_again._pipeline_recovery_failure != "pipeline_recovery_state_invalid"
     assert _assert_debts(recovered_again, assignments, "abort") == debt_ids
-    persisted_again = case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY]
+    persisted_again = recovered_again._model_control.snapshot()["lifecycle"]
     for key in recovery_keys:
         assert recovered_again._pipeline_recovery_state[key] == original[key], key
         assert persisted_again[key] == original[key], key
@@ -515,7 +524,7 @@ def test_cancel_racing_ready_retires_every_published_assignment(race_case, monke
 
     assert reached == [caller]
     _assert_unpublished(master, assignments)
-    snapshot = case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY]
+    snapshot = master._model_control.snapshot()["lifecycle"]
     if caller == "operation_cancel":
         assert cas_calls == []
         assert master._pipeline_load_transaction["phase"] == "aborted"
@@ -638,12 +647,12 @@ def test_legacy_offline_cleanup_survives_new_transaction_and_restart(race_case, 
     assert legacy["assignment_id"] == ""
     master._persist_pipeline_lifecycle_locked()
     # Without a live transaction, compatibility is retained at the old schema.
-    assert case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY]["schema_version"] == schema_version
+    assert master._model_control.snapshot()["lifecycle"]["schema_version"] == schema_version
 
     result = case.start("candidate-with-legacy-debt")
     assert result["transaction_phase"] == "preparing"
     assignments = _assignments(master)
-    migrated = deepcopy(case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY])
+    migrated = deepcopy(master._model_control.snapshot()["lifecycle"])
     assert migrated["schema_version"] == 4
     assert migrated["config_id"] == master._pipeline_load_transaction["config_id"]
     assert cleanup_id in master._pipeline_model_cleanup_ledger
@@ -687,7 +696,7 @@ def test_legacy_offline_cleanup_survives_new_transaction_and_restart(race_case, 
     assert restarted._ack_pipeline_model_cleanup(legacy_node, {**replay, "status": status}) is True
     assert cleanup_id not in restarted._pipeline_model_cleanup_ledger
     assert set(restarted._pipeline_model_cleanup_ledger) == set(native_debts)
-    persisted = case.lifecycle_store[_PIPELINE_LIFECYCLE_STATE_KEY]
+    persisted = restarted._model_control.snapshot()["lifecycle"]
     assert {record["cleanup_id"] for record in persisted["cleanup_ledger"]} == set(native_debts)
     assert all(record["legacy_identity"] is False for record in persisted["cleanup_ledger"])
 
@@ -699,3 +708,119 @@ def test_legacy_offline_cleanup_survives_new_transaction_and_restart(race_case, 
     assert set(restarted_again._pipeline_model_cleanup_ledger) == set(native_debts)
     assert cleanup_id not in restarted_again._pipeline_model_cleanup_ledger
     _assert_unpublished(restarted_again, assignments)
+
+
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+def test_tcp_heartbeat_and_duplicate_ack_progress_during_native_barrier(stage_case, monkeypatch, phase):
+    """A blocked real host boundary must leave its inbound TCP stream usable."""
+    import threading
+    import time
+    import config
+    import tcp_comm
+    from scheduler import Scheduler
+
+    case = stage_case
+    master = case.master
+    case.start()
+    if phase == "prepare":
+        ack(master, "worker", "prepare")
+        host_method = "materialize_pipeline_candidate"
+    else:
+        prepare_both(case)
+        ack(master, "worker", "commit")
+        host_method = "commit_pipeline_candidate"
+    entered, release, finished, returned, duplicate, heartbeat = [Event() for _ in range(6)]
+    calls = []
+    original = getattr(type(case.host), host_method)
+
+    def blocked(host, *args, **kwargs):
+        calls.append(threading.current_thread().name)
+        entered.set()
+        assert release.wait(10), "native test boundary was not released"
+        return original(host, *args, **kwargs)
+
+    monkeypatch.setattr(type(case.host), host_method, blocked)
+    transition_name = "_commit_pipeline_load_transaction" if phase == "prepare" else "_complete_pipeline_load_transaction"
+    transition = getattr(master, transition_name)
+
+    def complete(config_id):
+        try:
+            return transition(config_id)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(master, transition_name, complete)
+    monkeypatch.setattr(config, "CLUSTER_SECRET", "r6-native-heartbeat-regression")
+    monkeypatch.setattr(tcp_comm.TCPClient, "_compute_local_model_sha256", staticmethod(lambda: "test"))
+    monkeypatch.setattr(tcp_comm.TCPClient, "_heartbeat_loop", lambda *_args: None)
+    monkeypatch.setattr(tcp_comm, "detect_network_type", lambda: "ethernet")
+    monkeypatch.setattr(tcp_comm, "detect_lan_ip", lambda: "127.0.0.1")
+    server = tcp_comm.TCPServer(host="127.0.0.1", port=1)
+    server.port = 0
+    received = []
+
+    def inbound(node, message):
+        if message["type"] == "register":
+            server.confirm_registration(node)
+        elif message["type"] == "model_prepare":
+            Scheduler._on_tcp_message(master, node, message)
+            received.append(message)
+            returned.set()
+            if len(received) == 2:
+                duplicate.set()
+
+    server.start(on_message=inbound)
+    client = tcp_comm.TCPClient(server_host="127.0.0.1", server_port=server.sock.getsockname()[1], client_id="android", role="client")
+    handle_ack = client._handle_heartbeat_ack
+
+    def heartbeat_ack(message, connection_generation=None):
+        handle_ack(message, connection_generation)
+        heartbeat.set()
+
+    client._handle_heartbeat_ack = heartbeat_ack
+    expected = master._pipeline_load_transaction["expected"]["android"]
+    payload = _receipt(expected, phase)
+    payload["runtime_receipt"] = {"load_spec": deepcopy(expected["load_spec"]), "materialized_bytes": 1,
+        "memory_scope": "weight_tensors", "layer_range": deepcopy(payload["identity"]["layer_range"]),
+        "artifact_sha256": payload["identity"]["artifact_sha256"]}
+    try:
+        assert client.connect() is True
+        client.send_data(payload, tcp_comm.MessageType.MODEL_PREPARE)
+        assert entered.wait(3), "native barrier not entered"
+        client.send_data({"t_send": time.time()}, tcp_comm.MessageType.HEARTBEAT)
+        assert heartbeat.wait(2), "native barrier blocked TCP heartbeat ACK"
+        assert returned.wait(2), "TCP callback is still running native work"
+        client.send_data(payload, tcp_comm.MessageType.MODEL_PREPARE)
+        assert duplicate.wait(2), "duplicate ACK blocked transport"
+        assert len(calls) == 1
+        assert master._active_pipeline_capacity_plan is None
+        assert client.is_registered
+    finally:
+        release.set()
+        assert finished.wait(5)
+        client.disconnect()
+        server.stop()
+    assert master._pipeline_load_transaction["phase"] == ("committing" if phase == "prepare" else "ready")
+
+
+def test_reconnect_during_local_materialization_aborts_before_commit_delivery(stage_case, monkeypatch):
+    case = stage_case
+    master = case.master
+    epochs = {"worker": 11, "android": 11}
+    monkeypatch.setattr(master, "_assignment_connection_generation", lambda node: epochs[node])
+    original = type(case.host).materialize_pipeline_candidate
+
+    def materialize_then_reconnect(host, *args, **kwargs):
+        result = original(host, *args, **kwargs)
+        epochs["worker"] = 12
+        return result
+
+    monkeypatch.setattr(type(case.host), "materialize_pipeline_candidate", materialize_then_reconnect)
+    case.start()
+    ack(master, "worker", "prepare")
+    ack(master, "android", "prepare")
+    assert master._pipeline_load_transaction["phase"] == "aborted"
+    assert master._pipeline_load_transaction["reason_code"] == "pipeline_worker_connection_changed"
+    assert case.host.pipeline_candidate_status()["phase"] == "aborted"
+    assert master._active_pipeline_capacity_plan is None
+    assert not any(payload.get("action") == "commit" for _, payload, *_ in case.sent)

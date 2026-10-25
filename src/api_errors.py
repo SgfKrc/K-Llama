@@ -51,6 +51,9 @@ def error_response_content(exc: HTTPException, **extra: Any) -> dict[str, Any]:
     code = error_code_from_exception(exc)
     if code:
         content["error_code"] = code
+        from qlh_core.contracts.snapshots import reason
+        supplied = exc.detail.get("reason_detail") if isinstance(exc.detail, dict) else None
+        content["reason_detail"] = supplied or reason("api", code, "http_adapter", details={"message": exc.detail})
     return content
 
 

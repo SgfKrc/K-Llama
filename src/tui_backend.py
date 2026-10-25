@@ -12,7 +12,7 @@ import time
 import logging
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Mapping, Optional
 
 
 class BackendStartupError(RuntimeError):
@@ -28,6 +28,7 @@ class BackendSupervisor:
         port: int = 8000,
         *,
         bind_host: Optional[str] = None,
+        environment: Optional[Mapping[str, str]] = None,
         probe_timeout: float = 1.0,
         startup_timeout: float = 30.0,
     ) -> None:
@@ -36,8 +37,10 @@ class BackendSupervisor:
         # listener. Preserve the local IPv6 loopback default without exposing
         # any non-loopback interface unless explicitly configured.
         default_bind = "::1" if self.host == "::1" else "127.0.0.1"
+        self.environment = None if environment is None else dict(environment)
+        listener_environment = os.environ if self.environment is None else self.environment
         configured_bind = (
-            os.environ.get("QLH_BACKEND_HOST") if bind_host is None else bind_host
+            listener_environment.get("QLH_BACKEND_HOST") if bind_host is None else bind_host
         )
         self.bind_host = str(configured_bind or "").strip() or default_bind
         self.port = int(port)
@@ -95,6 +98,9 @@ class BackendSupervisor:
 
         # api_server 的日志仍保留在文件和内存 handler；TUI 独占终端，
         # 不允许后端启动/访问日志穿透到同一个 stdout/stderr。
+        if hasattr(api_server, "_get_app_runtime"):
+            api_server._get_app_runtime().configure_listener(self.port, environment=self.environment)
+        api_server._console_logging_enabled = False
         self._silence_console_logging()
         self._set_status("启动 API 服务")
 
@@ -148,14 +154,14 @@ class BackendSupervisor:
         """静默控制台 handler，保留文件与内存日志供日志屏查看。"""
         root = logging.getLogger()
         for handler in root.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
+            if type(handler) is logging.StreamHandler and not isinstance(
                 handler, logging.FileHandler
             ):
                 handler.setLevel(logging.CRITICAL + 1)
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
             logger = logging.getLogger(name)
             for handler in logger.handlers:
-                if isinstance(handler, logging.StreamHandler) and not isinstance(
+                if type(handler) is logging.StreamHandler and not isinstance(
                     handler, logging.FileHandler
                 ):
                     handler.setLevel(logging.CRITICAL + 1)

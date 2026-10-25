@@ -15,7 +15,7 @@ API integration: responder = MasterDiscoveryResponder(scheduler, api_port);
 call start() at startup and stop() at shutdown. api_port may be an integer or
 an inexpensive zero-argument callback returning the actual listening port.
 Scheduler callbacks are read afresh for each reply: _effective_role(),
-_scheduler_facade_global("RUN_MODE"), get_distributed_inference_enabled(),
+_runtime_setting("RUN_MODE"), get_distributed_inference_enabled(),
 get_effective_node_id(), plus the current _tcp_server.port / _running.
 start() only schedules a daemon thread; bound_port/running and named logs
 expose asynchronous readiness/failure. No retries are hidden from the owner.
@@ -289,7 +289,7 @@ class MasterDiscoveryResponder:
             return None
         scheduler = self.scheduler
         if (scheduler._effective_role() != "master"
-                or scheduler._scheduler_facade_global("RUN_MODE") != "distributed"
+                or scheduler._runtime_setting("RUN_MODE") != "distributed"
                 or scheduler.get_distributed_inference_enabled() is not True):
             return None
         server = scheduler._tcp_server

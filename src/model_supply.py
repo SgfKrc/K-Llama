@@ -26,6 +26,11 @@ from pipeline_capacity import solve_pipeline_capacity
 
 logger = logging.getLogger(__name__)
 
+# ★ 2026-10-24（#125）：`_worker_handshake_ready` 的诊断限流表（node_id -> 上次打印
+#   的 monotonic 时刻）。握手判据不满足时每 5 秒最多打一条，避免 `waiting_nodes`
+#   循环把日志刷爆，同时保留"卡在哪个条件上"的证据。
+_HANDSHAKE_DIAG: dict[str, float] = {}
+
 
 _STRATEGY_REASON_CODES = frozenset({
     "SUPPLY_CACHE_REUSED", "SUPPLY_LOCAL_CUT_PREFERRED", "SUPPLY_DISTRIBUTE_REQUESTED",
@@ -82,86 +87,35 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                         safety_margin: float = 1.2,
                         runtime_descriptors: dict[str, dict] | None = None,
                         preferred_ranges: dict[str, list[list[int]]] | None = None,
-                        runtime_host_ranges: dict[str, list[list[int]]] | None = None) -> dict:
+                        runtime_host_ranges: dict[str, list[list[int]]] | None = None,
+                        prefer_all_workers: bool | None = None) -> dict:
     """Reuse capacity admission while planning missing, not just existing, assets.
 
     GGUF segments retain non-block tensors. Charge those tensors on *each* GGUF
     executor, including the middle, and use aligned groups for hybrid models.
-    Mixed precision nodes are charged a conservative per-group ratio; the actual
-    packaged size is rechecked before dispatch.
+    Each executor uses its exact projected per-layer bytes for the selected
+    engine and load specification; packaged size is rechecked before dispatch.
     """
+    from model_supply_runtime_capacity import (
+        RuntimeCapacityProjectionError, project_supply_capacity_nodes,
+    )
+    try:
+        grouped, projected, by_id = project_supply_capacity_nodes(
+            descriptors, nodes, master_engine=master_engine, alignment=alignment,
+            safety_margin=safety_margin, runtime_descriptors=runtime_descriptors,
+            preferred_ranges=preferred_ranges, runtime_host_ranges=runtime_host_ranges,
+        )
+    except RuntimeCapacityProjectionError as exc:
+        raise ModelSupplyError(exc.code, exc.message) from exc
+    if prefer_all_workers is None:
+        from config import prefer_all_workers_enabled
+        prefer_all_workers = prefer_all_workers_enabled()
+    if type(prefer_all_workers) is not bool:
+        raise ModelSupplyError("SUPPLY_PLACEMENT_POLICY_INVALID", "prefer_all_workers must be a boolean")
     reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
-    if not reference or not reference.get("pipeline_runtime_supported"):
-        raise ModelSupplyError("SUPPLY_DESCRIPTOR_UNAVAILABLE", "No supported source descriptor")
     total = int(reference["total_layers"])
-    if isinstance(alignment, bool) or alignment < 1 or total % alignment:
-        raise ModelSupplyError("SUPPLY_ALIGNMENT_INVALID", "Invalid decoder cut alignment")
-    group_sizes = [sum(reference["layer_weight_bytes"][i:i + alignment])
-                   for i in range(0, total, alignment)]
-    projected = []
-    by_id = {}
-    for raw in nodes:
-        node = dict(raw)
-        node_id = str(node["node_id"])
-        engine = master_engine if node_id == "master" else str(node.get("engine", "llama_cpp"))
-        source = (runtime_descriptors or {}).get(node_id) or descriptors.get(engine)
-        if not source:
-            raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No source for {engine}")
-        if int(source["total_layers"]) != total or int(source["hidden_size"]) != int(reference["hidden_size"]):
-            raise ModelSupplyError("SUPPLY_SOURCE_CONTRACT_MISMATCH", "Source dimensions differ")
-        sizes = [sum(source["layer_weight_bytes"][i:i + alignment])
-                 for i in range(0, total, alignment)]
-        if any(value <= 0 for value in sizes + group_sizes):
-            raise ModelSupplyError("SUPPLY_LAYER_BYTES_MISSING", "Source layer bytes are incomplete")
-        multiplier = float(node.get("runtime_multiplier", 1.0))
-        components = source.get("component_weight_bytes") or {}
-        # GGUF cut files retain every non-block tensor. Selective PyTorch
-        # loading charges the head's input components and each node's norm;
-        # remote PyTorch nodes conservatively reserve both possible boundaries.
-        boundary_keys = (("embedding", "final_norm", "lm_head", "other")
-                         if engine == "llama_cpp" or node_id != "master" else
-                         ("embedding", "final_norm", "other"))
-        overhead = sum(int(components.get(key, 0)) for key in boundary_keys)
-        # A target plan may create a new segment. Inventory ranges constrain
-        # executable plans, never this supply plan. No execution advert is changed.
-        for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models"):
-            node.pop(key, None)
-        wanted_ranges = (preferred_ranges or {}).get(node_id)
-        if wanted_ranges is not None:
-            if (node_id == "master" or not isinstance(wanted_ranges, list) or not wanted_ranges
-                    or any(not isinstance(span, list) or len(span) != 2
-                           or any(type(value) is not int for value in span)
-                           or not 0 <= span[0] < span[1] <= total
-                           or span[1] - span[0] == total
-                           or span[0] % alignment or span[1] % alignment
-                           for span in wanted_ranges)):
-                raise ModelSupplyError("SUPPLY_PREFERRED_RANGE_INVALID", "Invalid reusable segment preference")
-            node["layer_ranges"] = [[span[0] // alignment, span[1] // alignment] for span in wanted_ranges]
-        host_ranges = (runtime_host_ranges or {}).get(node_id)
-        if host_ranges is not None:
-            if (not isinstance(host_ranges, list)
-                    or any(not isinstance(span, list) or len(span) != 2
-                           or any(type(value) is not int for value in span)
-                           or not 0 <= span[0] < span[1] <= total
-                           or span[1] - span[0] == total
-                           or span[0] % alignment or span[1] % alignment for span in host_ranges)):
-                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_BUDGET_INVALID", "Invalid source staging ranges")
-            admitted_ranges = [[span[0] // alignment, span[1] // alignment] for span in host_ranges]
-            if "layer_ranges" in node:
-                admitted_ranges = [span for span in admitted_ranges if span in node["layer_ranges"]]
-            node["layer_ranges"] = admitted_ranges
-        node["role"] = "master" if node_id == "master" else "client"
-        node["reserve_bytes"] = int(node.get("reserve_bytes", 0)) + math.ceil(overhead * multiplier * safety_margin)
-        node["runtime_multiplier"] = multiplier * max(a / b for a, b in zip(sizes, group_sizes))
-        node["engine"] = engine
-        by_id[node_id] = {**raw, "engine": engine, "overhead_bytes": overhead}
-        projected.append(node)
-    grouped = {**reference, "total_layers": len(group_sizes),
-               "layer_weight_bytes": group_sizes,
-               "component_weight_bytes": {"embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0},
-               "runtime_ignored_components": []}
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
-                                    require_distributed=True, prefer_all_workers=True,
+                                    require_distributed=True, prefer_all_workers=prefer_all_workers,
                                     required_node_id="master")
     if result.get("reason_code") == "pipeline_required_node_unavailable":
         result = {**result, "reason_code": "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
@@ -171,6 +125,7 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         diagnostic = explain_supply_capacity(
             result, grouped_descriptor=grouped, projected_nodes=projected,
             alignment=alignment, total_layers=total, safety_margin=safety_margin,
+            prefer_all_workers=prefer_all_workers,
         )
         return {**result, "total_layers": total, "loaded_ready": False, "supply_only": True,
                 "capacity_diagnostic": diagnostic}
@@ -180,9 +135,33 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         item["start_layer"] *= alignment
         item["end_layer"] *= alignment
         item["layers_count"] = item["end_layer"] - item["start_layer"]
+        if "range_weight_quote" in item:
+            item["range_weight_quote"] = {**item["range_weight_quote"],
+                "layer_range": [item["start_layer"], item["end_layer"]]}
         if "layer_ranges" in item:
             item["layer_ranges"] = [[start * alignment, end * alignment] for start, end in item["layer_ranges"]]
-        item["engine"] = by_id[item["node_id"]]["engine"]
+        selected_node = by_id[item["node_id"]]
+        item["engine"] = selected_node["engine"]
+        if selected_node.get("materialization") == "safetensors_layer_offload":
+            from model_supply_runtime_capacity import runtime_range_capacity
+            from qlh_core.planning.load_spec import assignment_load_spec
+            quote = runtime_range_capacity(runtime_descriptors[item["node_id"]],
+                item["start_layer"], item["end_layer"],
+                has_embedding=item["has_embedding"], has_lm_head=item["has_lm_head"])
+            host_required = math.ceil(quote["host_weight_peak_bytes"] * safety_margin) + selected_node["reserve_bytes"]
+            host_capacity = selected_node.get("host_capacity_bytes")
+            if type(host_capacity) is not int or not 0 < host_required <= host_capacity:
+                raise ModelSupplyError("SUPPLY_RUNTIME_HOST_CAPACITY_INSUFFICIENT", "Layer offload host budget changed")
+            item.update(quote, runtime_materialization="safetensors_layer_offload",
+                        host_required_bytes=host_required, host_capacity_bytes=host_capacity,
+                        runtime_target_dtype=runtime_descriptors[item["node_id"]]["runtime_target_dtype"],
+                        runtime_target_element_size=runtime_descriptors[item["node_id"]]["runtime_target_element_size"])
+            spec = assignment_load_spec(item, artifact_format="safetensors")
+            item.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest)
+        if item["engine"] == "llama_cpp":
+            # Native cut artifacts retain all non-block tensors on every node.
+            # Keep this header-derived quote for the later prepare admission.
+            item["retained_component_bytes"] = by_id[item["node_id"]]["overhead_bytes"]
         item["segment_mode"] = ("head" if item["start_layer"] == 0 else
                                 "tail" if item["end_layer"] == total else "middle")
         assignments.append(item)
@@ -213,6 +192,9 @@ class ModelSupplyCoordinator:
         self._preparing = ""
         self._prepare_cancelled = False
         self._capacity_queries: dict[str, dict] = {}
+        # ★ 2026-10-23（#116）：最近一次准入证据，供工件传输进度续期使用。
+        #   传输（可能数十分钟）是流程的正常组成，不应被读成"预算过期"。
+        self._capacity_evidence: dict[str, object] = {}
 
     @property
     def root(self) -> Path:
@@ -237,8 +219,19 @@ class ModelSupplyCoordinator:
         if not self.scheduler.get_distributed_inference_enabled():
             raise ModelSupplyError("SUPPLY_LOCAL_MODE", "Node has opted out of distributed inference")
 
-    def create(self, intent: dict, *, wait_for_nodes: bool = False) -> dict:
+    def create(self, intent: dict, *, wait_for_nodes: bool = False, idempotency_key: str = "") -> dict:
+        return self.accept(intent, wait_for_nodes=wait_for_nodes, idempotency_key=idempotency_key)[0]
+
+    def accept(self, intent: dict, *, wait_for_nodes: bool = False, idempotency_key: str = "") -> tuple[dict, bool]:
+        """Return the durable receipt and whether this call owns its background work."""
         self._check_master()
+        owner = getattr(self.scheduler, "_model_control", None)
+        if owner is not None and idempotency_key:
+            for prior in owner.snapshot()["supplies"].values():
+                if prior.get("idempotency_key") == idempotency_key:
+                    if prior["intent"] != intent:
+                        raise ModelSupplyError("INTENT_IDEMPOTENCY_CONFLICT", "Idempotency key belongs to another selection")
+                    return copy.deepcopy(prior), False
         if str(intent.get("quant_type", "")).lower() in {"fp32", "f32", "float32"}:
             raise ModelSupplyError("SUPPLY_RUNTIME_PRECISION_UNSUPPORTED", "FP32 supply requires per-tensor materialized byte admission")
         if any(re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value or "") is None for value in intent.get("node_ids", [])):
@@ -262,40 +255,62 @@ class ModelSupplyCoordinator:
             if self._active and self._operations[self._active]["status"] not in self.TERMINAL:
                 existing = self._operations[self._active]
                 if existing["intent"] == intent:
-                    return copy.deepcopy(existing)
+                    return copy.deepcopy(existing), False
                 raise ModelSupplyError("SUPPLY_OPERATION_BUSY", "Another model supply operation is active")
             op_id = "supply_" + uuid.uuid4().hex
-            operation = {"operation_id": op_id, "intent": copy.deepcopy(intent),
+            operation = {"operation_id": op_id, "intent": copy.deepcopy(intent), "idempotency_key": idempotency_key,
                          "status": "queued", "reason_code": "", "created_at": time.time(),
                          "updated_at": time.time(), "loaded_ready": False, "nodes": {},
                          "plan": None, "capacity_diagnostic": None,
                          "requires_prepare": True, "wait_for_nodes": wait_for_nodes}
+            try:
+                self._persist(operation)
+            except Exception as exc:
+                if owner is None or getattr(exc, "code", "") not in {
+                        "operation_idempotency_reused", "operation_idempotency_conflict"}:
+                    raise
+                for prior in owner.snapshot()["supplies"].values():
+                    if prior.get("idempotency_key") == idempotency_key:
+                        if prior["intent"] != intent:
+                            raise ModelSupplyError("INTENT_IDEMPOTENCY_CONFLICT", "Idempotency key belongs to another selection") from exc
+                        return copy.deepcopy(prior), False
+                raise
             self._operations[op_id] = operation
             self._events[op_id] = threading.Event()
             self._active = op_id
-            self._persist(operation)
             # Bound in-memory history without deleting user artifacts.
             for old_id in list(self._operations)[:-64]:
                 if self._operations[old_id]["status"] in self.TERMINAL:
                     self._operations.pop(old_id, None)
                     self._events.pop(old_id, None)
             threading.Thread(target=self._run, args=(op_id,), name="model-supply", daemon=True).start()
-            return copy.deepcopy(operation)
+            return copy.deepcopy(operation), True
 
     def _persist(self, operation):
         # Keep the owner lock through backoff so a delayed write cannot land
         # after a newer update or cancellation.
         with self._condition:
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None:
+                owner.start()
+                owner.save_supply(operation)
+                return
             directory = self.root / operation["operation_id"]
             directory.mkdir(parents=True, exist_ok=True)
             atomic_write_json(directory / "operation.json", operation, ensure_ascii=False, indent=2)
 
     def get(self, op_id: str) -> dict:
         with self._condition:
+            if not op_id.startswith("supply_") or len(op_id) != 39 or not all(c in "0123456789abcdef" for c in op_id[7:]):
+                raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None:
+                saved = owner.snapshot()["supplies"].get(op_id)
+                if saved is None:
+                    raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
+                return copy.deepcopy(saved)
             op = self._operations.get(op_id)
             if op is None:
-                if not op_id.startswith("supply_") or len(op_id) != 39 or not all(c in "0123456789abcdef" for c in op_id[7:]):
-                    raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
                 path = self.root / op_id / "operation.json"
                 if not path.is_file():
                     raise ModelSupplyError("SUPPLY_OPERATION_NOT_FOUND", "Supply operation not found")
@@ -308,7 +323,8 @@ class ModelSupplyCoordinator:
     def _update(self, op_id, **values):
         with self._condition:
             operation = self._operations[op_id]
-            if operation["status"] in {"failed", "cancelled", "available"}:
+            if (operation["status"] in {"failed", "cancelled"}
+                    or operation["status"] == "available" and set(values) != {"retention"}):
                 return
             if self._events[op_id].is_set() and values.get("status") not in {"cancelled", "failed"}:
                 return
@@ -318,6 +334,14 @@ class ModelSupplyCoordinator:
 
     def _check(self, op_id):
         self._check_master()
+        owner = getattr(self.scheduler, "_model_control", None)
+        if owner is not None:
+            snapshot = owner.snapshot()
+            operation = snapshot["operations"].get(op_id)
+            if (snapshot["boot_id"] != owner.boot_id
+                    or operation and (snapshot["selected_operation"] != op_id
+                                      or operation["status"] in {"failed", "cancelled", "superseded"})):
+                raise ModelSupplyError("SUPPLY_OPERATION_STALE", "Supply operation was superseded")
         if self._events[op_id].is_set():
             raise ModelSupplyError("SUPPLY_CANCELLED", "Supply operation cancelled")
         if self._active != op_id:
@@ -445,7 +469,7 @@ class ModelSupplyCoordinator:
         try:
             epoch = server.get_authenticated_peer_epoch(node_id)
             worker = control.worker_snapshot(node_id)
-            return bool(
+            ready = bool(
                 type(epoch) is int and epoch > 0
                 and epoch == connection.get("registration_epoch")
                 and worker.get("manual_stage_dispatch_enabled") is True
@@ -458,6 +482,29 @@ class ModelSupplyCoordinator:
             )
         except (AttributeError, KeyError, TypeError, ValueError):
             return False
+        if not ready:
+            # ★ 2026-10-24（#125）：供给曾在 `waiting_nodes` 与 `planning` 之间反复
+            #   循环（实测 6→58→63→172→177 s），却**没有任何日志**说明卡在六个判据的
+            #   哪一个上。这里把各自的实际值打出来（限流 5 秒一次，避免刷屏）。
+            now = time.monotonic()
+            if now - _HANDSHAKE_DIAG.get(node_id, 0.0) >= 5.0:
+                _HANDSHAKE_DIAG[node_id] = now
+                try:
+                    pending = node_id in control.pending_worker_ids()
+                except (AttributeError, TypeError):
+                    pending = None
+                logger.info(
+                    "event=supply_handshake_not_ready node=%s epoch=%r conn_epoch=%r "
+                    "manual_stage=%r layer_stage=%r healthy=%r connected=%r accepted=%r "
+                    "selected_version=%r pending=%r hello_received_at=%r connected_at=%r",
+                    node_id, epoch, connection.get("registration_epoch"),
+                    worker.get("manual_stage_dispatch_enabled"),
+                    worker.get("layer_stage_dispatch_enabled"),
+                    worker.get("healthy"), worker.get("connected"), worker.get("accepted"),
+                    worker.get("selected_version"), pending,
+                    worker.get("hello_received_at"), connection.get("connected_at"),
+                )
+        return ready
 
     def _send(self, op_id, node_id, payload):
         from transport_port import MessageType
@@ -523,7 +570,10 @@ class ModelSupplyCoordinator:
     def _extend_auto_inventory(self, op_id, intent, worker_ids, nodes, inventories, deadline, *,
                                wait_for_new=False, capacity_diagnostic=None):
         """Extend only the unpublished automatic pool, using the live join owners."""
+        # ★ 2026-10-24（#117）：本函数内的清点等待也用同一上限（见 `_execute` 顶部注释）。
+        from config import MODEL_SUPPLY_INVENTORY_TIMEOUT_S
         expanded = False
+        next_refresh = time.monotonic() + 1.0
         while True:
             with self._condition:
                 self._check(op_id)
@@ -555,8 +605,22 @@ class ModelSupplyCoordinator:
                     self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
                                                "source_model_sha256": ""})
                 for node_id in added:
+                    # ★ 2026-10-24（#117）：清点等待做成设置（默认 300 s）。此前硬编码
+                    #   90 s，而"未登记候选"的本地源核对要对整模做一次全量 sha256
+                    #   （5.78 GB，实测 90~120 s）⇒ 首次清点必然 SUPPLY_WORKER_TIMEOUT。
+                    # ★ 2026-10-24（#125）：清点是"并行发送、逐个 `_wait`"，故**总耗时
+                    #   由最慢节点决定**；此前这一段完全没有日志，导致"清点为什么慢"
+                    #   只能靠猜（实测 master 侧自身清点仅约 0.4 s、android 读 2 GiB 不到
+                    #   1 s，而 inventory 阶段仍要 108~142 s）。记录每个节点的真实往返。
+                    _inventory_started = time.monotonic()
                     inventory = self._wait(op_id, node_id, "inventory_result",
-                                           min(90, max(0, deadline - time.monotonic())))
+                                           min(MODEL_SUPPLY_INVENTORY_TIMEOUT_S,
+                                               max(0, deadline - time.monotonic())))
+                    logger.info(
+                        "event=supply_inventory_done node=%s elapsed_ms=%d sources=%d",
+                        node_id, int((time.monotonic() - _inventory_started) * 1000),
+                        len(inventory.get("sources") or []),
+                    )
                     if not inventory.get("distributed"):
                         raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
                     with self._condition:
@@ -568,6 +632,31 @@ class ModelSupplyCoordinator:
                 # Inventory/source inspection can take long enough for another
                 # peer to register. Drain new joined peers before planning once.
                 continue
+            if wait_for_new and not pending and time.monotonic() >= next_refresh:
+                # Re-observe existing nodes as well as joins. Capacity may become
+                # available without a membership change; inventory owns live RAM,
+                # VRAM and local artifact evidence. No build has started here.
+                refreshed = {"master": self.scheduler._model_supply_worker.inventory(model_id=intent["model_id"])}
+                for node_id in worker_ids:
+                    self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
+                                               "source_model_sha256": ""})
+                for node_id in worker_ids:
+                    refreshed[node_id] = self._wait(op_id, node_id, "inventory_result",
+                                                   min(MODEL_SUPPLY_INVENTORY_TIMEOUT_S,
+                                                       max(0, deadline - time.monotonic())))
+                    if not refreshed[node_id].get("distributed"):
+                        raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
+                with self._condition:
+                    self._check(op_id)
+                    self._check_receivers(op_id)
+                fields = ("engines", "pytorch_runtime", "memory_available_bytes", "disk_free_bytes",
+                          "sources", "artifacts", "local_cut", "distributed")
+                changed = any(any(inventories[node_id].get(key) != value.get(key) for key in fields)
+                              for node_id, value in refreshed.items())
+                inventories.update(refreshed)
+                if changed:
+                    return True
+                next_refresh = time.monotonic() + 1.0
             if wait_for_new and capacity_diagnostic is not None:
                 diagnostic = copy.deepcopy(capacity_diagnostic)
                 diagnostic["pending_node_ids"] = sorted(
@@ -599,10 +688,11 @@ class ModelSupplyCoordinator:
     def _sources(self, op_id, intent, *, want_gguf=True):
         import model_config as mc
         import local_store
-        from model_sync import compute_model_sha256, compute_file_sha256
+        from model_sync import compute_model_sha256
         from pipeline_model_descriptor import inspect_pipeline_model
         from llama_engine import LlamaCppEngine
         from relay_segment_info import read_gguf_layer_info
+        from model_supply_assets import _hash_file_cached
         model_id = intent["model_id"]
         from model_supply_sources import ensure_registered_sources
         source_result = ensure_registered_sources(
@@ -616,15 +706,15 @@ class ModelSupplyCoordinator:
         proof = source_result.get("conversion_proof")
         descriptors = {}
         if hf and (hf / "config.json").is_file():
-            descriptor = inspect_pipeline_model(hf, model_id=model_id)
-            descriptor.setdefault("model_sha256", compute_model_sha256(str(hf)))
+            descriptor = inspect_pipeline_model(hf, model_id=model_id, digest=_hash_file_cached)
+            descriptor.setdefault("model_sha256", compute_model_sha256(str(hf), digest=_hash_file_cached))
             descriptors["pytorch"] = descriptor
         if gguf and gguf.is_file():
             info = read_gguf_layer_info(gguf) or {}
             engine = LlamaCppEngine()
             engine._model_path = str(gguf)
             engine.active_model_id = model_id
-            descriptor = engine.get_pipeline_descriptor()
+            descriptor = engine.get_pipeline_descriptor(digest=_hash_file_cached)
             if not descriptor or any(value <= 0 for value in descriptor.get("layer_weight_bytes", [])):
                 raise ModelSupplyError("SUPPLY_FULL_SOURCE_REQUIRED", "Supply needs a complete on-disk source, not a pre-cut segment")
             descriptor["source_model_id"] = model_id
@@ -657,6 +747,63 @@ class ModelSupplyCoordinator:
                 "source_model_id": model_id, "source_model_sha256": identity,
                 "tokenizer_sha256": tokenizer, "conversion_proof": proof}
 
+    def collect_operation_directories(self, *, keep_operation_ids=(), keep_recent=None) -> dict:
+        """★ 2026-10-24（#125）：回收历史供给操作目录。
+
+        `self._root` 下每个 `<op_id>/` 都是一次供给为各节点构建的段工件（单次
+        3~15 GB），而**此前从不回收**：实测本机积压 **146 个目录、453.78 GB**，
+        C 盘一度只剩 108 GB 可用（内存里的 `_operations` 只淘汰记录，不碰磁盘）。
+
+        保留策略（全部保留，其余整目录删除）：
+          - 显式给出的 `keep_operation_ids`（正在服务的那次）；
+          - 仍登记在内存 `_operations` 中的（尚未终结）；
+          - 按 mtime 最新的 `keep_recent` 个，默认取设置
+            `MODEL_SUPPLY_KEEP_OPERATIONS`（0 = 清空全部历史）。
+
+        只处理本根目录的**直接子目录**，跳过符号链接；删除失败只记数不抛错，
+        因为回收是维护动作，绝不能让一次已成功的供给因此失败。
+        """
+        import shutil
+        from config import MODEL_SUPPLY_KEEP_OPERATIONS
+        recent = MODEL_SUPPLY_KEEP_OPERATIONS if keep_recent is None else int(keep_recent)
+        keep = {str(value) for value in keep_operation_ids if value}
+        with self._condition:
+            keep.update(str(key) for key in self._operations)
+        try:
+            candidates = [path for path in self._root.iterdir() if path.is_dir()]
+        except OSError:
+            return {"removed": 0, "reclaimed_bytes": 0, "kept": sorted(keep),
+                    "examined": 0, "failed": 0}
+        try:
+            candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError:
+            pass
+        for path in candidates[:max(0, recent)]:
+            keep.add(path.name)
+        removed, reclaimed, failed = 0, 0, 0
+        for path in candidates:
+            if path.name in keep or path.is_symlink() or path.parent != self._root:
+                continue
+            size = 0
+            try:
+                for child in path.rglob("*"):
+                    if child.is_file() and not child.is_symlink():
+                        size += child.stat().st_size
+                shutil.rmtree(path)
+            except OSError:
+                failed += 1
+                continue
+            removed += 1
+            reclaimed += size
+        if removed or failed:
+            logger.info(
+                "event=supply_operations_reclaimed removed=%d reclaimed_bytes=%d "
+                "failed=%d kept=%d examined=%d",
+                removed, reclaimed, failed, len(keep), len(candidates),
+            )
+        return {"removed": removed, "reclaimed_bytes": reclaimed, "kept": sorted(keep),
+                "examined": len(candidates), "failed": failed}
+
     def _run(self, op_id):
         try:
             self._execute(op_id)
@@ -672,18 +819,35 @@ class ModelSupplyCoordinator:
                         self._leases.pop(key, None)
                 cancelled = self._events[op_id].is_set()
                 self._events[op_id].set()
+            owner = getattr(self.scheduler, "_model_control", None)
+            if owner is not None and owner.snapshot()["boot_id"] != owner.boot_id:
+                return  # A recovered owner has already durably fenced this boot.
             self._update(op_id, status="cancelled" if cancelled else "failed",
                          reason_code="SUPPLY_CANCELLED" if cancelled else code, reason=message,
                          capacity_diagnostic=None if cancelled else getattr(exc, "diagnostic", None))
             self._cancel_receivers(op_id, list(self.get(op_id)["nodes"]))
+        finally:
+            # ★ 2026-10-24（#125）：**无论成败都回收历史操作目录**。此前每次供给都会在
+            #   `operations/<op_id>/` 留下 3~15 GB 的段工件且从不回收（实测积压
+            #   146 个 / 453.78 GB）。保留当前这次与设置指定的最近若干次。
+            try:
+                self.collect_operation_directories(keep_operation_ids=(op_id,))
+            except Exception:
+                logger.exception("event=supply_operations_reclaim_failed operation_id=%s", op_id)
+
 
     def _execute(self, op_id):
+        # ★ 2026-10-24（#117）：清点等待上限在此统一取一次，供本函数内所有
+        #   `inventory_result` 等待点使用（此前是散落的硬编码 90 秒，且改了一处漏了
+        #   另一处 ⇒ 主路径仍超时）。
+        from config import MODEL_SUPPLY_INVENTORY_TIMEOUT_S
         self._check(op_id)
         intent = self.get(op_id)["intent"]
         self._update(op_id, status="inspecting")
         selected = set(intent.get("node_ids") or [])
         auto_pool = not selected and self.get(op_id).get("wait_for_nodes") is True
-        deadline = time.monotonic() + int(intent.get("timeout_seconds", 3600))
+        created_at = self.get(op_id).get("created_at", time.time())
+        deadline = time.monotonic() + max(0, created_at + int(intent.get("timeout_seconds", 3600)) - time.time())
         while True:
             self._check(op_id)
             connections = self._worker_connections(selected)
@@ -711,14 +875,38 @@ class ModelSupplyCoordinator:
             raise ModelSupplyError("SUPPLY_WORKERS_UNAVAILABLE", "No joined supply workers")
         nodes = {node_id: {"status": "inventory"} for node_id in ["master", *worker_ids]}
         self._update(op_id, status="inventory", nodes=nodes)
+        # ★ 2026-10-24（#125）：记录**整个清点阶段**的耗时。实测存在一段 45 s 的
+        #   静默空档（最后一个 worker 的 inventory_done 之后、planning 之前），
+        #   期间 supply 内部没有任何日志，无法判断是二次观察、wait_for_new 轮询
+        #   还是别的等待。这里给出阶段总耗时，配合每节点的
+        #   `supply_inventory_done` 即可算出空档归属。
+        _inventory_phase_started = time.monotonic()
         for node_id in worker_ids:
             self._send(op_id, node_id, {"action": "inventory", "model_id": intent["model_id"],
                                      "source_model_sha256": ""})
         inventories = {"master": self.scheduler._model_supply_worker.inventory(model_id=intent["model_id"])}
+        # ★ 2026-10-24（#117）：这条**主路径**此前也硬编码 90 秒，而"未登记候选"的
+        #   本地源核对要对整模做一次全量 sha256（5.78 GB，实测 90~120 s）⇒ 首次清点
+        #   必然 SUPPLY_WORKER_TIMEOUT。与上面那处一起用同一设置（函数顶部已取）。
         for node_id in worker_ids:
-            inventories[node_id] = self._wait(op_id, node_id, "inventory_result", 90)
+            # ★ 2026-10-24（#125）：**这才是主路径**（上面 L582 那处是另一条分支）。
+            #   清点是「并行发送、逐个 `_wait`」，故总耗时 = 最慢节点，此前完全没有
+            #   日志可查（实测 master 自身约 0.4 s、android 读 2 GiB 不到 1 s，而整个
+            #   inventory 阶段仍要 108~142 s）。逐节点记录往返耗时以定位瓶颈。
+            _inventory_started = time.monotonic()
+            inventories[node_id] = self._wait(op_id, node_id, "inventory_result",
+                                              MODEL_SUPPLY_INVENTORY_TIMEOUT_S)
+            logger.info(
+                "event=supply_inventory_done node=%s elapsed_ms=%d sources=%d",
+                node_id, int((time.monotonic() - _inventory_started) * 1000),
+                len(inventories[node_id].get("sources") or []),
+            )
             if not inventories[node_id].get("distributed"):
                 raise ModelSupplyError("SUPPLY_WORKER_LOCAL_MODE", f"Worker {node_id} opted out")
+        logger.info(
+            "event=supply_inventory_phase_done nodes=%d elapsed_ms=%d",
+            len(inventories), int((time.monotonic() - _inventory_phase_started) * 1000),
+        )
         want_gguf = intent.get("engine") != "pytorch" or any(
             "pytorch" not in inventories[node_id].get("engines", []) for node_id in worker_ids)
         sources = self._sources(op_id, intent, want_gguf=want_gguf)
@@ -763,8 +951,15 @@ class ModelSupplyCoordinator:
                 if not engine:
                     raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No compatible source for {node_id}")
                 if engine == "llama_cpp":
+                    # ★ 2026-10-23（#117）：**自裁节点按原生量化宽度物化**。GGUF 段是
+                    #   从整模按原生 Q4_K_M 直接切出来的，worker 侧没有 fp16→fp32 的
+                    #   投影，所以不该乘 2。此前对 llama_cpp 一律硬编码
+                    #   `runtime_multiplier=2.0`，把自裁 worker 的可用内存凭空减半
+                    #   ⇒ 三机只凑得出 18 层 < 32 ⇒ 求解器恒无解、`waiting_nodes`
+                    #   反复空转。非自裁路径保留既有倍率，避免改动无关行为。
+                    multiplier = 1.0 if inventory.get("local_cut") else 2.0
                     base.update(capacity_bytes=int(inventory.get("memory_available_bytes", 0)),
-                                capacity_source="supply.ram.available_bytes_live", execution_device="cpu", runtime_multiplier=2.0)
+                                capacity_source="supply.ram.available_bytes_live", execution_device="cpu", runtime_multiplier=multiplier)
                 if engine == "pytorch":
                     from model_supply_runtime_capacity import project_runtime_descriptor
                     runtime = inventory.get("pytorch_runtime")
@@ -775,7 +970,8 @@ class ModelSupplyCoordinator:
                     available = runtime.get("available_bytes")
                     if (device not in {"cpu", "cuda"} or type(available) is not int or available <= 0):
                         raise ModelSupplyError("SUPPLY_RUNTIME_BUDGET_MISSING", f"Worker {node_id} has an invalid runtime memory budget")
-                    projection = project_runtime_descriptor(sources["hf"], sources["descriptors"]["pytorch"], element_size)
+                    projection = project_runtime_descriptor(sources["hf"], sources["descriptors"]["pytorch"], element_size,
+                        target_dtype={2: "float16", 4: "float32"}.get(element_size))
                     if device == "cuda":
                         # Selective loaders read Safetensors on CPU and transfer one
                         # tensor at a time. Charge target weights to VRAM, source
@@ -786,12 +982,49 @@ class ModelSupplyCoordinator:
                             "layer_weight_bytes": projection["runtime_layer_weight_bytes"],
                             "component_weight_bytes": projection["runtime_component_weight_bytes"]}
                     runtime_descriptors[node_id] = projection
+                    from model_supply_capacity import runtime_capacity_source
                     base.update(capacity_bytes=available, execution_device=device, runtime_multiplier=1.0,
-                                capacity_source="supply.cuda.mem_get_info" if device == "cuda" else "supply.ram.available_bytes_live")
+                                capacity_source=runtime_capacity_source(runtime, device, prefix="supply"))
+                    if device == "cuda" and isinstance(runtime.get("budget_observations"), dict):
+                        base["capacity_observations"] = copy.deepcopy(runtime["budget_observations"])
                 base["engine"] = engine
+                # Source resolution may select a different engine from the
+                # previous execution. Score its actual device and fresh RAM.
+                node_lock = getattr(self.scheduler, "_nodes_lock", None)
+                if node_lock is not None:
+                    with node_lock:
+                        observed_node = self.scheduler.nodes.get(node_id)
+                        profile = getattr(observed_node, "device_info", None)
+                    if isinstance(profile, dict):
+                        from scheduler_layer_plan import compute_node_weight
+                        profile = copy.deepcopy(profile)
+                        profile["ram"] = {**(profile.get("ram") or {}),
+                            "available_gb": max(0, int(inventory.get("memory_available_bytes", 0))) / 1024**3}
+                        base["score"] = compute_node_weight(profile, execution_device=base["execution_device"])
                 logger.info("event=supply_runtime_budget operation=%s node=%s engine=%s device=%s capacity_bytes=%s reserve_bytes=%s multiplier=%s score=%s",
                             op_id, node_id, engine, base.get("execution_device"), base.get("capacity_bytes"),
                             base.get("reserve_bytes"), base.get("runtime_multiplier"), base.get("score"))
+                if engine == "pytorch" and device == "cuda":
+                    # ★ 2026-10-23（#117）：**主机内存按物理总量封顶**（默认 60%）。
+                    from config import HOST_RAM_MAX_FRACTION
+                    #   主节点还要跑别的程序，不能把"当前可用内存"整块当成可分配容量
+                    #   —— 此前实测一次供给吃掉 ~14 GB / 31.6 GB（45%）。上限取
+                    #   `min(当前可用, 物理总量 × HOST_RAM_MAX_FRACTION)`，其余留给
+                    #   系统与其他程序；总量未知时退回可用内存（保持旧行为不更差）。
+                    available_ram = int(inventory.get("memory_available_bytes", 0))
+                    total_ram = int(inventory.get("memory_total_bytes", 0) or 0)
+                    if total_ram > 0:
+                        allowed = int(total_ram * HOST_RAM_MAX_FRACTION)
+                        base["host_capacity_bytes"] = max(0, min(available_ram, allowed))
+                        base["host_capacity_source"] = "host_ram_total_x_fraction"
+                    else:
+                        base["host_capacity_bytes"] = max(0, available_ram)
+                    logger.info(
+                        "event=host_ram_budget operation=%s node=%s available_gb=%.1f "
+                        "total_gb=%.1f fraction=%.2f host_capacity_gb=%.1f",
+                        op_id, node_id, available_ram / 1024**3, total_ram / 1024**3,
+                        HOST_RAM_MAX_FRACTION, base["host_capacity_bytes"] / 1024**3,
+                    )
                 records.append(base)
             from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
             from model_supply_host_capacity import allowed_host_layer_ranges
@@ -814,8 +1047,8 @@ class ModelSupplyCoordinator:
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
             from model_supply_plan_reuse import plan_segment_supply_reuse
-            def capacity_plan(*, preferred_ranges, constrain_host=True):
-                return plan_segment_supply(sources["descriptors"], records,
+            def capacity_plan(*, preferred_ranges, constrain_host=True, plan_records=None):
+                return plan_segment_supply(sources["descriptors"], plan_records or records,
                     master_engine=sources["master_engine"], alignment=sources["alignment"],
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                     runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
@@ -825,6 +1058,72 @@ class ModelSupplyCoordinator:
                 source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
                 engine_by_node={record["node_id"]:record["engine"] for record in records},
                 alignment=sources["alignment"])
+            # ★ 2026-10-23（#117）：**本机 RAM 是一等承载资源，不是失败兜底**。
+            #   此前只在 resident 规划**失败之后**才尝试 `safetensors_layer_offload`
+            #   （注释原文 "Prefer resident execution when feasible"），而 resident
+            #   几乎总能"成功"，于是本机那 ~32 GB 主机内存全程闲置、层段被整体压给
+            #   远端 —— 实测 master 只拿 `[0,8)`，android 被迫扛 `[8,32)` 共 24 层。
+            #   这里把两种物化**并列求解**，再按"本机承担更多层"选优。
+            # ★ 2026-10-24（#117）：**但 offload 会显著拖慢推理** —— 权重放在主机内存
+            #   时每步前向都要跨 PCIe 搬运，实测 master 以 offload 扛 28 层时每 token
+            #   约 5 秒（master 成了串行瓶颈），而 17-18 点 resident（master 只占 8 层）
+            #   的三机明显更快。所以是否启用由 `CAPACITY_PLANNING_MODE` 决定：
+            #   `balanced` 允许（资源优先），`fastest` 关闭（速度优先）。
+            local_runtime = inventories["master"].get("pytorch_runtime") or {}
+            local_projection = runtime_descriptors.get("master") or {}
+            # 运行时读（节点级 `capacity_planning_mode` 在 config 之后才写入 env）。
+            from config import host_ram_offload_enabled
+            if (host_ram_offload_enabled()
+                    and sources["master_engine"] == "pytorch"
+                    and local_runtime.get("execution_device") == "cuda"
+                    and "safetensors_layer_offload" in local_runtime.get("materializations", [])
+                    and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
+                resident_plan = plan
+                resident_diagnostic = copy.deepcopy(plan.get("capacity_diagnostic"))
+                offload_records = [
+                    {**record, "materialization": "safetensors_layer_offload"}
+                    if record["node_id"] == "master" else record
+                    for record in records
+                ]
+                offload_plan = plan_segment_supply_reuse(
+                    sources["descriptors"], capacity, offload_records,
+                    planner=lambda *, preferred_ranges, constrain_host=True: capacity_plan(
+                        preferred_ranges=preferred_ranges, constrain_host=constrain_host,
+                        plan_records=offload_records),
+                    source_model_id=sources["source_model_id"],
+                    source_model_sha256=sources["source_model_sha256"],
+                    tokenizer_sha256=sources["tokenizer_sha256"],
+                    engine_by_node={record["node_id"]: record["engine"] for record in offload_records},
+                    alignment=sources["alignment"])
+
+                def _local_layers(candidate):
+                    """本机承担的层数；越大越优（本机算力最强）。"""
+                    total = 0
+                    for item in candidate.get("assignments", []) or []:
+                        if item.get("node_id") == "master":
+                            total += max(0, int(item.get("end_layer", 0)) - int(item.get("start_layer", 0)))
+                    return total
+
+                if offload_plan.get("admitted") and (
+                        not plan.get("admitted")
+                        or _local_layers(offload_plan) > _local_layers(resident_plan)):
+                    plan = offload_plan
+                    plan["resident_capacity_diagnostic"] = resident_diagnostic
+                    logger.info(
+                        "本机 RAM 参与承载: materialization=safetensors_layer_offload "
+                        "resident_local_layers=%s offload_local_layers=%s",
+                        _local_layers(resident_plan), _local_layers(offload_plan),
+                    )
+                elif resident_plan.get("admitted"):
+                    plan = resident_plan
+                    if offload_plan is not None:
+                        plan["offload_capacity_diagnostic"] = copy.deepcopy(
+                            offload_plan.get("capacity_diagnostic"))
+                else:
+                    # 两种物化都不可行：保留 offload 的诊断（它把主机内存计入，
+                    # 更接近"真正差多少"的真相）。
+                    plan = offload_plan
+                    plan["resident_capacity_diagnostic"] = resident_diagnostic
             if not plan.get("admitted"):
                 diagnostic = plan["capacity_diagnostic"]
                 # A host range is a staging constraint, not an absent artifact.
@@ -866,12 +1165,18 @@ class ModelSupplyCoordinator:
                 projection = runtime_host_descriptors.get(node_id)
                 if projection is None:
                     continue
-                components = projection["source_component_weight_bytes"]
-                keys = ("embedding", "final_norm", "other") if node_id == "master" else ("embedding", "final_norm", "lm_head", "other")
-                source_bytes = sum(projection["source_layer_weight_bytes"][assignment["start_layer"]:assignment["end_layer"]])
-                source_bytes += sum(int(components.get(key, 0)) for key in keys)
+                from model_supply_runtime_capacity import runtime_range_capacity
+                from qlh_core.planning.load_spec import assignment_load_spec
+                materialization = assignment.get("runtime_materialization", "safetensors_key_filtered")
+                quote = runtime_range_capacity(
+                    projection, assignment["start_layer"], assignment["end_layer"],
+                    has_embedding=assignment["has_embedding"], has_lm_head=assignment["has_lm_head"],
+                    materialization=materialization,
+                )
+                source_bytes = quote["host_source_bytes"]
+                conversion_bytes = quote["host_conversion_bytes"]
                 reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
-                required = math.ceil(source_bytes * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
+                required = math.ceil((source_bytes + conversion_bytes) * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
                 if required > int(inventories[node_id].get("memory_available_bytes", 0)):
                     from model_supply_diagnostics import explain_host_capacity
                     diagnostic = explain_host_capacity(
@@ -883,13 +1188,37 @@ class ModelSupplyCoordinator:
                     )
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
-                assignment.update(host_source_bytes=source_bytes, host_required_bytes=required,
-                                  runtime_target_element_size=projection["runtime_target_element_size"])
+                # Freeze the exact runtime quote as well as the source identity.
+                # Fresh admission must retain target-dtype costs for resident
+                # CUDA too, rather than reverting to source artifact precision.
+                assignment.update(quote, host_source_bytes=source_bytes,
+                                  host_conversion_bytes=conversion_bytes,
+                                  host_required_bytes=required,
+                                  host_capacity_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                  runtime_materialization=materialization,
+                                  runtime_target_element_size=projection["runtime_target_element_size"],
+                                  runtime_target_dtype=projection["runtime_target_dtype"])
+                spec = assignment_load_spec(assignment, artifact_format="safetensors")
+                assignment.update(load_spec=spec.to_dict(), load_spec_digest=spec.digest)
+            reference = sources["descriptors"].get("llama_cpp") or sources["descriptors"][sources["master_engine"]]
+            plan["plan_id"] = _digest({
+                "source": reference.get("source_model_sha256", reference.get("model_sha256")),
+                "assignments": plan["assignments"],
+            })
             break
         with self._condition:
             self._check(op_id)
             self._check_receivers(op_id)
-            self._update(op_id, status="building", plan=plan)
+            assigned = {item["node_id"] for item in plan["assignments"]}
+            candidate_node_ids = sorted(nodes)
+            nodes = {node_id: value for node_id, value in nodes.items() if node_id in assigned}
+            # Inventory candidates are observations. Once placement is published,
+            # only its executors own connection/receipt obligations.
+            for key in list(self._connections):
+                if key[0] == op_id and key[1] not in assigned:
+                    self._connections.pop(key)
+            self._update(op_id, status="building", plan=plan, nodes=nodes,
+                         candidate_node_ids=candidate_node_ids)
         from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
         pending_receipts = []
         for assignment in plan["assignments"]:
@@ -914,12 +1243,14 @@ class ModelSupplyCoordinator:
                 "conversion_proof": sources["conversion_proof"]}
             if free < max(estimated * 2, 64 * 1024**2) and not segment_cache_hint(self.root, identity):
                 raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
+            build_options = ({"cancelled": lambda: self._events[op_id].is_set(), "deadline": deadline}
+                             if assignment["engine"] == "llama_cpp" else {})
             manifest = builder(src, directory, source_model_id=sources["source_model_id"],
                                source_model_sha256=sources["source_model_sha256"],
                                tokenizer_sha256=sources["tokenizer_sha256"],
                                start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
                                total_layers=plan["total_layers"], operation_id=op_id, node_id=node_id,
-                               conversion_proof=sources["conversion_proof"], reuse_root=self.root)
+                               conversion_proof=sources["conversion_proof"], reuse_root=self.root, **build_options)
             self._check(op_id)
             reused_bytes = manifest.pop("_reused_bytes", 0)
             files = manifest.pop("local_files")
@@ -943,9 +1274,18 @@ class ModelSupplyCoordinator:
                     self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
                 continue
             available_sources = inventories[node_id].get("sources") or []
+            # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
+            #   源身份的核心是权重摘要 `source_model_sha256`，tokenizer 摘要是附加
+            #   校验。此前用 `entry.get("tokenizer_sha256", default)` 判等，当 worker
+            #   上报的键**存在但值为 None/""**（实测安卓那份整模 GGUF：
+            #   `read_gguf_tokenizer_sha256` 读不到元数据 ⇒ tokenizer_sha256=None）
+            #   时不会回退到默认值 ⇒ 被判"无匹配本地源" ⇒ 明明握着整模却只能从网络
+            #   以 ~0.67 MB/s 拉 4 层（实测卡 `bytes=0` 超过 10 分钟）。
+            #   现在：源没给出 tokenizer 就不据此否决它。
             matching_source = any(
                 entry.get("source_model_sha256") == sources["source_model_sha256"]
-                and entry.get("tokenizer_sha256", sources["tokenizer_sha256"]) == sources["tokenizer_sha256"]
+                and (not entry.get("tokenizer_sha256")
+                     or entry.get("tokenizer_sha256") == sources["tokenizer_sha256"])
                 for entry in available_sources)
             can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
             requested = intent.get("strategy", "auto")
@@ -956,6 +1296,58 @@ class ModelSupplyCoordinator:
                       "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
                       "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
                       "SUPPLY_NODE_CUTTER_UNAVAILABLE")
+            # ★ 2026-10-24（#124）：**复用显式参与决策**。此前 master 只在
+            #   local_cut / distribute 间二选一，从不告知节点"复用你已有的段"：
+            #   Python worker 好在收到 local_cut 时会先试 `reuse_segment`，而 Kotlin
+            #   worker（android）的 local_cut 路径**没有任何复用检查** ⇒ 每轮白裁约
+            #   3 GB（实测 ~105 s），即使它磁盘上已有身份完全一致的同段缓存
+            #   （已用两轮 marker 逐字段 diff 证明仅 manifest_sha256/operation_id 两个
+            #   收据字段不同，而这两者不在接收端 `sameContentIdentity` 判据内）。
+            #
+            #   接收端的复用能力挂在 distribute 路径上（`ModelSupplyReceiver.receive()`
+            #   在下载前会先按 `sameContentIdentity` 扫已发布段并 hardlink），所以这里
+            #   把命中的节点改判为 distribute ⇒ 零网络传输地复用已有段。
+            #
+            #   只在此处**确认**层段与三项摘要全等时才切换：若复用意外未命中，
+            #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
+            cached_hit = False
+            if strategy == "local_cut" and requested == "auto":
+                try:
+                    control = getattr(self.scheduler, "_task_worker_control", None)
+                    snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
+                    # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
+                    caps = snapshot.get("capabilities") or snapshot
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    caps = {}
+                want_range = list(manifest.get("layer_range") or [])
+                for artifact in caps.get("layer_artifacts") or []:
+                    if (isinstance(artifact, dict)
+                            and list(artifact.get("layer_range") or []) == want_range
+                            and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
+                            and artifact.get("source_model_id") == manifest.get("source_model_id")
+                            and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
+                            and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")):
+                        cached_hit = True
+                        break
+            if cached_hit:
+                strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
+                logger.info(
+                    "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
+                    "reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
+                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12], reason,
+                )
+            elif strategy == "local_cut" and requested == "auto":
+                # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
+                logger.info(
+                    "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
+                    "advertised=%d artifact_shas=%s ranges=%s",
+                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12],
+                    len(caps.get("layer_artifacts") or []),
+                    [str(item.get("artifact_sha256"))[:12]
+                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                    [item.get("layer_range")
+                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                )
             # Do not attempt a new local cut when its staging reserve is already
             # known infeasible; the receiver can still reuse its cached files.
             if (strategy == "local_cut" and requested == "auto" and
@@ -993,10 +1385,12 @@ class ModelSupplyCoordinator:
                 self._leases.pop((op_id, node_id), None)
                 self._update(op_id, nodes=nodes)
         self._check(op_id)
-        self._collect_garbage(op_id)
-        self._check(op_id)
         self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
                      loaded_ready=False, requires_prepare=True)
+        try:
+            self._collect_garbage(op_id)
+        except Exception:
+            logger.exception("event=supply_cache_collection_failed operation=%s", op_id)
 
     def _collect_garbage(self, op_id):
         collector = getattr(self.scheduler._model_supply_worker, "collect_garbage", None)
@@ -1006,6 +1400,8 @@ class ModelSupplyCoordinator:
         # storage and must leave status, progress and cancellation responsive.
         # The receiver holds native owner admission throughout collection.
         with self._condition:
+            if self._preparing:
+                return
             protected = [self.root / op_id]
             preparing = self._preparing
             event = self._events[op_id]
@@ -1060,6 +1456,22 @@ class ModelSupplyCoordinator:
     def prepare_capacity_evidence(self, op_id):
         from model_supply_capacity import prepare_capacity_evidence
         return prepare_capacity_evidence(self, op_id)
+
+    def register_capacity_evidence(self, operation_id: str, evidence) -> None:
+        """★ 2026-10-23（#116）：保留活动证据，使传输进展可以给它续期。"""
+        self._capacity_evidence[operation_id] = evidence
+        if len(self._capacity_evidence) > 32:
+            for stale in list(self._capacity_evidence)[:-32]:
+                self._capacity_evidence.pop(stale, None)
+
+    def touch_capacity_evidence(self, operation_id: str) -> None:
+        """传输有实际进展就续期；停滞超过窗口仍会被准入判为过期。"""
+        evidence = self._capacity_evidence.get(operation_id)
+        if evidence is not None:
+            evidence.touch()
+
+    def discard_capacity_evidence(self, operation_id: str) -> None:
+        self._capacity_evidence.pop(operation_id, None)
 
     def prepared_source(self, op_id) -> dict:
         self._check_master()

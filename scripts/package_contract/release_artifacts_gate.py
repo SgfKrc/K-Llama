@@ -36,7 +36,6 @@ DEFAULT_IMAGE = "qlh-release-gate:bookworm"
 WINDOWS_BUNDLES = (
     ("cpu", "QLH-Edge-Inference", "QLH-Edge-Inference.exe", "product", "application"),
     ("cuda", "QLH-Edge-Inference-CUDA", "QLH-Edge-Inference.exe", "product", "application"),
-    ("launcher", "QLH-Launcher", "QLH-Launcher.exe", "launcher", "launcher"),
 )
 
 
@@ -59,7 +58,7 @@ def validate_contract(contract: dict[str, Any]) -> None:
     version, profile = contract.get("version"), contract.get("profile")
     if contract.get("schema_version") != 1 or not isinstance(version, dict) or not isinstance(profile, dict):
         raise ValueError("release contract requires schema_version=1, version and profile objects")
-    for key in ("product", "launcher"):
+    for key in ("product",):
         if not isinstance(version.get(key), str) or not re.fullmatch(r"\d+(?:\.\d+){1,3}", version[key]):
             raise ValueError(f"invalid version.{key}")
     code = version.get("android_code")
@@ -142,7 +141,7 @@ def check_bundle(report: Report, *, app: Path, contract: dict, platform: str,
     try:
         manifest = read_object(manifest_path)
         expected = dict(version=want, platform=platform, package_kind=kind,
-                        app_id="qlh-launcher" if kind == "launcher" else "qlh-edge-inference")
+                        app_id="qlh-edge-inference")
         if kind == "application":
             expected["variant"] = variant
         if any(manifest.get(k) != v for k, v in expected.items()):
@@ -212,8 +211,7 @@ def _clone_bundle(app: Path, manifest: dict, target: Path) -> Path:
 def gate_windows(dist: Path, contract: dict[str, Any], options: dict | None = None) -> Report:
     report, work = Report("windows"), _work(options, "windows")
     enabled = os.environ.get(LAUNCH_PROBE_ENV, "1") != "0"
-    selected = (options or {}).get("windows_variants", ("cpu", "launcher"))
-    prepared_cpu = None
+    selected = (options or {}).get("windows_variants", ("cpu",))
     for variant, directory, executable, version_key, kind in WINDOWS_BUNDLES:
         if variant not in selected:
             continue
@@ -232,34 +230,6 @@ def gate_windows(dist: Path, contract: dict[str, Any], options: dict | None = No
             continue
         try:
             clone = _clone_bundle(app, manifest, bundle_work / "app")
-            if kind == "launcher":
-                # Exercise the actual standalone Launcher and its dependency imports, no GUI.
-                result = run_command([
-                    str(clone / executable), "verify", "--root", str(clone), "--level", "deep",
-                    "--trusted-keys-dir", str(TRUSTED_KEYS), "--json",
-                ], cwd=clone, env=isolated_environment(bundle_work / "launcher-state"),
-                    log=bundle_work / "launcher-verify.log", timeout=600)
-                verified = _record_command(report, prefix + ".startup", result, ok=True, level="deep")
-                if verified:
-                    report.ok(prefix + ".dependencies", "Launcher executed signed-tree verifier", execution=result)
-                    if prepared_cpu is None:
-                        report.unverified(prefix + ".roles", "no ready CPU application for real Launcher role forwarding")
-                    else:
-                        forwarding = []
-                        default = "client" if contract["profile"]["default_node_role"] == "worker" else "master"
-                        for label, role in (("clean", default), ("confirmed-worker", "client")):
-                            runtime = probe_service([str(clone / executable), "--headless"], app=clone,
-                                target_app=prepared_cpu, work=bundle_work / label, role=role,
-                                confirmed_worker=label == "confirmed-worker",
-                                timeout=(options or {}).get("startup_timeout", 90))
-                            forwarding.append(runtime)
-                        (report.ok if all(r["ready"] for r in forwarding) else report.fail)(
-                            prefix + ".roles", "real Launcher child readiness and observed application roles",
-                            executions=forwarding)
-                else:
-                    report.unverified(prefix + ".dependencies", "Launcher command did not complete")
-                    report.unverified(prefix + ".roles", "Launcher command did not complete")
-                continue
             # Complete bundles can run offline; slim bootstrappers would pip-install an external
             # venv and may hardcode port 8000. Refuse that path until a separately staged runtime exists.
             if (clone / "_internal" / "src" / "api_server.py").is_file() and not (
@@ -277,8 +247,6 @@ def gate_windows(dist: Path, contract: dict[str, Any], options: dict | None = No
                 (report.ok if result["ready"] else report.fail)(
                     prefix + ".role." + label, "owned API ready and observed role=" + role
                     if result["ready"] else result.get("error", "not ready"), runtime=result)
-            if variant == "cpu" and all(r["ready"] for r in results):
-                prepared_cpu = clone
             for check in ("dependencies", "roles", "startup"):
                 (report.ok if all(r["ready"] for r in results) else report.fail)(
                     prefix + "." + check, "signed files + actual startup components and role observations",
@@ -680,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", type=Path)
     parser.add_argument("--work-dir", type=Path, default=ROOT / "build" / "release-artifacts-gate")
     parser.add_argument("--linux-image", default=DEFAULT_IMAGE)
-    parser.add_argument("--windows-variants", default="cpu,launcher", help="cpu,launcher; cuda explicitly opt-in")
+    parser.add_argument("--windows-variants", default="cpu", help="cpu; cuda explicitly opt-in")
     parser.add_argument("--linux-variants", default="cpu", help="cpu; cuda explicitly opt-in")
     parser.add_argument("--require-revision", help="full Git object id; must match authenticated artifact build-info.json")
     parser.add_argument("--startup-timeout", type=float, default=90)
@@ -703,8 +671,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--startup-timeout must be between 1 and 600 seconds")
     windows_variants = [v.strip() for v in args.windows_variants.split(",") if v.strip()]
     if (not windows_variants or len(windows_variants) != len(set(windows_variants))
-            or any(v not in {"cpu", "cuda", "launcher"} for v in windows_variants)):
-        parser.error("--windows-variants must contain unique cpu/cuda/launcher values")
+            or any(v not in {"cpu", "cuda"} for v in windows_variants)):
+        parser.error("--windows-variants must contain unique cpu/cuda values")
     if args.require_revision and not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", args.require_revision):
         parser.error("--require-revision must be a full lowercase Git object id")
     pin = args.android_cert_sha256.replace(":", "").lower()

@@ -1,8 +1,9 @@
-﻿# 发行物门（RELEASE-ARTIFACTS）
+# 发行物门（RELEASE-ARTIFACTS）
 
-> 状态：现行；三平台真实发行验收仍有缺口。
+> 状态：现行；**发行范围为 Android + Windows，Linux 暂停发行（延后）**，这两个平台的真实发行验收仍有缺口。
+> 依据：2026-10-25 裁决「暂时延后 linux，可以注释，linux 暂不发行」；[边缘最小发行包审计清单](边缘最小发行包审计清单-2026-09-26.md)（2026-09-28 修订）「**只发行 Android 与 Windows**。**Linux 发行变体不做**（`.deb` 变体 / 离线 bootstrap / Ubuntu-Debian 原生机证据）」。
 >
-> 更新日期：2026-10-16
+> 更新日期：2026-10-25
 
 本门检查已构建的最终发行物。源码合同、脚本存在、`--help` 返回 0 和进程存活都不能替代实际启动就绪。任何声明平台出现 failed 或 unverified，CLI 都返回非零。
 
@@ -10,12 +11,12 @@
 
 ```powershell
 .venv-test/Scripts/python.exe -B scripts/package_contract/release_artifacts_gate.py `
-  --platforms windows,linux,android --dist dist `
+  --platforms windows,android --dist dist `
   --require-revision <完整待发行Git-SHA> `
   --work-dir build/release-probes --json build/release-artifacts.json
 ```
 
-默认 Windows 范围为 CPU 应用和独立 Launcher，Linux 为 CPU `.deb`。票 15d 的 CUDA 包继续延后，需要时显式传 `--windows-variants cpu,cuda,launcher` 或 `--linux-variants cpu,cuda`。单个平台诊断可只声明对应平台；**整票发行验收**由总门强制三个平台全部具备证据，不能用缩小声明范围通过。
+默认 Windows 范围为 CPU 应用和独立 Launcher。**Linux CPU `.deb` 已随 2026-10-25 裁决暂停发行（延后）**，所以示例与整票发行验收的默认范围只含 `windows,android`；`--platforms linux` 与 `--linux-variants cpu` 仍保留为诊断入口，但不计入整票发行验收。票 15d 的 CUDA 包继续延后，需要时显式传 `--windows-variants cpu,cuda,launcher` 或 `--linux-variants cpu,cuda`。单个平台诊断可只声明对应平台；**整票发行验收**由总门强制当前发行范围（Windows + Android）全部具备证据，不能用缩小声明范围通过。
 
 `QLH_RELEASE_GATE_LAUNCH_PROBE=0` 会关闭实际启动，并把对应面记为 unverified，整体不通过。该开关用于诊断，不产生发行验收。每次探针使用唯一目录保存日志，不覆盖已有记录。
 
@@ -32,6 +33,12 @@ Windows 子进程隐藏启动，用私有 job 管理本次进程树。HTTP liste
 完整包的启动 smoke 覆盖实际 API 启动依赖；它不等价于每个可选推理后端都已执行。瘦身包若外部运行时未预备，会明确 unverified。最终 native 推理仍由产品门实测及对应 profile 的运行检查证明。
 
 ## Linux
+
+> **2026-10-25 裁决：Linux 暂停发行（延后）。** 本节判据、镜像与 runner 实现全部保留，
+> 但**不计入整票发行验收**，总门与两份 workflow 的 linux 项已注释停用。依据见
+> [边缘最小发行包审计清单](边缘最小发行包审计清单-2026-09-26.md) 的 2026-09-28 修订。
+> 恢复发行时取消本裁决，并恢复 `release_acceptance.py` 的 `PLATFORMS`／`MANDATORY`、
+> 两份 workflow 的 linux 矩阵项与 `--report linux=...`。
 
 门选择唯一最终 `.deb`，要求可用的 **Linux Docker daemon** 和事先准备好的镜像。镜像配置位于 `scripts/package_contract/Dockerfile.release-gate`，可在网络可用时预备：
 
@@ -57,7 +64,7 @@ Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.
 
 ## CI 与总门
 
-新增 `.github/workflows/release-build.yml` 作为最终附件的生产入口；它只允许 manual dispatch，输入完整 revision 必须等于该 run 的 `github.sha`。Windows／Linux／Android runner 标签与验收工作流一致，Windows 使用预置外部 packaging venv，Android 使用实验台预置发行 keystore 配置，不生成或替换签名密钥。
+新增 `.github/workflows/release-build.yml` 作为最终附件的生产入口；它只允许 manual dispatch，输入完整 revision 必须等于该 run 的 `github.sha`。Windows／Linux／Android runner 标签与验收工作流一致（2026-10-25 裁决后 Linux 矩阵项已注释停用，见文末），Windows 使用预置外部 packaging venv，Android 使用实验台预置发行 keystore 配置，不生成或替换签名密钥。
 
 实验台需配置以下仓库变量；路径必须指向对应 self-hosted runner 已有资源，密钥字节不放入变量或仓库：
 
@@ -77,9 +84,12 @@ Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.
 
 当前工作流使用 `qlh-release`／`qlh-release-android` labels；仓库未验证这些 runner 已配置。该工作流的源码接线已完成，不能把尚未配置或尚未执行的 job 记作成功。现有 Windows CPU／Launcher 及 Linux 构建入口已接入独立源码快照：构建前生成、签名前复核并原样纳入应用树。来源变化、已有签名树或已有 build-info 都会拒绝重新贴身份。Linux 无 Git 导出目录以 `SOURCE_CHECKOUT_REQUIRED` 失败，需真实主仓及固定子模块；不能用环境变量 revision 代替。旧包不能靠事后填 JSON 冒充已认证构建。
 
-`scripts/package_contract/release_acceptance.py` 要求三个平台完整且真实执行的报告，再校验同 revision 的 [DL／LL 产品证据](产品接力证据门-CI-RELEASE-01.md)。每个必验项、发行合同摘要和各包源码身份均须一致。
+`scripts/package_contract/release_acceptance.py` 要求**当前发行范围**（Windows + Android；2026-10-25 裁决后 Linux 暂停发行）完整且真实执行的报告，再校验同 revision 的 [DL／LL 产品证据](产品接力证据门-CI-RELEASE-01.md)。每个必验项、发行合同摘要和各包源码身份均须一致。
 
 ## 本机复核与历史更正
+
+> 本节为 2026-10-14～10-16 的历史记录，原文保留。其中的**「三平台」口径已在 2026-10-25 裁决后
+> 改为「Android + Windows，Linux 暂停发行（延后）」**（见文末裁决节），本节不再作为当前范围读。
 
 2026-10-14 旧脚本曾把 Linux／Android 报成 PASS。复核发现它只确认了源码检查入口／构建入口存在，未安装最终 `.deb` 或检查实际 release APK，因此这两项 **不构成发行验收**。“三平台只有 Windows 缺一个版本文件”的旧结论撤销。
 
@@ -94,7 +104,24 @@ Gradle `preBuild` 接入真实构建来源生成任务，将 `assets/build-info.
 
 上述首次失败记录保留。后续复核见 `build/ci-release-followup-20261015/final-artifact-result.json`：Linux daemon 已能应答，但仍无最终 `.deb`；Windows 现有 CPU／Launcher 的失败条件未解除；Android 仍无最终 release APK，签名配置缺失。Android 角色／native 探针代码已补齐并在保数据更新的 Y700 debug 包上获得本次 nonce／PID 的真实 JNI 观测，其最终 release 验收仍待可信签名包。没有为通过门替换信任库或复用 debug 签名。
 
-2026-10-15 后续复核已预备 Linux 验收镜像，并在禁网容器确认环境；最终 `.deb` 仍缺失。量化工具已完成真实 Windows GNU／Ninja Release 构建，补丁来源与运行依赖验证通过。最新三平台门仍退出 1，见 `build/ci-release-followup-20261015/final-artifact-retry-result.json`；具体构建修复与测试见 [票 13 续验](ci-release-followup-2026-10-15.md#构建来源与量化工具闭环)。
+2026-10-15 后续复核已预备 Linux 验收镜像，并在禁网容器确认环境；最终 `.deb` 仍缺失。量化工具已完成真实 Windows GNU／Ninja Release 构建，补丁来源与运行依赖验证通过。最新三平台门仍退出 1，见 `build/ci-release-followup-20261015/final-artifact-retry-result.json`；具体构建修复与测试见 [票 13 续验](archive/misc/ci-release-followup-2026-10-15.md#构建来源与量化工具闭环)。
 
 
-2026-10-16 的构建接线、Linux 禁网只读容器和当前发行物门实测见 [运行环境记录](ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)；打包路径修复、观测合同及最终软件组合结果见 [工件身份记录](ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。当前 debug／dirty 设备实跑继续作为开发证据，最终签名三平台执行门保持开放。
+2026-10-16 的构建接线、Linux 禁网只读容器和当前发行物门实测见 [运行环境记录](archive/misc/ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)；打包路径修复、观测合同及最终软件组合结果见 [工件身份记录](archive/misc/ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。当前 debug／dirty 设备实跑继续作为开发证据，最终签名三平台执行门保持开放。
+
+## 2026-10-25 发行范围裁决（Linux 延后）
+
+人类裁决原话：**「暂时延后 linux，可以注释，linux 暂不发行」**。依据为
+[边缘最小发行包审计清单](边缘最小发行包审计清单-2026-09-26.md) 的 2026-09-28 修订：
+**只发行 Android 与 Windows，Linux 发行变体不做**。本次只停用、不删除：
+
+| 位置 | 2026-10-25 处理 |
+| --- | --- |
+| `scripts/package_contract/release_acceptance.py` | `PLATFORMS` 与 `MANDATORY` 的 linux 项注释保留并可原样恢复；错误文本与 `--report` 提示改为按 `PLATFORMS` 动态生成 |
+| `.github/workflows/release-build.yml` | `artifacts` 矩阵的 `platform: linux` 项注释保留；构建 step 与 `build-deb.sh` 入口保留，因矩阵不再含 linux 而不执行 |
+| `.github/workflows/release-acceptance.yml` | `final-artifacts` 矩阵的 `platform: linux` 项与 `--report linux=...` 参数注释保留 |
+| 本文档 | 状态行、入口示例、Linux 节与总门说明改为 Android + Windows 口径；上方历史实测记录按原文保留 |
+
+`scripts/package_contract/release_artifacts_gate.py` 的 `GATES` 保留 `linux` 能力，
+`--platforms linux` 仍可用于单平台诊断，但只声明一个平台不能通过整票发行验收。
+**Linux 暂停发行不改变 Windows／Android 的平台判据，也不关闭它们的真实发行验收缺口。**

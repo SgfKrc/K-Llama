@@ -9,14 +9,14 @@ import pytest
 pytest.importorskip("textual")
 from textual.widgets import Button, DataTable, Input, Static
 import tui_textual as tt
-from tui_api import ApiError
+from tui_api import ApiError, ApiClient
 
 OP = "supply_" + "a" * 32
 NEXT_OP = "supply_" + "b" * 32
 
 
 def operation(status="supplying", model_id="master-big", operation_id=OP):
-    return {"operation_id": operation_id, "intent": {"model_id": model_id}, "status": status,
+    return {"schema_version": 2, "revision": 7, "identity": {"boot_id": "tui-test"}, "observed_at": 100, "validity": "valid", "runnable": status == "ready", "operation_id": operation_id, "intent": {"model_id": model_id}, "status": status,
             "reason_code": "", "reason": "", "config_id": "config-8", "generation": 8,
             "loaded_ready": status == "ready",
             "nodes": {"worker-1": {"status": "receiving", "bytes_received": 13,
@@ -25,6 +25,7 @@ def operation(status="supplying", model_id="master-big", operation_id=OP):
 
 
 class IntentApi:
+    accept_snapshot = ApiClient.accept_snapshot
     base_url = "http://local-worker:8000"
     host = "127.0.0.1"
     port = 8000
@@ -32,6 +33,7 @@ class IntentApi:
     log_token = ""
 
     def __init__(self, current=None):
+        self._snapshot_cache = {}
         self.current = current
         self.calls = []
         self.mode = "distributed"
@@ -128,7 +130,7 @@ def test_main_model_selection_uses_master_intent_and_holds_chat_until_ready(monk
         api = IntentApi()
         app = tt.KoakumaApp(api, interval=30)
         app.routing_preference = "distributed_required"
-        app.execution_mode = "task_graph"
+        app.execution_mode = "auto"
         async with app.run_test(size=(140, 50)) as pilot:
             screen = await enter(app, pilot)
             assert set(screen.model_rows) == {"master-big", "master-small"}
@@ -166,7 +168,7 @@ def test_main_model_selection_uses_master_intent_and_holds_chat_until_ready(monk
             await pilot.press("enter")
             await wait(pilot, lambda: bool(streamed))
             assert streamed[0][1]["routing_preference"] == "distributed_required"
-            assert streamed[0][1]["execution_mode"] == "task_graph"
+            assert streamed[0][1]["execution_mode"] == "auto"
             assert not any(path in {"/models", "/models/load", "/models/current"} or path.endswith("/prepare")
                            for _, path, _ in api.calls)
     asyncio.run(run())
@@ -864,4 +866,45 @@ def test_chat_context_changed_before_worker_dispatch_does_not_send(monkeypatch, 
                                ("POST", "/models/unload", None)] if change == "mode" else [])
             await dispatch(*deferred[0]).wait()
             assert [call for call in api.calls if call[0] != "GET"] == writes
+    asyncio.run(run())
+
+
+def test_disconnected_master_catalog_keeps_healthy_local_backend_feedback():
+    async def run():
+        api = IntentApi()
+        api.binding_error = True
+        app = tt.KoakumaApp(api, interval=30)
+        async with app.run_test(size=(140, 50)) as pilot:
+            app.show_main()
+            await wait(pilot, lambda: isinstance(app.screen, tt.MainScreen)
+                       and app.screen.runtime_ready is True and not app.screen._core_inflight)
+            screen = app.screen
+            assert screen.backend_available is True
+            table = screen.query_one("#models-table", DataTable)
+            assert table.row_count == 1
+            assert "主节点目录不可用" in str(table.get_row_at(0)[1])
+            assert "INTENT_BINDING_MISSING" in str(table.get_row_at(0)[5])
+            assert screen.chat_model_gate() and not screen.model_rows
+    asyncio.run(run())
+
+
+def test_single_master_waiting_for_workers_never_enables_chat(monkeypatch):
+    streamed = []
+    monkeypatch.setattr(tt, "iter_chat_payloads", lambda *a, **k: streamed.append((a, k)) or iter(()))
+    async def run():
+        api = IntentApi(operation("waiting_nodes"))
+        api.catalog["binding"].update(is_master=True, master_host="127.0.0.1")
+        api.current.update(reason_code="SUPPLY_WAITING_NODES", reason="Waiting for distributed workers to finish joining")
+        app = tt.KoakumaApp(api, interval=30)
+        async with app.run_test(size=(140, 50)) as pilot:
+            screen = await enter(app, pilot)
+            assert screen.model_binding["is_master"] is True
+            assert screen.model_intent["runnable"] is False
+            assert "SUPPLY_WAITING_NODES" in screen.chat_model_gate()
+            assert "主节点失连" not in screen.chat_model_gate()
+            box = screen.query_one("#chat-input", Input)
+            box.focus()
+            box.value = "wait for a real distributed worker"
+            await pilot.press("enter")
+            assert not streamed and box.value == "wait for a real distributed worker"
     asyncio.run(run())

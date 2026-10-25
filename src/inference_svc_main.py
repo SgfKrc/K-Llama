@@ -28,12 +28,17 @@ _LOG_FILE = Path(__file__).resolve().parent.parent / "logs" / "inference_svc_sta
 def _setup_logging() -> None:
     """控制台 + 启动日志文件双写。"""
     _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # ★ 2026-10-24（#125）：此前是**无轮转**的 FileHandler，每次启动只追加、永不清理
+    #   ⇒ `logs/inference_svc_startup.log` 无界增长（本次排查到 20 GB 级日志堆积的一部分）。
+    from logging.handlers import RotatingFileHandler
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(_LOG_FILE, encoding="utf-8"),
+            RotatingFileHandler(
+                _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            ),
         ],
     )
 

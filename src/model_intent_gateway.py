@@ -76,7 +76,7 @@ def _view(status, is_master, code="", reason="", **fields) -> dict:
 def _role_binding(scheduler, api_port) -> dict | None:
     try:
         role = scheduler._effective_role()
-        facade = getattr(scheduler, "_scheduler_facade_global", None)
+        facade = getattr(scheduler, "_runtime_setting", None)
         if callable(facade):
             run_mode = facade("RUN_MODE")
         else:
@@ -259,6 +259,8 @@ async def forward_intent(scheduler, request: Request, suffix: str, body=None):
     _require_worker(binding, connection)
     url = build_url("http", binding["master_host"], binding["master_api_port"], path)
     headers = {name: request.headers[name] for name in _REQUEST_HEADERS if name in request.headers}
+    if "idempotency-key" in request.headers:
+        headers["Idempotency-Key"] = request.headers["idempotency-key"]
     headers[HOP_HEADER] = "1"
     # Bound the wire body without accepting compression bombs from the peer.
     headers["Accept-Encoding"] = "identity"

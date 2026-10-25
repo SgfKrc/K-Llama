@@ -9,6 +9,7 @@ __pycache__/
 .venv-llama-rpc/
 venv/
 env/
+.venv-r6-product/
 
 # Node
 node_modules/
@@ -39,6 +40,7 @@ local_docs/evidence/torch-hetero-plan/*
 !local_docs/audits/
 local_docs/audits/*
 !local_docs/audits/2026-09-26-r-rx-rr3-commit-review.md
+video-remotion/
 
 # OS
 .DS_Store
@@ -200,6 +202,9 @@ scripts/*
 !scripts/edge_preflight.py
 !scripts/experiment_core/
 !scripts/experiment_gemma_judge_real.py
+!scripts/llama_kernel_bench.py
+!scripts/llama_isa_bench.py
+!scripts/placement_study.py
 !scripts/llama_pc_rpc.py
 !scripts/llama_relay_probe.py
 !scripts/llama_relay_xframe_probe.py
@@ -219,6 +224,8 @@ scripts/*
 !scripts/init-submodules.bat
 !scripts/init-submodules.sh
 !scripts/run_test_channels.py
+!scripts/check_refactor_boundaries.py
+!scripts/run_refactor_contracts.py
 !scripts/run_simulation.py
 !scripts/startup_matrix.py
 !scripts/test_classification_report.py
@@ -230,6 +237,7 @@ scripts/*
 !scripts/inspect_repo_state.py
 !scripts/export_model_catalog.py
 !scripts/qlh_log.py
+!scripts/compact_control_db.py
 !scripts/cluster_node_preflight.py
 !scripts/ipv6_dual_stack_gate.py
 !scripts/check_doc_links.py
@@ -292,3 +300,24 @@ dsh-migration-backup-*/
 !scripts/experiment_gemma_quality_unit.py
 !scripts/experiment_quality_production_gate.py
 !scripts/llama_dependency_contract.py
+
+# R2 reviewed catalog migration entrypoint.
+!scripts/migrate_model_catalog.py
+
+# DEVICE-AWARE-INFER-01 reproducible local A/B calibration
+!scripts/inference_switch_bench.py
+
+# COMM-WIRE-01 reproducible frame costs and native numerical gate
+!scripts/comm_wire_bench.py
+
+# COMM-MULTIPOS-01 fixed-token native parity gate
+!scripts/comm_multipos_bench.py
+
+# COMM-BATCH-01: autoregressive generation and rejection recovery evidence
+!scripts/comm_batch_bench.py
+
+# COMM-MERGE-01 reproducible provider/worker causal timing gate
+!scripts/comm_merge_bench.py
+
+# LLAMA-COMM-BORROW-01 local I/O and compute interference evidence
+!scripts/comm_borrow_bench.py

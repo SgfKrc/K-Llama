@@ -56,6 +56,11 @@ def ack(master, node, phase, **changes):
     value = deepcopy(master._pipeline_load_transaction["expected"][node]["worker_prepare_identity"])
     payload = {"action": "ack", "phase": phase, "identity": value,
                "status": "prepared" if phase == "prepare" else "ready", "loaded": True}
+    expected = master._pipeline_load_transaction["expected"][node]
+    if "load_spec_digest" in value:
+        payload["runtime_receipt"] = {"load_spec": deepcopy(expected["load_spec"]), "materialized_bytes": 1,
+            "memory_scope": "weight_tensors", "layer_range": deepcopy(value["layer_range"]),
+            "artifact_sha256": value["artifact_sha256"]}
     payload.update(changes)
     master._handle_worker_prepare_ack(node, payload)
     return payload
@@ -201,7 +206,9 @@ def test_retirement_cleanup_survives_master_restart(stage_case, monkeypatch):
     restored._load_pipeline_recovery_state()
     records = list(restored._pipeline_model_cleanup_ledger.values())
     assert {record["action"] for record in records} == {"finalize", "release"}
-    assert all(record["payload"]["worker_prepare_identity"] for record in records)
+    assert all(record["payload"]["worker_prepare_identity"] for record in records if record["node_id"] != "master")
+    local, = [record for record in records if record["node_id"] == "master"]
+    assert restored._dispatch_pipeline_model_cleanup(local) is False
     assert restored._pipeline_recovery_failure != "pipeline_recovery_state_invalid"
 
 
@@ -235,6 +242,7 @@ def test_recovery_ledger_updates_preserve_model_identity_across_restarts(stage_c
     restored = case.new_master(case.host).master
     restored._running = True
     restored._load_pipeline_recovery_state()
+    persisted.append(restored._model_control.snapshot()["lifecycle"])
     assert persisted
     assert persisted[-1]["model_id"] == snapshot["model_id"]
     assert persisted[-1]["model_sha256"] == snapshot["model_sha256"]
@@ -245,7 +253,7 @@ def test_recovery_ledger_updates_preserve_model_identity_across_restarts(stage_c
             "cleanup_id": record["cleanup_id"], "status": "released", "loaded": False,
         })
     assert restored._pipeline_model_cleanup_ledger == {}
-    latest = persisted[-1]
+    latest = restored._model_control.snapshot()["lifecycle"]
     assert latest["cleanup_ledger"] == []
     assert latest["config_id"] == snapshot["config_id"]
     assert latest["assignments"] == snapshot["assignments"]
@@ -285,15 +293,17 @@ def test_source_host_budget_constrains_gpu_plan_and_intersects_reuse_preferences
               "runtime_multiplier": 1, "score": score}
              for node, engine, score in (("master", "pytorch", 100), ("worker", "llama_cpp", 50), ("android", "llama_cpp", 10))]
     host_ranges = {"master": [[0, 2]], "worker": [[2, 4], [2, 6]]}
+    # This range-intersection fixture intentionally prefers all three nodes;
+    # the product placement default may choose fewer executors.
     plan = plan_segment_supply({"pytorch": descriptor, "llama_cpp": descriptor}, nodes,
         master_engine="pytorch", alignment=2, runtime_host_ranges=host_ranges,
-        preferred_ranges={"worker": [[2, 4]]})
+        preferred_ranges={"worker": [[2, 4]]}, prefer_all_workers=True)
     assert plan["admitted"] is True
     assert [(a["node_id"], a["start_layer"], a["end_layer"]) for a in plan["assignments"]] == [
         ("master", 0, 2), ("worker", 2, 4), ("android", 4, 8)]
     rejected = plan_segment_supply({"pytorch": descriptor, "llama_cpp": descriptor}, nodes,
         master_engine="pytorch", alignment=2, runtime_host_ranges=host_ranges,
-        preferred_ranges={"worker": [[4, 6]]})
+        preferred_ranges={"worker": [[4, 6]]}, prefer_all_workers=True)
     assert all(a["node_id"] != "worker" for a in rejected.get("assignments", []))
     assert nodes[0].get("layer_ranges") is None
     assert host_ranges == {"master": [[0, 2]], "worker": [[2, 4], [2, 6]]}

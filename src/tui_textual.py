@@ -119,7 +119,6 @@ from tui_api import (  # noqa: E402
     pause_queue,
     rename_session,
     resume_queue,
-    set_queue_strategy,
     unload_model,
     auth_capability,
     auth_login,
@@ -157,6 +156,15 @@ SUBTITLE_CHARS_PER_TICK = 3
 # slow cluster projection into a false "unreachable" state after five seconds.
 PAGE_READ_TIMEOUT = 15.0
 
+# ★ 2026-10-23（`docs/已知问题记录.md` #113-④）：``/api/models/intent/catalog`` 是
+#   唯一会触发主节点 GGUF 解析的重接口（冷启动 1.9–4.2 s，缓存未命中历史值
+#   12.8–13.8 s），而 ``PAGE_READ_TIMEOUT`` 只有 15 s。它不能再跟着 5 秒核心刷新
+#   走：一旦超时，服务端任务仍在跑而 TUI 已经重发 ⇒ 请求堆积、抢 GIL，把单请求
+#   从小几秒拖回 12 s（正反馈）。现在 catalog 只在「首次刷新 / 显式刷新（``r``、
+#   模型写操作收尾）/ 进入「模型」屏且数据已陈旧 / 距上次满 ``CATALOG_REFRESH_SECONDS``
+#   秒的兜底」时拉取，其余轮次复用上一次结果，语义与字段不变。
+CATALOG_REFRESH_SECONDS = 60.0
+
 #: 侧栏导航页表：(key, 页名, 一句话说明)
 PAGES: List[Tuple[str, str, str]] = [
     ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
@@ -164,7 +172,7 @@ PAGES: List[Tuple[str, str, str]] = [
     ("models", "模型", "选模 · L 自动供给并准备 · U 卸载 · C 取消选模"),
     ("cluster", "分布式", "配置 · 容量 · 层段 · /cluster/*"),
     ("nodes", "节点", "成员 · 入群 · 邀请 · 连接 · /cluster/nodes"),
-    ("queue", "队列", "MLFQ 三级 · P 暂停/恢复 · S 策略 · C 清空排队"),
+    ("queue", "队列", "FIFO · P 暂停/恢复 · C 清空排队"),
     ("logs", "日志", "筛选 · 统计 · 导出 · /logs/*"),
     ("device", "设备", "画像 · 自动配置 · GPU · /device/*"),
     ("settings", "设置", "会话参数与依赖边界"),
@@ -535,19 +543,6 @@ class ChatPane(Vertical):
             else:
                 self.query_one("#chat-status", Static).update(
                     "[red]用法: /route auto|local|distributed|required")
-            return
-        if text.startswith("/mode "):
-            # ★ 2026-10-07（#29 发起侧缺口）：请求级执行模式。
-            #   `auto` = 沿用后端推断（含 N2.1 显式字段推断）；`task_graph` = 显式任务图。
-            value = text.split(" ", 1)[1].strip().lower()
-            mapping = {"auto": "auto", "task_graph": "task_graph", "graph": "task_graph"}
-            if value in mapping:
-                self.app.execution_mode = mapping[value]
-                self.query_one("#chat-status", Static).update(
-                    f"执行模式 → {mapping[value]}")
-            else:
-                self.query_one("#chat-status", Static).update(
-                    "[red]用法: /mode auto|task_graph")
             return
         if text.startswith("/thinking "):
             value = text.split(" ", 1)[1].strip().lower()
@@ -1074,14 +1069,10 @@ class ChatPane(Vertical):
 
     def cmd_queue(self, text: str) -> None:
         parts = text.split()
-        usage = ("用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+        usage = ("用法: /queue pause | resume | clear"
                  " | cancel <task_id>")
         if len(parts) == 2 and parts[1].lower() in {"pause", "resume"}:
             self.queue_call(parts[1].lower())
-            return
-        if len(parts) == 3 and parts[1].lower() == "strategy" \
-                and parts[2].lower() in {"fifo", "mlfq"}:
-            self.queue_call("strategy", parts[2].lower())
             return
         if len(parts) == 3 and parts[1].lower() == "cancel":
             self.queue_call("cancel", parts[2])
@@ -1104,8 +1095,6 @@ class ChatPane(Vertical):
                 pause_queue(app.api)
             elif action == "resume":
                 resume_queue(app.api)
-            elif action == "strategy":
-                set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
             elif action == "cancel":
@@ -1344,7 +1333,6 @@ class MainScreen(Screen):
         Binding("i", "model_register", "登记模型"),
         Binding("v", "model_search", "搜索模型"),
         Binding("p", "queue_toggle_pause", "暂停/恢复"),
-        Binding("s", "queue_cycle_strategy", "调度策略"),
         Binding("c", "queue_clear", "清空排队"),
         Binding("t", "cluster_toggle", "分布式开关"),
         Binding("m", "cluster_max_nodes", "最大节点"),
@@ -1423,6 +1411,12 @@ class MainScreen(Screen):
         self.runtime_ready: Optional[bool] = None
         self._core_inflight = False
         self._core_refresh_pending = False
+        #: 分布式 catalog 的按需刷新状态（#113-④）：最后一次拉取时刻（单调时钟，
+        #: ``None`` = 从未拉过）与结果缓存。核心刷新只在到点时拉它。
+        self._catalog_fetched_at: Optional[float] = None
+        self._catalog_cache: Dict[str, Any] = {}
+        #: 缓存所属的后端（换端点即作废，不能让旧主节点的注册表留在屏上）。
+        self._catalog_endpoint: Optional[Tuple[str, int]] = None
         self._initial_page_data_started = False
         self._pages_inflight = False
         self._device_inflight = False
@@ -1475,7 +1469,7 @@ class MainScreen(Screen):
                     yield Static("选择节点后可执行邀请、连接和注销。", id="nodes-pane")
                     yield DataTable(id="nodes-table")
                 with Vertical(id="page-queue", classes="page"):
-                    yield Static("队列 · MLFQ 三级调度", classes="page-title")
+                    yield Static("队列 · 有界 FIFO", classes="page-title")
                     yield Static(PAGES[5][2], classes="page-hint")
                     yield Static("加载中…", id="queue-pane")
                     yield DataTable(id="queue-table")
@@ -1569,7 +1563,8 @@ class MainScreen(Screen):
             + kv("port", api.port) + "\n"
             + kv("完整地址", api.base_url) + "\n"
             + kv("请求超时", f"{api.timeout:.0f} 秒") + "\n"
-            + kv("自动刷新", f"{self.app.interval:.0f} 秒（核心状态/模型注册表/资源）") + "\n"
+            + kv("自动刷新", f"{self.app.interval:.0f} 秒（核心状态/资源；分布式模型注册表"
+                            f"按需拉取，最多 {CATALOG_REFRESH_SECONDS:.0f} 秒一次）") + "\n"
             + kv("日志 Token", "已设置" if api.log_token else "未设置（聚合日志可能需要 --log-token）") + "\n"
             + kv("路由偏好", self.app.routing_preference) + "\n"
             + kv("thinking", "on" if self.app.show_thinking else "off") + "\n"
@@ -1587,7 +1582,7 @@ class MainScreen(Screen):
             "节点", "角色 / 状态", "CPU 物理/逻辑", "内存 总/可用", "GPU 数/CUDA", "显存 总/可用")
         self.query_one("#nodes-table", DataTable).add_columns(
             "节点", "角色", "类型", "状态", "地址", "RTT")
-        self.query_one("#queue-table", DataTable).add_columns("队列", "深度", "上限(tokens)", "任务")
+        self.query_one("#queue-table", DataTable).add_columns("位置", "请求", "执行资源", "终局")
         self.query_one("#gpu-table", DataTable).add_columns(
             "", "名称", "类型", "CUDA", "显存GB", "驱动")
         self.query_one("#api-table", DataTable).add_columns(
@@ -1635,7 +1630,13 @@ class MainScreen(Screen):
         self.action_reload(refresh_page=True)
 
     @work(thread=True, exclusive=True, group="main")
-    def action_reload(self, refresh_page: bool = False) -> None:
+    def action_reload(self, refresh_page: bool = False, refresh_catalog: bool = False) -> None:
+        """核心状态刷新。
+
+        ``refresh_catalog``（#113-④）只影响分布式模式：为 ``True`` 时本轮**强制**
+        重新拉 ``/models/intent/catalog``（显式刷新、模型写操作收尾），否则该重接口
+        按 ``CATALOG_REFRESH_SECONDS`` 节流，未到点复用上一次结果。
+        """
         with self._refresh_state_lock:
             if self._core_inflight:
                 self._core_refresh_pending = True
@@ -1683,7 +1684,8 @@ class MainScreen(Screen):
                     mode = status["run_mode"]
             intent = None
             if mode == "distributed":
-                registry = self.fetch_json(API_PATHS["models_intent_catalog"], timeout=PAGE_READ_TIMEOUT, api=api)
+                # #113-④：catalog 不再每 5 秒拉一次（见 distributed_catalog）。
+                registry = self.distributed_catalog(api, force=refresh_page or refresh_catalog)
                 # Current belongs to the master and can be replaced by another device,
                 # including after our previously observed operation became terminal.
                 intent = self.fetch_json(API_PATHS["models_intent_current"], timeout=PAGE_READ_TIMEOUT, api=api)
@@ -1701,7 +1703,44 @@ class MainScreen(Screen):
                 pending = self._core_refresh_pending
                 self._core_refresh_pending = False
             if pending and self.is_attached:
-                self.app.call_from_thread(self.action_reload, refresh_page)
+                self.app.call_from_thread(self.action_reload, refresh_page, refresh_catalog)
+
+    def distributed_catalog(self, api: Any, *, force: bool) -> Dict[str, Any]:
+        """分布式注册表：按需拉 ``/models/intent/catalog``，未到点复用上一次结果。
+
+        ``#113-④``：这个接口是唯一会触发主节点 GGUF 解析的重接口，而核心刷新只有
+        5 秒、``PAGE_READ_TIMEOUT`` 15 秒——超时后服务端任务仍在跑而 TUI 已重发，
+        并发堆积抢 GIL，会把单请求从小几秒拖回 12 秒。因此它被移出周期性刷新：
+
+        * ``force=True``：显式刷新（``r``）或模型写操作收尾，立刻拉；
+        * 其它轮次：距上次拉取不足 ``CATALOG_REFRESH_SECONDS`` 秒就用缓存。
+
+        成功与失败（含 15 秒超时）**都**记时，否则失败路径仍会 5 秒重发一次，
+        并发堆积照旧。返回的仍是联机拉到的同一份 dict（语义与字段不变）。
+        """
+        now = time.monotonic()
+        endpoint = (str(getattr(api, "base_url", "")), id(api))
+        if endpoint != self._catalog_endpoint:
+            force = True  # 首次或换了后端（换端点）：缓存作废，必须重新拉
+        if (not force and self._catalog_fetched_at is not None
+                and now - self._catalog_fetched_at < CATALOG_REFRESH_SECONDS):
+            return self._catalog_cache or {
+                "_error": "模型注册表尚未刷新，请按 r 或进入「模型」屏",
+                "_code": "INTENT_CATALOG_DEFERRED"}
+        registry = self.fetch_json(API_PATHS["models_intent_catalog"],
+                                   timeout=PAGE_READ_TIMEOUT, api=api)
+        self._catalog_fetched_at = now
+        self._catalog_cache = registry
+        self._catalog_endpoint = endpoint
+        return registry
+
+    def request_catalog_refresh(self) -> None:
+        """进入「模型」屏时的按需补拉（#113-④）：数据仍新鲜就不重复打主节点。"""
+        if self._catalog_fetched_at is None:
+            return  # 首轮核心刷新正在拉
+        if time.monotonic() - self._catalog_fetched_at < CATALOG_REFRESH_SECONDS:
+            return
+        self.action_reload(refresh_catalog=True)
 
     def fetch_json(self, path: str, *, timeout: Optional[float] = None,
                    api: Any = None) -> Dict[str, Any]:
@@ -1786,6 +1825,9 @@ class MainScreen(Screen):
         elif key == "models":
             if force or not self.model_aux:
                 self.load_model_aux()
+            if self.model_mode == "distributed":
+                # #113-④：注册表只在进入该屏（且已陈旧）时补拉，不再跟着核心刷新。
+                self.request_catalog_refresh()
         elif key == "cluster":
             if force or not self.cluster_aux:
                 self.load_cluster_aux()
@@ -1937,7 +1979,8 @@ class MainScreen(Screen):
             table.clear()
             self.model_rows = {}
             if "_error" in registry:
-                table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
+                label = "主节点目录不可用" if self.model_mode == "distributed" else "模型目录不可用"
+                table.add_row("", f"[red]{label}[/]", "", "", "", registry["_error"])
                 return
             rows = registry.get("models")
             if not isinstance(rows, list) or not rows:
@@ -2259,26 +2302,30 @@ class MainScreen(Screen):
             table.add_row("[dim]（无在线节点）[/]", str(resources.get("scope") or "—"),
                           "", "", "", "")
             return
+        totals = resources.get("totals") or {}
+        physical_total = totals.get("physical_cores")
+        physical_total = physical_total if physical_total is not None else "—"
         for node in nodes[:64]:
             cpu = node.get("cpu") or {}
             ram = node.get("ram") or {}
             gpu = node.get("gpu") or {}
+            physical_cores = cpu.get("physical_cores")
             table.add_row(
                 str(node.get("node_id") or "—"),
                 f"{node.get('role') or '—'} / "
                 f"{'[green]在线[/]' if node.get('available') else '[yellow]离线[/]'}",
-                f"{cpu.get('physical_cores', '—')} / {cpu.get('logical_cores', '—')}",
+                f"{physical_cores if physical_cores is not None else '—'} / "
+                f"{cpu.get('logical_cores', '—')}",
                 f"{ram.get('total_gb', '—')} / {ram.get('available_gb', '—')} GB",
                 f"{gpu.get('count', '—')} / {gpu.get('cuda_count', '—')}",
                 f"{gpu.get('vram_total_gb', '—')} / {gpu.get('vram_free_gb', '—')} GB",
             )
-        totals = resources.get("totals") or {}
         if totals:
             table.add_row(
                 "[b]合计[/]",
                 f"{resources.get('available_node_count', '—')}/"
                 f"{resources.get('node_count', '—')} 可用",
-                f"{totals.get('physical_cores', '—')} / {totals.get('logical_cores', '—')}",
+                f"{physical_total} / {totals.get('logical_cores', '—')}",
                 f"{totals.get('ram_total_gb', '—')} / {totals.get('ram_available_gb', '—')} GB",
                 f"{totals.get('gpu_count', '—')} / {totals.get('cuda_gpu_count', '—')}",
                 f"{totals.get('vram_total_gb', '—')} / {totals.get('vram_free_gb', '—')} GB",
@@ -2708,47 +2755,20 @@ class MainScreen(Screen):
         )
 
     def fill_queue(self, queue: Dict[str, Any]) -> None:
-        """``/cluster/queue`` → MLFQ：``q0/q1/q2`` + ``*_depth`` + ``completed_count``。
-
-        此前按 ``tasks`` 解析——真实返回里没有该键（是三级队列），故只能显示"队列空闲"。
-        """
         pane = self.query_one("#queue-pane", Static)
         table = self.query_one("#queue-table", DataTable)
         table.clear()
         self.queue_state = queue if "_error" not in queue else {}
         if "_error" in queue:
-            pane.update(f"[red]队列不可用[/]  ·  {queue['_error']}")
+            pane.update(f"[red]队列不可用[/] · {queue['_error']}")
             return
-        if queue.get("paused"):
-            state = "[yellow]已暂停[/]"
-        elif queue.get("running"):
-            state = "[green]运行中[/]"
-        else:
-            state = "[yellow]未运行[/]"
-        pane.update(
-            f"{state}  ·  策略 {queue.get('strategy') or '—'}"
-            f"  ·  队列 {queue.get('queue_size', '—')}/{queue.get('max_size', '—')}"
-            f"  ·  已完成 {queue.get('completed_count', '—')}"
-            f"  ·  当前任务 {queue.get('current_task') or '无'}")
-        aging = queue.get("aging_params") or {}
-        limits = {"q0": aging.get("q0_max_tokens", 128),
-                  "q1": aging.get("q1_max_tokens", 512),
-                  "q2": None}
-        for level in ("q0", "q1", "q2"):
-            tasks = queue.get(level) or []
-            depth = queue.get(f"{level}_depth", len(tasks))
-            preview = ", ".join(
-                str(task.get("task_id") or task.get("id") or "task")
-                for task in tasks[:3] if isinstance(task, dict)
-            ) or "[dim]空[/]"
-            if len(tasks) > 3:
-                preview += f" … +{len(tasks) - 3}"
-            table.add_row(
-                f"[b]{level.upper()}[/]",
-                str(depth),
-                str(limits[level]) if limits[level] else "不限",
-                preview,
-            )
+        state = "已暂停接收" if queue.get("paused") else "接受请求"
+        pane.update(f"{state} · FIFO · {queue.get('queue_size', 0)}/{queue.get('capacity', '—')} · revision {queue.get('revision', '—')}")
+        active = queue.get("active")
+        if active:
+            table.add_row("执行中", str(active.get("request_id", "")), str(active.get("execution_state", "unknown")), str(active.get("terminal") or "进行中"))
+        for item in queue.get("tasks", []):
+            table.add_row(str(item.get("position", "—")), str(item.get("request_id", "")), f"等待 {item.get('wait_seconds', 0):.1f}s", str(item.get("outcome") or "排队中"))
 
     def fill_logs(self, logs: Dict[str, Any]) -> None:
         view = self.query_one("#logs-log", RichLog)
@@ -3251,7 +3271,8 @@ class MainScreen(Screen):
         self.render_model_intent()
         self.query_one("#chat-pane", ChatPane).write_line(text)
         self.write_status(text)
-        self.action_reload()
+        # 写操作收尾必须立刻看到最新注册表/绑定，故本轮强制拉一次（#113-④）。
+        self.action_reload(refresh_catalog=True)
 
     def apply_model_intent(self, value: Dict[str, Any], *, authoritative_current: bool = False) -> None:
         # Core current reads have already passed the epoch and endpoint checks.
@@ -3404,26 +3425,6 @@ class MainScreen(Screen):
             return
         self.run_queue_action("resume" if self.queue_state.get("paused") else "pause")
 
-    def action_queue_cycle_strategy(self) -> None:
-        """队列屏 S：mlfq ↔ fifo（影响新请求的排队行为，故先确认）。"""
-        if PAGES[self.page_index][0] == "logs":
-            self.action_logs_stats()
-            return
-        if PAGES[self.page_index][0] != "queue":
-            self.write_status("[yellow]请先切到「队列」屏[/]")
-            return
-        if not self.queue_state:
-            self.write_status("[yellow]队列数据不可用，无法操作[/]")
-            return
-        current = str(self.queue_state.get("strategy") or "mlfq").lower()
-        target = "fifo" if current == "mlfq" else "mlfq"
-        self.app.confirm(
-            "切换调度策略",
-            f"当前 [b]{current}[/] → [b]{target}[/]\n"
-            "影响：新入队请求的优先级与老化（aging）行为；执行中的任务不受影响。",
-            lambda: self.run_queue_action("strategy", target),
-            confirm_label="切换",
-        )
 
     def action_queue_clear(self) -> None:
         """队列屏 C：清空排队任务（列出将清空的内容后再确认）。"""
@@ -3441,7 +3442,7 @@ class MainScreen(Screen):
             return
         pending = self.queue_state.get("queue_size", "—")
         listing = []
-        for level in ("q0", "q1", "q2"):
+        for level in ("tasks",):
             tasks = self.queue_state.get(level) or []
             if not tasks:
                 continue
@@ -3452,7 +3453,7 @@ class MainScreen(Screen):
         self.app.confirm(
             "清空排队任务",
             f"将清空**排队中**的任务（queue_size={pending}），执行中的任务**不受影响**：\n"
-            + ("\n".join(listing) if listing else "  （三级队列当前为空）")
+            + ("\n".join(listing) if listing else "  （FIFO 当前为空）")
             + "\n此操作不可撤销。",
             lambda: self.run_queue_action("clear"),
             confirm_label="清空",
@@ -3467,8 +3468,6 @@ class MainScreen(Screen):
                 pause_queue(app.api)
             elif action == "resume":
                 resume_queue(app.api)
-            elif action == "strategy":
-                set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
             elif action == "cancel":
@@ -3791,9 +3790,13 @@ def run(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, interval: float =
     而启动器正是这样调它的。
     """
     api = ApiClient(host=host, port=port, log_token=log_token)
-    KoakumaApp(api, interval=interval, routing_preference=routing_preference,
-               show_thinking=show_thinking, enable_thinking=enable_thinking,
-               supervisor=supervisor).run()
+    try:
+        KoakumaApp(api, interval=interval, routing_preference=routing_preference,
+                   show_thinking=show_thinking, enable_thinking=enable_thinking,
+                   supervisor=supervisor).run()
+    finally:
+        if supervisor is not None:
+            supervisor.stop()
     return 0
 
 

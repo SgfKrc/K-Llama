@@ -1,0 +1,1017 @@
+{
+  "schema_version": 2,
+  "baseline_revision": "fb870d1d4ef2d1d2901db1c5e299ac387fc9597b",
+  "ignored_presentation_keys": [
+    "description",
+    "example",
+    "examples",
+    "operationId",
+    "summary",
+    "tags",
+    "title"
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ready": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chat": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chat/stream": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/chat/generations/{generation_id}/cancel": {
+      "post": {
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/intent/catalog": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/intent/current": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/intent": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelSupplyIntent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/intent/{operation_id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/inference-mode": {
+      "put": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InferenceModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/current": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/load": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoadModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/switch": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitchModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/prepare-pipeline": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreparePipelineModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/pipeline-capacity": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CreateSessionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/client/events": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/client/state": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/requests": {
+      "get": {
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "schemas": {
+    "ChatRequest": {
+      "properties": {
+        "client_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_.:-]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "image_data_urls": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "maxItems": 4
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_new_tokens": {
+          "type": "integer",
+          "maximum": 4096.0,
+          "minimum": 1.0,
+          "default": 1024
+        },
+        "temperature": {
+          "type": "number",
+          "maximum": 2.0,
+          "minimum": 0.0,
+          "default": 0.7
+        },
+        "top_p": {
+          "type": "number",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "default": 0.9
+        },
+        "show_thinking": {
+          "type": "boolean",
+          "default": false
+        },
+        "enable_thinking": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "streaming_mode": {
+          "type": "string",
+          "default": "full"
+        },
+        "routing_preference": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "local_only",
+            "distributed_preferred",
+            "distributed_required"
+          ],
+          "default": "auto"
+        },
+        "client_node_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_node_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_app_variant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution_mode": {
+          "type": "string",
+          "const": "auto",
+          "default": "auto"
+        },
+        "generation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allow_external": {
+          "type": "boolean",
+          "default": false
+        },
+        "prefer_external": {
+          "type": "boolean",
+          "default": false
+        },
+        "speculative_gamma": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "maximum": 8.0,
+              "minimum": 1.0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object",
+      "required": [
+        "message"
+      ]
+    },
+    "ChatResponse": {
+      "properties": {
+        "role": {
+          "type": "string",
+          "default": "assistant"
+        },
+        "content": {
+          "type": "string"
+        },
+        "thinking_content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metrics": {
+          "additionalProperties": true,
+          "type": "object",
+          "default": {}
+        },
+        "followups": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "default": []
+        }
+      },
+      "type": "object",
+      "required": [
+        "content"
+      ]
+    },
+    "CreateSessionRequest": {
+      "properties": {
+        "title": {
+          "type": "string",
+          "default": "新对话"
+        },
+        "first_message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "HTTPValidationError": {
+      "properties": {
+        "detail": {
+          "items": {
+            "$ref": "#/components/schemas/ValidationError"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "InferenceModeRequest": {
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "distributed",
+            "local"
+          ]
+        }
+      },
+      "type": "object",
+      "required": [
+        "mode"
+      ]
+    },
+    "LoadModelRequest": {
+      "properties": {
+        "engine": {
+          "type": "string",
+          "default": "llama_cpp"
+        },
+        "quant_type": {
+          "type": "string",
+          "default": "int4"
+        },
+        "use_compile": {
+          "type": "boolean",
+          "default": false
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ModelSupplyIntent": {
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$"
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "llama_cpp",
+            "pytorch"
+          ],
+          "default": "auto"
+        },
+        "quant_type": {
+          "type": "string",
+          "maxLength": 32,
+          "default": ""
+        },
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "distribute",
+            "local_cut"
+          ],
+          "default": "auto"
+        },
+        "node_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "maxItems": 32
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "maximum": 86400.0,
+          "minimum": 30.0,
+          "default": 3600
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "model_id"
+      ]
+    },
+    "PreparePipelineModelRequest": {
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "quant_type": {
+          "type": "string",
+          "default": "fp16"
+        }
+      },
+      "type": "object",
+      "required": [
+        "model_id"
+      ]
+    },
+    "SwitchModelRequest": {
+      "properties": {
+        "model_id": {
+          "type": "string"
+        },
+        "quant_type": {
+          "type": "string",
+          "default": "int4"
+        },
+        "engine": {
+          "type": "string",
+          "default": "auto"
+        }
+      },
+      "type": "object",
+      "required": [
+        "model_id"
+      ]
+    },
+    "ValidationError": {
+      "properties": {
+        "loc": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "msg": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "input": {},
+        "ctx": {
+          "type": "object"
+        }
+      },
+      "type": "object",
+      "required": [
+        "loc",
+        "msg",
+        "type"
+      ]
+    }
+  },
+  "migration_from": "refactor_product_api_v1.json",
+  "retired_http": {
+    "/api/cluster/config/task-graph": {
+      "methods": [
+        "get",
+        "put"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/cluster/queue/strategy": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/experimental/speculative": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/experimental/speculative/capability": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/workflows": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/workflows/journal/cleanup": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/workflows/journal/replicate": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/workflows/journal/replication": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/workflows/{workflow_id}": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    },
+    "/api/workflows/{workflow_id}/cancel": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R5"
+    }
+  }
+}

@@ -12,6 +12,7 @@ from tests.test_model_intent import native_intent, stage_case, retirement_case  
 def api(monkeypatch):
     import api_server
     from api import routes_model_intent
+    monkeypatch.setenv("QLH_MODEL_API_TRUSTED_CIDRS", "")
     monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
     fake = SimpleNamespace(current=lambda: None, get=lambda op_id: {"operation_id": op_id, "status": "ready"},
                            create=AsyncMock(return_value={"operation_id": "supply_" + "a" * 32, "status": "queued"}),
@@ -102,8 +103,8 @@ def registered_api(api, monkeypatch):
     assert tcp_server.confirm_registration(node_id)
     monkeypatch.setattr(server.scheduler, "_tcp_server_default", tcp_server)
     monkeypatch.setattr(server.scheduler, "get_distributed_inference_enabled", lambda: True)
-    original_facade = server.scheduler._scheduler_facade_global
-    monkeypatch.setattr(server.scheduler, "_scheduler_facade_global",
+    original_facade = server.scheduler._runtime_setting
+    monkeypatch.setattr(server.scheduler, "_runtime_setting",
                         lambda name: "distributed" if name == "RUN_MODE" else original_facade(name))
     monkeypatch.setattr(server, "_get_all_model_configs", lambda: [])
     return SimpleNamespace(server=server, routes=routes, coordinator=fake, tcp=tcp_server,
@@ -246,7 +247,7 @@ def test_loopback_worker_relay_reaches_registered_master_without_manual_cidr(reg
     import model_intent_gateway as gateway
     owner = registered_api
     worker = SimpleNamespace(_effective_role=lambda: "client", get_distributed_inference_enabled=lambda: True,
-        _scheduler_facade_global=lambda _name: "distributed",
+        _runtime_setting=lambda _name: "distributed",
         _tcp_client=SimpleNamespace(_running=True, is_registered=True, sock=object(), registration_epoch=1,
                                    server_host="100.64.1.2", server_port=18888, client_id=owner.node_id))
     owner.monkeypatch.setattr(gateway.node_config, "load_node_config", lambda: {
@@ -400,6 +401,11 @@ def test_late_intent_retirement_preserves_newer_committed_model(retirement_case,
         try:
             await wait_until(entered.is_set)
             if replacement == "native":
+                # A new selection explicitly retires old admission and obtains
+                # exact release evidence before preparing another deployment.
+                case.master._invalidate_pipeline_load_transaction("new_selection")
+                for record in list(case.master._pipeline_model_cleanup_ledger.values()):
+                    assert _ack_cleanup(case.master, record)
                 plan = _start_candidate(case, "candidate-newer")
                 assert plan["admitted"]
                 _worker_ack(case.master, "prepared")

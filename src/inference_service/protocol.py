@@ -74,9 +74,22 @@ class SwitchModelRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_features(cls, value):
+        if isinstance(value, dict) and (value.get("execution_mode", "auto") != "auto" or any(str(k).startswith("task_graph") or k == "workflow_id" for k in value)):
+            raise ValueError("CLIENT_FEATURE_REMOVED: workflow/PoC execution was removed in client contract v2")
+        return value
+
+    client_id: Optional[str] = Field(default=None, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    def pipeline_sampling(self):
+        from qlh_core.contracts.execution import SamplingPolicy
+        policy = SamplingPolicy.for_request(self)
+        return policy.temperature, policy.top_p
+
     """对齐 api_server.ChatRequest 核心字段（2026-08-03 基线）。
 
-    1.2 复制 api_server 执行段时按实际使用字段扩展（task_graph 系列等）。
+    执行字段与 api_server.ChatRequest 的客户端版本合同保持一致。
     """
 
     message: str = Field(..., description="用户消息", min_length=1)
@@ -105,27 +118,7 @@ class ChatRequest(BaseModel):
     client_node_type: Optional[str] = None
     client_mode: Optional[str] = None
     client_app_variant: Optional[str] = None
-    execution_mode: Literal["auto", "task_graph"] = Field(default="auto")
-    task_graph_template: Literal["dual_candidate"] = Field(
-        default="dual_candidate",
-        description="任务链模板；首期仅支持双候选校验（对齐 api_server.ChatRequest）",
-    )
-    task_graph_remote_stage: Literal[
-        "", "candidate_a", "candidate_b", "aggregate"
-    ] = Field(
-        default="",
-        description="N2.1 手动指定唯一远端 Stage；为空时全部本地执行",
-    )
-    task_graph_remote_provider_id: str = Field(
-        default="",
-        max_length=64,
-        description="N2.1 显式远端 Provider ID；不参与自动选择",
-    )
-    task_graph_auto_remote: bool = Field(
-        default=False,
-        description="N2.1 自动选择远端 Stage（与显式指定互斥）",
-    )
-    workflow_id: Optional[str] = None
+    execution_mode: Literal["auto"] = Field(default="auto")
     generation_id: Optional[str] = None
     allow_external: bool = Field(
         default=False,
@@ -147,8 +140,6 @@ class ChatRequest(BaseModel):
         self.image_data_urls = validate_image_data_urls(self.image_data_urls)
         if not self.image_data_urls:
             return self
-        if self.execution_mode != "auto":
-            raise ValueError("图像请求暂不支持 task_graph 执行模式")
         if self.routing_preference == "local_only":
             if len(self.image_data_urls) != 1:
                 raise ValueError("本地 MTMD 图像请求仅支持一张图片")
@@ -181,32 +172,6 @@ class WorkerStageRequest(BaseModel):
     runtime_context: Dict[str, Any] = Field(default_factory=dict)
 
 
-class SpeculativeRunRequest(BaseModel):
-    """投机解码实验端点（QLH_SPEC_ENABLED 门控沿用，§4.1）。
-    字段对齐 api_server.SpeculativeExperimentRequest（2026-08-03 修复：
-    此前只有 prompt/max_new_tokens/temperature/top_p，engine_host.speculative_run
-    访问 message/gamma/max_rounds/seed/draft_hint 时必然 AttributeError→500）。"""
-
-    message: str = Field(default="", max_length=8192)
-    allow_external: bool = Field(
-        default=False,
-        description=(
-            "数据作用域按请求授权：草稿 token 由用户内容派生，本路径确实"
-            "把数据送出集群，与路线 B 共用 QLH_EXTERNAL_DATA_SCOPE 门控。"
-        ),
-    )
-    max_new_tokens: int = Field(default=64, ge=1, le=1024)
-    gamma: int = Field(default=0, ge=0, le=16, description="每轮草稿数；0=用 QLH_SPEC_GAMMA")
-    max_rounds: int = Field(default=0, ge=0, le=1024, description="0=用 QLH_SPEC_MAX_ROUNDS")
-    temperature: float = Field(
-        default=-1.0, ge=-1.0, le=2.0,
-        description="<0 = 用 QLH_SPEC_TEMPERATURE；0 = 贪心模式",
-    )
-    seed: int = Field(default=0, ge=0, le=2147483647, description="RNG 种子，保证可复现")
-    draft_hint: str = Field(
-        default="", max_length=2048,
-        description="PoC 假 draft 模型的提示序列：命中则接受率高，用于演示接受率对比",
-    )
 
 
 class LayerLoadRequest(BaseModel):

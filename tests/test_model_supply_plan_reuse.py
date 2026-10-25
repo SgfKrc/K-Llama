@@ -52,7 +52,7 @@ def _select(case, *, planner=None, capabilities_by_node=None, **overrides):
         if planner is not None:
             return planner(preferred_ranges=preferred_ranges)
         return plan_segment_supply(descriptors, nodes, master_engine="pytorch",
-                                   alignment=4, safety_margin=1.0,
+                                   alignment=4, safety_margin=1.0, prefer_all_workers=True,
                                    preferred_ranges=preferred_ranges)
     arguments = {"planner": callback, "source_model_id": SOURCE_ID,
                  "source_model_sha256": SOURCE_SHA, "tokenizer_sha256": TOKENIZER_SHA,
@@ -73,16 +73,21 @@ def _caps(case):
             for record in case[1] if "layer_artifacts" in record}
 
 
-def test_small_pt_head_keeps_android_tail_and_creates_surface_middle():
+def test_small_pt_head_rebalances_instead_of_locking_a_suboptimal_cached_tail():
     case = _case()
     before = copy.deepcopy(case)
     plan, calls = _select(case)
     assert plan["admitted"]
-    assert _ranges(plan) == {"master": [0, 4], "surface": [4, 24], "android": [24, 32]}
-    assert calls == [{"android": [[24, 32]], "surface": [[16, 24]]},
+    assert _ranges(plan) == {"master": [0, 4], "surface": [4, 20], "android": [20, 32]}
+    assert calls == [{}, {"android": [[24, 32]], "surface": [[16, 24]]},
                      {"surface": [[16, 24]]}, {"android": [[24, 32]]}]
-    assert plan["reuse_preferred_node_ids"] == ["android"]
-    assert plan["target_preference"] == "greedy_fixed"
+    assert plan["reuse_preferred_node_ids"] == []
+    assert plan["target_preference"] == "unrestricted"
+    fixed = plan_segment_supply(case[0], case[2], master_engine="pytorch", alignment=4,
+                                safety_margin=1.0, prefer_all_workers=True,
+                                preferred_ranges={"android": [[24, 32]]})
+    assert fixed["admitted"]
+    assert plan["placement_objective"]["weighted_work_cost"] < fixed["placement_objective"]["weighted_work_cost"]
     assert plan["loaded_ready"] is False and plan["supply_only"] is True
     assert plan["require_distributed"] is True
     assert all(item["required_bytes"] <= item["capacity_bytes"] for item in plan["assignments"])
@@ -93,7 +98,7 @@ def test_joint_fixed_retains_three_segments_when_pt_head_fits():
     plan, calls = _select(_case(master_capacity=645))
     assert plan["admitted"]
     assert _ranges(plan) == {"master": [0, 16], "surface": [16, 24], "android": [24, 32]}
-    assert len(calls) == 1
+    assert len(calls) == 2 and calls[0] == {}
     assert plan["target_preference"] == "joint_fixed"
     assert plan["reuse_preferred_node_ids"] == ["android", "surface"]
     assert plan["loaded_ready"] is False
@@ -191,7 +196,7 @@ def test_master_asset_is_never_fixed_and_fresh_nodes_own_capacity():
     plan, calls = _select(case)
     assert _ranges(plan)["master"] == [0, 4]
     assert all("master" not in call for call in calls)
-    assert _ranges(plan)["android"] == [24, 32]
+    assert _ranges(plan)["android"] == [20, 32]
 
 
 def test_disconnected_inventory_and_target_engine_mismatch_are_not_reused():
@@ -202,11 +207,11 @@ def test_disconnected_inventory_and_target_engine_mismatch_are_not_reused():
 
 
 def test_optional_capabilities_proof_is_checked_without_mutation():
-    case = _case()
+    case = _case(master_capacity=645)
     caps = _caps(case)
     before = copy.deepcopy(caps)
     plan, _ = _select(case, capabilities_by_node=caps)
-    assert plan["reuse_preferred_node_ids"] == ["android"]
+    assert plan["reuse_preferred_node_ids"] == ["android", "surface"]
     assert caps == before
 
 
@@ -238,9 +243,10 @@ def test_greedy_order_uses_actual_asset_bytes_and_is_deterministic():
     case = _case()
     case[1][2]["layer_artifacts"][0]["layer_weight_bytes"] = [30] * 8
     plan, calls = _select(case)
-    assert calls[1] == {"android": [[24, 32]]}
-    assert calls[2] == {"android": [[24, 32]], "surface": [[16, 24]]}
-    assert plan["reuse_preferred_node_ids"] == ["android"]
+    assert calls[0] == {}
+    assert calls[2] == {"android": [[24, 32]]}
+    assert calls[3] == {"surface": [[16, 24]]}
+    assert plan["reuse_preferred_node_ids"] == []
     reversed_case = (case[0], list(reversed(case[1])), case[2])
     reversed_plan, reversed_calls = _select(reversed_case)
     assert reversed_calls == calls and reversed_plan == plan
@@ -250,7 +256,7 @@ def test_rejected_preferences_are_bounded_and_preserve_original_rejection():
     rejected = {"admitted": False, "reason_code": "real-capacity-failure", "assignments": []}
     before = copy.deepcopy(rejected)
     plan, calls = _select(_case(), planner=lambda **kwargs: rejected)
-    assert len(calls) == 4 and calls[-1] == {}
+    assert calls == [{}]
     assert plan["reason_code"] == "real-capacity-failure" and not plan["admitted"]
     assert plan["target_preference"] == "unrestricted" and plan["loaded_ready"] is False
     assert rejected == before
@@ -262,25 +268,25 @@ def test_admitted_plan_that_skips_a_fixed_worker_is_not_accepted():
     reduced_nodes[1]['capacity_bytes'] = 0
     reduced_nodes[2]['capacity_bytes'] = 400
     baseline = plan_segment_supply(case[0], reduced_nodes, master_engine="pytorch",
-                                   alignment=4, safety_margin=1.0)
+                                   alignment=4, safety_margin=1.0, prefer_all_workers=True)
     def ignores_preferences(**kwargs):
         return baseline
     plan, calls = _select(case, planner=ignores_preferences)
     assert plan["target_preference"] == "unrestricted"
-    assert calls[-1] == {}
+    assert calls[0] == {}
     assert baseline.get("target_preference") is None
 
 
 def test_full_model_or_unaligned_candidate_result_falls_back():
     case = _case()
     safe = plan_segment_supply(case[0], case[2], master_engine="pytorch",
-                               alignment=4, safety_margin=1.0)
+                               alignment=4, safety_margin=1.0, prefer_all_workers=True)
     unsafe = {**safe, "assignments": [{"node_id": "master", "engine": "pytorch",
                                        "start_layer": 0, "end_layer": 32}]}
     def callback(*, preferred_ranges):
         return unsafe if preferred_ranges else safe
     plan, calls = _select(case, planner=callback)
-    assert plan["target_preference"] == "unrestricted" and calls[-1] == {}
+    assert plan["target_preference"] == "unrestricted" and calls[0] == {}
     assert len(plan["assignments"]) == 3
 
 
@@ -300,3 +306,29 @@ def test_invalid_alignment_stays_owned_by_existing_planner():
     with pytest.raises(ModelSupplyError) as error:
         _select(case, planner=callback, alignment=3)
     assert error.value.code == "SUPPLY_ALIGNMENT_INVALID"
+
+
+def test_cached_three_stage_chain_cannot_override_fewest_nodes_configuration():
+    case = _case(master_capacity=645)
+    def planner(*, preferred_ranges):
+        return plan_segment_supply(case[0], case[2], master_engine="pytorch", alignment=4,
+                                   safety_margin=1.0, prefer_all_workers=False,
+                                   preferred_ranges=preferred_ranges)
+    plan, calls = _select(case, planner=planner)
+    assert plan["admitted"] and plan["participating_node_count"] == 2
+    assert plan["target_preference"] == "unrestricted"
+    assert plan["reuse_preferred_node_ids"] == []
+    assert calls[0] == {}
+
+
+def test_equal_quality_single_cached_range_still_gets_reused():
+    case = _case()
+    android = case[1][2]
+    android["layer_ranges"] = [[20, 32]]
+    artifact = android["layer_artifacts"][0]
+    artifact.update(layer_range=[20, 32], layer_weight_bytes=case[0]["llama_cpp"]["layer_weight_bytes"][20:32])
+    plan, calls = _select(case)
+    assert _ranges(plan) == {"master": [0, 4], "surface": [4, 20], "android": [20, 32]}
+    assert plan["reuse_preferred_node_ids"] == ["android"]
+    assert plan["target_preference"] == "greedy_fixed"
+    assert len(calls) <= 4

@@ -138,7 +138,12 @@ async def create(intent: ModelSupplyIntent, request: Request):
         # Reject only definite local incompatibility, before create can retire
         # the active native plan. Acquisition and content proof stay with supply.
         await run_in_threadpool(_preflight_selection, intent)
-        return await coordinator().create(intent.model_dump())
+        key = request.headers.get("Idempotency-Key", "")
+        if key:
+            import re
+            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", key) is None:
+                raise ModelSupplyError("INTENT_IDEMPOTENCY_KEY_INVALID", "Invalid idempotency key")
+        return await coordinator().create(intent.model_dump(), **({"idempotency_key": key} if key else {}))
     except (ModelSupplyError, ModelPipelineAvailabilityError) as exc:
         raise _error(exc) from exc
 

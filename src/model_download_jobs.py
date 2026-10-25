@@ -36,7 +36,6 @@ import model_registry_validation as mrv
 import proxy_config
 from model_config import _APP_ROOT
 from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
-from local_store import save_local_experimental_model
 
 # 下载成功后落盘子目录名（沿用 config.MODEL_PATH 的 ``models/<name>`` 约定）
 _DEFAULT_MODELS_ROOT = os.path.join(_APP_ROOT, "models")
@@ -729,7 +728,8 @@ def _infer_artifact(target: Path, gguf_path: str = "") -> dict[str, Any]:
 
 
 def _register(model_id: str, target: Path, summary: dict[str, Any],
-              *, gguf_path: str = "", revision: str = "") -> bool:
+              *, gguf_path: str = "", revision: str = "", registry_snapshot=None) -> bool:
+    snapshot = registry_snapshot if registry_snapshot is not None else local_store.get_local_model_registry_snapshot(model_id)
     artifact = _infer_artifact(target, gguf_path)
     manifest = summary.get("manifest") or build_manifest(
         target, artifact["files"], model_type=artifact["model_type"],
@@ -749,7 +749,7 @@ def _register(model_id: str, target: Path, summary: dict[str, Any],
         "revision": revision,
         "manifest": manifest,
     }
-    return save_local_experimental_model(model_id, config)
+    return local_store.publish_local_model_registry(model_id, config, expected_revision=snapshot.registry_revision)
 
 
 # ---------------------------------------------------------------------------
@@ -763,8 +763,10 @@ def _run_job(job_id: str, *, source: str, target: str, model_id: str,
              revision: str = "", allow_patterns: list[str] | None = None,
              required_files: list[str] | None = None,
              artifact_files: list[dict[str, str]] | None = None,
-             progress_cb: Callable[[int, int], None] | None = None) -> None:
+             progress_cb: Callable[[int, int], None] | None = None,
+             registry_snapshot=None) -> None:
     """在调用方线程中执行 job 全流程；异常写回 job 并落盘清理。"""
+    registry_snapshot = registry_snapshot if registry_snapshot is not None else local_store.get_local_model_registry_snapshot(model_id)
     staging: Path | None = None
     destination: Path | None = None
     published = False
@@ -828,27 +830,46 @@ def _run_job(job_id: str, *, source: str, target: str, model_id: str,
             destination,
             summary,
             gguf_path=_relocate_staged_path(gguf_path, staging, destination),
-            revision=revision,
+            revision=revision, registry_snapshot=registry_snapshot,
         )
         if not registered:
             raise JobError("REGISTER_FAILED", f"模型 '{model_id}' 注册失败")
         _update_job(job_id, status=STATUS_READY, progress=1.0,
                     finished_at=_now(), error=None, error_code=None)
     except JobError as exc:
+        message = str(exc)
         if published and not registered and destination is not None:
-            shutil.rmtree(destination, ignore_errors=True)
-        _fail_job(job_id, exc.code, str(exc))
+            message = "cleanup_pending: published artifact retained; " + message
+        _fail_job(job_id, exc.code, message)
     except Exception as exc:  # noqa: BLE001
+        message = str(exc)
         if published and not registered and destination is not None:
-            shutil.rmtree(destination, ignore_errors=True)
-        _fail_job(job_id, "INTERNAL_ERROR", str(exc))
+            message = "cleanup_pending: published artifact retained; " + message
+        _fail_job(job_id, "INTERNAL_ERROR", message)
     finally:
         if staging is not None and staging.exists() and not published:
             shutil.rmtree(staging, ignore_errors=True)
-        if published and not registered and destination is not None:
-            shutil.rmtree(destination, ignore_errors=True)
-            # 幂等清理：已发布则不删（注册失败已由 _register 抛出、staging 已 rename 前失败则不动）
-            pass
+
+
+def retain_unregistered_publication(destination: Path) -> dict:
+    """Return recovery evidence; published bytes await the R3 supply owner.
+
+    A registry read cannot authorize deletion: bindings include typed/external
+    locations, and a concurrent alias may adopt the artifact after that read.
+    Staging remains the creating operation's responsibility.
+    """
+    from qlh_core.bootstrap.model_control import build_model_control
+    from qlh_core.adapters.publication_cleanup import publication_evidence
+    try:
+        location = str(Path(destination).resolve(strict=True))
+        evidence = publication_evidence(location)
+        cleanup_id = build_model_control().retain_publication(location, evidence=evidence)
+        return {"reason_code": "cleanup_pending", "path": location, "retained": True, "cleanup_id": cleanup_id}
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("event=publication_cleanup_debt_persist_failed path=%s", destination)
+        return {"reason_code": "cleanup_pending", "path": str(destination), "retained": True,
+                "cleanup_persisted": False}
 
 
 def _fail_job(job_id: str, code: str, message: str) -> None:
@@ -915,7 +936,7 @@ def create_job(*, source: str = "", target: str = "", model_id: str = "", preset
         root,
     )
     model_id = model_id or destination.name
-    target = target or str(destination)
+    target = str(destination)
 
     with _LOCK:
         existing = _active_job_exists(source, target, model_id)
@@ -937,6 +958,8 @@ def create_job(*, source: str = "", target: str = "", model_id: str = "", preset
         }
         _insert_job(row)
 
+    registry_snapshot = local_store.get_local_model_registry_snapshot(model_id)
+
     def _run() -> None:
         _run_job(
             job_id, source=source, target=target, model_id=model_id,
@@ -945,7 +968,7 @@ def create_job(*, source: str = "", target: str = "", model_id: str = "", preset
             gguf_path=gguf_path, models_root=root,
             allow_cpu=allow_cpu, revision=revision, allow_patterns=allow_patterns,
             required_files=required_files, artifact_files=artifact_files,
-            progress_cb=progress_cb,
+            progress_cb=progress_cb, registry_snapshot=registry_snapshot,
         )
 
     if executor is not None:

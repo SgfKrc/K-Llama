@@ -925,7 +925,7 @@ class TestLoadLayerRangeIntegration:
         )
         monkeypatch.setattr(
             "model_sync.compute_model_sha256",
-            lambda path: "a" * 64,
+            lambda path, **kwargs: "a" * 64,
         )
 
         mgr = ModelManager()

@@ -362,7 +362,7 @@ def _is_fenced_control_message(msg_type: MessageType | str) -> bool:
     return value in FENCED_CONTROL_MESSAGE_TYPES
 
 
-def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFence | None) -> Any:
+def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFence | None, *, peer=False) -> Any:
     if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
         return data
     if not isinstance(data, dict):
@@ -373,8 +373,33 @@ def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFe
         if certificate is None:
             raise ControlFenceError("control_certificate_missing", "fenced control message has no current certificate")
         payload["control_certificate"] = certificate
-    fence.admit(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}", source="tcp")
+    if peer:
+        fence.admit_peer(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}")
+    else:
+        fence.admit(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}", source="tcp")
     return payload
+
+
+def _admit_inbound_control_message(
+    msg: dict, fence: ControlFence | None, *, peer: bool = False,
+) -> None:
+    msg_type = msg.get("type", "")
+    if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
+        return
+    data = msg.get("data")
+    certificate = data.get("control_certificate") if isinstance(data, dict) else None
+    action = f"tcp.receive.{msg_type}"
+    if peer:
+        fence.admit_peer(certificate, action=action, observe=True)
+    else:
+        fence.admit(certificate, action=action, source="tcp")
+
+    # The certificate belongs to the TCP control wrapper, not the task-worker
+    # protocol envelope. Remove it only after the fence has admitted it.
+    if msg_type == MessageType.TASK_WORKER.value and isinstance(data, dict):
+        sanitized_data = dict(data)
+        sanitized_data.pop("control_certificate", None)
+        msg["data"] = sanitized_data
 
 
 def detect_network_type() -> str:
@@ -1238,20 +1263,32 @@ class TCPServer:
         # socket.  Scheduler-side layer/config pushes must wait for this edge.
         self.on_registration_confirmed: Optional[Callable] = None
         self._control_fence: ControlFence | None = None
+        # ★ #106/#114：本集群要求 task-worker 协商的节点。主节点在加 fence 的
+        #   同一边沿写入这里，REGISTER ACK 据此带上声明；否则客户端只能靠自己的
+        #   本地实验开关猜——没开的节点永远不发 hello，而 fence 只能由 hello
+        #   解除，它的 release 债务就永远投递不出去。
+        self._task_worker_hello_required: set[str] = set()
 
     def set_control_fence(self, fence: ControlFence | None) -> None:
         if fence is not None and not isinstance(fence, ControlFence):
             raise TypeError("control fence must be a ControlFence or None")
         self._control_fence = fence
 
+    def set_task_worker_hello_required(self, client_id: str, required: bool) -> None:
+        """声明（或撤销）一次注册的 task-worker 握手要求。
+
+        每次 REGISTER 都显式覆写，因此主节点开关关闭或节点类型不符合时不会
+        残留上一次的要求。该字段只在 REGISTER ACK 的 `data` 里多带一个
+        `task_worker_hello_required`，旧客户端与 Android 忽略未知键即可。
+        """
+        with self._clients_lock:
+            if required:
+                self._task_worker_hello_required.add(str(client_id))
+            else:
+                self._task_worker_hello_required.discard(str(client_id))
+
     def _admit_inbound_control(self, msg: dict) -> None:
-        fence = self._control_fence
-        msg_type = msg.get("type", "")
-        if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
-            return
-        data = msg.get("data")
-        certificate = data.get("control_certificate") if isinstance(data, dict) else None
-        fence.admit(certificate, action=f"tcp.receive.{msg_type}", source="tcp")
+        _admit_inbound_control_message(msg, self._control_fence)
 
     def start(self, on_message: Callable = None,
               on_disconnect: Callable = None,
@@ -1384,6 +1421,25 @@ class TCPServer:
             data["client_id"] = client_id
         if reason:
             data["reason"] = reason
+        if status == "registered" and client_id:
+            with self._clients_lock:
+                requires_handshake = str(client_id) in self._task_worker_hello_required
+            if requires_handshake:
+                # 声明在先、ACK 在后：客户端在 connect() 返回前就能据它决定是否
+                # 发 hello，从而不再依赖客户端本地的实验开关（#106/#114）。
+                data["task_worker_hello_required"] = True
+        fence = self._control_fence
+        if status == "registered" and fence is not None and fence.enabled:
+            certificate = fence.current_certificate()
+            if certificate is None:
+                raise ControlFenceError(
+                    "control_certificate_missing",
+                    "fenced registration requires a current control certificate",
+                    action="tcp.register_ack",
+                )
+            fence.admit(certificate, action="tcp.register_ack", source="tcp")
+            data["control_fence_required"] = True
+            data["control_certificate"] = certificate
         conn.sendall(build_message(MessageType.REGISTER, data))
 
     def confirm_registration(self, client_id: str) -> bool:
@@ -1412,8 +1468,8 @@ class TCPServer:
                 if self._pending_registrations.get(client_id) is client:
                     self._pending_registrations.pop(client_id, None)
             return True
-        except OSError as e:
-            logger.warning(f"注册确认发送失败: {e}", exc_info=True)
+        except (OSError, ControlFenceError) as e:
+            logger.warning("注册确认发送失败: %s", e, exc_info=True)
             return False
 
     def reject_client(self, client_id: str, reason: str) -> None:
@@ -1644,7 +1700,12 @@ class TCPServer:
                                 "registered",
                                 client_id=client_id,
                             )
-                        except OSError:
+                        except (OSError, ControlFenceError) as exc:
+                            if isinstance(exc, ControlFenceError):
+                                logger.warning(
+                                    "fenced REGISTER ACK unavailable: client=%s code=%s",
+                                    client_id, exc.code,
+                                )
                             self._pop_client_if_same(client_id, current)
                             break
                         else:
@@ -2211,6 +2272,10 @@ class TCPClient:
         self._connection_generation = 0
         self._registration_epoch = 0
         self._registered = False
+        # ★ #106/#114：本代连接上协调方（REGISTER ACK）是否声明了 task-worker
+        #   协商要求。每次注册前重置、只在注册 ACK 明确声明后置位；调度侧据此
+        #   在本地实验开关关闭时也发 hello，解掉只有在 hello 后才会解开的 fence。
+        self.task_worker_hello_required = False
         self.last_register_error: str = ""
         # 注册确认等待期间，本代连接可能被别的线程（上一代心跳/接收的收尾，或显式
         # disconnect()）关闭或置换。那种情况这一代已经作废，不是一次注册失败。
@@ -2267,13 +2332,7 @@ class TCPClient:
         self._control_fence = fence
 
     def _admit_inbound_control(self, msg: dict) -> None:
-        fence = self._control_fence
-        msg_type = msg.get("type", "")
-        if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
-            return
-        data = msg.get("data")
-        certificate = data.get("control_certificate") if isinstance(data, dict) else None
-        fence.admit(certificate, action=f"tcp.receive.{msg_type}", source="tcp")
+        _admit_inbound_control_message(msg, self._control_fence, peer=True)
 
     def _transport_runtime_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         runtime = self.transport_runtime
@@ -2514,6 +2573,9 @@ class TCPClient:
                     with self._disconnect_callback_lock:
                         register_sock = self.sock
                         register_generation = self._connection_generation
+                    # A stale requirement from a previous coordinator must not
+                    # authorize a hello before this ACK says so.
+                    self.task_worker_hello_required = False
                     self.send_data(reg_data, MessageType.REGISTER)
 
                     # 等待注册确认
@@ -2532,6 +2594,9 @@ class TCPClient:
                                 ack_data = ack_msg.get("data", {})
                                 if ack_data.get("status") == "registered":
                                     registered = True
+                                    self.task_worker_hello_required = (
+                                        ack_data.get("task_worker_hello_required") is True
+                                    )
                                     logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
                                 else:
                                     status = ack_data.get("status") or "unknown"
@@ -2557,6 +2622,20 @@ class TCPClient:
                                 register_reason = f"注册确认等待失败: {e}"
                                 logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
+                    # A local shutdown can return EOF instead of raising on
+                    # Windows. Even a valid ACK can finish after retirement.
+                    # Check ownership for every receive outcome, not only the
+                    # OSError path, before consuming the registration result.
+                    with self._disconnect_callback_lock:
+                        displaced = (
+                            self.sock is not register_sock
+                            or self._connection_generation != register_generation
+                        )
+                        if displaced or not self._running:
+                            registered = False
+                            registration_interrupted = True
+                            register_reason = "注册被中断（连接已由其他线程关闭）"
+
                     if not registered:
                         self.last_register_error = register_reason
                         self._last_registration_interrupted = registration_interrupted
@@ -2565,11 +2644,15 @@ class TCPClient:
                         # write to the closed descriptor and surface WinError
                         # 10038 during a reconnect race.
                         with self._disconnect_callback_lock:
-                            self._connection_generation += 1
-                            self._running = False
-                            self._registered = False
-                            failed_sock = self.sock
-                            self.sock = None
+                            if (self.sock is register_sock
+                                    and self._connection_generation == register_generation):
+                                self._connection_generation += 1
+                                self._running = False
+                                self._registered = False
+                                self.sock = None
+                            # Cleanup belongs to this attempt, even when a
+                            # successor has already installed another socket.
+                            failed_sock = register_sock
                         if failed_sock is not None:
                             try:
                                 shutdown = getattr(failed_sock, "shutdown", None)
@@ -2599,6 +2682,15 @@ class TCPClient:
                             opened_sock.close()
                             return False
                         with self._disconnect_callback_lock:
+                            # Retirement can also happen between the receive
+                            # check above and this publication lock.
+                            if (self.sock is not register_sock
+                                    or self._connection_generation != register_generation
+                                    or not self._running):
+                                self.last_register_error = "注册被中断（连接已由其他线程关闭）"
+                                self._last_registration_interrupted = True
+                                opened_sock.close()
+                                return False
                             self._registered = True
                             self._last_registration_interrupted = False
                             self._registration_epoch += 1
@@ -2771,7 +2863,7 @@ class TCPClient:
                   connection_sock: socket.socket = None,
                   binary_body: Optional[bytes] = None) -> None:
         """向主节点发送数据"""
-        data = _decorate_control_payload(data, msg_type, self._control_fence)
+        data = _decorate_control_payload(data, msg_type, self._control_fence, peer=True)
         packet = build_message(msg_type, data, binary_body=binary_body)
         self._transport_runtime_call(
             "observe_legacy_send",

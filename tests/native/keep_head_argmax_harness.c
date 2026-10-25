@@ -11,6 +11,7 @@ static struct llama_vocab vocabulary;
 static float values[32];
 static int rows, columns, decode_rc, missing_row, missing_model, missing_vocab;
 static int allocated_batches, freed_batches;
+static void (*batch_observer)(struct llama_batch);
 
 struct llama_model_params llama_model_default_params(void) {
     struct llama_model_params params = {0};
@@ -30,6 +31,7 @@ void llama_model_free(struct llama_model * ptr) { abort(); }
 void llama_free(struct llama_context * ptr) { abort(); }
 uint32_t llama_n_ctx(const struct llama_context * ptr) { return 32; }
 uint32_t llama_n_batch(const struct llama_context * ptr) { return 4; }
+uint64_t llama_model_size(const struct llama_model * ptr) { return sizeof(*ptr); }
 int32_t llama_model_n_layer(const struct llama_model * ptr) { return 1; }
 int32_t llama_model_n_embd(const struct llama_model * ptr) { return 2; }
 enum llama_rope_type llama_model_rope_type(const struct llama_model * ptr) { return LLAMA_ROPE_TYPE_NORM; }
@@ -72,7 +74,10 @@ void llama_batch_free(struct llama_batch batch) {
     free(batch.logits);
     ++freed_batches;
 }
-int32_t llama_decode(struct llama_context * ptr, struct llama_batch batch) { return decode_rc; }
+int32_t llama_decode(struct llama_context * ptr, struct llama_batch batch) {
+    if (batch_observer != NULL) { batch_observer(batch); }
+    return decode_rc;
+}
 float * llama_get_logits_ith(struct llama_context * ptr, int32_t row) {
     return row == missing_row || row < 0 || row >= rows ? NULL : values + row * columns;
 }

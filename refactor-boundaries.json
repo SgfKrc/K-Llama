@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "fb870d1d4ef2d1d2901db1c5e299ac387fc9597b",
+  "legacy_pure_modules": [
+    "src/worker_prepare_contract.py",
+    "src/request_deadline.py",
+    "src/request_outcome.py",
+    "src/worker_assignment_state.py",
+    "src/pipeline_capacity.py"
+  ],
+  "layers": {
+    "contracts": {
+      "internal": [],
+      "stdlib_only": true,
+      "pure": true
+    },
+    "planning": {
+      "internal": [
+        "contracts"
+      ],
+      "stdlib_only": true,
+      "pure": true
+    },
+    "control": {
+      "internal": [
+        "contracts"
+      ],
+      "stdlib_only": true,
+      "pure": false
+    },
+    "execution": {
+      "internal": [
+        "contracts"
+      ],
+      "stdlib_only": true,
+      "pure": false
+    },
+    "adapters": {
+      "internal": [
+        "contracts"
+      ],
+      "stdlib_only": false,
+      "pure": false
+    },
+    "api": {
+      "internal": [
+        "contracts",
+        "control"
+      ],
+      "stdlib_only": false,
+      "pure": false
+    },
+    "bootstrap": {
+      "internal": [
+        "contracts",
+        "planning",
+        "control",
+        "execution",
+        "adapters",
+        "api"
+      ],
+      "stdlib_only": false,
+      "pure": false
+    }
+  },
+  "forbidden_core_imports": [
+    "api_server",
+    "scheduler",
+    "scheduler_pipeline",
+    "scheduler_cluster",
+    "tui_textual",
+    "tui_commands",
+    "task_graph",
+    "task_worker_adapter",
+    "graph_orchestrator",
+    "speculative",
+    "qlh_launcher",
+    "launcher"
+  ],
+  "forbidden_api_imports": [
+    "torch",
+    "transformers",
+    "llama_cpp",
+    "llama_engine",
+    "model_module",
+    "inference_service",
+    "model_host",
+    "engine_host"
+  ],
+  "write_owners": {
+    "model_loaded": "qlh.execution.runtime",
+    "current_quant": "qlh.execution.runtime",
+    "_manager": "qlh.execution.runtime",
+    "active_deployment": "qlh.control.deployment",
+    "_worker_assignments": "qlh.control.deployment",
+    "registry_revision": "qlh.control.catalog",
+    "active_session_id": "qlh.control.conversations",
+    "session_histories": "qlh.control.conversations"
+  },
+  "pure_call_exceptions": {
+    "request_deadline": [
+      "RequestDeadline.start"
+    ],
+    "qlh_core.contracts.deadline": [
+      "RequestDeadline.start"
+    ]
+  },
+  "package_roots": [
+    "qlh",
+    "qlh_core"
+  ],
+  "legacy_pure_imports": {
+    "pipeline_capacity": [
+      "qlh_core.planning.capacity"
+    ],
+    "worker_prepare_contract": [
+      "qlh_core.contracts.load"
+    ],
+    "request_deadline": [
+      "qlh_core.contracts.deadline"
+    ],
+    "request_outcome": [
+      "qlh_core.contracts.outcome"
+    ]
+  }
+}

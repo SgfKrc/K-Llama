@@ -198,10 +198,9 @@ LIVE_SHAPES = {
         "logs": [{"event_type": "handoff_committed", "reason": "maintenance"}],
         "count": 1,
     },
-    "/cluster/queue": {"running": True, "paused": False, "strategy": "mlfq", "queue_size": 0,
-                       "max_size": 100, "q0_depth": 0, "q1_depth": 0, "q2_depth": 0,
-                       "q0": [], "q1": [], "q2": [], "completed_count": 0, "current_task": None,
-                       "aging_params": {"q0_max_tokens": 128, "q1_max_tokens": 512}},
+    "/cluster/queue": {"running":True,"paused":False,"strategy":"fifo","queue_size":1,
+        "capacity":100,"active":{"request_id":"active","execution_state":"running","terminal":None},
+        "tasks":[{"position":1,"request_id":"waiting","wait_seconds":0,"outcome":None}]},
     "/cluster/nodes/log-aggregate": {"local": {"node_id": "master",
                                                "logs": ["line-1", "line-2"]},
                                      "workers": [], "total_workers": 0, "limit": 50},
@@ -291,7 +290,7 @@ def test_live_backend_shapes_render_every_page():
             assert nodes[0][0] == "master" and "在线" in nodes[0][3], nodes
 
             queue = _rows(screen, "#queue-table")
-            assert [row[0] for row in queue] == ["[b]Q0[/]", "[b]Q1[/]", "[b]Q2[/]"], queue
+            assert [row[0] for row in queue] == ["执行中", "1"], queue
 
             device = str(screen.query_one("#device-pane", Static).render())
             assert "Windows 10.0.19045" in device and "i9-13900H" in device, device
@@ -300,6 +299,40 @@ def test_live_backend_shapes_render_every_page():
             status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
             assert "运行模式=distributed" in status, status
             assert "尚未选择分布式模型" in status, status
+
+    _run(_main())
+
+
+def test_android_resource_projection_displays_unknown_physical_cores_as_dash():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause()
+            app.screen.fill_resources({
+                "scope": "cluster",
+                "node_count": 1,
+                "available_node_count": 1,
+                "available": {
+                    "local": {
+                        "node_id": "y700", "role": "client", "available": True,
+                        "cpu": {"physical_cores": None, "logical_cores": 8},
+                        "ram": {"total_gb": 12.0, "available_gb": 5.0},
+                        "gpu": {"count": 0, "cuda_count": 0},
+                    },
+                    "remote": [],
+                },
+                "totals": {
+                    "physical_cores": None, "logical_cores": 8,
+                    "ram_total_gb": 12.0, "ram_available_gb": 5.0,
+                },
+            })
+            rows = _rows(app.screen, "#resources-table")
+            assert rows[0][2] == "— / 8", rows
+            assert rows[0][3] == "12.0 / 5.0 GB", rows
+            assert rows[-1][2] == "— / 8", rows
 
     _run(_main())
 

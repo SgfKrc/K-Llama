@@ -61,7 +61,7 @@ def _validate_contract(data: Any, *, source: Path) -> dict[str, Any]:
     profile = data.get("profile")
     if not isinstance(version, dict) or not isinstance(profile, dict):
         raise ReleaseContractError(f"release contract sections are missing: {source}")
-    for key in ("product", "launcher", "inference_service_contract"):
+    for key in ("product", "inference_service_contract"):
         if not str(version.get(key, "")).strip():
             raise ReleaseContractError(f"release version {key!r} is missing: {source}")
     android_code = version.get("android_code")
@@ -77,7 +77,6 @@ def _validate_contract(data: Any, *, source: Path) -> dict[str, Any]:
     required_keys = {
         "QLH_ROUTE_A_STAGE_OFFER",
         "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED",
-        "QLH_TASK_GRAPH_ENABLED",
         "QLH_RELAY_ENABLED",
         "QLH_RELAY_PROBE_ONLY",
     }
@@ -122,7 +121,6 @@ def release_contract_path() -> Path:
 
 RELEASE_CONTRACT = load_release_contract()
 PRODUCT_VERSION = str(RELEASE_CONTRACT["version"]["product"])
-LAUNCHER_VERSION = str(RELEASE_CONTRACT["version"]["launcher"])
 ANDROID_VERSION_CODE = int(RELEASE_CONTRACT["version"]["android_code"])
 INFERENCE_SERVICE_CONTRACT_VERSION = str(
     RELEASE_CONTRACT["version"]["inference_service_contract"]

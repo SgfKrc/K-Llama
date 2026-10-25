@@ -27,7 +27,6 @@ def _clear_role_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_canonical_versions_are_exported() -> None:
     contract = json.loads((ROOT / "release-contract.json").read_text(encoding="utf-8"))
     assert release_contract.PRODUCT_VERSION == contract["version"]["product"]
-    assert release_contract.LAUNCHER_VERSION == contract["version"]["launcher"]
     assert release_contract.ANDROID_VERSION_CODE == contract["version"]["android_code"]
 
 
@@ -40,80 +39,27 @@ def test_release_profile_overrides_stale_product_switches(monkeypatch: pytest.Mo
     applied = release_contract.apply_release_profile_to_env(environment)
     assert applied == release_contract.FIXED_RELEASE_ENV
     assert environment["QLH_ROUTE_A_STAGE_OFFER"] == "1"
-    assert environment["QLH_TASK_GRAPH_ENABLED"] == "0"
+    assert "QLH_TASK_GRAPH_ENABLED" not in release_contract.FIXED_RELEASE_ENV
     assert environment["QLH_TASK_WORKER_EXPERIMENTAL_ENABLED"] == "1"
 
 
-def test_release_runtime_feature_conflict_is_named_and_side_effect_free(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_release_runtime_feature_conflict_is_named_and_side_effect_free(monkeypatch):
     import api_server
-    import config
-
-    monkeypatch.setenv('QLH_RELEASE_PROFILE_ENFORCE', '1')
-    monkeypatch.setattr(api_server.scheduler, '_effective_role', lambda: 'master')
-    monkeypatch.setattr(api_server, 'TASK_GRAPH_ENABLED', False)
-    monkeypatch.setattr(api_server, 'TASK_WORKER_EXPERIMENTAL_ENABLED', True)
-    monkeypatch.setattr(config, 'TASK_GRAPH_ENABLED', False)
-    monkeypatch.setattr(config, 'TASK_WORKER_EXPERIMENTAL_ENABLED', True)
-    persisted = False
-
-    def fail_if_persisted(**_kwargs: bool) -> None:
-        nonlocal persisted
-        persisted = True
-        raise AssertionError('a rejected release feature change must not persist')
-
-    monkeypatch.setattr(
-        api_server,
-        '_persist_task_graph_feature_settings',
-        fail_if_persisted,
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(api_server.set_task_graph_config(
-            api_server.TaskGraphConfigRequest(enabled=True)
-        ))
-
-    assert exc_info.value.status_code == 409
-    assert exc_info.value.headers == {
-        'X-QLH-Error-Code': 'RELEASE_PROFILE_FEATURE_LOCKED',
-    }
-    assert exc_info.value.detail == {
-        'code': 'RELEASE_PROFILE_FEATURE_LOCKED',
-        'message': (
-            f'release profile {release_contract.RELEASE_PROFILE_NAME!r} fixes '
-            'QLH_TASK_GRAPH_ENABLED=0; requested 1'
-        ),
-        'feature': 'QLH_TASK_GRAPH_ENABLED',
-        'requested': '1',
-        'required': '0',
-        'release_profile': release_contract.RELEASE_PROFILE_NAME,
-    }
-    assert api_server.TASK_GRAPH_ENABLED is False
-    assert api_server.TASK_WORKER_EXPERIMENTAL_ENABLED is True
-    assert config.TASK_GRAPH_ENABLED is False
-    assert config.TASK_WORKER_EXPERIMENTAL_ENABLED is True
-    assert persisted is False
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+    before = api_server.TASK_WORKER_EXPERIMENTAL_ENABLED
+    with pytest.raises(HTTPException) as error:
+        api_server._apply_runtime_feature_settings({"QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": False})
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "RELEASE_PROFILE_FEATURE_LOCKED"
+    assert api_server.TASK_WORKER_EXPERIMENTAL_ENABLED == before
 
 
-def test_runtime_feature_lock_only_rejects_release_conflicts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_runtime_feature_lock_only_rejects_release_conflicts(monkeypatch):
     import api_server
-
-    monkeypatch.setenv('QLH_RELEASE_PROFILE_ENFORCE', '1')
-    assert api_server._apply_runtime_feature_settings({
-        'QLH_TASK_GRAPH_ENABLED': False,
-        'QLH_TASK_WORKER_EXPERIMENTAL_ENABLED': True,
-    }) == {
-        'QLH_TASK_GRAPH_ENABLED': False,
-        'QLH_TASK_WORKER_EXPERIMENTAL_ENABLED': True,
-    }
-
-    monkeypatch.setenv('QLH_RELEASE_PROFILE_ENFORCE', '0')
-    assert api_server._apply_runtime_feature_settings({
-        'QLH_TASK_GRAPH_ENABLED': True,
-    }) == {'QLH_TASK_GRAPH_ENABLED': True}
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+    assert api_server._apply_runtime_feature_settings({"QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": True}) == {"QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": True}
+    with pytest.raises(ValueError):
+        api_server._apply_runtime_feature_settings({"QLH_TASK_GRAPH_ENABLED": True})
 
 
 def test_packaged_role_is_deterministic_without_user_state(
@@ -153,7 +99,7 @@ def test_distributed_required_rejects_local_or_external_completion() -> None:
         )
 
 
-def test_release_distributed_required_accepts_route_a_evidence(
+def test_release_distributed_required_accepts_linear_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
@@ -161,19 +107,27 @@ def test_release_distributed_required_accepts_route_a_evidence(
         "distributed_required",
         {
             "distributed_used": True,
-            "execution_mode": "route_a_stage_offer_v3",
+            "execution_mode": "distributed_pipeline",
             "workers_used": ["worker-1"],
             "layer_segments": [[16, 24]],
         },
     )
 
 
+@pytest.mark.parametrize("mode", ["task_graph", "route_a_stage_offer_v3"])
 def test_release_distributed_required_rejects_non_product_route(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mode,
 ) -> None:
     monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
     with pytest.raises(distributed_completion.DistributedCompletionError, match="不允许"):
         distributed_completion.validate_distributed_completion(
             "distributed_required",
-            {"distributed_used": True, "execution_mode": "task_graph"},
+            {"distributed_used": True, "execution_mode": mode},
         )
+
+
+def test_release_linear_completion_requires_physical_worker_evidence(monkeypatch):
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+    with pytest.raises(distributed_completion.DistributedCompletionError, match="缺少 worker"):
+        distributed_completion.validate_distributed_completion("distributed_required", {
+            "distributed_used": True, "execution_mode": "distributed_pipeline"})

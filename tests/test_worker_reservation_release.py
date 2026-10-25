@@ -25,7 +25,7 @@ from task_worker_adapter import (  # noqa: E402
     RemoteFullWorkerProvider,
     TaskWorkerControlPlane,
 )
-from task_provider import ModelIdentity, StageRequest  # noqa: E402
+from execution_provider import ModelIdentity, StageRequest  # noqa: E402
 
 
 def _capabilities():
@@ -128,7 +128,7 @@ def test_in_flight_reservation_is_not_reaped():
     provider = _provider(coordinator, sent=sent)
     reservation = provider.reserve(_request(provider.provider_id))
 
-    from task_provider import StageAttempt
+    from execution_provider import StageAttempt
 
     stage_attempt = StageAttempt(
         attempt_id="att_release001",

@@ -30,7 +30,7 @@ from cluster_quorum import (  # noqa: E402
     SQLiteVoterLedger,
 )
 from journal_replication import DurableJournalReplica, build_checkpoint  # noqa: E402
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 WF = "wf-wired"
 DIGEST = "c" * 64
@@ -263,14 +263,21 @@ def test_voter_rpc_keeps_the_watermark_code(tmp_path):
     assert result["code"] == "quorum_watermark_unavailable"
 
 
-def test_remote_voter_call_propagates_watermark_code():
-    """`HTTPRemoteVoter` 不得把水位码降级成通用码（白名单必须放行它）。"""
+@pytest.mark.parametrize("code", [
+    "quorum_watermark_unheld", "quorum_term_conflict", "quorum_ledger_corrupt",
+])
+def test_remote_voter_call_propagates_protocol_error_codes(monkeypatch, code):
+    """HTTP voter replies retain every stable quorum protocol error code."""
     import json as _json
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from cluster_auto_role_runtime import HTTPRemoteVoter
     from cluster_quorum import QuorumError
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -279,7 +286,7 @@ def test_remote_voter_call_propagates_watermark_code():
             return
 
         def do_POST(self):  # noqa: N802 - http.server API
-            body = _json.dumps({"ok": False, "code": "quorum_watermark_unheld"}).encode()
+            body = _json.dumps({"ok": False, "code": code}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -295,7 +302,7 @@ def test_remote_voter_call_propagates_watermark_code():
         remote = HTTPRemoteVoter("rog-voter", f"http://{host}:{port}", secret="s" * 40, timeout=3.0)
         with pytest.raises(QuorumError) as excinfo:
             remote.snapshot()
-        assert excinfo.value.code == "quorum_watermark_unheld"
+        assert excinfo.value.code == code, repr(excinfo.value.__cause__)
     finally:
         server.shutdown()
         server.server_close()

@@ -390,3 +390,27 @@ def test_aggregate_resource_view_counts_only_available_nodes_and_hides_addresses
     serialized = json.dumps(view)
     assert "127.0.0.1" not in serialized
     assert "100.64.0.2" not in serialized
+
+
+def test_aggregate_resource_view_projects_android_cpu_and_byte_memory():
+    gib = 1024 ** 3
+    view = build_aggregate_resource_view([
+        {
+            "node_id": "master", "role": "master", "state": "online",
+            "device_info": {
+                "android": {"cpu_cores": 8},
+                "memory": {
+                    "total_bytes": 12 * gib,
+                    "available_bytes": 5 * gib,
+                },
+            },
+        },
+    ], local_node_id="master")
+
+    local = view["available"]["local"]
+    assert local["cpu"] == {"physical_cores": None, "logical_cores": 8}
+    assert local["ram"] == {"total_gb": 12.0, "available_gb": 5.0}
+    assert view["totals"]["physical_cores"] is None
+    assert view["totals"]["logical_cores"] == 8
+    assert view["totals"]["ram_total_gb"] == 12.0
+    assert view["totals"]["ram_available_gb"] == 5.0

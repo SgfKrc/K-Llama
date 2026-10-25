@@ -24,6 +24,16 @@ from cluster_quorum import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def synthetic_lease_clock(monkeypatch):
+    # This suite asserts lease state transitions at explicit millisecond values.
+    # Advancing wall/monotonic-clock fencing has dedicated authority tests.
+    from qlh_core.control import clock
+    advancing = clock.operation_clock
+    monkeypatch.setattr(clock, "operation_clock",
+        lambda now_ms=None: advancing() if now_ms is None else lambda: now_ms)
+
+
 def _fixture(root: Path):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -182,6 +192,7 @@ def test_scheduler_can_attach_controller_without_enabling_global_auto_mode(tmp_p
         "voter-0", authority=authority, collector=collector, fence=fence
     )
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._runtime_settings = {"NODE_ROLE":"client"}
     scheduler._role_override = None
     scheduler._auto_role_controller = None
     scheduler.set_auto_role_controller(controller)
@@ -278,6 +289,7 @@ def test_auto_role_override_cannot_claim_master_without_a_certificate(monkeypatc
 
     monkeypatch.setattr(scheduler_module, "NODE_ROLE", "auto")
     scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler._runtime_settings = {"NODE_ROLE":"auto"}
     scheduler._auto_role_controller = None
     scheduler._role_override = "master"
     assert scheduler._effective_role() == "client"

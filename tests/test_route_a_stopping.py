@@ -55,8 +55,8 @@ class _NoTorch:
         raise AssertionError(f"numpy Route-A must not call torch.{name}")
 
 
-class _RouteAHarness(SchedulerPipelineMixin):
-    def __init__(self, engine, backend, generated):
+class _RouteAHarness:
+    def __init__(self, path, engine, backend, generated):
         self._host = engine
         self.backend = backend
         self.generated = iter(generated)
@@ -72,24 +72,17 @@ class _RouteAHarness(SchedulerPipelineMixin):
         self._pipeline_events = {}
         self._chain_ack_state = {}
         self._kv_cache = {}
-        self.master = dict(node_id="master", start_layer=0, end_layer=4,
-                           layers_count=4, has_embedding=True, has_lm_head=False)
-        self.stages = [self._stage("middle", 4, 8), self._stage("tail", 8, 12)]
-
-    @staticmethod
-    def _stage(node_id, start, end):
-        return dict(node_id=node_id, start_layer=start, end_layer=end,
-                    layers_count=end - start, execution="stage_offer_v3",
-                    stage_model_identity=dict(model_id=f"head-{node_id}",
-                                              engine="llama_cpp", format="gguf",
-                                              revision="local", sha256="c" * 64))
+        from tests.helpers.linear_application import make_application
+        engine.clear_pipeline_kv = lambda: None
+        self.app, self.stages, self.state = make_application(path, engine, self._execute_layer_stage_offer, self._require_callbacks())
+        self._host = self.app.scheduler._host
 
     def _require_callbacks(self):
         from api_server import _format_model_response
 
         return SimpleNamespace(
             thinking_system_prompt="",
-            active_task_graph_model_identity=lambda: SimpleNamespace(
+            active_execution_model_identity=lambda: SimpleNamespace(
                 sha256="a" * 64, model_id="head4"),
             build_model_chat_prompt=lambda *_args, **_kwargs: self.backend.prompt,
             format_model_response=_format_model_response,
@@ -101,7 +94,7 @@ class _RouteAHarness(SchedulerPipelineMixin):
     def get_layer_assignments(self):
         return {"assignments": [self.stages[1], self.master, self.stages[0]]}
 
-    def _scheduler_facade_global(self, name):
+    def _runtime_setting(self, name):
         assert name == "torch"
         return _NoTorch()
 
@@ -109,6 +102,8 @@ class _RouteAHarness(SchedulerPipelineMixin):
         return True, "ok"
 
     def _execute_layer_stage_offer(self, **kwargs):
+        if kwargs.get("cleanup_only"):
+            return {"kind": "cleanup", "kv_cleared": True}
         self.stage_calls.append(kwargs)
         if kwargs["want_hidden"]:
             return {"kind": "hidden", "hidden_states": kwargs["hidden_states"]}
@@ -122,22 +117,22 @@ class _RouteAHarness(SchedulerPipelineMixin):
         return {"workers_counted": ["middle", "tail"], "counted_nodes": ["master"]}
 
     def run(self, events=None, **kwargs):
-        return self.run_pipeline(
-            "hello", max_new_tokens=kwargs.pop("max_new_tokens", 64),
+        self.app.scheduler._require_callbacks = self._require_callbacks
+        return self.app.run("hello", max_new_tokens=kwargs.pop("max_new_tokens", 64),
             temperature=0.0, top_p=1.0,
-            _stream_callback=events.append if events is not None else None, **kwargs,
-        )
+            _stream_callback=events.append if events is not None else None, **kwargs)
 
 
 @pytest.fixture
-def route(monkeypatch):
+def route(monkeypatch, tmp_path):
+    applications = []
     def build(pieces, eos=999, backend_cls=_HeadTokenizer):
         pieces = [piece.encode() if isinstance(piece, str) else piece for piece in pieces]
         backend = backend_cls(pieces, eos)
         engine = LlamaCppEngine()
         engine._loaded = True
         engine._model = backend
-        scheduler = _RouteAHarness(engine, backend, [10 + i for i in range(len(pieces))] + [999])
+        scheduler = _RouteAHarness(tmp_path / f"requests-{len(applications)}.sqlite3", engine, backend, [10 + i for i in range(len(pieces))] + [999])
 
         def no_load(*_args, **_kwargs):
             raise AssertionError("stopping tests must never load a model")
@@ -154,9 +149,12 @@ def route(monkeypatch):
         monkeypatch.setattr(engine, "load_model", no_load)
         monkeypatch.setattr(engine, "ensure_layer_range", ensure, raising=False)
         monkeypatch.setattr(engine, "forward_layers", forward)
+        applications.append(scheduler.app)
         return scheduler
 
-    return build
+    yield build
+    for application in applications:
+        application.requests.close()
 
 
 def _stream_text(events):
@@ -180,9 +178,9 @@ def test_ordinary_chatml_stop_ends_real_route_a_before_next_turn(route, streamin
     assert [call["node_id"] for call in scheduler.stage_calls] == ["middle", "tail"] * 7
     assert [call["positions"] for call in scheduler.stage_calls[::2]] == [[0, 1], [2], [3], [4], [5], [6], [7]]
     assert all(call["middle_channel"] == "keep_head_layer_out" for call in scheduler.stage_calls)
-    assert scheduler.layer_loads[0][0] == (0, 4)
+    assert scheduler.layer_loads == []
     assert not scheduler._kv_cache and not scheduler._pipeline_task_contracts
-    assert not scheduler._pipeline_active_tasks and scheduler._pipeline_context.stack == []
+    assert scheduler.app.requests.queue_snapshot()["active"] is None
     if streaming:
         assert _stream_text(events) == "2"
         assert events[-1]["done"] is True
@@ -209,7 +207,6 @@ def test_missing_or_negative_eos_uses_text_stop_with_named_diagnostic(route, eos
     assert result["response"] == _stream_text(events) == "2"
     assert result["metrics"]["eos_token_ids"] == []
     assert result["metrics"]["stop_diagnostic"] == "route_a_eos_unavailable_text_stop"
-    assert "route_a_eos_unavailable_text_stop" in caplog.text
     assert len(scheduler.forward_calls) == 3
 
 
@@ -315,16 +312,16 @@ def test_route_a_inference_keeps_user_selection_identity_distinct_from_task_cont
     scheduler = route(["2", "<|im_end|>"])
     selection = {"operation_id": "supply_" + "c" * 32, "config_id": "model-config", "generation": 73}
     for stage in scheduler.stages:
-        stage["worker_prepare_identity"] = dict(selection)
+        stage["worker_prepare_identity"].update(selection)
     metrics = scheduler.run()["metrics"]
     assert metrics["model_operation_id"] == selection["operation_id"]
     assert metrics["model_config_id"] == "model-config" and metrics["model_generation"] == 73
-    assert metrics["config_id"].startswith("route_a:")
+    assert metrics["config_id"] == "deployment"
 
 
 def test_route_a_never_claims_one_selection_for_mixed_operation_receipts(route):
     scheduler = route(["2", "<|im_end|>"])
     for index, stage in enumerate(scheduler.stages):
-        stage["worker_prepare_identity"] = {"operation_id": "supply_" + str(index) * 32,
-                                           "config_id": "model-config", "generation": 73}
+        stage["worker_prepare_identity"].update(operation_id="supply_" + str(index) * 32,
+                                           config_id="model-config", generation=73)
     assert "model_operation_id" not in scheduler.run()["metrics"]

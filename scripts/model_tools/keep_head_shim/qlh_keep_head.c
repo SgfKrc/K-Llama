@@ -407,6 +407,102 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
     return 0;
 }
 
+/* COMM-MULTIPOS-01: one argmax per input row, for one contiguous sequence.
+ * out_capacity counts int32_t elements (not bytes); it must be >= n_tokens.
+ * NULL metadata means n_seq_id=1, seq_id=0, positions=n_past+i. Explicit
+ * positions take precedence over n_past and must be contiguous nonnegative
+ * int32 positions starting at positions[0]. A constant nonzero seq_id is valid.
+ * Returns -5 for invalid input/allocation failure, -2 for decode failure,
+ * -6 for missing logits/vocab, -7 for non-finite logits. On ANY failure the
+ * caller's output remains untouched. This does not roll back decoded KV.
+ * The scalar entry point and its ABI/metadata semantics remain unchanged. */
+int32_t qlh_kh_forward_embd_tokens(void * handle_void,
+                                   const float * embd, int32_t n_tokens, int32_t n_past,
+                                   const int32_t * n_seq_id, const int32_t * seq_ids,
+                                   const int32_t * positions,
+                                   int32_t * out_tokens, int32_t out_capacity) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle != NULL) {
+        handle->last_error = 0;
+    }
+    if (handle == NULL || handle->ctx == NULL || handle->n_embd <= 0 ||
+        embd == NULL || out_tokens == NULL || n_tokens <= 0 ||
+        out_capacity < n_tokens ||
+        (size_t) n_tokens > SIZE_MAX / sizeof(int32_t) ||
+        (size_t) n_tokens > SIZE_MAX / sizeof(float) / (size_t) handle->n_embd) {
+        return -5;
+    }
+    const int32_t pos_start = positions == NULL ? n_past : positions[0];
+    if (pos_start < 0 || (int64_t) pos_start + n_tokens - 1 > INT32_MAX) {
+        return -5;
+    }
+    const int32_t sequence = seq_ids == NULL ? 0 : seq_ids[0];
+    if (sequence < 0) {
+        return -5;
+    }
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        if ((n_seq_id != NULL && n_seq_id[i] != 1) ||
+            (seq_ids != NULL && seq_ids[i] != sequence) ||
+            (positions != NULL && positions[i] != pos_start + i)) {
+            return -5;
+        }
+    }
+
+    int32_t * result = (int32_t *) malloc((size_t) n_tokens * sizeof(int32_t));
+    if (result == NULL) {
+        return -5;
+    }
+    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
+    qlh_fill_explicit(&batch, n_tokens, pos_start, n_seq_id, seq_ids, positions);
+    if (qlh_fill_pos_planar(&batch, n_tokens, pos_start, positions,
+                            handle->n_pos_per_embd) != 0) {
+        llama_batch_free(batch);
+        free(result);
+        return -5;
+    }
+    memcpy(batch.embd, embd, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
+    const int32_t decode_rc = llama_decode(handle->ctx, batch);
+    llama_batch_free(batch);
+    if (decode_rc != 0) {
+        handle->last_error = decode_rc;
+        free(result);
+        return -2;
+    }
+
+    const struct llama_model * model = llama_get_model(handle->ctx);
+    const struct llama_vocab * vocab = model == NULL ? NULL : llama_model_get_vocab(model);
+    const int32_t n_vocab = vocab == NULL ? 0 : llama_vocab_n_tokens(vocab);
+    int32_t rc = n_vocab > 0 ? 0 : -6;
+    for (int32_t row = 0; rc == 0 && row < n_tokens; ++row) {
+        const float * logits = llama_get_logits_ith(handle->ctx, row);
+        if (logits == NULL) {
+            rc = -6;
+            break;
+        }
+        int32_t best = 0;
+        float best_logit = logits[0];
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            const float value = logits[i];
+            if (!isfinite(value)) {
+                fprintf(stderr, "[qlh_keep_head] non-finite logits (row=%d, vocab_index=%d)\n",
+                        row, i);
+                rc = -7;
+                break;
+            }
+            if (value > best_logit) {
+                best_logit = value;
+                best = i;
+            }
+        }
+        result[row] = best;
+    }
+    if (rc == 0) {
+        memcpy(out_tokens, result, (size_t) n_tokens * sizeof(int32_t));
+    }
+    free(result);
+    return rc;
+}
+
 /* Optional capabilities; older shims do not export these symbols. */
 int32_t qlh_kh_finite_logits_guard(void) {
     return 1;
@@ -473,4 +569,18 @@ void qlh_kh_close(void * handle_void) {
         handle->model = NULL;
     }
     free(handle);
+}
+
+/* Read-only R3 load receipt. Values come from the loaded native handle. */
+uint64_t qlh_kh_model_bytes(void * ptr) {
+    qlh_keep_head * h = (qlh_keep_head *) ptr;
+    return h && h->model ? llama_model_size(h->model) : 0;
+}
+uint32_t qlh_kh_context_size(void * ptr) {
+    qlh_keep_head * h = (qlh_keep_head *) ptr;
+    return h && h->ctx ? llama_n_ctx(h->ctx) : 0;
+}
+uint32_t qlh_kh_batch_size(void * ptr) {
+    qlh_keep_head * h = (qlh_keep_head *) ptr;
+    return h && h->ctx ? llama_n_batch(h->ctx) : 0;
 }

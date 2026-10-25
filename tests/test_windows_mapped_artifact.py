@@ -22,7 +22,7 @@ SPEC = importlib.util.spec_from_file_location(
 helper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(helper)
 
-Mapping = namedtuple("Mapping", "addr perms path rss")
+Mapping = namedtuple("Mapping", "addr perms path region_bytes")
 PID, CREATED = 4242, 12345.25
 MAPPED = r"C:\deleted-operation\old-segment.gguf"
 ARTIFACT = r"C:\current-operation\segment.gguf"
@@ -280,7 +280,7 @@ def test_entire_inventory_must_be_stable_including_unrelated_regions(fake, chang
     else:
         key, value = {
             "address": ("addr", "0xa0000"), "permissions": ("perms", "r"),
-            "path": ("path", r"C:\changed.dll"), "size": ("rss", PAGE * 2),
+            "path": ("path", r"C:\changed.dll"), "size": ("region_bytes", PAGE * 2),
         }[change]
         fake.snapshots[1][1] = unrelated._replace(**{key: value})
     with pytest.raises(ValueError, match="inventory changed"):
@@ -290,7 +290,7 @@ def test_entire_inventory_must_be_stable_including_unrelated_regions(fake, chang
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, "4096"])
 def test_malformed_unrelated_map_cannot_be_silently_dropped(fake, value):
-    fake.snapshots[0][1] = fake.snapshots[0][1]._replace(rss=value)
+    fake.snapshots[0][1] = fake.snapshots[0][1]._replace(region_bytes=value)
     with pytest.raises(ValueError, match="malformed"):
         capture()
     assert not fake.reads
@@ -324,7 +324,7 @@ def test_selected_mapping_must_be_exactly_readonly(fake, perms):
 
 @pytest.mark.parametrize("size", [1, len(DATA), PAGE, rounded(len(DATA)) + PAGE])
 def test_mapping_size_must_be_exactly_page_rounded_artifact_size(fake, size):
-    fake.snapshots[0][0] = fake.snapshots[0][0]._replace(rss=size)
+    fake.snapshots[0][0] = fake.snapshots[0][0]._replace(region_bytes=size)
     with pytest.raises(ValueError, match="page-rounded"):
         capture()
     assert not fake.reads
@@ -558,3 +558,14 @@ def test_windows_real_writable_file_mapping_is_rejected(native_mapping):
 
 
 
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows VirtualQueryEx")
+def test_windows_boundary_uses_virtual_extent_independent_of_rss(monkeypatch):
+    backend = helper._WindowsMemoryBackend()
+    monkeypatch.setattr(backend._psutil, "Process", lambda pid: SimpleNamespace(
+        memory_maps=lambda **kwargs: [SimpleNamespace(addr=hex(BASE), perms="r", path=MAPPED, rss=0)]))
+    monkeypatch.setattr(backend, "query", lambda address: region())
+    observed = list(backend.maps(PID))
+    assert len(observed) == 1
+    assert observed[0].region_bytes == rounded(len(DATA))

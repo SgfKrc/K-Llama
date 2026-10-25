@@ -24,7 +24,7 @@ from journal_replication_transport import (  # noqa: E402
     JournalReplicationTransportError,
     send_checkpoint,
 )
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 
 def _serve_replica_child(replica_path, ready_queue, stop_event, secret):

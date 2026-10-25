@@ -17,7 +17,7 @@ _SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from task_provider import (
+from execution_provider import (
     ModelIdentity,
     ProviderExecutionError,
     ProviderUnavailable,

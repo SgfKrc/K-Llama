@@ -1,6 +1,6 @@
 """TUI 端到端 flow —— **D-a 档：本机 loopback 多段**（演示降级；缺工件则 skip）。
 
-计划：`docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md`（具名票 `CORE-TUI-E2E-01`，§4.2 D-a）。
+计划：`docs/archive/tui/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md`（具名票 `CORE-TUI-E2E-01`，§4.2 D-a）。
 
 与另外两档的关系
 - **F1**（`tests/test_tui_e2e_flow.py`）：假后端、零模型 ⇒ **必跑**，进 `unit` 通道 + `startup_matrix`。

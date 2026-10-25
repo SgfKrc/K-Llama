@@ -27,7 +27,7 @@ def _isolated_api_probe_env(tmp_path: Path) -> dict[str, str]:
         "QLH_NODE_CONFIG_PATH": str(tmp_path / "node-config.json"),
         "QLH_TASK_GRAPH_ENABLED": "false",
         "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": "false",
-        "QLH_TASK_GRAPH_INSTANCE_ID": f"cold-probe-{tmp_path.name}",
+        "QLH_LEGACY_RECOVERY_INSTANCE_ID": f"cold-probe-{tmp_path.name}",
     })
     env["PYTHONPATH"] = os.pathsep.join(
         item for item in (str(repo_root / "src"), env.get("PYTHONPATH", "")) if item
@@ -39,9 +39,10 @@ def test_shared_lifespans_reference_count_runtime(monkeypatch):
     """Two uvicorn servers must share one runtime lifetime and readiness state."""
     startup_calls = []
     shutdown_calls = []
+    runtime = api_server._get_app_runtime()
     readiness_before = dict(api_server._runtime_readiness)
-    with api_server._runtime_lifecycle_lock:
-        api_server._runtime_lifecycle_users = 0
+    with runtime._lock:
+        runtime._users = 0
 
     def fake_startup():
         startup_calls.append(True)
@@ -69,18 +70,18 @@ def test_shared_lifespans_reference_count_runtime(monkeypatch):
         await first.__aexit__(None, None, None)
         assert shutdown_calls == []
         with api_server._runtime_lifecycle_lock:
-            assert api_server._runtime_lifecycle_users == 1
+            assert runtime._users == 1
 
         await second.__aexit__(None, None, None)
         assert shutdown_calls == [True]
         with api_server._runtime_lifecycle_lock:
-            assert api_server._runtime_lifecycle_users == 0
+            assert runtime._users == 0
 
     try:
         asyncio.run(exercise())
     finally:
-        with api_server._runtime_lifecycle_lock:
-            api_server._runtime_lifecycle_users = 0
+        with runtime._lock:
+            runtime._users = 0
         with api_server._runtime_readiness_lock:
             api_server._runtime_readiness.clear()
             api_server._runtime_readiness.update(readiness_before)
@@ -137,7 +138,10 @@ def test_frontend_bootstrap_endpoints_keep_model_manager_lazy(monkeypatch):
     monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "model_manager", model_host_module._LazyModelManager())
 
+    from types import SimpleNamespace
     class FakeScheduler:
+        _participation = SimpleNamespace(snapshot=lambda: {"phase":"stable"})
+        _model_control = SimpleNamespace(boot_id="cold-start-test")
         _max_nodes = 3
 
         def get_distributed_inference_enabled(self):

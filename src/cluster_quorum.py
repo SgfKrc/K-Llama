@@ -42,6 +42,7 @@ QUORUM_ERROR_CODES = frozenset(
         "quorum_expiry_regressed",
         "quorum_certificate_conflict",
         "quorum_ledger_corrupt",
+        "quorum_migration_not_required",
         "quorum_invalid_identity",
         "quorum_invalid_leader",
         "quorum_invalid_policy",
@@ -185,6 +186,12 @@ class SQLiteVoterLedger:
                     active_expires_at_ms INTEGER,
                     active_certificate_digest TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS quorum_recovery_floors (
+                    domain_id TEXT PRIMARY KEY,
+                    last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0),
+                    checkpoint_digest TEXT NOT NULL,
+                    floor_state TEXT NOT NULL CHECK (floor_state IN ('accepted', 'committed'))
+                );
                 CREATE TABLE IF NOT EXISTS quorum_votes (
                     voter_set_epoch INTEGER NOT NULL,
                     term INTEGER NOT NULL CHECK (term > 0),
@@ -223,6 +230,61 @@ class SQLiteVoterLedger:
                     (key, value),
                 )
 
+            # An older ledger cannot infer its recovery domain list from a
+            # certificate hash. Hold it read-only until a verified import.
+            marker = connection.execute("SELECT value FROM quorum_metadata WHERE key='recovery_floor_schema'").fetchone()
+            if marker is None:
+                active = self._state(connection)
+                votes = connection.execute("SELECT COUNT(*) FROM quorum_votes").fetchone()[0]
+                initialized = "needs_import" if active["active_certificate_digest"] or votes else "2"
+                connection.execute("INSERT INTO quorum_metadata(key,value) VALUES ('recovery_floor_schema',?)", (initialized,))
+
+    def import_recovery_manifest(self, certificate, voter_set, *, accepted_certificates=()):
+        """Import once, covering every durable legacy signature before unlocking."""
+        manifests = tuple(QuorumCertificate.from_dict(item) if not isinstance(item, QuorumCertificate) else item
+                          for item in (certificate, *accepted_certificates))
+        for item in manifests:
+            validate_certificate(item, voter_set, now_ms=0)
+            if item.cluster_id != self.cluster_id or item.voter_set_epoch != self.voter_set_epoch:
+                raise QuorumError("quorum_ledger_corrupt", "manifest belongs to another recovery domain")
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            marker = connection.execute("SELECT value FROM quorum_metadata WHERE key='recovery_floor_schema'").fetchone()
+            if marker is None or marker["value"] != "needs_import":
+                raise QuorumError("quorum_migration_not_required", "recovery manifest import is a one-shot legacy migration")
+            row = self._state(connection)
+            active_digest = row["active_certificate_digest"]
+            if active_digest and manifests[0].digest() != active_digest:
+                raise QuorumError("quorum_ledger_corrupt", "migration manifest must match the durable active certificate")
+            for vote in connection.execute("SELECT * FROM quorum_votes"):
+                covered = any(
+                    item.term == vote["term"] and item.leader_id == vote["leader_id"]
+                    and item.lease_id == vote["lease_id"] and item.expires_at_ms == vote["expires_at_ms"]
+                    and any(sig.voter_id == self.voter_id and sig.signature == vote["signature"] for sig in item.signatures)
+                    for item in manifests)
+                if not covered:
+                    raise QuorumError("quorum_watermark_unavailable", "legacy signed proposal requires its verified recovery manifest")
+            for item in manifests:
+                self._save_floor(connection, item, "committed" if item.digest() == active_digest else "accepted")
+            connection.execute("UPDATE quorum_metadata SET value='2' WHERE key='recovery_floor_schema'")
+            connection.execute("COMMIT")
+
+    def _save_floor(self, connection, certificate, state):
+        for watermark in certificate.commit_watermark:
+            previous = connection.execute("SELECT * FROM quorum_recovery_floors WHERE domain_id=?", (watermark.workflow_id,)).fetchone()
+            if previous is not None:
+                if watermark.last_sequence < previous["last_sequence"]:
+                    continue
+                if watermark.last_sequence == previous["last_sequence"] and watermark.checkpoint_digest != previous["checkpoint_digest"]:
+                    raise QuorumError("quorum_watermark_unheld", "recovery manifest forks a durable safety floor")
+            connection.execute(
+                "INSERT INTO quorum_recovery_floors(domain_id,last_sequence,checkpoint_digest,floor_state) VALUES (?,?,?,?) "
+                "ON CONFLICT(domain_id) DO UPDATE SET last_sequence=excluded.last_sequence, "
+                "checkpoint_digest=excluded.checkpoint_digest, floor_state=CASE "
+                "WHEN quorum_recovery_floors.last_sequence=excluded.last_sequence AND quorum_recovery_floors.floor_state='committed' "
+                "THEN 'committed' ELSE excluded.floor_state END",
+                (watermark.workflow_id, watermark.last_sequence, watermark.checkpoint_digest, state))
+
     def _state(self, connection: sqlite3.Connection) -> sqlite3.Row:
         row = connection.execute(
             "SELECT promised_term, promised_leader, active_term, active_leader, "
@@ -252,6 +314,12 @@ class SQLiteVoterLedger:
                 active_certificate_digest=str(row["active_certificate_digest"]),
             )
 
+    def _require_accepted_lease(self, connection, *, leader_id, term, now_ms, lease_id=None):
+        for row in connection.execute("SELECT term,leader_id,lease_id FROM quorum_votes WHERE expires_at_ms > ?", (now_ms,)):
+            if (int(row["term"]) != term or row["leader_id"] != leader_id
+                    or (lease_id is not None and row["lease_id"] != lease_id)):
+                raise QuorumError("quorum_active_lease", "a durable signed lease still protects another authority")
+
     def reserve_term(self, leader_id: str, *, now_ms: int | None = None) -> int:
         now = _now_ms(now_ms)
         leader_id = str(leader_id)
@@ -266,6 +334,7 @@ class SQLiteVoterLedger:
                     "quorum_active_lease",
                     "voter has an unexpired certificate lease",
                 )
+            self._require_accepted_lease(connection, leader_id=leader_id, term=-1, now_ms=now)
             promised_term = int(row["promised_term"])
             promised_leader = str(row["promised_leader"])
             term = max(promised_term, int(row["active_term"])) + 1
@@ -284,6 +353,7 @@ class SQLiteVoterLedger:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._state(connection)
+            self._require_accepted_lease(connection, leader_id=leader_id, term=term, now_ms=now)
             active_expiry = row["active_expires_at_ms"]
             active_term = int(row["active_term"])
             if active_expiry is not None and int(active_expiry) > now and term > active_term:
@@ -307,6 +377,32 @@ class SQLiteVoterLedger:
                 )
             connection.execute("COMMIT")
 
+    def _require_preserved_floor(self, connection, certificate) -> None:
+        marker = connection.execute("SELECT value FROM quorum_metadata WHERE key='recovery_floor_schema'").fetchone()
+        if marker is None or marker["value"] != "2":
+            raise QuorumError("quorum_watermark_unavailable", "legacy voter recovery manifest requires verified import")
+        proposed = {w.workflow_id: w for w in certificate.commit_watermark}
+        for row in connection.execute("SELECT domain_id, last_sequence, checkpoint_digest FROM quorum_recovery_floors"):
+            value = proposed.get(row["domain_id"])
+            if (value is None or value.last_sequence < row["last_sequence"]
+                    or (value.last_sequence == row["last_sequence"]
+                        and value.checkpoint_digest != row["checkpoint_digest"])):
+                raise QuorumError("quorum_watermark_unheld",
+                                  "proposal omits or regresses a durable committed recovery floor")
+
+    def recovery_floors(self) -> tuple[CommitWatermark, ...]:
+        """Durable safety floor, including votes accepted before certificate commit."""
+        with self._lock, self._connect() as connection:
+            return tuple(CommitWatermark(workflow_id=row["domain_id"], last_sequence=row["last_sequence"],
+                                         checkpoint_digest=row["checkpoint_digest"])
+                         for row in connection.execute("SELECT * FROM quorum_recovery_floors ORDER BY domain_id"))
+
+    def committed_floors(self) -> tuple[CommitWatermark, ...]:
+        with self._lock, self._connect() as connection:
+            return tuple(CommitWatermark(workflow_id=row["domain_id"], last_sequence=row["last_sequence"],
+                                         checkpoint_digest=row["checkpoint_digest"])
+                         for row in connection.execute("SELECT * FROM quorum_recovery_floors WHERE floor_state='committed' ORDER BY domain_id"))
+
     def sign_vote(
         self,
         certificate: QuorumCertificate,
@@ -322,6 +418,9 @@ class SQLiteVoterLedger:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._state(connection)
+            self._require_preserved_floor(connection, certificate)
+            self._require_accepted_lease(connection, leader_id=certificate.leader_id, term=certificate.term,
+                                         lease_id=certificate.lease_id, now_ms=now)
             if int(row["promised_term"]) != certificate.term or str(row["promised_leader"]) != certificate.leader_id:
                 raise QuorumError("quorum_vote_rejected", "voter has not prepared this leader and term")
             active_expiry = row["active_expires_at_ms"]
@@ -357,6 +456,7 @@ class SQLiteVoterLedger:
                     certificate.expires_at_ms, signature.signature,
                 ),
             )
+            self._save_floor(connection, certificate, "accepted")
             connection.execute("COMMIT")
             return signature
 
@@ -369,6 +469,9 @@ class SQLiteVoterLedger:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._state(connection)
+            self._require_preserved_floor(connection, certificate)
+            self._require_accepted_lease(connection, leader_id=certificate.leader_id, term=certificate.term,
+                                         lease_id=certificate.lease_id, now_ms=now)
             local_vote = connection.execute(
                 "SELECT leader_id, lease_id, expires_at_ms, signature FROM quorum_votes "
                 "WHERE voter_set_epoch = ? AND term = ? AND voter_id = ?",
@@ -408,6 +511,7 @@ class SQLiteVoterLedger:
                     certificate.expires_at_ms, certificate.digest(),
                 ),
             )
+            self._save_floor(connection, certificate, "committed")
             connection.execute("COMMIT")
 
 
@@ -546,7 +650,11 @@ class QuorumCollector:
         lease_id: str | None = None,
         commit_watermark: Sequence[CommitWatermark] = (),
     ) -> QuorumOutcome:
-        now = _now_ms(now_ms)
+        if now_ms is not None:
+            _now_ms(now_ms)
+        from qlh_core.control.clock import operation_clock
+        read_clock = operation_clock(now_ms)
+        now = read_clock()
         if leader_id not in self.voter_set.voter_map:
             raise QuorumError("quorum_invalid_leader", "leader_id is not a voter")
         available = self._available(available_voter_ids)
@@ -556,7 +664,7 @@ class QuorumCollector:
         reserved: dict[str, int] = {}
         for voter_id in available:
             try:
-                reserved[voter_id] = self.voters[voter_id].reserve_term(leader_id, now_ms=now)
+                reserved[voter_id] = self.voters[voter_id].reserve_term(leader_id, now_ms=read_clock())
             except QuorumError:
                 continue
         if len(reserved) < self.voter_set.quorum_size:
@@ -565,7 +673,7 @@ class QuorumCollector:
         prepared: list[str] = []
         for voter_id in available:
             try:
-                self.voters[voter_id].prepare(leader_id, term, now_ms=now)
+                self.voters[voter_id].prepare(leader_id, term, now_ms=read_clock())
                 prepared.append(voter_id)
             except QuorumError:
                 continue
@@ -589,7 +697,7 @@ class QuorumCollector:
         watermark_error = ""
         for voter_id in prepared:
             try:
-                signatures.append(self.voters[voter_id].sign_vote(unsigned, now_ms=now))
+                signatures.append(self.voters[voter_id].sign_vote(unsigned, now_ms=read_clock()))
             except QuorumError as exc:
                 # 区分「多数不可用」与「多数不持有被提议的已提交前缀」：后者必须让调用方
                 # 看得见（否则会误判成容量/网络问题而重试，掩盖一致性风险）。
@@ -604,10 +712,10 @@ class QuorumCollector:
                 signed_voters=tuple(sorted(signature.voter_id for signature in signatures)),
             )
         certificate = unsigned.with_signatures(signatures)
-        validate_certificate(certificate, self.voter_set, now_ms=now)
+        validate_certificate(certificate, self.voter_set, now_ms=read_clock())
         try:
             for signature in signatures:
-                self.voters[signature.voter_id].commit_certificate(certificate, now_ms=now)
+                self.voters[signature.voter_id].commit_certificate(certificate, now_ms=read_clock())
         except QuorumError:
             return QuorumOutcome(
                 False, "quorum_unavailable", term=term,
@@ -628,13 +736,17 @@ class QuorumCollector:
         now_ms: int | None = None,
         commit_watermark: Sequence[CommitWatermark] | None = None,
     ) -> QuorumOutcome:
-        now = _now_ms(now_ms)
+        if now_ms is not None:
+            _now_ms(now_ms)
+        from qlh_core.control.clock import operation_clock
+        read_clock = operation_clock(now_ms)
+        now = read_clock()
         available = self._available(available_voter_ids)
         blocked = self._blocked(available)
         if blocked is not None:
             return blocked
         try:
-            validate_certificate(certificate, self.voter_set, now_ms=now)
+            validate_certificate(certificate, self.voter_set, now_ms=read_clock())
         except (ControlContractError, TypeError, ValueError):
             return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
         if now + self.policy.lease_duration_ms <= certificate.expires_at_ms:
@@ -642,7 +754,7 @@ class QuorumCollector:
         prepared = []
         for voter_id in available:
             try:
-                self.voters[voter_id].prepare(certificate.leader_id, certificate.term, now_ms=now)
+                self.voters[voter_id].prepare(certificate.leader_id, certificate.term, now_ms=read_clock())
                 prepared.append(voter_id)
             except QuorumError:
                 continue
@@ -668,7 +780,7 @@ class QuorumCollector:
         watermark_error = ""
         for voter_id in prepared:
             try:
-                signatures.append(self.voters[voter_id].sign_vote(renewed_unsigned, now_ms=now))
+                signatures.append(self.voters[voter_id].sign_vote(renewed_unsigned, now_ms=read_clock()))
             except QuorumError as exc:
                 code = str(getattr(exc, "code", ""))
                 if code.startswith("quorum_watermark"):
@@ -680,10 +792,10 @@ class QuorumCollector:
                 term=certificate.term, contacted_voters=available,
             )
         renewed = renewed_unsigned.with_signatures(signatures)
-        validate_certificate(renewed, self.voter_set, now_ms=now)
+        validate_certificate(renewed, self.voter_set, now_ms=read_clock())
         try:
             for signature in signatures:
-                self.voters[signature.voter_id].commit_certificate(renewed, now_ms=now)
+                self.voters[signature.voter_id].commit_certificate(renewed, now_ms=read_clock())
         except QuorumError:
             return QuorumOutcome(False, "quorum_unavailable", term=certificate.term, contacted_voters=available)
         return QuorumOutcome(

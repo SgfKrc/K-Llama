@@ -41,6 +41,7 @@ import re
 import sys
 import time
 from ctypes import byref
+from functools import wraps
 from pathlib import Path
 from product_runtime_receipt import NativeLayerLoadProof
 from typing import Optional, Dict, Any, Iterator, List
@@ -153,7 +154,7 @@ def _apply_ngram_draft_model(load_kwargs: Dict[str, Any]) -> None:
     )
 
 
-def _default_n_ctx(model_path: str) -> int:
+def _default_n_ctx(model_path: str, *, execution_device="cpu", ceiling=None, **context_options) -> int:
     """未显式给 `n_ctx` 时的默认值：先用「每段 KV 预算」收窄，再回退既有常量。
 
     票 20 完成定义第三条：`n_ctx` 应基于每段 KV 预算（层数 × 每层字节 × ctx），
@@ -163,10 +164,15 @@ def _default_n_ctx(model_path: str) -> int:
     from config import MAX_SEQ_LEN
 
     baseline = MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else 4096
+    if ceiling is not None:
+        if type(ceiling) is not int or ceiling <= 0:
+            raise ValueError("inference_context_limit_invalid")
+        baseline = min(baseline, ceiling)
     try:
         import inference_switches
 
-        suggested = inference_switches.suggest_n_ctx_from_gguf(model_path, max_ctx=baseline)
+        suggested = inference_switches.suggest_n_ctx_from_gguf(
+            model_path, max_ctx=baseline, execution_device=execution_device, **context_options)
     except Exception as exc:  # pragma: no cover - 预算属可选事实
         logger.debug("KV 预算推导不可用，n_ctx 用既有默认 %s: %s", baseline, exc)
         return baseline
@@ -179,26 +185,19 @@ def _default_n_ctx(model_path: str) -> int:
     return baseline
 
 
-def _apply_inference_switches(load_kwargs: Dict[str, Any]) -> None:
-    """按设备画像与环境覆盖挂上推理开关（就地修改 `load_kwargs`）。
-
-    映射表与实测依据见 `src/inference_switches.py`。**默认档位不新增任何键** ⇒
-    未设置 `QLH_INFER_*` 时加载路径与本函数引入前逐字一致；每次都记一行日志，
-    使「关闭态」同样可观测（便于回滚与对拍）。
-    """
-    try:
-        import inference_switches
-    except Exception as exc:  # pragma: no cover - 模块缺失属异常部署
-        logger.warning("推理开关模块不可用，按默认档位继续: %s", exc)
-        return
-
-    try:
-        switches = inference_switches.resolve_from_device_profile()
-        inference_switches.apply_to_load_kwargs(switches, load_kwargs)
-    except Exception as exc:
-        logger.warning("推理开关解析失败，按默认档位继续: %s", exc)
-        return
+def _apply_inference_switches(load_kwargs: Dict[str, Any], *, explicit_keys=(),
+                              environment=None, execution_path="llama_cpp_binding"):
+    """Resolve once, apply before native load and return the requested snapshot."""
+    import inference_switches
+    switches = inference_switches.resolve_for_load(
+        str(load_kwargs.get("model_path") or ""), load_kwargs,
+        execution_path=execution_path, explicit_keys=explicit_keys, env=environment)
+    if switches.n_threads and "n_threads" not in explicit_keys:
+        load_kwargs.pop("n_threads", None)
+    inference_switches.apply_to_load_kwargs(switches, load_kwargs)
+    inference_switches.validate_binding_options(load_kwargs)
     logger.info("推理开关: %s", switches.describe())
+    return switches
 
 
 def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
@@ -277,6 +276,8 @@ class LlamaCppEngine:
             print(chunk, end="", flush=True)
     """
 
+    _environment = None
+
     def __init__(self):
         self._model = None           # llama_cpp.Llama 实例
         self._model_path: str = ""
@@ -288,9 +289,9 @@ class LlamaCppEngine:
         self._n_ctx: int = 4096      # 上下文窗口大小
         self._n_threads: int = 4     # CPU 线程数
         self._loaded: bool = False
+        self._inference_switches = None
         self._pipeline_descriptor: Dict[str, Any] | None = None
         self._layer_load_proof: NativeLayerLoadProof | None = None
-        self._pipeline_sha_cache: Dict[str, Any] = {}
         self._pipeline_distributed_only: bool = False
         # RAG embedding is opt-in. A normal text-generation load is never
         # silently reused as an embedding model.
@@ -393,41 +394,27 @@ class LlamaCppEngine:
     # ================================================================
 
     def _pipeline_file_sha256(self, path: str, *, use_cache: bool = True) -> str:
-        """整文件 sha256，按 `(path, mtime, size)` 记忆 —— 大 GGUF 只读一次。
-
-        与 PyTorch 侧 `model_sync.compute_model_sha256`（目录内 artifact 的稳定序
-        联合哈希）**语义不同**：那里是「一组文件」，这里是「单个 GGUF」。两者都只用于
-        「各节点是否握着同一份权重」的自证，由**主节点的描述器单独定口径**，因此
-        混合部署时以主节点为准，不需要跨引擎可比。
-        """
+        """Share verified file digests with supply; explicit fresh checks read bytes."""
+        from model_supply_assets import _hash_file_cached, sha256_file
         try:
-            stat = os.stat(path)
+            return (_hash_file_cached if use_cache else sha256_file)(path)
         except OSError:
             return ""
-        key = (
-            path,
-            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
-            int(stat.st_size),
-        )
-        cache = getattr(self, "_pipeline_sha_cache", None)
-        if not isinstance(cache, dict):
-            cache = {}
-            self._pipeline_sha_cache = cache
-        if use_cache and cache.get("key") == key:
-            return str(cache.get("value", ""))
-        digest = hashlib.sha256()
-        try:
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            return ""
-        value = digest.hexdigest()
-        cache["key"] = key
-        cache["value"] = value
-        return value
 
-    def get_pipeline_descriptor(self) -> dict:
+    def configure_catalog(self, catalog_prepare, *, model_id: str = "") -> None:
+        self._catalog_prepare = catalog_prepare
+        self._catalog_model_id = model_id
+
+    def _verify_catalog_artifact(self, model_id: str, model_path: str, *, expected=None):
+        prepare = getattr(self, "_catalog_prepare", None)
+        resolved = prepare(model_id, model_path) if prepare is not None else None
+        if expected is not None and resolved != expected:
+            from qlh_core.contracts.catalog import CatalogError
+            raise CatalogError("artifact_revision_mismatch", "source binding changed since pipeline preparation")
+        self._resolved_artifact = resolved
+        return resolved
+
+    def get_pipeline_descriptor(self, *, digest=None) -> dict:
         """流水线描述器：**零依赖**读 GGUF 头，不加载模型、不需要 torch。
 
         与 `ModelManager.get_pipeline_descriptor()`（PyTorch 侧）同一契约。主节点的
@@ -470,7 +457,6 @@ class LlamaCppEngine:
         from pipeline_model_descriptor import (
             PIPELINE_RUNTIME_MODEL_TYPES,
             canonical_pipeline_model_type,
-            tokenizer_sha256_from_asset,
         )
 
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
@@ -541,7 +527,7 @@ class LlamaCppEngine:
             weight_bytes = int(os.path.getsize(path))
         except OSError:
             weight_bytes = 0
-        model_sha256 = self._pipeline_file_sha256(path)
+        model_sha256 = digest(Path(path)) if digest is not None else self._pipeline_file_sha256(path)
         artifact_manifest_info = None
         tokenizer_sha256 = read_gguf_tokenizer_sha256(path) or ""
         for manifest_path in (
@@ -555,28 +541,21 @@ class LlamaCppEngine:
                 if declared_tokenizer and declared_tokenizer != tokenizer_sha256:
                     return {}
                 break
+        # Tokenizer identity comes from these GGUF bytes or an explicitly
+        # verified conversion binding. A builtin display name cannot prove
+        # that a tokenizer from another directory belongs to this revision.
         if not tokenizer_sha256:
-            tokenizer_sha256 = tokenizer_sha256_from_asset(Path(path).parent)
-        if not tokenizer_sha256:
-            try:
-                from model_config import get_builtin_model, resolve_model_path
+            from qlh_core.contracts.catalog import ResolvedArtifact
 
-                registered = get_builtin_model(
-                    str(getattr(self, "active_model_id", "") or "")
-                )
-                registered_path = (
-                    resolve_model_path(str(getattr(registered, "model_path", "") or ""))
-                    if registered is not None else ""
-                )
-                if registered_path:
-                    tokenizer_sha256 = tokenizer_sha256_from_asset(
-                        Path(registered_path)
-                    )
-            except Exception:
-                logger.debug(
-                    "GGUF pipeline descriptor could not resolve tokenizer asset",
-                    exc_info=True,
-                )
+            resolved = getattr(self, "_resolved_artifact", None)
+            if isinstance(resolved, ResolvedArtifact):
+                if (resolved.location.kind == "disk"
+                        and Path(resolved.location.locator).resolve() == Path(path).resolve()
+                        and resolved.artifact.content_sha256 == model_sha256
+                        and any((proof.source_sha256 == model_sha256 and proof.source_format == "gguf")
+                                or (proof.target_sha256 == model_sha256 and proof.target_format == "gguf")
+                                for proof in resolved.revision.equivalence_proofs)):
+                    tokenizer_sha256 = resolved.revision.tokenizer_sha256
         descriptor = {
             "model_id": (
                 str(getattr(self, "active_model_id", "") or "")
@@ -632,6 +611,7 @@ class LlamaCppEngine:
     ) -> dict:
         """Prepare GGUF pipeline metadata without constructing llama.cpp."""
         resolved_path = os.path.abspath(model_path or "")
+        self._verify_catalog_artifact(model_id, resolved_path)
         if not resolved_path or not os.path.isfile(resolved_path):
             raise FileNotFoundError(f"GGUF 模型文件未找到: {resolved_path or '(未提供路径)'}")
         if layer_range is not None:
@@ -653,7 +633,8 @@ class LlamaCppEngine:
             declared: list[int] | None = None
             _bases = []
             from model_supply_worker import selected_gguf_path
-            _env_gguf = selected_gguf_path() or os.environ.get("QLH_LAYER_GGUF", "").strip()
+            environment = os.environ if self._environment is None else self._environment
+            _env_gguf = selected_gguf_path() or environment.get("QLH_LAYER_GGUF", "").strip()
             if _env_gguf:
                 _bases.append(Path(_env_gguf))
             _bases.append(Path(resolved_path))
@@ -681,7 +662,6 @@ class LlamaCppEngine:
         self._quant_type = str(quant_type or "GGUF")
         self._pipeline_descriptor = None
         self._layer_load_proof = None
-        self._pipeline_sha_cache = {}
         descriptor = self.get_pipeline_descriptor()
         if not descriptor.get("pipeline_runtime_supported", False):
             raise RuntimeError("GGUF 工件缺少可执行的流水线描述元数据")
@@ -741,7 +721,8 @@ class LlamaCppEngine:
             directory = supplied_path.parent
             candidates = [supplied_path.with_suffix(".manifest.json")]
         else:
-            configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
+            environment = os.environ if self._environment is None else self._environment
+            configured = environment.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
             directory = (
                 _Path(configured)
                 if configured
@@ -823,6 +804,14 @@ class LlamaCppEngine:
         **失败**（`RuntimeError`），绝不静默退回整模 —— 那会让主节点跑着自己没被分配的
         层，下游段收到的 hidden 就从错误的层深取来，而链路看上去"成功"。
         """
+        descriptor = dict(self._pipeline_descriptor or {})
+        source_path = descriptor.get("model_path") or self._model_path or ""
+        prepared = getattr(self, "_resolved_artifact", None)
+        self._verify_catalog_artifact(
+            str(getattr(self, "_catalog_model_id", "") or getattr(self, "active_model_id", "") or ""),
+            source_path,
+            expected=prepared,
+        )
         path = self._find_layer_artifact(int(start_layer), int(end_layer))
         if not path:
             raise RuntimeError(
@@ -857,7 +846,45 @@ class LlamaCppEngine:
             proof = None
         whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
         was_pipeline_prepared = self.is_pipeline_prepared
-        self.load_model(path)
+        load_spec = kwargs.get("load_spec")
+        if load_spec is None:
+            self._runtime_load_spec = None
+            self._load_model_runtime(path, calibration_allowed=False)
+        else:
+            from qlh_core.contracts.load import RuntimeLoadSpec
+            from qlh_core.adapters.llama_vocabulary import LlamaVocabulary
+            spec = RuntimeLoadSpec.from_dict(load_spec)
+            components = {"layers"}
+            if has_embedding:
+                components.add("embedding")
+            if has_lm_head:
+                components.update(("final_norm", "lm_head"))
+            if (spec.device != "cpu" or spec.dtype != "artifact" or spec.quant_type != "artifact"
+                    or spec.kv_device != "cpu" or spec.kv_dtype != "float16" or spec.kv_policy != "preallocated"
+                    or spec.materialization != "gguf_segment" or set(spec.components) != components):
+                raise ValueError("deployment_local_policy_unsupported")
+            self.unload()
+            # Tokenization owns a vocabulary-only handle. Segment tensors and KV
+            # have exactly one owner, the observed keep-head runner below.
+            from inference_switches import resolve_from_device_profile
+            switches = resolve_from_device_profile(env=self._environment, execution_path="llama_keep_head")
+            if switches.kv_cache_type_k or "flash_attn" in switches.overrides:
+                raise ValueError("deployment_inference_switch_unsupported")
+            self._runtime_load_spec = spec
+            self._inference_switches = {
+                "schema_version": 2, "scope": "loaded_model", "execution_path": "llama_keep_head",
+                "requested": switches.to_dict(),
+                "effective": {"n_ctx": spec.context_size, "sequence_count": spec.sequence_count,
+                              "n_batch": spec.batch_size, "n_threads": switches.n_threads or 8,
+                              "type_k": "f16", "type_v": "f16", "flash_attn": "native_default"},
+                "sources": {"policy": "frozen_load_spec", "n_threads": switches.sources.get("n_threads", "native_baseline")},
+                "capabilities": {"kv_type_tuning": False, "flash_attn_tuning": False},
+            }
+            logger.info("层段推理开关: %s", self._inference_switches)
+            self._model = LlamaVocabulary(path)
+            self._model_path = path
+            self._n_ctx = spec.context_size
+            self._loaded = True
         # A stage worker may be created directly and load its first artifact
         # without ever having cached a full-model descriptor.  The artifact
         # itself is still partial; leaving the descriptor empty would let
@@ -880,6 +907,10 @@ class LlamaCppEngine:
             "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
             int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
         )
+        if load_spec is not None:
+            upstream = self._keep_head_upstream()
+            if upstream is None or not upstream.is_available:
+                raise ValueError("deployment_local_runtime_unavailable")
         return {
             "success": True,
             "engine": "llama_cpp",
@@ -893,7 +924,7 @@ class LlamaCppEngine:
     # 模型加载
     # ================================================================
 
-    def load_model(
+    def _load_model_runtime(
         self,
         model_path: str = None,
         n_ctx: int = None,
@@ -913,6 +944,8 @@ class LlamaCppEngine:
         rpc_split: float | str | List[float] | None = None,
         align_numerics: bool = False,
         n_seq_max: int | None = None,
+        context_limit: int | None = None,
+        calibration_allowed: bool = True,
         **kwargs,
     ) -> None:
         """
@@ -920,7 +953,7 @@ class LlamaCppEngine:
 
         Args:
             model_path: GGUF 文件路径
-            n_ctx: 上下文窗口大小（默认 4096，边缘设备建议 2048）
+            n_ctx: 显式上下文窗口；省略时按资源预算收窄，受MAX_SEQ_LEN与context_limit约束
             n_threads: CPU 推理线程数（默认自动检测：物理核心数）
             chat_format: 对话格式（默认自动检测，Qwen 用 "chatml"）
                 align_numerics: 跨路径数值对齐（关闭 CPU_REPACK，使 RPC 与本机 no-repack 逐比特一致）。
@@ -981,7 +1014,6 @@ class LlamaCppEngine:
         # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
         self._pipeline_descriptor = None
         self._layer_load_proof = None
-        self._pipeline_sha_cache = {}
         # KV 是新 context 的，占用计数跟着归零（见 `_kv_used_cells`）。
         self._kv_used = 0
         model_profile = model_profile if isinstance(model_profile, dict) else {}
@@ -999,8 +1031,42 @@ class LlamaCppEngine:
         if not self._quant_type:
             self._quant_type = "GGUF"
 
+        explicit_keys = set(kwargs)
+        if n_threads is not None:
+            explicit_keys.add("n_threads")
+        if n_ctx is not None:
+            explicit_keys.add("n_ctx")
+        if n_seq_max is not None:
+            explicit_keys.add("n_seq_max")
+        tuning_path = "llama_cpp_binding"
+        import config as inference_config
+        if (not calibration_allowed or rpc_servers or rpc_worker_exe or align_numerics or embedding
+                or mmproj_path or n_seq_max or inference_config.NGRAM_SPEC_ENABLED):
+            tuning_path = "llama_cpp_binding_special"
+        context_observation = {"reason": "explicit_context", "n_ctx": n_ctx}
         if n_ctx is None:
-            n_ctx = _default_n_ctx(model_path)
+            from inference_switches import resolve_from_device_profile, preference_environment
+            preferences = resolve_from_device_profile(
+                env=preference_environment(self._environment, explicit_keys))
+            context_observation = {}
+            device = "cpu"
+            try:
+                import llama_cpp
+                if (kwargs.get("n_gpu_layers", 0) != 0 and kwargs.get("offload_kqv", True)
+                        and llama_cpp.llama_supports_gpu_offload()):
+                    device = f"cuda:{int(kwargs.get('main_gpu', 0))}"
+                    if kwargs.get("tensor_split") is not None:
+                        device = "multi_gpu"
+                if rpc_servers or rpc_worker_exe:
+                    device = "rpc"
+                elif embedding:
+                    device = "embedding"
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
+            n_ctx = _default_n_ctx(model_path, execution_device=device, ceiling=context_limit,
+                cache_type_k=kwargs.get("type_k", preferences.kv_cache_type_k),
+                cache_type_v=kwargs.get("type_v", preferences.kv_cache_type_v),
+                n_seq_max=n_seq_max or 1, observation=context_observation)
         if n_threads is None:
             n_threads = self._auto_threads()
 
@@ -1034,11 +1100,11 @@ class LlamaCppEngine:
                 # Qwen-1.8B GGUF metadata is not always detected reliably.
                 load_kwargs["chat_format"] = "chatml"
 
-            # 推理开关（设备画像 → KV 量化 / flash-attn / 线程）：默认档位不新增键，
-            # 紧随其后的显式 kwargs 仍然优先（见 src/inference_switches.py）。
-            _apply_inference_switches(load_kwargs)
-
             load_kwargs.update(kwargs)
+            switches = _apply_inference_switches(
+                load_kwargs, explicit_keys=explicit_keys,
+                environment=self._environment, execution_path=tuning_path)
+            self._n_threads = int(load_kwargs["n_threads"])
             # n-gram 自投机（绑定路径 / 无 CUDA 边缘）：默认关闭；
             # 调用方显式传了 draft_model 时不覆盖。
             _apply_ngram_draft_model(load_kwargs)
@@ -1097,6 +1163,13 @@ class LlamaCppEngine:
                     engine_detail = ""
                 engine_label = "llama.cpp (CPU)"
 
+            from inference_switches import loaded_switch_state
+            self._inference_switches = loaded_switch_state(switches, load_kwargs, actual=self._model)
+            self._inference_switches["context_budget"] = context_observation
+            if "n_ctx" not in explicit_keys and context_observation.get("reason") == "ok":
+                self._inference_switches["sources"]["n_ctx"] = "context_budget"
+            for key in explicit_keys & set(self._inference_switches["effective"]):
+                self._inference_switches["sources"][key] = "call_argument"
             self._loaded = True
             self._install_chat_template_controls()
             self._embedding_enabled = embedding
@@ -1123,6 +1196,14 @@ class LlamaCppEngine:
             # tensors must close before their RPC device/process retires.
             self.unload()
             raise
+
+    @wraps(_load_model_runtime)
+    def load_model(self, model_path=None, *args, **kwargs) -> None:
+        self._verify_catalog_artifact(
+            str(getattr(self, "_catalog_model_id", "") or getattr(self, "active_model_id", "") or ""),
+            model_path,
+        )
+        return self._load_model_runtime(model_path, *args, **kwargs)
 
     @staticmethod
     def _vram_free_bytes() -> Optional[int]:
@@ -1452,6 +1533,7 @@ class LlamaCppEngine:
         self._model = None
         self._close_rpc_session()
         self._loaded = False
+        self._inference_switches = None
         self._embedding_enabled = False
         self._embedding_dimension = None
         self._embedding_model_id = ""
@@ -1462,7 +1544,6 @@ class LlamaCppEngine:
         self._chat_template_kwargs = {}
         self._pipeline_descriptor = None
         self._layer_load_proof = None
-        self._pipeline_sha_cache = {}
         self._pipeline_distributed_only = False
         self._model_path = ""
         logger.info("GGUF 模型已卸载")
@@ -1470,6 +1551,14 @@ class LlamaCppEngine:
     @property
     def is_loaded(self) -> bool:
         return self._loaded and self._model is not None
+
+    @property
+    def layer_range(self) -> tuple[int, int] | None:
+        """Read the loaded assignment from the native owner's descriptor."""
+        if not self.is_loaded:
+            return None
+        span = (self._pipeline_descriptor or {}).get("assignment_layer_range")
+        return tuple(span) if span is not None else None
 
     def get_device(self) -> str:
         """流水线/缓存路径要的 device —— llama.cpp 恒为 CPU。
@@ -2149,7 +2238,8 @@ class LlamaCppEngine:
         ⚠️ **绝不**返回与"实际加载了什么"无关的静态默认值。此前的缺陷正是：
         `get_model_info()` 不报 `model_name` ⇒ 消费方各自兜底到静态 `config.MODEL_NAME`
         （= 默认 0.6B）⇒ 加载 2B 却对外报 `Qwen/Qwen3-0.6B`。
-        根因与实测证据见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2。
+        根因与实测证据的原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`（2026-10-25
+        归档；原引「§4.8 B2」小节号已随该件重排失效，`遗留清单-2026-10-07.md` 不登记该已修项）。
         """
         if not self._model_path:
             return ""
@@ -2179,6 +2269,7 @@ class LlamaCppEngine:
             "n_threads": self._n_threads,
             "loaded": self._loaded,
             "capabilities": self.get_capabilities(),
+            "inference_switches": getattr(self, "_inference_switches", None),
         }
         if self._loaded:
             info["memory"] = self.get_memory_usage()
@@ -2325,6 +2416,18 @@ class LlamaCppEngine:
             "cache": n_past + len(ids),
         }
 
+    def clear_pipeline_kv(self) -> None:
+        """Strict cleanup receipt: propagate native reset failure to the request owner."""
+        upstream = getattr(self, "_keep_head", None)
+        if upstream is not None:
+            upstream.reset()
+        context = getattr(self._model, "_ctx", None)
+        if context is not None:
+            context.kv_cache_clear()
+        elif self._model is not None and upstream is None:
+            raise RuntimeError("pipeline_kv_owner_unavailable")
+        self._kv_used = 0
+
     def _clear_context_kv(self) -> None:
         """清掉原生 context 里的 KV（新序列从位置 0 起时必须做）。
 
@@ -2349,6 +2452,7 @@ class LlamaCppEngine:
         按「工件路径 + 层数」缓存：`load_layer_range` 换了工件就自动重建。
         """
         import os
+        environment = os.environ if self._environment is None else self._environment
         from pathlib import Path
 
         desc = getattr(self, "_pipeline_descriptor", None) or {}
@@ -2357,7 +2461,8 @@ class LlamaCppEngine:
         if not artifact or not rng or len(rng) != 2:
             return None
         cut_layer = int(rng[1]) - int(rng[0])
-        key = (str(artifact), cut_layer)
+        spec = getattr(self, "_runtime_load_spec", None)
+        key = (str(artifact), cut_layer, spec.digest if spec else "legacy")
         if (
             getattr(self, "_keep_head_key", None) == key
             and getattr(getattr(self, "_keep_head", None), "is_available", True)
@@ -2373,7 +2478,7 @@ class LlamaCppEngine:
         # ★ 2026-10-08（#53）：定位收敛到 `keep_head_shim.resolve_keep_head_shim()` ——
         #   与本模块此前内联的推导等价（环境变量 > 仓库默认构建产物），
         #   但**两侧共用同一事实源**，避免 worker 侧只读环境变量而 master 侧能推导。
-        shim = resolve_keep_head_shim()
+        shim = resolve_keep_head_shim(**({"environment": self._environment} if self._environment is not None else {}))
         if not shim:
             # shim 本体是 `qlh_keep_head.dll`（`qlh_kh_*` 入口在它里面）；同目录的
             # `libllama.dll` 只是它依赖的**带补丁** llama.cpp，不是 shim。
@@ -2409,11 +2514,14 @@ class LlamaCppEngine:
             #   放大到能容纳 4× 放大，并保留 `QLH_KEEP_HEAD_N_BATCH` 旋钮。
             self._keep_head = KeepHeadUpstream(
                 shim, str(artifact), mode="nextn",
-                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096),
-                n_batch=max(
+                n_ctx=spec.context_size if spec else int(getattr(self, "_n_ctx", 4096) or 4096),
+                n_threads=int((getattr(self, "_inference_switches", None) or {}).get("effective", {}).get("n_threads") or 8),
+                n_batch=spec.batch_size if spec else max(
                     512,
-                    int(os.environ.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
-                ))
+                    int(environment.get("QLH_KEEP_HEAD_N_BATCH", "2048") or 2048),
+                ),
+                **({"n_seq_max": spec.sequence_count} if spec else {}),
+                **({"environment": self._environment} if self._environment is not None else {}))
         except KeepHeadCleanupError as exc:
             self._keep_head = exc.cleanup_owner
             self._keep_head_key = None
@@ -2424,6 +2532,16 @@ class LlamaCppEngine:
                 "（docs/已知问题记录.md #35）", exc_info=True)
             self._keep_head = None
         return self._keep_head
+
+    def deployment_materialization_observation(self):
+        upstream = self._keep_head_upstream()
+        if upstream is None:
+            raise ValueError("deployment_local_runtime_unavailable")
+        observation = dict(upstream.materialization_observation())
+        descriptor = self._pipeline_descriptor or {}
+        artifact = descriptor.get("loaded_artifact") or self._model_path
+        observation["artifact_sha256"] = self._pipeline_file_sha256(artifact)
+        return observation
 
     def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
                                    all_positions: bool = False):

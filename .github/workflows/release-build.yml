@@ -83,8 +83,12 @@ jobs:
         include:
           - platform: windows
             runner: '["self-hosted", "Windows", "qlh-release"]'
-          - platform: linux
-            runner: '["self-hosted", "Linux", "qlh-release"]'
+          # linux 暂不发行（2026-10-25 裁决；见 docs/边缘最小发行包审计清单-2026-09-26.md
+          # 2026-09-28 修订「只发行 Android 与 Windows，Linux 发行变体不做」）。
+          # 恢复 Linux 发行时取消本项注释，并同步 release-acceptance.yml 的同一矩阵与
+          # scripts/package_contract/release_acceptance.py 的 PLATFORMS／MANDATORY。
+          # - platform: linux
+          #   runner: '["self-hosted", "Linux", "qlh-release"]'
           - platform: android
             runner: '["self-hosted", "Linux", "qlh-release-android"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
@@ -122,13 +126,11 @@ jobs:
       - name: Reject stale outputs and snapshot clean pinned sources
         shell: bash
         run: python -B scripts/package_contract/release_build.py preflight --platform "${{ matrix.platform }}"
-      - name: Build signed Windows CPU and standalone Launcher
+      - name: Build signed Windows CPU application
         if: matrix.platform == 'windows'
         shell: cmd
         run: |
           call "%GITHUB_WORKSPACE%\packaging\packaging\build-cpu.bat" <NUL
-          if errorlevel 1 exit /b 1
-          call "%GITHUB_WORKSPACE%\packaging\packaging\build-launcher.bat" <NUL
           if errorlevel 1 exit /b 1
       - name: Build signed Linux CPU Debian package
         if: matrix.platform == 'linux'

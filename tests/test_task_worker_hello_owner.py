@@ -52,12 +52,17 @@ class Worker(SchedulerTaskWorkerMixin):
     def _effective_role(self):
         return "client"
 
-    def _scheduler_facade_global(self, name):
+    def _runtime_setting(self, name):
         assert name == "TASK_WORKER_EXPERIMENTAL_ENABLED"
         return True
 
     def get_effective_node_id(self):
         return "hello-owner-worker"
+
+    def _task_worker_engine_schema(self):
+        # This harness has no inference host. Its ownership/registration tests
+        # explicitly offer zero engine operations, independent of installed runtimes.
+        return {"schema_version": 1, "runtimes": []}
 
     def _task_worker_capabilities(self):
         return {"stage_types": ["aggregate"], "engines": ["pytorch"],

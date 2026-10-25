@@ -82,6 +82,25 @@ def _sha(path: Path, cancelled: Callable[[], bool]) -> str:
     return digest.hexdigest()
 
 
+def _content_sha(path: Path, cancelled: Callable[[], bool]) -> str:
+    """Share verified immutable source identities with builders and preparation."""
+    from model_supply_assets import _hash_file_cached
+    def check_cancelled():
+        _check(cancelled)
+        return False
+    _check(cancelled)
+    return _hash_file_cached(path, check_cancelled)
+
+
+def _not_cancelled() -> bool:
+    return False
+
+
+def _content_digest(path: Path) -> str:
+    """Digest callback for injected-hash APIs that have no cancellation hook."""
+    return _content_sha(path, _not_cancelled)
+
+
 def _canonical(payload: dict) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -108,9 +127,12 @@ def _publish_json(path: Path, payload: dict) -> None:
 
 
 def _registered(model_id: str) -> tuple[ModelConfig, dict]:
-    rows = local_store.get_local_experimental_models()
-    row = next((item for item in rows if item.get("model_id") == model_id), {})
-    cfg = mc.get_model_config(model_id, rows)
+    try:
+        snapshot = local_store.get_local_model_registry_snapshot(model_id)
+    except (TypeError, ValueError):
+        _fail("SUPPLY_REGISTRY_INVALID", "Registered model configuration is invalid")
+    row = local_store._RegistryPayload(snapshot.as_payload() or {}, snapshot.registry_revision)
+    cfg = mc.get_model_config(model_id, [row] if row else [])
     if cfg is None:
         code = "SUPPLY_REGISTRY_INVALID" if row else "SUPPLY_MODEL_NOT_REGISTERED"
         _fail(code, "Registered model configuration is invalid" if row else "Select a registered model")
@@ -279,7 +301,7 @@ def _gguf_metadata(path: Path) -> dict:
     verify_gguf = _model_tools("gguf").verify_gguf
     from relay_segment_info import read_gguf_tokenizer_sha256
     mrv.validate_model_artifact("gguf", gguf_path=str(path))
-    report = verify_gguf(path, full_hash=True)
+    report = verify_gguf(path, full_hash=True, digest=_content_digest)
     if not report.get("valid") or not report.get("structure_valid"):
         raise ValueError("GGUF structure or SHA256 validation failed")
     tokenizer = read_gguf_tokenizer_sha256(path)
@@ -371,7 +393,7 @@ def _live_manifest(root: Path, weights: list[Path], cancelled: Callable[[], bool
         if (isinstance(size, bool) or not isinstance(size, int) or size < 0
                 or not isinstance(digest, str) or not jobs._SHA256_RE.fullmatch(digest)):
             raise ValueError("invalid source manifest size or digest")
-        if size != path.stat().st_size or digest != _sha(path, cancelled):
+        if size != path.stat().st_size or digest != _content_sha(path, cancelled):
             raise ValueError("source manifest content changed")
         lines.append(f"{relative}\0{entry['size_bytes']}\0{entry['sha256']}")
     required = {item.relative_to(root).as_posix() for item in weights}
@@ -394,7 +416,7 @@ def _proof(root: Path, weights: list[Path], cancelled: Callable[[], bool],
     try:
         _live_manifest(root, weights, cancelled, external_files=external_files,
                        expected_identity=expected_identity)
-        identity = descriptor.cross_format_pipeline_identity(root)
+        identity = descriptor.cross_format_pipeline_identity(root, digest=_content_digest)
         if not identity:
             raise ValueError("missing cross-format identity")
         proof = _json(root / PROVENANCE)
@@ -516,7 +538,7 @@ def _save(cfg: ModelConfig, row: dict, *, registry_snapshot: dict | None,
 
 def _download(cfg: ModelConfig, row: dict, operation: Path,
               cancelled: Callable[[], bool], progress: Callable | None) -> ModelConfig:
-    registry_snapshot = deepcopy(row) if row else None
+    registry_snapshot = deepcopy(row)
     expected_identity = _registered_manifest_identity(registry_snapshot or {})
     spec = _download_spec(cfg, row)
     target = _path(cfg.model_path) if cfg.model_type != "gguf" else None
@@ -793,7 +815,7 @@ def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: 
     _check(cancelled)
     _notify(progress, "resolving")
     cfg, row = _registered(model_id)
-    registry_snapshot = deepcopy(row) if row else None
+    registry_snapshot = deepcopy(row)
     expected_identity = _registered_manifest_identity(registry_snapshot or {})
     operation = Path(operation_dir).absolute()
     if any(_linked(item) for item in (operation, *operation.parents)):
@@ -807,7 +829,7 @@ def ensure_registered_sources(model_id: str, *, operation_dir: Path, want_gguf: 
         cfg = _download(cfg, row, operation, cancelled, progress)
         # Reload persisted download evidence while retaining builtin metadata.
         cfg, row = _registered(model_id)
-        registry_snapshot = deepcopy(row) if row else None
+        registry_snapshot = deepcopy(row)
         hf = _existing(_path(cfg.model_path), directory=True)
         gguf = _existing(_path(cfg.gguf_path), directory=False)
     weights: list[Path] = []

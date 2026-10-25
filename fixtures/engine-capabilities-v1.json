@@ -1,0 +1,1391 @@
+{
+  "schema_version": 1,
+  "registry": {
+    "schema_version": 1,
+    "runtimes": [
+      {
+        "family": "llama_cpp",
+        "runtime_kind": "llama_cpp_binding",
+        "operations": [
+          "forward_layers",
+          "full_request",
+          "layer_range"
+        ],
+        "native_abi": "llama_cpp_python.v1",
+        "artifact_kind": "gguf",
+        "layer_range_mode": "precut_artifact",
+        "capabilities": [
+          "chat",
+          "chat_image",
+          "chat_stream",
+          "forward_layers",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [
+          "gguf"
+        ],
+        "architectures": {
+          "forward_layers": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ],
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ],
+          "layer_range": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ]
+        },
+        "precisions": {
+          "forward_layers": [
+            "gguf"
+          ],
+          "full_request": [
+            "gguf"
+          ],
+          "layer_range": [
+            "gguf"
+          ]
+        },
+        "input_kinds": [
+          "messages",
+          "token_ids",
+          "hidden_f32"
+        ],
+        "output_kinds": [
+          "text",
+          "hidden_f32",
+          "logits_f32"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model",
+          "verified_precut_manifest"
+        ]
+      },
+      {
+        "family": "llama_cpp",
+        "runtime_kind": "llama_cpp_keep_head",
+        "operations": [
+          "forward_layers",
+          "layer_range"
+        ],
+        "native_abi": "qlh_keep_head.v1",
+        "artifact_kind": "gguf",
+        "layer_range_mode": "precut_artifact",
+        "capabilities": [
+          "forward_layers"
+        ],
+        "artifact_formats": [
+          "gguf"
+        ],
+        "architectures": {
+          "forward_layers": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ],
+          "layer_range": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ]
+        },
+        "precisions": {
+          "forward_layers": [
+            "gguf"
+          ],
+          "layer_range": [
+            "gguf"
+          ]
+        },
+        "input_kinds": [
+          "token_ids",
+          "hidden_f32"
+        ],
+        "output_kinds": [
+          "hidden_f32",
+          "logits_f32"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model",
+          "verified_precut_manifest",
+          "keep_head_hidden_extraction"
+        ]
+      },
+      {
+        "family": "llama_cpp",
+        "runtime_kind": "llama_server",
+        "operations": [
+          "full_request"
+        ],
+        "native_abi": "llama_server_http.v1",
+        "artifact_kind": "gguf",
+        "layer_range_mode": "none",
+        "capabilities": [
+          "chat",
+          "chat_stream",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [
+          "gguf"
+        ],
+        "architectures": {
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ]
+        },
+        "precisions": {
+          "full_request": [
+            "gguf"
+          ]
+        },
+        "input_kinds": [
+          "messages"
+        ],
+        "output_kinds": [
+          "text"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model",
+          "full_request_only"
+        ]
+      },
+      {
+        "family": "llama_cpp",
+        "runtime_kind": "llama_cpp_android",
+        "operations": [
+          "forward_layers",
+          "full_request",
+          "layer_range"
+        ],
+        "native_abi": "qlh_llama_jni.v1",
+        "artifact_kind": "gguf",
+        "layer_range_mode": "precut_artifact",
+        "capabilities": [
+          "chat",
+          "chat_stream",
+          "forward_layers",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [
+          "gguf"
+        ],
+        "architectures": {
+          "forward_layers": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ],
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ],
+          "layer_range": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ]
+        },
+        "precisions": {
+          "forward_layers": [
+            "gguf"
+          ],
+          "full_request": [
+            "gguf"
+          ],
+          "layer_range": [
+            "gguf"
+          ]
+        },
+        "input_kinds": [
+          "messages",
+          "token_ids",
+          "hidden_f32"
+        ],
+        "output_kinds": [
+          "text",
+          "hidden_f32",
+          "logits_f32"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model",
+          "verified_precut_manifest"
+        ]
+      },
+      {
+        "family": "pytorch",
+        "runtime_kind": "pytorch_cpu",
+        "operations": [
+          "forward_layers",
+          "full_request",
+          "layer_range"
+        ],
+        "native_abi": "torch_module.v1",
+        "artifact_kind": "safetensors",
+        "layer_range_mode": "dynamic",
+        "capabilities": [
+          "chat",
+          "chat_image",
+          "chat_stream",
+          "ensure_full_model",
+          "forward_layers",
+          "load_layer_range",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [
+          "safetensors"
+        ],
+        "architectures": {
+          "forward_layers": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ],
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ],
+          "layer_range": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ]
+        },
+        "precisions": {
+          "forward_layers": [
+            "fp32"
+          ],
+          "full_request": [
+            "fp32",
+            "fp16",
+            "int8",
+            "int4"
+          ],
+          "layer_range": [
+            "fp32"
+          ]
+        },
+        "input_kinds": [
+          "messages",
+          "token_ids",
+          "hidden_f32"
+        ],
+        "output_kinds": [
+          "text",
+          "hidden_f32",
+          "logits_f32"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model",
+          "cpu_fp32_materialization"
+        ]
+      },
+      {
+        "family": "pytorch",
+        "runtime_kind": "pytorch_cuda",
+        "operations": [
+          "forward_layers",
+          "full_request",
+          "layer_range"
+        ],
+        "native_abi": "torch_module.v1",
+        "artifact_kind": "safetensors",
+        "layer_range_mode": "dynamic",
+        "capabilities": [
+          "chat",
+          "chat_image",
+          "chat_stream",
+          "ensure_full_model",
+          "forward_layers",
+          "load_layer_range",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [
+          "safetensors"
+        ],
+        "architectures": {
+          "forward_layers": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ],
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ],
+          "layer_range": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text"
+          ]
+        },
+        "precisions": {
+          "forward_layers": [
+            "fp32",
+            "fp16"
+          ],
+          "full_request": [
+            "fp32",
+            "fp16",
+            "int8",
+            "int4"
+          ],
+          "layer_range": [
+            "fp32",
+            "fp16"
+          ]
+        },
+        "input_kinds": [
+          "messages",
+          "token_ids",
+          "hidden_f32"
+        ],
+        "output_kinds": [
+          "text",
+          "hidden_f32",
+          "logits_f32"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model",
+          "quantized_layers_materialize_fp16"
+        ]
+      },
+      {
+        "family": "island",
+        "runtime_kind": "island_remote",
+        "operations": [
+          "full_request"
+        ],
+        "native_abi": "openai_chat.v1",
+        "artifact_kind": null,
+        "layer_range_mode": "none",
+        "capabilities": [
+          "chat",
+          "chat_stream",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [],
+        "architectures": {
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ]
+        },
+        "precisions": {
+          "full_request": [
+            "remote"
+          ]
+        },
+        "input_kinds": [
+          "messages"
+        ],
+        "output_kinds": [
+          "text"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model"
+        ]
+      },
+      {
+        "family": "external_api",
+        "runtime_kind": "external_api_remote",
+        "operations": [
+          "full_request"
+        ],
+        "native_abi": "openai_chat.v1",
+        "artifact_kind": null,
+        "layer_range_mode": "none",
+        "capabilities": [
+          "chat",
+          "chat_stream",
+          "load_model",
+          "unload_model"
+        ],
+        "artifact_formats": [],
+        "architectures": {
+          "full_request": [
+            "qwen",
+            "qwen2",
+            "qwen3_5",
+            "qwen3_5_text",
+            "llama",
+            "mistral",
+            "gemma",
+            "gemma2",
+            "phi3"
+          ]
+        },
+        "precisions": {
+          "full_request": [
+            "remote"
+          ]
+        },
+        "input_kinds": [
+          "messages"
+        ],
+        "output_kinds": [
+          "text"
+        ],
+        "optimization_constraints": [
+          "distributed_no_full_model"
+        ]
+      }
+    ]
+  },
+  "builder_cases": [
+    {
+      "name": "binding_full",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_cpp_binding",
+      "full_inference_available": true,
+      "layer_ranges": [],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_cpp_binding",
+            "operations": [
+              "forward_layers",
+              "full_request",
+              "layer_range"
+            ],
+            "native_abi": "llama_cpp_python.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "full_inference",
+        "aggregate"
+      ],
+      "android_stage_types": [
+        "full_inference"
+      ]
+    },
+    {
+      "name": "binding_segment",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_cpp_binding",
+      "full_inference_available": false,
+      "layer_ranges": [
+        [
+          2,
+          4
+        ]
+      ],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_cpp_binding",
+            "operations": [
+              "forward_layers",
+              "layer_range"
+            ],
+            "native_abi": "llama_cpp_python.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "layer_forward"
+      ],
+      "android_stage_types": [
+        "layer_forward"
+      ]
+    },
+    {
+      "name": "keep_head_segment",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_cpp_keep_head",
+      "full_inference_available": false,
+      "layer_ranges": [
+        [
+          2,
+          4
+        ]
+      ],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_cpp_keep_head",
+            "operations": [
+              "forward_layers",
+              "layer_range"
+            ],
+            "native_abi": "qlh_keep_head.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "layer_forward"
+      ],
+      "android_stage_types": [
+        "layer_forward"
+      ]
+    },
+    {
+      "name": "server_full",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_server",
+      "full_inference_available": true,
+      "layer_ranges": [],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_server",
+            "operations": [
+              "full_request"
+            ],
+            "native_abi": "llama_server_http.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "full_inference",
+        "aggregate"
+      ],
+      "android_stage_types": [
+        "full_inference"
+      ]
+    },
+    {
+      "name": "server_positive_probe_cannot_expand",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_server",
+      "full_inference_available": true,
+      "layer_ranges": [],
+      "probed_operations": [
+        "full_request",
+        "layer_range",
+        "forward_layers"
+      ],
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_server",
+            "operations": [
+              "full_request"
+            ],
+            "native_abi": "llama_server_http.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "full_inference",
+        "aggregate"
+      ],
+      "android_stage_types": [
+        "full_inference"
+      ]
+    },
+    {
+      "name": "android_full",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_cpp_android",
+      "full_inference_available": true,
+      "layer_ranges": [],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_cpp_android",
+            "operations": [
+              "forward_layers",
+              "full_request",
+              "layer_range"
+            ],
+            "native_abi": "qlh_llama_jni.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "full_inference",
+        "aggregate"
+      ],
+      "android_stage_types": [
+        "full_inference"
+      ]
+    },
+    {
+      "name": "android_segment",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_cpp_android",
+      "full_inference_available": false,
+      "layer_ranges": [
+        [
+          2,
+          4
+        ]
+      ],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_cpp_android",
+            "operations": [
+              "forward_layers",
+              "layer_range"
+            ],
+            "native_abi": "qlh_llama_jni.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "layer_forward"
+      ],
+      "android_stage_types": [
+        "layer_forward"
+      ]
+    },
+    {
+      "name": "binding_probe_narrows_layers",
+      "family": "llama_cpp",
+      "runtime_kind": "llama_cpp_binding",
+      "full_inference_available": true,
+      "layer_ranges": [],
+      "probed_operations": [
+        "full_request"
+      ],
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "llama_cpp",
+            "runtime_kind": "llama_cpp_binding",
+            "operations": [
+              "full_request"
+            ],
+            "native_abi": "llama_cpp_python.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "full_inference",
+        "aggregate"
+      ],
+      "android_stage_types": [
+        "full_inference"
+      ]
+    },
+    {
+      "name": "torch_cpu_full",
+      "family": "pytorch",
+      "runtime_kind": "pytorch_cpu",
+      "full_inference_available": true,
+      "layer_ranges": [],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "pytorch",
+            "runtime_kind": "pytorch_cpu",
+            "operations": [
+              "forward_layers",
+              "full_request",
+              "layer_range"
+            ],
+            "native_abi": "torch_module.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "full_inference",
+        "aggregate"
+      ],
+      "android_stage_types": [
+        "full_inference"
+      ]
+    },
+    {
+      "name": "torch_cpu_segment",
+      "family": "pytorch",
+      "runtime_kind": "pytorch_cpu",
+      "full_inference_available": false,
+      "layer_ranges": [
+        [
+          2,
+          4
+        ]
+      ],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "pytorch",
+            "runtime_kind": "pytorch_cpu",
+            "operations": [
+              "forward_layers",
+              "layer_range"
+            ],
+            "native_abi": "torch_module.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "layer_forward"
+      ],
+      "android_stage_types": [
+        "layer_forward"
+      ]
+    },
+    {
+      "name": "torch_cuda_segment",
+      "family": "pytorch",
+      "runtime_kind": "pytorch_cuda",
+      "full_inference_available": false,
+      "layer_ranges": [
+        [
+          2,
+          4
+        ]
+      ],
+      "probed_operations": null,
+      "engine_capabilities": {
+        "schema_version": 1,
+        "runtimes": [
+          {
+            "family": "pytorch",
+            "runtime_kind": "pytorch_cuda",
+            "operations": [
+              "forward_layers",
+              "layer_range"
+            ],
+            "native_abi": "torch_module.v1"
+          }
+        ]
+      },
+      "pc_stage_types": [
+        "layer_forward"
+      ],
+      "android_stage_types": [
+        "layer_forward"
+      ]
+    }
+  ],
+  "invalid_cases": [
+    {
+      "name": "unknown_abi",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "unknown.v99"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "cross_runtime_abi",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_server",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "family_runtime_mismatch",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "pytorch",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown_runtime",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_magic",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown_schema_version",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 2,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "float_schema_version",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1.0,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "boolean_schema_version",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": true,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown_runtime_field",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1",
+              "guess": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "missing_native_abi",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "duplicate_runtime",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            },
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "duplicate_operation",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range",
+                "forward_layers"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "undeclared_family",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "island"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_binding",
+              "operations": [
+                "forward_layers",
+                "full_request",
+                "layer_range"
+              ],
+              "native_abi": "llama_cpp_python.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "server_layer_stage_and_ranges",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_server",
+              "operations": [
+                "full_request"
+              ],
+              "native_abi": "llama_server_http.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "server_positive_probe_expansion",
+      "capabilities": {
+        "stage_types": [
+          "layer_forward"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_server",
+              "operations": [
+                "full_request",
+                "forward_layers"
+              ],
+              "native_abi": "llama_server_http.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "server_full_stage_with_stale_ranges",
+      "capabilities": {
+        "stage_types": [
+          "full_inference"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [
+          [
+            2,
+            4
+          ]
+        ],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_server",
+              "operations": [
+                "full_request"
+              ],
+              "native_abi": "llama_server_http.v1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "keep_head_full_request_expansion",
+      "capabilities": {
+        "stage_types": [
+          "full_inference"
+        ],
+        "engines": [
+          "llama_cpp"
+        ],
+        "models": [],
+        "max_concurrency": 1,
+        "layer_ranges": [],
+        "engine_capabilities": {
+          "schema_version": 1,
+          "runtimes": [
+            {
+              "family": "llama_cpp",
+              "runtime_kind": "llama_cpp_keep_head",
+              "operations": [
+                "forward_layers",
+                "layer_range"
+              ],
+              "native_abi": "qlh_keep_head.v1"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

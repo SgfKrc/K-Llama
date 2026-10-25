@@ -233,7 +233,7 @@ def test_worker_offer_cannot_register_after_local_mode_wins_admission_lock(node,
 
     monkeypatch.setattr(scheduler, "_task_worker_stage_lock", SwitchBeforeAdmission())
     monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "test-worker")
-    monkeypatch.setattr(scheduler, "_scheduler_facade_global", lambda _name: True)
+    monkeypatch.setattr(scheduler, "_runtime_setting", lambda _name: True)
     monkeypatch.setattr(scheduler, "_task_worker_capabilities", lambda: {"stage_types": ["inference"]})
     monkeypatch.setattr(scheduler, "_task_worker_offer_model_identity_matches", lambda *_args: True)
     monkeypatch.setattr(scheduler._task_worker_control, "coordinator_snapshot", lambda: {"manual_stage_dispatch_enabled": True})

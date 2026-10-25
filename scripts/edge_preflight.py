@@ -32,7 +32,7 @@ PROBE_MARKER = "QLH_EDGE_PREFLIGHT="
 #: `REQUIRED_ROUTES` 描述的是**这个入口**的契约（裸 `/health` 等）。
 ROUTES_CONTRACT_ENTRY = "qlh_edge"
 #: ★ P0-3：「干净 venv 运行扫描」的第二个入口 —— **SLIM 的真实载荷**。
-#: `packaging/packaging/qlh_launcher.py` 用 `uvicorn src.api_server:app` 启动它，
+#: `packaging/packaging/slim_entry.py` 分派正式应用入口，
 #: 而它的路由带 `/api/` 前缀 ⇒ **不能**拿 `REQUIRED_ROUTES` 去判它；只判
 #: 「**导入成功**且没把 forbidden 模块拽进 `sys.modules`」。
 SLIM_ENTRY = "src.api_server"

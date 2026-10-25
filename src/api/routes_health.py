@@ -240,26 +240,16 @@ async def get_status():
             "reachable": await _api_module.run_in_threadpool(check_external_reachable),
         }
 
-    # ---- 路线 C-1：投机解码外部辅助状态（启用时上报，端点已脱敏）----
-    # 刻意不做端点探活：路线 B 曾因在 /api/status 里同步探活堵死事件循环
-    # （后来用 run_in_threadpool 修掉），投机段直接不引入任何出网请求。
-    speculative_status = None
-    if getattr(_cfg, "SPEC_ENABLED", False):
-        try:
-            from speculative import speculative_status_section
-            speculative_status = speculative_status_section()
-        except Exception as exc:      # 实验特性不得拖垮 /api/status
-            speculative_status = {"enabled": True, "error": str(exc)[:200]}
-
     return {
         "model_loaded": _api_module.model_host.model_loaded,
         "pipeline_prepared": pipeline_prepared,
         "pipeline_descriptor": pipeline_descriptor,
         "current_quant": _api_module.model_host.current_quant,
         "use_compile": _api_module.USE_COMPILE if _api_module.model_host.model_loaded else False,
-        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（那是默认模型，会张冠李戴 —— 见
-        #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。改为按活跃模型 id 兜底，
-        #   与同仓既有写法 `inference_service/engine_host.py:664` 同口径。
+        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（那是默认模型，会张冠李戴）。改为按
+        #   活跃模型 id 兜底，与同仓既有写法 `inference_service/engine_host.py:664` 同口径。
+        #   原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`（2026-10-25 归档；
+        #   原引「§4.8 B2」小节号已随该件重排失效 ⇒ `遗留清单-2026-10-07.md` 不登记该已修项）。
         "model_name": active_info.get("model_name") or active_info.get("model_id") or (
             _api_module.model_manager.active_model_id
             if _api_module.model_host.model_loaded else ""
@@ -269,7 +259,7 @@ async def get_status():
         "engine": active_info.get("engine", "") if _api_module.model_host.model_loaded else "",
         "island": island_status,
         "external": external_status,
-        "speculative": speculative_status,
+
         "run_mode": _api_module.RUN_MODE,
         "node_role": _api_module.scheduler._effective_role(),
         "node_id": _api_module.scheduler.get_effective_node_id(),

@@ -8,6 +8,7 @@ import importlib
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from scheduler_types import NodeRole
-from task_provider import (
+from execution_provider import (
     ModelIdentity as TaskModelIdentity,
     StageRequest as TaskProviderStageRequest,
     sanitize_result_metadata as sanitize_task_result_metadata,
@@ -34,6 +35,7 @@ from task_worker_protocol import (
     RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
     WorkerProtocolError,
+    InvalidTokenOutputResult,
     binary_hidden_frame_bytes,
     build_message as build_task_worker_message,
     canonical_message_bytes as task_worker_message_bytes,
@@ -44,13 +46,21 @@ from task_worker_protocol import (
     worker_protocol_status,
 )
 from torch_runtime import torch_available
+from koakuma_engine import Capability, backend_id_for, runtime_identity_for, runtime_supports
+from qlh_core.contracts.engines import (
+    ENGINE_REGISTRY, FULL_REQUEST, FORWARD_LAYERS,
+    LLAMA_CPP_BINDING, LLAMA_CPP_KEEP_HEAD, PYTORCH_CPU, PYTORCH_CUDA,
+    ISLAND_REMOTE, EXTERNAL_API_REMOTE, advertisement_supports,
+)
+from task_worker_capabilities import build_engine_capabilities
 
 logger = logging.getLogger("scheduler")
 
 _LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
 _LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
 _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
-_REQUEST_DEADLINE_EXCEEDED = "request_deadline_exceeded"
+_TASK_WORKER_RESPONSE_CONTEXT = threading.local()
+from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED as _REQUEST_DEADLINE_EXCEEDED
 
 
 def _task_worker_capability_log_summary(
@@ -271,7 +281,7 @@ class SchedulerTaskWorkerMixin:
                 or getattr(self._host, "layer_range", None) is not None
             ):
                 return None
-            identity = self._require_callbacks().active_task_graph_model_identity()
+            identity = self._require_callbacks().active_execution_model_identity()
             if identity is None or (
                 engines is not None and identity.engine not in engines
             ):
@@ -319,10 +329,7 @@ class SchedulerTaskWorkerMixin:
     ) -> list[dict]:
         """Return only identities executable by a complete-model stage."""
         stage_types = capabilities.get("stage_types") or []
-        if not any(
-            stage_type in stage_types
-            for stage_type in ("full_inference", "aggregate")
-        ):
+        if "full_inference" not in stage_types:
             return []
         layer_artifact_digests = {
             artifact.get("artifact_sha256")
@@ -612,46 +619,161 @@ class SchedulerTaskWorkerMixin:
         )
         return messages
 
+    def _task_worker_multi_position_argmax_available(self) -> bool:
+        """Use the execution owner's explicit port; ModelHost is not its owner."""
+        try:
+            probe = getattr(self._require_callbacks(), "supports_layer_multi_position_argmax", None)
+            return callable(probe) and probe() is True
+        except Exception:
+            logger.debug("multi-position argmax capability probe failed", exc_info=True)
+            return False
+
+    def _task_worker_local_cut_available(self) -> bool:
+        """True when this node can cut a layer segment out of a complete GGUF.
+
+        Mirrors `model_supply_worker`'s probe so the advertised capability and the
+        supply path can never disagree about whether cutting is possible.
+        """
+        try:
+            assets = importlib.import_module("model_supply_assets")
+            capability = getattr(assets, "local_cut_available", None)
+            if callable(capability):
+                return bool(capability())
+        except (ImportError, OSError, ValueError):
+            return False
+        try:
+            from pathlib import Path
+            return bool(importlib.util.find_spec("gguf") is not None and (
+                getattr(sys, "frozen", False)
+                or (Path(__file__).resolve().parent.parent / "scripts" / "cut_layers.py").is_file()))
+        except (ImportError, OSError, ValueError):
+            return False
+
+    def _task_worker_local_full_layers(self) -> int | None:
+        """Layer count of the installed *complete* local GGUF source, if any.
+
+        A node holding a whole GGUF can host any contiguous range, so it may join
+        the layer pool without a pre-cut segment. Only cheap header reads are
+        used (`verify_hashes=False`); nothing is hashed on this path.
+        """
+        try:
+            from pathlib import Path
+            from local_model_assets import discover_local_model_assets, _app_root
+            from relay_segment_info import read_gguf_layer_info
+            root = Path(_app_root())
+            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
+                relative = asset.get("gguf_path")
+                if not isinstance(relative, str) or not relative:
+                    continue
+                path = (root / relative).resolve()
+                if not path.is_file():
+                    continue
+                info = read_gguf_layer_info(path) or {}
+                total = info.get("n_layer")
+                if isinstance(total, int) and total > 0:
+                    return total
+        except Exception:
+            logger.debug("local full GGUF source probe failed", exc_info=True)
+        return None
+
+    def _task_worker_local_full_source_available(self) -> bool:
+        return self._task_worker_local_full_layers() is not None
+
+    def _task_worker_local_full_source_bytes(self) -> int:
+        """Size of the installed complete local GGUF source, 0 when absent."""
+        try:
+            from pathlib import Path
+            from local_model_assets import discover_local_model_assets, _app_root
+            root = Path(_app_root())
+            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
+                relative = asset.get("gguf_path")
+                if not isinstance(relative, str) or not relative:
+                    continue
+                path = (root / relative).resolve()
+                if path.is_file():
+                    return int(path.stat().st_size)
+        except Exception:
+            logger.debug("local full GGUF size probe failed", exc_info=True)
+        return 0
+
+    def _task_worker_local_cut_layer_budget(self) -> dict | None:
+        """Device-advertised layer budget, mirroring Android's computeLayerBudget.
+
+        `layer_ranges=[[0, total]]` says "I can take any range" but **not** how many
+        layers this node can actually hold. Without the budget the solver hands the
+        node everything and only rejects it afterwards: 实测 rog 被分 [8,32)、预算
+        11.4GB、缺口 5.65GB，`waiting_nodes` 因此每 20~30 秒重算一次（白烧 4 分钟），
+        而空闲 9.6GB 的 android 反而一个层段都拿不到。
+        """
+        total = self._task_worker_local_full_layers()
+        size = self._task_worker_local_full_source_bytes()
+        if not total or not size:
+            return None
+        try:
+            import psutil
+
+            available = int(psutil.virtual_memory().available)
+        except (ImportError, OSError):
+            return None
+        if available <= 0:
+            return None
+        per_layer = int(size) // int(total)
+        if per_layer <= 0:
+            return None
+        # 与 Android 同系数：留 40% 给 KV 缓存与运行时。
+        budget_bytes = int(available * 0.6)
+        max_layers = budget_bytes // per_layer
+        if max_layers <= 0:
+            return None
+        return {
+            "available_bytes": budget_bytes,
+            "per_layer_bytes": per_layer,
+            "max_layers": int(max_layers),
+            "local_cut": True,
+        }
+
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
-        engines = []
-        if torch_available():
-            engines.append("pytorch")
-        try:
-            if importlib.util.find_spec("llama_cpp") is not None:
-                engines.append("llama_cpp")
-            elif keep_head_shim_available():
-                # shim 路径同样能执行 llama.cpp 层段（见 keep_head_shim_available 的说明）。
-                engines.append("llama_cpp")
-        except (ImportError, ValueError):
-            pass
-        # TP 孤岛网关：以 island 引擎承担整请求推理（配置启用即上报能力）
-        try:
-            import config as _island_cfg
-            if (getattr(_island_cfg, "ISLAND_ENABLED", False)
-                    and getattr(_island_cfg, "ISLAND_BASE_URL", "")):
-                engines.append("island")
-        except Exception:
-            pass
-        # 外部推理服务（路线 B）：以 external_api 引擎承担整请求推理。
-        # 仅声明能力，实际外发仍受数据作用域门控约束（默认 opt_in 不出集群）。
-        try:
-            import config as _external_cfg
-            if (getattr(_external_cfg, "EXTERNAL_ENABLED", False)
-                    and getattr(_external_cfg, "EXTERNAL_BASE_URL", "")):
-                engines.append("external_api")
-        except Exception:
-            pass
+        engine_schema = self._task_worker_engine_schema()
+        engines = list(dict.fromkeys(
+            item["family"] for item in engine_schema["runtimes"]
+        ))
+        # Preserve a diagnostic hello for a broken slim installation, with no
+        # execution operations. aggregate is handled locally by the worker.
         if not engines:
-            # The PC application currently requires the PyTorch runtime. Keeping
-            # the schema valid also makes a broken installation visible in hello.
-            engines.append("pytorch")
+            engines = ["pytorch"]
 
         full_model_identity = self._task_worker_full_model_identity(engines)
         models = [full_model_identity] if full_model_identity is not None else []
         active_layer_config = getattr(self, "_active_layer_config", None) or {}
+        # ★ 2026-10-23（已知问题记录 #117 修正）：**持有完整 GGUF 源且能本地裁层**的节点
+        #   也必须进入层段池。原判据只看「是否已有层段配置」⇒ 没有段的新节点永不广告
+        #   `layer_forward`，master 于是永不分配新段（鸡生蛋），历史上乱切的旧段因此
+        #   永远清理不掉。这是"worker 自持整模、任意切点自裁"落地的前提。
+        try:
+            host_has_model = bool(
+                getattr(self._host, "model_loaded", False)
+                or self._host.has_loaded_model()
+            )
+        except Exception:
+            host_has_model = bool(getattr(self._host, "model_loaded", False))
+        # 只在**没有在跑整模**的节点上启用自裁路径：正在整模推理的节点保持原有
+        # full_inference 语义，避免把线程池/内存同时押在两套执行路径上。
+        # `QLH_LOCAL_CUT_SELF=0` 可显式关闭自裁广告（测试默认关闭：该判据要探测
+        # 本地完整 GGUF 源，而开发机 `models/` 里就有整模，否则每个用例都会被
+        # 误判成自裁节点）。生产侧默认开启，无需配置。
+        local_cut_only = bool(
+            not host_has_model
+            and not os.environ.get("QLH_LAYER_GGUF", "").strip()
+            and os.environ.get("QLH_LOCAL_CUT_SELF", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+            and self._task_worker_local_cut_available()
+            and self._task_worker_local_full_source_available()
+        )
         layer_worker = bool(
-            active_layer_config or getattr(self._host, "layer_range", None)
+            active_layer_config
+            or getattr(self._host, "layer_range", None)
+            or local_cut_only
         )
         layer_ranges: list[list[int]] = []
         # ★ #28：**工件身份**（「我手上有哪份权重」）与**就绪区间**（「我现在能跑哪几层」）
@@ -669,7 +791,15 @@ class SchedulerTaskWorkerMixin:
             # An explicitly configured but missing/corrupt GGUF must not keep
             # advertising a stale active range from the previous generation.
             layer_worker = False
-        if artifact is not None:
+        if local_cut_only:
+            # ★ 持整模 + 能自裁 ⇒ 声明整域 [0, total)，让容量求解按能力自由分配，
+            #   而不是被某个历史段绑死。已注册的段仍作为可复用工件存在，但**分发
+            #   契约**以"能承担任意连续层段"为准（否则早期乱切的段会永久固化布局）。
+            total = self._task_worker_local_full_layers()
+            if total:
+                layer_ranges.append([0, int(total)])
+            layer_worker = True
+        elif artifact is not None:
             # A registered segment is executable only for the exact manifest
             # range.  Never let a stale active config publish a second range
             # beside the per-artifact contract.
@@ -687,7 +817,12 @@ class SchedulerTaskWorkerMixin:
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
         artifact_model = self._task_worker_layer_artifact_identity(artifact)
-        if artifact_model is not None:
+        if artifact_model is not None and (
+            full_model_identity is None
+            or (layer_worker and advertisement_supports(engine_schema, FORWARD_LAYERS))
+        ):
+            # An unsupported segment beside a real full model has no executable
+            # layer_artifacts entry; keep it out of that full model's identities.
             # Protocol v3 requires layer_artifacts to reference a physical
             # identity in models.  This is an artifact registry entry only;
             # full-stage admission independently requires a loaded full model.
@@ -699,8 +834,17 @@ class SchedulerTaskWorkerMixin:
                 models.append(artifact_model)
             elif existing != artifact_model:
                 raise RuntimeError("layer_artifact_model_identity_conflict")
-        stage_types = ["full_inference", "aggregate"]
-        if layer_worker and full_model_identity is None:
+        if (layer_worker or artifact_model is not None) and full_model_identity is None:
+            entries = ENGINE_REGISTRY.validate_advertisement(engine_schema)
+            engine_schema = ENGINE_REGISTRY.advertisement(
+                ENGINE_REGISTRY.narrow(entry.family, entry.runtime_kind,
+                                       entry.operations - {FULL_REQUEST})
+                for entry in entries
+            )
+        stage_types = ["aggregate"]
+        if advertisement_supports(engine_schema, FULL_REQUEST):
+            stage_types.insert(0, "full_inference")
+        if (layer_worker or artifact_model is not None) and full_model_identity is None:
             stage_types = []
         if layer_worker and "layer_forward" not in stage_types:
             # ★ 票 15a（能力广告半边）：**能起 server 不等于能参与层段接力**。
@@ -708,14 +852,23 @@ class SchedulerTaskWorkerMixin:
             #   子进程路径），就不得广告 `layer_forward` —— 否则 master 会把层段
             #   派给一台执行不了的 worker。判据走运行时能力探测而非 backend 名字：
             #   server 引擎对外仍报 `engine_type="llama_cpp"`。
-            if self._advertises_layer_forward():
+            if advertisement_supports(engine_schema, FORWARD_LAYERS):
                 stage_types.append("layer_forward")
             else:
                 logger.warning(
                     "task worker 声明为层段 worker，但当前推理路径不支持层段前向 "
                     "-> 不广告 layer_forward（票 15a INFER-PATH-SPLIT-01）"
                 )
+        if not layer_worker or not advertisement_supports(engine_schema, FORWARD_LAYERS):
+            layer_ranges = []
+        if not stage_types:
+            stage_types = ["aggregate"]
+        local_cut_budget = (
+            self._task_worker_local_cut_layer_budget() if local_cut_only else None
+        )
         capabilities = {
+            "engine_capabilities": engine_schema,
+            "load_spec_version": 1,
             "stage_types": stage_types,
             "engines": engines,
             "models": models,
@@ -728,6 +881,17 @@ class SchedulerTaskWorkerMixin:
             "layer_worker": layer_worker,
             # Exact registered/assigned ranges, without a loaded-ready ACK.
             "layer_ranges": layer_ranges,
+            # ★ 2026-10-23（#117）：自裁节点必须**同时**声明能装几层。只给
+            #   `layer_ranges=[[0,total]]` 等于宣称"我什么都能接"却不报上限，求解器
+            #   会先把它喂满（[8,32)）再事后按容量排除，于是算不出可行解、
+            #   `waiting_nodes` 每 20~30 秒重算一次。字段语义与 Android 的
+            #   `computeLayerBudget` 一致：`max_layers` 是承载上界，`local_cut=true`
+            #   表示"可按分配在本地裁层"（capacity.py 据此把 layer_ranges 降级为
+            #   "当前已就绪"的信息而非硬约束）。
+            **(
+                {"layer_budget": local_cut_budget}
+                if local_cut_budget is not None else {}
+            ),
             # ★ 2026-10-08（DIST-NEXT-2b）：声明**能接收分片 hidden**。接收侧
             #   （`_handle_task_worker_stage_chunk` + `hidden_ref` 装配）早已实现，但此前
             #   没有任何声明处 —— 于是 provider 的 `_maybe_send_stage_chunks` 直接跳过
@@ -735,6 +899,8 @@ class SchedulerTaskWorkerMixin:
             #   （实测 `route_a_stage_frame_too_large:…:wire=24160940:budget=8126464`）。
             #   非层段 worker 不接收 hidden，故按 `layer_worker` 保守声明。
             "stage_chunked_input": bool(layer_worker),
+            "stage_kv_cleanup": bool(layer_worker),
+            "node_incarnation": self._model_control.boot_id,
             "relay_middle": bool(
                 layer_worker
                 and active_layer_config
@@ -746,7 +912,10 @@ class SchedulerTaskWorkerMixin:
         # false. The compatibility switch must omit the key entirely.
         if layer_worker and binary_hidden_transport_enabled():
             capabilities["binary_hidden"] = True
-        if artifact is not None and artifact.get("segment_mode") in {
+        if (layer_worker and "layer_forward" in stage_types
+                and self._task_worker_multi_position_argmax_available()):
+            capabilities["multi_position_argmax"] = True
+        if layer_ranges and artifact is not None and artifact.get("segment_mode") in {
             "head", "middle", "tail",
         }:
             item = {
@@ -781,39 +950,88 @@ class SchedulerTaskWorkerMixin:
             # unspecified; it must never claim a stronger release profile.
             return RUNTIME_PROFILE_UNSPECIFIED
 
-    def _advertises_layer_forward(self) -> bool:
-        """当前 runtime 能否**真的**执行层段前向（票 15a 的能力广告判据）。
-
-        保守语义：只有拿到**明确的否定结论**才不广告 —— 探测不出结论时（测试替身、
-        未加载模型、无可识别 backend）按"可以"处理，维持既有广告行为不变。
-        """
+    def _task_worker_engine_schema(self) -> dict:
+        """Discover installed paths, then apply only narrowing runtime probes."""
+        runtimes = []
+        if torch_available():
+            kind = (PYTORCH_CUDA if self._runtime_profile_for_capabilities() == "torch_cuda"
+                    else PYTORCH_CPU)
+            runtimes.append(("pytorch", kind))
         try:
-            from koakuma_engine import Capability, backend_id_for
-
-            host = self._host
-            probe = getattr(host, "supports", None)
-            if not callable(probe):
-                return True
-            if not backend_id_for(host):
-                # 没有可识别的 backend（未加载/替身）=> 不下否定结论
-                return True
-            return bool(probe(Capability.FORWARD_LAYERS))
+            if importlib.util.find_spec("llama_cpp") is not None:
+                runtimes.append(("llama_cpp", LLAMA_CPP_BINDING))
+            if keep_head_shim_available():
+                runtimes.append(("llama_cpp", LLAMA_CPP_KEEP_HEAD))
+        except (ImportError, ValueError):
+            pass
+        try:
+            import config as cfg
+            if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
+                runtimes.append(("island", ISLAND_REMOTE))
+            if getattr(cfg, "EXTERNAL_ENABLED", False) and getattr(cfg, "EXTERNAL_BASE_URL", ""):
+                runtimes.append(("external_api", EXTERNAL_API_REMOTE))
         except Exception:
-            return True
+            pass
+        host = self._host
+        family, kind = runtime_identity_for(host)
+        if ENGINE_REGISTRY.get(family, kind) is not None:
+            runtimes.append((family, kind))
+        # A current server or a negative probe must also narrow installed
+        # binding/keep-head paths; installation alone does not grant a live host.
+        allow_layers = True
+        if kind:
+            allow_layers = runtime_supports(host, Capability.FORWARD_LAYERS)
+        elif backend_id_for(host):
+            probe = getattr(host, "supports", None)
+            if callable(probe):
+                try:
+                    allow_layers = bool(probe(Capability.FORWARD_LAYERS))
+                except Exception:
+                    allow_layers = False
+        schema = build_engine_capabilities(runtimes, allow_layers=allow_layers)
+        if kind and not runtime_supports(host, Capability.CHAT):
+            entries = ENGINE_REGISTRY.validate_advertisement(schema)
+            schema = ENGINE_REGISTRY.advertisement(
+                ENGINE_REGISTRY.narrow(entry.family, entry.runtime_kind,
+                    entry.operations - {FULL_REQUEST} if entry.family == family else entry.operations)
+                for entry in entries
+            )
+        return schema
 
+    def _advertises_layer_forward(self) -> bool:
+        return advertisement_supports(self._task_worker_engine_schema(), FORWARD_LAYERS)
+
+    def _master_requires_task_worker_hello(self, client=None) -> bool:
+        """协调方（REGISTER ACK）是否声明了 task-worker 协商要求。
+
+        ★ #106/#114：主节点在 `TASK_WORKER_EXPERIMENTAL_ENABLED` 下对每个
+        pc/android 连接加 fence，而 fence **只能**由 hello 解除。此前是否发
+        hello 完全取决于**客户端本地**的同一开关 ⇒ 没开的节点永远被 fence，
+        release 债务（outbox `state=pending, attempts=0`）永远投递不出去，
+        再经 `model_intent._retirement_state` 把整集群 `/api/models/load` 卡成
+        503。声明在 REGISTER ACK 里，旧协调方不带该字段 ⇒ 保持原行为。
+        """
+        target = client if client is not None else getattr(self, "_tcp_client", None)
+        return getattr(target, "task_worker_hello_required", False) is True
+
+    def _task_worker_handshake_required(self, client=None) -> bool:
+        """本地实验开关或协调方声明，任一成立都必须协商。"""
+        if self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+            return True
+        return self._master_requires_task_worker_hello(client)
 
     def _send_task_worker_hello(
         self, client=None, refresh_generation: int = 0,
         registration_owner: tuple | None = None,
     ) -> bool:
         """Send hello for exactly one authenticated client/epoch/socket owner."""
+        target = client or getattr(self, "_tcp_client", None)
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
-            or not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+            or not self._task_worker_handshake_required(target)
         ):
             return False
-        target = client or getattr(self, "_tcp_client", None)
         if not target:
             return False
         message = None
@@ -881,11 +1099,23 @@ class SchedulerTaskWorkerMixin:
 
     def refresh_task_worker_capabilities(self) -> bool:
         """Schedule a hello bound to the registration requesting this refresh."""
+        # Engine changes affect a local master too, even though only clients
+        # send hello. Keep planning profiles current without warming a manager.
+        from task_worker_capabilities import engine_profile
+        schema = self._task_worker_engine_schema()
+        self._local_device_profile = engine_profile(
+            getattr(self, "_local_device_profile", None) or {}, schema,
+        )
+        local_id = "master" if self._effective_role() == "master" else self.get_effective_node_id()
+        self._merge_task_worker_capabilities_into_node(local_id, {
+            "engine_capabilities": schema,
+            "engines": list(dict.fromkeys(item["family"] for item in schema["runtimes"])),
+        })
         client = getattr(self, "_tcp_client", None)
         if (
             not self.get_distributed_inference_enabled()
             or self._effective_role() != "client"
-            or not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+            or not self._task_worker_handshake_required(client)
             or not client
             or not getattr(client, "is_registered", False)
         ):
@@ -961,29 +1191,167 @@ class SchedulerTaskWorkerMixin:
         return self._task_worker_control.worker_binary_hidden_enabled(owner)
 
 
-    def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
+    def _task_worker_response_owner(self, *, physical_stop=False):
+        """Keep a reply attached to the registration that delivered its request."""
+        scope = getattr(_TASK_WORKER_RESPONSE_CONTEXT, "scope", None)
+        if scope is not None and scope[0] is self:
+            generation = (getattr(self, "_task_worker_io_generation", 0)
+                          if physical_stop else scope[2])
+            return scope[1], generation
+        from tcp_comm import TCPClient
+        owner = TCPClient.received_registration_owner()
         client = getattr(self, "_tcp_client", None)
-        if not client or not getattr(client, "is_registered", False):
-            raise ConnectionError("task worker is not connected to its master")
+        if owner is None:
+            capture = getattr(client, "capture_registration_owner", None)
+            owner = capture() if callable(capture) else None
+        return owner, getattr(self, "_task_worker_io_generation", 0)
+
+
+    def _task_worker_response_current(self, owner, generation):
+        if generation != getattr(self, "_task_worker_io_generation", 0):
+            return False
+        client = getattr(self, "_tcp_client", None)
+        if owner is None:
+            return bool(client and getattr(client, "is_registered", False))
+        capture = getattr(client, "capture_registration_owner", None)
+        return bool(owner[0] is client and callable(capture) and capture() == owner)
+
+
+    def _run_task_worker_stage_offer(self, message, owner, generation):
+        previous = getattr(_TASK_WORKER_RESPONSE_CONTEXT, "scope", None)
+        _TASK_WORKER_RESPONSE_CONTEXT.scope = (self, owner, generation)
+        try:
+            if not self._task_worker_response_current(owner, generation):
+                self._forget_task_worker_request(message.message_id)
+                return
+            self._handle_task_worker_stage_offer(message)
+        finally:
+            _TASK_WORKER_RESPONSE_CONTEXT.scope = previous
+
+
+    def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
+        owner, generation = self._task_worker_response_owner(
+            physical_stop=(message.message_type == "stage_cancelled"
+                           and message.payload.get("execution_state") == "execution_stopped"),
+        )
+        client = getattr(self, "_tcp_client", None)
+        if not self._task_worker_response_current(owner, generation):
+            raise ConnectionError("task worker reply registration is retired")
         from transport_port import MessageType
 
-        capture = getattr(client, "capture_registration_owner", None)
-        owner = capture() if callable(capture) else None
         snapshot, binary_body = split_task_worker_hidden(
             message.snapshot(),
             enabled=self._task_worker_control.worker_binary_hidden_enabled(owner),
         )
-        if binary_body is None:
-            client.send_data(snapshot, MessageType.TASK_WORKER)
+        options = {} if owner is None else {"connection_sock": owner[2]}
+        if binary_body is not None:
+            options["binary_body"] = binary_body
+            logger.debug(
+                "event=task_worker_binary_hidden_sent_to_master message_type=%s bytes=%d",
+                snapshot.get("message_type"), len(binary_body),
+            )
+        # Bind JSON and binary alike. Reconnection during encoding/queue wait
+        # must never redirect a previous registration's result to its successor.
+        client.send_data(snapshot, MessageType.TASK_WORKER, **options)
+
+
+    @staticmethod
+    def _task_worker_io_enabled():
+        return os.environ.get("QLH_TASK_WORKER_IO_ISOLATION", "0").strip().lower() in {
+            "1", "true", "on",
+        }
+
+
+    @staticmethod
+    def _task_worker_response_charge(responses):
+        """Charge the retained Python response graph without encoding it twice."""
+        seen = set()
+        def size(value):
+            if id(value) in seen:
+                return 0
+            seen.add(id(value))
+            total = sys.getsizeof(value)
+            if isinstance(value, dict):
+                total += sum(size(k) + size(v) for k, v in value.items())
+            elif isinstance(value, (list, tuple)):
+                total += sum(size(v) for v in value)
+            return total
+        return size([response.snapshot() for response in responses])
+
+
+    def _send_task_worker_responses(self, request_message_id, responses, *, wait=True, ready_event=None):
+        """Submit a whole ordered batch; accept still waits for its actual write."""
+        responses = tuple(responses)
+        if not responses:
             return
-        logger.debug(
-            "event=task_worker_binary_hidden_sent_to_master message_type=%s bytes=%d",
-            snapshot.get("message_type"), len(binary_body),
+        if not self._task_worker_io_enabled():
+            for response in responses:
+                self._send_task_worker_response(request_message_id, response)
+            return
+        from task_worker_io import WorkerIOSender
+        # Terminal data survives a delivery retirement/full queue. Publish a
+        # complete batch under one lock; duplicates cannot observe half a batch.
+        # Accept is published only after its original write succeeds, so a
+        # duplicate cannot advertise admission when the original submit fails.
+        cacheable = [response for response in responses
+                     if response.message_type != "stage_accept"]
+        self._cache_task_worker_responses(request_message_id, cacheable)
+        # A duplicate can observe a complete cached result before the original
+        # submission/finally completes. Replays share its physical publication
+        # boundary, even if the original queue admission failed.
+        if ready_event is None:
+            with self._task_worker_stage_lock:
+                for response in responses:
+                    if response.message_type == "stage_result":
+                        active = self._task_worker_active_attempts.get(response.payload["attempt_id"])
+                        if active is not None:
+                            ready_event = active.done_event
+                        break
+        physical_stop = (len(responses) == 1 and responses[0].message_type == "stage_cancelled"
+                         and responses[0].payload.get("execution_state") == "execution_stopped")
+        owner, generation = self._task_worker_response_owner(physical_stop=physical_stop)
+        if owner is None or not self._task_worker_response_current(owner, generation):
+            raise ConnectionError("task worker I/O needs a current authenticated registration")
+        with self._task_worker_stage_lock:
+            if getattr(self, "_task_worker_io_stopped", False):
+                raise ConnectionError("task worker I/O is stopped")
+            sender = getattr(self, "_task_worker_io_sender", None)
+            if sender is None:
+                sender = WorkerIOSender(max_bytes=128 * 1024 * 1024)
+                self._task_worker_io_sender = sender
+        def send_batch():
+            previous = getattr(_TASK_WORKER_RESPONSE_CONTEXT, "scope", None)
+            _TASK_WORKER_RESPONSE_CONTEXT.scope = (self, owner, generation)
+            try:
+                # A result may reach the coordinator before send_data returns.
+                # Publish physical completion before making it visible on wire,
+                # so an immediate next offer cannot see the completed stage busy.
+                if ready_event is not None:
+                    while not ready_event.wait(_TASK_WORKER_LOCK_WAIT_SLICE_SECONDS):
+                        if not self._task_worker_response_current(owner, generation):
+                            raise ConnectionError("task worker result publication is retired")
+                for response in responses:
+                    if not self._task_worker_response_current(owner, generation):
+                        raise ConnectionError("task worker I/O batch is retired")
+                    self._send_task_worker_to_master(response)
+                    if response.message_type == "stage_accept":
+                        self._cache_task_worker_responses(request_message_id, [response])
+            finally:
+                _TASK_WORKER_RESPONSE_CONTEXT.scope = previous
+        future = sender.submit(
+            send_batch, charge_bytes=self._task_worker_response_charge(responses),
+            is_current=lambda: self._task_worker_response_current(owner, generation),
+            description=responses[-1].message_type,
         )
-        # A reconnect during serialization must not send the old result to a
-        # successor that has not negotiated binary hidden.
-        client.send_data(snapshot, MessageType.TASK_WORKER,
-                         connection_sock=owner[2], binary_body=binary_body)
+        if wait:
+            future.result()
+        else:
+            def finished(done):
+                if done.cancelled() or done.exception() is not None:
+                    logger.warning("event=task_worker_io_delivery_failed message_type=%s",
+                                   responses[-1].message_type)
+            future.add_done_callback(finished)
+        return future
 
 
     def _task_worker_hello_followup_owner_current(self, node_id, work) -> bool:
@@ -1083,6 +1451,26 @@ class SchedulerTaskWorkerMixin:
                              or not self._task_worker_hello_followup_owner_current(node_id, work))):
                     pending.pop(node_id, None)
 
+    def _merge_task_worker_capabilities_into_node(self, node_id, capabilities, *, accepted=True):
+        """Publish a hello's verified engine schema to the planner node view."""
+        from task_worker_capabilities import validate_worker_engine_capabilities
+
+        schema = None
+        if accepted:
+            validate_worker_engine_capabilities(capabilities)
+            schema = capabilities.get("engine_capabilities")
+        nodes_lock = getattr(self, "_nodes_lock", None)
+        if nodes_lock is None:
+            return
+        with nodes_lock:
+            node = self.nodes.get(node_id)
+            if node is not None:
+                if schema is not None:
+                    from task_worker_capabilities import engine_profile
+                    node.device_info = engine_profile(node.device_info or {}, schema)
+                else:
+                    node.device_info = {**(node.device_info or {}), "engine_capabilities": None}
+
     def _apply_task_worker_hello_followup(self, node_id, work):
         def current():
             return self._task_worker_hello_followup_current(node_id, work)
@@ -1092,6 +1480,8 @@ class SchedulerTaskWorkerMixin:
         snapshot = self._task_worker_control.worker_snapshot(node_id)
         accepted = snapshot.get("accepted")
         capabilities = snapshot.get("capabilities") or {}
+        if current():
+            self._merge_task_worker_capabilities_into_node(node_id, capabilities, accepted=bool(accepted))
         cleanup_pending = bool(self._pending_pipeline_model_cleanup_for_node(node_id))
         if accepted and cleanup_pending and current():
             self._replay_pipeline_model_cleanup_for_node(node_id)
@@ -1167,6 +1557,16 @@ class SchedulerTaskWorkerMixin:
             return False, []
 
 
+    def _cache_task_worker_responses(self, request_message_id, responses):
+        if request_message_id is None or not responses:
+            return
+        snapshots = [response.snapshot() for response in responses]
+        with self._task_worker_stage_lock:
+            cached = self._task_worker_seen_messages.get(request_message_id)
+            if cached is not None:
+                cached[1].extend(snapshots)
+
+
     def _cache_task_worker_response(
         self, request_message_id: str, response: WorkerMessage,
     ) -> None:
@@ -1185,20 +1585,28 @@ class SchedulerTaskWorkerMixin:
                 pass
 
 
-    def _send_task_worker_response(
-        self, request_message_id: str, response: WorkerMessage,
-    ) -> None:
-        self._cache_task_worker_response(request_message_id, response)
+    def _send_task_worker_response_sync(self, request_message_id, response):
+        if request_message_id is not None:
+            self._cache_task_worker_response(request_message_id, response)
         self._send_task_worker_to_master(response)
 
 
-    def _replay_task_worker_responses(self, responses: list[dict]) -> None:
-        for response in responses:
-            self._send_task_worker_to_master(
-                decode_task_worker_message(
-                    response, binary_hidden=self._task_worker_binary_hidden_enabled(),
-                )
+    def _send_task_worker_response(
+        self, request_message_id: str, response: WorkerMessage,
+    ) -> None:
+        if self._task_worker_io_enabled():
+            self._send_task_worker_responses(
+                request_message_id, [response], wait=response.message_type == "stage_accept",
             )
+        else:
+            self._send_task_worker_response_sync(request_message_id, response)
+
+
+    def _replay_task_worker_responses(self, responses: list[dict]) -> None:
+        decoded = [decode_task_worker_message(
+            response, binary_hidden=self._task_worker_binary_hidden_enabled(),
+        ) for response in responses]
+        self._send_task_worker_responses(None, decoded, wait=False)
 
 
     @staticmethod
@@ -1414,6 +1822,7 @@ class SchedulerTaskWorkerMixin:
             payload, provider_id=provider_id,
         )
         response_payload["reason_code"] = terminal_reason
+        response_payload["execution_state"] = "execution_stopped" if active.done_event.is_set() else "execution_in_flight"
         response = build_task_worker_message(
             "stage_cancelled",
             response_payload,
@@ -1555,6 +1964,13 @@ class SchedulerTaskWorkerMixin:
             for attempt in self._task_worker_active_attempts.values():
                 attempt.cancel_reason = reason_code
                 attempt.cancel_event.set()
+            self._task_worker_io_generation = getattr(self, "_task_worker_io_generation", 0) + 1
+            sender = getattr(self, "_task_worker_io_sender", None)
+            self._task_worker_io_sender = None
+            if close:
+                self._task_worker_io_stopped = True
+        if sender is not None:
+            sender.close(wait=False)
         controller = getattr(self, "_worker_prepare", None)
         if controller is not None:
             if close:
@@ -1583,7 +1999,7 @@ class SchedulerTaskWorkerMixin:
         coordinator = self._task_worker_control.coordinator_snapshot()
         if not self.get_distributed_inference_enabled():
             reject_reason = "local_inference_mode"
-        elif not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+        elif not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             reject_reason = "worker_experiment_disabled"
             reject_retryable = True
         else:
@@ -1612,6 +2028,9 @@ class SchedulerTaskWorkerMixin:
                 reject_reason = "model_identity_mismatch"
                 reject_retryable = True
 
+        if not reject_reason and offer.get("token_output") == "all_positions":
+            if not self._task_worker_multi_position_argmax_available():
+                reject_reason = "multi_position_argmax_unavailable"
         with self._task_worker_stage_lock:
             if not self.get_distributed_inference_enabled():
                 reject_reason = "local_inference_mode"
@@ -1715,7 +2134,7 @@ class SchedulerTaskWorkerMixin:
                     key: offer[key]
                     for key in (
                         "layer_range", "handoff_at", "hidden_sha256",
-                        "hidden_spec", "middle_channel", "seq_ids", "positions", "prepare_identity",
+                        "hidden_spec", "middle_channel", "seq_ids", "positions", "prepare_identity", "token_output",
                     )
                     if key in offer
                 },
@@ -1772,17 +2191,18 @@ class SchedulerTaskWorkerMixin:
                 attempt_id=attempt_id,
                 provider_id=expected_provider,
             )
-            for response in responses:
-                try:
-                    self._send_task_worker_response(message.message_id, response)
-                except Exception:
-                    logger.warning(
-                        "event=task_worker_stage_result_send_failed attempt_id=%s",
-                        attempt_id, exc_info=True,
-                    )
-                    return
+            try:
+                self._send_task_worker_responses(
+                    message.message_id, responses, wait=False, ready_event=active.done_event,
+                )
+            except Exception:
+                logger.warning(
+                    "event=task_worker_stage_result_send_failed attempt_id=%s",
+                    attempt_id, exc_info=True,
+                )
+                return
             logger.info(
-                "event=task_worker_stage_result_sent workflow_id=%s stage_id=%s attempt_id=%s chunks=%d",
+                "event=task_worker_stage_result_submitted workflow_id=%s stage_id=%s attempt_id=%s chunks=%d",
                 offer["workflow_id"], offer["stage_id"], attempt_id,
                 max(0, len(responses) - 1),
             )
@@ -1863,6 +2283,17 @@ class SchedulerTaskWorkerMixin:
                         if expires_at <= now:
                             completed.pop(completed_id, None)
                     completed[attempt_id] = (removed, now + 5.0)
+            if removed is not None and removed.cancel_event.is_set():
+                stopped = self._task_worker_attempt_payload(offer, provider_id=expected_provider)
+                stopped.update(reason_code=removed.terminal_reason or "provider_cancelled",
+                               execution_state="execution_stopped")
+                try:
+                    response = build_task_worker_message("stage_cancelled", stopped,
+                        message_id=f"msg_stopped_{uuid.uuid4().hex}", sent_at_ms=int(time.time() * 1000),
+                        version=TASK_WORKER_PROTOCOL_VERSION)
+                    self._send_task_worker_response(message.message_id, response)
+                except Exception:
+                    logger.warning("physical stop receipt delivery failed attempt=%s", attempt_id, exc_info=True)
 
 
     def _handle_task_worker_message(self, client_id: str, msg: dict) -> None:
@@ -1907,7 +2338,15 @@ class SchedulerTaskWorkerMixin:
                     "event=task_worker_binary_hidden_received peer=%s message_type=%s bytes=%d",
                     client_id, raw.get("message_type"), len(binary_body),
                 )
-            message = decode_task_worker_message(raw, binary_hidden=binary_hidden)
+            try:
+                message = decode_task_worker_message(raw, binary_hidden=binary_hidden)
+            except InvalidTokenOutputResult as exc:
+                if self._effective_role() != "master":
+                    raise
+                # Route only the bounded, otherwise validated receipt through the
+                # usual registered-node/provider/attempt checks. The provider
+                # records a terminal token-output error instead of a timeout.
+                message = exc.message
             if self._effective_role() == "master":
                 if client_id == "master":
                     raise WorkerProtocolError(
@@ -2115,9 +2554,10 @@ class SchedulerTaskWorkerMixin:
                     if duplicate:
                         self._replay_task_worker_responses(responses)
                         return
+                    owner, generation = self._task_worker_response_owner()
                     threading.Thread(
-                        target=self._handle_task_worker_stage_offer,
-                        args=(message,),
+                        target=self._run_task_worker_stage_offer,
+                        args=(message, owner, generation),
                         name=f"task-worker-stage-{message.payload['attempt_id']}",
                         daemon=True,
                     ).start()
@@ -2211,7 +2651,7 @@ class SchedulerTaskWorkerMixin:
             )
         full_model_ready = bool(full_model_worker_ids)
         layer_stage_ready = bool(layer_stage_worker_ids)
-        if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
+        if not self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             readiness_reason = "task_worker_experiment_disabled"
         elif not connected:
             readiness_reason = "task_worker_control_plane_not_connected"
@@ -2221,18 +2661,18 @@ class SchedulerTaskWorkerMixin:
             readiness_reason = "task_worker_manual_dispatch_ready"
         runtime.update({
             "phase": "TC-N2.4",
-            "experiment_enabled": self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'),
+            "experiment_enabled": self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED'),
             "experimental_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
             "auto_provider_selection_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
             "manual_stage_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
             "layer_stage_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 and connected and layer_stage_ready
             ),
             # ★ 2026-10-03：上面那个字段的判据是 `layer_stage_worker_ids` —— 那是
@@ -2244,7 +2684,7 @@ class SchedulerTaskWorkerMixin:
             #   这里按**自己的** capabilities 给出同名字段，口径与 master 侧
             #   `task_worker_adapter.py:359` 一致。
             "self_layer_stage_dispatch_enabled": bool(
-                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 and connected
                 and "layer_forward" in (
                     self._task_worker_capabilities().get("stage_types") or []
@@ -2265,9 +2705,9 @@ class SchedulerTaskWorkerMixin:
             "worker_readiness_reason": readiness_reason,
             "admission_state": (
                 "n2_4_experimental_physical_validation_pending"
-                if self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected
+                if self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected
                 else "n2_4_experiment_enabled_not_connected"
-                if self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                if self._runtime_setting('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 else "n2_4_experiment_disabled"
             ),
         })

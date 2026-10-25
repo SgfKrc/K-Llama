@@ -392,9 +392,18 @@ def test_real_qwen2_candidate_materializes_only_supplied_layers(prepared_supply,
         materialized = []
         original = model_module._LayerRangeLoadTracker.materialize
 
-        def tracked(tracker, handle, key):
+        index = json.loads((directory / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        expected_sources = {key: (directory / shard).resolve(strict=True)
+                            for key, shard in index["weight_map"].items()}
+        observed_sources = {}
+
+        def tracked(tracker, handle, key, source_file=""):
+            assert source_file, "filtered loading must identify the source shard"
+            source = Path(source_file).resolve(strict=True)
+            assert source == expected_sources[key]
+            observed_sources[key] = source
             materialized.append(key)
-            return original(tracker, handle, key)
+            return original(tracker, handle, key, source_file=source_file)
 
         def no_full(*_args, **_kwargs):
             pytest.fail("legacy supply prepare attempted to load a full source model")
@@ -411,6 +420,10 @@ def test_real_qwen2_candidate_materializes_only_supplied_layers(prepared_supply,
         assert manager.layer_range == (1, 3)
         assert len(manager.model.model.layers) == 2
         assert materialized
+        assert observed_sources == expected_sources
+        proof = manager._layer_load_metrics["materialization_proof"]
+        assert {tensor.name: Path(tensor.source_file).resolve(strict=True)
+                for tensor in proof.tensors} == observed_sources
         assert not any(key.startswith(("model.layers.0.", "model.layers.3.")) for key in materialized)
         assert {int(key.split(".")[2]) for key in materialized if key.startswith("model.layers.")} == {1, 2}
         assert manager.get_pipeline_descriptor()["model_sha256"] == manifest["source_model_sha256"]

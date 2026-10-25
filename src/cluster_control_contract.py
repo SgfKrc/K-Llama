@@ -13,10 +13,14 @@ import base64
 import hashlib
 import json
 import re
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
+
+from qlh_core.contracts.authority import (
+    AuthorityError, AuthorityIdentity, AuthorityProof, RecoveryFloor, ValidatedAuthority,
+)
+from qlh_core.control.authority import AuthorityService
 
 try:
     from cryptography.exceptions import InvalidSignature
@@ -605,124 +609,79 @@ class ControlPlaneAuthority:
         self._cluster_id = cluster
         self._voter_set = voter_set
         self._static_role = static_role
-        self._committed_term = 0
-        self._certificate: QuorumCertificate | None = None
-        self._lock = threading.RLock()
+        self._service = AuthorityService(self._validate)
+
+    def _validate(self, certificate, now_ms):
+        cert = certificate if isinstance(certificate, QuorumCertificate) else QuorumCertificate.from_dict(certificate)
+        validation = validate_certificate(cert, self._voter_set, now_ms=now_ms)
+        proof = AuthorityProof(
+            identity=AuthorityIdentity(cert.cluster_id, cert.voter_set_epoch,
+                                       cert.leader_id, cert.term, cert.lease_id),
+            certificate_digest=cert.digest(), expires_at_ms=cert.expires_at_ms,
+            committed_floor=tuple(RecoveryFloor(w.workflow_id, w.last_sequence, w.checkpoint_digest)
+                                  for w in cert.commit_watermark),
+        )
+        return ValidatedAuthority(proof, cert, validation)
 
     @property
     def voter_set(self) -> VoterSet:
         return self._voter_set
 
-    def install_certificate(
-        self,
-        certificate: QuorumCertificate | Mapping[str, Any],
-        *,
-        now_ms: int | None = None,
-    ) -> CertificateValidation:
-        """Install a validated certificate; this never allocates a new term."""
-        cert = certificate if isinstance(certificate, QuorumCertificate) else QuorumCertificate.from_dict(certificate)
-        validation = validate_certificate(cert, self._voter_set, now_ms=now_ms)
-        with self._lock:
-            digest = cert.digest()
-            if cert.term < self._committed_term:
-                raise ControlContractError(
-                    "control_certificate_stale",
-                    "certificate term is older than the committed term",
-                )
-            if cert.term == self._committed_term and self._certificate is not None:
-                previous = self._certificate
-                if cert.leader_id != previous.leader_id or cert.lease_id != previous.lease_id:
-                    raise ControlContractError(
-                        "control_certificate_conflict",
-                        "two different certificates claim the same term",
-                    )
-                if cert.expires_at_ms < previous.expires_at_ms or (
-                    cert.expires_at_ms == previous.expires_at_ms and digest != previous.digest()
-                ):
-                    raise ControlContractError(
-                        "control_certificate_conflict",
-                        "certificate renewal must strictly extend the same lease",
-                    )
-                self._certificate = cert
-                return validation
-            if cert.term == self._committed_term:
-                raise ControlContractError(
-                    "control_certificate_stale",
-                    "a revoked certificate cannot be installed again",
-                )
-            self._certificate = cert
-            self._committed_term = cert.term
-            return validation
+    def install_certificate(self, certificate, *, now_ms=None, recovery=None) -> CertificateValidation:
+        """Validate first, recover once under admission fence, then publish."""
+        if now_ms is not None:
+            _now_ms(now_ms)
+        try:
+            return self._service.install(certificate, now_ms=now_ms, recover=recovery)
+        except AuthorityError as exc:
+            raise ControlContractError(exc.code, str(exc)) from exc
+
+    def cancel_recovery(self):
+        self._service.cancel_recovery()
+
+    def admit_bound_identity(self, identity, *, now_ms=None):
+        try:
+            return self._service.admit_bound_identity(identity, now_ms=now_ms)
+        except AuthorityError as exc:
+            raise ControlContractError(exc.code, str(exc)) from exc
+
+    def authority_identity(self) -> AuthorityIdentity | None:
+        _term, proof, recovering = self._service.observation()
+        return proof.identity if proof is not None and not recovering else None
 
     def revoke_certificate(self, certificate: QuorumCertificate) -> bool:
         """Fence this node's current lease without forgetting its committed term."""
-        with self._lock:
-            if self._certificate is None or self._certificate.digest() != certificate.digest():
-                return False
-            self._certificate = None
-            return True
+        return self._service.revoke(certificate.digest())
 
     def snapshot(self, *, now_ms: int | None = None) -> ControlPlaneSnapshot:
         current = _now_ms(now_ms)
-        with self._lock:
-            certificate = self._certificate
-            expired = certificate is not None and certificate.expires_at_ms <= current
-            writable = certificate is not None and not expired
-            reason = "" if writable else "control_certificate_expired" if expired else "control_certificate_missing"
-            return ControlPlaneSnapshot(
-                schema_version=CONTROL_SCHEMA_VERSION,
-                cluster_id=self._cluster_id,
-                mode="writable" if writable else "read_only",
-                static_role=self._static_role,
-                voter_set_epoch=self._voter_set.voter_set_epoch,
-                committed_term=self._committed_term,
-                leader_id=certificate.leader_id if certificate else "",
-                lease_id=certificate.lease_id if certificate else "",
-                certificate_digest=certificate.digest() if certificate else "",
-                expires_at_ms=certificate.expires_at_ms if certificate else None,
-                read_only_reason=reason,
-            )
+        term, proof, recovering = self._service.observation()
+        expired = proof is not None and proof.expires_at_ms <= current
+        writable = proof is not None and not expired and not recovering
+        reason = ("" if writable else "control_certificate_not_current" if recovering
+                  else "control_certificate_expired" if expired else "control_certificate_missing")
+        return ControlPlaneSnapshot(
+            schema_version=CONTROL_SCHEMA_VERSION, cluster_id=self._cluster_id,
+            mode="writable" if writable else "read_only", static_role=self._static_role,
+            voter_set_epoch=self._voter_set.voter_set_epoch, committed_term=term,
+            leader_id=proof.identity.leader_id if proof else "",
+            lease_id=proof.identity.lease_id if proof else "",
+            certificate_digest=proof.certificate_digest if proof else "",
+            expires_at_ms=proof.expires_at_ms if proof else None, read_only_reason=reason,
+        )
 
     def current_certificate(self) -> QuorumCertificate | None:
-        """Return the installed public certificate for transport decoration."""
-        with self._lock:
-            return self._certificate
+        return self._service.current_certificate()
 
-    def admit_control_write(
-        self,
-        certificate: QuorumCertificate | Mapping[str, Any] | None,
-        *,
-        now_ms: int | None = None,
-    ) -> ControlWritePermit:
-        """Require the exact current, unexpired certificate for a control write."""
+    def admit_control_write(self, certificate, *, now_ms=None) -> ControlWritePermit:
         if certificate is None:
-            raise ControlContractError(
-                "control_certificate_missing",
-                "control write requires a quorum certificate",
-            )
-        cert = certificate if isinstance(certificate, QuorumCertificate) else QuorumCertificate.from_dict(certificate)
-        validate_certificate(cert, self._voter_set, now_ms=now_ms)
-        with self._lock:
-            if self._certificate is None:
-                raise ControlContractError(
-                    "control_certificate_not_current",
-                    "certificate has not been committed by this authority",
-                )
-            if cert.term < self._committed_term:
-                raise ControlContractError(
-                    "control_certificate_stale",
-                    "certificate term is older than the committed term",
-                )
-            if cert.digest() != self._certificate.digest():
-                raise ControlContractError(
-                    "control_certificate_not_current",
-                    "control write certificate is not the current certificate",
-                )
-            return ControlWritePermit(
-                certificate_digest=cert.digest(),
-                term=cert.term,
-                lease_id=cert.lease_id,
-            )
+            raise ControlContractError("control_certificate_missing", "control write requires a quorum certificate")
+        try:
+            proof = self._service.admit(certificate, now_ms=now_ms)
+        except AuthorityError as exc:
+            raise ControlContractError(exc.code, str(exc)) from exc
+        return ControlWritePermit(certificate_digest=proof.certificate_digest,
+                                  term=proof.identity.term, lease_id=proof.identity.lease_id)
 
     require_control_write = admit_control_write
 

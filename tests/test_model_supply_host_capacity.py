@@ -96,7 +96,7 @@ def test_one_aligned_group_has_no_proper_segment(layers, alignment, node_id):
                    reserve=0, margin=1, alignment=alignment) == []
 
 
-@pytest.mark.parametrize("component", ["embedding", "final_norm", "other"])
+@pytest.mark.parametrize("component", ["final_norm", "other"])
 @pytest.mark.parametrize("node_id", ["master", "worker"])
 def test_required_source_boundary_is_charged_even_for_remote_middle(component, node_id):
     components = dict.fromkeys(("embedding", "final_norm", "lm_head", "other"), 0)
@@ -108,16 +108,16 @@ def test_required_source_boundary_is_charged_even_for_remote_middle(component, n
 
 
 @pytest.mark.parametrize("node_id", ["worker", "android"])
-def test_lm_head_is_reserved_on_every_remote_range_but_not_master(node_id):
+def test_lm_head_is_charged_only_for_remote_tail(node_id):
     value = projection((10, 10, 10, 10), components={
         "embedding": 0, "final_norm": 0, "other": 0, "lm_head": 7,
     })
     assert allowed(value, "master", available=10, reserve=0, margin=1) == [[0, 1]]
-    assert allowed(value, node_id, available=16, reserve=0, margin=1) == []
+    assert allowed(value, node_id, available=16, reserve=0, margin=1) == [[0, 1], [1, 2], [2, 3]]
     assert allowed(value, node_id, available=17, reserve=0, margin=1) == [[0, 1], [1, 2], [2, 3], [3, 4]]
 
 
-@pytest.mark.parametrize("node_id,boundary", [("master", 50), ("worker", 110)])
+@pytest.mark.parametrize("node_id,boundary", [("master", 50), ("worker", 50)])
 def test_margin_and_reserve_match_postcheck_at_the_last_byte(node_id, boundary):
     value = projection((101, 200, 300))
     required = math.ceil((101 + boundary) * 1.2) + 23
@@ -238,3 +238,43 @@ assert "torch" not in sys.modules and "safetensors" not in sys.modules
     result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", code, source],
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("component,span,charge", [
+    ("embedding", [0, 1], 7), ("embedding", [1, 2], 0), ("embedding", [3, 4], 0),
+    ("lm_head", [0, 1], 0), ("lm_head", [1, 2], 0), ("lm_head", [3, 4], 7),
+])
+def test_remote_range_charges_only_the_boundary_it_owns(component, span, charge):
+    components = dict.fromkeys(("embedding", "final_norm", "lm_head", "other"), 0)
+    components[component] = 7
+    value = projection((10, 10, 10, 10), components=components)
+    required = 10 + charge
+    assert span not in allowed(value, "worker", available=required - 1, reserve=0, margin=1)
+    assert span in allowed(value, "worker", available=required, reserve=0, margin=1)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_remote_middle_excludes_unowned_embedding_head_and_their_conversion(tied):
+    value = projection((10, 10, 10, 10), components={
+        "embedding": 10**9, "final_norm": 1, "lm_head": 10**9, "other": 2,
+    })
+    value.update(tie_word_embeddings=tied, runtime_conversion_layer_max_bytes=[2] * 4,
+                 runtime_conversion_component_max_bytes={"embedding": 10**9, "final_norm": 3,
+                                                         "lm_head": 10**9, "other": 0})
+    # Source 10+1+2, with one maximum conversion of 3.
+    assert allowed(value, "worker", available=15, reserve=0, margin=1) == []
+    assert allowed(value, "worker", available=16, reserve=0, margin=1) == [[1, 2], [2, 3]]
+
+
+def test_tied_tail_charges_shared_embedding_and_its_conversion_once():
+    value = projection((10, 10, 10, 10), components={
+        "embedding": 7, "final_norm": 2, "lm_head": 10**9, "other": 3,
+    })
+    value.update(tie_word_embeddings=True, runtime_conversion_layer_max_bytes=[1] * 4,
+                 runtime_conversion_component_max_bytes={"embedding": 9, "final_norm": 0,
+                                                         "lm_head": 10**9, "other": 0})
+    # Tail source 10+7+2+3, with one conversion of 9; the shared source is unique.
+    assert [3, 4] not in allowed(value, "worker", available=30, reserve=0, margin=1)
+    assert [3, 4] in allowed(value, "worker", available=31, reserve=0, margin=1)
+    assert [0, 1] in allowed(value, "worker", available=31, reserve=0, margin=1)
+    assert [1, 2] in allowed(value, "worker", available=16, reserve=0, margin=1)

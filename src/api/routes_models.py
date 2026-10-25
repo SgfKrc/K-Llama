@@ -26,20 +26,36 @@ def exported_handlers() -> dict[str, object]:
     return {name: globals()[name] for name in ['get_current_model', 'unload_model', 'load_model', 'prepare_pipeline_model', 'list_available_models', 'list_models', 'list_local_model_assets', 'preflight_local_model_asset', 'switch_model', 'list_model_registry', 'register_model', 'unregister_model', 'list_model_presets', 'search_model_repositories', 'create_model_download', 'list_model_downloads', 'get_model_download', 'cancel_model_download', 'downloadable_pytorch_model', 'download_pytorch_model_file', 'downloadable_pipeline_assignment', 'list_gguf_models', 'download_model_file']}
 
 async def get_current_model(request: Request = None):
-    """当前模型信息"""
+    """Observe the published runtime without hashing, repair or native loading."""
+    import time
+    from qlh_core.contracts.snapshots import envelope, reason
     _api_module.require_model_api_source(request)
+    runtime = _api_module.model_host.runtime_controller
+    with runtime.publication():
+        payload = _current_model_payload()
+        snapshot = runtime.snapshot()
+    participation = _api_module.scheduler._participation.snapshot()
+    runnable = bool(payload.get("loaded") and payload.get("inference_mode") == "local" and participation["phase"] == "stable")
+    return envelope({**payload, "runnable":runnable, "participation":participation},
+        revision=snapshot.revision,
+        identity={"boot_id":_api_module.scheduler._model_control.boot_id,"owner":"native_runtime"},
+        observed_at=time.time(), reason=None if runnable else reason("runtime", "runtime_not_runnable", "native_runtime"))
+
+
+def _current_model_payload():
     if _api_module._pipeline_model_is_prepared():
         from pipeline_model_descriptor import public_pipeline_descriptor
         descriptor = public_pipeline_descriptor(
             _api_module.model_manager.get_pipeline_descriptor()
         )
+        materialized = bool(getattr(_api_module.model_manager, "is_loaded", False))
+        loaded_info = _api_module.model_manager.get_model_info() if materialized else {}
         return {
+            "inference_switches": loaded_info.get("inference_switches"),
             "inference_mode": _api_module._node_inference_mode(),
             "loaded": False,
             "pipeline_prepared": True,
-            "segment_materialized": bool(
-                getattr(_api_module.model_manager, "is_loaded", False)
-            ),
+            "segment_materialized": materialized,
             "quant_type": _api_module.model_host.current_quant,
             "model_id": descriptor.get("model_id"),
             "descriptor": descriptor,
@@ -55,19 +71,6 @@ async def get_current_model(request: Request = None):
 
     info = _api_module.model_manager.get_model_info()
     mem = _api_module.model_manager.get_memory_usage()
-    # ★ 2026-10-11（ROG+Y700+本机三机实测）：整模加载态此前**不返回** `descriptor`，
-    #   只有 `pipeline_prepared` 态才返回。后果：Android worker 的
-    #   `MainViewModel` 要求 `descriptor.model_sha256` 为 64-hex 才认定
-    #   `hasCoordinatorIdentity` ⇒ 恒为 false ⇒ 不扫描/不广告层段工件 ⇒ 容量求解器
-    #   看不到该节点（实测 `candidate_node_count=1`）⇒ Route A 无法 prepare，
-    #   而 prepare 又正是 descriptor 出现的条件 ⇒ 死锁。
-    #   这里补**完整**身份：优先复用**公开流水线描述符**（`public_pipeline_descriptor`，
-    #   白名单含 `total_layers` / `hidden_size` / `tokenizer_sha256` / `model_sha256`）——
-    #   前三项正是 `model_preflight.descriptor_missing` 的判据，缺一即
-    #   `model_preflight_descriptor_incomplete`（实测三机接力就卡在这一层）。
-    #   拿不到描述符时退回 `_active_task_graph_model_identity()`（pytorch 整模走
-    #   `compute_model_sha256`，带 `model.sha256` + 指纹缓存）。投影失败只降级，
-    #   **不让端点 500**（替身 manager 缺属性时仍返回原结构）。
     descriptor = {}
     get_pipeline_descriptor = getattr(
         _api_module.model_manager, "get_pipeline_descriptor", None
@@ -80,29 +83,20 @@ async def get_current_model(request: Request = None):
         except Exception:
             _api_module.logger.warning("整模流水线描述符投影失败", exc_info=True)
             descriptor = {}
-    try:
-        identity = _api_module._active_task_graph_model_identity()
-    except Exception:
-        _api_module.logger.warning("整模身份投影失败", exc_info=True)
-        identity = None
-    if identity is not None:
-        descriptor = {
-            **descriptor,
-            "model_id": descriptor.get("model_id") or identity.model_id,
-            "model_sha256": descriptor.get("model_sha256") or identity.sha256,
-        }
     return {
         "inference_mode": _api_module._node_inference_mode(),
         "loaded": True,
         "model_id": _api_module.model_manager.active_model_id,
         "descriptor": descriptor,
         "quant_type": _api_module.model_host.current_quant,
-        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴，见
-        #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。按活跃模型 id 兜底。
+        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴）。按活跃模型
+        #   id 兜底。原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`（2026-10-25
+        #   归档；原引「§4.8 B2」小节号已失效 ⇒ `遗留清单-2026-10-07.md` 不登记该已修项）。
         "model_name": (info.get("model_name") or info.get("model_id")
                        or _api_module.model_manager.active_model_id),
         "model_path": info.get("model_path", ""),
         "engine": info.get("engine", ""),
+        "inference_switches": info.get("inference_switches"),
         "total_params": info.get("total_params", "N/A"),
         "device": info.get("device", "N/A"),
         "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
@@ -304,6 +298,9 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id="", cap
             )
 
     try:
+        metadata_started = _api_module.time.monotonic()
+        _api_module.logger.info("event=pipeline_candidate_metadata_begin operation=%s candidate=%s",
+                                operation_id, candidate_id)
         result = await _api_module.run_in_threadpool(
             lambda: _api_module.model_host.prepare_pipeline_candidate(
                 candidate_id,
@@ -313,6 +310,8 @@ async def _prepare_pipeline_model_resolution(resolution, *, operation_id="", cap
             )
         )
         candidate_prepared = True
+        _api_module.logger.info("event=pipeline_candidate_metadata_ready operation=%s candidate=%s elapsed_ms=%d",
+                                operation_id, candidate_id, (_api_module.time.monotonic() - metadata_started) * 1000)
         capacity_plan = await _api_module.run_in_threadpool(
             lambda: _api_module.scheduler.start_pipeline_model_transaction(
                 candidate_id=candidate_id,
@@ -707,6 +706,7 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
     _api_module.require_model_api_source(request)
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise _api_module.HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
+    registry_snapshot = _api_module._local_store.get_local_model_registry_snapshot(req.model_id)
     resolved_model_path = _api_module.mc.resolve_model_path(req.model_path) if req.model_path else ""
     resolved_gguf_path = _api_module.mc.resolve_model_path(req.gguf_path) if req.gguf_path else ""
     try:
@@ -722,8 +722,13 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
             model_type=req.model_type,
             source=req.huggingface_id,
         )
-        _api_module.write_manifest(manifest_root, manifest)
+        from model_registry_validation import publish_registration_manifest
+        publish_registration_manifest(manifest_root, manifest)
     except ValueError as exc:
+        if str(exc) == "registration_manifest_conflict":
+            raise _api_module.HTTPException(status_code=409, detail={
+                "reason_code": "MODEL_MANIFEST_CONFLICT", "message": "目录已绑定其他模型修订，请保留原件并使用新的工件目录",
+            }) from exc
         raise _api_module.HTTPException(status_code=400, detail=f"model preflight failed: {exc}") from exc
     from model_registry_validation import manifest_external_files
     config = {
@@ -745,11 +750,13 @@ async def register_model(req: RegisterModelRequest, request: Request = None):
     }
 
     try:
-        ok = _api_module._local_store.save_local_experimental_model(
-            req.model_id, _api_module.json.dumps(config, ensure_ascii=False),
+        ok = _api_module._local_store.publish_local_model_registry(
+            req.model_id, config, expected_revision=registry_snapshot.registry_revision,
         )
         if not ok:
-            raise _api_module.HTTPException(status_code=500, detail="注册模型配置失败")
+            raise _api_module.HTTPException(status_code=409, detail={
+                "reason_code": "MODEL_REGISTRY_CHANGED", "message": "模型注册在校验期间已改变，请刷新后重试",
+            })
         return {"status": "registered", "model_id": req.model_id}
     except _api_module.HTTPException:
         raise

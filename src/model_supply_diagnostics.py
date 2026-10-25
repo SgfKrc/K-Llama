@@ -32,6 +32,7 @@ _REASONS = {
     "pipeline_cluster_capacity_insufficient": "当前各节点容量无法满足层段预算",
     "pipeline_capacity_single_node_insufficient": "当前层段约束下，存在节点无法容纳自己的层段",
     "pipeline_layer_range_coverage_insufficient": "当前节点的可用层段范围无法组成连续接力",
+    "pipeline_candidate_layer_range_unsatisfied": "当前源覆盖或源张量暂存范围无法组成满足容量的连续接力",
     "pipeline_segment_contract_unsatisfied": "当前工件的层段类型或来源约束无法组成接力",
 }
 _RESOURCE_NAMES = {"ram": "内存", "vram": "显存", "host_ram": "源张量暂存内存"}
@@ -73,6 +74,7 @@ def _details(nodes: list[dict[str, Any]]) -> str:
 
 def _capacity_candidate(
     descriptor: dict[str, Any], nodes: list[dict[str, Any]], safety_margin: float,
+    *, prefer_all_workers: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
     """Solve one generously budgeted copy without changing relative node order."""
     layers, embedding, norm, output = _descriptor_costs(descriptor)
@@ -80,6 +82,9 @@ def _capacity_candidate(
     # them, but never relax a caller's additional range/artifact contracts here.
     raw_upper = sum(layers)
     for node in nodes:
+        sizes = node.get("layer_weight_bytes")
+        if sizes is not None:
+            raw_upper = max(raw_upper, sum(sizes) + int(node.get("retained_component_bytes", 0)))
         for artifact in node.get("layer_artifacts", ()):
             sizes = artifact.get("layer_weight_bytes")
             if sizes is not None:
@@ -105,7 +110,7 @@ def _capacity_candidate(
         node["capacity_bytes"] = int(node.get("capacity_bytes", 0)) + increment
     candidate = solve_pipeline_capacity(
         deepcopy(descriptor), boosted, safety_margin=safety_margin,
-        require_distributed=True, prefer_all_workers=True, required_node_id="master",
+        require_distributed=True, prefer_all_workers=prefer_all_workers, required_node_id="master",
     )
     if not candidate.get("admitted"):
         return None
@@ -127,6 +132,7 @@ def _capacity_candidate(
 def explain_supply_capacity(
     plan: dict, *, grouped_descriptor: dict, projected_nodes: list[dict],
     alignment: int, total_layers: int, safety_margin: float,
+    prefer_all_workers: bool = False,
 ) -> dict:
     """Explain a rejected supply plan using one capacity-only diagnostic solve.
 
@@ -157,7 +163,8 @@ def explain_supply_capacity(
         "scope": "candidate_plan",
     }
     try:
-        candidate = _capacity_candidate(grouped_descriptor, projected_nodes, safety_margin)
+        candidate = _capacity_candidate(grouped_descriptor, projected_nodes, safety_margin,
+                                     prefer_all_workers=prefer_all_workers)
     except (PipelineCapacityError, TypeError, ValueError, OverflowError, KeyError):
         # Diagnostics must not replace the authoritative rejection with a
         # second error, guessed capacity number, or unconstrained topology.
@@ -198,8 +205,9 @@ def explain_host_capacity(
     """Explain minimum proper source staging or an explicitly selected segment.
 
     Host budget validation is shared with ``allowed_host_layer_ranges``. Positive
-    layer costs and a constant boundary charge make a one-group span cheapest;
-    the master is constrained to [0, alignment), remote ties use earliest start.
+    layer costs make one-group spans sufficient for the minimum. Each candidate
+    includes only its owned boundaries and largest CPU conversion; the master
+    starts at zero and equal-cost remote candidates use the earliest start.
     Source bytes never fall back to target/runtime estimates or full-model cost.
     """
     allowed_host_layer_ranges(
@@ -223,12 +231,28 @@ def explain_host_capacity(
         "scope": scope,
     }
     layers = projection["source_layer_weight_bytes"]
+    components = projection["source_component_weight_bytes"]
+    conversions = projection.get("runtime_conversion_layer_max_bytes", [0] * total)
+    boundary_conversions = projection.get("runtime_conversion_component_max_bytes", {})
+
+    def host_quote(start, end):
+        keys = ["final_norm", "other"]
+        tied = projection.get("tie_word_embeddings") is True
+        if start == 0 or (end == total and tied):
+            keys.append("embedding")
+        if end == total and not tied:
+            keys.append("lm_head")
+        source = sum(layers[start:end]) + sum(components[key] for key in keys)
+        conversion = max([*conversions[start:end],
+                          *(boundary_conversions.get(key, 0) for key in keys)], default=0)
+        return source, conversion
+
     if layer_range is None:
         if alignment == total:
             return result
         start = 0 if node_id == "master" else min(
             range(0, total, alignment),
-            key=lambda index: (sum(layers[index:index + alignment]), index),
+            key=lambda index: (sum(host_quote(index, index + alignment)), index),
         )
         end = start + alignment
     else:
@@ -240,13 +264,11 @@ def explain_host_capacity(
                 or start % alignment or end % alignment
                 or (node_id == "master" and start != 0)):
             raise HostCapacityProjectionError("layer_range must be an aligned proper source segment")
-    components = projection["source_component_weight_bytes"]
-    keys = (("embedding", "final_norm", "other") if node_id == "master"
-            else ("embedding", "final_norm", "lm_head", "other"))
-    source_bytes = sum(layers[start:end]) + sum(components[key] for key in keys)
-    required = math.ceil(source_bytes * safety_margin) + reserve_bytes
+    source_bytes, conversion_bytes = host_quote(start, end)
+    required = math.ceil((source_bytes + conversion_bytes) * safety_margin) + reserve_bytes
     row.update(
         required_bytes=required, deficit_bytes=max(0, required - available_bytes),
+        host_source_bytes=source_bytes, host_conversion_bytes=conversion_bytes,
         layer_range=[start, end],
     )
     kind = "最小合法源层段" if scope == "minimum_segment" else "指定源层段"

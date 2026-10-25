@@ -27,7 +27,8 @@ for candidate in (str(ROOT), str(ROOT / "tests")):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from tui_e2e_flow import main  # noqa: E402
+from tests.tui_e2e_flow import *
+from tests.tui_e2e_flow import main  # noqa: E402
 
 
 if __name__ == "__main__":

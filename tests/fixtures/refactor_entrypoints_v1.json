@@ -1,0 +1,1226 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "fb870d1d4ef2d1d2901db1c5e299ac387fc9597b",
+  "semantics": "Baseline inventory; every removal or behavior change requires an explicit contract migration. Retired entrypoints leave production in R5.",
+  "http_surfaces": {
+    "product_api": {
+      "/api/auth/capability": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/auth/login": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/auth/logout": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/auth/me": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/auth/totp/provision": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/auth/totp/verify": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/bootstrap/first-connect": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/bootstrap/info": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/chat": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/chat/clear": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/chat/generations/{generation_id}/cancel": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/chat/stream": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/chat/upload": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/android/heartbeat": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/android/register": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/config": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/config/distributed-inference": {
+        "methods": [
+          "get",
+          "put"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/config/max-nodes": {
+        "methods": [
+          "put"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/config/task-graph": {
+        "methods": [
+          "get",
+          "put"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/cluster/connect": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/control-plane": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/control-plane/certificate": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/credentials/rotate": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/discover": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/invite": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/join/consume": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/join/grant": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/join/request": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/layers": {
+        "methods": [
+          "delete",
+          "get",
+          "put"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/management-score": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/master-health": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/model-runtime/contracts": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/model-runtime/contracts/bind": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/model-runtime/sidecars": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/model-runtime/sidecars/begin": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/model-runtime/sidecars/release": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/model-runtime/sidecars/{profile}": {
+        "methods": [
+          "delete"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/my-role": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/nodes": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/nodes/log-aggregate": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/nodes/register": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/nodes/{node_id}": {
+        "methods": [
+          "delete"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/nodes/{node_id}/deregister": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/pipeline-capacity": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/pipeline-reshard": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/queue": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/queue/clear": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/queue/pause": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/queue/resume": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/queue/strategy": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/cluster/queue/task/{task_id}": {
+        "methods": [
+          "delete"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/quorum/voter": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/qwen3/local-chain": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/qwen3/local-chain/begin": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/qwen3/local-chain/decode": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/qwen3/local-chain/parity": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/qwen3/local-chain/prefill": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/qwen3/local-chain/release": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "extension",
+        "phase": "R4"
+      },
+      "/api/cluster/reset-identity": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/resources": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/review/can-vote": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/review/create": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/review/expire-check": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/review/tickets": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/review/tickets/{ticket_id}": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/review/vote": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/spare-master": {
+        "methods": [
+          "delete",
+          "get",
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/spare-master/logs": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/status": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/transfer-logs": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/cluster/transfer-master": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/conversations": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/conversations/sync-status": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/db/health": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/device/auto-configure": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/device/profile": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/device/select-gpu": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/diagnostics/product-runtime": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/diagnostics/product-source": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/experimental/speculative": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/experimental/speculative/capability": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/health": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/client-error": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/download": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/export": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/node/{node_id}/recent": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/nodes-summary": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/recent": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/stats": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/logs/{filename}": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/available": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/current": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/download/{filename}": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/downloadable": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/downloads": {
+        "methods": [
+          "get",
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/downloads/{job_id}": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/files/{model_id}/{relative_path}": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/gguf": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/inference-mode": {
+        "methods": [
+          "put"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/intent": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/intent/catalog": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/intent/connect": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/intent/current": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/intent/{operation_id}": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/load": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/local-assets": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/local-assets/{model_id}/preflight": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/pipeline-assignment/{model_id}": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/prepare-pipeline": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/presets": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/registry": {
+        "methods": [
+          "get",
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/registry/{model_id}": {
+        "methods": [
+          "delete"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/search": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/supply": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/supply/{operation_id}": {
+        "methods": [
+          "delete",
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/supply/{operation_id}/files/{node_id}/{filename}": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/supply/{operation_id}/prepare": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/switch": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/models/unload": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/presets": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/ready": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/sessions": {
+        "methods": [
+          "get",
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/sessions/{session_id}": {
+        "methods": [
+          "delete",
+          "get",
+          "put"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/sessions/{session_id}/activate": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/sessions/{session_id}/turns/{turn_index}": {
+        "methods": [
+          "delete"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/status": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/storage/health": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/system/shutdown": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/user/settings": {
+        "methods": [
+          "get",
+          "put"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/users": {
+        "methods": [
+          "get",
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/users/{username}": {
+        "methods": [
+          "delete",
+          "patch"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/api/workflows": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/workflows/journal/cleanup": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/workflows/journal/replicate": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/workflows/journal/replication": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/workflows/{workflow_id}": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/api/workflows/{workflow_id}/cancel": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      }
+    },
+    "native_service": {
+      "/v1/chat": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/chat/cancel": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/chat/stream": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/health": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/kv/free": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/kv/init": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/layers/embedding": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/layers/forward": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/layers/lm_head": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/layers/load": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/layers/unload": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/available": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/current": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/load": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/local-assets": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/local-assets/{model_id}/preflight": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/switch": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/models/unload": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/ready": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/speculative/run": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "retire",
+        "phase": "R5"
+      },
+      "/v1/status": {
+        "methods": [
+          "get"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      },
+      "/v1/worker/stage": {
+        "methods": [
+          "post"
+        ],
+        "disposition": "migrate",
+        "phase": "R5"
+      }
+    }
+  },
+  "non_http": [
+    {
+      "path": "qlh.py",
+      "symbol": "main",
+      "disposition": "migrate",
+      "phase": "R1",
+      "responsibility": "CLI and TUI composition; commands consume application ports"
+    },
+    {
+      "path": "src/tui_textual.py",
+      "symbol": "run",
+      "disposition": "migrate",
+      "phase": "R5",
+      "responsibility": "Thin snapshot consumer; release an owned backend at exit"
+    },
+    {
+      "path": "src/tcp_comm.py",
+      "symbol": "TCPServer",
+      "disposition": "migrate",
+      "phase": "R4",
+      "responsibility": "Star transport, authentication, framing and connection generations"
+    },
+    {
+      "path": "src/tcp_comm.py",
+      "symbol": "TCPClient",
+      "disposition": "migrate",
+      "phase": "R4",
+      "responsibility": "Authorized master connection and reconnection"
+    },
+    {
+      "path": "packaging/packaging/launcher.py",
+      "symbol": "main",
+      "disposition": "migrate",
+      "phase": "R1",
+      "responsibility": "Frozen application bootstrap and earliest helper dispatch"
+    },
+    {
+      "path": "packaging/packaging/qlh_launcher.py",
+      "symbol": "LauncherController",
+      "disposition": "retire",
+      "phase": "R5",
+      "responsibility": "Migrate installation, signing, repair and retention before removing the independent shell"
+    },
+    {
+      "path": "src/inference_svc_main.py",
+      "symbol": "build_app",
+      "disposition": "migrate",
+      "phase": "R4",
+      "responsibility": "Unify model mode admission and runtime ownership across /api and /v1"
+    },
+    {
+      "path": "android/app/src/main/java/com/qlh/inference/MainViewModel.kt",
+      "symbol": "ensureAndroidTaskWorker",
+      "disposition": "migrate",
+      "phase": "R5",
+      "responsibility": "Preserve Full/Lite roles, Room data, SAF and local runtime lifecycle"
+    }
+  ]
+}

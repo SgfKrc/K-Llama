@@ -91,8 +91,7 @@ def test_first_connect_returns_only_target_encrypted_cluster_credential(
             return {"status": "registered", "node_id": kwargs["node_id"]}
 
     monkeypatch.setattr(api_server, "scheduler", MasterScheduler())
-    monkeypatch.setattr(node_config, "ensure_local_cluster_secret", lambda: "s" * 32)
-    monkeypatch.setattr(node_config, "get_local_cluster_secret_epoch", lambda: 5)
+    monkeypatch.setattr(api_server, "_bootstrap_cluster_credential", lambda: ("s" * 32, 5))
     monkeypatch.setattr(
         api_server,
         "_get_join_ledger",

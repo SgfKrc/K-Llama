@@ -56,7 +56,11 @@ def _harness(root: Path, *, seed: int) -> PartitionHarness:
     collector = QuorumCollector(
         voter_set=voter_set,
         voters=voters,
-        policy=QuorumPolicy(lease_duration_ms=100),
+        # 租约必须明显长于一次 acquire 的实际耗时：operation_clock(now_ms) 返回的是
+        # 「假起点 + 真实流逝」的时钟（见 qlh_core/control/clock.py），而 acquire 内部
+        # 要走 3 个 voter 的 reserve/prepare/sign/commit 多次 SQLite 往返。原先的 100 ms
+        # 会被自身耗时挤爆，证书签完即判过期（本机与 CI 都稳定失败）。
+        policy=QuorumPolicy(lease_duration_ms=60_000),
     )
     return PartitionHarness(collector, voter_set=voter_set, seed=seed)
 

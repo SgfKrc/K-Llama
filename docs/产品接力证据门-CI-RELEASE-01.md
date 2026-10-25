@@ -44,7 +44,7 @@
 
 快照生产者为 `scripts/build_product_snapshots.py`。`--revision` 仅指定期望值，`--node-addresses` 指定独立地址映射；`--observations-dir` 导入实验台未改写的逐节点 v1 JSON，并保留原时间。全部节点通过后才输出 topology/native；失败只保存 raw 和 `producer-result.json`，拒绝覆盖已有输出。
 
-live collector 已接入 PID 绑定的 master／PC loader 与启动来源回执、DL tensor 材料化明细、Android prepare／工件回执和完整进程树。接口与启用方式见 [运行端回执与独立采集](ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)。master／PC 需在业务导入前设置 `QLH_PRODUCT_OBSERVATION=1` 后启动，旧进程须更新并重新准备；Android 产品采集使用 `--product --require-process-tree`，保留普通发行 idle 探针。当前已部署三端开发版本，Android 进程枚举兼容和 prepare 回执绑定已通过装载实测。Safetensors 双摘要、Windows 映射字节绑定及三机 DL／LL 开发实跑结果见 [工件身份与复采记录](ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。严格来源、实验台时钟和最终发行验收按该记录保留实际判定。
+live collector 已接入 PID 绑定的 master／PC loader 与启动来源回执、DL tensor 材料化明细、Android prepare／工件回执和完整进程树。接口与启用方式见 [运行端回执与独立采集](archive/misc/ci-release-followup-2026-10-16.md#8-运行端回执与独立采集2026-10-16)。master／PC 需在业务导入前设置 `QLH_PRODUCT_OBSERVATION=1` 后启动，旧进程须更新并重新准备；Android 产品采集使用 `--product --require-process-tree`，保留普通发行 idle 探针。当前已部署三端开发版本，Android 进程枚举兼容和 prepare 回执绑定已通过装载实测。Safetensors 双摘要、Windows 映射字节绑定及三机 DL／LL 开发实跑结果见 [工件身份与复采记录](archive/misc/ci-release-followup-2026-10-16.md#9-工件摘要与-windows-映射身份2026-10-16)。严格来源、实验台时钟和最终发行验收按该记录保留实际判定。
 
 冻结 clean 来源并部署后，先按采集器 `capture --help` 准备每档文件，再用 `combine --help` 合并。发布门要求完整 DL／LL 两档。
 
@@ -55,10 +55,10 @@ live collector 已接入 PID 绑定的 master／PC loader 与启动来源回执�
   --json build/product-release/result.json
 ```
 
-bundle、run 和各 native 节点观测都必须显式含 `source_dirty=false`；缺字段、`true`、null、0 或字符串等值一律拒绝。未知来源不能作为旧 schema 清洁来源兼容，不能通过外层 clean 标记覆盖内部 dirty 或缺失事实。2026-10-16 发现快照生产者刻意省略该字段会掩盖 Android raw 的 dirty 状态，相关旧 passed=true 结果已撤销严格验收效力，详见 [下午复核](ci-release-followup-2026-10-16.md#6-新提交与三机-bundle-的重新核实2026-10-16-下午)。
+bundle、run 和各 native 节点观测都必须显式含 `source_dirty=false`；缺字段、`true`、null、0 或字符串等值一律拒绝。未知来源不能作为旧 schema 清洁来源兼容，不能通过外层 clean 标记覆盖内部 dirty 或缺失事实。2026-10-16 发现快照生产者刻意省略该字段会掩盖 Android raw 的 dirty 状态，相关旧 passed=true 结果已撤销严格验收效力，详见 [下午复核](archive/misc/ci-release-followup-2026-10-16.md#6-新提交与三机-bundle-的重新核实2026-10-16-下午)。
 
 缺 bundle、缺某档、缺附件、错误 SHA、非当前源码 revision、旧请求／代际拼接、全 skip 均不会变成 PASS。历史三机材料可以保留用于追溯；没有本轮新完成记录与同 revision 观测时，不能改写为本轮通过。
 
 ## 当前验收范围
 
-2026-10-15 的首轮两机 LL 和 DL 容量等待材料按原结果保留。修复 HELLO 锁竞争和并发收尾后，master／ROG／Y700 的 Qwen3.5-9B 自动三段 LL 与 DL 均完成真实 API 2／6、Textual/SSE 2，正常停止且无 fallback；LL 42／DL 12 条远端完成回执逐项核对，原生层段观测有独立材料。开发证据汇总为 `build/ci-release-followup-20261015/physical-post-fix-final.json`。当前 dirty 开发部署和 Y700 debug APK 不能组成同 revision 的可信发行 bundle；`final_release_gate_passed=false`，最终发行门仍开放。详见 [票 13 续验记录](ci-release-followup-2026-10-15.md)。
+2026-10-15 的首轮两机 LL 和 DL 容量等待材料按原结果保留。修复 HELLO 锁竞争和并发收尾后，master／ROG／Y700 的 Qwen3.5-9B 自动三段 LL 与 DL 均完成真实 API 2／6、Textual/SSE 2，正常停止且无 fallback；LL 42／DL 12 条远端完成回执逐项核对，原生层段观测有独立材料。开发证据汇总为 `build/ci-release-followup-20261015/physical-post-fix-final.json`。当前 dirty 开发部署和 Y700 debug APK 不能组成同 revision 的可信发行 bundle；`final_release_gate_passed=false`，最终发行门仍开放。详见 [票 13 续验记录](archive/misc/ci-release-followup-2026-10-15.md)。

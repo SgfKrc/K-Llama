@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from scheduler import Scheduler  # noqa: E402
 import scheduler_task_worker  # noqa: E402
-from task_provider import ModelIdentity  # noqa: E402
+from execution_provider import ModelIdentity  # noqa: E402
 from task_worker_adapter import remote_provider_id  # noqa: E402
 
 
@@ -110,6 +110,7 @@ def _scheduler(*, active_layer_config=None, layer_range=None,
                forward_layers=None):
     """绕过 Scheduler.__init__ 构造最小能力快照目标。"""
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._model_control = SimpleNamespace(boot_id="fixture-worker-boot")
     scheduler._distributed_inference_enabled = True
     scheduler._host = _FakeHost(
         layer_range=layer_range, full_model_loaded=full_model_loaded,
@@ -118,7 +119,7 @@ def _scheduler(*, active_layer_config=None, layer_range=None,
     scheduler._active_layer_config = active_layer_config
     if full_model_identity is not None:
         scheduler._require_callbacks = lambda: SimpleNamespace(
-            active_task_graph_model_identity=lambda: full_model_identity,
+            active_execution_model_identity=lambda: full_model_identity,
         )
     return scheduler
 
@@ -141,7 +142,7 @@ def _reject_stage_offer(scheduler, *, stage_type, model_identity):
     scheduler._task_worker_control = SimpleNamespace(
         coordinator_snapshot=lambda: {"manual_stage_dispatch_enabled": True},
     )
-    scheduler._scheduler_facade_global = lambda name: True
+    scheduler._runtime_setting = lambda name: True
     scheduler.get_effective_node_id = lambda: "pc-worker"
     scheduler._task_worker_stage_lock = threading.Lock()
     scheduler._task_worker_active_attempts = {}
@@ -202,8 +203,12 @@ class TestLayerCapabilities:
             active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
             forward_layers=False,
         )
-        assert caps["stage_types"] == []
+        # R2 keeps hello valid (stage_types must be non-empty) while granting
+        # neither full-model work nor layers to this unavailable layer worker.
+        assert caps["stage_types"] == ["aggregate"]
         assert "layer_forward" not in caps["stage_types"]
+        assert "full_inference" not in caps["stage_types"]
+        assert caps["layer_ranges"] == []
 
     def test_layer_worker_with_forward_layers_keeps_advertising_it(self):
         """绑定路径（真的支持层段前向）广告行为不变。"""
@@ -481,3 +486,23 @@ def test_binary_hidden_compatibility_switch_omits_the_unknown_key(monkeypatch):
     assert caps["stage_chunked_input"] is True
     monkeypatch.setenv("QLH_TASK_WORKER_BINARY_HIDDEN", "1")
     assert _capabilities(active_layer_config={"layer_range": [4, 16]})["binary_hidden"] is True
+
+
+def test_cold_slim_host_can_build_hello_without_torch_manager(monkeypatch):
+    from model_host import ModelHost, _LazyModelManager
+
+    def unavailable(self):
+        raise RuntimeError("frozen distribution has no torch ModelManager")
+
+    monkeypatch.setattr(_LazyModelManager, "_get_instance", unavailable)
+    monkeypatch.setattr(scheduler_task_worker, "torch_available", lambda: False)
+    monkeypatch.setattr(scheduler_task_worker, "keep_head_shim_available", lambda: True)
+    monkeypatch.delenv("QLH_LAYER_GGUF", raising=False)
+    worker = _scheduler()
+    worker._host = ModelHost()
+    caps = worker._task_worker_capabilities()
+    assert caps["engines"] == ["llama_cpp"]
+    assert caps["models"] == []
+    assert caps["layer_worker"] is False
+    assert caps["layer_ranges"] == []
+    assert worker._host.peek_manager() is None

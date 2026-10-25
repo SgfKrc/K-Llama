@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from local_store import save_local_experimental_model
+import local_store
 
 try:
     from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
@@ -126,8 +126,9 @@ def _infer_artifact(target: Path, gguf_path: str = "") -> dict[str, Any]:
     return artifact
 
 
-def register_model(model_id: str, target: Path, summary: dict[str, Any], *, gguf_path: str = "", revision: str = "") -> bool:
-    """Validate immediately before the SQLite upsert."""
+def register_model(model_id: str, target: Path, summary: dict[str, Any], *, gguf_path: str = "", revision: str = "", registry_snapshot=None) -> bool:
+    """Validate and publish against the version observed before import work."""
+    snapshot = registry_snapshot if registry_snapshot is not None else local_store.get_local_model_registry_snapshot(model_id)
     artifact = _infer_artifact(target, gguf_path)
     manifest = summary.get("manifest") or build_manifest(target, artifact["files"], model_type=artifact["model_type"], revision=revision, source="import-model")
     config = {
@@ -144,7 +145,7 @@ def register_model(model_id: str, target: Path, summary: dict[str, Any], *, gguf
         "revision": revision,
         "manifest": manifest,
     }
-    return save_local_experimental_model(model_id, config)
+    return local_store.publish_local_model_registry(model_id, config, expected_revision=snapshot.registry_revision)
 
 
 def main(argv: list[str] | argparse.Namespace | None = None) -> int:
@@ -166,8 +167,11 @@ def main(argv: list[str] | argparse.Namespace | None = None) -> int:
     staging: Path | None = None
     published = False
     remote_import = False
+    registered = False
     try:
         target = resolve_target(args.source, getattr(args, "target", ""))
+        registry_model_id = getattr(args, "model_id", "") or target.name
+        registry_snapshot = local_store.get_local_model_registry_snapshot(registry_model_id) if getattr(args, "register", False) else None
         local_source = Path(args.source).is_dir()
         if not getattr(args, "skip_download", False) and not local_source:
             if target.exists():
@@ -189,7 +193,11 @@ def main(argv: list[str] | argparse.Namespace | None = None) -> int:
         files = artifact["files"]
         summary = verify_files(files, getattr(args, "expected_sha256", "") or None)
         manifest = build_manifest(target_for_validation, artifact["files"], model_type=artifact["model_type"], revision=getattr(args, "revision", ""), source=args.source)
-        write_manifest(target_for_validation, manifest)
+        if staging is None:
+            from model_registry_validation import publish_registration_manifest
+            publish_registration_manifest(target_for_validation, manifest)
+        else:
+            write_manifest(target_for_validation, manifest)
         summary.update({"artifact_sha256": manifest["artifact_sha256"], "manifest_sha256": manifest["manifest_sha256"], "manifest": manifest, "model_type": artifact["model_type"]})
 
         if staging is not None:
@@ -199,10 +207,11 @@ def main(argv: list[str] | argparse.Namespace | None = None) -> int:
         print(f"[3/4] registration ready: model_id={model_id}")
         registered = False
         if getattr(args, "register", False):
-            registered = register_model(model_id, target, summary, gguf_path=getattr(args, "gguf_path", ""), revision=getattr(args, "revision", ""))
+            registered = register_model(model_id, target, summary, gguf_path=getattr(args, "gguf_path", ""), revision=getattr(args, "revision", ""), registry_snapshot=registry_snapshot)
             print(f"[4/4] registration {'succeeded' if registered else 'failed'} (main-node SQLite)")
             if remote_import and not registered:
-                shutil.rmtree(target, ignore_errors=True)
+                from model_download_jobs import retain_unregistered_publication
+                print(json.dumps(retain_unregistered_publication(target)), file=sys.stderr)
         else:
             print("[4/4] not registered (use --register to write main-node SQLite)")
         result = {"model_id": model_id, "target": str(target), "model_type": artifact["model_type"], "file_count": summary["file_count"], "total_bytes": summary["total_bytes"], "sha256": summary["sha256"], "artifact_sha256": summary["artifact_sha256"], "manifest_sha256": summary["manifest_sha256"], "registered": registered}
@@ -211,12 +220,13 @@ def main(argv: list[str] | argparse.Namespace | None = None) -> int:
         else:
             print(f"complete: {result['file_count']} files / {result['total_bytes']} bytes")
             print(f"  SHA-256: {result['sha256']}")
-        return 0
+        return 0 if registered or not getattr(args, "register", False) else 2
     except Exception as exc:
         if staging is not None and staging.exists() and not published:
             shutil.rmtree(staging, ignore_errors=True)
-        if remote_import and published and target is not None:
-            shutil.rmtree(target, ignore_errors=True)
+        if remote_import and published and not registered and target is not None:
+            from model_download_jobs import retain_unregistered_publication
+            print(json.dumps(retain_unregistered_publication(target)), file=sys.stderr)
         print(f"[error] import failed: {str(exc)[:300]}", file=sys.stderr)
         return 2
 

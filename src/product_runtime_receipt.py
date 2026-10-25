@@ -184,6 +184,17 @@ def _pytorch(manager, selection, process):
     _require(byte_count == proof.materialized_bytes == metrics.get("materialized_tensor_bytes"),
              "selective tensor materialization byte accounting differs")
     materialization = {**proof.as_dict(), **process, **selection}
+    if _state(manager, "_layer_offload") is not None:
+        # Observe the live CPU source owners and CUDA unit sizes under the
+        # existing manager lock. A requested policy is never mmap evidence.
+        try:
+            observation = deepcopy(manager.layer_offload_observation())
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeObservationError("actual layer offload observation unavailable") from exc
+        _require(isinstance(observation, dict)
+                 and observation.get("materialization") == "safetensors_layer_offload",
+                 "actual layer offload materialization missing")
+        materialization["layer_offload"] = observation
     return {"engine": "pytorch", "loaded": True, "full_model_loaded": False,
             "layer_range": span, "total_layers": total, "loader_pid": process["pid"],
             "artifact": {"path": proof.artifact_path, "sha256": digest,
@@ -238,14 +249,22 @@ def _llama(manager, process):
     _require(descriptor.get("total_layers") == proof.total_layers,
              "source descriptor total differs from loaded artifact manifest total")
     digest = _digest(proof.artifact_sha256)
-    count = _native_count(_state(engine, "_model"))
-    _require(count == span[1] - span[0], "actual llama.cpp native count differs from loaded segment")
-    loader = process["pid"]
+    from qlh_core.adapters.llama_vocabulary import LlamaVocabulary
+    binding = _state(engine, "_model")
     keep_head = _state(engine, "_keep_head")
-    if keep_head is not None:
-        upstream_path, upstream_count, loader = _upstream(keep_head, process)
-        _require(_path(upstream_path) == _path(path) and upstream_count == count,
-                 "keep-head child and binding loaded different artifacts/counts")
+    loader = process["pid"]
+    if isinstance(binding, LlamaVocabulary):
+        # A vocab-only handle has no decoder weights. Count the existing native
+        # weight owner; a missing owner remains an unavailable observation.
+        upstream_path, count, loader = _upstream(keep_head, process)
+        _require(_path(upstream_path) == _path(path), "keep-head loaded a different artifact")
+    else:
+        count = _native_count(binding)
+        if keep_head is not None:
+            upstream_path, upstream_count, loader = _upstream(keep_head, process)
+            _require(_path(upstream_path) == _path(path) and upstream_count == count,
+                     "keep-head child and binding loaded different artifacts/counts")
+    _require(count == span[1] - span[0], "actual llama.cpp native count differs from loaded segment")
     return {"engine": "llama_cpp", "loaded": True, "full_model_loaded": False,
             "layer_range": span, "total_layers": proof.total_layers,
             "loader_pid": loader, "native_layer_count": count,
@@ -372,7 +391,7 @@ def capture_runtime(api_module):
     """Return v1 runtime from existing SSOT, or raise RuntimeObservationError.
 
     HTTP/source authorization and independent artifact rehash are caller-owned.
-    Lock order follows model replacement: full-chat -> inference -> layer execution.
+    Lock order follows model replacement: full-chat -> runtime execution -> layer execution.
     Config/controller locks are released before acquiring model/native-owner locks,
     then rechecked. No factories, lazy managers, plans, hashes or model API calls.
     """
@@ -380,8 +399,13 @@ def capture_runtime(api_module):
     process = psutil.Process(os.getpid())
     identity = {"pid": process.pid, "created_at": process.create_time()}
     host, scheduler = api_module.model_host, api_module.scheduler
+    from qlh_core.bootstrap.runtime import LazyResource
+    if isinstance(scheduler, LazyResource):
+        services = _state(_state(api_module, "_app_runtime"), "_services")
+        scheduler = _state(services, "scheduler")
+        _require(scheduler is not None, "no existing runtime scheduler")
     with _hold(host, "full_chat_execution_lock"):
-        with _hold(scheduler, "_inference_lock"):
+        with _hold(_state(host, "_runtime_controller"), "execution_lock"):
             with _hold(scheduler, "_layer_execution_lock"):
                 role = scheduler._effective_role()
                 node_id = scheduler.get_effective_node_id()

@@ -44,7 +44,7 @@ def compute_file_sha256(path: str | Path) -> str:
     return value
 
 
-def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
+def compute_model_sha256(model_path: str, *, use_cache: bool = True, digest=None) -> str:
     """Hash every executable PyTorch model artifact in stable path order."""
     root = Path(model_path)
     if not root.is_dir():
@@ -54,6 +54,10 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
     metadata_path = root / _HASH_META_NAME
     # Supply directories have an exact member whitelist; hashing must not add files.
     cache_writable = not (root / "supply.manifest.json").exists()
+    file_digest = digest or compute_file_sha256
+    if digest is None and not cache_writable:
+        from model_supply_assets import _hash_file_cached
+        file_digest = _hash_file_cached
     artifact_files = sorted(
         path for path in root.rglob("*")
         if (
@@ -84,14 +88,14 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
         except (OSError, IndexError, json.JSONDecodeError):
             pass
 
-    digest = hashlib.sha256()
+    model_digest = hashlib.sha256()
     for path in artifact_files:
         relative = path.relative_to(root).as_posix()
-        file_sha = compute_file_sha256(path)
-        digest.update(
+        file_sha = file_digest(path)
+        model_digest.update(
             f"{relative}\0{path.stat().st_size}\0{file_sha}\n".encode("utf-8")
         )
-    value = digest.hexdigest()
+    value = model_digest.hexdigest()
     if cache_writable:
         try:
             cache_path.write_text(f"{value}  {root.name}\n", encoding="utf-8")

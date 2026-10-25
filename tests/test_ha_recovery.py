@@ -10,8 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from cluster_recovery import decide_recovery  # noqa: E402
-from task_graph import TaskGraphCoordinator  # noqa: E402
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 
 def _append(journal, workflow_id, snapshot, event_type="workflow_state_changed"):
@@ -84,86 +83,3 @@ def test_recovery_policy_can_continue_an_explicitly_continuable_projection():
     decision = decide_recovery(snapshot)
     assert decision.action == "continue"
     assert decision.reason == "journal_state_continuable"
-
-
-def test_journal_retry_is_recorded_once_without_duplicate_submission(tmp_path):
-    path = str(tmp_path / "recovery.sqlite3")
-    seed = SQLiteTaskJournal(path)
-    _append(seed, "wf_retry0201", _running_snapshot("wf_retry0201"))
-    seed.close()
-
-    journal = SQLiteTaskJournal(path)
-    coordinator = TaskGraphCoordinator(journal=journal)
-    summary = coordinator.recover_persisted_workflows()
-    recovered = coordinator.get("wf_retry0201")
-    assert summary["retried_workflows"] == 1
-    assert recovered["state"] == "running"
-    assert recovered["recovery_action"] == "retry"
-    assert recovered["recovery_pending"] is True
-    assert recovered["stages"][0]["state"] == "ready"
-    assert recovered["stages"][0]["attempts"][0]["state"] == "expired"
-    assert [event["event_type"] for event in journal.list_events("wf_retry0201")] == [
-        "workflow_state_changed", "workflow_recovery_retry",
-    ]
-
-    replay = coordinator.recover_persisted_workflows()
-    assert replay["recovered_workflows"] == 0
-    assert len(journal.list_events("wf_retry0201")) == 2
-    coordinator.close()
-
-
-def test_journal_cancel_and_handoff_timeout_are_terminal_and_auditable(tmp_path):
-    path = str(tmp_path / "recovery-terminal.sqlite3")
-    journal = SQLiteTaskJournal(path)
-    _append(
-        journal, "wf_cancel02",
-        _running_snapshot("wf_cancel02", cancel_requested=True),
-        event_type="workflow_cancel_requested",
-    )
-    _append(
-        journal, "wf_timeout02",
-        _running_snapshot(
-            "wf_timeout02", handoff_pending=True, handoff_state="fenced",
-        ),
-    )
-    coordinator = TaskGraphCoordinator(journal=journal)
-
-    summary = coordinator.recover_persisted_workflows()
-    assert summary["cancelled_workflows"] == 1
-    assert summary["handoff_timeouts"] == 1
-    assert coordinator.get("wf_cancel02")["state"] == "cancelled"
-    assert coordinator.get("wf_cancel02")["error_code"] == "recovered_cancel_request"
-    assert coordinator.get("wf_timeout02")["state"] == "failed"
-    assert coordinator.get("wf_timeout02")["error_code"] == "handoff_timeout"
-    assert journal.list_events("wf_cancel02")[-1]["event_type"] == (
-        "workflow_recovery_cancel"
-    )
-    assert journal.list_events("wf_timeout02")[-1]["event_type"] == (
-        "workflow_recovery_handoff_timeout"
-    )
-    coordinator.close()
-
-
-@pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
-def test_terminal_journal_state_is_never_recovered(tmp_path, state):
-    journal = SQLiteTaskJournal(str(tmp_path / f"{state}.sqlite3"))
-    _append(
-        journal,
-        f"wf_terminal_{state}",
-        {
-            "workflow_id": f"wf_terminal_{state}",
-            "last_sequence": 1,
-            "state": state,
-            "created_at": 1.0,
-            "stages": [],
-        },
-    )
-    coordinator = TaskGraphCoordinator(journal=journal)
-    assert coordinator.recover_persisted_workflows() == {
-        "recovered_workflows": 0,
-        "expired_attempts": 0,
-        "failed_stages": 0,
-        "skipped_stages": 0,
-    }
-    assert len(journal.list_events(f"wf_terminal_{state}")) == 1
-    coordinator.close()

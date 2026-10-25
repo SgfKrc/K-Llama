@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git(source: Path, *args: str, check: bool = True) -> str:
+def _git(
+    source: Path, *args: str, check: bool = True, env: dict[str, str] | None = None,
+) -> str:
     result = subprocess.run(
         ["git", "-C", str(source), *args],
         capture_output=True,
@@ -34,6 +37,7 @@ def _git(source: Path, *args: str, check: bool = True) -> str:
         encoding="utf-8",
         errors="replace",
         timeout=30,
+        env=env,
     )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:500]
@@ -51,13 +55,19 @@ def _android_root(explicit: Path | None) -> Path:
 
 
 def _contract(lock_path: Path = LOCK_PATH) -> tuple[str, list[dict[str, Any]]]:
-    """Read the lock and return (revision, patches).
+    """Return the expected HEAD and patches for existing lock consumers."""
+    _, revision, patches = _read_contract(lock_path)
+    return revision, patches
+
+
+def _read_contract(lock_path: Path) -> tuple[str, str, list[dict[str, Any]]]:
+    """Read the lock and return (upstream_revision, expected_revision, patches).
 
     ★ 2026-09-20：契约由「**恰好一个**补丁」放宽为「**一个或多个**补丁」。
     每个补丁条目声明：
       * ``path``    —— 补丁文件（相对仓库根）
       * ``targets`` —— 它改动的文件（相对 submodule 根）；兼容旧字段 ``target``（单数）
-      * ``marker``  —— 判定「是否已应用」的标记串
+      * ``marker``  —— 仅供诊断的说明或标记串，不参与补丁状态判定
       * ``sha256``  —— 补丁文件的摘要（防止内容漂移）
     """
     try:
@@ -71,13 +81,17 @@ def _contract(lock_path: Path = LOCK_PATH) -> tuple[str, list[dict[str, Any]]]:
     if not isinstance(upstream, dict) or not isinstance(patch_list, list) or not patch_list:
         raise SyncError("llama.cpp lock must contain one upstream and at least one patch contract")
     revision = upstream.get("revision")
-    if not isinstance(revision, str) or len(revision) != 40:
+    if (
+        not isinstance(revision, str) or len(revision) != 40
+        or any(char not in "0123456789abcdef" for char in revision)
+    ):
         raise SyncError("invalid llama.cpp revision in lock")
     # ★ 2026-09-20：允许 lock 声明一个「本地补丁 commit」（submodule HEAD 应当是它）。
     #   未声明时回落到 upstream.revision（即「补丁只在工作树、不提交」的形态）。
     local_revision = lock.get("revision_local")
-    if local_revision is not None and (
+    if "revision_local" in lock and (
         not isinstance(local_revision, str) or len(local_revision) != 40
+        or any(char not in "0123456789abcdef" for char in local_revision)
     ):
         raise SyncError("invalid llama.cpp local revision in lock")
     expected_revision = local_revision or revision
@@ -100,7 +114,7 @@ def _contract(lock_path: Path = LOCK_PATH) -> tuple[str, list[dict[str, Any]]]:
             raise SyncError(f"duplicate llama.cpp patch id in lock: {patch_id}")
         seen_ids.add(patch_id)
         patches.append({**entry, "id": patch_id, "targets": targets})
-    return expected_revision, patches
+    return revision, expected_revision, patches
 
 
 def _patch_targets(entry: dict[str, Any]) -> list[str]:
@@ -124,16 +138,64 @@ def _safe_relative(root: Path, value: str) -> Path:
 
 
 def _status_paths(source: Path) -> set[str]:
-    output = _git(source, "status", "--porcelain", "--untracked-files=all")
+    output = _git(source, "status", "--porcelain", "-z", "--untracked-files=all")
     paths: set[str] = set()
-    for line in output.splitlines():
-        if not line:
+    records = iter(output.split("\0"))
+    for record in records:
+        if not record:
             continue
-        path = line[3:].strip()
-        if " -> " in path:
-            path = path.rsplit(" -> ", 1)[1]
-        paths.add(path.replace("\\", "/"))
+        paths.add(record[3:])
+        if "R" in record[:2] or "C" in record[:2]:
+            paths.add(next(records))
     return paths
+
+
+def _patch_check(
+    source: Path, patch_path: Path, *, reverse: bool = False,
+    cached: bool = False, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    flags = (["--reverse"] if reverse else []) + (["--cached"] if cached else [])
+    return subprocess.run(
+        ["git", "-C", str(source), "apply", *flags, "--check", str(patch_path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, env=env,
+    )
+
+
+def _check_source_diff(
+    source: Path, patches: list[dict[str, Any]],
+    applied: list[dict[str, Any]], upstream_revision: str,
+) -> set[str]:
+    """Prove source trees and return patch IDs actually committed in HEAD."""
+    with tempfile.TemporaryDirectory(prefix="qlh-llama-sync-") as directory:
+        scratch = Path(directory)
+        objects = scratch / "objects"
+        objects.mkdir()
+        # Keep the real checkout, index and object database untouched, including
+        # in --dry-run. Git still supplies its normal content/line-ending filters.
+        env = {
+            **os.environ,
+            "GIT_INDEX_FILE": str(scratch / "index"),
+            "GIT_OBJECT_DIRECTORY": str(objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": _git(
+                source, "rev-parse", "--path-format=absolute", "--git-path", "objects",
+            ),
+        }
+        _git(source, "read-tree", "HEAD", env=env)
+        committed: set[str] = set()
+        for entry in reversed(patches):
+            if _patch_check(source, entry["patch_path"], reverse=True, cached=True, env=env).returncode == 0:
+                _git(source, "apply", "--cached", "--reverse", str(entry["patch_path"]), env=env)
+                committed.add(entry["id"])
+            elif _patch_check(source, entry["patch_path"], cached=True, env=env).returncode != 0:
+                raise SyncError(f"llama.cpp unmanaged pinned diff for patch {entry['id']}")
+        # Reversibility alone does not rule out unrelated committed edits.
+        _git(source, "diff", "--cached", "--quiet", "--no-ext-diff", upstream_revision, "--", env=env)
+        for entry in applied:
+            _git(source, "apply", "--cached", str(entry["patch_path"]), env=env)
+        # Always compare every tracked file; status may hide skip-worktree edits.
+        _git(source, "diff", "--quiet", "--no-ext-diff", "--", env=env)
+        return committed
 
 
 def inspect_sync(
@@ -150,9 +212,11 @@ def inspect_sync(
       * submodule 的 HEAD 等于 lock 的 revision；
       * **worktree 中允许出现的改动，恰好是所有补丁 targets 的并集**
         （原先要求「只有唯一 target 有改动」⇒ 多补丁必然误报 unrelated changes）；
-      * marker 在 ⇒ 必须可 reverse（已应用）；marker 不在 ⇒ 必须可 apply（待应用）。
+      * 仅按 apply / reverse --check 判定完整补丁状态，marker 只用于诊断；
+      * upstream pin 必须是 HEAD 的祖先 commit；移除 HEAD 中的受管补丁后必须恰好匹配上游；
+      * 完整 tracked worktree 必须恰好匹配上游加已应用补丁，即使 status 为空也检查。
     """
-    revision, patch_contracts = _contract(lock_path)
+    upstream_revision, revision, patch_contracts = _read_contract(lock_path)
     source = _android_root(android_root) / "app" / "src" / "main" / "cpp" / "llama.cpp"
     if not source.is_dir():
         raise SyncError("Android llama.cpp submodule is missing")
@@ -162,6 +226,17 @@ def inspect_sync(
         raise SyncError(
             f"llama.cpp revision mismatch: expected {revision}, got {checked_revision}"
         )
+
+    try:
+        upstream_commit = _git(source, "rev-parse", "--verify", f"{upstream_revision}^{{commit}}")
+    except SyncError as exc:
+        raise SyncError(f"llama.cpp upstream revision is not an available commit: {upstream_revision}") from exc
+    if upstream_commit != upstream_revision:
+        raise SyncError("llama.cpp upstream revision must name a commit directly")
+    try:
+        _git(source, "merge-base", "--is-ancestor", upstream_revision, checked_revision)
+    except SyncError as exc:
+        raise SyncError("llama.cpp upstream revision is not an ancestor of the pinned revision") from exc
 
     # 先把所有补丁的路径/target 解析并校验，再统一比对 worktree 改动集合。
     entries: list[dict[str, Any]] = []
@@ -186,6 +261,17 @@ def inspect_sync(
                     f"llama.cpp patch target is missing: {raw_target} (patch {contract['id']})"
                 )
             relative_targets.append(target.relative_to(source).as_posix())
+        stats = _git(source, "apply", "--numstat", "-z", str(patch_path))
+        actual_targets = set()
+        for record in stats.split("\0"):
+            if not record:
+                continue
+            fields = record.split("\t", 2)
+            if len(fields) != 3:
+                raise SyncError(f"llama.cpp patch has unsupported targets: {contract['id']}")
+            actual_targets.add(fields[2])
+        if actual_targets != set(relative_targets):
+            raise SyncError(f"llama.cpp patch targets do not match the lock: {contract['id']}")
         allowed_paths.update(relative_targets)
         entries.append({**contract, "patch_path": patch_path, "relative_targets": relative_targets})
 
@@ -196,48 +282,32 @@ def inspect_sync(
 
     results: list[dict[str, Any]] = []
     for entry in entries:
-        marker = entry["marker"]
-        applied = any(
-            marker in (source / rel).read_text(encoding="utf-8", errors="replace")
-            for rel in entry["relative_targets"]
-        )
-        if applied:
-            # ★ 2026-09-20：区分「补丁在 git commit 里」与「补丁只在工作树」。
-            #   若该补丁的 targets 都不在 worktree 改动集合里，说明它已经被提交
-            #   （HEAD 就是 revision_local），此时 reverse-check 必然失败 ——
-            #   不能据此判为错误，而要如实报 `applied_committed`。
-            dirty = any(rel in status_paths for rel in entry["relative_targets"])
-            if not dirty:
-                state = "applied_committed"
-            else:
-                reverse = subprocess.run(
-                    ["git", "-C", str(source), "apply", "--reverse", "--check",
-                     str(entry["patch_path"])],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=30,
-                )
-                if reverse.returncode != 0:
-                    raise SyncError(
-                        f"llama.cpp target contains the marker but the managed patch "
-                        f"{entry['id']} is not reversible"
-                    )
-                state = "applied"
-        else:
-            check = subprocess.run(
-                ["git", "-C", str(source), "apply", "--check", str(entry["patch_path"])],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
-            if check.returncode != 0:
-                detail = (check.stderr or check.stdout).strip()[:500]
-                raise SyncError(f"llama.cpp patch {entry['id']} does not apply cleanly: {detail}")
+        reverse = _patch_check(source, entry["patch_path"], reverse=True)
+        forward = _patch_check(source, entry["patch_path"])
+        if reverse.returncode == 0 and forward.returncode != 0:
+            # Classify committed state only after inspecting HEAD itself; status
+            # can hide a complete, uncommitted patch via index flags.
+            state = "applied"
+        elif forward.returncode == 0 and reverse.returncode != 0:
             state = "ready_to_apply"
+        else:
+            marker_present = any(
+                entry["marker"] in (source / rel).read_text(encoding="utf-8", errors="replace")
+                for rel in entry["relative_targets"]
+            )
+            detail = (
+                f"forward: {(forward.stderr or forward.stdout).strip()[:500]}; "
+                f"reverse: {(reverse.stderr or reverse.stdout).strip()[:500]}"
+            )
+            problem = (
+                "has ambiguous apply/reverse checks"
+                if forward.returncode == reverse.returncode == 0
+                else "is neither applicable nor reversible"
+            )
+            raise SyncError(
+                f"llama.cpp patch {entry['id']} {problem} "
+                f"(marker_present={marker_present}): {detail}"
+            )
         results.append(
             {
                 "id": entry["id"],
@@ -247,6 +317,19 @@ def inspect_sync(
                 "state": state,
             }
         )
+
+    applied = [
+        entry for entry, result in zip(entries, results)
+        if result["state"].startswith("applied")
+    ]
+    try:
+        committed = _check_source_diff(source, entries, applied, upstream_revision)
+    except SyncError as exc:
+        raise SyncError(f"llama.cpp pinned source or worktree has unmanaged diff: {exc}") from exc
+
+    for item in results:
+        if item["state"] == "applied" and item["id"] in committed:
+            item["state"] = "applied_committed"
 
     # 顶层字段保留首个补丁的信息，兼容既有消费方；新增 `patches` 给出全量。
     first = results[0]

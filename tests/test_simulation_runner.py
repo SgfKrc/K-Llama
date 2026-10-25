@@ -11,9 +11,9 @@ _VENV_TEST = Path(__file__).resolve().parents[1] / ".venv-test"
 
 def test_simulation_runner_profiles_are_fixed_and_layered():
     assert run_simulation.targets_for_profile("quick") == (
-        "tests/test_task_graph_simulation.py",
+        "tests/test_refactor_execution.py",
         "tests/test_task_worker_control_simulation.py",
-        "tests/test_capacity_simulation.py",
+        "tests/test_linear_simulation.py",
     )
     quick = run_simulation.targets_for_profile("quick")
     assert run_simulation.targets_for_profile("extended")[:len(quick)] == quick
@@ -35,9 +35,8 @@ def test_simulation_runner_quick_profile_emits_safe_json(tmp_path):
     assert summary["pytest"]["exit_code"] == 0
     assert summary["pytest"]["counts"]["passed"] >= 23
     assert [item["family"] for item in summary["evidence"]] == [
-        "task_graph",
+        "linear_execution",
         "task_worker_control",
-        "capacity",
     ]
     assert summary["acceptance_scope"] == {
         "physical_nodes": "not_established",

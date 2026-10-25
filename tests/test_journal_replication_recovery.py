@@ -34,7 +34,7 @@ from journal_replication_transport import (  # noqa: E402
     JournalReplicationTcpServer,
     request_checkpoint,
 )
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 SECRET = b"r" * 40
 SRC = "node-leader"

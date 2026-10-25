@@ -126,5 +126,5 @@ class TestNoRegression:
 
     def test_existing_gaps_still_declared(self):
         for key in ("cluster_queue_pause", "cluster_queue_resume",
-                    "cluster_queue_strategy", "cluster_queue_clear"):
+                     "cluster_queue_clear"):
             assert key in API_PATHS

@@ -6,15 +6,19 @@ No model, device, signing key, package build, download, or production DLL is use
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "scripts/model_tools/build_keep_head_cpu.ps1"
@@ -24,7 +28,7 @@ DLLS = (
     "libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll", "libgomp-1.dll",
 )
 
-# One framework executable copied under the four tool names. It logs argv as
+# One framework executable linked under the four tool names. It logs argv as
 # individual lines so the tests exercise real PowerShell/Windows quoting.
 FAKE_TOOL = r'''using System;
 using System.IO;
@@ -42,6 +46,11 @@ class NativeTool {
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         File.WriteAllText(path, text, new UTF8Encoding(false));
     }
+    static void Mutate(string stage) {
+        if (Environment.GetEnvironmentVariable("QLH_TEST_MUTATE_AT") == stage)
+            File.AppendAllText(Environment.GetEnvironmentVariable("QLH_TEST_MUTATE_PATH"),
+                               Environment.GetEnvironmentVariable("QLH_TEST_MUTATE_TEXT"), new UTF8Encoding(false));
+    }
     static int Main(string[] args) {
         string name = Path.GetFileNameWithoutExtension(Environment.GetCommandLineArgs()[0]);
         string log = Environment.GetEnvironmentVariable("QLH_TEST_TOOL_LOG");
@@ -57,17 +66,24 @@ class NativeTool {
             if (Failure("CONFIGURE") != 0) return Failure("CONFIGURE");
             string dir = After(args, "-B");
             var cache = new List<string>();
+            string missingKey = Environment.GetEnvironmentVariable("QLH_TEST_MISSING_CACHE_KEY");
             foreach (string arg in args) {
                 if (arg.StartsWith("-D")) {
                     int equal = arg.IndexOf('=');
-                    cache.Add(arg.Substring(2, equal - 2) + ":STRING=" + arg.Substring(equal + 1).Replace('\\', '/'));
+                    string key = arg.Substring(2, equal - 2);
+                    if (key != missingKey)
+                        cache.Add(key + ":STRING=" + arg.Substring(equal + 1).Replace('\\', '/'));
                 }
             }
             cache.Add("CMAKE_GENERATOR:INTERNAL=" + After(args, "-G"));
             cache.Add("CMAKE_HOME_DIRECTORY:INTERNAL=" + After(args, "-S").Replace('\\', '/'));
             if (Environment.GetEnvironmentVariable("QLH_TEST_BAD_CACHE") == "1")
                 cache.Add("GGML_NATIVE:BOOL=ON");
+            string badKey = Environment.GetEnvironmentVariable("QLH_TEST_BAD_CACHE_KEY");
+            if (!String.IsNullOrEmpty(badKey))
+                cache.Add(badKey + ":STRING=" + Environment.GetEnvironmentVariable("QLH_TEST_BAD_CACHE_VALUE"));
             Write(Path.Combine(dir, "CMakeCache.txt"), String.Join("\n", cache));
+            Mutate("CONFIGURE");
             return 0;
         }
         if (Array.IndexOf(args, "--build") >= 0) {
@@ -77,17 +93,95 @@ class NativeTool {
                 if (dll != Environment.GetEnvironmentVariable("QLH_TEST_MISSING_DLL"))
                     Write(Path.Combine(dir, "bin", dll), "fresh fake " + dll);
             Write(Path.Combine(dir, "src", "libllama.dll.a"), "fresh fake import library");
+            Mutate("BUILD");
             return 0;
         }
         if (Array.IndexOf(args, "-shared") >= 0) {
             if (Failure("SHIM") != 0) return Failure("SHIM");
             Write(After(args, "-o"), "fresh fake shim");
+            Mutate("SHIM");
             return 0;
         }
         return 98;
     }
 }
 '''
+
+
+def retry_fixture_sharing(operation):
+    """Only retry Windows sharing violations while preparing fake tools."""
+    for attempt in range(12):
+        try:
+            return operation()
+        except OSError as error:
+            if getattr(error, "winerror", None) != 32 or attempt == 11:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+
+def wait_image_released(path, *, deadline=3.0):
+    """Wait until a just-exited exec image can be pinned.
+
+    ``pin_fixture_image`` excludes write sharing, so while the previous
+    process image is still unmapping Windows answers ERROR_ACCESS_DENIED (5).
+    That is a different condition from the sharing violations
+    ``retry_fixture_sharing`` handles, so it gets its own short wait instead of
+    widening that helper's contract. Callers pass one of the hard-linked tool
+    names: they share an image, so one wait covers all of them.
+    """
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            pin_fixture_image(path)()
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) != 5 or time.monotonic() >= end:
+                raise
+            time.sleep(0.05)
+
+
+def exclusive_read(path):
+    # A completed managed process can leave a scanner holding the image briefly.
+    # Unlike Python's open(), FileShare.None also detects those remaining handles.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    handle = create(str(path), 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, OPEN_EXISTING
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    if not close(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def pin_fixture_image(path):
+    """Keep a fake image readable/executable while excluding transient writers."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    # Share reads and deletion, but no write opens between successive tool starts.
+    handle = create(str(path), 0x80000000, 0x1 | 0x4, None, 3, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    def release():
+        if not close(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    return release
 
 
 @unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe") and shutil.which("git.exe"),
@@ -130,69 +224,200 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         self.source = self.root / "android/app/src/main/cpp/llama.cpp"
         self.source.mkdir(parents=True)
         (self.source / "include").mkdir()
-        (self.source / "include/llama.h").write_text("/* fake pinned header */\n", encoding="ascii")
-        (self.source / "CMakeLists.txt").write_text("# fake pinned source\n", encoding="ascii")
+        self.header = self.source / "include/llama.h"
+        self.header.write_bytes(b"/* fake upstream header */\n" + b"/* context */\n" * 20)
+        (self.source / "CMakeLists.txt").write_bytes(b"# fake pinned source\n")
         self.git(self.source, "init", "-q")
-        self.git(self.source, "add", ".")
-        self.git(self.source, "-c", "user.name=QLH test", "-c", "user.email=qlh-test@example.invalid",
-                 "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
-        revision = self.git(self.source, "rev-parse", "HEAD").stdout.strip()
+        for key, value in (("user.name", "QLH test"), ("user.email", "qlh-test@example.invalid"),
+                           ("core.autocrlf", "false"), ("commit.gpgsign", "false")):
+            self.git(self.source, "config", key, value)
+        self.upstream = self.commit_source("upstream fixture")
         scripts = self.root / "scripts/model_tools"
         (scripts / "keep_head_shim").mkdir(parents=True)
-        # Exercise the existing shim unchanged, including its exit and copy rules.
+        # Execute the real SourceRoot copy: sync derives its ROOT and lock from
+        # __file__, so importing or running the original would inspect this repo.
+        self.sync = scripts / "sync_llama_cpp.py"
+        shutil.copyfile(ROOT / "scripts/model_tools/sync_llama_cpp.py", self.sync)
         shutil.copyfile(ROOT / "scripts/model_tools/build_keep_head_shim.ps1", scripts / "build_keep_head_shim.ps1")
-        (scripts / "keep_head_shim/qlh_keep_head.c").write_text("/* fake shim */\n", encoding="ascii")
-        patch = scripts / "committed.patch"
-        patch.write_bytes(b"patch fixture\r\n")
-        lock = {"source": "android/app/src/main/cpp/llama.cpp", "revision_local": revision,
-                "revision_local_note": "Windows UTF-8 fixture: \u8865\u4e01",  # PS 5.1 must read UTF-8.
-                "upstream": {"revision": "a" * 40},
-                "patches": [{"path": "scripts/model_tools/committed.patch",
-                             "sha256": hashlib.sha256(b"patch fixture\n").hexdigest()}]}
-        (scripts / "llama_quantize.lock.json").write_text(json.dumps(lock, ensure_ascii=False), encoding="utf-8")
+        (scripts / "keep_head_shim/qlh_keep_head.c").write_bytes(b"/* fake shim */\n")
+        self.header.write_bytes(b"/* QLH managed API */\n" + self.header.read_bytes())
+        self.managed_patch = scripts / "committed.patch"
+        self.managed_patch.write_bytes(self.git(self.source, "diff", "--binary").stdout.encode("ascii"))
+        self.revision = self.commit_source("managed patch fixture")
+        self.lock_path = scripts / "llama_quantize.lock.json"
+        self.lock = {"source": "android/app/src/main/cpp/llama.cpp", "revision_local": self.revision,
+                     "revision_local_note": "Windows UTF-8 fixture: \u8865\u4e01",
+                     "upstream": {"revision": self.upstream},
+                     "patches": [{"id": "fixture-api", "path": "scripts/model_tools/committed.patch",
+                                  "targets": ["include/llama.h"], "marker": "QLH managed API",
+                                  "sha256": hashlib.sha256(self.managed_patch.read_bytes()).hexdigest()}]}
+        self.write_lock()
         self.tools = self.root / "build/toolchain with spaces"
         self.tools.mkdir(parents=True)
+        # Reuse one compiled image instead of writing four fresh EXEs for every
+        # case. Each path still exercises the real tool name and space quoting.
         for name in ("gcc.exe", "g++.exe", "mingw32-make.exe", "cmake.exe"):
-            shutil.copyfile(self.fake, self.tools / name)
+            os.link(self.fake, self.tools / name)
         for name in DLLS[5:]:
             (self.tools / name).write_bytes(("runtime " + name).encode())
         self.log = self.root / "build/tool-argv.log"
         self.env["QLH_TEST_TOOL_LOG"] = str(self.log)
+        self.probe_log = self.root / "build/tool-readiness.log"
+        for name in ("gcc.exe", "g++.exe", "mingw32-make.exe", "cmake.exe"):
+            self.ready_fake_tool(self.tools / name)
         self.build = self.root / "build/fresh build"
         self.output = self.root / "build/separate output"
         self.command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BUILDER),
                         "-SourceRoot", str(self.root), "-BuildDir", str(self.build),
-                        "-OutDir", str(self.output), "-ToolchainBin", str(self.tools)]
+                        "-OutDir", str(self.output), "-Python", sys.executable, "-ToolchainBin", str(self.tools)]
 
     def git(self, directory, *args):
         return subprocess.run(["git.exe", "-C", str(directory), *args], env=self.env,
                               capture_output=True, text=True, errors="replace", check=True, timeout=20)
 
+    def commit_source(self, message):
+        self.git(self.source, "add", ".")
+        self.git(self.source, "commit", "-qm", message)
+        return self.git(self.source, "rev-parse", "HEAD").stdout.strip()
+
+    def write_lock(self):
+        self.lock_path.write_text(json.dumps(self.lock, ensure_ascii=False), encoding="utf-8")
+
+    def run_sync(self):
+        return subprocess.run([sys.executable, "-B", "-X", "utf8", str(self.sync),
+                               "--android-root", str(self.root / "android"), "--dry-run"],
+                              env=self.env, capture_output=True, text=True, errors="replace", timeout=30)
+
+    def assert_no_build(self):
+        self.assertFalse(self.log.exists())
+        self.assertFalse(self.build.exists())
+        self.assertFalse(self.output.exists())
+
+    def assert_drift_rejected(self, path, stage, detail, *, code=1, addition="\n/* drift */\n"):
+        before = path.read_bytes()
+        result = self.run_builder(code, QLH_TEST_MUTATE_AT=stage, QLH_TEST_MUTATE_PATH=str(path),
+                                  QLH_TEST_MUTATE_TEXT=addition)
+        self.assertIn(detail, result.stdout)
+        self.assertEqual(path.read_bytes(), before + addition.encode("utf-8"))
+        self.assertIn("--build\n", self.log.read_text())
+        self.assertTrue((self.build / "bin/libllama.dll").exists())
+        self.assertFalse((self.build / "keep-head-cpu-build.json").exists())
+
+    def ready_fake_tool(self, path):
+        def probe():
+            result = subprocess.run([str(path), "--version"], cwd=self.tmp.name,
+                                    env=dict(self.env, QLH_TEST_TOOL_LOG=str(self.probe_log)),
+                                    capture_output=True, text=True, errors="replace", timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.strip(), f"{path.stem} fake 1.0",
+                             result.stdout + result.stderr)
+        retry_fixture_sharing(probe)
+        retry_fixture_sharing(lambda: exclusive_read(path))
+
     def run_builder(self, code=0, **env):
-        # Windows can refuse to launch a tool image that a just-written copy — or the
-        # security/indexer scan of it — still holds. PowerShell surfaces that either as
-        #   "Program 'x.exe' failed to run: The process cannot access the file ...
-        #    being used by another process"                        (WinError 32)
-        # or as a plain access denial in the middle of the same race             (5).
-        # It is a timing race on freshly created images and clears on retry. Only these
-        # signatures are retried, so any real contract violation still fails at once.
-        racing = ("being used by another process", "Access is denied", "拒绝访问",
-                  "[WinError 32]", "[WinError 5]")
-        for attempt in range(12):
+        # Never replay configuration/build against outputs from a previous launch.
+        with ExitStack() as images:
+            tools = getattr(self, "tools", None)
+            names = sorted(tools.glob("*.exe")) if tools is not None else []
+            # The four tool names are hard links to one image: a single wait
+            # clears the unmapping window for all of them.
+            if names:
+                wait_image_released(names[0])
+            for path in names:
+                images.callback(retry_fixture_sharing(lambda: pin_fixture_image(path)))
             result = subprocess.run(self.command, cwd=self.tmp.name, env=dict(self.env, **env),
                                     capture_output=True, text=True, errors="replace", timeout=45)
-            output = result.stdout + result.stderr
-            if result.returncode == code or not any(token in output for token in racing):
-                break
-            time.sleep(0.5 * (attempt + 1))
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
 
+    def assert_profile_contract(self, profile):
+        receipt = json.loads((self.build / "keep-head-cpu-build.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(receipt["schema_version"], 1)
+        self.assertEqual(receipt["isa_profile"], profile)
+        self.assertEqual(receipt["production_default_profile"], "avx2")
+        self.assertIs(receipt["experimental_profile"], profile == "avx2_vnni")
+        expected = {
+            "CMAKE_BUILD_TYPE": "Release", "BUILD_SHARED_LIBS": "ON", "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+            "CMAKE_C_COMPILER": str(self.tools / "gcc.exe"),
+            "CMAKE_CXX_COMPILER": str(self.tools / "g++.exe"),
+            "CMAKE_MAKE_PROGRAM": str(self.tools / "mingw32-make.exe"),
+            "CMAKE_TOOLCHAIN_FILE": "", "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "",
+            "CMAKE_C_FLAGS": "", "CMAKE_CXX_FLAGS": "",
+            "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG", "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
+            "CMAKE_EXE_LINKER_FLAGS": "", "CMAKE_SHARED_LINKER_FLAGS": "", "CMAKE_MODULE_LINKER_FLAGS": "",
+            "LLAMA_USE_SYSTEM_GGML": "OFF", "LLAMA_BUILD_COMMON": "OFF", "LLAMA_BUILD_TOOLS": "OFF",
+            "LLAMA_BUILD_TESTS": "OFF", "LLAMA_BUILD_EXAMPLES": "OFF", "LLAMA_BUILD_SERVER": "OFF",
+            "LLAMA_BUILD_APP": "OFF", "LLAMA_BUILD_UI": "OFF", "LLAMA_USE_PREBUILT_UI": "OFF",
+            "LLAMA_BUILD_MTMD": "OFF", "LLAMA_OPENSSL": "OFF", "LLAMA_CURL": "OFF", "LLAMA_LLGUIDANCE": "OFF",
+            "LLAMA_TOOLS_INSTALL": "OFF", "LLAMA_TESTS_INSTALL": "OFF",
+            "FETCHCONTENT_FULLY_DISCONNECTED": "ON", "FETCHCONTENT_UPDATES_DISCONNECTED": "ON",
+            "GGML_CPU": "ON", "GGML_CPU_REPACK": "ON", "GGML_NATIVE": "OFF", "GGML_AVX": "ON", "GGML_AVX2": "ON",
+            "GGML_SSE42": "ON", "GGML_BMI2": "ON", "GGML_FMA": "ON", "GGML_F16C": "ON",
+            "GGML_AVX_VNNI": "ON" if profile == "avx2_vnni" else "OFF",
+            "GGML_AVX512": "OFF", "GGML_AVX512_VBMI": "OFF",
+            "GGML_AVX512_VNNI": "OFF", "GGML_AVX512_BF16": "OFF",
+            "GGML_AMX_TILE": "OFF", "GGML_AMX_INT8": "OFF", "GGML_AMX_BF16": "OFF",
+            "GGML_CPU_ALL_VARIANTS": "OFF", "GGML_BACKEND_DL": "OFF",
+            "GGML_CPU_HBM": "OFF", "GGML_CPU_KLEIDIAI": "OFF", "GGML_CCACHE": "OFF",
+            "GGML_OPENMP": "ON", "GGML_LLAMAFILE": "ON",
+            "GGML_BUILD_TESTS": "OFF", "GGML_BUILD_EXAMPLES": "OFF",
+            "GGML_ACCELERATE": "OFF", "GGML_BLAS": "OFF", "GGML_CUDA": "OFF", "GGML_HIP": "OFF",
+            "GGML_MUSA": "OFF", "GGML_VULKAN": "OFF", "GGML_SYCL": "OFF", "GGML_RPC": "OFF",
+            "GGML_METAL": "OFF", "GGML_WEBGPU": "OFF", "GGML_OPENCL": "OFF", "GGML_OPENVINO": "OFF",
+            "GGML_HEXAGON": "OFF", "GGML_ZDNN": "OFF", "GGML_ZENDNN": "OFF",
+            "GGML_VIRTGPU": "OFF", "GGML_VIRTGPU_BACKEND": "OFF",
+        }
+        self.assertEqual(receipt["cmake_definitions"], expected)
+        configure = receipt["configure_arguments"]
+        flags = [arg for arg in configure if arg.startswith("-D")]
+        self.assertCountEqual(flags, [f"-D{key}={value}" for key, value in expected.items()])
+        keys = [flag.split("=", 1)[0] for flag in flags]
+        self.assertEqual(len(keys), len(set(keys)), "CMake definitions must appear exactly once")
+        logged = self.log.read_text().splitlines()
+        start = logged.index("-S")
+        self.assertEqual(logged[start:logged.index("END", start)], configure)
+        self.assertEqual(configure[:6], ["-S", str(self.source), "-B", str(self.build), "-G", "MinGW Makefiles"])
+        # The tiny fake deliberately does not generate compile_commands.json.
+        self.assertFalse((self.build / "compile_commands.json").exists())
+        inputs = receipt["input_sha256"]
+        for name, digest in inputs.items():
+            self.assertEqual(hashlib.sha256(Path(name).read_bytes()).hexdigest(), digest, name)
+        self.assertIn(str(Path(sys.executable)), inputs)
+        self.assertEqual(inputs[str(BUILDER)], receipt["builder_sha256"])
+        self.assertEqual(set(receipt["tools"]), {"cmake", "gcc", "g++", "make"})
+        for tool in receipt["tools"].values():
+            self.assertEqual(tool["sha256"], inputs[tool["path"]])
+        for name in ("cmake.exe", "gcc.exe", "g++.exe", "mingw32-make.exe", *DLLS[5:]):
+            self.assertIn(str(self.tools / name), inputs)
+        for artifact in receipt["artifacts"]:
+            path = Path(artifact["path"])
+            self.assertEqual(artifact["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            if artifact["name"] in DLLS[5:]:
+                self.assertEqual(artifact["sha256"], inputs[str(self.tools / artifact["name"])])
+        return receipt
+
     def test_fresh_build_spaces_custom_output_and_safe_config(self):
         # Host CFLAGS must not change the portable ISA selection.
-        self.run_builder(CFLAGS="-march=native -mavx512f", CXXFLAGS="-m32")
+        self.run_builder(CFLAGS="-march=native -mavx512f", CXXFLAGS="-m32",
+                         QLH_ANDROID_ROOT=str(self.root / "wrong android"),
+                         QLH_KEEP_HEAD_PYTHON=str(self.root / "wrong python.exe"))
         receipt = json.loads((self.build / "keep-head-cpu-build.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(self.assert_profile_contract("avx2"), receipt)
+        sync = receipt["source_sync"]
+        self.assertEqual(Path(sync["python"]), Path(sys.executable))
+        self.assertEqual(Path(sync["script"]), self.sync)
+        self.assertIn("--dry-run", sync["arguments"])
+        self.assertNotIn("--apply", sync["arguments"])
+        for phase in ("before", "after"):
+            self.assertTrue(sync[phase]["ok"])
+            self.assertTrue(sync[phase]["dry_run"])
+            self.assertEqual(sync[phase]["revision"], self.revision)
+            self.assertEqual(sync[phase]["state"], "applied")
+            self.assertEqual([item["state"] for item in sync[phase]["patches"]], ["applied_committed"])
+        self.assertEqual(sync["script_sha256"], hashlib.sha256(self.sync.read_bytes()).hexdigest())
+        for name, digest in receipt["input_sha256"].items():
+            self.assertEqual(hashlib.sha256(Path(name).read_bytes()).hexdigest(), digest, name)
         self.assertTrue(receipt["source_git_clean"])
         self.assertEqual({p.name for p in self.output.iterdir()}, set(DLLS))
         self.assertEqual(len(receipt["artifacts"]), 9)
@@ -208,6 +433,59 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         self.assertEqual(self.git(self.source, "status", "--porcelain").stdout, "")
         for name in DLLS[5:]:
             self.assertEqual((self.output / name).read_bytes(), (self.tools / name).read_bytes())
+
+    def test_explicit_production_profile_has_exact_default_flags(self):
+        self.command += ["-IsaProfile", "avx2"]
+        self.run_builder()
+        self.assert_profile_contract("avx2")
+
+    def test_candidate_profile_changes_only_vnni(self):
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        self.run_builder(QLH_KEEP_HEAD_ISA_PROFILE="avx2", GGML_AVX_VNNI="OFF")
+        self.assert_profile_contract("avx2_vnni")
+
+    def test_profile_names_are_canonical_in_receipt(self):
+        self.command += ["-IsaProfile", "AVX2_VNNI"]
+        self.run_builder()
+        self.assert_profile_contract("avx2_vnni")
+
+    def test_environment_cannot_select_candidate_or_override_fixed_definitions(self):
+        self.run_builder(QLH_KEEP_HEAD_ISA_PROFILE="avx2_vnni", ISA_PROFILE="avx2_vnni",
+                         GGML_AVX_VNNI="ON", GGML_NATIVE="ON", GGML_CPU_REPACK="OFF",
+                         CMAKE_EXPORT_COMPILE_COMMANDS="OFF")
+        self.assert_profile_contract("avx2")
+
+    def test_invalid_profile_is_rejected_before_tools_or_output(self):
+        command = self.command[:]
+        for profile in ("avx512", "native", "", "avx2_vnni;avx2"):
+            with self.subTest(profile=profile):
+                self.command = command + ["-IsaProfile", profile]
+                result = self.run_builder(1)
+                self.assertIn("IsaProfile", result.stdout + result.stderr)
+                self.assert_no_build()
+
+    def test_candidate_cache_mismatches_are_rejected_before_compile(self):
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        build_root = self.build
+        bad_values = {"GGML_AVX_VNNI": "OFF", "GGML_CPU_REPACK": "OFF", "GGML_NATIVE": "ON",
+                      "GGML_AVX512": "ON", "GGML_AMX_TILE": "ON", "CMAKE_EXPORT_COMPILE_COMMANDS": "OFF"}
+        for key, value in bad_values.items():
+            with self.subTest(key=key):
+                self.build = build_root / key
+                self.command[self.command.index("-BuildDir") + 1] = str(self.build)
+                result = self.run_builder(1, QLH_TEST_BAD_CACHE_KEY=key, QLH_TEST_BAD_CACHE_VALUE=value)
+                self.assertIn(f"Unexpected CMake cache value for {key}", result.stdout)
+                self.assertNotIn("--build\n", self.log.read_text())
+                self.assertFalse(self.output.exists())
+                self.assertFalse((self.build / "keep-head-cpu-build.json").exists())
+
+    def test_candidate_cache_must_include_vnni_definition(self):
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        result = self.run_builder(1, QLH_TEST_MISSING_CACHE_KEY="GGML_AVX_VNNI")
+        self.assertIn("Unexpected CMake cache value for GGML_AVX_VNNI", result.stdout)
+        self.assertNotIn("--build\n", self.log.read_text())
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.build / "keep-head-cpu-build.json").exists())
 
     def test_configure_failure_preserves_code_and_never_builds(self):
         self.run_builder(23, QLH_TEST_FAIL_CONFIGURE="23")
@@ -229,14 +507,15 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
             with self.subTest(name=name):
                 path = self.tools / name
                 contents = path.read_bytes()
-                path.unlink()
+                retry_fixture_sharing(path.unlink)
                 try:
                     result = self.run_builder(1)
                     self.assertIn(name, result.stdout)
                     self.assertFalse(self.log.exists())
                     self.assertFalse(self.build.exists())
                 finally:
-                    path.write_bytes(contents)
+                    retry_fixture_sharing(lambda: path.write_bytes(contents))
+                    self.ready_fake_tool(path)
 
     def test_missing_runtime_fails_before_configuration(self):
         (self.tools / "libgomp-1.dll").unlink()
@@ -266,6 +545,132 @@ class KeepHeadCpuBuildTests(unittest.TestCase):
         self.assertIn("Git-clean", self.run_builder(1).stdout)
         self.assertEqual(header.read_bytes(), b"modified header\n")
         self.assertFalse(self.build.exists())
+
+    def test_unmanaged_committed_change_is_rejected_by_shared_sync(self):
+        cmake = self.source / "CMakeLists.txt"
+        cmake.write_bytes(cmake.read_bytes() + b"# unmanaged committed change\n")
+        self.lock["revision_local"] = self.commit_source("unmanaged fixture")
+        self.write_lock()
+        before = cmake.read_bytes()
+        index = (self.source / ".git/index").read_bytes()
+        objects = self.git(self.source, "count-objects", "-v").stdout
+        self.assertEqual(self.git(self.source, "status", "--porcelain").stdout, "")
+
+        self.assertIn("unmanaged", self.run_builder(2).stdout)
+
+        self.assertEqual(cmake.read_bytes(), before)
+        self.assertEqual((self.source / ".git/index").read_bytes(), index)
+        self.assertEqual(self.git(self.source, "count-objects", "-v").stdout, objects)
+        self.assert_no_build()
+
+    def test_fake_upstream_is_rejected_before_any_output(self):
+        for upstream in ("a" * 40, self.revision):
+            with self.subTest(upstream=upstream):
+                self.lock["upstream"]["revision"] = upstream
+                self.write_lock()
+                result = self.run_builder(2)
+                self.assertIn("upstream" if upstream == "a" * 40 else "unmanaged", result.stdout)
+                self.assert_no_build()
+
+    def test_pending_patch_sync_exit_zero_is_rejected_without_applying(self):
+        self.git(self.source, "checkout", "-q", "--detach", self.upstream)
+        self.lock["revision_local"] = self.upstream
+        self.write_lock()
+        before = self.header.read_bytes()
+        sync = self.run_sync()
+        self.assertEqual(sync.returncode, 0, sync.stdout + sync.stderr)
+        report = json.loads(sync.stdout)
+        self.assertEqual(report["state"], "ready_to_apply")
+        self.assertEqual(report["pending"], ["fixture-api"])
+
+        result = self.run_builder(1)
+
+        self.assertIn("pending or uncommitted", result.stdout)
+        self.assertIn("fixture-api=ready_to_apply", result.stdout)
+        self.assertEqual(self.header.read_bytes(), before)
+        self.assertEqual(self.git(self.source, "status", "--porcelain").stdout, "")
+        self.assert_no_build()
+
+    def test_hidden_complete_worktree_patch_is_rejected_before_any_output(self):
+        # HEAD and both pins identify unpatched upstream; the complete patch
+        # exists only in the worktree, hidden from porcelain by index flags.
+        self.git(self.source, "checkout", "-q", "--detach", self.upstream)
+        self.lock["revision_local"] = self.upstream
+        self.write_lock()
+        self.git(self.source, "apply", str(self.managed_patch))
+        before = self.header.read_bytes()
+        self.assertEqual(self.git(self.source, "rev-parse", "HEAD").stdout.strip(), self.upstream)
+        self.assertNotEqual(self.git(self.source, "show", "HEAD:include/llama.h").stdout.encode("ascii"), before)
+
+        for flag, undo in (("--skip-worktree", "--no-skip-worktree"),
+                           ("--assume-unchanged", "--no-assume-unchanged")):
+            with self.subTest(flag=flag):
+                self.git(self.source, "update-index", flag, "--", "include/llama.h")
+                try:
+                    self.assertEqual(self.git(self.source, "status", "--porcelain", "--untracked-files=all").stdout, "")
+                    index = (self.source / ".git/index").read_bytes()
+
+                    result = self.run_builder(1)
+
+                    self.assertIn("pending or uncommitted", result.stdout)
+                    self.assertIn("fixture-api=applied", result.stdout)
+                    self.assert_no_build()
+                    self.assertEqual(self.header.read_bytes(), before)
+                    self.assertEqual((self.source / ".git/index").read_bytes(), index)
+                    self.assertEqual(self.git(self.source, "rev-parse", "HEAD").stdout.strip(), self.upstream)
+                finally:
+                    self.git(self.source, "update-index", undo, "--", "include/llama.h")
+
+    def test_hidden_worktree_edit_is_rejected_by_shared_sync(self):
+        cmake = self.source / "CMakeLists.txt"
+        self.git(self.source, "update-index", "--skip-worktree", "CMakeLists.txt")
+        cmake.write_bytes(cmake.read_bytes() + b"# hidden edit\n")
+        self.assertEqual(self.git(self.source, "status", "--porcelain").stdout, "")
+        before = cmake.read_bytes()
+
+        self.assertIn("unmanaged", self.run_builder(2).stdout)
+
+        self.assertEqual(cmake.read_bytes(), before)
+        self.assert_no_build()
+
+    def test_source_drift_during_configure_never_writes_success_receipt(self):
+        self.assert_drift_rejected(self.source / "CMakeLists.txt", "CONFIGURE", "Git-clean")
+
+    def test_hidden_source_drift_is_rechecked_by_shared_sync_before_success(self):
+        self.git(self.source, "update-index", "--skip-worktree", "CMakeLists.txt")
+        self.assert_drift_rejected(self.source / "CMakeLists.txt", "BUILD", "unmanaged", code=2)
+        self.assertEqual(self.git(self.source, "status", "--porcelain").stdout, "")
+
+    def test_lock_drift_with_identical_contract_is_rejected(self):
+        # Still valid JSON and the same pins: re-running sync alone cannot bind
+        # the receipt to the lock bytes used at build entry.
+        self.assert_drift_rejected(self.lock_path, "BUILD", "Build input changed", addition="\n \n")
+
+    def test_shim_source_drift_during_build_is_rejected(self):
+        self.assert_drift_rejected(self.root / "scripts/model_tools/keep_head_shim/qlh_keep_head.c",
+                                   "BUILD", "Build input changed")
+
+    def test_shim_script_drift_during_shim_compile_is_rejected(self):
+        self.assert_drift_rejected(self.root / "scripts/model_tools/build_keep_head_shim.ps1",
+                                   "SHIM", "Build input changed", addition="\n# drift\n")
+
+    def test_runtime_drift_during_build_is_rejected_even_when_shim_copies_it(self):
+        runtime = self.tools / "libgomp-1.dll"
+        self.command += ["-IsaProfile", "avx2_vnni"]
+        self.assert_drift_rejected(runtime, "BUILD", "Build input changed")
+        self.assertEqual((self.output / runtime.name).read_bytes(), runtime.read_bytes())
+
+    def test_python_environment_override_without_explicit_parameter(self):
+        index = self.command.index("-Python")
+        del self.command[index:index + 2]
+        self.run_builder(QLH_KEEP_HEAD_PYTHON=sys.executable)
+        receipt = json.loads((self.build / "keep-head-cpu-build.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(Path(receipt["source_sync"]["python"]), Path(sys.executable))
+
+    def test_missing_explicit_python_does_not_fall_back_or_create_output(self):
+        self.command[self.command.index("-Python") + 1] = str(self.root / "missing python.exe")
+        self.assertIn("missing python.exe", self.run_builder(1, QLH_KEEP_HEAD_PYTHON=sys.executable).stdout)
+        self.assert_no_build()
 
     def test_missing_build_dll_never_runs_shim_or_writes_receipt(self):
         self.assertIn("ggml-cpu.dll", self.run_builder(1, QLH_TEST_MISSING_DLL="ggml-cpu.dll").stdout)
@@ -315,10 +720,15 @@ class CpuBatchNativeGateTests(unittest.TestCase):
             root = Path(directory)
             scripts = root / "scripts/model_tools"
             scripts.mkdir(parents=True)
-            (scripts / "build_keep_head_cpu.ps1").write_text("param([string]$SourceRoot)\nexit 47\n", encoding="ascii")
+            (scripts / "build_keep_head_cpu.ps1").write_text(
+                "param([string]$SourceRoot, [string]$Python)\n"
+                "if ($Python -cne $env:QLH_TEST_SELECTED_PYTHON) { exit 46 }\nexit 47\n", encoding="ascii")
             batch = root / "test.bat"
             batch.write_text("@echo off\nsetlocal enabledelayedexpansion\n" + block + "exit /b 99\n", encoding="ascii")
-            env = dict(os.environ, QLH_CORE_ROOT=str(root), QLH_BUILD_PROFILE="llama_cpp_only")
+            selected_python = str(root / "selected python/python.exe")
+            env = dict(os.environ, QLH_CORE_ROOT=str(root), QLH_BUILD_PROFILE="llama_cpp_only",
+                       PYTHON=selected_python, QLH_TEST_SELECTED_PYTHON=selected_python,
+                       QLH_KEEP_HEAD_PYTHON="must not override packaging Python")
             result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(batch)],
                                     env=env, capture_output=True, text=True, errors="replace", timeout=20)
             self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
@@ -326,6 +736,134 @@ class CpuBatchNativeGateTests(unittest.TestCase):
             result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(batch)],
                                     env=env, capture_output=True, text=True, errors="replace", timeout=20)
             self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
+
+
+class FakeToolReadinessTests(unittest.TestCase):
+    """Fixture retries must never turn a real builder failure into a rerun."""
+
+    def setUp(self):
+        self.builder = KeepHeadCpuBuildTests("test_fresh_build_spaces_custom_output_and_safe_config")
+        self.builder.command = ["unused fixture builder"]
+        self.builder.tmp = SimpleNamespace(name="unused fixture directory")
+        self.builder.env = {"QLH_TEST_TOOL_LOG": "formal.log"}
+        self.builder.probe_log = Path("readiness.log")
+        self.process = self.enterContext(patch.object(subprocess, "run"))
+        self.sleep = self.enterContext(patch.object(time, "sleep"))
+        self.exclusive = self.enterContext(patch(f"{__name__}.exclusive_read"))
+
+    @staticmethod
+    def result(code=0, output="gcc fake 1.0\n"):
+        return subprocess.CompletedProcess([], code, output, "")
+
+    @staticmethod
+    def windows_error(code):
+        error = OSError(f"fixture WinError {code}")
+        error.winerror = code
+        return error
+
+    def test_probe_retries_only_launch_sharing_and_keeps_separate_log(self):
+        self.process.side_effect = [self.windows_error(32), self.result()]
+
+        self.builder.ready_fake_tool(Path("gcc.exe"))
+
+        self.assertEqual(self.process.call_count, 2)
+        self.sleep.assert_called_once_with(0.5)
+        self.exclusive.assert_called_once_with(Path("gcc.exe"))
+        for call in self.process.call_args_list:
+            self.assertEqual(call.args[0], ["gcc.exe", "--version"])
+            self.assertEqual(call.kwargs["env"]["QLH_TEST_TOOL_LOG"], "readiness.log")
+        self.assertEqual(self.builder.env["QLH_TEST_TOOL_LOG"], "formal.log")
+
+    def test_exclusive_read_waits_after_successful_probe_without_relaunch(self):
+        self.process.return_value = self.result()
+        self.exclusive.side_effect = [self.windows_error(32), self.windows_error(32), None]
+
+        self.builder.ready_fake_tool(Path("gcc.exe"))
+
+        self.process.assert_called_once()
+        self.assertEqual(self.exclusive.call_count, 3)
+        self.assertEqual([call.args for call in self.sleep.call_args_list], [(0.5,), (1.0,)])
+
+    def test_probe_access_denied_and_missing_file_propagate_without_retry(self):
+        for code in (5, 2):
+            with self.subTest(winerror=code):
+                error = self.windows_error(code)
+                self.process.side_effect = error
+                with self.assertRaises(OSError) as caught:
+                    self.builder.ready_fake_tool(Path("gcc.exe"))
+                self.assertIs(caught.exception, error)
+        self.assertEqual(self.process.call_count, 2)
+        self.sleep.assert_not_called()
+        self.exclusive.assert_not_called()
+
+    def test_nonzero_or_empty_probe_output_fails_without_retry(self):
+        for result in (self.result(1, "being used by another process"), self.result(0, "")):
+            with self.subTest(returncode=result.returncode):
+                self.process.return_value = result
+                with self.assertRaises(AssertionError):
+                    self.builder.ready_fake_tool(Path("gcc.exe"))
+        self.assertEqual(self.process.call_count, 2)
+        self.sleep.assert_not_called()
+        self.exclusive.assert_not_called()
+
+    def test_file_delete_and_restore_retry_only_sharing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fake.exe"
+            path.write_bytes(b"fixture")
+            for operation in (path.unlink, lambda: path.write_bytes(b"restored")):
+                calls = []
+                def locked_once():
+                    calls.append(1)
+                    if len(calls) == 1:
+                        raise self.windows_error(32)
+                    return operation()
+                retry_fixture_sharing(locked_once)
+                self.assertEqual(len(calls), 2)
+            self.assertEqual(path.read_bytes(), b"restored")
+        self.assertEqual([call.args for call in self.sleep.call_args_list], [(0.5,), (0.5,)])
+
+    def test_file_operation_nonsharing_error_is_never_retried(self):
+        for code in (5, 2, None):
+            with self.subTest(winerror=code):
+                error = self.windows_error(code)
+                with patch.object(Path, "unlink", side_effect=error) as unlink:
+                    with self.assertRaises(OSError) as caught:
+                        retry_fixture_sharing(Path("fake.exe").unlink)
+                    self.assertIs(caught.exception, error)
+                    unlink.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_sharing_exhaustion_is_bounded_and_preserves_original_error(self):
+        self.process.return_value = self.result()
+        error = self.windows_error(32)
+        self.exclusive.side_effect = error
+
+        with self.assertRaises(OSError) as caught:
+            self.builder.ready_fake_tool(Path("gcc.exe"))
+
+        self.assertIs(caught.exception, error)
+        self.process.assert_called_once()
+        self.assertEqual(self.exclusive.call_count, 12)
+        self.assertEqual([call.args for call in self.sleep.call_args_list],
+                         [(0.5 * attempt,) for attempt in range(1, 12)])
+
+    def test_builder_failures_are_never_replayed_or_replaced(self):
+        outputs = (
+            "[FAIL] Unexpected CMake cache value for GGML_NATIVE\n",
+            "[FAIL] Expected x64 MinGW compiler, got \n",
+            "[FAIL] Program 'gcc.exe' failed to run: Access is denied [WinError 5]\n",
+            "Program 'gcc.exe' failed to run: being used by another process\n",
+        )
+        for output in outputs:
+            with self.subTest(output=output):
+                expected = self.result(1, output)
+                self.process.return_value = expected
+                self.assertIs(self.builder.run_builder(1), expected)
+                with self.assertRaises(AssertionError):
+                    self.builder.run_builder(23)
+        self.assertEqual(self.process.call_count, 2 * len(outputs))
+        self.sleep.assert_not_called()
+        self.exclusive.assert_not_called()
 
 
 if __name__ == "__main__":

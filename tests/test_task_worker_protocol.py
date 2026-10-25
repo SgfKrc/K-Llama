@@ -109,6 +109,17 @@ def test_unknown_envelope_or_payload_fields_are_rejected(golden):
     assert payload_error.value.code == "invalid_fields"
 
 
+def test_control_certificate_is_not_part_of_task_worker_protocol(golden):
+    message = copy.deepcopy(golden["messages"][0])
+    message["control_certificate"] = {"term": 7, "proof": "signed"}
+
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(message)
+
+    assert captured.value.code == "invalid_fields"
+    assert captured.value.field == "message"
+
+
 def test_offer_input_digest_detects_tampering(golden):
     offer = copy.deepcopy(golden["messages"][2])
     offer["payload"]["root_input"]["message"] = "tampered"
@@ -194,11 +205,9 @@ def test_wire_model_identity_normalizes_alias_and_preserves_non_local_engine(gol
     capabilities = hello["payload"]["capabilities"]
     capabilities["engines"] = ["speculative_assisted"]
     capabilities["models"][0]["engine"] = "speculative_assisted"
-    decoded = decode_message(hello)
-    assert decoded.payload["capabilities"]["engines"] == ["speculative_assisted"]
-    assert decoded.payload["capabilities"]["models"][0]["engine"] == (
-        "speculative_assisted"
-    )
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(hello)
+    assert captured.value.code == "invalid_capabilities"
 
 
 def test_wire_engine_aliases_fail_closed_and_canonical_duplicates_are_rejected(golden):
@@ -583,6 +592,13 @@ def test_hello_capabilities_may_advertise_unusable_artifact_reasons():
     assert hello([unreadable]).payload["capabilities"][
         "layer_artifact_diagnostics"
     ] == [unreadable]
+
+    omitted_unknown_range = {
+        key: value for key, value in unreadable.items() if key != "layer_range"
+    }
+    assert hello([omitted_unknown_range]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [omitted_unknown_range]
 
     unavailable = {
         **identity_fields,

@@ -32,7 +32,8 @@ def test_target_plan_uses_aligned_missing_ranges_without_mutating_execution_inve
     records[1]["layer_ranges"] = [[2, 6]]
     records[2]["layer_ranges"] = [[6, 8]]
     before = copy.deepcopy(records)
-    plan = plan_segment_supply({"llama_cpp": descriptor()}, records, master_engine="llama_cpp", alignment=2)
+    plan = plan_segment_supply({"llama_cpp": descriptor()}, records, master_engine="llama_cpp", alignment=2,
+                               prefer_all_workers=True)
     assert plan["admitted"]
     assert len(plan["assignments"]) == 3
     assert plan["assignments"][0]["node_id"] == "master"
@@ -288,6 +289,8 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
     monkeypatch.setattr(module, "plan_segment_supply", lambda *args, **kw: {"admitted": True, "assignments": assignments, "total_layers": 6})
     manifests = {}
     def build(source, directory, **kw):
+        assert callable(kw["cancelled"]) and not kw["cancelled"]()
+        assert time.monotonic() < kw["deadline"] <= time.monotonic() + c._operations[op_id]["intent"].get("timeout_seconds", 3600)
         file = directory / "segment.gguf"
         file.write_bytes(b"segment")
         manifest = {"operation_id":op_id, "node_id":kw["node_id"], "layer_range":[kw["start_layer"],kw["end_layer"]],
@@ -412,7 +415,7 @@ def test_existing_range_preference_is_grouped_without_imposing_old_inventory():
     records=[node("master",100),node("middle",100),node("tail",100)]
     records[1]["layer_ranges"]=[[4,6]]
     plan=plan_segment_supply({"llama_cpp":descriptor(layers=8)},records,master_engine="llama_cpp",alignment=2,
-                             preferred_ranges={"tail":[[6,8]]})
+                             preferred_ranges={"tail":[[6,8]]}, prefer_all_workers=True)
     assert plan["admitted"]
     tail=next(item for item in plan["assignments"] if item["node_id"]=="tail")
     assert [tail["start_layer"],tail["end_layer"]]==[6,8]
@@ -765,6 +768,7 @@ def startup_pool_case(tmp_path, monkeypatch):
         proof={"source_owner": "verified-conversion"})
     monkeypatch.setattr(config, "PIPELINE_CAPACITY_RESERVE_MB", 0)
     monkeypatch.setattr(config, "PIPELINE_CAPACITY_SAFETY_MARGIN", 1.0)
+    monkeypatch.setattr(config, "PIPELINE_PREFER_ALL_WORKERS", True)
     monkeypatch.setattr(module.shutil, "disk_usage", lambda path: SimpleNamespace(free=10**12))
 
     def join(node_id="android", *, acknowledge=True, available=True, fresh=True, connected=True):
@@ -914,6 +918,7 @@ def test_default_local_cut_precedence_and_named_distribution(startup_pool_case, 
     monkeypatch.setattr(server, "send_to_client", send)
     observed = []
     def collect(**kwargs):
+        assert case.c.get(case.op)["status"] == "available"
         observed.append(kwargs)
         return {"removed": 1, "reclaimed_bytes": 7, "skipped": {}, "examined": 2}
     case.scheduler._model_supply_worker.collect_garbage = collect
@@ -1215,3 +1220,45 @@ def test_gc_snapshot_fence_rejects_new_operation_prepare_or_lease(tmp_path, chan
         return {"removed": 0, "reclaimed_bytes": 0, "skipped": {}, "examined": 0}
     c.scheduler._model_supply_worker.collect_garbage = collect
     c._collect_garbage(op_id)
+
+
+@pytest.mark.parametrize("node_id", ["master", "worker"])
+def test_capacity_wait_refreshes_existing_node_without_new_membership(startup_pool_case, node_id):
+    case = startup_pool_case
+    case.budgets = {"master": 45, "worker": 45}
+    case.release_source.set()
+    runner = case.start()
+    assert case.waiting.wait(2)
+    assert not case.build_calls
+    case.budgets[node_id] = 200
+    result = _assert_startup_available(case, runner, {"master", "worker"})
+    assert len(case.capacity_pools) == 2
+    assert case.inventory_nodes == ["worker", "worker"]
+    assert case.source_calls == [True]
+    assert result["operation_id"] == case.op
+
+
+def test_unused_candidate_disconnect_does_not_abort_published_minimum_hop_plan(startup_pool_case, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PIPELINE_PREFER_ALL_WORKERS", False)
+    case = startup_pool_case
+    case.join()
+    def disconnect_unused(_kwargs):
+        published = case.c.get(case.op)
+        assigned = {item["node_id"] for item in published["plan"]["assignments"]}
+        for node_id in set(published["candidate_node_ids"]) - assigned:
+            case.scheduler._tcp_server.clients.pop(node_id, None)
+    case.on_build = disconnect_unused
+    case.release_source.set()
+    runner = case.start()
+    runner.join(3)
+    assert not runner.is_alive()
+    operation = case.c.get(case.op)
+    assert operation["status"] == "available", operation
+    assigned = {item["node_id"] for item in operation["plan"]["assignments"]}
+    assert len(assigned) == 2 and "master" in assigned
+    assert set(operation["nodes"]) == assigned
+    assert set(operation["candidate_node_ids"]) == {"master", "worker", "android"}
+    unused = set(operation["candidate_node_ids"]) - assigned
+    assert all((case.op, node_id) not in case.c._connections for node_id in unused)
+    assert all(value["status"] == "available" for value in operation["nodes"].values())

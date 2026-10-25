@@ -71,7 +71,9 @@ def intent_api(monkeypatch, tmp_path):
 
     rows, builtins = [], []
     monkeypatch.setattr(mc, "BUILTIN_MODELS", builtins)
+    from tests.test_model_intent import IntentOwner
     scheduler = SimpleNamespace(
+        _model_control=IntentOwner(),
         _effective_role=lambda: "master", _layer_config_lock=threading.RLock(),
         _pipeline_load_transaction={"phase": "ready", "config_id": "old", "generation": 7},
         _active_pipeline_capacity_plan={"transaction_phase": "ready", "config_id": "old", "generation": 7},
@@ -491,7 +493,10 @@ def test_main_ui_preserves_dl_default_for_provenance_ll_catalog(intent_api):
     intent_api.coordinator.create.return_value = {
         "operation_id": "supply_" + "a" * 32, "status": "queued", "intent": {"model_id": model.model_id},
     }
+    from tui_api import ApiClient
     class UiApi:
+        accept_snapshot = ApiClient.accept_snapshot
+        _snapshot_cache = {}
         base_url, host, port, timeout, log_token = "http://fixture:18000", "127.0.0.1", 18000, 5.0, ""
         def get(self, path, **kwargs):
             if path == "/models/intent/catalog":

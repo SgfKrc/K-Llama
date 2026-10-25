@@ -26,7 +26,7 @@ from journal_replication_service import (  # noqa: E402
     replicate_journal_to_quorum,
 )
 from journal_replication_transport import JournalReplicationTcpServer  # noqa: E402
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 SECRET = b"q" * 40
 SRC = "node-leader"
@@ -194,37 +194,3 @@ def _set_env(monkeypatch, peers: str) -> None:
     monkeypatch.setenv("QLH_JOURNAL_REPLICATION_SECRET", SECRET.decode())
     monkeypatch.setenv("QLH_JOURNAL_REPLICATION_QUORUM_PEERS", peers)
     monkeypatch.setenv("QLH_JOURNAL_REPLICATION_TIMEOUT_S", "1")
-
-
-def test_api_endpoint_answers_only_when_quorum_is_durable(monkeypatch, tmp_path):
-    journal = _journal(tmp_path, "wf-api1")
-    servers = _replica_servers(tmp_path, 3)
-    try:
-        peers = ",".join(f"127.0.0.1:{address[1]}" for _server, address in servers)
-        _set_env(monkeypatch, peers)
-        routes = _fake_api_module(monkeypatch, role="master", journal=journal)
-        payload = asyncio.run(routes.replicate_journal(workflow_id="wf-api1"))
-    finally:
-        for server, _address in servers:
-            server.close()
-        journal.close()
-    assert payload["accepted"] is True
-    assert payload["durable_acks"] == 3
-    assert payload["required_quorum"] == 2
-
-
-def test_api_endpoint_returns_503_when_quorum_is_not_durable(monkeypatch, tmp_path):
-    """栅栏必须体现在 HTTP 语义上：多数未达成 ⇒ 503，而不是 200。"""
-    journal = _journal(tmp_path, "wf-api2")
-    servers = _replica_servers(tmp_path, 1)
-    try:
-        peers = f"127.0.0.1:{servers[0][1][1]},127.0.0.1:1,127.0.0.1:2"
-        _set_env(monkeypatch, peers)
-        routes = _fake_api_module(monkeypatch, role="master", journal=journal)
-        with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(routes.replicate_journal(workflow_id="wf-api2"))
-    finally:
-        servers[0][0].close()
-        journal.close()
-    assert excinfo.value.status_code == 503
-    assert "1/2" in str(excinfo.value.detail)

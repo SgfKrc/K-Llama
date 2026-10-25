@@ -4,6 +4,7 @@ import base64
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,16 @@ from cluster_quorum import (  # noqa: E402
     QuorumVoter,
     SQLiteVoterLedger,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fixed_quorum_transition_clock(monkeypatch):
+    """Keep explicit state-machine times independent of durable IO latency.
+
+    Cross-IO clock advance and expiry are injected in the R1 authority tests.
+    """
+    from qlh_core.control import clock
+    monkeypatch.setattr(clock, "time", SimpleNamespace(time=lambda: 1.0, monotonic=lambda: 1.0))
 
 
 def _fixture(tmp_path: Path, *, count: int = 3):

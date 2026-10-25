@@ -9,9 +9,7 @@
 api_server 与 scheduler 共享同一 model_host 单例，消除 scheduler 对
 api_server 的运行时反向 import（scheduler.py 中 12 处 `import api_server`）。
 
-属性代理：ModelHost 上未显式定义的属性转发给内部 manager（ModelManager），
-调用方 `host.forward_layers(...)`、`host.chat(...)` 与直接使用
-ModelManager 等价。
+原生访问使用显式端口；运行态由 RuntimeController 发布。
 """
 import threading
 from dataclasses import dataclass
@@ -85,26 +83,28 @@ class InferenceHost(Protocol):
 class SchedulerCallbacks(Protocol):
     """Explicit callbacks required by scheduler control-plane features."""
 
-    active_task_graph_model_identity: Callable[[], Any]
+    active_execution_model_identity: Callable[[], Any]
     execute_task_worker_stage: Callable[[Any, Any], dict]
     build_model_chat_prompt: Callable[..., str]
     thinking_system_prompt: str
     snapshot_recent_logs: Callable[[], tuple[list[dict], int]]
     filter_recent_logs: Callable[..., list[dict]]
     format_model_response: Callable[..., tuple[str, Optional[str]]]
+    supports_layer_multi_position_argmax: Callable[[], bool]
 
 
 @dataclass(frozen=True)
 class SchedulerCallbackSet:
     """Immutable scheduler dependency bundle assembled by the API composition root."""
 
-    active_task_graph_model_identity: Callable[[], Any]
+    active_execution_model_identity: Callable[[], Any]
     execute_task_worker_stage: Callable[[Any, Any], dict]
     build_model_chat_prompt: Callable[..., str]
     thinking_system_prompt: str
     snapshot_recent_logs: Callable[[], tuple[list[dict], int]]
     filter_recent_logs: Callable[..., list[dict]]
     format_model_response: Callable[..., tuple[str, Optional[str]]]
+    supports_layer_multi_position_argmax: Callable[[], bool] = lambda: False
 
 
 class _LazyModelManager:
@@ -191,21 +191,128 @@ _PIPELINE_HOST_MIRROR_ATTRS = (
 _PIPELINE_CANDIDATE_TERMINAL_PHASES = frozenset({"aborted", "finalized"})
 
 
-# ModelHost owns these runtime attributes rather than proxying them to a manager.
-_OWN_ATTRS = {
-    "_manager", "model_loaded", "generation_config", "current_quant",
-    "full_chat_execution_lock", "scheduler_callbacks",
-    "_pipeline_candidate_lock", "_pipeline_candidate_transaction",
-}
+def _runtime_mutation(method):
+    from functools import wraps
+    @wraps(method)
+    def run(host, *args, **kwargs):
+        with host.full_chat_execution_lock, host.runtime_controller.execution_lock:
+            return method(host, *args, **kwargs)
+    return run
 
+
+def _runtime_publication(method):
+    from functools import wraps
+    @wraps(method)
+    def publish(host, *args, **kwargs):
+        with host.runtime_controller.publication():
+            return method(host, *args, **kwargs)
+    return publish
+
+
+def _runtime_metadata_property(name):
+    def read(host):
+        return host._runtime_owner().read_metadata(name)
+    def write(host, value):
+        host._runtime_owner().publish_metadata(name, value)
+    return property(read, write)
+
+
+def _manager_port(name):
+    def read(host):
+        return getattr(host._materialize_manager(), name)
+    def write(host, value):
+        setattr(host._materialize_manager(), name, value)
+    return property(read, write)
+
+
+def _manager_state(name, empty=None):
+    """Observe an existing owner; explicit writes may construct the manager."""
+    def read(host):
+        manager = host.peek_manager()
+        return empty if manager is None else getattr(manager, name)
+
+    def write(host, value):
+        setattr(host._materialize_manager(), name, value)
+
+    return property(read, write)
 
 class ModelHost:
     """推理宿主：统一持有 ModelManager + 模型运行时状态 + 执行锁。
 
-    属性代理：未在 _OWN_ATTRS 中的属性读写转发给内部 ModelManager。
+    原生访问使用下面列明的执行端口与只读描述符。
     """
 
-    def __init__(self, manager: Any = None):
+    abort_pipeline_materialization = _manager_port("abort_pipeline_materialization")
+    clear_pipeline_kv = _manager_port("clear_pipeline_kv")
+    tokenizer = _manager_state("tokenizer")
+    model = _manager_state("model")
+    role = _manager_state("role")
+    _total_model_layers = _manager_state("_total_model_layers", 0)
+    _model_path = _manager_state("_model_path")
+    _full_model_path = _manager_state("_full_model_path")
+    _island_engine = _manager_state("_island_engine")
+    _chat_template = _manager_state("_chat_template")
+    _thinking_controlled = _manager_state("_thinking_controlled", False)
+    chat = _manager_port("chat")
+    chat_image = _manager_port("chat_image")
+    chat_stream = _manager_port("chat_stream")
+    native_vision_available = _manager_port("native_vision_available")
+    load_layer_range = _manager_port("load_layer_range")
+    ensure_layer_range = _manager_port("ensure_layer_range")
+    forward_layers = _manager_port("forward_layers")
+    forward_lm_head = _manager_port("forward_lm_head")
+    get_device = _manager_port("get_device")
+    get_memory_usage = _manager_port("get_memory_usage")
+    get_model_info = _manager_port("get_model_info")
+    _get_generation_eos_token_ids = _manager_port("_get_generation_eos_token_ids")
+    _merge_stop_sequences = _manager_port("_merge_stop_sequences")
+    _build_stop_criteria = _manager_port("_build_stop_criteria")
+    _decode_generated_ids = _manager_port("_decode_generated_ids")
+    _ensure_device_profile = _manager_port("_ensure_device_profile")
+
+    _engine_type = _runtime_metadata_property("_engine_type")
+    quant_type = _runtime_metadata_property("quant_type")
+    model_path = _runtime_metadata_property("model_path")
+    active_model_id = _runtime_metadata_property("active_model_id")
+    _active_model_id = _runtime_metadata_property("_active_model_id")
+
+    def _runtime_owner(self):
+        state = object.__getattribute__(self, "__dict__")
+        if "_runtime_controller" not in state:
+            from qlh_core.execution.runtime import RuntimeController
+            state["_runtime_controller"] = RuntimeController(write_metadata=lambda manager, name, value: setattr(manager, name, value))
+        return state["_runtime_controller"]
+
+    @property
+    def runtime_controller(self):
+        return self._runtime_owner()
+
+    @property
+    def _manager(self):
+        return self._runtime_owner().manager()
+
+    @_manager.setter
+    def _manager(self, value):
+        self._runtime_owner().install(value)
+
+    @property
+    def model_loaded(self):
+        return self._runtime_owner().snapshot().model_loaded
+
+    @model_loaded.setter
+    def model_loaded(self, value):
+        self._runtime_owner().update(model_loaded=value)
+
+    @property
+    def current_quant(self):
+        return self._runtime_owner().snapshot().current_quant
+
+    @current_quant.setter
+    def current_quant(self, value):
+        self._runtime_owner().set_quant(value)
+
+    def __init__(self, manager: Any = None, *, initial_quant: str | None = None, environment=None):
+        object.__setattr__(self, "_runtime_environment", None if environment is None else dict(environment))
         object.__setattr__(self, "_manager", manager if manager is not None else _LazyModelManager())
         object.__setattr__(self, "model_loaded", False)
         try:
@@ -213,7 +320,7 @@ class ModelHost:
             _initial_quant = str(getattr(_cfg, "QUANT_TYPE", "int4"))
         except Exception:
             _initial_quant = "int4"
-        object.__setattr__(self, "current_quant", _initial_quant)
+        object.__setattr__(self, "current_quant", initial_quant if initial_quant is not None else _initial_quant)
         object.__setattr__(self, "generation_config", {
             "max_new_tokens": 1024,          # laptop 档默认值
             "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
@@ -225,12 +332,13 @@ class ModelHost:
         object.__setattr__(self, "scheduler_callbacks", None)
         object.__setattr__(self, "_pipeline_candidate_lock", threading.RLock())
         object.__setattr__(self, "_pipeline_candidate_transaction", None)
+        object.__setattr__(self, "_catalog_prepare", None)
 
     @property
     def engine_type(self) -> str:
         """Public backend identity; implementation details stay behind the host."""
 
-        own_id = object.__getattribute__(self, "__dict__").get("_engine_type")
+        own_id = self._runtime_owner().read_metadata("_engine_type") if "_engine_type" in dict(self._runtime_owner().snapshot().metadata) else None
         if own_id:
             return str(own_id)
         manager = object.__getattribute__(self, "_manager")
@@ -271,6 +379,23 @@ class ModelHost:
             island_base_url=island_base_url,
         )
 
+    def configure_catalog(self, catalog_prepare) -> None:
+        """Bind the owning runtime without materializing the lazy manager."""
+        object.__setattr__(self, "_catalog_prepare", catalog_prepare)
+        manager = self.peek_manager()
+        if manager is not None:
+            self._configure_manager_catalog(manager)
+
+    def _configure_manager_catalog(self, manager, *, model_id="") -> None:
+        prepare = object.__getattribute__(self, "_catalog_prepare")
+        if prepare is not None:
+            configure = getattr(manager, "configure_catalog", None)
+            if callable(configure):
+                configure(prepare, model_id=model_id)
+
+    def configure_runtime_environment(self, environment):
+        object.__setattr__(self, "_runtime_environment", dict(environment))
+
     def configure_scheduler_callbacks(self, callbacks: SchedulerCallbacks) -> None:
         """Install the scheduler's complete, typed callback contract atomically."""
 
@@ -294,14 +419,29 @@ class ModelHost:
         # stable proxy type name here instead of requiring that symbol remain a
         # class object.
         if type(manager).__name__ != "_LazyModelManager":
+            self._configure_manager_catalog(manager)
             return manager
         try:
-            return manager._get_instance()
+            instance = manager._get_instance()
+            self._configure_manager_catalog(instance)
+            return instance
         except ImportError as exc:
             raise RuntimeError(
                 "当前发行版没有 PyTorch，无法使用 torch ModelManager；"
                 "请选择 llama_cpp/GGUF 引擎"
             ) from exc
+
+    @property
+    def layer_range(self):
+        """Read the existing native owner's range without creating a manager."""
+        manager = self.peek_manager()
+        return None if manager is None else getattr(manager, "layer_range", None)
+
+    def get_pipeline_descriptor(self) -> dict:
+        """Describe the existing owner without constructing a torch runtime."""
+        manager = self.peek_manager()
+        describe = getattr(manager, "get_pipeline_descriptor", None)
+        return describe() if callable(describe) else {}
 
     def has_loaded_model(self) -> bool:
         """Check LLM ownership without materializing the lazy manager."""
@@ -411,6 +551,11 @@ class ModelHost:
         error: Exception,
     ) -> Optional[Exception]:
         transaction.error = str(error)
+        # Unwound observer/loader frames can retain the model and tensor lists.
+        # Release those locals before unload runs GC/empty_cache, retaining the
+        # original traceback locations and error for diagnostics.
+        import traceback
+        traceback.clear_frames(error.__traceback__)
         try:
             self._close_pipeline_manager(manager)
         except Exception as cleanup_error:
@@ -456,11 +601,12 @@ class ModelHost:
             "model_loaded": object.__getattribute__(self, "model_loaded"),
             "current_quant": object.__getattribute__(self, "current_quant"),
             "mirrors": {
-                name: (name in instance_state, instance_state.get(name))
+                name: (name in dict(self._runtime_owner().snapshot().metadata), dict(self._runtime_owner().snapshot().metadata).get(name))
                 for name in _PIPELINE_HOST_MIRROR_ATTRS
             },
         }
 
+    @_runtime_publication
     def _restore_pipeline_host_state(self, snapshot: dict) -> None:
         object.__setattr__(self, "model_loaded", snapshot["model_loaded"])
         object.__setattr__(self, "current_quant", snapshot["current_quant"])
@@ -507,6 +653,7 @@ class ModelHost:
             },
         }
 
+    @_runtime_publication
     def _apply_pipeline_candidate_host_state(self, state: dict) -> None:
         object.__setattr__(self, "model_loaded", state["model_loaded"])
         if state["current_quant"]:
@@ -603,6 +750,7 @@ class ModelHost:
                 from llama_engine import LlamaCppEngine
 
                 manager = LlamaCppEngine()
+                manager._environment = self._runtime_environment
             else:
                 lazy_manager = _LazyModelManager()
                 if type(lazy_manager).__name__ == "_LazyModelManager":
@@ -627,6 +775,7 @@ class ModelHost:
             )
             object.__setattr__(self, "_pipeline_candidate_transaction", transaction)
             try:
+                self._configure_manager_catalog(manager, model_id=model_id)
                 descriptor = manager.prepare_pipeline_model(
                     model_id=model_id,
                     model_path=resolved_path,
@@ -647,6 +796,26 @@ class ModelHost:
             transaction.phase = "prepared"
             return dict(transaction.descriptor)
 
+    def freeze_pipeline_candidate_assignment(self, transaction_id, assignment, *, config_id, generation):
+        from copy import deepcopy
+        from qlh_core.planning.load_spec import assignment_load_spec
+        transaction = self._require_pipeline_candidate(transaction_id)
+        native = getattr(transaction.manager, "engine_type", "pytorch") == "llama_cpp"
+        artifact_sha = transaction.model_sha256 or transaction.descriptor.get("model_sha256")
+        if native:
+            path = transaction.manager._find_layer_artifact(int(assignment["start_layer"]), int(assignment["end_layer"]))
+            if not path:
+                raise ValueError("deployment_local_artifact_missing")
+            artifact_sha = transaction.manager._pipeline_file_sha256(path)
+        spec = assignment_load_spec(assignment, artifact_format="gguf" if native else "safetensors")
+        result = deepcopy(assignment)
+        result["load_spec"] = spec.to_dict()
+        result["identity"] = {"config_id": config_id, "generation": generation,
+            "assignment_id": "local-" + config_id, "node_id": "master",
+            "layer_range": [int(assignment["start_layer"]), int(assignment["end_layer"])],
+            "artifact_sha256": artifact_sha, "load_spec_digest": spec.digest}
+        return result
+
     def materialize_pipeline_candidate(
         self,
         transaction_id: str,
@@ -656,6 +825,7 @@ class ModelHost:
         has_lm_head: bool,
         total_layers: int = None,
         model_id: str = None,
+        load_assignment: dict | None = None,
     ) -> Any:
         """Materialize the candidate's assigned range while active stays live."""
 
@@ -681,6 +851,7 @@ class ModelHost:
                 bool(has_lm_head),
                 total_layers,
                 model_id or transaction.model_id,
+                load_assignment,
             )
             if transaction.materialization_key is not None:
                 if transaction.materialization_key != materialization_key:
@@ -711,10 +882,15 @@ class ModelHost:
                         has_embedding=bool(has_embedding),
                         has_lm_head=bool(has_lm_head),
                         model_path=transaction.model_path,
-                        quant_type=transaction.quant_type,
+                        quant_type=(load_assignment["load_spec"]["quant_type"] if load_assignment else transaction.quant_type),
                         total_layers=total_layers,
                         model_id=model_id or transaction.model_id,
+                        **({"load_spec": load_assignment["load_spec"]} if load_assignment else {}),
                     )
+                    if load_assignment:
+                        from qlh_core.adapters.runtime_observation import observe_runtime
+                        result = dict(result or {"success": True})
+                        result["runtime_receipt"] = observe_runtime(transaction.manager, load_assignment)
             except Exception as exc:
                 manager = transaction.manager
                 cleanup_error = self._abort_failed_pipeline_candidate(
@@ -737,13 +913,14 @@ class ModelHost:
             transaction.phase = "materialized"
             return result
 
+    @_runtime_mutation
     def commit_pipeline_candidate(self, transaction_id: str) -> dict:
         """Atomically publish the materialized manager, retaining rollback state."""
 
         lock = object.__getattribute__(self, "_pipeline_candidate_lock")
         # API unload/invalidation already owns full-chat before aborting a
         # candidate. Direct commit/abort must follow the same lifecycle order.
-        with object.__getattribute__(self, "full_chat_execution_lock"), lock:
+        with object.__getattribute__(self, "full_chat_execution_lock"), lock, self.runtime_controller.publication():
             transaction = self._require_pipeline_candidate(transaction_id)
             if transaction.phase in {"committed", "finalized"}:
                 return self.pipeline_candidate_status(transaction_id)
@@ -760,11 +937,12 @@ class ModelHost:
             transaction.phase = "committed"
             return self.pipeline_candidate_status(transaction_id)
 
+    @_runtime_mutation
     def abort_pipeline_candidate(self, transaction_id: str) -> dict:
         """Discard an uncommitted candidate or restore the exact prior runtime."""
 
         lock = object.__getattribute__(self, "_pipeline_candidate_lock")
-        with object.__getattribute__(self, "full_chat_execution_lock"), lock:
+        with object.__getattribute__(self, "full_chat_execution_lock"), lock, self.runtime_controller.publication():
             transaction = self._require_pipeline_candidate(transaction_id)
             if transaction.phase == "aborted":
                 return self.pipeline_candidate_status(transaction_id)
@@ -785,6 +963,7 @@ class ModelHost:
             transaction.phase = "aborted"
             return self.pipeline_candidate_status(transaction_id)
 
+    @_runtime_mutation
     def finalize_pipeline_candidate(self, transaction_id: str) -> dict:
         """Make a committed candidate permanent and release the prior runtime."""
 
@@ -806,6 +985,7 @@ class ModelHost:
             return self.pipeline_candidate_status(transaction_id)
 
     # ------------------------------------------------------------ engine dispatch
+    @_runtime_mutation
     def load_model(
         self,
         model_path: str = None,
@@ -847,6 +1027,7 @@ class ModelHost:
             resolution=resolution,
         )
 
+    @_runtime_mutation
     def prepare_pipeline_model(
         self,
         model_id: str,
@@ -875,6 +1056,8 @@ class ModelHost:
                 if callable(unload):
                     unload()
             engine_obj = LlamaCppEngine()
+            engine_obj._environment = self._runtime_environment
+            self._configure_manager_catalog(engine_obj, model_id=model_id)
             descriptor = engine_obj.prepare_pipeline_model(
                 model_id=model_id,
                 model_path=resolved_path,
@@ -977,9 +1160,11 @@ class ModelHost:
         n_ctx = {"edge": 1024, "mobile": 512, "ultrabook": 2048}.get(tier, 4096)
 
         engine_obj = LlamaCppEngine()
+        engine_obj._environment = self._runtime_environment
+        self._configure_manager_catalog(engine_obj, model_id=resolved_id or "")
         engine_obj.load_model(
             model_path=gguf_path,
-            n_ctx=n_ctx,
+            context_limit=n_ctx,
             model_profile=model_metadata,
         )
         # Install the engine as the manager: chat/chat_stream/is_loaded are then proxied
@@ -1011,6 +1196,7 @@ class ModelHost:
             return True
         return bool(get_gguf_model_path())
 
+    @_runtime_mutation
     def switch_model(
         self,
         model_id: str = None,
@@ -1064,7 +1250,7 @@ class ModelHost:
             for _name in ("_engine_type", "quant_type", "model_path",
                           "active_model_id", "_active_model_id"):
                 object.__getattribute__(self, "__dict__").pop(_name, None)
-            manager = self._manager
+            manager = self._materialize_manager()
         return manager.switch_model(
             model_id=model_id,
             quant_type=quant_type,
@@ -1075,6 +1261,7 @@ class ModelHost:
             resolution=resolution,
         )
 
+    @_runtime_mutation
     def unload_model(self) -> None:
         """Unload whichever engine is active -- GGUF (direct) or ModelManager."""
 
@@ -1088,31 +1275,15 @@ class ModelHost:
         elif hasattr(manager, "unload"):  # LlamaCppEngine
             manager.unload()
         object.__setattr__(self, "model_loaded", False)
+        self.runtime_controller.clear_metadata()
         for name in (
             "_engine_type", "quant_type", "model_path",
             "active_model_id", "_active_model_id",
         ):
             object.__getattribute__(self, "__dict__").pop(name, None)
 
-    def __getattr__(self, name):
-        # object.__getattribute__ 直接取 _manager，避免 _manager 被 del 后
-        # 经 __getattr__ 访问自身导致无限递归
-        mgr = object.__getattribute__(self, "_manager")
-        if mgr is None:
-            return None  # manager 缺失（测试注入 None）时模拟原 getattr(..., None) 语义
-        return getattr(mgr, name)
 
-    def __setattr__(self, name, value):
-        if name in _OWN_ATTRS:
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._manager, name, value)
 
-    def __delattr__(self, name):
-        if name in _OWN_ATTRS:
-            object.__delattr__(self, name)
-            return
-        delattr(self._manager, name)
 
     def __repr__(self):
         return "<ModelHost manager=%r model_loaded=%s>" % (

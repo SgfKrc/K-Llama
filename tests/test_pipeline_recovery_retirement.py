@@ -27,6 +27,15 @@ def recovery_case(retirement_case, monkeypatch):
     """Real Scheduler/ModelHost/API owners; only persistence and model I/O are local."""
     case = retirement_case
     master = case.master
+    # This suite exercises import/retirement of the frozen legacy JSON schema.
+    # R3 SQLite crash/commit behavior is covered by test_refactor_deployment_owner.
+    master._model_control = None
+    legacy_new_master = case.new_master
+    def new_legacy_master(host):
+        restored = legacy_new_master(host)
+        restored.master._model_control = None
+        return restored
+    case.new_master = new_legacy_master
     master._running = True
     # The fixture's connected worker is healthy; both old participants are offline.
     assignments = []
@@ -74,8 +83,7 @@ def recovery_case(retirement_case, monkeypatch):
     return case
 
 
-@pytest.mark.parametrize("entrypoint", ["explicit_unload", "automatic_intent"])
-def test_successful_unload_retires_recovery_before_refresh(recovery_case, monkeypatch, entrypoint):
+def test_successful_unload_retires_recovery_before_refresh(recovery_case, monkeypatch):
     case = recovery_case
     master = case.master
     events = []
@@ -122,43 +130,7 @@ def test_successful_unload_retires_recovery_before_refresh(recovery_case, monkey
     monkeypatch.setattr(master, "_clear_pipeline_recovery_fence", clear_after_persist)
     monkeypatch.setattr(api_server, "_refresh_pipeline_layer_config", refresh_after_retirement)
 
-    if entrypoint == "explicit_unload":
-        assert case.unload()["unloaded"] is True
-    else:
-        monkeypatch.setattr(routes_model_intent, "_api_module", api_server)
-        unload = Mock(wraps=api_server._unload_model_under_model_lock)
-        monkeypatch.setattr(api_server, "_unload_model_under_model_lock", unload)
-        supply = master._model_supply
-        monkeypatch.setattr(supply, "_run", lambda _op: None)
-        create_supply = supply.create
-
-        def supply_after_retirement(*args, **kwargs):
-            assert events == ["retire", "persist", "clear", "refresh"]
-            assert master._pipeline_model_cleanup_ledger == case.debts
-            return create_supply(*args, **kwargs)
-
-        monkeypatch.setattr(supply, "create", supply_after_retirement)
-
-        async def unused_prepare(_operation):
-            pytest.fail("inventory must precede preparation")
-
-        async def select():
-            coordinator = ModelIntentCoordinator(master, unused_prepare,
-                                                 retire=routes_model_intent._retire_native_plan,
-                                                 retire_timeout=1, poll_interval=0.001)
-            # Recovery alone must enter retirement even without a live transaction.
-            assert coordinator._retirement_state() == (True, False)
-            try:
-                selected = await coordinator.create({"model_id": NEW_MODEL["model_id"],
-                                                     "engine": "pytorch", "quant_type": "fp16"})
-                assert selected["status"] == "queued" and len(supply._operations) == 1
-                assert coordinator._retirement_state() == (False, False)
-                coordinator.cancel(selected["operation_id"])
-            finally:
-                await coordinator.close()
-
-        asyncio.run(select())
-        unload.assert_called_once_with(retire_worker_runtime=False)
+    assert case.unload()["unloaded"] is True
 
     assert events == ["retire", "persist", "clear", "refresh"]
     assert master._pipeline_recovery_pending is False
@@ -304,9 +276,14 @@ def test_failed_local_change_preserves_recovery_identity_and_digest_check(recove
     assert master._pipeline_model_cleanup_ledger == case.debts
     assert case.saved == [] and case.settings[LIFECYCLE_KEY] == durable_before
     assert master._recovery_model_matches(OLD_MODEL) is True
-    assert master._recovery_model_matches({**OLD_MODEL, "model_sha256": "b" * 64}) is False
-    assert master._pipeline_recovery_failure == "pipeline_recovery_model_mismatch"
+    # 2026-10-23（#117）：恢复身份只看 id/type。持久化摘要与当前描述器摘要来自
+    # 不同格式域（HF 侧 vs GGUF 侧），同 id/type 下摘要不等属"同模型不同量化"，
+    # 只告警不否决 —— 否则恒判 mismatch ⇒ 层配置恒不推送。
+    failure_before = master._pipeline_recovery_failure
+    assert master._recovery_model_matches({**OLD_MODEL, "model_sha256": "b" * 64}) is True
+    assert master._pipeline_recovery_failure == failure_before
     assert master._recovery_model_matches(NEW_MODEL) is False
+    assert master._pipeline_recovery_failure == "pipeline_recovery_model_mismatch"
 
 
 @pytest.mark.parametrize("reason", ["pipeline_recovery_state_invalid", "pipeline_recovery_state_unavailable"])

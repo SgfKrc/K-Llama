@@ -160,3 +160,28 @@ def test_direct_supplied_prepare_preserves_fresh_probe_error_before_candidate(re
     assert entered == ["enter", "exit"]
     assert case.host.peek_manager() is case.active
     assert not case.managers  # No candidate was constructed before the failed probe.
+
+
+def test_transfer_progress_renews_admission_window_but_stall_still_expires(fresh_case, monkeypatch):
+    """#116：漫长的工件传输本身不是陈旧风险，停滞才是。
+
+    工件传输（实测 5.4 GB、数十分钟）发生在证据准备之后、准入之前。窗口必须跟随
+    「最后一次实际进展」，否则任何大工件的供给都必然以 SUPPLY_RUNTIME_BUDGET_EXPIRED
+    失败；而一旦传输停滞超过窗口，原判据必须原样生效。
+    """
+    import model_supply_capacity
+    case = fresh_case
+    clock = [100.0]
+    monkeypatch.setattr(model_supply_capacity.time, "monotonic", lambda: clock[0])
+    with case.c.prepare_guard(case.op):
+        evidence = case.c.prepare_capacity_evidence(case.op)
+        # 40 分钟传输，每 30 秒都有真实进展 ⇒ 准入窗口始终有效。
+        for _ in range(80):
+            clock[0] += 30.0
+            case.c.touch_capacity_evidence(case.op)
+        assert plan(case, evidence)["admitted"]
+        # 传输停滞超过窗口 ⇒ 仍旧 fail-closed 过期。
+        clock[0] += model_supply_capacity.MAX_BUDGET_AGE_SECONDS + 1
+        with pytest.raises(ModelSupplyError) as error:
+            plan(case, evidence)
+    assert error.value.code == "SUPPLY_RUNTIME_BUDGET_EXPIRED"

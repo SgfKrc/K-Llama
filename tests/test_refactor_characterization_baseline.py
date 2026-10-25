@@ -20,6 +20,10 @@ from pathlib import Path
 import sys
 import unittest
 
+import pytest
+
+pytestmark = pytest.mark.legacy_characterization
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
@@ -42,91 +46,70 @@ def assignment_value(source: str, symbol: str) -> str:
 
 
 class TestEngineCapabilityFactSources(unittest.TestCase):
-    """① `engine × runtime capability`：**两张同键不同字段的表 + 判据分叉 + 死字段**。"""
+    """R2 migration: both projections and runtime gates share EngineRegistry.
 
-    def test_two_tables_share_keys_but_no_fields(self) -> None:
-        """当前事实：两张表都用 `BackendId` 作键，但**字段完全不重叠**。
+    Replaces the R0 evidence of independent field tables, family-only server
+    admission, PC default admission, and an unconsumed negative segment flag.
+    Product wire fixtures remain unchanged; the v1 engine schema is optional.
+    """
 
-        票 14 的目标之一是抽出一份声明式的 `engine × runtime capability` 事实源 ——
-        这就是它要合并的两个候选。
-        """
-        from koakuma_engine import _BACKEND_CAPABILITIES
-        from model_load_resolver import ENGINE_CAPABILITIES
+    def test_both_legacy_tables_derive_from_the_same_registry(self) -> None:
+        import koakuma_engine
+        import model_load_resolver
+        from qlh_core.contracts.engines import ENGINE_REGISTRY, LEGACY_ENGINE_SPECS
 
-        self.assertEqual(
-            set(_BACKEND_CAPABILITIES), set(ENGINE_CAPABILITIES),
-            "两张表若键集不同，说明又多了第三处定义",
-        )
-        capability_fields = {f.name for f in dataclasses.fields(
-            next(iter(_BACKEND_CAPABILITIES.values())))}
-        resolver_fields = {f.name for f in dataclasses.fields(
-            next(iter(ENGINE_CAPABILITIES.values())))}
-        self.assertEqual(
-            capability_fields & resolver_fields, set(),
-            "字段一旦重叠，两张表就该合并了 —— 这是票 14 的触发信号",
-        )
+        self.assertIs(koakuma_engine.LEGACY_ENGINE_SPECS, LEGACY_ENGINE_SPECS)
+        self.assertIs(model_load_resolver.LEGACY_ENGINE_SPECS, LEGACY_ENGINE_SPECS)
+        self.assertEqual(set(koakuma_engine._BACKEND_CAPABILITIES), set(LEGACY_ENGINE_SPECS))
+        self.assertEqual(set(model_load_resolver.ENGINE_CAPABILITIES), set(LEGACY_ENGINE_SPECS))
+        for family, spec in LEGACY_ENGINE_SPECS.items():
+            self.assertIs(spec, ENGINE_REGISTRY.default(family))
+            self.assertEqual(koakuma_engine._BACKEND_CAPABILITIES[family].capabilities,
+                             spec.capabilities)
+            projected = model_load_resolver.ENGINE_CAPABILITIES[family]
+            self.assertEqual((projected.artifact_kind, projected.layer_range_mode),
+                             (spec.artifact_kind, spec.layer_range_mode))
 
-    def test_llama_cpp_declares_forward_layers_but_island_does_not(self) -> None:
-        """当前事实：能力位表里 `llama_cpp` 与 `pytorch` 有 `FORWARD_LAYERS`，`island` 没有。
-
-        （19 节里 python 的 `c in set` 判据是 3.11 语义；此处用等价显式写法。）
-        """
-        from koakuma_engine import (
-            Capability,
-            _BACKEND_CAPABILITIES,
-            BackendId,
+    def test_concrete_runtime_separates_llama_binding_keep_head_and_server(self) -> None:
+        from koakuma_engine import Capability, backend_capabilities, runtime_supports
+        from llama_server_engine import LlamaServerEngine
+        from qlh_core.contracts.engines import (
+            ENGINE_REGISTRY, FULL_REQUEST, FORWARD_LAYERS, LAYER_RANGE,
+            LLAMA_CPP_BINDING, LLAMA_CPP_KEEP_HEAD, LLAMA_CPP_SERVER,
         )
 
-        self.assertIn(Capability.FORWARD_LAYERS, _BACKEND_CAPABILITIES[BackendId.LLAMA_CPP].capabilities)
-        self.assertIn(Capability.FORWARD_LAYERS, _BACKEND_CAPABILITIES[BackendId.PYTORCH].capabilities)
-        self.assertNotIn(Capability.FORWARD_LAYERS, _BACKEND_CAPABILITIES[BackendId.ISLAND].capabilities)
+        for kind in (LLAMA_CPP_BINDING, LLAMA_CPP_KEEP_HEAD):
+            self.assertTrue(ENGINE_REGISTRY.supports("llama_cpp", kind, FORWARD_LAYERS))
+        server = ENGINE_REGISTRY.require("llama_cpp", LLAMA_CPP_SERVER)
+        self.assertEqual(server.operations, frozenset({FULL_REQUEST}))
+        self.assertFalse(server.supports(LAYER_RANGE))
+        self.assertFalse(backend_capabilities("llama_cpp", LLAMA_CPP_SERVER).supports(Capability.FORWARD_LAYERS))
+        self.assertFalse(runtime_supports(LlamaServerEngine(), Capability.FORWARD_LAYERS))
 
-    def test_node_side_judgement_ignores_the_runtime_path_dimension(self) -> None:
-        """★ 分叉实证：同一个 `llama_cpp` 家族，节点侧按 `backend_id` 判 ⇒ True。
-
-        节点侧完全没有 `inference_path` 维度，所以一台**跑 `llama-server`** 的机器
-        在节点侧会被判「能承接层段」，而在本机侧 `LlamaServerEngine.supports(
-        FORWARD_LAYERS)` 是 False。**两处结论相反**，这就是票面要消灭的「分叉判据」。
-        """
-        from koakuma_engine import Capability
+    def test_planner_requires_runtime_evidence_and_rejects_server_even_with_positive_probe(self) -> None:
         from scheduler import _node_supports_forward_layers
+        from qlh_core.contracts.engines import ENGINE_REGISTRY, LLAMA_CPP_BINDING, LLAMA_CPP_SERVER
 
-        # 1) 自报能力最权威
-        self.assertTrue(_node_supports_forward_layers(
-            {"node_type": "pc", "device_info": {"capabilities": [Capability.FORWARD_LAYERS]}}))
-        # 2) 只给 backend_id 就按白名单判 —— server 路径在这里被误判为「可层段」
-        self.assertTrue(_node_supports_forward_layers(
-            {"node_type": "android", "device_info": {"backend_id": "llama_cpp"}}))
-        self.assertTrue(_node_supports_forward_layers(
-            {"node_type": "android", "device_info": {"engine": "llama_cpp"}}))
-        # 3) 兜底语义：未上报能力时，仅 pc 允许（旧行为，保守向后兼容）
-        self.assertTrue(_node_supports_forward_layers({"node_type": "pc"}))
-        self.assertFalse(_node_supports_forward_layers({"node_type": "android"}))
-        # `node_type` 缺省即 pc
-        self.assertTrue(_node_supports_forward_layers({}))
+        for node in ({}, {"node_type": "pc"}, {"node_type": "android"},
+                     {"device_info": {"backend_id": "llama_cpp"}},
+                     {"device_info": {"capabilities": ["forward_layers"]}}):
+            self.assertFalse(_node_supports_forward_layers(node))
+        for kind, expected in ((LLAMA_CPP_BINDING, True), (LLAMA_CPP_SERVER, False)):
+            self.assertEqual(_node_supports_forward_layers({"device_info": {
+                "backend_id": "llama_cpp", "runtime_kind": kind,
+                "native_abi": ENGINE_REGISTRY.require("llama_cpp", kind).native_abi,
+                "capabilities": ["forward_layers"],
+            }}), expected)
 
-    def test_serves_layer_segments_has_no_consumer(self) -> None:
-        """★ 死字段实证：`serves_layer_segments` 只有定义、没有任何读取者。
+    def test_negative_segment_probe_narrows_the_static_runtime_contract(self) -> None:
+        from scheduler import _node_supports_forward_layers
+        from qlh_core.contracts.engines import ENGINE_REGISTRY, LLAMA_CPP_BINDING
 
-        票 15a 新增的这个能力位**尚未接线** —— 调度仍走 `stage_types`。票 14 若要
-        抽「单一能力事实源」，必须先把这条接上或删掉，否则抽出来的是空壳。
-        """
-        occurrences: list[str] = []
-        for path in sorted(SRC.rglob("*.py")):
-            for number, line in enumerate(
-                    path.read_text(encoding="utf-8").splitlines(), 1):
-                if "serves_layer_segments" not in line:
-                    continue
-                occurrences.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
-
-        self.assertEqual(
-            len(occurrences), 4,
-            "定义/注释数量变了，说明这个字段被接线或被删除 —— 请更新本条基线：\n"
-            + "\n".join(occurrences),
-        )
-        # 4 处全是「写」（定义 + 注释）与「读自己」；没有任何跨模块消费者。
-        writers = [item for item in occurrences if re.search(r"[:=]\s*(self\.path ==|\{)", item)]
-        self.assertGreaterEqual(len(writers), 1)
+        self.assertFalse(_node_supports_forward_layers({"device_info": {
+            "backend_id": "llama_cpp", "inference_path": LLAMA_CPP_BINDING,
+            "native_abi": ENGINE_REGISTRY.require("llama_cpp", LLAMA_CPP_BINDING).native_abi,
+            "serves_layer_segments": False,
+        }}))
 
 
 class TestReasonCodeFactSources(unittest.TestCase):
@@ -134,27 +117,19 @@ class TestReasonCodeFactSources(unittest.TestCase):
 
     DEADLINE_CODE = "request_deadline_exceeded"
 
-    def test_the_same_deadline_code_is_defined_four_times(self) -> None:
-        """★ 最刺眼的一处：一个 code 值有 **4 份模块级常量定义**。
-
-        票面要求「不允许在 API、scheduler、solver、worker 各层重写真因」——
-        这 4 份就是反例；票 14 应收敛成单一定义并在各层 import。
-        """
-        definitions = {
-            "request_deadline.py": "REQUEST_DEADLINE_EXCEEDED",
-            "request_outcome.py": "REASON_REQUEST_DEADLINE_EXCEEDED",
-            "relay_transport.py": "REQUEST_DEADLINE_EXCEEDED",
-            "scheduler_task_worker.py": "_REQUEST_DEADLINE_EXCEEDED",
-        }
-        values = {}
-        for filename, symbol in definitions.items():
-            values[f"{filename}:{symbol}"] = assignment_value(
-                read_source(filename), symbol)
-        self.assertEqual(
-            set(values.values()), {self.DEADLINE_CODE},
-            f"4 份定义的值必须一致（当前事实），实际：{values}",
-        )
-        self.assertEqual(len(values), 4, "定义份数变了，请更新本条基线")
+    def test_deadline_code_has_one_definition_and_compatibility_aliases(self) -> None:
+        from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED
+        from request_deadline import REQUEST_DEADLINE_EXCEEDED as compatibility
+        from request_outcome import REASON_REQUEST_DEADLINE_EXCEEDED
+        from relay_transport import REQUEST_DEADLINE_EXCEEDED as relay
+        from scheduler_task_worker import _REQUEST_DEADLINE_EXCEEDED as worker
+        self.assertEqual(REQUEST_DEADLINE_EXCEEDED, self.DEADLINE_CODE)
+        for value in (compatibility, REASON_REQUEST_DEADLINE_EXCEEDED, relay, worker):
+            self.assertIs(value, REQUEST_DEADLINE_EXCEEDED)
+        sources = ["request_deadline.py", "request_outcome.py", "relay_transport.py", "scheduler_task_worker.py"]
+        literal = re.compile(r"^[A-Z_]+\s*=\s*['\"]request_deadline_exceeded['\"]", re.MULTILINE)
+        self.assertTrue(all(not literal.search(read_source(source)) for source in sources))
+        self.assertEqual(len(literal.findall(read_source("qlh_core/contracts/deadline.py"))), 1)
 
     def test_independent_reason_vocabularies_stay_separate(self) -> None:
         """当前事实：每个领域各自定义 reason 常量，**没有共享枚举**。
@@ -163,7 +138,7 @@ class TestReasonCodeFactSources(unittest.TestCase):
         以便票 14 判断哪些该收敛、哪些该保留。
         """
         vocabularies = {
-            "request_outcome.py": "REQUEST_OUTCOME 终局词表",
+            "qlh_core/contracts/outcome.py": "REQUEST_OUTCOME 终局词表",
             "model_preflight.py": "MODEL_PREFLIGHT 事前检查词表",
             "worker_assignment_state.py": "WORKER_ASSIGNMENT 词表",
             "model_pipeline_availability.py": "MODEL_PIPELINE_AVAILABILITY 词表",
@@ -197,7 +172,7 @@ class TestReasonCodeFactSources(unittest.TestCase):
         )
         self.assertIn(
             "pipeline_layer_range_coverage_insufficient",
-            read_source("pipeline_capacity.py"),
+            read_source("qlh_core/planning/capacity.py"),
         )
 
 
@@ -237,21 +212,16 @@ class TestPipelinePlanFactSources(unittest.TestCase):
 class TestSessionContextFactSources(unittest.TestCase):
     """④ 会话上下文：**服务已统一，但仍有进程内 facade 镜像**。"""
 
-    def test_service_is_single_but_facade_duplicates_it(self) -> None:
-        """当前事实：`ConversationContextService` 是唯一实现，但 `api_server` 又建了一层
-        模块级 facade（`active_session_id` / `session_histories` 两个名字指向同一对象）。
-
-        票 14 若抽「会话上下文服务」，这层 facade 是「事务边界」要收紧的对象。
-        """
-        context = read_source("chat_context.py")
-        self.assertIn("class ConversationContextService", context)
-        self.assertIn("self.active_session_id: Optional[str] = None", context)
-        self.assertIn("self.histories: MutableMapping[str, list[dict]] = {}", context)
-
-        api = read_source("api_server.py")
-        self.assertIn("_chat_context = ConversationContextService(", api)
-        self.assertIn("active_session_id = _chat_context.active_session_id", api)
-        self.assertIn("session_histories = _chat_context.histories", api)
+    def test_context_owner_keeps_client_selection_without_facade_mirrors(self) -> None:
+        from chat_context import ConversationContextService
+        context = ConversationContextService(load_history=lambda _: [], persist_turn=lambda *a: True)
+        context.prepare("first", client_id="alpha", runtime_kv=False)
+        context.prepare("second", client_id="beta", runtime_kv=False)
+        self.assertEqual(context.resolve_session(client_id="alpha"), "first")
+        self.assertEqual(context.resolve_session(client_id="beta"), "second")
+        import api_server
+        self.assertNotIn("active_session_id", vars(api_server))
+        self.assertNotIn("session_histories", vars(api_server))
 
     def test_persistence_is_a_separate_fact_source(self) -> None:
         """当前事实：持久化在 `local_store` 独立承担，服务只持有两个回调。"""

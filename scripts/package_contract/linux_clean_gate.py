@@ -129,7 +129,7 @@ def main() -> int:
         "ok": True,
         "gate": "linux-clean-source-contract",
         "product_version": release_contract.PRODUCT_VERSION,
-        "launcher_version": release_contract.LAUNCHER_VERSION,
+        "application_version": release_contract.PRODUCT_VERSION,
         "profile": release_contract.RELEASE_PROFILE_NAME,
         "default_node_role": release_contract.DEFAULT_PACKAGED_NODE_ROLE,
         "topology_invariants": ["star", "master-coordinated", "D-to-L", "L-to-L"],

@@ -24,7 +24,9 @@ from worker_prepare import LayerRuntime, WorkerPrepareController
 
 
 def _api(manager=None, *, role="master", node_id="master"):
-    host = NS(full_chat_execution_lock=threading.RLock(), _pipeline_candidate_lock=threading.RLock())
+    from qlh_core.execution.runtime import RuntimeController
+    host = NS(full_chat_execution_lock=threading.RLock(), _pipeline_candidate_lock=threading.RLock(),
+              _runtime_controller=RuntimeController())
     selected = {"operation_id": "op-real", "config_id": "config-real", "generation": 3}
     transaction = {**selected, "candidate_id": "candidate-real", "phase": "ready", "published": True,
                    "expected": {"pc": {"worker_prepare_identity": deepcopy(selected)}}}
@@ -386,7 +388,9 @@ def _llama_fixture(tmp_path, monkeypatch, *, changed_on_load=False):
                                    "total_layers": 4}
     engine._pipeline_distributed_only = True
     monkeypatch.setattr(engine, "_find_layer_artifact", lambda start, end: str(path))
-    def load(path_text):
+    def load(path_text, calibration_allowed=True):
+        # 票 20（a465ce3d）给 _load_model_runtime 加了关键字参数 calibration_allowed，
+        # 这里的替身必须接受它，否则 load_layer_range 调用时 TypeError。
         engine._model_path = path_text
         engine._pipeline_descriptor = None
         engine._layer_load_proof = None
@@ -394,11 +398,13 @@ def _llama_fixture(tmp_path, monkeypatch, *, changed_on_load=False):
         engine._loaded = True
         if changed_on_load:
             path.write_bytes(b"different artifact during loading")
-    monkeypatch.setattr(engine, "load_model", load)
+    monkeypatch.setattr(engine, "_load_model_runtime", load)
     def native_count(pointer):
         assert pointer == "native-handle"
         return 2
-    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", NS(llama_model_n_layer=native_count))
+    binding = NS(llama_model_n_layer=native_count)
+    monkeypatch.setitem(sys.modules, "llama_cpp", NS(Llama=NS, llama_cpp=binding))
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_cpp", binding)
     engine.load_layer_range(0, 2)
     return engine, path, digest
 
@@ -440,3 +446,55 @@ def test_llama_reports_actual_keep_head_child_and_rejects_different_artifact(tmp
     engine._keep_head.model_path = tmp_path / "whole.gguf"
     with pytest.raises(RuntimeObservationError, match="different artifacts/counts"):
         capture_runtime(_api(engine))
+
+
+def test_runtime_receipt_reads_existing_services_without_resolving_lazy_factory(loaded):
+    from qlh_core.bootstrap.runtime import LazyResource
+    api = _api(loaded.manager)
+    real_scheduler = api.scheduler
+    api._app_runtime = NS(_services=NS(scheduler=real_scheduler))
+    api.scheduler = LazyResource(lambda: pytest.fail("diagnostic resolved lazy scheduler"))
+    assert capture_runtime(api)["artifact"]["sha256"] == loaded.manifest["artifact_sha256"]
+    api._app_runtime._services = None
+    with pytest.raises(RuntimeObservationError, match="existing runtime scheduler"):
+        capture_runtime(api)
+
+
+def test_runtime_receipt_holds_linear_execution_owner_lock(loaded):
+    api = _api(loaded.manager)
+    lock = api.model_host._runtime_controller.execution_lock
+    acquired = threading.Event()
+    def peek():
+        def contender():
+            with lock:
+                acquired.set()
+        thread = threading.Thread(target=contender)
+        threads.append(thread)
+        thread.start()
+        assert not acquired.wait(0.05)
+        return loaded.manager
+    threads = []
+    api._peek_model_manager = peek
+    capture_runtime(api)
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert acquired.is_set()
+
+
+def test_vocab_only_binding_observes_existing_native_weight_owner(tmp_path, monkeypatch):
+    from qlh_core.adapters.llama_vocabulary import LlamaVocabulary
+    engine, path, digest = _llama_fixture(tmp_path, monkeypatch)
+    engine._model = object.__new__(LlamaVocabulary)
+    engine._keep_head = NS(model_path=path, n_layer=2, is_available=True,
+                          _worker=NS(pid=4444, poll=lambda: None))
+    monkeypatch.setitem(sys.modules, 'llama_cpp.llama_cpp', NS(
+        llama_model_n_layer=lambda _: pytest.fail('vocabulary is not the weight owner')))
+    assert capture_runtime(_api(engine))['native_layer_count'] == 2
+    engine._keep_head.n_layer = 4
+    with pytest.raises(RuntimeObservationError, match='native count differs'):
+        capture_runtime(_api(engine))
+    engine._keep_head = None
+    with pytest.raises(RuntimeObservationError, match='upstream is not loaded'):
+        capture_runtime(_api(engine))
+    engine._model = None

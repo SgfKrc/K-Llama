@@ -25,7 +25,7 @@ from journal_replication import (  # noqa: E402
     JournalReplicationGap,
     build_checkpoint,
 )
-from task_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
+from recovery_journal import JournalEvent, SQLiteTaskJournal  # noqa: E402
 
 SOURCE = "node-a"
 STREAM = "journal-1"

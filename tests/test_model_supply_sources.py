@@ -27,6 +27,40 @@ _REAL_EXECUTE = convert.execute_conversion
 _REAL_DOWNLOAD = jobs._download
 
 
+def test_source_identity_is_shared_with_segment_builders_and_invalidation(tmp_path, monkeypatch):
+    import model_supply_assets as assets
+    path = tmp_path / "source.gguf"
+    path.write_bytes(b"original-weights")
+    expected = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert sources._content_sha(path, lambda: False) == expected
+    original = assets._hash_file
+    reads = []
+    def record(file_path, *args, **kwargs):
+        reads.append(Path(file_path))
+        return original(file_path, *args, **kwargs)
+    monkeypatch.setattr(assets, "_hash_file", record)
+    assert assets._hash_file_cached(path) == expected
+    assert sources._content_sha(path, lambda: False) == expected
+    assert reads == []
+    _assert_code("SUPPLY_CANCELLED", lambda: sources._content_sha(path, lambda: True))
+    path.write_bytes(b"new-weights-with-new-size")
+    changed = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert sources._content_sha(path, lambda: False) == changed
+    assert assets._hash_file_cached(path) == changed
+    assert reads == [path]
+
+
+def test_source_bundle_identity_reuses_source_verification_digests(tmp_path, monkeypatch):
+    import model_supply_assets as assets
+    from model_sync import compute_model_sha256
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(b"verified-source-weights")
+    file_digest = sources._content_sha(path, lambda: False)
+    expected = hashlib.sha256(f"{path.name}\0{path.stat().st_size}\0{file_digest}\n".encode()).hexdigest()
+    monkeypatch.setattr(assets, "_hash_file", lambda *args, **kwargs: pytest.fail("source bundle reread weight bytes"))
+    assert compute_model_sha256(str(tmp_path), digest=assets._hash_file_cached) == expected
+
+
 def _hf(root: Path, *, manifest: bool = False, tokenizer: bool = True) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     config = {"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2",
@@ -74,7 +108,8 @@ def _register(tmp_path: Path, *, root: Path | None = None, gguf: Path | None = N
     cfg = ModelConfig(model_id=model_id, name="Source fixture", model_type="safetensors",
                       model_path=str(root) if root else str(tmp_path / "models" / model_id),
                       gguf_path=str(gguf) if gguf else "", huggingface_id=repo)
-    local_store.save_local_experimental_model(model_id, {**asdict(cfg), **fields})
+    snapshot = local_store.get_local_model_registry_snapshot(model_id)
+    assert local_store.save_local_experimental_model(model_id, {**asdict(cfg), **fields}, expected_revision=snapshot.registry_revision)
     return cfg
 
 
@@ -824,7 +859,8 @@ def test_external_manifest_binding_does_not_bypass_live_validation(tmp_path, tam
         gguf.unlink()
     else:
         cfg = mc.get_model_config("fixture", local_store.get_local_experimental_models())
-        local_store.save_local_experimental_model("fixture", {**asdict(cfg), "gguf_path": ""})
+        snapshot = local_store.get_local_model_registry_snapshot("fixture")
+        assert local_store.save_local_experimental_model("fixture", {**asdict(cfg), "gguf_path": ""}, expected_revision=snapshot.registry_revision)
     _assert_code("SUPPLY_SOURCE_METADATA_INVALID", lambda: _ensure(tmp_path, want_gguf=True))
 
 
@@ -1062,9 +1098,10 @@ def test_download_cas_conflict_preserves_source_adopted_by_new_registration(
 
     def progress(value):
         if value["phase"] == "registering":
-            local_store.save_local_experimental_model("fixture", {
+            snapshot = local_store.get_local_model_registry_snapshot("fixture")
+            assert local_store.save_local_experimental_model("fixture", {
                 **asdict(cfg), "name": "Concurrent registration adopted this source",
-            })
+            }, expected_revision=snapshot.registry_revision)
             captured["row"] = local_store.get_local_experimental_models()[0]
 
     _assert_code("SUPPLY_REGISTRY_CHANGED", lambda: _ensure(tmp_path, progress=progress))
