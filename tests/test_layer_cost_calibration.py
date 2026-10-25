@@ -17,6 +17,10 @@ from pathlib import Path
 
 import pytest
 
+# 复用既有 fixture：它构造了"陈旧 profile + 新鲜短缺"的完整求解场景，
+# 本文件的 makespan 报告测试直接跑真实求解器，而不是伪造求解结果。
+from tests.test_pipeline_capacity_freshness import fresh_case  # noqa: F401
+
 ROOT = Path(__file__).resolve().parents[1]
 for _directory in (ROOT, ROOT / "src"):
     if str(_directory) not in sys.path:
@@ -108,3 +112,86 @@ def test_reference_and_multiplier_semantics():
     assert partial["uncalibrated"] == pytest.approx(1.0)
     partial2 = multipliers({"fast": 5.0, "slow": 20.0, "uncalibrated": 0.0})
     assert partial2["uncalibrated"] == pytest.approx(20.0 / 5.0)
+
+
+# --------------------------------------------------------------------------
+# makespan 报告：让"切点好不好"可测，但**不参与选择**
+# --------------------------------------------------------------------------
+
+def _admitted_plan(case, calibrate=None):
+    """用**新鲜 evidence** 求解。
+
+    fixture 的陈旧 profile 本身不足以准入（`test_pipeline_capacity_freshness` 自己就断言
+    `not plan(case)["admitted"]`）—— 必须走 `prepare_guard` + `prepare_capacity_evidence`
+    拿新鲜容量样本，这也是 `test_refactor_product_gate` 采用同一模式的原因。
+    """
+    from tests.test_pipeline_capacity_freshness import plan
+
+    if calibrate is not None:
+        calibrate(case)
+    with case.c.prepare_guard(case.op):
+        evidence = case.c.prepare_capacity_evidence(case.op)
+        return plan(case, evidence)
+
+
+def test_step_time_estimate_reports_bottleneck_without_changing_the_choice(fresh_case):
+    """标定后求解器给出步时估计与瓶颈节点；**选择必须与未标定时完全一致**。
+
+    这是本报告的核心契约：求解目标是"能力加权工作平方"的**均衡近似**，而端到端由
+    最长段（makespan）决定，两者会背离（实测 `fastest` 下按成本均衡反而慢 7%）。
+    因此报告必须只读——一旦它影响了选择，就会把"均衡"悄悄换成"另一个东西"。
+    """
+    case = fresh_case
+    baseline = _admitted_plan(case)
+    assert baseline["admitted"], baseline.get("reason_code")
+    assert "step_time_estimate" not in baseline          # 未标定 ⇒ 不产出报告
+
+    def calibrate(case):
+        for record in case.cached:
+            record["layer_cost_ms"] = 20.0 if record["node_id"] == "worker" else 10.0
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    segments = lambda r: [(a["node_id"], a["start_layer"], a["end_layer"])
+                          for a in r["assignments"]]
+    assert segments(result) == segments(baseline), "报告不得改变选择"
+
+    est = result["step_time_estimate"]
+    assert est["basis"] == "layers_count_x_calibrated_layer_ms"
+    assert est["uncalibrated_segments"] == []
+    assert all(seg["layers_count"] == seg["layer_range"][1] - seg["layer_range"][0]
+               for seg in est["segments"])
+    assert all(seg["estimated_ms"] == pytest.approx(
+        seg["layers_count"] * seg["layer_cost_ms"]) for seg in est["segments"])
+    # 瓶颈 = 估计步时最大的那一段
+    assert est["estimated_step_ms"] == max(seg["estimated_ms"] for seg in est["segments"])
+    assert est["bottleneck_node_id"] == next(
+        seg["node_id"] for seg in est["segments"]
+        if seg["estimated_ms"] == est["estimated_step_ms"])
+
+
+def test_uncalibrated_segments_are_declared_not_guessed(fresh_case):
+    """半标定：未标定段的 `estimated_ms` 必须是 None 并被单列 —— 不猜。
+
+    半真半假的步时估计比没有更危险：它会让人以为瓶颈已经确定。
+    """
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            if record["node_id"] == "worker":
+                record["layer_cost_ms"] = 20.0
+            else:
+                record.pop("layer_cost_ms", None)        # master 不标定
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    est = result.get("step_time_estimate")
+    assert est is not None, "有任一参与节点带标定就应产出报告"
+    uncalibrated = [seg for seg in est["segments"]
+                    if seg["node_id"] in est["uncalibrated_segments"]]
+    assert uncalibrated, est
+    assert all(seg["estimated_ms"] is None and seg["layer_cost_ms"] is None
+               for seg in uncalibrated)
+    # 瓶颈只能取自**已标定**段
+    assert est["bottleneck_node_id"] not in est["uncalibrated_segments"]

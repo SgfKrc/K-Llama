@@ -1521,6 +1521,42 @@ def solve_pipeline_capacity(
         "memory_pressure_cost": objective[2],
         "score_total": -objective[3],
     }
+    # ★ 2026-10-25：**makespan 报告**（**不参与选择**，只让"切点好不好"可测）。
+    #   求解目标 `capability_weighted_work_square` 是**均衡近似**，不是端到端步时
+    #   （= 最长段）。实测证明两者会背离：`fastest` 档下按**成本**均衡把 rog 推成
+    #   新瓶颈 174 ms，而按**字节**均衡的最长段只有 161 ms（端到端反而慢 7%）——
+    #   见 docs/本机跨框架层段成本与干扰实测-2026-10-25.md。
+    #   所以"选了哪条切点"与"这条切点实际多快"必须能分别看到，否则无法判断是否值得
+    #   为 makespan 另开一条求解路径（那需要重新论证最优性，因为现有 suffix optimum
+    #   依赖目标**可加**，而 max 不可加）。
+    #   数据来自调用方填的 `layer_cost_ms`（本模块是纯求解器、不读环境）。只要有任意
+    #   一个**参与**节点带标定就给出报告；未标定段的 `estimated_ms` 留 None 而不猜，
+    #   并单列在 `uncalibrated_segments` 里 —— 半真半假的步时估计比没有更危险。
+    if any(usable[value[0]].get("layer_cost_ms") for value in solved):
+        segments_ms = []
+        for value in solved:
+            node = usable[value[0]]
+            cost = node.get("layer_cost_ms")
+            layers = int(value[2]) - int(value[1])
+            segments_ms.append({
+                "node_id": node["node_id"],
+                "layer_range": [int(value[1]), int(value[2])],
+                "layers_count": layers,
+                "layer_cost_ms": float(cost) if cost else None,
+                "estimated_ms": (layers * float(cost)) if cost else None,
+            })
+        measured = [item for item in segments_ms if item["estimated_ms"] is not None]
+        if measured:
+            bottleneck = max(measured, key=lambda item: item["estimated_ms"])
+            base["step_time_estimate"] = {
+                "basis": "layers_count_x_calibrated_layer_ms",
+                "estimated_step_ms": bottleneck["estimated_ms"],
+                "bottleneck_node_id": bottleneck["node_id"],
+                "bottleneck_layer_range": bottleneck["layer_range"],
+                "segments": segments_ms,
+                "uncalibrated_segments": [item["node_id"] for item in segments_ms
+                                          if item["estimated_ms"] is None],
+            }
     participating_count = len(assignments) + len(relay_only)
     return {
         **base,
