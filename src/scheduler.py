@@ -2541,29 +2541,27 @@ class Scheduler(
             if base_record is not None:
                 cpu_record = self._local_cpu_executor_record(base_record)
                 records.append(cpu_record)
-                # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**两段分摊同一份主机内存总账**。
-                #   域校验按 `host_capacity_bytes` 记账（同一类资源，见
-                #   `capacity_domains`），若主段仍保留整份额度，两段之和就会超过总账
-                #   ⇒ `pipeline_capacity_domain_exceeded`（实测超额 1.56 GB）。
-                #   物理上本机 RAM 只有一份，所以把划给 CPU 段的份额**从主段扣掉**。
-                #   注意扣的是 `host_capacity_bytes`（主机额度）而**不是**
-                #   `capacity_bytes` —— 后者对 CUDA 主段是 VRAM，扣它会凭空削掉显存。
-                if "host_capacity_bytes" in base_record:
-                    base_record["host_capacity_bytes"] = max(
-                        0,
-                        int(base_record["host_capacity_bytes"])
-                        - int(cpu_record["capacity_bytes"]),
-                    )
-                # ★ 2026-10-25：把分摊结果记下来。域校验按 `host_capacity_bytes` 记账，
-                #   只有两段之和落在总账内才不会再报 `domain_exceeded`；而这一行是
-                #   唯一能看出"扣了没有、扣了多少"的地方（实测出现过扣了却没生效的情形，
-                #   因为 `_get_pipeline_capacity_nodes` 会被多次调用、每次重建记录）。
+                # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**两段分摊同一份主机内存总账**，
+                #   且必须**幂等**。域校验按主机内存记账（见 `capacity_domains`），若两段
+                #   都按整机申报 ⇒ 之和超总账 ⇒ `pipeline_capacity_domain_exceeded`
+                #   （实测超额 1.56 GB，而物理上并不冲突）。
+                #   ⚠️ 不能"在 `host_capacity_bytes` 上原地做减法"：那个字段还承载
+                #   `safetensors_layer_offload` 的 host 预算，扣它会连带削掉 offload 额度；
+                #   而且 `_get_pipeline_capacity_nodes` **会被多次调用、每次重建 records**，
+                #   原地扣减只对那一次返回值生效，供给拿到的仍是未扣快照（实测踩到）。
+                #   正确做法：走**专用**通道 `domain_allocatable_bytes`，每段的值都从
+                #   `domain_total_bytes`（即主机额度本身）**重新推导** ⇒ 与调用次数无关。
+                host_total = int(cpu_record["domain_total_bytes"])
+                cpu_share = max(0, int(cpu_record["capacity_bytes"]))
+                cpu_record["domain_allocatable_bytes"] = cpu_share
+                base_record["domain_total_bytes"] = host_total
+                base_record["domain_allocatable_bytes"] = max(0, host_total - cpu_share)
                 logger.info(
-                    "event=local_host_budget_split primary_host_capacity=%s "
+                    "event=local_host_budget_split primary_allocatable=%s "
                     "cpu_share=%s domain_total=%s",
-                    base_record.get("host_capacity_bytes"),
-                    cpu_record["capacity_bytes"],
-                    cpu_record["domain_total_bytes"],
+                    base_record["domain_allocatable_bytes"],
+                    cpu_share,
+                    host_total,
                 )
                 logger.info(
                     "event=local_cpu_executor_declared node_id=%s executor_id=%s "

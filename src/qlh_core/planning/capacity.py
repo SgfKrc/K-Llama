@@ -448,6 +448,13 @@ def _normalize_nodes(
         if "domain_total_bytes" in raw:
             normalized["domain_total_bytes"] = _non_negative_int(
                 raw["domain_total_bytes"], "domain_total_bytes")
+        # ★ 2026-10-25：**域内申报额**（专用通道，与 `host_capacity_bytes` 分开）。
+        #   调用方用它来表达"这个执行器在该共享域里占多少"，且**每次重新推导** ⇒ 幂等。
+        #   不能复用 `host_capacity_bytes`：那个字段还承载 `safetensors_layer_offload`
+        #   的 host 预算（见 `_node_budget`），扣减它会连带削掉 offload 额度。
+        if "domain_allocatable_bytes" in raw:
+            normalized["domain_allocatable_bytes"] = _non_negative_int(
+                raw["domain_allocatable_bytes"], "domain_allocatable_bytes")
         if "configured_reserve_bytes" in raw or "retained_component_reserve_bytes" in raw:
             for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
                 if type(raw.get(field)) is not int or raw[field] < 0:
@@ -683,11 +690,23 @@ def capacity_domains(usable: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         #   实测：主段 VRAM 6.0 GB + 本机 CPU 段 RAM 10.2 GB = 16.2 GB > 总账 14.6 GB
         #   ⇒ 报 `pipeline_capacity_domain_exceeded` 超额 1.56 GB，而物理上并不冲突
         #   （VRAM 与 RAM 是两份独立资源）。
-        #   共享**内存**域的本质是"同一份 RAM"，所以域内每个执行器都用它的
-        #   `host_capacity_bytes`（主机内存额度）记账；没有该项时退化为 `capacity_bytes`
-        #   ——对纯 CPU/GGUF 节点两者同义，因此既有拓扑逐字节不变。
-        host_budget = node.get("host_capacity_bytes")
-        if host_budget is None:
+        #   共享**内存**域的本质是"同一份 RAM"，所以按主机内存记账，优先级：
+        #     1. `domain_allocatable_bytes` —— **调用方显式声明的域内额度**。这是唯一
+        #        幂等的通道：份额由声明值推导（例如按 `QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION`
+        #        从 `domain_total_bytes` 重新计算），而不是"在上一次结果上做减法"。
+        #        实测教训：先前直接对 `host_capacity_bytes` 原地扣减，而
+        #        `_get_pipeline_capacity_nodes` **会被多次调用、每次重建 records**
+        #        ⇒ 扣除只对那一次返回值生效，供给拿到的仍是未扣的快照 ⇒ 超额照旧。
+        #        也不能直接改 `host_capacity_bytes`：它另有用途（`safetensors_layer_offload`
+        #        的 host 预算，见 `_node_budget`），扣它会连带削掉 offload 额度。
+        #     2. `host_capacity_bytes` —— 主机内存额度。
+        #     3. `capacity_bytes` —— 兜底（对纯 CPU/GGUF 节点与前两者同义）。
+        explicit_budget = node.get("domain_allocatable_bytes")
+        if explicit_budget is not None:
+            host_budget = explicit_budget
+        elif node.get("host_capacity_bytes") is not None:
+            host_budget = node["host_capacity_bytes"]
+        else:
             host_budget = node["capacity_bytes"]
         entry["executors"].append({
             "node_id": node["node_id"],
