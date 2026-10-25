@@ -1177,11 +1177,28 @@ class ModelSupplyCoordinator:
                 conversion_bytes = quote["host_conversion_bytes"]
                 reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
                 required = math.ceil((source_bytes + conversion_bytes) * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
-                if required > int(inventories[node_id].get("memory_available_bytes", 0)):
+                # ★ 2026-10-25（#117 收尾）：这一段检查的是**主机内存**（上方注释原文即
+                #   "complete source bytes against real RAM"），却取了
+                #   `memory_available_bytes` —— 对 `pytorch` + `cuda` 的 master，该字段是
+                #   **显存可用量**（实测 7451181056 = 7.45 GB）。
+                #   后果：任何需要把权重放在主机内存的物化（`safetensors_layer_offload`）
+                #   都必然被拒 —— 用 14 GB 的主机需求去比 7.45 GB 的显存，于是 master
+                #   永远只能拿显存装得下的那几层（实测 `[0,8)`），主机那 ~32 GB 全程闲置。
+                #   主机内存额度是 `host_capacity_bytes`
+                #   （= min(当前可用内存, 物理总量 × HOST_RAM_MAX_FRACTION)，见上方
+                #   `host_ram_budget` 的写入点），这里改用它。远端 CPU 节点该字段同样由
+                #   该分支之外的路径落到"可用内存"，语义一致。
+                #   字段缺失时（旧回执 / 非 host-projection 节点）回退到
+                #   `memory_available_bytes`，保持旧行为不更差。
+                host_budget = inventories[node_id].get("host_capacity_bytes")
+                if host_budget is None:
+                    host_budget = inventories[node_id].get("memory_available_bytes", 0)
+                host_budget = int(host_budget)
+                if required > host_budget:
                     from model_supply_diagnostics import explain_host_capacity
                     diagnostic = explain_host_capacity(
                         projection, node_id=node_id,
-                        available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                        available_bytes=host_budget,
                         reserve_bytes=reserve, safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                         alignment=sources["alignment"],
                         layer_range=[assignment["start_layer"], assignment["end_layer"]],
@@ -1194,7 +1211,7 @@ class ModelSupplyCoordinator:
                 assignment.update(quote, host_source_bytes=source_bytes,
                                   host_conversion_bytes=conversion_bytes,
                                   host_required_bytes=required,
-                                  host_capacity_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                  host_capacity_bytes=host_budget,
                                   runtime_materialization=materialization,
                                   runtime_target_element_size=projection["runtime_target_element_size"],
                                   runtime_target_dtype=projection["runtime_target_dtype"])

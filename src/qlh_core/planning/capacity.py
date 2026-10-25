@@ -402,6 +402,19 @@ def _normalize_nodes(
             "capacity_source": capacity_source,
             "execution_device": str(raw.get("execution_device", "unknown") or "unknown"),
         }
+        # ★ 2026-10-25（#117 收尾）：**物化模式与主机内存额度必须随节点透传到求解器**。
+        #   `_node_budget` 要据此把主机内存计入可分配容量 —— `safetensors_layer_offload`
+        #   下权重驻留主机内存，只按 `capacity_bytes`（对 pytorch+cuda 是**显存**，实测
+        #   7451181056 ≈ 7.45 GB）参与求解，会把 master 从能扛 24 层压到只有 8 层，
+        #   主机那 ~32 GB 全程闲置（这正是"容量不准入（只算了 VRAM）"的根因）。
+        #   上面是白名单式字段挑拣，二者此前不在其中 ⇒ `_node_budget` 永远读不到，
+        #   求解器侧的改动会形同虚设。仅在实际出现时附加：未标注物化的节点
+        #   （既有拓扑与既有测试）行为完全不变。
+        if raw.get("materialization"):
+            normalized["materialization"] = str(raw["materialization"])
+        if "host_capacity_bytes" in raw:
+            normalized["host_capacity_bytes"] = _non_negative_int(
+                raw["host_capacity_bytes"], "host_capacity_bytes")
         if "configured_reserve_bytes" in raw or "retained_component_reserve_bytes" in raw:
             for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
                 if type(raw.get(field)) is not int or raw[field] < 0:
@@ -575,8 +588,24 @@ def capacity_budget(
 
 
 def _node_budget(raw_bytes: int, node: dict[str, Any], safety_margin: float) -> dict[str, int]:
+    # ★ 2026-10-25（#117 收尾）：**offload 节点的可分配额度应以主机内存为准**。
+    #   `safetensors_layer_offload` 的语义是权重**驻留主机内存**、显存只放下当前执行的
+    #   那一个单元（见 `_LayerOffloadRuntime`：逐执行单元 stage → 用完释放）。但求解器
+    #   此前只认 `capacity_bytes`，而对 `pytorch`+`cuda` 的 master 那是**显存**
+    #   （实测 7451181056 ≈ 7.45 GB）⇒ master 只能拿到显存装得下的 8 层，主机那 ~32 GB
+    #   全程闲置（实测 master 恒为 `[0,8)`）。这正是"容量不准入（只算了 VRAM）"的根因。
+    #   上游 `project_supply_capacity_nodes` 已按 `host_capacity_bytes` 把**装不下的候选
+    #   区间筛掉**（`host_weight_peak_bytes × margin + reserve > host_available` 即跳过），
+    #   因此这里把额度换成主机额度是**自洽**的：候选合法性由 host 峰值决定，额度也由
+    #   host 决定，不再拿显存去衡量放在主机里的权重。
+    #   仅在该物化被显式标注时生效；未标注的节点（既有拓扑与既有测试）行为完全不变。
+    capacity = node.get("capacity_bytes", 0)
+    if node.get("materialization") == "safetensors_layer_offload":
+        host_capacity = node.get("host_capacity_bytes")
+        if host_capacity:
+            capacity = host_capacity
     return capacity_budget(
-        raw_bytes, capacity_bytes=node.get("capacity_bytes", 0),
+        raw_bytes, capacity_bytes=capacity,
         reserve_bytes=node["reserve_bytes"],
         runtime_multiplier=node.get("runtime_multiplier", 1.0),
         safety_margin=safety_margin,
