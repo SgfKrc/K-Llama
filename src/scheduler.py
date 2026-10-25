@@ -2033,7 +2033,13 @@ class Scheduler(
     ) -> list[dict]:
         """Project live layer-worker profiles into explicit free-memory budgets."""
         from contextlib import nullcontext
-        from config import PIPELINE_CAPACITY_RESERVE_MB
+        from config import (
+            LOCAL_CPU_EXECUTOR_ENABLED,
+            LOCAL_CPU_EXECUTOR_HOST_FRACTION,
+            LOCAL_CPU_EXECUTOR_ID,
+            LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            PIPELINE_CAPACITY_RESERVE_MB,
+        )
         from koakuma_engine import canonical_backend
 
         # ★ 2026-10-07（DIST-NEXT-4b）：规划前先回收「心跳已过期且没有在跑 attempt」的
@@ -2412,7 +2418,84 @@ class Scheduler(
                     if local_mode in {"head", "middle", "tail"}:
                         record["segment_mode"] = local_mode
             records.append(record)
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机 CPU 执行器（同机第二个执行器）**。
+        #   由 `QLH_LOCAL_CPU_EXECUTOR=1` 开启（默认关 ⇒ 既有拓扑逐位不变）。
+        #   三个要点：
+        #     * `node_id` 与主执行器**相同** —— 它就是**同一台物理机**（同一传输身份、
+        #       同一份 RAM、同一断线归属）；靠 `executor_id` 区分。
+        #       刻意**不做**成"重复注册虚拟物理节点"：那样 RAM 共享、断线、设备竞争都会
+        #       被两套独立记账掩盖（`NInfer…:120` 反对的正是这个）。
+        #     * `capacity_domain_id` = 主执行器 node_id、`domain_total_bytes` = 本机 host
+        #       容量 ⇒ 两段**共用一份总账**，求解器不会给出物理上装不下的计划
+        #       （`validate_capacity_domains` 会 fail closed）。
+        #     * `segment_mode="middle"` —— keep-head 上游的挂点在 `output_norm` **之后**，
+        #       所以它**不能当首段**（首段必须有 embedding）。
+        if LOCAL_CPU_EXECUTOR_ENABLED and self._effective_role() == "master":
+            # ⚠️ 匹配判据必须同时认字面量 `"master"` 与 `get_effective_node_id()`：
+            #    主节点的本地 ID 在 records 里是**字面量** `"master"`，而后者返回
+            #    `_configured_node_id()`（可能是主机名），两者**不等** —— 同一文件
+            #    `_pipeline_node_metadata` 上方（`record["layer_ranges"]` 那处）已经为
+            #    这个坑留过注释，这里重复踩过一次（测试直接抓到 extra 为空）。
+            base_record = next(
+                (item for item in records
+                 if item["node_id"] in {"master", local_node_id}
+                 and not item.get("executor_id")), None)
+            if base_record is not None:
+                cpu_record = self._local_cpu_executor_record(base_record)
+                records.append(cpu_record)
+                logger.info(
+                    "event=local_cpu_executor_declared node_id=%s executor_id=%s "
+                    "capacity_bytes=%s domain_total_bytes=%s layer_cost_ms=%s",
+                    cpu_record["node_id"], cpu_record["executor_id"],
+                    cpu_record["capacity_bytes"], cpu_record["domain_total_bytes"],
+                    cpu_record["layer_cost_ms"],
+                )
         return records
+
+    @staticmethod
+    def _local_cpu_executor_record(base_record: dict) -> dict:
+        """由**主执行器**记录派生出**本机 CPU 执行器**记录（同 node_id，不同 executor_id）。
+
+        ★ 2026-10-25（LOCAL-EXECUTORS-01）。抽成纯函数有两个理由：一是它承载了本票最
+        核心的三条不变量（见下），值得被单独测试；二是 `_get_pipeline_capacity_nodes`
+        在既有 fixture 里会被整体替换掉，藏在里面的逻辑无从验证。
+
+        三条不变量：
+          * `node_id` 与主执行器**相同** —— 它就是**同一台物理机**（同一传输身份、同一
+            份 RAM、同一断线归属）。刻意**不做**成"重复注册虚拟物理节点"：那样 RAM
+            共享、断线、设备竞争都会被两套独立记账掩盖（`NInfer…:120` 反对的正是这个）。
+          * `capacity_domain_id` = 主执行器 node_id、`domain_total_bytes` = 本机 host
+            容量 ⇒ 两段**共用一份总账**，求解器不会给出物理上装不下的计划
+            （`validate_capacity_domains` 会 fail closed）。
+          * `segment_mode="middle"` —— keep-head 上游的挂点在 `output_norm` **之后**，
+            所以它**不能当首段**（首段必须有 embedding）。
+        """
+        from config import (
+            LOCAL_CPU_EXECUTOR_HOST_FRACTION,
+            LOCAL_CPU_EXECUTOR_ID,
+            LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+        )
+
+        host_total = int(base_record.get("host_capacity_bytes")
+                         or base_record["capacity_bytes"])
+        return {
+            "node_id": base_record["node_id"],
+            "role": base_record["role"],
+            "executor_id": LOCAL_CPU_EXECUTOR_ID,
+            "capacity_domain_id": base_record["node_id"],
+            "domain_total_bytes": host_total,
+            "capacity_bytes": max(
+                0, int(host_total * LOCAL_CPU_EXECUTOR_HOST_FRACTION)),
+            "reserve_bytes": base_record["reserve_bytes"],
+            "reserve_source": "config.PIPELINE_CAPACITY_RESERVE_MB",
+            "runtime_multiplier": base_record["runtime_multiplier"],
+            "execution_device": "cpu",
+            "capacity_source": "local_cpu_executor_host_ram",
+            "engine": "llama_cpp",
+            "score": base_record["score"],
+            "layer_cost_ms": LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            "segment_mode": "middle",
+        }
 
     def _pipeline_node_metadata(self) -> dict[str, dict]:
         """Project live scheduler nodes into opaque layout-location metadata."""

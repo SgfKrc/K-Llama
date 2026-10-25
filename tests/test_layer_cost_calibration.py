@@ -527,3 +527,92 @@ def test_assignment_exposes_executor_identity_when_declared(fresh_case):
         assert item["capacity_domain_id"] == "host-alpha"
     # 域账仍可见（阶段 1 的交付条件没被破坏）
     assert result["capacity_domains"]["host-alpha"]["excess_bytes"] == 0
+
+
+def _primary_record():
+    return {
+        "node_id": "master", "role": "master", "capacity_bytes": 10000,
+        "host_capacity_bytes": 8000, "reserve_bytes": 100,
+        "runtime_multiplier": 2.0, "score": 50.0,
+    }
+
+
+def test_local_cpu_executor_record_shares_the_physical_node():
+    """本机 CPU 执行器记录的三条不变量 —— 这是本票的核心形态。
+
+    1. `node_id` 与主执行器**相同**：它就是**同一台物理机**（同一传输身份、同一份 RAM、
+       同一断线归属）。刻意**不做**成"重复注册虚拟物理节点"—— 那样 RAM 共享、断线、
+       设备竞争都会被两套独立记账掩盖。
+    2. 与主执行器**同容量域**、总账 = 本机 host 容量 ⇒ 求解器不能因两段各自申报而放过
+       物理上装不下的计划。
+    3. `segment_mode="middle"`：keep-head 上游的挂点在 `output_norm` **之后**，
+       **不能当首段**（首段必须有 embedding）。
+    """
+    from config import LOCAL_CPU_EXECUTOR_ID, LOCAL_CPU_EXECUTOR_LAYER_COST_MS
+    from scheduler import Scheduler
+
+    base = _primary_record()
+    cpu = Scheduler._local_cpu_executor_record(base)
+
+    assert cpu["node_id"] == base["node_id"]              # ★ 同一台物理机
+    assert cpu["executor_id"] == LOCAL_CPU_EXECUTOR_ID
+    assert cpu["capacity_domain_id"] == base["node_id"]   # ★ 同一份 RAM 总账
+    assert cpu["domain_total_bytes"] == 8000              # host 容量，而非 capacity_bytes
+    assert cpu["capacity_bytes"] == 4000                  # 默认划走一半
+    assert cpu["capacity_bytes"] < cpu["domain_total_bytes"]
+    assert cpu["segment_mode"] == "middle"                # ★ 不能当首段
+    assert cpu["engine"] == "llama_cpp"
+    assert cpu["execution_device"] == "cpu"
+    assert cpu["layer_cost_ms"] == LOCAL_CPU_EXECUTOR_LAYER_COST_MS
+    # 主执行器记录本身不被改动
+    assert base == _primary_record()
+
+
+def test_local_cpu_executor_shares_one_host_budget():
+    """同机两段共用一份总账 ⇒ 域校验看得到两者，且不因总账冲突而报错。
+
+    这正是"容量无重复计数"在**同机第二执行器**上的体现：若两段各自按整机可用内存申报
+    而不声明共享域，求解器会把它们当成两台独立机器，给出物理上装不下的计划。
+    """
+    from qlh_core.planning.capacity import validate_capacity_domains
+    from scheduler import Scheduler
+
+    base = _primary_record()
+    cpu = Scheduler._local_cpu_executor_record(base)
+    nodes = [
+        {**base, "executor_id": ""},
+        {**cpu},
+        # 与主执行器同域、总账一致（真实路径下两条记录的总账同源）
+        {**base, "executor_id": "", "capacity_domain_id": None},
+    ]
+    nodes[2].pop("capacity_domain_id")
+
+    _ok, report = validate_capacity_domains(nodes)
+    domain_id = cpu["capacity_domain_id"]
+    assert domain_id in report
+    assert report[domain_id]["domain_total_bytes"] == cpu["domain_total_bytes"]
+    # 同域里能看到两个执行器（主 + CPU）
+    assert len(report[domain_id]["executors"]) >= 2
+    assert {item["executor_id"] for item in report[domain_id]["executors"]} >= {
+        "", cpu["executor_id"]}
+
+
+def test_local_cpu_executor_defaults_to_off(monkeypatch):
+    """默认**关闭** ⇒ 既有三机拓扑逐位不变（回归门）。
+
+    这一档必须是**显式开启**的：它改变的是"哪些层由哪台机器算"，属于部署决策，
+    不该因为一次升级就悄悄生效。
+    """
+    import importlib
+
+    import config
+
+    monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR", raising=False)
+    reloaded = importlib.reload(config)
+    assert reloaded.LOCAL_CPU_EXECUTOR_ENABLED is False
+    # 成本缺省用**实测值**（docs 里那一份），不是拍脑袋的数
+    assert reloaded.LOCAL_CPU_EXECUTOR_LAYER_COST_MS == pytest.approx(6.84)
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR", "1")
+    assert importlib.reload(config).LOCAL_CPU_EXECUTOR_ENABLED is True
+    monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR", raising=False)
+    importlib.reload(config)

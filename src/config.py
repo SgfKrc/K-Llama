@@ -492,6 +492,29 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
                 out[node_id] = cost
         return out
 
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机 CPU 执行器**（同一物理节点上的第二个
+    #   执行器）。开启后 master 除了自己的 GPU 段（PyTorch，`local_assignment`）之外，
+    #   还能在**同一台机器**上再跑一段中间层：llama.cpp keep-head，权重常驻主机内存、
+    #   CPU 就地计算 —— **零 PCIe 搬运**。
+    #   实测（docs/本机跨框架层段成本与干扰实测-2026-10-25.md）：本机 9B 中间段
+    #   6.84 ms/层（n_threads=8），比 rog-5060 的 8.7 / android 的 20.1 都快，且比
+    #   `safetensors_layer_offload` 的 76.8（权重在 RAM、每步经 PCIe 搬上 GPU）**快 11.2 倍**。
+    #   0 = **关闭**（默认）⇒ 既有三机拓扑与部署权威逐位不变。
+    #   ⚠️ 这一档**刻意不做**成"重复注册虚拟物理节点"：CPU 段与 GPU 段共用同一个
+    #   `node_id`（同一传输身份、同一份 RAM），靠 `executor_id` 区分，容量按
+    #   `capacity_domain_id` 合并记账（见 `validate_capacity_domains`）。
+    LOCAL_CPU_EXECUTOR_ENABLED = bool(_env_int("QLH_LOCAL_CPU_EXECUTOR", 0, min_val=0, max_val=1))
+    # 该执行器的标识（进入 `Segment.executor_id` / `PipelineNode.executor_id`）。
+    LOCAL_CPU_EXECUTOR_ID = (os.environ.get("QLH_LOCAL_CPU_EXECUTOR_ID") or "cpu").strip() or "cpu"
+    # 该执行器的每层成本（ms）。缺省用实测值 6.84。
+    LOCAL_CPU_EXECUTOR_LAYER_COST_MS = _env_float(
+        "QLH_LOCAL_CPU_EXECUTOR_LAYER_COST_MS", 6.84, min_val=0.0, max_val=100000.0,
+    )
+    # 从 host 容量里划给它的**上限比例**（余下留给 GPU 段与系统）。
+    LOCAL_CPU_EXECUTOR_HOST_FRACTION = _env_float(
+        "QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION", 0.5, min_val=0.0, max_val=1.0,
+    )
+
     # ★ 2026-10-24（#117）：**清点阶段的等待上限**（秒）。此前 `model_supply.py` 里
     #   硬编码 `min(90, ...)`，而"未登记候选"的本地源核对需要对整模做一次全量
     #   sha256（5.78 GB，实测 90~120 s）⇒ 首次清点必然 `SUPPLY_WORKER_TIMEOUT`。
