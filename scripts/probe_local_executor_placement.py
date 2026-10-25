@@ -195,6 +195,33 @@ def main() -> int:
     scenario("F) 真机形态：远端带上一轮 candidate 锁 [8,20)+[20,32)，看放宽后能否并存",
              locked, total_layers=32)
 
+    # G) ★★ 真机当前形态（关键）：供给侧求解器工作在**对齐组**空间 ——
+    #    `grouped.total_layers` 是 `len(group_sizes)`（32 层 ÷ alignment 4 = 8 组），
+    #    `candidate_layer_ranges` 也是**组索引**（`[[0,1]..[7,8]]`）。
+    #    真机日志里 master 恰好 7 个候选、其余执行器各 35 个，而 master 仍被
+    #    `node_candidate_layer_range_unavailable` 拒 14 次（=7×2 次求解）。
+    #    本场景按真机的组空间形态复现：看主段为何拿不到它的候选。
+    group_candidates = [[s, e] for s in range(0, 8) for e in range(s + 1, 9) if e - s < 8]
+    group_nodes = [
+        node("master", capacity=int(6.0 * GB), layer_ranges=[[0, 2]],
+             engine="pytorch", host_capacity=host_total, segment_mode="head",
+             domain_total=host_total, domain_allocatable=primary_alloc,
+             candidate=[[0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7]],
+             score=1.0),
+        node("master", executor_id="cpu", capacity=cpu_share, layer_ranges=[[2, 6]],
+             engine="llama_cpp", cost_ms=6.84, segment_mode="middle",
+             domain_total=host_total, domain_allocatable=cpu_share, score=1.0,
+             local_cut=True, bounds=(2, 6), candidate=group_candidates),
+        node("android-542cd254", capacity=int(7.2 * GB), layer_ranges=[[6, 8]],
+             cost_ms=20.1, score=1.0, local_cut=True, segment_mode="tail",
+             candidate=group_candidates),
+        node("TABLET-2TLUCNU8", capacity=int(7.2 * GB), layer_ranges=[[5, 8]],
+             cost_ms=20.1, score=1.0, local_cut=True, segment_mode="tail",
+             candidate=group_candidates),
+    ]
+    scenario("G) 真机组空间形态：候选 7/35/35/35，看主段为何被拒",
+             group_nodes, total_layers=8)
+
     return 0
 
 

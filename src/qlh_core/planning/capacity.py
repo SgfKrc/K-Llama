@@ -1389,8 +1389,15 @@ def solve_pipeline_capacity(
                     raw_bytes += output_bytes
             budget = _node_budget(raw_bytes, node, safety_margin)
             required = budget["required_bytes"]
-            checks[(node["node_id"], cursor, end)] = {
-                "node_id": node["node_id"], "layer_range": [cursor, end],
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**检查结果按执行器身份区分**。
+            #   同机 CPU 段与主段共用 `node_id="master"`，此前 key 只用
+            #   `(node_id, cursor, end)` ⇒ 两者的检查结果**互相覆盖**，对外只剩后写的
+            #   那一条 —— 实测把**主段**的显存额度（4.47 GB）安到了 **CPU 段**的区间上，
+            #   于是一条"CPU 段被要求 28 层、只有 3.96 GB"的假记录，掩盖了真实原因。
+            executor_id = str(node.get("executor_id") or "")
+            checks[(node["node_id"], executor_id, cursor, end)] = {
+                "node_id": node["node_id"], "executor_id": executor_id,
+                "layer_range": [cursor, end],
                 "raw_weight_bytes": raw_bytes, **budget,
                 "reason_code": "node_capacity_insufficient" if budget["shortfall_bytes"] else "",
             }

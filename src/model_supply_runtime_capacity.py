@@ -455,7 +455,22 @@ def project_supply_capacity_nodes(
         identity = (node_id, executor_id)
         if identity in by_id:
             fail("SUPPLY_CAPACITY_INVALID", "Supply nodes must have unique nonempty identities")
-        engine = master_engine if node_id == "master" else node.get("engine")
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**"用主引擎"是主执行器的性质，不是
+        #   `node_id` 的性质**。
+        #
+        #   本机 CPU 段与主段共用 `node_id="master"`，但它的引擎是 `llama_cpp`
+        #   （scheduler 的 `_local_cpu_executor_record` 明确声明 `engine="llama_cpp"`，
+        #   与它持有的 keep-head GGUF 工件一致）。此前 `node_id == "master"` 就把
+        #   `master_engine`（`pytorch`）强加给它 ⇒ 它被当成 PyTorch 段走
+        #   `build_safetensors_segment` ⇒ 段虽然建出来了（磁盘上 master 下确实有两个
+        #   segment 目录），但 manifest 形态与执行期期望的 GGUF 段不符 ⇒ 无法注册，
+        #   也不会出现在部署视图里。
+        #   实测（2026-10-26 06:19）：
+        #     master\segment-7909e1b5…\supply.manifest.json   ← 主段
+        #     master\segment-864ade28…\supply.manifest.json   ← CPU 段（形态错了）
+        #   而 android / TABLET 都同时有 `segment.manifest.json`（llama_cpp 段形态）。
+        is_primary_executor = node_id == "master" and not node.get("executor_id")
+        engine = master_engine if is_primary_executor else node.get("engine")
         if engine not in {"llama_cpp", "pytorch"} or engine not in descriptors:
             fail("SUPPLY_ENGINE_SOURCE_MISSING", f"No source for {engine}")
         original = descriptors[engine]
@@ -538,6 +553,26 @@ def project_supply_capacity_nodes(
                       if end - start < total and (not is_primary_master or start == 0)]
         for mapping, code in ((preferred_ranges, "SUPPLY_PREFERRED_RANGE_INVALID"),
                               (runtime_host_ranges, "SUPPLY_RUNTIME_HOST_BUDGET_INVALID")):
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**host 暂存约束只适用于主执行器**。
+            #
+            #   它的 key 保持裸 `node_id`（既有契约 ——
+            #   `test_host_ranges_remain_hard_after_pc_ready_hints_are_removed` 直接断言
+            #   `runtime_host_ranges={"master": [[0,1]], "surface": [[2,4]]}` 必须让求解无解，
+            #   我一度把 key 改成 `(node_id, executor_id)` 而打掉了这个测试）。
+            #
+            #   但**本机附加执行器要跳过**这条约束：它表达的是"把**源权重暂存到主机内存**
+            #   需要多少 RAM"，只对需要跨 PCIe 暂存的物化（CUDA 上的 safetensors）成立。
+            #   本机 CPU 段（llama.cpp）的权重**本来就常驻主机、就地计算**，不存在"暂存"。
+            #   此前它对 CPU 段同样生效 ⇒ CPU 段继承了主段的 host 区间
+            #   `[[0,4]..[0,28]]` ⇒ 候选被卡成与主段一样的 7 个、只能 `start == 0`
+            #   ⇒ 32 层的中段无人承担 ⇒ 整盘无解。
+            #   实测（2026-10-26 05:32，`event=supply_capacity_input`）：
+            #     master      候选数=7      ← 首段，正确
+            #     TABLET      候选数=35
+            #     android     候选数=35
+            #     master#cpu  候选数=7      ← 错！middle 段被 host 约束卡在首段
+            if mapping is runtime_host_ranges and executor_id:
+                continue
             if mapping is None or node_id not in mapping:
                 continue
             spans = mapping[node_id]

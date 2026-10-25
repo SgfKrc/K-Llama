@@ -160,6 +160,39 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
     if _excl and not result.get("admitted"):
         logger.info("event=supply_capacity_exclusions %s",
                     sorted((f"{k[0]}#{k[1]}:{k[2]}", v) for k, v in _excl.items()))
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**容量不足的具体缺口**。只看排除计数无法
+        #   判断是"显存不够"还是"host 暂存预算不够"——两者都会记成
+        #   `node_capacity_insufficient`，而修法完全不同。把 required / allocatable /
+        #   shortfall 三项一起打出来，才能一次定位。
+        _short = [
+            (check.get("node_id"), str(check.get("executor_id") or ""),
+             check.get("layer_range"),
+             check.get("required_bytes"), check.get("allocatable_bytes"),
+             check.get("shortfall_bytes"))
+            for check in (result.get("capacity_checks") or [])
+            if check.get("shortfall_bytes")
+        ]
+        if _short:
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**必须带 `executor_id`**。同机 CPU 段与主段
+            #   共用 `node_id="master"`，只打 `node_id` 时两者在日志里完全无法区分 ——
+            #   我据此误判过"主段被要求承担 28 层"，实际那条是 CPU 段的。
+            logger.info(
+                "event=supply_capacity_shortfalls count=%s "
+                "(node, executor, range, required, allocatable, shortfall)=%s",
+                len(_short),
+                sorted(_short, key=lambda item: -(item[5] or 0))[:6],
+            )
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**额度来源**。`_node_budget` 只在
+            #   `node["materialization"] == "safetensors_layer_offload"` 时才改用
+            #   `host_capacity_bytes`；否则一律用 `capacity_bytes`（对 CUDA 主段是**显存**）。
+            #   把这两个字段一起打出来，才能判断"拿显存判主机权重"是不是这个分支没走到。
+            logger.info(
+                "event=supply_capacity_budget_source %s",
+                [(item.get("node_id"), item.get("materialization"),
+                  item.get("capacity_bytes"), item.get("host_capacity_bytes"),
+                  item.get("runtime_multiplier"), item.get("reserve_bytes"))
+                 for item in projected],
+            )
     if result.get("reason_code") == "pipeline_required_node_unavailable":
         result = {**result, "reason_code": "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
                   "reason": "主节点当前可用容量不足以执行接力的首段。"}
@@ -400,6 +433,15 @@ class ModelSupplyCoordinator:
             if self._events[op_id].is_set() and values.get("status") not in {"cancelled", "failed"}:
                 return
             operation.update(values, updated_at=time.time())
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：状态每次变化都留痕。供给的状态机在
+            #   `waiting_nodes` / `inventory` / `building` 之间来回，而「谁把它设成
+            #   waiting_nodes」此前完全不可见 —— 排查只能靠读代码猜调用点。
+            #   这是低频事件（每次状态变化一条），不会刷屏。
+            if "status" in values:
+                logger.info(
+                    "event=supply_status op=%s status=%s reason=%s",
+                    op_id, values.get("status"), values.get("reason_code"),
+                )
             self._persist(self._operations[op_id])
             self._condition.notify_all()
 
@@ -1351,6 +1393,27 @@ class ModelSupplyCoordinator:
                         wait_for_new=True, capacity_diagnostic=diagnostic)):
                     continue
                 raise ModelSupplyError(code, diagnostic["reason"], diagnostic=diagnostic)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**规划成功后必须清掉"等待新节点"的残留状态**。
+            #
+            #   诊断路径（上方 `wait_for_new=True` + `capacity_diagnostic=diagnostic`）会把
+            #   status 设为 `waiting_nodes` 并带上**诊断的** reason_code。而规划是**每轮重跑**
+            #   的、且结果会**波动**：
+            #     * `plan_segment_supply_reuse` 会先试 `preferred_ranges={}`（可能失败 ⇒ 触发
+            #       上面的诊断路径、把 status 写成 `waiting_nodes`），再靠 `release_candidates`
+            #       成功 ⇒ **最终 plan 是好的，但中途已经把状态写脏**；
+            #     * 候选又来自上一轮 plan ⇒ 下一轮重复同样的波动。
+            #   于是**成功轮不清状态，对外就永远显示 `waiting_nodes`**，客户端一直等下去，
+            #   而 `pending_node_ids` 是空的（根本没有节点可等）。
+            #
+            #   实测（2026-10-26 05:04，`event=supply_status`）：
+            #     planning → waiting_nodes(pipeline_candidate_layer_range_unsatisfied)
+            #              → waiting_nodes(同) → planning → … 每 5 秒循环，从不恢复。
+            #
+            #   ⚠️ 位置很关键：必须放在下面 `auto_pool` 那个 `continue` **之前** ——
+            #   `_extend_auto_inventory` 在此期间只要发现任何变化就会 `continue`，
+            #   放在它之后等于永远不执行（第一版就是这么写错的）。
+            self._update(op_id, status="building", reason_code="", reason="",
+                         capacity_diagnostic=None)
             if auto_pool and self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline):
                 continue
             # CUDA still needs host source mappings. Gate the selected segment's
@@ -1522,13 +1585,29 @@ class ModelSupplyCoordinator:
             reused_bytes = manifest.pop("_reused_bytes", 0)
             files = manifest.pop("local_files")
             total_bytes = sum(int(item["size_bytes"]) for item in manifest["files"])
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**部署视图必须按执行器身份区分**。
+            #
+            #   同机 CPU 段与主段共用 `node_id="master"` ⇒ `nodes[node_id] = ...` 让它们
+            #   **互相覆盖**，对外只剩后写的那个。实测（2026-10-26 05:38）：
+            #     master [8,16)  ← 这是 **CPU 段**的区间（组 [2,4)×4）
+            #   而主段的 `[0,8)` **整个消失** —— capacity plan 里两段并存是有的（日志可证），
+            #   但对外视图只剩一段，肉眼根本无法确认"并存"这一验收判据。
+            #
+            #   视图键取 `node_id`（主执行器，保持既有客户端契约）或
+            #   `node_id#executor_id`（附加执行器）。
+            executor_id = str(assignment.get("executor_id") or "")
+            view_key = node_id if not executor_id else f"{node_id}#{executor_id}"
             with self._condition:
-                nodes[node_id] = {"status": "supplying", "layer_range": manifest["layer_range"],
-                                  "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
-                                  "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
-                                  "transfer_granularity": "segment_tensors", "engine": assignment["engine"]}
+                nodes[view_key] = {"status": "supplying", "layer_range": manifest["layer_range"],
+                                   "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
+                                   "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
+                                   "transfer_granularity": "segment_tensors", "engine": assignment["engine"],
+                                   "executor_id": executor_id, "node_id": node_id}
                 self._update(op_id, nodes=nodes, status="supplying")
-            if node_id == "master":
+            # ★ 同上：**"本机"是主执行器的性质，不是 `node_id` 的性质**。本机 CPU 段
+            #   （llama.cpp）虽然也在 master 上，但它的权重**就地常驻**、由它自己的
+            #   执行器注册，不走 `activate_local` 的 PyTorch 段注册路径。
+            if node_id == "master" and not executor_id:
                 self._check(op_id)
                 result = self.scheduler._model_supply_worker.activate_local(
                     manifest, directory, cancelled=lambda: self._events[op_id].is_set(),
@@ -1536,9 +1615,19 @@ class ModelSupplyCoordinator:
                 if result.get("status") != "available":
                     raise ModelSupplyError(str(result.get("reason_code") or "SUPPLY_LOCAL_REGISTRATION_FAILED"), "Master could not register its segment")
                 with self._condition:
-                    nodes[node_id].update(status="available", strategy="reuse" if reused_bytes else "local_build",
-                                          actual_downloaded_bytes=0, reused_bytes=reused_bytes)
+                    nodes[view_key].update(status="available", strategy="reuse" if reused_bytes else "local_build",
+                                           actual_downloaded_bytes=0, reused_bytes=reused_bytes)
                     self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
+                continue
+            if node_id == "master" and executor_id:
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机附加执行器（CPU 段）既不需要
+                #   跨网传输，也不走 PyTorch 段注册** —— 它的工件（keep-head GGUF）本来就在
+                #   本机磁盘上、由它自己的执行器就地加载并常驻。此前它会一路走到下面的
+                #   远端分支，尝试向"远端 master"拉取自己的段。
+                with self._condition:
+                    nodes[view_key].update(status="available", strategy="local_resident",
+                                           actual_downloaded_bytes=0, reused_bytes=reused_bytes)
+                    self._update(op_id, nodes=nodes)
                 continue
             available_sources = inventories[node_id].get("sources") or []
             # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
