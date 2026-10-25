@@ -172,7 +172,13 @@ def project_inventory_capacity(record, inventory, engine, *, source_prefix="inve
     #   "不再满足"而按设计解除 `candidate_layer_ranges` 锁定、重排成
     #   [8,19)/[19,32) ⇒ 与已裁好的段对不上 ⇒ `prepare_assignment_range_drift`
     #   与 worker 回执 `prepare_receipt_artifact_resolution_failed`，整次供给作废。
-    #   判据现与供给阶段（`model_supply.py`：`1.0 if local_cut else 2.0`）一致。
+    #   ★ 判据与**物理真相**一致：GGUF 段是原生量化宽度、就地使用不 upcast，故
+    #   `engine == "llama_cpp"` 恒取 1.0。这与 `docs/已知问题记录.md` 登记的决定同向
+    #   （`runtime_multiplier` 只适用于**未投影**描述符，即 PyTorch CPU 的 fp16→fp32）。
+    #   ⚠️ 它与**供给阶段**（`model_supply.py` 的 `1.0 if local_cut else 2.0`）**刻意
+    #   不同**：非自裁 llama_cpp 在供给阶段仍保守取 2.0（#117 有意保留）。两阶段在此
+    #   不一致是设计，方向是**供给阶段高估一倍**（更保守），不会放过装不下的方案。
+    #   （此处原先写作"判据现与供给阶段…一致"，是错误陈述 —— 它会把容量归因排查带偏。）
     runtime_multiplier = 1.0 if (
         device == "cuda" or projected or engine == "llama_cpp"
     ) else 2.0

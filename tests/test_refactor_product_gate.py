@@ -232,8 +232,13 @@ def test_supply_native_component_quote_reaches_fresh_final_admission(fresh_case)
         result = plan(case, evidence)
     assert result["admitted"], result
     worker = next(a for a in result["assignments"] if a["node_id"] == "worker")
-    assert worker["retained_component_bytes"] == 500 and worker["required_bytes"] == 1500
-    case.ram["worker"] = 1499
+    # GGUF 段（`llama_cpp`）按**原生量化宽度**计费，`runtime_multiplier` 只适用于
+    # **未投影**描述符（见 `docs/已知问题记录.md` 的「×2 倍率误用」）⇒ 倍率 1.0：
+    # 账 = (2 层 × 100 + retained 500) × 1.0 + reserve 100 = 800。
+    # 该断言同时锁住两件事：native 组件的 500 B 报价确实抵达最终准入，且没有被
+    # 退化成 ×2（那会是 1500，见 test_pipeline_capacity_freshness 的同源说明）。
+    assert worker["retained_component_bytes"] == 500 and worker["required_bytes"] == 800
+    case.ram["worker"] = 799
     with case.c.prepare_guard(case.op):
         result = plan(case, case.c.prepare_capacity_evidence(case.op))
     assert not result["admitted"]
