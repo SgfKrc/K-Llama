@@ -1529,6 +1529,85 @@ class SchedulerTaskWorkerMixin:
                 for node_id in sorted(self._remote_task_worker_providers)
             ]
 
+    @staticmethod
+    def _local_executor_key(node_id: str, executor_id: str = "") -> str:
+        """本机执行器的 provider 缓存键。缺省 `executor_id` ⇒ 就是 `node_id`。"""
+        executor_id = str(executor_id or "")
+        return f"{node_id}#{executor_id}" if executor_id else str(node_id)
+
+    def _local_stage_executor(self):
+        """进程内层段执行体：懒建 `EngineHost`，返回它的 `execute_task_worker_stage`。
+
+        它的签名与 `ProviderExecutor` 协议
+        （`Callable[[StageRequest, threading.Event], dict]`，见 `execution_provider.py`）
+        **逐字匹配**，且自带 `_worker_layer_lock()` 串行保护；返回体也与远端 offer
+        同形（`hidden_out_f32` / `hidden_out_sha256` / `token_argmax`）。
+
+        `EngineHost` 只在本机执行器**首次被调度**时才构造：它的 keep-head 上游
+        （`QLH_LAYER_GGUF` + `QLH_KEEP_HEAD_SHIM`）是首次执行才加载 ⇒ 不执行就不加载
+        任何 GGUF，对既有拓扑零影响。
+        """
+        host = self._local_engine_host
+        if host is None:
+            from inference_service.engine_host import EngineHost
+            host = EngineHost()
+            self._local_engine_host = host
+        return host.execute_task_worker_stage
+
+    def _lazy_stage_executor(self):
+        """把 `EngineHost` 的构造推迟到**首次真正执行**时（`ProviderExecutor` 闭包）。
+
+        ⚠️ 这是必需的，不是优化：`LocalFullModelProvider(executor, ...)` 的 `executor`
+        参数**立即求值**。直接传 `self._local_stage_executor()` 会让"构造 provider"
+        等同于"构造 `EngineHost`"（连带 `ModelHost`），而 provider 在**装配期**就会被
+        建出来 —— 于是"不执行就不加载"不成立。实测由
+        `test_local_provider_is_lazy_and_reuses_the_generic_container` 抓到
+        （`AssertionError: Expected 'EngineHost' to not have been called. Called 1 times.`）。
+        签名与 `ProviderExecutor` 一致：`Callable[[StageRequest, threading.Event], dict]`。
+        """
+        def execute(stage_request, cancel_event):
+            return self._local_stage_executor()(stage_request, cancel_event)
+        return execute
+
+    def _ensure_local_task_worker_provider(self, node_id: str, executor_id: str = ""):
+        """本机执行器的 provider（复用 `LocalFullModelProvider` 容器，**不发帧**）。
+
+        ★ 2026-10-25（LOCAL-EXECUTORS-01）：与 `_ensure_remote_task_worker_provider`
+        并列，但语义完全不同 —— 本机执行器（例如 master 上的 CPU 段）与远端 worker
+        **共用同一套 `StageRequest`/`ProviderExecutor` 契约**，却没有 TCP 连接：
+          * 不能走 `RemoteFullWorkerProvider`（它按 node_id 发帧，并把故障归属绑到连接
+            世代上）；
+          * 也不需要新的 provider 类 —— `LocalFullModelProvider` 的
+            `supported_stage_types` 本就是构造参数。
+        为什么独立构造 `EngineHost` 而不复用 `self._host`：`self._host` 是 PyTorch 的
+        `ModelHost`（负责 master 首段），没有层段执行入口；本机 CPU 段的 keep-head 上游
+        只存在于 `EngineHost` 里。两者在**同一进程内并存**（shim 的进程隔离由
+        `KeepHeadUpstream` 自理）—— 这正是"同机 GPU 段 + CPU 段"的形态，而不是两台
+        假装无关的物理机。
+        """
+        key = self._local_executor_key(node_id, executor_id)
+        with self._task_worker_stage_lock:
+            provider = self._local_task_worker_providers.get(key)
+            if provider is None:
+                from execution_provider import LocalFullModelProvider
+                provider = LocalFullModelProvider(
+                    self._lazy_stage_executor(),
+                    provider_id="local-" + key.replace("#", "-"),
+                    node_id=str(node_id),
+                    supported_stage_types=("layer_forward",),
+                    provider_kind="local_layer_executor",
+                )
+                self._local_task_worker_providers[key] = provider
+            return provider
+
+    def local_task_worker_providers(self) -> list:
+        """本机执行器的稳定 Provider 列表（供显式 TaskGraph 注册，与远端并列）。"""
+        with self._task_worker_stage_lock:
+            return [
+                self._local_task_worker_providers[key]
+                for key in sorted(self._local_task_worker_providers)
+            ]
+
 
     @staticmethod
     def _task_worker_message_digest(message: WorkerMessage) -> str:

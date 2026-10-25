@@ -398,3 +398,92 @@ def test_same_node_segments_get_distinct_stage_identities():
     assert stage_identity(primary) != stage_identity(secondary)
     assert primary.node_id == secondary.node_id      # 同一台物理机
     assert primary.identity_key != secondary.identity_key
+
+
+# --------------------------------------------------------------------------
+# 本机执行器 provider：复用 LocalFullModelProvider 容器，且**懒建**
+# --------------------------------------------------------------------------
+
+class _BareScheduler:
+    """只挂 provider 相关状态的裸壳，避免为一个契约测试构造整个 Scheduler。"""
+
+    def __init__(self):
+        import threading
+
+        from scheduler_task_worker import SchedulerTaskWorkerMixin
+
+        self._remote_task_worker_providers = {}
+        self._local_task_worker_providers = {}
+        self._local_engine_host = None
+        self._task_worker_stage_lock = threading.RLock()
+        # 裸壳只挂本次要验证的两个方法，避免构造整个 Scheduler
+        self._local_executor_key = SchedulerTaskWorkerMixin._local_executor_key
+        self._local_stage_executor = (
+            SchedulerTaskWorkerMixin._local_stage_executor.__get__(self)
+        )
+        self._lazy_stage_executor = (
+            SchedulerTaskWorkerMixin._lazy_stage_executor.__get__(self)
+        )
+
+
+def test_local_executor_key_rule():
+    """键规则：缺省 `executor_id` ⇒ 就是 `node_id`（与旧行为逐字相同）。"""
+    from scheduler_task_worker import SchedulerTaskWorkerMixin
+
+    key = SchedulerTaskWorkerMixin._local_executor_key
+    assert key("master") == "master"
+    assert key("master", "") == "master"
+    assert key("master", "cpu") == "master#cpu"
+
+
+def test_local_provider_is_lazy_and_reuses_the_generic_container():
+    """本机 provider 必须**懒建**，且复用 `LocalFullModelProvider` 而不是新类。
+
+    "懒"是可观察的安全性质：`EngineHost` 的 keep-head 上游（`QLH_LAYER_GGUF`）是首次
+    执行才加载，所以**不执行就不加载任何 GGUF** ⇒ 既有三机拓扑即使带着本机执行器声明
+    也零影响。这里断言 provider 构造后 `_local_engine_host` **仍然是 None**。
+    """
+    from unittest.mock import patch
+
+    from execution_provider import LocalFullModelProvider
+    from scheduler_task_worker import SchedulerTaskWorkerMixin
+
+    shell = _BareScheduler()
+    ensure = SchedulerTaskWorkerMixin._ensure_local_task_worker_provider.__get__(shell)
+
+    with patch("inference_service.engine_host.EngineHost") as host_cls:
+        first = ensure("master", "cpu")
+        # ★ 懒：构造 provider 不该构造 EngineHost
+        host_cls.assert_not_called()
+        assert shell._local_engine_host is None
+
+        assert isinstance(first, LocalFullModelProvider)
+        assert first.inspect().supported_stage_types == ("layer_forward",)
+        assert first.inspect().node_id == "master"
+        # 缓存：同一 (node, executor) 复用同一对象（否则每步都会新建 provider）
+        assert ensure("master", "cpu") is first
+        # 不同 executor ⇒ 不同 provider（同机两段互不干扰）
+        other = ensure("master", "")
+        assert other is not first
+        assert other.provider_id != first.provider_id
+        host_cls.assert_not_called()  # 仍未触碰 EngineHost
+
+
+def test_local_provider_executor_is_the_engine_host_stage_entry():
+    """执行体必须是 `EngineHost.execute_task_worker_stage` —— 签名与 ProviderExecutor 匹配。
+
+    这是整个接入的关键事实：不需要新类、不需要适配层。`ProviderExecutor` 定义为
+    `Callable[[StageRequest, threading.Event], dict]`，而该方法的签名逐字相同，且返回体
+    与远端 offer 同形（`hidden_out_f32` / `hidden_out_sha256` / `token_argmax`）。
+    """
+    import inspect
+
+    from execution_provider import ProviderExecutor
+    from inference_service.engine_host import EngineHost
+
+    signature = inspect.signature(EngineHost.execute_task_worker_stage)
+    parameters = list(signature.parameters)
+    # (self, stage_request, provider_cancel_event) —— 去掉 self 后正是协议要求的两个
+    assert parameters[:3] == ["self", "stage_request", "provider_cancel_event"]
+    assert ProviderExecutor is not None
+    assert "layer_forward" in inspect.getsource(EngineHost.execute_task_worker_stage)

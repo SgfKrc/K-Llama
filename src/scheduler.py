@@ -523,6 +523,16 @@ class Scheduler(
         self._remote_task_worker_providers: dict[
             str, RemoteFullWorkerProvider
         ] = {}
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机执行器 provider**。键为
+        #   `node_id` 或 `node_id#executor_id`。本机执行器（例如 master 上的 CPU 段）
+        #   与远端 worker 共用同一套 `StageRequest`/`ProviderExecutor` 契约，但**没有
+        #   TCP 连接** ⇒ 不能走 `RemoteFullWorkerProvider`（它按 node_id 发帧、并把
+        #   故障归属绑到连接世代上）。
+        self._local_task_worker_providers: dict[str, Any] = {}
+        # 懒建、进程内共用：`EngineHost` 只在本机执行器首次被调度时才构造，且它的
+        # keep-head 上游（`QLH_LAYER_GGUF`）是**首次执行才加载** ⇒ 不执行就不加载，
+        # 对既有拓扑零影响。
+        self._local_engine_host: Any = None
         self._task_worker_stage_lock = threading.RLock()
         self._task_worker_active_attempts: dict[
             str, _TaskWorkerActiveAttempt

@@ -406,6 +406,7 @@ class NativePorts:
             hidden_states=hidden, model_identity=ModelIdentity(**frozen["stage_model_identity"]),
             workflow_id="wf_" + record["request_id"], request_id=f'{record["request_id"]}:step:{identity.step}',
             stage_id=f'{stage_identity(segment)}:step:{identity.step}', context_size=self.context_size,
+            executor_id=segment.executor_id,
             want_hidden=not segment.head,
             want_all_tokens=segment.head and all_tokens,
             middle_channel="keep_head_layer_out", positions=positions,
@@ -485,6 +486,7 @@ class NativePorts:
                         want_hidden=not segment.head, middle_channel="keep_head_layer_out",
                         seq_ids=[0], positions=[0], cancel_event=record["cancel"] if check else threading.Event(),
                         request_deadline=record["deadline"], cleanup_only=True,
+                        executor_id=segment.executor_id,
                         execution_attempts=self.attempts)
                     if receipt.get("kv_cleared") is not True:
                         raise ExecutionError("execution_kv_cleanup_receipt_invalid")

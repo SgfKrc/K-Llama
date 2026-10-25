@@ -2717,6 +2717,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         request_deadline: RequestDeadline | None = None,
         execution_attempts: list | None = None,
         cleanup_only: bool = False,
+        executor_id: str = "",
     ) -> dict:
         """Execute one Route-A v3 layer stage and map its result to a step.
 
@@ -2796,12 +2797,31 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             node_id, stage_id, n_tokens, stage_fields["hidden_sha256"],
             workflow_id, request_id,
         )
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机执行器走进程内 provider，不发帧**。
+        #   本机执行器（例如 master 上的 CPU 段）与远端 worker **共用同一套**
+        #   `StageRequest`/`ProviderExecutor` 契约，但没有 TCP 连接 ⇒ 不能走
+        #   `RemoteFullWorkerProvider`（它按 node_id 发帧，并把故障归属绑到连接世代上）。
+        #   注意 provider 选择必须提到 `StageRequest` 构造**之前**：`provider_id` 要与
+        #   最终选中的 provider 一致，否则 `reserve()` 会以 `provider_request_mismatch` 拒绝。
+        #   `_ensure_local_task_worker_provider` 取 `_task_worker_stage_lock`（RLock），
+        #   与调用方可能已持有的同一把锁可重入。
+        if executor_id:
+            provider = self._ensure_local_task_worker_provider(str(node_id), str(executor_id))
+            provider_id = str(provider.provider_id)
+            logger.info(
+                "Route-A stage handoff (local executor): node=%s executor=%s stage=%s "
+                "tokens=%d hidden_sha256=%s",
+                node_id, executor_id, stage_id, n_tokens, stage_fields["hidden_sha256"],
+            )
+        else:
+            provider = self._ensure_remote_task_worker_provider(str(node_id))
+            provider_id = remote_provider_id(str(node_id))
         request = StageRequest(
             workflow_id=str(workflow_id),
             request_id=str(request_id),
             stage_id=str(stage_id),
             stage_type="layer_forward",
-            provider_id=remote_provider_id(str(node_id)),
+            provider_id=provider_id,
             dependencies={},
             root_input={
                 "hidden_f32": base64.b64encode(raw).decode("ascii"),
@@ -2814,7 +2834,6 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             stage_fields=stage_fields,
             runtime_context={"pipeline_route": "route_a"},
         )
-        provider = self._ensure_remote_task_worker_provider(str(node_id))
         try:
             reservation = provider.reserve(request)
         except Exception as exc:
