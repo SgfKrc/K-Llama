@@ -248,6 +248,28 @@ def test_zero_cuda_budget_reaches_existing_positive_free_admission_guard(
     assert exc.value.code == "SUPPLY_RUNTIME_BUDGET_MISSING"
 
 
+def test_llama_cpp_segment_multiplier_matches_the_supply_stage():
+    """GGUF 段按原生量化宽度就地使用 ⇒ 倍率必须是 1.0，与供给阶段判据一致。
+
+    回归现场（2026-10-25，三机实网）：`project_inventory_capacity` 原先只用
+    `device == "cuda" or projected` 判定，而 `projected` 依赖 `record["load_spec"]`；
+    上游 `bind_supplied_runtime_capacity` 对**非 CUDA/safetensors** 的 assignment
+    直接早退、从不注入 `load_spec`，于是 CPU/GGUF 节点（rog-5060、android-542cd254）
+    恒得 `runtime_multiplier=2.0`，与供给阶段 `model_supply.py` 的
+    `1.0 if inventory["local_cut"] else 2.0` 判据分叉。
+
+    后果：准备阶段的容量账比供给阶段少一半 ⇒ 按设计解除 `candidate_layer_ranges`
+    锁定重排 ⇒ 切点与已裁好的段对不上（`prepare_assignment_range_drift` + worker 回执
+    `prepare_receipt_artifact_resolution_failed`），整次三机供给作废。
+    """
+    from model_supply_capacity import project_inventory_capacity
+
+    inventory = {"distributed": True, "engines": ["llama_cpp"],
+                 "memory_available_bytes": 8 * 1024 * MIB}
+    node = project_inventory_capacity({"node_id": "rog-5060"}, inventory, "llama_cpp")
+    assert node["runtime_multiplier"] == 1.0
+
+
 def test_global_budget_reaches_fresh_solver_with_reserve_and_safety_unchanged(inventory_worker, monkeypatch):
     from model_supply_capacity import project_inventory_capacity
     from pipeline_capacity import solve_pipeline_capacity

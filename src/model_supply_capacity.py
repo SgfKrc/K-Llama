@@ -159,7 +159,23 @@ def project_inventory_capacity(record, inventory, engine, *, source_prefix="inve
         isinstance(supplied_spec, dict)
         and str(supplied_spec.get("materialization", "") or "") == "gguf_segment"
     )
-    runtime_multiplier = 1.0 if (device == "cuda" or projected) else 2.0
+    # ★ 2026-10-25：`engine == "llama_cpp"` 同样必须算 1.0。
+    #   上面 #117 的结论（"GGUF 段按原生量化宽度就地使用、再乘 2 会把整模算成
+    #   11.6GB ⇒ 三机容量账凭空减半"）当时只落到了 `projected` 上，而 `projected`
+    #   依赖 `record["load_spec"]`；上游 `bind_supplied_runtime_capacity` 对
+    #   **非 CUDA/safetensors** 的 assignment 会直接早退、从不注入 `load_spec`
+    #   （见该函数 `if mode != "safetensors_layer_offload" and not (cuda_spec or
+    #   quoted_cuda): return record`），于是 CPU/GGUF 节点（rog-5060、
+    #   android-542cd254）的 `projected` 恒为 False ⇒ multiplier 恒为 2.0
+    #   ⇒ **准备阶段的容量账比供给阶段少一半**。
+    #   实测后果：供给阶段求解出 rog=[8,24)/android=[24,32)，准备阶段因容量
+    #   "不再满足"而按设计解除 `candidate_layer_ranges` 锁定、重排成
+    #   [8,19)/[19,32) ⇒ 与已裁好的段对不上 ⇒ `prepare_assignment_range_drift`
+    #   与 worker 回执 `prepare_receipt_artifact_resolution_failed`，整次供给作废。
+    #   判据现与供给阶段（`model_supply.py`：`1.0 if local_cut else 2.0`）一致。
+    runtime_multiplier = 1.0 if (
+        device == "cuda" or projected or engine == "llama_cpp"
+    ) else 2.0
     result = {**deepcopy(record), "capacity_bytes": available, "capacity_source": source,
               "execution_device": device, "engine": engine,
               "runtime_multiplier": runtime_multiplier}
