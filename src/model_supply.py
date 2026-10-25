@@ -934,12 +934,26 @@ class ModelSupplyCoordinator:
                          tokenizer_sha256=sources["tokenizer_sha256"], reason_code="", reason="",
                          capacity_diagnostic=None)
             capacity = self.scheduler._get_pipeline_capacity_nodes(set(worker_ids) | {"master"})
-            capacity_by_id = {record["node_id"]: record for record in capacity}
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**供给流程只处理"有工件传输的"执行器**。
+            #   本机附加执行器（CPU 段）与主段**共用 `node_id`**，用
+            #   `{record["node_id"]: record}` 建索引会让它**静默覆盖**主段。实测后果：
+            #   供给 plan 里 master 的 assignment 被标成 `executor_id='cpu'`，层区间却
+            #   是主段的 `[0,8)`。这个被污染的 plan 一路传到
+            #   `SupplyCapacityEvidence.project()`，于是 CPU 段拿到主段的切点
+            #   `candidate_layer_ranges=[[0,8]]`，与自身声明的 `[8,24)` 冲突 ⇒ 求解器
+            #   永远不选它（"同机两段"名存实亡）。
+            #   修法：索引按 `(node_id, executor_id)`，且这里**只取主执行器**
+            #   （`executor_id` 为空）—— 本机附加执行器没有供给流程（无工件传输、
+            #   无 inventory、无回执），它该由容量规划而非供给来安置。
+            capacity_by_id = {
+                (record["node_id"], str(record.get("executor_id") or "")): record
+                for record in capacity
+            }
             records = []
             runtime_descriptors = {}
             runtime_host_descriptors = {}
             for node_id, inventory in inventories.items():
-                base = dict(capacity_by_id.get(node_id) or {})
+                base = dict(capacity_by_id.get((node_id, "")) or {})
                 if not base:
                     from config import PIPELINE_CAPACITY_RESERVE_MB
                     base = {"node_id": node_id, "role": "client", "score": 0.0,
@@ -1033,7 +1047,7 @@ class ModelSupplyCoordinator:
                 runtime_host_ranges[node_id] = allowed_host_layer_ranges(
                     projection, node_id=node_id,
                     available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                    reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                    reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
                 )
                 if not runtime_host_ranges[node_id]:
@@ -1041,7 +1055,7 @@ class ModelSupplyCoordinator:
                     diagnostic = explain_host_capacity(
                         projection, node_id=node_id,
                         available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                        reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                        reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
                         safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
                     )
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
@@ -1161,7 +1175,7 @@ class ModelSupplyCoordinator:
                             explanation = explain_host_capacity(
                                 runtime_host_descriptors[node_id], node_id=node_id,
                                 available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                                reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                                reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
                                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
                                 layer_range=[assignment["start_layer"], assignment["end_layer"]],
                             )
@@ -1196,7 +1210,7 @@ class ModelSupplyCoordinator:
                 )
                 source_bytes = quote["host_source_bytes"]
                 conversion_bytes = quote["host_conversion_bytes"]
-                reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
+                reserve = int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0))
                 required = math.ceil((source_bytes + conversion_bytes) * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
                 # ★ 2026-10-25（#117 收尾）：这一段检查的是**主机内存**（上方注释原文即
                 #   "complete source bytes against real RAM"），却取了

@@ -321,6 +321,17 @@ class SupplyCapacityEvidence:
             return (record["node_id"], str(record.get("executor_id") or ""))
 
         by_id = {_executor_key(record): record for record in records}
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：把**供给 plan 的 assignment 身份**打出来。
+        #   串味排查的下一步依赖它：CPU 段仍拿到主段的 `candidate_layer_ranges`，而唯一
+        #   剩下的注入点就是这个循环（`record["candidate_layer_ranges"]` 由 assignment
+        #   的 start/end 决定）。若 plan 里的 `master` assignment 缺 `executor_id`，
+        #   它就会匹配到 CPU 段 —— 那意味着**plan 自身也按 node_id 串味**，需要在更上游修。
+        logger.info(
+            "供给 plan 身份: %s",
+            [(item.get("node_id"), item.get("executor_id", ""),
+              item.get("start_layer"), item.get("end_layer"))
+             for item in (query.get("plan") or {}).get("assignments", [])],
+        )
         result, provenance = [], []
         handled: set[tuple[str, str]] = set()
         for assignment in query["plan"]["assignments"]:
