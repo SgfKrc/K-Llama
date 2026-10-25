@@ -90,7 +90,29 @@ void * qlh_kh_load(const char * model_path,
     struct llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = (uint32_t) (n_ctx > 0 ? n_ctx : 4096);
     cparams.n_batch         = (uint32_t) (n_batch > 0 ? n_batch : 512);
-    cparams.n_ubatch        = (uint32_t) (n_batch > 0 ? n_batch : 512);
+    /* ★ 2026-10-25（PERF-NATIVE-COST-01）：**n_ubatch 不再跟着 n_batch**。
+     *
+     * llama.cpp 按 `min(n_ctx, n_ubatch)` 做 worst-case 图预留，而 QWEN35 的
+     * `graph_max_nodes = n_tokens * 40` ⇒ n_ubatch=4096 时每次 memory update 都要
+     * 预留约 16.4 万节点。ROG 的 native 日志实测 `sched_reserve: CPU compute
+     * buffer size = 4168.16 MiB`，就是这个值撑出来的（而它只有 15.15 GB 可见内存、
+     * 热数据是 1646 MiB 的匿名 repack buffer，4 GB 预留会直接挤压它）。
+     *
+     * `n_batch` 仍必须够装下整段序列 —— M-RoPE 会把 embd 批次按 4× 放大
+     * （见 llama_engine.py 关于上游 #28963 的记录），所以保留调用方传入值不动。
+     * 但 **`n_ubatch` 只需覆盖一次内部微批量**。
+     *
+     * Android 侧早已如此（android/.../qlh_llama_jni.cpp：`n_ubatch = min(512,
+     * batch_limit)`），且真机实测过不放大的代价：`n_batch = n_ubatch = n_ctx = 32768`
+     * ⇒ 1062 tokens × 4 层 **>43 秒**（超 stage 超时）。PC shim 至今未移植，
+     * 这里对齐同一取值。 */
+    {
+        uint32_t ubatch = (uint32_t) (n_batch > 0 ? n_batch : 512);
+        if (ubatch > 512) {
+            ubatch = 512;
+        }
+        cparams.n_ubatch = ubatch;
+    }
     cparams.n_threads       = (n_threads > 0 ? n_threads : 4);
     cparams.n_threads_batch = (n_threads > 0 ? n_threads : 4);
     cparams.n_seq_max       = (uint32_t) (n_seq_max > 0 ? n_seq_max : 1);
@@ -104,9 +126,10 @@ void * qlh_kh_load(const char * model_path,
     /* ★ 2026-09-24：把**实际生效**的 ctx 参数打出来。长时 decode 在 ~481 帧报
      * `llama_decode rc=1`（llama.cpp 的 "failed to find a memory slot for batch"）时，必须能
      * 一眼看出 llama.cpp 是否真按我们请求的 `n_ctx` / `n_batch` 分配了 KV。 */
-    fprintf(stderr, "[qlh_keep_head] ctx ready: n_ctx=%u n_batch=%u "
+    fprintf(stderr, "[qlh_keep_head] ctx ready: n_ctx=%u n_batch=%u n_ubatch=%u "
                     "(requested n_ctx=%d n_batch=%d n_seq_max=%d)\n",
-            llama_n_ctx(ctx), llama_n_batch(ctx), n_ctx, n_batch, n_seq_max);
+            llama_n_ctx(ctx), llama_n_batch(ctx), cparams.n_ubatch,
+            n_ctx, n_batch, n_seq_max);
 
     const int n_layer = llama_model_n_layer(model);
     if (mode == 1 && (cut_layer < 0 || cut_layer >= n_layer)) {
