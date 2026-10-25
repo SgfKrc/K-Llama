@@ -89,8 +89,9 @@ def _current_model_payload():
         "model_id": _api_module.model_manager.active_model_id,
         "descriptor": descriptor,
         "quant_type": _api_module.model_host.current_quant,
-        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴，见
-        #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。按活跃模型 id 兜底。
+        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴）。按活跃模型
+        #   id 兜底。原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`（2026-10-25
+        #   归档；原引「§4.8 B2」小节号已失效 ⇒ `遗留清单-2026-10-07.md` 不登记该已修项）。
         "model_name": (info.get("model_name") or info.get("model_id")
                        or _api_module.model_manager.active_model_id),
         "model_path": info.get("model_path", ""),

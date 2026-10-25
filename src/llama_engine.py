@@ -2238,7 +2238,8 @@ class LlamaCppEngine:
         ⚠️ **绝不**返回与"实际加载了什么"无关的静态默认值。此前的缺陷正是：
         `get_model_info()` 不报 `model_name` ⇒ 消费方各自兜底到静态 `config.MODEL_NAME`
         （= 默认 0.6B）⇒ 加载 2B 却对外报 `Qwen/Qwen3-0.6B`。
-        根因与实测证据见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2。
+        根因与实测证据的原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`（2026-10-25
+        归档；原引「§4.8 B2」小节号已随该件重排失效，`遗留清单-2026-10-07.md` 不登记该已修项）。
         """
         if not self._model_path:
             return ""

@@ -354,7 +354,7 @@ Real hardware, cross-host networks, Android ARM64, performance and long-run soak
 - [Testing and acceptance criteria](测试与评判标准.md) · [test channel notes](测试通道运行说明.md) · [release artifact gate](发行物门-RELEASE-ARTIFACTS.md)
 - [Mainline plan: distributed inference and edge optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5: dynamic master election and distributed management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Parallelism and cross-framework survey](archive/relay/分布式推理并行与跨框架路线调研汇总-2026-09-15.md) · [KTransformers migration survey](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
-- [Outstanding work ledger (current)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
+- [Outstanding work ledger (current)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](archive/misc/未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
 - [Document status and cleanup list](文档状态与清理清单.md) · [Archive index](archive/README.md)
 - [Android validation alternatives](../android/Android验证替代路径-2026-09-18.md)
 

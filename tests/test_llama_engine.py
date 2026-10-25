@@ -552,7 +552,8 @@ def test_model_name_reports_actual_gguf_not_static_default(tmp_path):
 
     缺陷史：`get_model_info()` 原先**不报** `model_name` ⇒ 消费方（`/status`、`/models/current`）
     各自兜底到静态 `config.MODEL_NAME`（= 默认 0.6B）⇒ 实测加载 2B（`qwen35-2b-Q4_K_M.gguf`）
-    却对外报 `Qwen/Qwen3-0.6B`（见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。
+    却对外报 `Qwen/Qwen3-0.6B`（原始登记见 `docs/archive/misc/未完成工作备忘-2026-09-23.md`，
+    2026-10-25 归档；原引「§4.8 B2」小节号已随该件重排失效，`遗留清单` 不登记该已修项）。
 
     「该红必须红」：若有人把 `model_name` 改回"取不到就返回 `MODEL_NAME`"，本用例立刻红。
     """
