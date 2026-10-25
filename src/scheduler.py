@@ -272,6 +272,52 @@ def _node_supports_forward_layers(node: "NodeInfo") -> bool:
     return node_supports_forward_layers(node)
 
 
+def _local_cpu_layer_artifact() -> str:
+    """本机 CPU 段要常驻的**裁层 GGUF** 路径（`QLH_LAYER_GGUF`）。未设返回空串。
+
+    刻意直读环境变量而非新增 config 常量：`engine_host._layer_forward_upstream()`
+    也是直读同一个键（`environment.get("QLH_LAYER_GGUF")`）。两处同源，才不会出现
+    "规划按 A 文件算、执行却加载 B 文件"这种只在推理时才炸的错位。
+    """
+    raw = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    if not path.is_absolute():
+        # 相对路径按仓库根解析（`.env` 里写的是 `models/...`），与 `koakuma.bat`
+        # 的工作目录一致。`src/scheduler.py` 的上一级就是仓库根。
+        path = Path(__file__).resolve().parents[1] / path
+    return str(path)
+
+
+def _local_cpu_layer_bytes() -> int:
+    """由裁好的 GGUF 工件推导**每层字节**（文件大小 ÷ 覆盖层数）。取不到返回 0。
+
+    工件就是本机 CPU 段要常驻主机内存的权重本身 ⇒ 尺寸是权威来源，不需要另设旋钮
+    （少一个要对齐的配置项，就少一处"看起来生效其实没接上"的隐患）。层数由
+    `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE` 给出。
+
+    返回 0 时调用方**不给** `layer_budget`，退化为精确区间匹配的既有行为 ——
+    规划期少一点灵活性，好过按错误的每层字节算出装不下的计划。
+    """
+    from config import local_cpu_executor_layer_range
+
+    layer_range = local_cpu_executor_layer_range()
+    if layer_range is None:
+        return 0
+    layers = int(layer_range[1]) - int(layer_range[0])
+    if layers <= 0:
+        return 0
+    artifact = _local_cpu_layer_artifact()
+    if not artifact:
+        return 0
+    try:
+        size = Path(artifact).stat().st_size
+    except OSError:
+        return 0
+    return size // layers if size > 0 else 0
+
+
 
 class Scheduler(
     SchedulerSidecarMixin, SchedulerTaskWorkerMixin,
@@ -2630,6 +2676,51 @@ class Scheduler(
             logger.warning(
                 "event=local_cpu_executor_layer_range_unconstrained executor_id=%s "
                 "hint=请设 QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=start,end 与本机裁层 GGUF 对齐",
+                LOCAL_CPU_EXECUTOR_ID,
+            )
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**段区间不是硬锁，本机 CPU 段要能自适应切分**。
+        #   只给 `layer_ranges` 会让它落到**精确匹配**语义（`[[8,24]]` 只允许整段
+        #   `(8,24)`），于是它被迫吃满 16 层。而两个远端各 12 层的方案在目标函数第二项
+        #   `Σ work²/weight`（均衡项）上更优 ⇒ 同样 3 段，求解器选了远端组合、CPU 段空转
+        #   （2026-10-26 真机实测：`master[0,8) + android[8,20) + TABLET[20,32)`，
+        #   而 CPU 段在候选里却没被选）。
+        #   远端 worker 靠 `layer_budget.local_cut=True` 获得同等的灵活性（供给记录里
+        #   这条来自 hello capabilities），本机执行器此前缺的正是这一项。
+        #   每层字节由**裁好的 GGUF 工件**推导（文件大小 ÷ 它覆盖的层数）—— 工件就是
+        #   要常驻内存的权重本身，尺寸是权威，且不需要读求解器不该碰的环境状态。
+        #   取不到尺寸时**不给** budget（退化为精确匹配的既有行为），并留一条诊断。
+        per_layer_bytes = _local_cpu_layer_bytes()
+        if per_layer_bytes > 0:
+            capacity = int(record["capacity_bytes"])
+            budget = {
+                "available_bytes": capacity,
+                "per_layer_bytes": per_layer_bytes,
+                "max_layers": max(1, capacity // per_layer_bytes),
+                "local_cut": True,
+            }
+            if layer_range is not None:
+                # ★ 工件边界：`local_cut` 只解锁**切分粒度**（能在区间内任意切），
+                #   但本机 CPU 段手上只有**裁好的部分工件**、不能自裁到任意区间
+                #   ⇒ 用 `min_layer`/`max_layer` 钉住它的可切范围。
+                #   缺了这两项，求解器会把工件覆盖不到的层派给它，而失败发生在**执行期**
+                #   （层号越界/权重缺失）—— 真机实测踩到过：capacity plan 给
+                #   `('master','cpu',0,8)`，工件却是 `mid8-24`。
+                budget["min_layer"] = int(layer_range[0])
+                budget["max_layer"] = int(layer_range[1])
+            record["layer_budget"] = budget
+            logger.info(
+                "event=local_cpu_executor_budget per_layer_bytes=%s max_layers=%s "
+                "bounds=%s artifact=%s",
+                per_layer_bytes,
+                budget["max_layers"],
+                f"[{budget.get('min_layer')},{budget.get('max_layer')})"
+                if "min_layer" in budget else "(unbounded)",
+                _local_cpu_layer_artifact() or "(unset)",
+            )
+        else:
+            logger.warning(
+                "event=local_cpu_executor_budget_unavailable executor_id=%s "
+                "hint=QLH_LAYER_GGUF 指向的裁层工件不存在或不可读 ⇒ 回落到精确区间匹配",
                 LOCAL_CPU_EXECUTOR_ID,
             )
         return record

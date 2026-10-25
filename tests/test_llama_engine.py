@@ -99,6 +99,17 @@ def test_pipeline_file_digest_survives_engine_replacement_and_fresh_checks(tmp_p
     assert LlamaCppEngine()._pipeline_file_sha256(str(path), use_cache=False) == expected
     assert reads == [path]
     path.write_bytes(b"changed GGUF bytes")
+    # ★ 2026-10-26：**显式推后 mtime**，否则这个测试会必然失败（不是偶发）。
+    #
+    #   `_hash_file_cached` 的缓存键是 `_file_identity` = `(dev, ino, size, mtime_ns)`。
+    #   上面两段内容 `b"GGUF shared digest"` 与 `b"changed GGUF bytes"` **恰好都是 18 字节**
+    #   ⇒ `size` 不变；而 Windows 的 `mtime_ns` 精度约 15.6 ms，连续两次 `write_bytes`
+    #   极易落在**同一刻度内** ⇒ 整个签名不变 ⇒ 缓存仍然命中 ⇒ 断言失败。
+    #   （实测：本机连续 3 次运行全部失败；把改动 `git stash` 后通过，只是因为重写文件
+    #   顺带把 mtime 推过了刻度 —— 会误判成"改动引入的回归"。）
+    #   这里显式把 mtime 前推 10 ms，让签名**确定**变化，测试才有稳定的被测对象。
+    _stat = path.stat()
+    os.utime(path, ns=(_stat.st_atime_ns, _stat.st_mtime_ns + 10_000_000))
     changed = hashlib.sha256(path.read_bytes()).hexdigest()
     assert LlamaCppEngine()._pipeline_file_sha256(str(path)) == changed
     assert reads == [path, path]

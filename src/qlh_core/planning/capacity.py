@@ -277,11 +277,36 @@ def _normalize_layer_budget(value: Any, field: str) -> dict[str, Any]:
     local_cut = value.get("local_cut", False)
     if not isinstance(local_cut, bool):
         raise PipelineCapacityError(f"{field}.local_cut must be a boolean")
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**可切区间**（可选，`min_layer`/`max_layer`）。
+    #
+    #   `local_cut` 只解锁**切分粒度**（能在工件覆盖的区间内任意切），**不解锁工件边界**。
+    #   持有**整模**、真能自裁的 worker 不需要这两项（给了也不影响：没声明就不检查，
+    #   行为与改动前逐字节一致）。而只持有**裁好的部分工件**的执行器 —— 例如本机 CPU 段的
+    #   `q35-9b-local-mid8-24.gguf`（只含 `[8,24)`）—— **必须**声明它们；否则求解器会把
+    #   工件覆盖不到的层派给它，而那种失败发生在**执行期**（层号越界/权重缺失），
+    #   不是规划期报错，属于"部署显示成功、第一次推理才炸"的最坏形态（真机实测踩到过：
+    #   `assignments=[('master','cpu',0,8), ...]`，而工件是 `mid8-24`）。
+    bounds: dict[str, int] = {}
+    low = value.get("min_layer")
+    high = value.get("max_layer")
+    if (low is None) != (high is None):
+        raise PipelineCapacityError(
+            f"{field}.min_layer and {field}.max_layer must be given together"
+        )
+    if low is not None and high is not None:
+        low_value = _non_negative_int(low, f"{field}.min_layer")
+        high_value = _non_negative_int(high, f"{field}.max_layer")
+        if high_value <= low_value:
+            raise PipelineCapacityError(
+                f"{field}.max_layer must be greater than {field}.min_layer"
+            )
+        bounds = {"min_layer": low_value, "max_layer": high_value}
     return {
         "available_bytes": available_bytes,
         "per_layer_bytes": per_layer_bytes,
         "max_layers": max_layers,
         "local_cut": local_cut,
+        **bounds,
     }
 
 
@@ -1192,9 +1217,25 @@ def solve_pipeline_capacity(
             if advertised_budget is not None and count > advertised_budget["max_layers"]:
                 exclude(node, cursor, end, "node_layer_budget_exceeded")
                 continue
-            # 只有当设备声明"能按分配在本地裁层"（`local_cut=true`）时，`layer_ranges`
-            # 才降级为"当前已就绪"的信息、不再限制分配；否则它仍是硬约束 ——
-            # 派给设备一个它手上没有工件的区间，请求必然失败。
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`local_cut` 只解锁切分粒度，不解锁工件边界**。
+            #
+            #   `local_cut=true` 的原意是"本设备手上有整模，能按分配在本地裁层"⇒ 任意区间
+            #   都行，故 `layer_ranges` 降级为信息、不再约束。但本机 CPU 段拿的是**裁好的
+            #   部分工件**（`q35-9b-local-mid8-24.gguf` 只含 `[8,24)`），它**不能**自裁到
+            #   任意区间。此前直接复用 `local_cut` ⇒ 边界失效 ⇒ 真机实测把 `[0,8)` 派给
+            #   了它（2026-10-26 01:04 `assignments=[('master','cpu',0,8), ...]`），而执行期
+            #   要拿 `mid8-24.gguf` 去算 `[0,8)` ⇒ 层号越界/权重缺失，正是"部署显示成功、
+            #   第一次推理才炸"的最坏形态。
+            #
+            #   修法：`layer_budget` 可携带 `min_layer`/`max_layer` 声明**可切区间**。
+            #   给了边界就必须落在边界内；**没给边界则保持原行为（不检查）** —— 远端
+            #   worker 的 budget 来自 hello capabilities、不含这两项，逐字节不变。
+            budget_bounds: tuple[int, int] | None = None
+            if advertised_budget is not None:
+                low = advertised_budget.get("min_layer")
+                high = advertised_budget.get("max_layer")
+                if low is not None and high is not None:
+                    budget_bounds = (int(low), int(high))
             if advertised_budget is None or not advertised_budget.get("local_cut"):
                 allowed_ranges = node.get("layer_ranges")
                 if allowed_ranges is not None and not any(
@@ -1203,6 +1244,11 @@ def solve_pipeline_capacity(
                 ):
                     exclude(node, cursor, end, "node_layer_range_not_advertised")
                     continue
+            elif budget_bounds is not None and not (
+                budget_bounds[0] <= cursor and end <= budget_bounds[1]
+            ):
+                exclude(node, cursor, end, "node_layer_budget_out_of_bounds")
+                continue
             # ★ 2026-10-05（DIST-3 三机实测）：**段类型约束**。
             #
             #   区间包含判据不够：`layer_ranges` 只说"本节点覆盖哪些层"，不区分工件

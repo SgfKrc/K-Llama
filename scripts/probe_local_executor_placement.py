@@ -31,7 +31,8 @@ def build_descriptor(layers=TOTAL_LAYERS):
 
 def node(node_id, *, executor_id="", capacity, layer_ranges, engine="llama_cpp",
          cost_ms=None, segment_mode=None, candidate=None, domain_total=None,
-         domain_allocatable=None, score=1.0, host_capacity=None, local_cut=False):
+         domain_allocatable=None, score=1.0, host_capacity=None, local_cut=False,
+         bounds=None):
     record = {
         "node_id": node_id,
         "role": "master" if node_id == "master" else "client",
@@ -44,18 +45,23 @@ def node(node_id, *, executor_id="", capacity, layer_ranges, engine="llama_cpp",
         "score": score,
         "layer_ranges": layer_ranges,
     }
-    # ⚠️ 关键：判据是 `if advertised_budget is None or not budget["local_cut"]` **才**检查
-    #    `layer_ranges`。而 `layer_ranges=[[0,32]]` 的语义是**精确匹配** `(cursor, end)`
-    #    （`start == cursor and end == allowed_end`），**不是**"覆盖范围" ——
-    #    没有 `local_cut` 的节点只能拿整段 `[0,32)`，无法分担部分层。
-    #    生产日志里 rog/android 正是靠 `local_cut=True` 才拿到 `[8,24)` 这种部分区间。
+    # ⚠️ 判据是 `if advertised_budget is None or not budget["local_cut"]` **才**检查
+    #    `layer_ranges`。而 `layer_ranges=[[0,32]]` 的语义是**精确匹配** `(cursor, end)`，
+    #    **不是**"覆盖范围" —— 没有 `local_cut` 的节点只能拿整段。
+    #
+    #    ★ 2026-10-26：`local_cut` 只解锁**切分粒度**，**不解锁工件边界**。
+    #    持有整模、真能自裁的 worker 不需要 `bounds`；只持有裁好部分工件的执行器
+    #    （本机 CPU 段的 mid8-24.gguf）**必须**给 `bounds`，否则会被派到工件覆盖不到的层。
     if local_cut:
-        record["layer_budget"] = {
+        budget = {
             "available_bytes": int(capacity),
             "per_layer_bytes": 100,
             "max_layers": max(1, int(capacity) // 100),
             "local_cut": True,
         }
+        if bounds is not None:
+            budget["min_layer"], budget["max_layer"] = int(bounds[0]), int(bounds[1])
+        record["layer_budget"] = budget
     if executor_id:
         record["executor_id"] = executor_id
     if cost_ms is not None:
@@ -131,7 +137,9 @@ def main() -> int:
              candidate=[[0, 8]], score=1.0),
         node("master", executor_id="cpu", capacity=cpu_share, layer_ranges=[[8, 24]],
              engine="llama_cpp", cost_ms=6.84, segment_mode="middle",
-             domain_total=host_total, domain_allocatable=cpu_share, score=1.0),
+             domain_total=host_total, domain_allocatable=cpu_share, score=1.0,
+             # ★ 本机 CPU 段手上只有裁好的 mid8-24.gguf ⇒ 必须钉住可切范围。
+             local_cut=True, bounds=(8, 24)),
         # 两个远端都是 tail（生产日志 segment_mode={'android':'tail','rog-5060':'tail'}）
         # ⇒ 只有一个能当末段，另一个必然闲置。这是既有拓扑的真实约束。
         node("rog-5060", capacity=int(4.3 * GB), layer_ranges=[[0, 32]],
