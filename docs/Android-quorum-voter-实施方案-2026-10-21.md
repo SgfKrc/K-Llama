@@ -1,7 +1,7 @@
 # Android 端 Quorum Voter 实施与验收记录
 
 > 状态：**部分实施**
-> 更新日期：2026-10-22
+> 更新日期：2026-10-25（状态复核：仍现行——§6 第 54–55 行自述「Android voter 服务尚未配置，Tailnet `100.99.211.13:8765` 当前拒绝连接」「PC→Android quorum 选举和真实投票尚未联调」，与「部分实施」一致；#107 仍在「已知问题记录」未闭环区「待实网验收」）
 > 适用范围：Android Y700 作为 QLH 自动选举 voter 的实现、配置与验收边界。协议语义以 `src/cluster_quorum.py`、`src/cluster_control_contract.py` 和 `src/cluster_auto_role_runtime.py` 为准。
 
 ## 1. 拓扑合同
