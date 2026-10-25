@@ -582,9 +582,29 @@ def _normalize_nodes(
         usable.append(normalized)
     # The execution contract puts a participating master at the input stage.
     # This order chooses stage positions; the objective below chooses amounts.
+    #
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**段类型必须参与排序**。
+    #   排序决定 DFS 的遍历次序，而 DFS 是**单向**的（`cursor` 只前进、不回头）
+    #   ⇒ 段类型必须与层顺序一致。实测（`scripts/probe_local_executor_placement.py`）：
+    #   `fastest`（`prefer_all_workers` 为真、目标第一项就是 `-len(candidate)`，3 段必
+    #   优于 2 段）下求解器仍只输出 2 段 —— 因为本机 CPU 段**继承了主段的
+    #   `role="master"`**，与主段同组后按容量降序排到**第一位**（11.2 GB > 主段 6.4 GB），
+    #   而它是 `middle`，在 `cursor=0` 被 `cursor != 0` 拒掉后再不被回看 ⇒ 结构性跳过。
+    #
+    #   次序与理由（**不是**"最灵活就排最后"）：
+    #     head (0)      —— 强制首段（必须含 embedding），必须最先落位；
+    #     未声明 (0.5)  —— 最灵活，可作任意段 ⇒ **越早越好**：它选择多，先安排不会
+    #                      挤掉别人。放到最后反而会被有约束的节点占满位置 ⇒ 无解
+    #                      （实测 `test_per_artifact_modes_select_the_matching_range_and_identity`：
+    #                      未声明 mode 的 `edge` 排到 `tail` 之后 ⇒ tail 先占末段 ⇒
+    #                      `edge` 无处安放 ⇒ `admitted=False`）；
+    #     middle (1)    —— 不能是首段也不能是末段；
+    #     tail (2)      —— 强制末段，约束最强，兜底。
+    mode_order = {"head": 0, "": 0.5, "middle": 1, "tail": 2}
     usable.sort(
         key=lambda node: (
             node["role"] != "master",
+            mode_order.get(str(node.get("segment_mode") or "").lower(), 0.5),
             -node["score"],
             -(node["capacity_bytes"] - node["reserve_bytes"]),
             node["node_id"],

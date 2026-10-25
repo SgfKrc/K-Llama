@@ -90,8 +90,21 @@ def _ordered_nodes(nodes):
             "reserve_bytes": reserve,
             "runtime_multiplier": float(raw.get("runtime_multiplier", 1.0)),
         })
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：与 `_normalize_nodes` 的排序保持**逐字一致**。
+    #   段类型必须参与：head → 未声明 → middle → tail。
+    #   - 排序决定 DFS 遍历次序，而 DFS 是**单向**的（`cursor` 只前进、不回头）⇒
+    #     `middle` 段若排在 `head` 段之前，在 `cursor=0` 会被 `cursor != 0` 拒掉，
+    #     之后 `cursor` 前进而 DFS 不回头 ⇒ 它永远拿不到本可承载的中间区间。
+    #   - **未声明 `segment_mode` 的节点排在 head 之后、middle 之前**：它最灵活，
+    #     选择多，越早安排越不会被别人挤掉。放到最后反而会无解（有约束的 tail 先占
+    #     末段 ⇒ 灵活节点无处安放）。
+    #   本函数复刻求解器的排序，漏掉这一项就会让 oracle 与求解器对
+    #   `control_only_nodes` 的期望分歧（实测 seed-11 报
+    #   `['worker-a','worker-z'] == ['worker-z','worker-a']`）。
+    mode_order = {"head": 0, "": 0.5, "middle": 1, "tail": 2}
     return sorted(normalized, key=lambda node: (
         node["role"] != "master",
+        mode_order.get(str(node.get("segment_mode") or "").lower(), 0.5),
         -node["score"],
         -(node["capacity_bytes"] - node["reserve_bytes"]),
         node["node_id"],
