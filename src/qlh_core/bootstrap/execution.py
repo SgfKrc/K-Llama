@@ -39,7 +39,8 @@ class ExecutionApplication:
         self.requests = requests
 
     def handles(self):
-        state = self.scheduler._model_control.snapshot()
+        owner = self.scheduler._model_control
+        state = getattr(owner, "execution_snapshot", owner.snapshot)()
         deployment = state["deployments"].get(state["active_deployment"], {})
         local = deployment.get("local_assignment") or (state.get("lifecycle") or {}).get("local_assignment") or {}
         return bool(local.get("load_spec"))
@@ -62,7 +63,8 @@ class ExecutionApplication:
 
     def freeze(self):
         scheduler = self.scheduler
-        state = scheduler._model_control.snapshot()
+        owner = scheduler._model_control
+        state = getattr(owner, "execution_snapshot", owner.snapshot)()
         key = state["active_deployment"]
         deployment = state["deployments"].get(key)
         if not deployment or deployment["status"] != "active" or not deployment.get("published"):

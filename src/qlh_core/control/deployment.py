@@ -22,7 +22,9 @@ class DeploymentService:
         self._operation_fences = {}
 
     def snapshot(self):
-        state = self.repository.read()
+        return self._with_operation_fences(self.repository.read())
+
+    def _with_operation_fences(self, state):
         if state["boot_id"] == self.boot_id:
             for operation_id, value in self._operation_fences.items():
                 old = state["operations"].get(operation_id)
@@ -30,6 +32,22 @@ class DeploymentService:
                     state["operations"][operation_id] = {**deepcopy(value), "durable": False,
                                                          "commit_scope": "volatile_failure"}
         return state
+
+    @property
+    def query_reads_enabled(self):
+        return getattr(self.repository, "query_reads_enabled", False)
+
+    def execution_snapshot(self):
+        read = getattr(self.repository, "read_execution", self.repository.read)
+        return read()
+
+    def query_snapshot(self, operation_id=None):
+        read = getattr(self.repository, "read_query", None)
+        return self._with_operation_fences(read(operation_id) if read else self.repository.read())
+
+    def query_stamp(self):
+        read = getattr(self.repository, "read_stamp", self.repository.read)
+        return read()
 
     def fence_operation_failure(self, value):
         # A failed disk cannot accept a durable terminal. Keep the admission
@@ -382,7 +400,7 @@ class DeploymentService:
         return self.repository.transact(settle)
 
     def runnable(self, config_id, *, authority, connections, input_revisions=None):
-        state = self.snapshot()
+        state = self.execution_snapshot()
         value = state["deployments"].get(config_id)
         return bool(state["boot_id"] == self.boot_id and state["active_deployment"] == config_id
                     and value and value["boot_id"] == self.boot_id and value["status"] == "active"

@@ -21,6 +21,12 @@ TERMINAL = {"ready", "failed", "cancelled", "superseded"}
 logger = logging.getLogger(__name__)
 
 
+def _query_reads_enabled(owner):
+    return (getattr(owner, "query_reads_enabled", False) is True
+            and callable(getattr(owner, "query_snapshot", None))
+            and callable(getattr(owner, "query_stamp", None)))
+
+
 class ModelIntentCoordinator:
     def __init__(self, scheduler, prepare, *, retire=None, retire_timeout=300, root=None, poll_interval=0.25):
         self.scheduler = scheduler
@@ -60,7 +66,12 @@ class ModelIntentCoordinator:
         return deepcopy(saved)
 
     def current(self):
-        selected = self.scheduler._model_control.snapshot()["selected_operation"]
+        owner = self.scheduler._model_control
+        if _query_reads_enabled(owner):
+            snapshot = owner.query_snapshot()
+            selected = snapshot["selected_operation"]
+            return self.get(selected, snapshot=snapshot) if selected else None
+        selected = owner.snapshot()["selected_operation"]
         return self.get(selected) if selected else None
 
     def _transaction(self, operation_id, candidate_id):
@@ -81,13 +92,19 @@ class ModelIntentCoordinator:
                 value["_native_ready"], value["_native_reason_code"], value["_native_reason"] = self._native_readiness(transaction)
             return value, active
 
-    def get(self, operation_id):
+    def get(self, operation_id, *, snapshot=None):
         from qlh_core.contracts.snapshots import envelope, reason
         owner = getattr(self.scheduler, "_model_control", None)
-        for _ in range(3):
-            before = owner.snapshot() if owner is not None else None
-            result = self._project(operation_id)
-            after = owner.snapshot() if owner is not None else None
+        query_reads = _query_reads_enabled(owner)
+        for attempt in range(3):
+            if query_reads:
+                before = snapshot if attempt == 0 and snapshot is not None else owner.query_snapshot(operation_id=operation_id)
+                result = self._project(operation_id, snapshot=before)
+                after = owner.query_stamp()
+            else:
+                before = owner.snapshot() if owner is not None else None
+                result = self._project(operation_id)
+                after = owner.snapshot() if owner is not None else None
             if before is not None and (before["revision"] != after["revision"] or before["boot_id"] != after["boot_id"]):
                 continue
             code = result.get("reason_code") or result.get("deployment_reason_code", "")
@@ -99,9 +116,10 @@ class ModelIntentCoordinator:
                         revision=None, identity={"operation_id": operation_id}, observed_at=time.time(), validity="pending",
                         reason=reason("snapshot", "snapshot_revision_changed", "model_control", retryability="retry"))
 
-    def _project(self, operation_id):
+    def _project(self, operation_id, *, snapshot=None):
         owner = getattr(self.scheduler, "_model_control", None)
-        snapshot = owner.snapshot() if owner is not None else None
+        if snapshot is None:
+            snapshot = owner.snapshot() if owner is not None else None
         if snapshot is not None and operation_id in snapshot["operations"] and operation_id in snapshot["supplies"]:
             record = snapshot["operations"][operation_id]
             supply = snapshot["supplies"][operation_id]

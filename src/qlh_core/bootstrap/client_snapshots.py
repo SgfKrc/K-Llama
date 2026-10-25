@@ -10,8 +10,11 @@ class ClientSnapshots:
     def current(self):
         scheduler = self.scheduler
         owner = scheduler._model_control
+        query_reads = (getattr(owner, "query_reads_enabled", False) is True
+                       and callable(getattr(owner, "query_snapshot", None))
+                       and callable(getattr(owner, "query_stamp", None)))
         for _ in range(3):
-            state = owner.snapshot()
+            state = owner.query_snapshot() if query_reads else owner.snapshot()
             queue = scheduler._execution_app.requests.queue_snapshot()
             enabled = scheduler.get_distributed_inference_enabled()
             mode = {"desired": "distributed" if enabled else "local", "phase": "stable", "eligible": bool(enabled)}
@@ -30,7 +33,7 @@ class ClientSnapshots:
                                               retryability="retry", cause=getattr(exc, "reason_detail", None))
             if not runnable and readiness_reason is None:
                 readiness_reason = reason("deployment", "execution_deployment_unavailable" if enabled else "local_mode", "model_control", retryability="retry")
-            end = owner.snapshot()
+            end = owner.query_stamp() if query_reads else owner.snapshot()
             if (state["revision"] != end["revision"] or state["boot_id"] != end["boot_id"]
                     or queue["revision"] != scheduler._execution_app.requests.queue_snapshot()["revision"]
                     or enabled != scheduler.get_distributed_inference_enabled()
@@ -42,8 +45,9 @@ class ClientSnapshots:
             operation = None
             if selected and selected in state["operations"]:
                 from model_intent import ModelIntentCoordinator
-                operation = ModelIntentCoordinator(scheduler, None).get(selected)
-                check = owner.snapshot()
+                coordinator = ModelIntentCoordinator(scheduler, None)
+                operation = coordinator.get(selected, snapshot=state) if query_reads else coordinator.get(selected)
+                check = owner.query_stamp() if query_reads else owner.snapshot()
                 if check["revision"] != state["revision"] or check["boot_id"] != state["boot_id"]:
                     continue
             if deployment is not None:

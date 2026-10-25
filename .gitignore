@@ -238,6 +238,7 @@ scripts/*
 !scripts/export_model_catalog.py
 !scripts/qlh_log.py
 !scripts/compact_control_db.py
+!scripts/perf_control_read.py
 !scripts/cluster_node_preflight.py
 !scripts/ipv6_dual_stack_gate.py
 !scripts/check_doc_links.py
