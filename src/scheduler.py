@@ -2459,6 +2459,23 @@ class Scheduler(
         #     * `segment_mode="middle"` —— keep-head 上游的挂点在 `output_norm` **之后**，
         #       所以它**不能当首段**（首段必须有 embedding）。
         if LOCAL_CPU_EXECUTOR_ENABLED and self._effective_role() == "master":
+            # ★ 2026-10-25：**把本机主段的层区间打出来**。求解器报
+            #   `node_layer_range_not_advertised` 时，`candidate_exclusions` 只能指出
+            #   "master 的哪些候选被排除"，却看不到它**实际声明了**什么区间 —— 而两者
+            #   相减才是根因。实测环境门卡住正是如此：master 声明的是**上一轮供给残留**
+            #   的段（`_configured_layer_artifact` 从 `get_selected_model()` 推导），
+            #   与 CPU 段的 `[4,24)` 在 `[4,8)` 重叠 ⇒ 无法连续切分 ⇒ 无解，而日志里
+            #   完全看不到这个区间值。
+            if self._effective_role() == "master":
+                local_ranges = next((
+                    item.get("layer_ranges") for item in records
+                    if item["node_id"] in {"master", local_node_id}
+                    and not item.get("executor_id")
+                ), None)
+                logger.info(
+                    "event=local_primary_layer_ranges ranges=%s",
+                    local_ranges,
+                )
             # ⚠️ 匹配判据必须同时认字面量 `"master"` 与 `get_effective_node_id()`：
             #    主节点的本地 ID 在 records 里是**字面量** `"master"`，而后者返回
             #    `_configured_node_id()`（可能是主机名），两者**不等** —— 同一文件
@@ -3051,6 +3068,24 @@ class Scheduler(
              for key, value in (result.get("capacity_domains") or {}).items()
              if isinstance(value, dict)},
         )
+        # ★ 2026-10-25：**候选排除原因**。求解器把每个被排除的 (节点, 区间) 及**具名
+        #   原因**（`node_segment_mode_mismatch` / `node_capacity_insufficient` 等）收在
+        #   `candidate_exclusions` 里，但此前**从未被打出来** ⇒ 无解时只能看到
+        #   `...insufficient` 这一句，完全看不出是哪条约束在起作用（实测环境门就被
+        #   这个盲区挡住：日志显示 android 有 7.24 GB 且区间覆盖，却无解）。
+        #   只在**未准入**时打，避免成功路径刷日志。
+        if not result.get("admitted"):
+            exclusions = result.get("candidate_exclusions") or []
+            logger.info(
+                "容量候选排除: count=%d detail=%s",
+                len(exclusions),
+                [
+                    (item.get("node_id"), item.get("reason_code"),
+                     item.get("layer_range") or [item.get("start_layer"),
+                                                 item.get("end_layer")])
+                    for item in exclusions[:24]
+                ],
+            )
         if result.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
             result["reason"] = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"
