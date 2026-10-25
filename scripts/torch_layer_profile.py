@@ -33,20 +33,61 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _text_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the text-tower config for nested/hybrid architectures.
+
+    `qwen3_5` declares its layer geometry under `text_config`
+    (`Qwen3_5ForConditionalGeneration` has no top-level `num_hidden_layers`), so
+    every geometry read must fall back there.
+    """
+    nested = config.get("text_config")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _config_value(config: dict[str, Any], name: str, default: Any = 0) -> Any:
+    value = config.get(name)
+    if value is None:
+        value = _text_config(config).get(name)
+    return default if value is None else value
+
+
+def _weight_files(model_dir: Path) -> list[Path]:
+    """Resolve the safetensors shard set: single file, or `model-*-of-NNNNN` shards."""
+    single = model_dir / "model.safetensors"
+    if single.is_file():
+        return [single]
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        names = sorted({str(name) for name in (index.get("weight_map") or {}).values()})
+        shards = [model_dir / name for name in names]
+        missing = [str(path) for path in shards if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"safetensors index lists missing shards: {missing[:3]}")
+        return shards
+    shards = sorted(model_dir.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"expected local safetensors weights under: {model_dir}")
+    return shards
+
+
 def _artifact_identity(model_dir: Path) -> dict[str, Any]:
     config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     manifest_path = model_dir / "model.manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
-    weight_path = model_dir / "model.safetensors"
-    if not weight_path.is_file():
-        raise FileNotFoundError(f"expected a single local safetensors file: {weight_path}")
+    weights = _weight_files(model_dir)
+    # A sharded checkpoint is identified by its ordered per-shard digest set; a
+    # single-file checkpoint degenerates to the original single digest.
+    digests = [[path.name, _sha256_file(path)] for path in weights]
     return {
         "name": model_dir.name,
         "manifest_sha256": manifest.get("manifest_sha256"),
-        "weights_sha256": _sha256_file(weight_path),
+        "weights_sha256": digests[0][1] if len(digests) == 1 else None,
+        "weights_shards": digests,
+        "weights_bytes": sum(path.stat().st_size for path in weights),
         "model_type": config.get("model_type"),
-        "num_hidden_layers": int(config.get("num_hidden_layers", 0)),
-        "hidden_size": int(config.get("hidden_size", 0)),
+        "num_hidden_layers": int(_config_value(config, "num_hidden_layers")),
+        "hidden_size": int(_config_value(config, "hidden_size")),
     }
 
 
@@ -286,7 +327,16 @@ def main(argv: list[str] | None = None) -> int:
     torch.set_num_interop_threads(args.interop_threads)
     torch.manual_seed(0)
     config = AutoConfig.from_pretrained(str(args.model_dir), trust_remote_code=False, local_files_only=True)
-    total_layers = int(config.num_hidden_layers)
+    # ★ 2026-10-25：`qwen3_5` 是 hybrid 架构（`layer_types` 混有 linear_attention 与
+    #   full_attention），层数声明在 `text_config` 下 —— `Qwen3_5ForConditionalGeneration`
+    #   的顶层 config 没有 `num_hidden_layers`，直接取会 AttributeError。这里按
+    #   「顶层优先、text_config 兜底」读取，对既有标准架构行为不变。
+    _text_config = getattr(config, "text_config", None)
+    total_layers = int(getattr(config, "num_hidden_layers", None)
+                       or getattr(_text_config, "num_hidden_layers", 0))
+    if total_layers <= 0:
+        print("FAIL: cannot resolve num_hidden_layers", file=sys.stderr)
+        return 2
     layer_end = total_layers if args.layer_end is None else args.layer_end
     if layer_end <= args.layer_start or layer_end > total_layers:
         print("FAIL: invalid layer range", file=sys.stderr)
