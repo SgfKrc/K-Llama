@@ -235,6 +235,10 @@ class PipelineNode:
     federated: bool = False
     cross_engine: bool = False
     handoff_at: int | None = None
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**节点内执行器**。同一物理节点（同一 node_id）
+    #   上的 GPU 段与 CPU 段靠它区分；缺省 "" = 该节点的默认/主执行器 = 今天的行为。
+    #   必须留在**末尾且带默认值**（既有调用方按关键字/位置构造）。
+    executor_id: str = ""
 
     def __post_init__(self) -> None:
         node_id = str(self.node_id or "").strip()
@@ -263,9 +267,15 @@ class PipelineNode:
         object.__setattr__(self, "federated", bool(self.federated))
         object.__setattr__(self, "cross_engine", bool(self.cross_engine))
         object.__setattr__(self, "handoff_at", handoff_at)
+        object.__setattr__(self, "executor_id", str(self.executor_id or "").strip())
+
+    @property
+    def identity_key(self) -> tuple[str, str]:
+        """唯一性判据用的键：同一 node 上的不同执行器互不冲突。"""
+        return (self.node_id, self.executor_id)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "node_id": self.node_id,
             "kind": self.kind,
             "layer_range": list(self.layer_range),
@@ -279,6 +289,11 @@ class PipelineNode:
             "cross_engine": self.cross_engine,
             "handoff_at": self.handoff_at,
         }
+        # ★ 仅**非空**时输出：缺省即主执行器 ⇒ 既有 layout 的 `to_dict()` 形态与
+        #   `contract_sha256` 逐位不变（frozen 契约与只读消费者不受影响）。
+        if self.executor_id:
+            payload["executor_id"] = self.executor_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -358,7 +373,12 @@ def validate_pipeline_nodes(
         raise PipelineNodeContractError("pipeline requires at least one node")
     if any(not isinstance(node, PipelineNode) for node in values):
         raise PipelineNodeContractError("every layout entry must be a PipelineNode")
-    if len({node.node_id for node in values}) != len(values):
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：唯一性判据由 `node_id` 放宽到
+    #   `(node_id, executor_id)` —— 同一物理节点上的 GPU 段与 CPU 段必须能共存
+    #   （本票的目标形态）。`executor_id` 缺省 "" ⇒ 键退化为 `(node_id, "")`，
+    #   与旧的"node_id 唯一"**逐位等价** ⇒ 既有 layout 零回归。
+    #   错误文本保持原样（既有断言依赖它），但它现在指的是"节点身份"而非 node_id。
+    if len({node.identity_key for node in values}) != len(values):
         raise PipelineNodeContractError("pipeline node_id values must be unique")
 
     ordered = tuple(sorted(values, key=lambda node: node.layer_range))

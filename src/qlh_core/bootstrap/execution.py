@@ -73,7 +73,24 @@ class ExecutionApplication:
         local = deployment.get("local_assignment")
         if not local:
             raise ExecutionError("execution_master_prefix_missing")
-        segments = [Segment.freeze(scheduler.get_effective_node_id(), local, 0, local=True, incarnation=deployment["boot_id"])]
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**同一物理节点上的附加执行器**。
+        #   master 可以同时承载 GPU 段（`local_assignment`，语义不变）与 CPU 段
+        #   （`local_executors`，形如 `{executor_id: assignment}`）。三者刻意分开：
+        #     * 不进 `deployment["assignments"]` —— 那个键同时是 wire 目的地、
+        #       连接世代、incarnation 来源与 readiness 关联四种语义，且本机执行器
+        #       **没有 TCP 连接**，进 `expected` 必然被要求 ACK（会 `deployment_commit_receipts_missing`）。
+        #     * 与 `local_assignment` 共用 master 的 node_id、boot_id 作 incarnation
+        #       ⇒ 传输身份与故障归属仍是"这台机器"，不伪装成第二台物理机。
+        #   缺省为空 ⇒ 与改动前逐位相同（`Segment.executor_id` 也缺省空串）。
+        local_node_id = scheduler.get_effective_node_id()
+        segments = [Segment.freeze(local_node_id, local, 0, local=True,
+                                   incarnation=deployment["boot_id"])]
+        for executor_id, value in (deployment.get("local_executors") or {}).items():
+            if not executor_id:
+                raise ExecutionError("execution_local_executor_id_missing")
+            segments.append(Segment.freeze(local_node_id, value, 0, local=True,
+                                           incarnation=deployment["boot_id"],
+                                           executor_id=str(executor_id)))
         for node, value in deployment["assignments"].items():
             worker = scheduler._task_worker_control.worker_snapshot(node) or {}
             incarnation = worker.get("capabilities", {}).get("node_incarnation", "")
@@ -86,6 +103,11 @@ class ExecutionApplication:
         if not self.current(plan):
             raise ExecutionError("execution_deployment_fenced")
         for segment in plan.segments[1:]:
+            # ★ 本机执行器没有 TCP worker，它的 KV 由本进程自己管（见 `_reset_pipeline_kv`
+            #   的本机分支），所以不能要求远端才有的 `stage_kv_cleanup` 能力。
+            #   判据用 node_id 而非 executor_id：本机**主**执行器的 executor_id 是空串。
+            if segment.node_id == local_node_id:
+                continue
             worker = scheduler._task_worker_control.worker_snapshot(segment.node_id) or {}
             if worker.get("capabilities", {}).get("stage_kv_cleanup") is not True:
                 raise ExecutionError("execution_kv_cleanup_unsupported")

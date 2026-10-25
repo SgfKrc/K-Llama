@@ -271,3 +271,89 @@ def test_conflicting_domain_totals_are_rejected_loudly():
     ]
     with pytest.raises(PipelineCapacityError):
         validate_capacity_domains(nodes)
+
+
+# --------------------------------------------------------------------------
+# 执行器身份进契约（LOCAL-EXECUTORS-01 交付条件前半："同物理节点两段可规划"）
+# --------------------------------------------------------------------------
+
+def _segment(node_id, executor_id, start, end):
+    from qlh_core.contracts.execution import Segment
+
+    return Segment(node_id, f"assign-{node_id}-{executor_id or 'main'}", "inc-1", 1,
+                   start, end, start == 0, end == 8, "{}", executor_id)
+
+
+def test_execution_plan_admits_two_executors_on_one_physical_node():
+    """**同一 node_id、不同 executor_id** ⇒ 可规划（本票的目标形态）。
+
+    物理上就是一台机器：GPU 段跑 PyTorch 首段、CPU 段跑 llama.cpp 中间段。两者共享
+    同一份 RAM 与同一个传输身份，所以 `node_id` 必须相同；靠 `executor_id` 区分。
+    """
+    from qlh_core.contracts.execution import ExecutionPlan
+
+    plan = ExecutionPlan("deploy-1", "boot-1", "auth", 8, (
+        _segment("master", "", 0, 4),        # 主执行器 = GPU 段
+        _segment("master", "cpu", 4, 8),     # 附加执行器 = 同机 CPU 段
+    ))
+    assert [s.executor_id for s in plan.segments] == ["", "cpu"]
+    assert [s.identity_key for s in plan.segments] == [
+        ("master", ""), ("master", "cpu")]
+
+
+def test_execution_plan_still_rejects_duplicate_executor_identity():
+    """**同一 (node_id, executor_id) 出现两次** ⇒ 仍然拒绝。
+
+    放宽的是"一台机器只能有一个段"，不是"允许重复声明同一个执行器"。
+    """
+    from qlh_core.contracts.execution import ExecutionError, ExecutionPlan
+
+    with pytest.raises(ExecutionError, match="execution_requires_two_nodes"):
+        ExecutionPlan("deploy-1", "boot-1", "auth", 8, (
+            _segment("master", "", 0, 4),
+            _segment("master", "", 4, 8),
+        ))
+
+
+def test_executor_id_defaults_to_the_primary_executor():
+    """缺省 `executor_id` ⇒ 与改动前**逐位等价**（旧的"node_id 唯一"语义）。
+
+    这是整个阶段 2 的回归保证：既有 topology 从不传 `executor_id`，所以它们的
+    `identity_key` 退化为 `(node_id, "")`，唯一性判据与旧的 `node_id` 集合相同。
+    """
+    from qlh_core.contracts.execution import ExecutionPlan
+
+    plan = ExecutionPlan("deploy-1", "boot-1", "auth", 8, (
+        _segment("master", "", 0, 4),
+        _segment("worker", "", 4, 8),
+    ))
+    assert all(s.executor_id == "" for s in plan.segments)
+    assert {s.identity_key for s in plan.segments} == {("master", ""), ("worker", "")}
+
+
+def test_pipeline_node_executor_id_is_omitted_when_default():
+    """`to_dict()` 只在**非空**时输出 `executor_id`。
+
+    缺省即主执行器 ⇒ 既有 layout 的 `to_dict()` 形态与 `contract_sha256` 逐位不变，
+    frozen 契约与只读消费者不受影响。
+    """
+    from pipeline_node_contract import (
+        PipelineArtifactRef, PipelineNode, PipelineNodeCapacity,
+    )
+
+    common = dict(
+        kind="layer", layer_range=(0, 4), engine="pytorch", location="local",
+        capacity=PipelineNodeCapacity(capacity_bytes=1000, required_bytes=200,
+                                      reserve_bytes=50, execution_device="cpu"),
+        artifact=PipelineArtifactRef(model_sha256="a" * 64,
+                                     artifact_kind="safetensors_assignment",
+                                     architecture="qwen3",
+                                     source_layer_range=(0, 4)),
+    )
+    primary = PipelineNode(node_id="master", **common)
+    assert "executor_id" not in primary.to_dict()
+    assert primary.identity_key == ("master", "")
+
+    secondary = PipelineNode(node_id="master", executor_id="cpu", **common)
+    assert secondary.to_dict()["executor_id"] == "cpu"
+    assert secondary.identity_key == ("master", "cpu")

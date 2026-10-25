@@ -46,9 +46,17 @@ class Segment:
     embedding: bool
     head: bool
     payload: str
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**节点内执行器**。一台物理机可以承载多个
+    #   执行器（master 的 GPU 段 + 同机 CPU 段），二者 node_id **相同**（同一台机器、
+    #   同一个传输身份、同一份 RAM 域）而执行器不同。
+    #   ⚠️ 必须留在**末尾且带默认值**：`Segment` 已有 9 个位置参数，
+    #   `tests/test_refactor_execution.py` 等按位置构造；插在中间会静默错位。
+    #   缺省 "" = 该节点的默认/主执行器 = 今天的行为（唯一性判据因此逐位等价）。
+    executor_id: str = ""
 
     @classmethod
-    def freeze(cls, node, value, connection, *, local=False, incarnation=""):
+    def freeze(cls, node, value, connection, *, local=False, incarnation="",
+               executor_id=""):
         identity = value.get("worker_prepare_identity", value.get("identity", {}))
         spec = RuntimeLoadSpec.from_dict(value["load_spec"])
         start, end = identity.get("layer_range", [value.get("start_layer"), value.get("end_layer")])
@@ -57,7 +65,13 @@ class Segment:
         if not assignment or (not local and (not incarnation or connection < 1)):
             raise ExecutionError("execution_assignment_identity_missing")
         return cls(node, assignment, incarnation, connection, int(start), int(end),
-                   "embedding" in spec.components, "lm_head" in spec.components, canonical(value))
+                   "embedding" in spec.components, "lm_head" in spec.components, canonical(value),
+                   str(executor_id or identity.get("executor_id", "") or ""))
+
+    @property
+    def identity_key(self):
+        """唯一性判据用的键：同一 node 上的不同执行器互不冲突。"""
+        return (self.node_id, self.executor_id)
 
 
 @dataclass(frozen=True)
@@ -69,8 +83,13 @@ class ExecutionPlan:
     segments: tuple[Segment, ...]
 
     def __post_init__(self):
+        # ★ 2026-10-25：唯一性判据由 `node_id` 放宽到 `(node_id, executor_id)` ——
+        #   同一物理节点上的 GPU 段与 CPU 段**必须**能共存（这正是本票的目标形态）。
+        #   `executor_id` 缺省 "" ⇒ 键退化为 `(node_id, "")`，与旧的"node_id 唯一"
+        #   完全等价，既有 fixture 全为不同 node ⇒ 零回归。
+        #   "至少两段"的语义不变（分布式接力的前提是有东西可接力）。
         if (not self.deployment_id or not self.boot_id or len(self.segments) < 2
-                or len({s.node_id for s in self.segments}) != len(self.segments)):
+                or len({s.identity_key for s in self.segments}) != len(self.segments)):
             raise ExecutionError("execution_requires_two_nodes")
         cursor = 0
         for segment in self.segments:
