@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import sys
 import threading
+import time
 from typing import Any, Callable
 import uuid
 import weakref
@@ -1155,16 +1156,32 @@ class ModelSupplyWorker:
                 raise SupplyError("artifact_unavailable")
             directory = _within(matches[0], self.root.parent)
         self._check(op)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**逐步计时**。
+        #   实测（10:26）master 的 `activate_local` 静默卡了 >180 秒，而远端 30 秒就
+        #   `worker_native_loaded_ready`。单看代码无法判断卡在「选择键扫描」「哈希校验」
+        #   还是「准入锁/指针替换」；已排除哈希（3.3 GB 段一次 SHA-256 实测 2.69 s，
+        #   1230 MB/s）。这三段耗时能直接指出是哪一段。
+        _t0 = time.monotonic()
         verified_files = _selection_key(self.root, b"", directory, op.manifest)[1]
+        _t_key1 = time.monotonic()
         self._check(op)
         with _SELECTION_CACHE_LOCK:
             cached = _SELECTION_CACHE.get(str(self.root.resolve()))
             changed = _selection_files_changed(cached, verified_files)
         model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op),
                                   **({"fresh": True} if changed else {}))
+        _t_verify = time.monotonic()
         self._check(op)
         if _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
             raise SupplyError("artifact_changed")
+        _t_key2 = time.monotonic()
+        _LOG.info(
+            "event=local_register_timing dir=%s files=%d changed=%s "
+            "selection_ms=%d verify_ms=%d reselect_ms=%d",
+            directory.name, len(verified_files), changed,
+            (_t_key1 - _t0) * 1000, (_t_verify - _t_key1) * 1000,
+            (_t_key2 - _t_verify) * 1000,
+        )
         self._check(op)
         manifest_path = directory / "supply.manifest.json"
         if manifest_path.is_symlink() or _manifest(_json(manifest_path)) != op.manifest:

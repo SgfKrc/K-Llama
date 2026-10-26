@@ -2,7 +2,11 @@
 from __future__ import annotations
 from contextlib import contextmanager
 import json
+import logging
 import threading
+from typing import Mapping
+
+_LOG = logging.getLogger(__name__)
 
 from qlh_core.adapters.request_repository import SqliteRequestRepository
 from qlh_core.contracts.deadline import coerce_request_deadline
@@ -62,7 +66,17 @@ class ExecutionApplication:
         scheduler = self.scheduler
         if plan.boot_id != scheduler._model_control.boot_id:
             return False
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机执行器没有 TCP worker**，不能向
+        #   `worker_snapshot` 查证它的 incarnation —— 它的 incarnation 就是本进程的
+        #   `deployment["boot_id"]`（见 `freeze` 里建段时传入）。此前这里无差别遍历
+        #   `segments[1:]`，同机 CPU 段必然取不到 worker ⇒ incarnation 比对失败
+        #   ⇒ `current()` 返回 False ⇒ `execution_deployment_fenced`（实测 13:18：
+        #   段列表已经完美 `[0,8)+[8,24)+[24,28)+[28,32)`，却仍被这一条挡下）。
+        #   判据与下方 `stage_kv_cleanup` 那处保持一致：按 `node_id` 跳过本机段。
+        local_node_id = scheduler.get_effective_node_id()
         for segment in plan.segments[1:]:
+            if segment.node_id == local_node_id:
+                continue
             worker = scheduler._task_worker_control.worker_snapshot(segment.node_id) or {}
             if worker.get("capabilities", {}).get("node_incarnation") != segment.incarnation:
                 return False
@@ -111,6 +125,24 @@ class ExecutionApplication:
                 raise ExecutionError("execution_node_incarnation_unsupported")
             segments.append(Segment.freeze(node, value, deployment["connections"].get(node, 0), incarnation=incarnation))
         segments[1:] = sorted(segments[1:], key=lambda s: s.start)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**段列表是执行期唯一的连续性来源**。
+        #   `ExecutionPlan.__post_init__` 要求 `segment.start == cursor` 严格首尾相接，
+        #   一旦某个执行器没进 `local_executors`，缺口就在那里出现
+        #   （实测：缺 CPU 段的 `[8,24)` ⇒ `execution_segment_coverage_invalid`）。
+        #   而该键由 `scheduler_pipeline` 的 `freeze_pipeline_candidate_assignment`
+        #   逐段冻结而来 —— 任何一段冻结失败都会静默变成"缺口"，因此把两侧都打出来。
+        #   ★ 降为 debug：`freeze()` 每个请求甚至每一步都会重建 plan，放在 INFO 会让
+        #   每秒几十行把真正的执行日志（Route-A handoff、keep-head、traceback）整个
+        #   淹掉 —— 实测排查时完全看不到执行进展。需要时 `QLH_LOG_LEVEL=DEBUG`。
+        _LOG.debug(
+            "event=execution_segments total_layers=%s local_executors=%s "
+            "deployment_assignments=%s segments=%s",
+            lifecycle["total_layers"],
+            sorted((deployment.get("local_executors") or {}).keys()),
+            sorted(deployment["assignments"].keys()),
+            [(segment.node_id, str(segment.executor_id or ""), segment.start, segment.end)
+             for segment in segments],
+        )
         plan = ExecutionPlan(key, deployment["boot_id"], canonical(deployment["authority"]),
                              lifecycle["total_layers"], tuple(segments))
         if not self.current(plan):
@@ -230,6 +262,19 @@ class NativePorts:
         inputs = self.tokenizer(self.model_prompt, return_tensors="pt")
         self.input_ids, self.attention = inputs["input_ids"], inputs.get("attention_mask")
         self.prompt_length = int(self.input_ids.shape[1])
+        # ★ 2026-10-26：**prompt 长度与来源探针**。实测 `2+3=?`（4 token）却让每一段
+        #   都收到 `tokens=2644`，直接把一次 prefill 拖到 5 分钟以上。此前链路里
+        #   完全看不到 `model_prompt` 到底被拼成了什么 —— 只能在 `/api/chat/clear`
+        #   的 `deleted_count` 上间接猜。这里把长度、消息条数和开头露出。
+        _LOG.info(
+            "event=execution_prompt prompt_tokens=%d messages=%d chars=%d thinking=%s "
+            "head=%r",
+            self.prompt_length,
+            len(self.options.get("messages") or ()),
+            len(str(self.model_prompt or "")),
+            bool(self.options.get("show_thinking", False)),
+            str(self.model_prompt or "")[:200],
+        )
         local = json.loads(plan.segments[0].payload)
         self.context_size = local["load_spec"]["context_size"]
         if self.prompt_length + self.options.get("max_new_tokens", 1024) > self.context_size:
@@ -395,7 +440,22 @@ class NativePorts:
     def stage(self, segment, identity, hidden, record, *, positions=None, all_tokens=None):
         from execution_provider import ModelIdentity
         assignment = json.loads(segment.payload)
-        frozen = assignment["worker_prepare_identity"]
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**身份块的两种来源**。
+        #   远端 worker 用 `worker_prepare_identity`；本机执行器
+        #   （`freeze_pipeline_candidate_assignment`）写的是 `identity`。
+        #   `Segment.freeze` 早已按这个回退取值，这里此前硬取 ⇒ 本机 CPU 段一被
+        #   执行就 `KeyError: 'worker_prepare_identity'`（实测 11:31:27：
+        #   四段已就位、`execution_segments` 正确，却在第一个 CPU 段 stage 崩溃）。
+        frozen = assignment.get("worker_prepare_identity") or assignment.get("identity") or {}
+        # `stage_model_identity` 由 `bind_model_preflight` 注入到 assignment **顶层**
+        # （`model_preflight.py:571`），不在上面那个身份块里 —— 两种位置都接受。
+        stage_model = (
+            frozen.get("stage_model_identity")
+            or assignment.get("stage_model_identity")
+            or {}
+        )
+        if not stage_model:
+            raise ExecutionError("execution_stage_model_identity_missing")
         if positions is None:
             start = 0 if identity.step == 0 else self.prompt_length + identity.step - 1
             positions = list(range(start, start + len(hidden)))
@@ -403,7 +463,7 @@ class NativePorts:
             all_tokens = segment.head and self.options.get("_all_position_argmax") is True
         self.used.append(segment)
         value = self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
-            hidden_states=hidden, model_identity=ModelIdentity(**frozen["stage_model_identity"]),
+            hidden_states=hidden, model_identity=ModelIdentity(**stage_model),
             workflow_id="wf_" + record["request_id"], request_id=f'{record["request_id"]}:step:{identity.step}',
             stage_id=f'{stage_identity(segment)}:step:{identity.step}', context_size=self.context_size,
             executor_id=segment.executor_id,
@@ -475,12 +535,12 @@ class NativePorts:
                         self._receipt_guard._check(self.plan, record)
                     record["deadline"].require_remaining()
                     assignment = json.loads(segment.payload)
-                    frozen = assignment["worker_prepare_identity"]
+                    frozen = assignment.get("worker_prepare_identity") or assignment.get("identity") or {}
                     # 与 `stage()` 共用 `stage_identity()`：同 node 两段的清理回执
                     # 必须关联到各自的 stage，不能因为 node_id 相同而撞车。
                     receipt = self.scheduler._execute_layer_stage_offer(node_id=segment.node_id, assignment=assignment,
-                        hidden_states=np.zeros((1, frozen["hidden_size"]), dtype=np.float32),
-                        model_identity=ModelIdentity(**frozen["stage_model_identity"]),
+                        hidden_states=np.zeros((1, int((frozen.get("hidden_size") or assignment.get("hidden_size") or 1))), dtype=np.float32),
+                        model_identity=ModelIdentity(**(frozen.get("stage_model_identity") or assignment.get("stage_model_identity") or {})),
                         workflow_id="wf_" + record["request_id"], request_id=record["request_id"] + ":" + tag,
                         stage_id=stage_identity(segment) + ":" + tag, context_size=self.context_size,
                         want_hidden=not segment.head, middle_channel="keep_head_layer_out",
@@ -522,7 +582,20 @@ class NativePorts:
             else:
                 self._reset_pipeline_kv(record, tag="cleanup")
         except Exception:
+            # ★ 2026-10-26：**不许静默**。此前这里是裸 `clean = False`，于是
+            #   "清理失败"在执行侧没有任何痕迹 —— 调用方只看到
+            #   `request_runtime_cleanup_pending`，而该错误会把整个 deployment 加入
+            #   `_quarantine`（`requests.py:203`），之后**所有**请求都被
+            #   `request_runtime_cleanup_pending` 挡下（实测连发数次 503），
+            #   现场只能靠猜。清理失败必须能定位到是哪一段、哪个错误码。
             clean = False
+            _LOG.warning(
+                "event=execution_cleanup_failed request=%s segments=%s",
+                record.get("request_id") if isinstance(record, Mapping) else "",
+                [(segment.node_id, str(segment.executor_id or ""),
+                  segment.start, segment.end) for segment in self.used],
+                exc_info=True,
+            )
         finally:
             self.cache = None
             if self.lock_held:

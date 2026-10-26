@@ -12,6 +12,7 @@
 """
 
 import collections
+import functools
 import hashlib
 import importlib.util
 import json
@@ -316,6 +317,90 @@ def _local_cpu_layer_bytes() -> int:
     except OSError:
         return 0
     return size // layers if size > 0 else 0
+
+
+@functools.lru_cache(maxsize=4)
+def _cpu_artifact_digest(path: str, size: int, mtime_ns: int) -> str:
+    """工件文件的 SHA-256。按 `(path, size, mtime_ns)` 缓存 ⇒ 3.23 GB 只读一次。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _local_cpu_artifact_sha256() -> str:
+    """本机 CPU 段工件的 SHA-256（取不到返回空串）。"""
+    artifact = _local_cpu_layer_artifact()
+    if not artifact:
+        return ""
+    try:
+        stat = Path(artifact).stat()
+    except OSError:
+        return ""
+    try:
+        return _cpu_artifact_digest(str(Path(artifact).resolve()), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return ""
+
+
+def _local_cpu_layer_artifacts(records) -> list:
+    """为本机 CPU 段申报 `layer_artifacts`（求解器补齐整模视图的唯一数据源）。
+
+    ★ 2026-10-26（LOCAL-EXECUTORS-01）：**这是"同机两段并存"的最后一环。**
+
+    求解器要用**整模**的逐层字节（`_descriptor_costs` 要求每层正字节），而跨格式
+    主节点（PyTorch 描述器 + GGUF 层段）的 descriptor **只覆盖 master 自己那 8 层**，
+    其余靠 `_merge_source_layer_bytes(descriptor, usable)` 从各节点的
+    `layer_artifacts` 平移拼出来。
+
+    主段 `[0,8)`、本机 CPU 段 `[8,24)`、远端各占其余 ⇒ CPU 段**不申报**，
+    `[8,24)` 这 16 层就永远是 0。实测（2026-10-26 09:58）：
+
+        PipelineCapacityError: every decoder layer must have a positive byte count
+          (zero at layers [8..19]...; total_layers=32, zero_count=24)
+
+    ⇒ `prepare` 直接失败（`pipeline_capacity_descriptor_invalid`），
+    而此时四段工件其实**全部已就位**（视图里全是 `available`）。
+
+    `source_model_sha256` **必须与描述器一致**，否则补齐函数会静默跳过本工件；
+    它取自其他节点已申报的工件身份（同一次供给里它们同源）。
+    """
+    from config import local_cpu_executor_layer_range
+
+    layer_range = local_cpu_executor_layer_range()
+    per_layer = _local_cpu_layer_bytes()
+    if layer_range is None or per_layer <= 0:
+        return []
+    source_sha = ""
+    model_id = ""
+    for item in records or ():
+        if not isinstance(item, dict) or str(item.get("executor_id") or ""):
+            continue
+        for artifact in item.get("layer_artifacts") or ():
+            sha = str(artifact.get("source_model_sha256", "") or "").strip().lower()
+            if sha:
+                source_sha = sha
+                model_id = str(artifact.get("model_id", "") or "").strip()
+                break
+        if source_sha:
+            break
+    if not source_sha or not model_id:
+        return []
+    artifact_sha = _local_cpu_artifact_sha256()
+    if not artifact_sha:
+        return []
+    start, end = int(layer_range[0]), int(layer_range[1])
+    if end <= start:
+        return []
+    return [{
+        "layer_range": [start, end],
+        "segment_mode": "middle",
+        "model_id": model_id,
+        "artifact_sha256": artifact_sha,
+        "source_model_sha256": source_sha,
+        "layer_weight_bytes": [per_layer] * (end - start),
+    }]
 
 
 
@@ -2081,11 +2166,12 @@ class Scheduler(
         from contextlib import nullcontext
         from config import (
             HOST_RAM_MAX_FRACTION,
-            LOCAL_CPU_EXECUTOR_ENABLED,
-            LOCAL_CPU_EXECUTOR_HOST_FRACTION,
             LOCAL_CPU_EXECUTOR_ID,
             LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
             PIPELINE_CAPACITY_RESERVE_MB,
+            local_cpu_executor_enabled,
+            local_cpu_executor_host_fraction,
+            local_cpu_executor_layer_range,
         )
         from koakuma_engine import canonical_backend
 
@@ -2500,7 +2586,7 @@ class Scheduler(
                 #   ⇒ CPU 段启用时，主段的区间留给它**自己的运行时**决定：它在 CUDA 上跑
                 #   PyTorch、按显存规划（这正是 `local_executor_entered_supply_plan` 之后的
                 #   正常路径）。CPU 段的工件只描述 CPU 段自己。
-                local_cpu_executor_on = bool(LOCAL_CPU_EXECUTOR_ENABLED)
+                local_cpu_executor_on = local_cpu_executor_enabled()
                 local_artifact = (
                     None if local_cpu_executor_on else self._configured_layer_artifact()
                 )
@@ -2577,7 +2663,19 @@ class Scheduler(
         #       （`validate_capacity_domains` 会 fail closed）。
         #     * `segment_mode="middle"` —— keep-head 上游的挂点在 `output_norm` **之后**，
         #       所以它**不能当首段**（首段必须有 embedding）。
-        if LOCAL_CPU_EXECUTOR_ENABLED and self._effective_role() == "master":
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**探针**。本机 CPU 段的启用判据有三个
+        #   独立的输入（开关、角色、工件区间），任何一个是空值都会让整段静默消失，
+        #   而日志里只表现成"CPU 段不在 plan 里"——无法区分是哪一项没满足。
+        #   实测（2026-10-26 09:50）：`.env` 写明 `QLH_LOCAL_CPU_EXECUTOR=1`，但
+        #   CPU 段始终不申报，全靠逐个变量猜。这一行把三项一次打出来。
+        logger.info(
+            "event=local_cpu_executor_probe enabled=%s role=%s layer_range=%s "
+            "host_fraction=%.2f env_raw=%r",
+            local_cpu_executor_enabled(), self._effective_role(),
+            local_cpu_executor_layer_range(), local_cpu_executor_host_fraction(),
+            os.environ.get("QLH_LOCAL_CPU_EXECUTOR"),
+        )
+        if local_cpu_executor_enabled() and self._effective_role() == "master":
             # ★ 2026-10-25：**把本机主段的层区间打出来**。求解器报
             #   `node_layer_range_not_advertised` 时，`candidate_exclusions` 只能指出
             #   "master 的哪些候选被排除"，却看不到它**实际声明了**什么区间 —— 而两者
@@ -2607,6 +2705,33 @@ class Scheduler(
             if base_record is not None:
                 cpu_record = self._local_cpu_executor_record(base_record)
                 records.append(cpu_record)
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**申报本段工件**。
+                #   descriptor 的整模逐层字节只覆盖 master 段，其余靠
+                #   `_merge_source_layer_bytes` 从各节点 `layer_artifacts` 补；
+                #   CPU 段不申报 ⇒ 它那 16 层永远是 0 ⇒ prepare 报
+                #   `every decoder layer must have a positive byte count`。
+                #   源身份取自同一批 records 里远端已申报的工件（同源）。
+                _cpu_artifacts = _local_cpu_layer_artifacts(records)
+                if _cpu_artifacts:
+                    cpu_record["layer_artifacts"] = _cpu_artifacts
+                    logger.info(
+                        "event=local_cpu_executor_artifact_declared "
+                        "layer_range=%s layers=%s per_layer_bytes=%s "
+                        "source=%s artifact_sha256=%s",
+                        _cpu_artifacts[0]["layer_range"],
+                        len(_cpu_artifacts[0]["layer_weight_bytes"]),
+                        _cpu_artifacts[0]["layer_weight_bytes"][0]
+                        if _cpu_artifacts[0]["layer_weight_bytes"] else 0,
+                        _cpu_artifacts[0]["source_model_sha256"][:12],
+                        _cpu_artifacts[0]["artifact_sha256"][:12],
+                    )
+                else:
+                    # 缺源身份或工件摘要 ⇒ 补齐会失败，宁可现在就喊出来。
+                    logger.warning(
+                        "event=local_cpu_executor_artifact_missing reason=%s",
+                        "no-source-identity" if not _cpu_artifacts
+                        else "unknown",
+                    )
                 # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**两段分摊同一份主机内存总账**，
                 #   且必须**幂等**。域校验按主机内存记账（见 `capacity_domains`），若两段
                 #   都按整机申报 ⇒ 之和超总账 ⇒ `pipeline_capacity_domain_exceeded`
@@ -2657,9 +2782,9 @@ class Scheduler(
             所以它**不能当首段**（首段必须有 embedding）。
         """
         from config import (
-            LOCAL_CPU_EXECUTOR_HOST_FRACTION,
             LOCAL_CPU_EXECUTOR_ID,
             LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            local_cpu_executor_host_fraction,
             local_cpu_executor_layer_range,
         )
 
@@ -2672,7 +2797,7 @@ class Scheduler(
             "capacity_domain_id": base_record["node_id"],
             "domain_total_bytes": host_total,
             "capacity_bytes": max(
-                0, int(host_total * LOCAL_CPU_EXECUTOR_HOST_FRACTION)),
+                0, int(host_total * local_cpu_executor_host_fraction())),
             "reserve_bytes": base_record["reserve_bytes"],
             "reserve_source": "config.PIPELINE_CAPACITY_RESERVE_MB",
             "runtime_multiplier": base_record["runtime_multiplier"],
@@ -3677,6 +3802,26 @@ class Scheduler(
         with self._layer_config_push_lock:
             if not self.get_distributed_inference_enabled():
                 return
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**供给事务在手时 legacy 分层整体退让**。
+            #
+            #   本函数有 14 个调用点（注册确认、hello、节点增删、心跳、集群角色切换、
+            #   api_server 与 engine_host 侧等），逐个加判据既不现实也必然漏 ——
+            #   所以收口在这里。它的下游 `_push_layer_config_to_clients_locked` 走的是
+            #   `compute_layer_assignment` 的 `simple_weight` 加权切分，与供给求解器的
+            #   `capacity_plan.assignments` 是**两个独立答案**。
+            #   实测（2026-10-26 13:20，balanced）：
+            #     供给   = master[0,24) / android[24,28) / TABLET[28,32)
+            #     legacy = master[0,20) / android[20,22) / TABLET[22,24)
+            #   ⇒ worker 认了这边丢那边 ⇒ 主节点「重发分层配置」无限重试
+            #   ⇒ 供给 15 分钟到不了 `ready`，而日志看起来只像"慢"。
+            #
+            #   判据用 `_pipeline_load_transaction`：供给事务存在即代表本次分层由
+            #   求解器负责；供给结束事务清空 ⇒ legacy 恢复原行为，无回归。
+            if getattr(self, "_pipeline_load_transaction", None) is not None:
+                logger.debug(
+                    "layer_config_push skipped reason=pipeline_supply_active"
+                )
+                return
             # Keep the transition check under the same lock used by the
             # publisher.  Otherwise a transition can begin after the check
             # but before the publish and still leak a transient release.
@@ -3885,6 +4030,26 @@ class Scheduler(
         elif task_worker_handshake_pending:
             logger.info(
                 "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
+                client_id,
+            )
+        elif getattr(self, "_pipeline_load_transaction", None) is not None:
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**供给事务在手时 legacy 分层必须退让**。
+            #
+            #   `push_layer_config_to_clients()` 走的是旧路径
+            #   （`compute_layer_assignment` → `_simple_weight_assignment` 的
+            #   `simple_weight` 加权切分），它算出的切点与供给求解器给出的
+            #   `capacity_plan.assignments` **是两个独立答案**。
+            #   实测（2026-10-26 13:20，`QLH_CAPACITY_PLANNING_MODE=balanced`）：
+            #     供给 plan  = master[0,24) / android[24,28) / TABLET[28,32)
+            #     legacy     = master[0,20) / android[20,22) / TABLET[22,24)
+            #   ⇒ 两条路径各自往同一批 worker 推配置 ⇒ worker 认了这边丢了那边
+            #   ⇒ 主节点「重发分层配置」无限重试（attempt 11、12…）⇒ 供给永远到不了
+            #   `ready`（15 分钟无进展，而单看日志像是"慢"）。
+            #
+            #   判据用 `_pipeline_load_transaction`：供给事务存在即代表本次分层由
+            #   求解器负责。供给结束后该事务清空，legacy 恢复原有行为 ⇒ 无回归。
+            logger.info(
+                "legacy_layer_config skipped reason=pipeline_supply_active node=%s",
                 client_id,
             )
         else:

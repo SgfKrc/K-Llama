@@ -542,6 +542,16 @@ def pipeline_layout_from_capacity_plan(
             federated=bool(meta.get("federated", not is_local)),
             cross_engine=bool(meta.get("cross_engine", False)),
             handoff_at=meta.get("handoff_at"),
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**执行器身份必须传下去**。
+            #   同机 GPU 段与 CPU 段共用 `node_id="master"`，靠 `executor_id` 区分；
+            #   `identity_key` 已经是 `(node_id, executor_id)`，但这里没填 ⇒ 两个
+            #   `PipelineNode` 的键都是 `("master", "")` ⇒ `validate_pipeline_nodes`
+            #   报 `pipeline node_id values must be unique` ⇒
+            #   `pipeline_node_contract_invalid` ⇒ prepare 失败。
+            #   实测（2026-10-26 10:05）：容量求解已经给出
+            #     [('master','',0,8), ('master','cpu',8,24), ('android',...), ('TABLET',...)]
+            #   却死在布局契约上。缺省 "" ⇒ 与旧的"node_id 唯一"逐位等价。
+            executor_id=str(assignment.get("executor_id") or ""),
         ))
     annotated: list[PipelineNode] = []
     previous_engine = ""

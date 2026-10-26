@@ -324,7 +324,16 @@ def _descriptor_costs(
         for index, value in enumerate(raw_layers)
     ]
     if any(value <= 0 for value in layer_bytes):
-        raise PipelineCapacityError("every decoder layer must have a positive byte count")
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**带出是哪些层为 0**。
+        #   本函数是纯求解器、不能记日志（`test_refactor_capacity_load_spec` 会把
+        #   `logging.Logger._log` patch 成禁止），所以异常消息是唯一的诊断通道。
+        #   只报"每层必须有正字节数"无法判断是补零没生效、还是补了但覆盖不全。
+        zeros = [index for index, value in enumerate(layer_bytes) if value <= 0]
+        raise PipelineCapacityError(
+            "every decoder layer must have a positive byte count "
+            f"(zero at layers {zeros[:12]}{'...' if len(zeros) > 12 else ''}; "
+            f"total_layers={total_layers}, zero_count={len(zeros)})"
+        )
 
     components = descriptor.get("component_weight_bytes")
     if not isinstance(components, dict):

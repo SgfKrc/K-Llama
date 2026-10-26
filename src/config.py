@@ -504,6 +504,36 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     #   `node_id`（同一传输身份、同一份 RAM），靠 `executor_id` 区分，容量按
     #   `capacity_domain_id` 合并记账（见 `validate_capacity_domains`）。
     LOCAL_CPU_EXECUTOR_ENABLED = bool(_env_int("QLH_LOCAL_CPU_EXECUTOR", 0, min_val=0, max_val=1))
+
+    def local_cpu_executor_enabled() -> bool:
+        """主节点是否启用本机 CPU 分段执行器（运行时读 env，**不要用模块常量**）。
+
+        ⚠️ 与 `host_ram_offload_enabled` 是**同一类陷阱**：`.env` 由 `SettingsStore`
+        在**模块 import 之后**才写入 `os.environ`（见本文件顶部
+        "Import is a read-only compatibility view. Explicit SettingsStore startup
+        owns .env"）。 模块常量 `LOCAL_CPU_EXECUTOR_ENABLED` 会在 import 那一刻就
+        定死为默认值 `False`，于是 `.env` 里写了 `QLH_LOCAL_CPU_EXECUTOR=1`
+        也**永远不生效**。
+
+        实测（2026-10-26 09:44）：`.env` 明确写着 `=1`，而进程内
+        `os.environ.get("QLH_LOCAL_CPU_EXECUTOR")` 是 `None`、
+        `LOCAL_CPU_EXECUTOR_ENABLED` 是 `False` ⇒ 本机 CPU 段从未申报
+        ⇒ 三机供给退化成"master 独扛 28 层" ⇒ 只用 VRAM 4.47 GB ⇒ 无解
+        （`master#:node_capacity_insufficient`，用户原话："只算了 VRAM 没算 RAM"）。
+
+        保留模块常量是为了兼容既有导入点；**判断"是否启用"必须调用本函数**。
+
+        ⚠️ 还有第二层陷阱：`build_settings` 内部的 `_env_int` 读的是它的
+        `environment` **参数快照**（`dict(os.environ)`），运行时再改 `os.environ`
+        对它无效。所以这里直接读 `os.environ`（与 `host_ram_offload_enabled` 一致）。
+        """
+        raw = os.environ.get("QLH_LOCAL_CPU_EXECUTOR")
+        if raw is None or str(raw).strip() == "":
+            return False
+        try:
+            return int(raw) == 1
+        except (TypeError, ValueError):
+            return False
     # 该执行器的标识（进入 `Segment.executor_id` / `PipelineNode.executor_id`）。
     LOCAL_CPU_EXECUTOR_ID = (os.environ.get("QLH_LOCAL_CPU_EXECUTOR_ID") or "cpu").strip() or "cpu"
     # 该执行器的每层成本（ms）。缺省用实测值 6.84。
@@ -514,6 +544,20 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     LOCAL_CPU_EXECUTOR_HOST_FRACTION = _env_float(
         "QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION", 0.5, min_val=0.0, max_val=1.0,
     )
+
+    def local_cpu_executor_host_fraction() -> float:
+        """同上，**运行时读 `os.environ`**（模块常量会被 import 时的快照固化）。
+
+        影响域账里本机 CPU 段占的那份 host RAM；读不到就退回默认 0.5。
+        """
+        raw = os.environ.get("QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION")
+        if raw is None or str(raw).strip() == "":
+            return 0.5
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.5
+        return value if 0.0 <= value <= 1.0 else 0.5
     # ★ 2026-10-25：该执行器承载的**层区间**（`"start,end"`，闭开）。
     #   本机 keep-head 用的是**裁好的 GGUF 工件**（例：`q35-9b-local-mid4-24.gguf`
     #   对应 `4,24`），求解器**必须**被钉到该区间：否则它可能切出工件不覆盖的层，
@@ -529,8 +573,16 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
 
         非法输入返回 None（并在调用处退化为"不约束"）而不是抛错：这是运行期配置，
         一次手误不该让整次供给失败 —— 但**不静默假装约束有效**，调用处会记日志。
+
+        ⚠️ **必须运行时读 `os.environ`，不能用模块常量**
+        `LOCAL_CPU_EXECUTOR_LAYER_RANGE`：`.env` 由 `SettingsStore` 在 import 之后
+        才写入 `os.environ` ⇒ 模块常量会停在 import 那一刻的空串 ⇒ 本函数返回 None
+        ⇒ **工件边界不再受限** ⇒ 求解器可能把工件覆盖不到的层派给本机 CPU 段
+        （实测给出 `[8,28)` 而 `mid8-24.gguf` 只覆盖 `[8,24)`）⇒ 验收判据 2 失守，
+        且失败发生在**执行期**（层号越界/权重缺失），属于"部署看起来成功、
+        第一次推理才炸"的最坏形态。
         """
-        raw = LOCAL_CPU_EXECUTOR_LAYER_RANGE
+        raw = (os.environ.get("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE") or "").strip()
         if not raw:
             return None
         parts = [piece.strip() for piece in raw.replace(":", ",").replace("-", ",").split(",")]

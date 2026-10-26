@@ -11,9 +11,12 @@ api_server 的运行时反向 import（scheduler.py 中 12 处 `import api_serve
 
 原生访问使用显式端口；运行态由 RuntimeController 发布。
 """
+import hashlib
+import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from koakuma_engine import (
     BackendCapabilities,
@@ -800,20 +803,103 @@ class ModelHost:
         from copy import deepcopy
         from qlh_core.planning.load_spec import assignment_load_spec
         transaction = self._require_pipeline_candidate(transaction_id)
-        native = getattr(transaction.manager, "engine_type", "pytorch") == "llama_cpp"
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**引擎按该 assignment 判，不是事务的 manager**。
+        #
+        #   同机 CPU 段（llama_cpp）与主段（pytorch）共用**同一个** candidate 事务，
+        #   而 `transaction.manager` 是主段的引擎。此前用 manager 判 `native`
+        #   ⇒ CPU 段被当成 safetensors 段 ⇒ `artifact_format` 错、也不去取 GGUF 摘要。
+        #   实测（2026-10-26 11:52）：plan 里四段齐全、供给 `ready`，但 `/api/chat`
+        #   立刻 503 `execution_segment_coverage_invalid`，缺的正是 CPU 段的 `[8,24)`。
+        #
+        #   缺省（assignment 未声明 engine）时退回原判据，保持既有行为不变。
+        assignment_engine = str(assignment.get("engine") or "").strip()
+        native = (assignment_engine == "llama_cpp") if assignment_engine else (
+            getattr(transaction.manager, "engine_type", "pytorch") == "llama_cpp"
+        )
         artifact_sha = transaction.model_sha256 or transaction.descriptor.get("model_sha256")
         if native:
-            path = transaction.manager._find_layer_artifact(int(assignment["start_layer"]), int(assignment["end_layer"]))
-            if not path:
-                raise ValueError("deployment_local_artifact_missing")
-            artifact_sha = transaction.manager._pipeline_file_sha256(path)
+            # CPU 段的 GGUF 由它自己加载（本机文件 `QLH_LAYER_GGUF`），**不在**
+            # `transaction.manager` 里 —— 那里只有主段（pytorch）的层工件，而且
+            # `ModelManager` 根本没有 `_find_layer_artifact` 方法（原 `native` 判据
+            # 从未为真，这段代码是第一次被执行 ⇒ 一跑就暴露）。
+            #   优先级：求解结果带的 `layer_artifact.artifact_sha256` > 本机 GGUF 文件摘要。
+            selected = assignment.get("layer_artifact")
+            selected_sha = (
+                str(selected.get("artifact_sha256") or "").strip().lower()
+                if isinstance(selected, Mapping) else ""
+            )
+            if selected_sha:
+                artifact_sha = selected_sha
+            else:
+                raw_layer = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
+                if not raw_layer:
+                    raise ValueError("deployment_local_artifact_missing")
+                layer_path = Path(raw_layer)
+                if not layer_path.is_absolute():
+                    # 相对路径按仓库根解析（`.env` 里写的是 `models/...`）。
+                    layer_path = Path(__file__).resolve().parents[1] / layer_path
+                if not layer_path.is_file():
+                    raise ValueError("deployment_local_artifact_missing")
+                digest = hashlib.sha256()
+                with open(layer_path, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                artifact_sha = digest.hexdigest()
         spec = assignment_load_spec(assignment, artifact_format="gguf" if native else "safetensors")
         result = deepcopy(assignment)
         result["load_spec"] = spec.to_dict()
-        result["identity"] = {"config_id": config_id, "generation": generation,
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`stage_model_identity` 必须自建**。
+        #
+        #   `bind_model_preflight` 只给**有 binding 的 worker** 注入这个键（按
+        #   `(node_id, start_layer, end_layer)` 查表，`model_preflight.py:571`），
+        #   而本机执行器根本不在 worker 列表里 ⇒ 永远取不到。
+        #   执行期要拿它构造 `ModelIdentity(**...)`，缺了就直接
+        #   `execution_stage_model_identity_missing`（实测 14:14）。
+        #   字段集与 `model_preflight._MODEL_IDENTITY_FIELDS` 完全一致
+        #   （model_id/engine/format/revision/sha256），取值与远端同源：描述器 + 本段工件摘要。
+        stage_model = dict(assignment.get("stage_model_identity") or {})
+        if not stage_model:
+            _descriptor = transaction.descriptor or {}
+            stage_model = {
+                "model_id": str(
+                    _descriptor.get("model_id")
+                    or assignment.get("model_id")
+                    or "local"
+                ),
+                "engine": "llama_cpp" if native else "pytorch",
+                "format": "gguf" if native else "safetensors",
+                "revision": str(
+                    assignment.get("quant_type")
+                    or _descriptor.get("quant_type")
+                    or "local"
+                ),
+                "sha256": str(artifact_sha or ""),
+            }
+        result["identity"] = {
+            # ★ `stage_identity()` 要求 `STAGE_IDENTITY_FIELDS` 全集
+            #   （operation_id/config_id/generation/assignment_id/artifact_sha256），
+            #   本机执行器没有供给侧的 `operation_id`，用本机前缀派生一个合法值
+            #   （`_ID` 允许 `[A-Za-z0-9_.:/-]`）。缺了它，执行期会在
+            #   `validate_stage_identity` 抛 `invalid_prepare_identity`。
+            "operation_id": "local-" + config_id,
+            "config_id": config_id, "generation": generation,
             "assignment_id": "local-" + config_id, "node_id": "master",
             "layer_range": [int(assignment["start_layer"]), int(assignment["end_layer"])],
-            "artifact_sha256": artifact_sha, "load_spec_digest": spec.digest}
+            "artifact_sha256": artifact_sha, "load_spec_digest": spec.digest,
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**与远端 `worker_prepare_identity` 同构**。
+            #
+            #   执行期（`qlh_core/bootstrap/execution.py` 的 `stage()` 与
+            #   `_reset_pipeline_kv()`）直接消费这两个键：
+            #     * `stage_model_identity` → `ModelIdentity(**...)`，由
+            #       `bind_model_preflight` 注入到 assignment **顶层**，这里搬进来；
+            #     * `hidden_size` → `np.zeros((1, hidden_size))` 的清理占位张量。
+            #       远端是 worker 自报的，本机则取自描述器。
+            #   缺了它们，本机 CPU 段一被 stage 就
+            #   `KeyError: 'worker_prepare_identity'` / `KeyError: 'hidden_size'`
+            #   （实测 11:31:27：四段已就位、段列表正确，却死在第一个 CPU 段）。
+            "stage_model_identity": stage_model,
+            "hidden_size": int(transaction.descriptor.get("hidden_size", 0) or 0),
+        }
         return result
 
     def materialize_pipeline_candidate(

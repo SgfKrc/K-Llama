@@ -641,6 +641,21 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             ),
             "assignments": assignments,
             "local_assignment": transaction.get("local_assignment"),
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**同机附加执行器必须进快照**。
+            #
+            #   这是"同机跨框架两段并存"的最后一环，也是最隐蔽的一环：`freeze` 明明
+            #   成功（日志 `local_executor_freeze_done frozen=['cpu']`），但执行期
+            #   `execution_segments local_executors=[]` —— 因为
+            #   `qlh_core/control/deployment.py:293` 是从 **lifecycle（本快照）** 读
+            #   `local_executors` 再写进 deployment 的，而这里没输出该字段
+            #   ⇒ `lifecycle.get(...)` 为 None ⇒ 下游跳过写入 ⇒ deployment 里没有
+            #   ⇒ 执行期段列表缺 CPU 段的 `[8,24)` ⇒ 覆盖不连续
+            #   ⇒ `/api/chat` 503 `execution_segment_coverage_invalid`。
+            #   实测（2026-10-26 12:58）：plan 四段齐全、供给 ready、freeze 成功，
+            #   唯独执行期只有 3 段。
+            #   缺省 `{}`（而非 None）：下游 `if ... is not None` 才会写入，
+            #   与 `local_assignment` 的语义一致。
+            "local_executors": dict(transaction.get("local_executors") or {}),
             "local_receipt": transaction.get("local_receipt"),
             "candidate_id": transaction.get("candidate_id", ""),
             "process_identity": transaction.setdefault("process_identity", self._model_control_process_identity()),
@@ -2361,6 +2376,18 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             #   共用 master 的 node_id/boot_id 作 incarnation，因此传输身份与故障归属
             #   仍是"这台机器"，而不是续航一台虚拟物理机。
             if callable(freeze):
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**这一步的产物是执行期段连续性的
+                #   唯一来源**。实测（12:48）`bootstrap/execution` 报
+                #   `local_executors=[]` ⇒ segments 缺 `[8,24)` ⇒
+                #   `execution_segment_coverage_invalid`，而 plan 里四段齐全、
+                #   供给 `ready`。需要看清是"plan 里没有"、"master_ids 不匹配"
+                #   还是"freeze 返回 None"。
+                logger.info(
+                    "event=local_executor_freeze_begin plan=%s master_ids=%s",
+                    [(item.get("node_id"), str(item.get("executor_id") or ""))
+                     for item in capacity_plan.get("assignments", [])],
+                    sorted(master_ids),
+                )
                 for item in capacity_plan.get("assignments", []):
                     executor_id = str(item.get("executor_id") or "")
                     if not executor_id or item.get("node_id") not in master_ids:
@@ -2369,11 +2396,21 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                         frozen_executor = freeze(candidate["candidate_id"], item,
                                                  config_id=config_id, generation=generation)
                     except Exception as exc:
+                        logger.warning(
+                            "event=local_executor_freeze_failed executor=%s err=%s: %s",
+                            executor_id, type(exc).__name__, exc,
+                        )
                         return {"status": "rejected", "admitted": False,
                                 "reason_code": str(exc), "assignments": [],
                                 "transaction_phase": "rejected"}
                     if frozen_executor is not None:
                         local_executors_frozen[executor_id] = frozen_executor
+                logger.info(
+                    "event=local_executor_freeze_done frozen=%s",
+                    sorted(local_executors_frozen),
+                )
+            else:
+                logger.warning("event=local_executor_freeze_unavailable freeze=%r", freeze)
         if capacity_plan is not None:
             if not assignments and not stage_assignments:
                 capacity_plan = dict(capacity_plan)
@@ -2767,24 +2804,31 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         #   改为只在实际超预算时才查询；fits 时 `_assert_layer_stage_offer_fits_frame` 本就
         #   提前 return（不看该参数），故**语义完全等价**。
         _fits_single_frame = hidden_fits_stage_frame(n_tokens, n_embd, "float32")
-        # ★ 票 21a（COMM-WIRE-01）：只有 base64 判不下时才查能力（该查询含全量
-        #   capabilities 深拷贝），且**一次查询**同时取出分片与二进制两个键 ——
-        #   分别调 `_node_declares_*` 会各付一次深拷贝。
-        _worker_caps = (
-            {}
-            if _fits_single_frame and not want_all_tokens
-            else _node_capabilities(
-                getattr(self, "_task_worker_control", None), str(node_id)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机执行器没有网络帧**。
+        #   帧大小上限是 TCP 传输约束（base64 / 分片 / 二进制体），而本机执行器
+        #   走进程内 provider（见下方 `if executor_id:` 分支），根本不序列化成帧。
+        #   此前无条件校验 ⇒ 本机 CPU 段在 hidden 稍大时被
+        #   `route_a_stage_frame_too_large` 拒绝（实测 11:45:11：CPU 段第一次真正
+        #   被 stage，就死在这里，而它并不是远端）。
+        if not executor_id:
+            # ★ 票 21a（COMM-WIRE-01）：只有 base64 判不下时才查能力（该查询含全量
+            #   capabilities 深拷贝），且**一次查询**同时取出分片与二进制两个键 ——
+            #   分别调 `_node_declares_*` 会各付一次深拷贝。
+            _worker_caps = (
+                {}
+                if _fits_single_frame and not want_all_tokens
+                else _node_capabilities(
+                    getattr(self, "_task_worker_control", None), str(node_id)
+                )
             )
-        )
-        _assert_layer_stage_offer_fits_frame(
-            node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
-            # ★ 票 21a：对端声明 `binary_hidden` ⇒ 帧走原始字节体，单帧容量 +≈33%。
-            binary_hidden=_worker_caps.get("binary_hidden") is True,
-            # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
-            #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
-            chunked_input=_worker_caps.get("stage_chunked_input") is True,
-        )
+            _assert_layer_stage_offer_fits_frame(
+                node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
+                # ★ 票 21a：对端声明 `binary_hidden` ⇒ 帧走原始字节体，单帧容量 +≈33%。
+                binary_hidden=_worker_caps.get("binary_hidden") is True,
+                # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
+                #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
+                chunked_input=_worker_caps.get("stage_chunked_input") is True,
+            )
         hidden_spec = {
             "n_tokens": n_tokens,
             "n_embd": n_embd,
@@ -2801,7 +2845,12 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             "middle_channel": middle_channel,
         }
         from worker_prepare_contract import stage_identity
-        identity = assignment.get("worker_prepare_identity")
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：本机执行器的身份块键名是 `identity`
+        #   （`freeze_pipeline_candidate_assignment` 写入），远端才是
+        #   `worker_prepare_identity`。`Segment.freeze` 早已按此回退，这里此前硬取
+        #   ⇒ 本机 CPU 段 stage 时 `KeyError`。两处现已一致。
+        identity = (assignment.get("worker_prepare_identity")
+                    or assignment.get("identity") or {})
         ready, reason = self._worker_prepare_assignment_loaded(node_id, assignment)
         if not ready:
             raise RuntimeError(reason)
@@ -2862,6 +2911,10 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
             model_identity=model_identity,
             stage_fields=stage_fields,
             runtime_context={"pipeline_route": "route_a"},
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：把执行器身份交给执行侧 ——
+            #   它需要据此判断"这一段的工件由谁持有"（本机附加执行器有自己的
+            #   GGUF 层段，不能落到全局主模型）。缺省 "" 与改动前逐位等价。
+            executor_id=str(executor_id or ""),
         )
         try:
             reservation = provider.reserve(request)

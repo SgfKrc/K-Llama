@@ -356,9 +356,30 @@ class SupplyCapacityEvidence:
             #   `prepare_artifact_identity_missing`。容量确实不再满足时，求解入口会
             #   去掉这个约束重排（见 scheduler 的容量求解），即"内存增加不动切点、
             #   减少才重切"。
-            record["candidate_layer_ranges"] = [
-                [int(assignment["start_layer"]), int(assignment["end_layer"])]
-            ]
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**切点必须换算到组空间**。
+            #
+            #   `assignment.start_layer/end_layer` 是**层索引**（工件坐标系，实测
+            #   master 段是 `[0,8)`、CPU 段是 `[8,24)`），而 `candidate_layer_ranges`
+            #   的契约是**对齐组**索引 —— `project_supply_capacity_nodes` 里一律写
+            #   `start // alignment`，求解器的工作空间也是组（`total_layers = 32 ÷ 4 = 8`）。
+            #
+            #   此前把层索引直接抄进 `candidate_layer_ranges` ⇒ `[[0, 8]]` 被理解成
+            #   "组 0..8" = "层 0..32"，而工件只有层 `[0,8)` ⇒ prepare 阶段按错误的
+            #   候选重新切段 ⇒ 与已裁好的段对不上。
+            #
+            #   `cut_alignment` 由求解结果自带；缺省 1 时与原行为逐位等价。
+            _alignment = int((query.get("plan") or {}).get("cut_alignment") or 1)
+            if _alignment < 1:
+                _alignment = 1
+            _start = int(assignment["start_layer"])
+            _end = int(assignment["end_layer"])
+            if _start % _alignment or _end % _alignment:
+                raise _error(
+                    "SUPPLY_RUNTIME_NODE_UNAVAILABLE",
+                    f"Selected node {node_id} has an unaligned segment [{_start},{_end}) "
+                    f"for alignment {_alignment}",
+                )
+            record["candidate_layer_ranges"] = [[_start // _alignment, _end // _alignment]]
             result.append(record)
             handled.add(key)
             item = {"node_id": node_id, "engine": engine, "execution_device": device,
