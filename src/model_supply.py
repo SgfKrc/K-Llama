@@ -6,12 +6,14 @@ assignment-scoped files from that master; no worker-to-worker transfer is create
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
 import hmac
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import shutil
@@ -80,6 +82,25 @@ def _segment_disk_weight_bytes(descriptor: dict, assignment: dict, source_path: 
     return sum(descriptor["layer_weight_bytes"][start:end]) + sum(
         int(components.get(key, 0)) for key in keys
     )
+
+
+def _segment_disk_overhead_bytes(engine: str, source_path: Path) -> int:
+    from model_supply_assets import _MAX_HEADER, _gguf_table
+
+    if engine == "llama_cpp":
+        if not source_path.is_file():
+            return _MAX_HEADER
+        _, tensors = _gguf_table(source_path)
+        return _MAX_HEADER + len(tensors) * 32
+
+    from pipeline_assignment_manifest import _support_files
+
+    source_root = Path(source_path)
+    if source_root.is_file() and source_root.suffix == ".safetensors":
+        source_root = source_root.parent
+    excluded = {"model.manifest.json", "cross_format.provenance.json", ".qlh-model-asset.json"}
+    support = (name for name in _support_files(source_root) if Path(name).name not in excluded)
+    return _MAX_HEADER + sum((source_root / name).stat().st_size for name in support)
 
 
 def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
@@ -819,6 +840,7 @@ class ModelSupplyCoordinator:
         from relay_segment_info import read_gguf_layer_info
         from model_supply_assets import _hash_file_cached
         model_id = intent["model_id"]
+        started = time.monotonic()
         from model_supply_sources import ensure_registered_sources
         source_result = ensure_registered_sources(
             model_id, operation_dir=self.root / op_id / "source",
@@ -832,7 +854,8 @@ class ModelSupplyCoordinator:
         descriptors = {}
         if hf and (hf / "config.json").is_file():
             descriptor = inspect_pipeline_model(hf, model_id=model_id, digest=_hash_file_cached)
-            descriptor.setdefault("model_sha256", compute_model_sha256(str(hf), digest=_hash_file_cached))
+            if "model_sha256" not in descriptor:
+                descriptor["model_sha256"] = compute_model_sha256(str(hf), digest=_hash_file_cached)
             descriptors["pytorch"] = descriptor
         if gguf and gguf.is_file():
             info = read_gguf_layer_info(gguf) or {}
@@ -867,6 +890,8 @@ class ModelSupplyCoordinator:
             descriptor = descriptors[master_engine]
             identity = descriptor.get("source_model_sha256", descriptor["model_sha256"])
             tokenizer = descriptor["tokenizer_sha256"]
+        logger.info("event=supply_sources_done operation=%s elapsed_ms=%d engines=%s",
+                    op_id, int((time.monotonic() - started) * 1000), sorted(descriptors))
         return {"hf": hf, "gguf": gguf, "descriptors": descriptors,
                 "master_engine": master_engine, "alignment": alignment,
                 "source_model_id": model_id, "source_model_sha256": identity,
@@ -952,14 +977,190 @@ class ModelSupplyCoordinator:
                          capacity_diagnostic=None if cancelled else getattr(exc, "diagnostic", None))
             self._cancel_receivers(op_id, list(self.get(op_id)["nodes"]))
         finally:
-            # ★ 2026-10-24（#125）：**无论成败都回收历史操作目录**。此前每次供给都会在
-            #   `operations/<op_id>/` 留下 3~15 GB 的段工件且从不回收（实测积压
-            #   146 个 / 453.78 GB）。保留当前这次与设置指定的最近若干次。
             try:
-                self.collect_operation_directories(keep_operation_ids=(op_id,))
+                if self.get(op_id).get("status") != "available":
+                    self.collect_operation_directories(keep_operation_ids=(op_id,))
             except Exception:
                 logger.exception("event=supply_operations_reclaim_failed operation_id=%s", op_id)
 
+
+    def _local_resident_view(self, op_id, sources, plan, assignment, deadline):
+        from model_supply_digest_cache import (
+            DigestCacheError, cached_metadata, cached_sha256, file_stamp,
+        )
+        from relay_segment_info import read_artifact_manifest, read_gguf_layer_info
+
+        def check():
+            self._check(op_id)
+            if time.monotonic() >= deadline:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_TIMEOUT", "Resident verification exceeded the operation deadline")
+
+        def mismatch():
+            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_MISMATCH", "Bound resident artifact disagrees with the selected supply identity")
+
+        check()
+        selected = assignment.get("layer_artifact")
+        alignment = sources["alignment"]
+        span = [assignment["start_layer"], assignment["end_layer"]]
+        if (assignment.get("engine") != "llama_cpp" or not isinstance(selected, dict)
+                or type(alignment) is not int or alignment < 1
+                or plan.get("cut_alignment", alignment) != alignment
+                or any(type(value) is not int for value in span)
+                or not 0 <= span[0] < span[1] <= plan["total_layers"]):
+            mismatch()
+        selected_span = selected.get("layer_range")
+        if (not isinstance(selected_span, (list, tuple)) or len(selected_span) != 2
+                or any(type(value) is not int for value in selected_span)
+                or [value * alignment for value in selected_span] != span):
+            mismatch()
+        mode = "head" if span[0] == 0 else "tail" if span[1] == plan["total_layers"] else "middle"
+        if selected.get("segment_mode") != mode:
+            mismatch()
+        for field in ("source_model_sha256", "tokenizer_sha256"):
+            if not isinstance(sources.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", sources[field]) is None:
+                mismatch()
+        artifact_sha = selected.get("artifact_sha256")
+        if (not isinstance(artifact_sha, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None
+                or selected.get("source_model_sha256") != sources["source_model_sha256"]
+                or not isinstance(sources.get("source_model_id"), str) or not sources["source_model_id"]
+                or not isinstance(selected.get("model_id"), str) or not selected["model_id"]):
+            mismatch()
+        for field, expected in (("model_id", sources["source_model_id"]),
+                                ("model_sha256", sources["source_model_sha256"]),
+                                ("source_model_sha256", sources["source_model_sha256"])):
+            if field in plan and plan[field] != expected:
+                mismatch()
+        configured_path = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
+        if not configured_path:
+            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "QLH_LAYER_GGUF is not configured")
+        artifact = Path(configured_path)
+        if not artifact.is_absolute():
+            artifact = Path(__file__).resolve().parents[1] / artifact
+        markers = (artifact.with_suffix(".manifest.json"), Path(str(artifact) + ".manifest.json"))
+
+        def version():
+            check()
+            if (os.environ.get("QLH_LAYER_GGUF") or "").strip() != configured_path:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_CHANGED", "Resident artifact binding changed")
+            try:
+                return (str(artifact.resolve(strict=True)), file_stamp(artifact), tuple(
+                    file_stamp(marker) if marker.exists() else None for marker in markers))
+            except OSError as exc:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "Bound resident artifact is unavailable") from exc
+
+        before = version()
+
+        def unchanged():
+            if version() != before:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_CHANGED", "Resident artifact or sidecar changed")
+
+        def cancelled():
+            check()
+            return False
+
+        def read_manifest(path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_span = payload.get("source_layer_range") if isinstance(payload, dict) else None
+            if (not isinstance(raw_span, list) or len(raw_span) != 2
+                    or any(type(value) is not int for value in raw_span)):
+                return {}
+            return read_artifact_manifest(path) or {}
+
+        try:
+            manifests = []
+            for marker, stamp in zip(markers, before[2]):
+                if stamp is None:
+                    continue
+                manifest = cached_metadata(marker, "supply-local-resident-v1", read_manifest, cancelled)
+                if (manifest.get("source_layer_range") != span
+                        or manifest.get("artifact_sha256") != artifact_sha
+                        or any(manifest.get(field) != sources[field] for field in (
+                            "source_model_id", "source_model_sha256", "tokenizer_sha256"))
+                        or ("n_layer" in manifest and manifest["n_layer"] != plan["total_layers"])):
+                    mismatch()
+                manifests.append(marker)
+            if not manifests:
+                mismatch()
+            info = read_gguf_layer_info(artifact) or {}
+            if info.get("n_layer") != span[1] - span[0]:
+                mismatch()
+            if cached_sha256(artifact, cancelled) != artifact_sha:
+                mismatch()
+        except (OSError, DigestCacheError, json.JSONDecodeError) as exc:
+            check()
+            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "Resident file verification failed") from exc
+        unchanged()
+        total_bytes = before[1][0]
+        return ({"status": "available", "strategy": "local_resident", "layer_range": span,
+                 "segment_mode": mode, "total_bytes": total_bytes, "artifact_sha256": artifact_sha,
+                 "source_model_id": sources["source_model_id"],
+                 "source_model_sha256": sources["source_model_sha256"],
+                 "tokenizer_sha256": sources["tokenizer_sha256"], "model_id": selected["model_id"],
+                 "model_path": before[0], "resident_manifest_path": str(manifests[0].resolve()),
+                 "transfer_granularity": "local_file", "engine": assignment["engine"],
+                 "executor_id": assignment["executor_id"], "node_id": assignment["node_id"],
+                 "actual_downloaded_bytes": 0, "reused_bytes": total_bytes}, unchanged)
+
+    @contextmanager
+    def _segment_builds(self, op_id, sources, plan, deadline):
+        from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
+        stopped = threading.Event()
+        jobs = []
+        reserve = 0
+        for assignment in plan["assignments"]:
+            self._check(op_id)
+            node_id = assignment["node_id"]
+            if node_id == "master" and assignment.get("executor_id"):
+                continue
+            directory = self.root / op_id / node_id
+            directory.mkdir(parents=True, exist_ok=True)
+            engine = assignment["engine"]
+            source = sources["gguf"] if engine == "llama_cpp" else sources["hf"]
+            estimated = _segment_disk_weight_bytes(sources["descriptors"][engine], assignment, source)
+            identity = {"node_id": node_id, "source_model_id": sources["source_model_id"],
+                        "source_model_sha256": sources["source_model_sha256"],
+                        "tokenizer_sha256": sources["tokenizer_sha256"], "total_layers": plan["total_layers"],
+                        "layer_range": [assignment["start_layer"], assignment["end_layer"]],
+                        "segment_mode": "head" if assignment["start_layer"] == 0 else
+                                        "tail" if assignment["end_layer"] == plan["total_layers"] else "middle",
+                        "format": "gguf" if engine == "llama_cpp" else "safetensors",
+                        "conversion_proof": sources["conversion_proof"]}
+            if not segment_cache_hint(self.root, identity):
+                reserve += estimated + _segment_disk_overhead_bytes(engine, source)
+            jobs.append((assignment, directory, source))
+        if shutil.disk_usage(self.root / op_id).free < reserve:
+            raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
+
+        def build(assignment, directory, source):
+            self._check(op_id)
+            started = time.monotonic()
+            builder = build_gguf_segment if assignment["engine"] == "llama_cpp" else build_safetensors_segment
+            options = {"cancelled": lambda: stopped.is_set() or self._events[op_id].is_set(),
+                       "deadline": deadline}
+            manifest = builder(source, directory, source_model_id=sources["source_model_id"],
+                               source_model_sha256=sources["source_model_sha256"],
+                               tokenizer_sha256=sources["tokenizer_sha256"],
+                               start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
+                               total_layers=plan["total_layers"], operation_id=op_id, node_id=assignment["node_id"],
+                               conversion_proof=sources["conversion_proof"], reuse_root=self.root, **options)
+            self._check(op_id)
+            logger.info("event=supply_segment_build_done operation=%s node=%s executor=%s elapsed_ms=%d reused_bytes=%d",
+                        op_id, assignment["node_id"], assignment.get("executor_id", ""),
+                        int((time.monotonic() - started) * 1000), manifest.get("_reused_bytes", 0))
+            return manifest
+
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="supply-build")
+        futures = []
+        try:
+            futures = [(assignment, directory, executor.submit(build, assignment, directory, source))
+                       for assignment, directory, source in jobs]
+            by_future = {future: (assignment, directory) for assignment, directory, future in futures}
+            yield ((by_future[future][0], by_future[future][1], future) for future in as_completed(by_future))
+        finally:
+            stopped.set()
+            for _, _, future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _execute(self, op_id):
         # ★ 2026-10-24（#117）：清点等待上限在此统一取一次，供本函数内所有
@@ -1576,185 +1777,165 @@ class ModelSupplyCoordinator:
                     self._connections.pop(key)
             self._update(op_id, status="building", plan=plan, nodes=nodes,
                          candidate_node_ids=candidate_node_ids)
-        from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
         pending_receipts = []
+        pending_local = []
+        resident_checks = []
         for assignment in plan["assignments"]:
-            self._check(op_id)
-            node_id = assignment["node_id"]
-            directory = self.root / op_id / node_id
-            directory.mkdir(parents=True, exist_ok=True)
-            builder = build_gguf_segment if assignment["engine"] == "llama_cpp" else build_safetensors_segment
-            src = sources["gguf"] if assignment["engine"] == "llama_cpp" else sources["hf"]
-            # Disk budget covers the temporary segment + final publish. Source
-            # is already on disk; a missing source is never assumed free.
-            disk_descriptor = sources["descriptors"][assignment["engine"]]
-            estimated = _segment_disk_weight_bytes(disk_descriptor, assignment, src)
-            free = shutil.disk_usage(directory).free
-            identity = {"node_id": node_id, "source_model_id": sources["source_model_id"],
-                "source_model_sha256": sources["source_model_sha256"],
-                "tokenizer_sha256": sources["tokenizer_sha256"], "total_layers": plan["total_layers"],
-                "layer_range": [assignment["start_layer"], assignment["end_layer"]],
-                "segment_mode": "head" if assignment["start_layer"] == 0 else
-                                "tail" if assignment["end_layer"] == plan["total_layers"] else "middle",
-                "format": "gguf" if assignment["engine"] == "llama_cpp" else "safetensors",
-                "conversion_proof": sources["conversion_proof"]}
-            if free < max(estimated * 2, 64 * 1024**2) and not segment_cache_hint(self.root, identity):
-                raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
-            build_options = ({"cancelled": lambda: self._events[op_id].is_set(), "deadline": deadline}
-                             if assignment["engine"] == "llama_cpp" else {})
-            manifest = builder(src, directory, source_model_id=sources["source_model_id"],
-                               source_model_sha256=sources["source_model_sha256"],
-                               tokenizer_sha256=sources["tokenizer_sha256"],
-                               start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
-                               total_layers=plan["total_layers"], operation_id=op_id, node_id=node_id,
-                               conversion_proof=sources["conversion_proof"], reuse_root=self.root, **build_options)
-            self._check(op_id)
-            reused_bytes = manifest.pop("_reused_bytes", 0)
-            files = manifest.pop("local_files")
-            total_bytes = sum(int(item["size_bytes"]) for item in manifest["files"])
-            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**部署视图必须按执行器身份区分**。
-            #
-            #   同机 CPU 段与主段共用 `node_id="master"` ⇒ `nodes[node_id] = ...` 让它们
-            #   **互相覆盖**，对外只剩后写的那个。实测（2026-10-26 05:38）：
-            #     master [8,16)  ← 这是 **CPU 段**的区间（组 [2,4)×4）
-            #   而主段的 `[0,8)` **整个消失** —— capacity plan 里两段并存是有的（日志可证），
-            #   但对外视图只剩一段，肉眼根本无法确认"并存"这一验收判据。
-            #
-            #   视图键取 `node_id`（主执行器，保持既有客户端契约）或
-            #   `node_id#executor_id`（附加执行器）。
-            executor_id = str(assignment.get("executor_id") or "")
-            view_key = node_id if not executor_id else f"{node_id}#{executor_id}"
+            if assignment["node_id"] != "master" or not assignment.get("executor_id"):
+                continue
+            view, unchanged = self._local_resident_view(op_id, sources, plan, assignment, deadline)
             with self._condition:
-                nodes[view_key] = {"status": "supplying", "layer_range": manifest["layer_range"],
-                                   "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
-                                   "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
-                                   "transfer_granularity": "segment_tensors", "engine": assignment["engine"],
-                                   "executor_id": executor_id, "node_id": node_id}
-                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：留痕「视图里到底有哪些键」。
-                #   同机两段的并存只有在**对外视图**里也能看到时才算可验证；此前
-                #   `plan` 四段齐全、磁盘上 `master/` 也确实有两个 segment 目录，
-                #   但 intent 的 `nodes` 只有三条，无从确认。这一行把每次发布的键集合
-                #   打出来，才能分清是"没写进去"还是"写进去又被覆盖"。
-                logger.info(
-                    "event=supply_view_publish op=%s view_key=%s keys=%s",
-                    op_id, view_key, sorted(nodes),
-                )
-                self._update(op_id, nodes=nodes, status="supplying")
-            # ★ 同上：**"本机"是主执行器的性质，不是 `node_id` 的性质**。本机 CPU 段
-            #   （llama.cpp）虽然也在 master 上，但它的权重**就地常驻**、由它自己的
-            #   执行器注册，不走 `activate_local` 的 PyTorch 段注册路径。
-            if node_id == "master" and not executor_id:
+                unchanged()
+                self._check_receivers(op_id)
+                nodes[f"master#{assignment['executor_id']}"] = view
+                self._update(op_id, nodes=nodes)
+            resident_checks.append(unchanged)
+        with self._segment_builds(op_id, sources, plan, deadline) as builds:
+            for assignment, directory, future in builds:
                 self._check(op_id)
-                result = self.scheduler._model_supply_worker.activate_local(
-                    manifest, directory, cancelled=lambda: self._events[op_id].is_set(),
-                )
-                if result.get("status") != "available":
-                    raise ModelSupplyError(str(result.get("reason_code") or "SUPPLY_LOCAL_REGISTRATION_FAILED"), "Master could not register its segment")
+                manifest = future.result()
+                node_id = assignment["node_id"]
+                reused_bytes = manifest.pop("_reused_bytes", 0)
+                files = manifest.pop("local_files")
+                total_bytes = sum(int(item["size_bytes"]) for item in manifest["files"])
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**部署视图必须按执行器身份区分**。
+                #
+                #   同机 CPU 段与主段共用 `node_id="master"` ⇒ `nodes[node_id] = ...` 让它们
+                #   **互相覆盖**，对外只剩后写的那个。实测（2026-10-26 05:38）：
+                #     master [8,16)  ← 这是 **CPU 段**的区间（组 [2,4)×4）
+                #   而主段的 `[0,8)` **整个消失** —— capacity plan 里两段并存是有的（日志可证），
+                #   但对外视图只剩一段，肉眼根本无法确认"并存"这一验收判据。
+                #
+                #   视图键取 `node_id`（主执行器，保持既有客户端契约）或
+                #   `node_id#executor_id`（附加执行器）。
+                executor_id = str(assignment.get("executor_id") or "")
+                view_key = node_id if not executor_id else f"{node_id}#{executor_id}"
                 with self._condition:
-                    nodes[view_key].update(status="available", strategy="reuse" if reused_bytes else "local_build",
-                                           actual_downloaded_bytes=0, reused_bytes=reused_bytes)
-                    self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
-                continue
-            if node_id == "master" and executor_id:
-                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机附加执行器（CPU 段）既不需要
-                #   跨网传输，也不走 PyTorch 段注册** —— 它的工件（keep-head GGUF）本来就在
-                #   本机磁盘上、由它自己的执行器就地加载并常驻。此前它会一路走到下面的
-                #   远端分支，尝试向"远端 master"拉取自己的段。
+                    nodes[view_key] = {"status": "supplying", "layer_range": manifest["layer_range"],
+                                       "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
+                                       "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
+                                       "transfer_granularity": "segment_tensors", "engine": assignment["engine"],
+                                       "executor_id": executor_id, "node_id": node_id}
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：留痕「视图里到底有哪些键」。
+                    #   同机两段的并存只有在**对外视图**里也能看到时才算可验证；此前
+                    #   `plan` 四段齐全、磁盘上 `master/` 也确实有两个 segment 目录，
+                    #   但 intent 的 `nodes` 只有三条，无从确认。这一行把每次发布的键集合
+                    #   打出来，才能分清是"没写进去"还是"写进去又被覆盖"。
+                    logger.info(
+                        "event=supply_view_publish op=%s view_key=%s keys=%s",
+                        op_id, view_key, sorted(nodes),
+                    )
+                    self._update(op_id, nodes=nodes, status="supplying")
+                # ★ 同上：**"本机"是主执行器的性质，不是 `node_id` 的性质**。本机 CPU 段
+                #   （llama.cpp）虽然也在 master 上，但它的权重**就地常驻**、由它自己的
+                #   执行器注册，不走 `activate_local` 的 PyTorch 段注册路径。
+                if node_id == "master" and not executor_id:
+                    pending_local.append((view_key, manifest, directory, reused_bytes))
+                    continue
+                available_sources = inventories[node_id].get("sources") or []
+                # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
+                #   源身份的核心是权重摘要 `source_model_sha256`，tokenizer 摘要是附加
+                #   校验。此前用 `entry.get("tokenizer_sha256", default)` 判等，当 worker
+                #   上报的键**存在但值为 None/""**（实测安卓那份整模 GGUF：
+                #   `read_gguf_tokenizer_sha256` 读不到元数据 ⇒ tokenizer_sha256=None）
+                #   时不会回退到默认值 ⇒ 被判"无匹配本地源" ⇒ 明明握着整模却只能从网络
+                #   以 ~0.67 MB/s 拉 4 层（实测卡 `bytes=0` 超过 10 分钟）。
+                #   现在：源没给出 tokenizer 就不据此否决它。
+                matching_source = any(
+                    entry.get("source_model_sha256") == sources["source_model_sha256"]
+                    and (not entry.get("tokenizer_sha256")
+                         or entry.get("tokenizer_sha256") == sources["tokenizer_sha256"])
+                    for entry in available_sources)
+                can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
+                requested = intent.get("strategy", "auto")
+                if requested == "local_cut" and not can_cut:
+                    raise ModelSupplyError("SUPPLY_LOCAL_CUT_UNAVAILABLE", f"Worker {node_id} lacks the verified source or cutter")
+                strategy = "local_cut" if can_cut and requested != "distribute" else "distribute"
+                reason = ("SUPPLY_LOCAL_CUT_PREFERRED" if strategy == "local_cut" else
+                          "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
+                          "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
+                          "SUPPLY_NODE_CUTTER_UNAVAILABLE")
+                # ★ 2026-10-24（#124）：**复用显式参与决策**。此前 master 只在
+                #   local_cut / distribute 间二选一，从不告知节点"复用你已有的段"：
+                #   Python worker 好在收到 local_cut 时会先试 `reuse_segment`，而 Kotlin
+                #   worker（android）的 local_cut 路径**没有任何复用检查** ⇒ 每轮白裁约
+                #   3 GB（实测 ~105 s），即使它磁盘上已有身份完全一致的同段缓存
+                #   （已用两轮 marker 逐字段 diff 证明仅 manifest_sha256/operation_id 两个
+                #   收据字段不同，而这两者不在接收端 `sameContentIdentity` 判据内）。
+                #
+                #   接收端的复用能力挂在 distribute 路径上（`ModelSupplyReceiver.receive()`
+                #   在下载前会先按 `sameContentIdentity` 扫已发布段并 hardlink），所以这里
+                #   把命中的节点改判为 distribute ⇒ 零网络传输地复用已有段。
+                #
+                #   只在此处**确认**层段与三项摘要全等时才切换：若复用意外未命中，
+                #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
+                cached_hit = False
+                if strategy == "local_cut" and requested == "auto":
+                    try:
+                        control = getattr(self.scheduler, "_task_worker_control", None)
+                        snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
+                        # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
+                        caps = snapshot.get("capabilities") or snapshot
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        caps = {}
+                    want_range = list(manifest.get("layer_range") or [])
+                    for artifact in caps.get("layer_artifacts") or []:
+                        if (isinstance(artifact, dict)
+                                and list(artifact.get("layer_range") or []) == want_range
+                                and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
+                                and artifact.get("source_model_id") == manifest.get("source_model_id")
+                                and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
+                                and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")):
+                            cached_hit = True
+                            break
+                if cached_hit:
+                    strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
+                    logger.info(
+                        "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
+                        "reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
+                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12], reason,
+                    )
+                elif strategy == "local_cut" and requested == "auto":
+                    # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
+                    logger.info(
+                        "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
+                        "advertised=%d artifact_shas=%s ranges=%s",
+                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12],
+                        len(caps.get("layer_artifacts") or []),
+                        [str(item.get("artifact_sha256"))[:12]
+                         for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                        [item.get("layer_range")
+                         for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                    )
+                # Do not attempt a new local cut when its staging reserve is already
+                # known infeasible; the receiver can still reuse its cached files.
+                if (strategy == "local_cut" and requested == "auto" and
+                        int(inventories[node_id].get("disk_free_bytes", 0)) < total_bytes + 64 * 1024**2):
+                    strategy, reason = "distribute", "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT"
+                token = secrets.token_urlsafe(32)
                 with self._condition:
-                    nodes[view_key].update(status="available", strategy="local_resident",
-                                           actual_downloaded_bytes=0, reused_bytes=reused_bytes)
-                    self._update(op_id, nodes=nodes)
-                continue
-            available_sources = inventories[node_id].get("sources") or []
-            # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
-            #   源身份的核心是权重摘要 `source_model_sha256`，tokenizer 摘要是附加
-            #   校验。此前用 `entry.get("tokenizer_sha256", default)` 判等，当 worker
-            #   上报的键**存在但值为 None/""**（实测安卓那份整模 GGUF：
-            #   `read_gguf_tokenizer_sha256` 读不到元数据 ⇒ tokenizer_sha256=None）
-            #   时不会回退到默认值 ⇒ 被判"无匹配本地源" ⇒ 明明握着整模却只能从网络
-            #   以 ~0.67 MB/s 拉 4 层（实测卡 `bytes=0` 超过 10 分钟）。
-            #   现在：源没给出 tokenizer 就不据此否决它。
-            matching_source = any(
-                entry.get("source_model_sha256") == sources["source_model_sha256"]
-                and (not entry.get("tokenizer_sha256")
-                     or entry.get("tokenizer_sha256") == sources["tokenizer_sha256"])
-                for entry in available_sources)
-            can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
-            requested = intent.get("strategy", "auto")
-            if requested == "local_cut" and not can_cut:
-                raise ModelSupplyError("SUPPLY_LOCAL_CUT_UNAVAILABLE", f"Worker {node_id} lacks the verified source or cutter")
-            strategy = "local_cut" if can_cut and requested != "distribute" else "distribute"
-            reason = ("SUPPLY_LOCAL_CUT_PREFERRED" if strategy == "local_cut" else
-                      "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
-                      "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
-                      "SUPPLY_NODE_CUTTER_UNAVAILABLE")
-            # ★ 2026-10-24（#124）：**复用显式参与决策**。此前 master 只在
-            #   local_cut / distribute 间二选一，从不告知节点"复用你已有的段"：
-            #   Python worker 好在收到 local_cut 时会先试 `reuse_segment`，而 Kotlin
-            #   worker（android）的 local_cut 路径**没有任何复用检查** ⇒ 每轮白裁约
-            #   3 GB（实测 ~105 s），即使它磁盘上已有身份完全一致的同段缓存
-            #   （已用两轮 marker 逐字段 diff 证明仅 manifest_sha256/operation_id 两个
-            #   收据字段不同，而这两者不在接收端 `sameContentIdentity` 判据内）。
-            #
-            #   接收端的复用能力挂在 distribute 路径上（`ModelSupplyReceiver.receive()`
-            #   在下载前会先按 `sameContentIdentity` 扫已发布段并 hardlink），所以这里
-            #   把命中的节点改判为 distribute ⇒ 零网络传输地复用已有段。
-            #
-            #   只在此处**确认**层段与三项摘要全等时才切换：若复用意外未命中，
-            #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
-            cached_hit = False
-            if strategy == "local_cut" and requested == "auto":
-                try:
-                    control = getattr(self.scheduler, "_task_worker_control", None)
-                    snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
-                    # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
-                    caps = snapshot.get("capabilities") or snapshot
-                except (AttributeError, KeyError, TypeError, ValueError):
-                    caps = {}
-                want_range = list(manifest.get("layer_range") or [])
-                for artifact in caps.get("layer_artifacts") or []:
-                    if (isinstance(artifact, dict)
-                            and list(artifact.get("layer_range") or []) == want_range
-                            and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
-                            and artifact.get("source_model_id") == manifest.get("source_model_id")
-                            and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
-                            and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")):
-                        cached_hit = True
-                        break
-            if cached_hit:
-                strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
-                logger.info(
-                    "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
-                    "reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
-                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12], reason,
-                )
-            elif strategy == "local_cut" and requested == "auto":
-                # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
-                logger.info(
-                    "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
-                    "advertised=%d artifact_shas=%s ranges=%s",
-                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12],
-                    len(caps.get("layer_artifacts") or []),
-                    [str(item.get("artifact_sha256"))[:12]
-                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
-                    [item.get("layer_range")
-                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
-                )
-            # Do not attempt a new local cut when its staging reserve is already
-            # known infeasible; the receiver can still reuse its cached files.
-            if (strategy == "local_cut" and requested == "auto" and
-                    int(inventories[node_id].get("disk_free_bytes", 0)) < total_bytes + 64 * 1024**2):
-                strategy, reason = "distribute", "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT"
-            token = secrets.token_urlsafe(32)
+                    self._leases[(op_id, node_id)] = {"token": token, "files": files}
+                with self._condition:
+                    nodes[node_id].update(strategy=strategy, strategy_reason_code=reason)
+                self._send(op_id, node_id, {"action": "ensure", "node_id": node_id, "strategy": strategy,
+                                         "manifest": manifest, "api_port": int(API_PORT), "token": token,
+                                         "allow_fallback": requested == "auto", "strategy_reason_code": reason,
+                                         "local_cut_timeout_seconds": max(1, min(300, int((deadline - time.monotonic()) / 3)))})
+                pending_receipts.append((node_id, manifest, total_bytes, strategy, time.monotonic()))
+        for view_key, manifest, directory, reused_bytes in pending_local:
+            self._check(op_id)
+            started = time.monotonic()
+            result = self.scheduler._model_supply_worker.activate_local(
+                manifest, directory, cancelled=lambda: self._events[op_id].is_set(),
+            )
+            if result.get("status") != "available":
+                raise ModelSupplyError(str(result.get("reason_code") or "SUPPLY_LOCAL_REGISTRATION_FAILED"), "Master could not register its segment")
+            logger.info("event=supply_local_activation_done operation=%s elapsed_ms=%d",
+                        op_id, int((time.monotonic() - started) * 1000))
             with self._condition:
-                self._leases[(op_id, node_id)] = {"token": token, "files": files}
-            with self._condition:
-                nodes[node_id].update(strategy=strategy, strategy_reason_code=reason)
-            self._send(op_id, node_id, {"action": "ensure", "node_id": node_id, "strategy": strategy,
-                                     "manifest": manifest, "api_port": int(API_PORT), "token": token,
-                                     "allow_fallback": requested == "auto", "strategy_reason_code": reason,
-                                     "local_cut_timeout_seconds": max(1, min(300, int((deadline - time.monotonic()) / 3)))})
-            pending_receipts.append((node_id, manifest, total_bytes, strategy, time.monotonic()))
+                nodes[view_key].update(status="available", strategy="reuse" if reused_bytes else "local_build",
+                                       actual_downloaded_bytes=0, reused_bytes=reused_bytes)
+                self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
         # All receivers pull from the master concurrently. File availability
         # is published only after every assignment returns its exact identity.
         for node_id, manifest, total_bytes, strategy, dispatched_at in pending_receipts:
@@ -1776,13 +1957,19 @@ class ModelSupplyCoordinator:
                         nodes[node_id][counter] = result[counter]
                 self._leases.pop((op_id, node_id), None)
                 self._update(op_id, nodes=nodes)
-        self._check(op_id)
-        self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
-                     loaded_ready=False, requires_prepare=True)
+        try:
+            self.collect_operation_directories(keep_operation_ids=(op_id,))
+        except Exception:
+            logger.exception("event=supply_operations_reclaim_failed operation=%s", op_id)
         try:
             self._collect_garbage(op_id)
         except Exception:
             logger.exception("event=supply_cache_collection_failed operation=%s", op_id)
+        for unchanged in resident_checks:
+            unchanged()
+        self._check(op_id)
+        self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
+                     loaded_ready=False, requires_prepare=True)
 
     def _collect_garbage(self, op_id):
         collector = getattr(self.scheduler._model_supply_worker, "collect_garbage", None)

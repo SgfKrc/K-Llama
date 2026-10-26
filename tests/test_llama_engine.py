@@ -115,6 +115,21 @@ def test_pipeline_file_digest_survives_engine_replacement_and_fresh_checks(tmp_p
     assert reads == [path, path]
 
 
+def test_pipeline_digest_cache_detects_same_size_change_with_restored_mtime(tmp_path):
+    path = tmp_path / "segment.gguf"
+    path.write_bytes(b"verified GGUF payload")
+    engine = LlamaCppEngine()
+    original = engine._pipeline_file_sha256(str(path))
+    before = path.stat()
+    path.write_bytes(b"tampered GGUF payload")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    changed = engine._pipeline_file_sha256(str(path))
+
+    assert changed != original
+    assert changed == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_prepare_pipeline_model_is_metadata_only(monkeypatch, tmp_path):
     path = tmp_path / "model.gguf"
     path.write_bytes(b"GGUF metadata probe")

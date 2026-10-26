@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+import time
 
 import uvicorn
 from fastapi import FastAPI
@@ -19,10 +20,30 @@ from fastapi import FastAPI
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from atomic_json import atomic_write_json  # noqa: E402
 from qwen3_pipeline_control import router as control_router  # noqa: E402
 from qwen3_pipeline_data_plane import Qwen3ArtifactTransferRuntime, router as transfer_router  # noqa: E402
 from qwen3_pipeline_network import Qwen3NetworkTransferCoordinator  # noqa: E402
 from qwen3_pipeline_peer_auth import Qwen3PeerAuthMiddleware, Qwen3PeerRequestVerifier  # noqa: E402
+
+
+def _read_ledger_text(path: Path) -> str:
+    """Read the ledger while a scanner holds a transient exclusive handle.
+
+    与 save 侧同因（360 主动防御 / SearchIndexer 会短暂独占刚写出的文件）：
+    节点重启时要先读旧 ledger，读失败会让整个测试节点启动失败，表现为
+    `_spawn_network_node` 抛出 "exited with ..." 这一类不固定失败。这里只
+    对 win32 的 `PermissionError` 做 2 秒有界等待，文件缺失或 JSON 损坏仍然
+    立即失败。
+    """
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if sys.platform != "win32" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 class _RegistrationProjection:
@@ -137,15 +158,27 @@ def main() -> None:
                 "transfers": {},
                 "outputs": {},
             }
-        return json.loads(ledger_path.read_text(encoding="utf-8"))
+        return json.loads(_read_ledger_text(ledger_path))
 
     def save_ledger(value: dict) -> dict:
+        # 为什么不用 `Path.with_suffix(".tmp") + replace`：
+        # 本机装有 360 主动防御（360sd/360tray）与 Windows SearchIndexer，它们会在
+        # `os.replace` 落盘的瞬间以**不带 FILE_SHARE_DELETE** 的方式打开刚写出的
+        # ledger（扫描/索引），于是 Windows 直接拒绝替换，抛
+        # `PermissionError: [WinError 5]`。这是本项目早已踩过的坑：
+        # `src/atomic_json.py` 的存在就是为了它（唯一临时名 + WinError 5/32/33
+        # 退避重试）。实测（2026-10-26，这台机器，修复前）：`pytest -n 8` 共 16
+        # 次运行里 3 次失败、4 个用例（每次失败的用例不固定：three_process /
+        # target_chain[2] / ttl_epoch）；失败瞬间的诊断证明 save **没有并发**
+        # （coordinator 的 RLock 正常，active=1、total=26），占用者完全在进程外
+        # ——所以靠加锁、换目录或换临时名都治不好，只能像 atomic_json 那样面对
+        # 瞬时占用做有界重试，并把临时文件改成唯一名，避免固定 .tmp 在两路保存
+        # 之间互相覆盖。
+        # 该失败会一路冒泡成 "network ledger could not be persisted"
+        # （qwen3_pipeline_network.py:291 → control:529 / multisidecar:649），
+        # 出现在三个不固定用例上，因此必须在这里修，而不是在测试里重试。
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = ledger_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(value, ensure_ascii=True, sort_keys=True), encoding="utf-8",
-        )
-        temporary.replace(ledger_path)
+        atomic_write_json(ledger_path, value, sort_keys=True)
         return value
 
     coordinator.configure_persistent_ledger(load=load_ledger, save=save_ledger)

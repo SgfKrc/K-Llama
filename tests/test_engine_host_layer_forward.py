@@ -9,6 +9,7 @@ offer 校验、租约与结果回程都早已就位。
 """
 import base64
 import hashlib
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -92,6 +93,187 @@ def _host(upstream):
     host = EngineHost.__new__(EngineHost)
     host._layer_upstream = upstream
     return host
+
+
+@pytest.fixture
+def local_executor(tmp_path, monkeypatch):
+    import keep_head_shim
+    import llama_keep_head
+    import model_supply_worker
+
+    head = tmp_path / "head.gguf"
+    head.write_bytes(b"primary head 0-8")
+    middle = tmp_path / "middle.gguf"
+    middle.write_bytes(b"cpu middle 8-24")
+    digest = hashlib.sha256(middle.read_bytes()).hexdigest()
+    middle.with_suffix(".manifest.json").write_text(json.dumps({
+        "artifact_sha256": digest, "source_layer_range": [8, 24],
+        "source_model_sha256": "a" * 64,
+    }), encoding="utf-8")
+    request = _request(want_hidden=True, positions=[0, 1, 2], seq_ids=[0, 0, 0])
+    request.executor_id = "cpu"
+    request.provider_id = "local-master-cpu"
+    request.model_identity = {"model_id": "model", "engine": "llama_cpp", "format": "gguf",
+                              "revision": "local", "sha256": digest}
+    request.stage_fields.update(layer_range=[8, 24], middle_channel="extract_hidden", prepare_identity={
+        "operation_id": "local-config", "config_id": "config", "generation": 1,
+        "assignment_id": "local-config", "artifact_sha256": digest,
+    })
+    made = []
+
+    class Upstream(_FakeUpstream):
+        def __init__(self, shim, path, **kwargs):
+            super().__init__()
+            self.model_path = path
+            made.append(self)
+
+        def close(self):
+            self.is_available = False
+
+    monkeypatch.setenv("QLH_LAYER_GGUF", str(middle))
+    monkeypatch.setattr(model_supply_worker, "selected_gguf_path", lambda: str(head))
+    monkeypatch.setattr(model_supply_worker, "get_selected_model", lambda: {
+        "model_path": str(head), "manifest": {"format": "gguf"},
+    })
+    monkeypatch.setattr(keep_head_shim, "resolve_keep_head_shim", lambda **kwargs: "shim")
+    monkeypatch.setattr(llama_keep_head, "KeepHeadUpstream", Upstream)
+    return SimpleNamespace(host=_host(None), request=request, middle=middle, head=head,
+                           made=made, digest=digest)
+
+
+class TestLocalExecutorArtifact:
+    @pytest.mark.parametrize("snapshot", [False, True])
+    def test_binds_middle_instead_of_selected_primary(self, local_executor, monkeypatch, snapshot):
+        import model_supply_digest_cache
+        import model_supply_worker
+
+        case = local_executor
+        if snapshot:
+            case.host._environment = {"QLH_LAYER_GGUF": str(case.middle)}
+            monkeypatch.setenv("QLH_LAYER_GGUF", str(case.head))
+        result = case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        assert len(case.made) == 1
+        upstream = case.made[0]
+        assert upstream.model_path == str(case.middle)
+        expected = np.frombuffer(_hidden_bytes(), dtype=np.float32) + 1
+        assert np.array_equal(np.frombuffer(base64.b64decode(result["hidden_out_f32"]), dtype=np.float32), expected)
+        assert upstream.reset_count == 1
+
+        def reject(*args, **kwargs):
+            pytest.fail("bound local executor revisited global selection or rehashed unchanged bytes")
+
+        monkeypatch.setattr(model_supply_worker, "get_selected_model", reject)
+        monkeypatch.setattr(model_supply_worker, "selected_gguf_path", reject)
+        monkeypatch.setattr(model_supply_digest_cache, "cached_sha256", reject)
+        case.request.stage_fields["positions"] = [41, 42, 43]
+        case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        assert len(case.made) == 1
+        assert upstream.reset_count == 1
+        assert upstream.hidden_calls[-1]["positions"] == [41, 42, 43]
+        assert upstream.hidden_calls[-1]["seq_ids"] == [0, 0, 0]
+
+    @pytest.mark.parametrize("mismatch, error", [
+        ("digest", "local_executor_artifact_contract_mismatch"),
+        ("bytes", "local_executor_artifact_digest_mismatch"),
+        ("range", "local_executor_artifact_contract_mismatch"),
+        ("model", "local_executor_model_identity_mismatch"),
+        ("manifest", "local_executor_artifact_contract_mismatch"),
+        ("identity", "invalid_prepare_identity"),
+        ("path", "local_executor_artifact_path_missing"),
+    ])
+    def test_rejects_unbound_artifact_before_loading(self, local_executor, monkeypatch, mismatch, error):
+        case = local_executor
+        if mismatch == "digest":
+            case.request.stage_fields["prepare_identity"]["artifact_sha256"] = "b" * 64
+            case.request.model_identity["sha256"] = "b" * 64
+        elif mismatch == "bytes":
+            case.middle.write_bytes(b"bad middle 8-24")
+        elif mismatch == "range":
+            case.request.stage_fields["layer_range"] = [0, 8]
+        elif mismatch == "model":
+            case.request.model_identity["sha256"] = "b" * 64
+        elif mismatch == "manifest":
+            case.middle.with_suffix(".manifest.json").unlink()
+        elif mismatch == "identity":
+            case.request.stage_fields.pop("prepare_identity")
+        else:
+            monkeypatch.delenv("QLH_LAYER_GGUF")
+        with pytest.raises(ValueError, match=error):
+            case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        assert case.made == []
+
+    @pytest.mark.parametrize("changed", ["file", "manifest"])
+    def test_warm_binding_rejects_changed_version(self, local_executor, changed):
+        case = local_executor
+        case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        upstream = case.made[0]
+        if changed == "file":
+            before = case.middle.stat()
+            case.middle.write_bytes(b"bad middle 8-24")
+            os.utime(case.middle, ns=(before.st_atime_ns, before.st_mtime_ns))
+        else:
+            marker = case.middle.with_suffix(".manifest.json")
+            payload = json.loads(marker.read_text())
+            payload["source_layer_range"] = [0, 8]
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError):
+            case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        assert len(case.made) == 1
+        assert len(upstream.hidden_calls) == 1
+
+    def test_new_generation_does_not_reuse_previous_runtime(self, local_executor):
+        case = local_executor
+        case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        previous = case.made[0]
+        case.request.stage_fields["prepare_identity"]["generation"] = 2
+        case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        assert len(case.made) == 2
+        assert not previous.is_available
+
+    @pytest.mark.parametrize("changed", ["file", "manifest", "cancel"])
+    def test_load_change_never_reaches_forward(self, local_executor, monkeypatch, changed):
+        import threading
+        import llama_keep_head
+
+        case = local_executor
+        cancelled = threading.Event()
+        original = llama_keep_head.KeepHeadUpstream
+
+        def changed_upstream(*args, **kwargs):
+            upstream = original(*args, **kwargs)
+            if changed == "file":
+                before = case.middle.stat()
+                case.middle.write_bytes(b"bad middle 8-24")
+                os.utime(case.middle, ns=(before.st_atime_ns, before.st_mtime_ns))
+            elif changed == "manifest":
+                case.middle.with_suffix(".manifest.json").unlink()
+            else:
+                cancelled.set()
+            return upstream
+
+        monkeypatch.setattr(llama_keep_head, "KeepHeadUpstream", changed_upstream)
+        error = "local_executor_cancelled" if changed == "cancel" else "local_executor_artifact_changed"
+        with pytest.raises(ValueError, match=error):
+            case.host.execute_task_worker_stage(case.request, cancelled)
+        assert len(case.made) == 1
+        assert not case.made[0].is_available
+        assert case.made[0].hidden_calls == []
+
+    def test_gguf_suffix_manifest_and_identity_snapshot(self, local_executor):
+        case = local_executor
+        case.middle.with_suffix(".manifest.json").rename(str(case.middle) + ".manifest.json")
+        identity = case.request.model_identity
+        case.request.model_identity = SimpleNamespace(snapshot=lambda: dict(identity))
+        case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        assert case.made[0].model_path == str(case.middle)
+
+    def test_nonlocal_upstream_still_uses_selected_primary(self, local_executor):
+        case = local_executor
+        case.host.execute_task_worker_stage(case.request, SimpleNamespace(is_set=lambda: False))
+        upstream = case.host._layer_forward_upstream()
+        assert upstream.model_path == str(case.head)
+        assert len(case.made) == 2
+        assert not case.made[0].is_available
 
 
 class TestIntermediateStage:

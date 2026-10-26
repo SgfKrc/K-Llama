@@ -56,8 +56,6 @@ from task_worker_capabilities import build_engine_capabilities
 
 logger = logging.getLogger("scheduler")
 
-_LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
-_LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
 _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
 _TASK_WORKER_RESPONSE_CONTEXT = threading.local()
 from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED as _REQUEST_DEADLINE_EXCEEDED
@@ -170,34 +168,16 @@ def keep_head_shim_available() -> bool:
 
 
 def _verified_layer_artifact_sha256(path) -> str:
-    """Hash one configured GGUF once per stable filesystem identity."""
+    """Reuse the shared digest for the same complete live file version."""
+    from model_supply_digest_cache import DigestCacheError, cached_sha256
+
     try:
         resolved = path.resolve(strict=True)
-        stat = resolved.stat()
         if not resolved.is_file():
             return ""
-        fingerprint = (
-            int(stat.st_size),
-            int(getattr(stat, "st_mtime_ns", 0)),
-            int(getattr(stat, "st_ctime_ns", 0)),
-        )
-    except OSError:
+        return cached_sha256(resolved)
+    except (OSError, DigestCacheError):
         return ""
-    cache_key = str(resolved)
-    with _LAYER_ARTIFACT_DIGEST_LOCK:
-        cached = _LAYER_ARTIFACT_DIGEST_CACHE.get(cache_key)
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1]
-        digest = hashlib.sha256()
-        try:
-            with resolved.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            return ""
-        value = digest.hexdigest()
-        _LAYER_ARTIFACT_DIGEST_CACHE[cache_key] = (fingerprint, value)
-        return value
 
 
 def _layer_weight_bytes_of(artifact_path, local_layers: int) -> list[int]:

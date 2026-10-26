@@ -9,7 +9,7 @@
 裁层语义（与 ``relay_contract.RelayTrimPlan`` 一致）
   * 保留 ``blk.K..blk.(N-1)``，并**重命名**为 ``blk.0..blk.(N-1-K)``；
   * ``<arch>.block_count`` 由 ``N`` 改写为 ``N-K``；
-  * 非 blk 张量（``token_embd`` / ``output_norm`` / ``output`` 等）**原样保留**；
+  * 非 blk 张量原样保留；Qwen3.5 非尾段省略可选的 ``output.weight``；
   * 其余 KV 字段全部复制（``general.architecture`` 与 ``GGUF.*`` 由 writer 维护，不复制）。
 
 约束（2026-09-18 实测）
@@ -48,6 +48,7 @@ from gguf_metadata_contract import (
     project_gguf_metadata, read_gguf_metadata,
     verify_gguf_metadata,
 )
+from gguf_tensor_selection import omit_gguf_output_weight
 
 _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -129,6 +130,7 @@ def _read_identity(reader, source_path: Path) -> dict:
         "nextn_predict_layers": nextn,
         "n_embd": metadata["n_embd"] or 0,
         "gguf_metadata": metadata,
+        "has_output_weight": any(tensor.name == "output.weight" for tensor in reader.tensors),
     }
 
 
@@ -403,7 +405,9 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
             "output_weight": has_out,
             # 能否承担**末段**职责：需 final_norm，且末段要么有独立 output.weight，
             # 要么 tie embeddings（此时 token_embd 兼作 lm_head）。
-            "can_serve_tail": bool(has_norm and (has_out or has_tok)),
+            "can_serve_tail": bool(has_norm and (
+                has_out or (has_tok and not identity.get("has_output_weight", False))
+            )),
         }
     if mode != "tail":
         # `RelayTrimPlan` 只描述 tail 语义 ⇒ 上游段/中段**不给**可能误导的合同字段。
@@ -524,7 +528,7 @@ def _copy_kv(gguf, reader, writer, overrides: dict) -> int:
 
 
 def _plan_tensors(reader, k: int | None = None, *, end: int | None = None,
-                  keep_head: int | None = None) -> tuple[list, list]:
+                  keep_head: int | None = None, identity: dict | None = None) -> tuple[list, list]:
     """返回 (保留张量及新名字, 将丢弃的张量名)。不做写入，便于 --dry-run。
 
     * `keep_head` 模式：保留 `blk.0..N-1`，**不重命名**（本就连续）；
@@ -533,8 +537,16 @@ def _plan_tensors(reader, k: int | None = None, *, end: int | None = None,
     """
     keep: list[tuple] = []
     drop: list[str] = []
+    omit_output = identity is not None and omit_gguf_output_weight(
+        identity["architecture"],
+        keep_head if keep_head is not None else (end if end is not None else identity["n_layer"]),
+        identity["n_layer"],
+    )
     for tensor in reader.tensors:
         name = tensor.name
+        if omit_output and name == "output.weight":
+            drop.append(name)
+            continue
         if name.startswith("blk."):
             parts = name.split(".", 2)
             index = int(parts[1])
@@ -651,7 +663,8 @@ def main() -> int:
     problems += _validate_required_tensors(
         reader, identity, k=args.k, end=args.end, keep_head=args.keep_head,
     )
-    keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head)
+    keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head,
+                             identity=identity)
     mode = _cut_mode(args.k, args.end, args.keep_head)
     if mode == "head":
         kept_block_count = int(args.keep_head)

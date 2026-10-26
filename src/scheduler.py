@@ -12,7 +12,6 @@
 """
 
 import collections
-import functools
 import hashlib
 import importlib.util
 import json
@@ -319,28 +318,16 @@ def _local_cpu_layer_bytes() -> int:
     return size // layers if size > 0 else 0
 
 
-@functools.lru_cache(maxsize=4)
-def _cpu_artifact_digest(path: str, size: int, mtime_ns: int) -> str:
-    """工件文件的 SHA-256。按 `(path, size, mtime_ns)` 缓存 ⇒ 3.23 GB 只读一次。"""
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _local_cpu_artifact_sha256() -> str:
     """本机 CPU 段工件的 SHA-256（取不到返回空串）。"""
+    from model_supply_digest_cache import DigestCacheError, cached_sha256
+
     artifact = _local_cpu_layer_artifact()
     if not artifact:
         return ""
     try:
-        stat = Path(artifact).stat()
-    except OSError:
-        return ""
-    try:
-        return _cpu_artifact_digest(str(Path(artifact).resolve()), stat.st_size, stat.st_mtime_ns)
-    except OSError:
+        return cached_sha256(artifact)
+    except (OSError, DigestCacheError):
         return ""
 
 

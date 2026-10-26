@@ -1,6 +1,7 @@
 """Header-only tensor selection shared by GGUF supply and pipeline budgets.
 
-All non-block tensors are retained, including names unknown to the runtime.
+Non-block tensors are retained, including names unknown to the runtime, except
+the optional Qwen3.5 output weight in segments ending before the decoder tail.
 Only the MTP blocks declared after the decoder are excluded from every relay
 segment. No tensor payload, native loader or optional dependency is used.
 """
@@ -11,6 +12,12 @@ from dataclasses import dataclass
 from typing import Mapping
 
 _BLOCK_TENSOR = re.compile(r"blk\.(0|[1-9][0-9]*)\.(.+)", re.ASCII)
+
+
+def omit_gguf_output_weight(architecture: str | None, end_layer: int,
+                            decoder_layers: int) -> bool:
+    """Qwen3.5 can load non-tail segments using its embedding output fallback."""
+    return architecture == "qwen35" and end_layer < decoder_layers
 
 
 @dataclass
@@ -27,7 +34,7 @@ class GgufTensorSelection:
 def select_gguf_tensors(
     tensor_bytes: Mapping[str, int], *, block_count: int,
     nextn_predict_layers: int = 0, start_layer: int = 0,
-    end_layer: int | None = None,
+    end_layer: int | None = None, architecture: str | None = None,
 ) -> GgufTensorSelection:
     """Select a decoder range using exact payload sizes from a GGUF header.
 
@@ -76,6 +83,9 @@ def select_gguf_tensors(
             target = f"blk.{index - start_layer}.{match[2]}"
             layer_bytes[index] += size
         else:
+            if name == "output.weight" and omit_gguf_output_weight(
+                    architecture, end_layer, decoder_layers):
+                continue
             target = name
             if name.startswith("token_embd."):
                 component = "embedding"

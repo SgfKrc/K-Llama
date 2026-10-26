@@ -205,6 +205,20 @@ def receiving(monkeypatch, source, *, progress_events=None, result_counts=None, 
     return calls
 
 
+def test_supply_available_does_not_run_retention_before_prepare(setup, tmp_path, monkeypatch):
+    worker, scheduler, client = setup
+    source = tmp_path / "source"
+    manifest = segment(source)
+    receiving(monkeypatch, source)
+    calls = []
+    monkeypatch.setattr(worker, "collect_garbage", lambda **kwargs: calls.append(kwargs))
+    worker.handle(command(manifest), client)
+    assert client.wait()["status"] == "available"
+    finish(worker)
+    assert calls == []
+    assert get_selected_model(worker.root)["artifact_sha256"] == manifest["artifact_sha256"]
+
+
 def test_receive_register_and_cached_selection(setup, tmp_path, monkeypatch):
     worker, scheduler, client = setup
     source = tmp_path / "master-segment"
@@ -798,6 +812,8 @@ def test_worker_reuses_verified_segment_before_transfer_or_local_cut(setup, tmp_
     manifest["operation_id"] = "op-two"
     manifest.pop("manifest_sha256")
     manifest["manifest_sha256"] = digest(manifest)
+    for entry in manifest["files"]:
+        assets._hash_file_cached(worker.root / ("segment-" + "a" * 64) / entry["path"])
     monkeypatch.setattr(assets, "receive_segment", lambda *args, **kwargs: pytest.fail("verified cache started HTTP transfer"))
     monkeypatch.setattr(worker, "_local_cut", lambda *args, **kwargs: pytest.fail("verified cache started local cutting"))
     original = assets._hash_file

@@ -305,7 +305,7 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
         if action == "inventory_result":
             return c.scheduler._model_supply_worker.inventory()
         ensured = [item[0] for item in c.scheduler._tcp_server.sent if item[1]["action"] == "ensure"]
-        assert ensured == ["worker", "tail"]
+        assert set(ensured) == {"worker", "tail"}
         return {**manifests[node_id], "status":"available", "actual_downloaded_bytes":7, "reused_bytes":0, "resumed_bytes":0}
     c._wait = wait
     if disk_free_bytes < 64 * 1024**2:
@@ -318,6 +318,158 @@ def test_master_dispatches_all_receivers_before_waiting_for_receipts(tmp_path, m
     result = c.get(op_id)
     assert result["status"] == "available" and result["loaded_ready"] is False
     assert result["nodes"]["tail"]["actual_downloaded_bytes"] == 7
+
+
+def test_parallel_build_budget_counts_one_output_plus_metadata(tmp_path, monkeypatch):
+    import model_supply as module
+    import model_supply_assets as assets
+
+    coordinator_instance, operation_id, _ = coordinator(tmp_path)
+    output_bytes = 20 * 1024**2
+    overhead_bytes = 1 * 1024**2
+    monkeypatch.setattr(module, "_segment_disk_weight_bytes", lambda *args: output_bytes)
+    monkeypatch.setattr(module, "_segment_disk_overhead_bytes", lambda *args: overhead_bytes)
+    monkeypatch.setattr(assets, "segment_cache_hint", lambda *args: False)
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda path: SimpleNamespace(free=50 * 1024**2))
+    monkeypatch.setattr(assets, "build_gguf_segment", lambda source, directory, **kwargs: {
+        "node_id": kwargs["node_id"],
+    })
+
+    sources = {"gguf": tmp_path / "source.gguf", "hf": None,
+               "descriptors": {"llama_cpp": {}}, "source_model_id": "fixture",
+               "source_model_sha256": "a" * 64, "tokenizer_sha256": "b" * 64,
+               "conversion_proof": None}
+    plan = {"total_layers": 4, "assignments": [
+        {"node_id": node_id, "engine": "llama_cpp", "start_layer": start, "end_layer": start + 2}
+        for node_id, start in (("master", 0), ("worker", 2))
+    ]}
+
+    with coordinator_instance._segment_builds(operation_id, sources, plan, time.monotonic() + 30) as builds:
+        assert {future.result()["node_id"] for _, _, future in builds} == {"master", "worker"}
+
+
+@pytest.mark.parametrize("stop", ["failure", "cancel"])
+def test_parallel_build_failure_or_cancel_stops_sibling_and_passes_owner_options(
+    tmp_path, monkeypatch, stop,
+):
+    import model_supply as module
+    import model_supply_assets as assets
+
+    coordinator_instance, operation_id, _ = coordinator(tmp_path)
+    sources_dir = tmp_path / "hf-source"
+    sources_dir.mkdir()
+    deadline = time.monotonic() + 30
+    both_started = threading.Event()
+    seen_options = {}
+    stopped_nodes = set()
+    started_nodes = set()
+    lock = threading.Lock()
+
+    def build(source, directory, **options):
+        node_id = options["node_id"]
+        callback = options.get("cancelled")
+        with lock:
+            seen_options[node_id] = (callback, options.get("deadline"))
+            started_nodes.add(node_id)
+            if len(started_nodes) == 2:
+                both_started.set()
+        assert callable(callback)
+        assert options["deadline"] == deadline
+        assert both_started.wait(3)
+        if stop == "failure" and node_id == "master":
+            raise RuntimeError("injected segment failure")
+        while not callback():
+            time.sleep(0.001)
+        with lock:
+            stopped_nodes.add(node_id)
+        raise RuntimeError("segment observed stop")
+
+    monkeypatch.setattr(assets, "build_gguf_segment", build)
+    monkeypatch.setattr(assets, "build_safetensors_segment", build)
+    monkeypatch.setattr(assets, "segment_cache_hint", lambda *args: True)
+    monkeypatch.setattr(module, "_segment_disk_weight_bytes", lambda *args: 1)
+    monkeypatch.setattr(module, "_segment_disk_overhead_bytes", lambda *args: 0)
+    sources = {"gguf": tmp_path / "source.gguf", "hf": sources_dir,
+               "descriptors": {"llama_cpp": {}, "pytorch": {}}, "source_model_id": "fixture",
+               "source_model_sha256": "a" * 64, "tokenizer_sha256": "b" * 64,
+               "conversion_proof": None}
+    plan = {"total_layers": 4, "assignments": [
+        {"node_id": "master", "engine": "llama_cpp", "start_layer": 0, "end_layer": 2},
+        {"node_id": "worker", "engine": "pytorch", "start_layer": 2, "end_layer": 4},
+    ]}
+
+    cancel_thread = None
+    if stop == "cancel":
+        def cancel_when_started():
+            assert both_started.wait(3)
+            coordinator_instance._events[operation_id].set()
+        cancel_thread = threading.Thread(target=cancel_when_started)
+        cancel_thread.start()
+
+    with pytest.raises(RuntimeError):
+        with coordinator_instance._segment_builds(operation_id, sources, plan, deadline) as builds:
+            for _, _, future in builds:
+                future.result()
+
+    if cancel_thread is not None:
+        cancel_thread.join(3)
+        assert not cancel_thread.is_alive()
+    assert set(seen_options) == {"master", "worker"}
+    assert all(callable(callback) and value == deadline for callback, value in seen_options.values())
+    assert "worker" in stopped_nodes
+    if stop == "cancel":
+        assert stopped_nodes == {"master", "worker"}
+
+
+def test_independent_build_completes_while_first_segment_is_blocked(tmp_path, monkeypatch):
+    import model_supply_assets as assets
+    coordinator_instance, operation_id, _ = coordinator(tmp_path)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    fast_finished = threading.Event()
+    active_builds = []
+    concurrency = []
+    build_lock = threading.Lock()
+
+    def build(source, directory, **options):
+        with build_lock:
+            active_builds.append(options["node_id"])
+            concurrency.append(len(active_builds))
+        try:
+            if options["start_layer"] == 0:
+                first_entered.set()
+                assert release_first.wait(3)
+            else:
+                assert first_entered.wait(3)
+                fast_finished.set()
+            return {"node_id": options["node_id"]}
+        finally:
+            with build_lock:
+                active_builds.remove(options["node_id"])
+
+    monkeypatch.setattr(assets, "build_gguf_segment", build)
+    monkeypatch.setattr(assets, "segment_cache_hint", lambda *args: True)
+    monkeypatch.setattr(assets, "gguf_segment_disk_weight_bytes", lambda *args: 1)
+    sources = {"gguf": tmp_path / "source.gguf", "hf": None,
+               "descriptors": {"llama_cpp": {}}, "source_model_id": "fixture",
+               "source_model_sha256": "a" * 64, "tokenizer_sha256": "b" * 64,
+               "conversion_proof": None}
+    plan = {"total_layers": 6, "assignments": [
+        {"node_id": node_id, "engine": "llama_cpp", "start_layer": index * 2, "end_layer": index * 2 + 2}
+        for index, node_id in enumerate(("master", "worker", "tail"))
+    ]}
+    try:
+        with coordinator_instance._segment_builds(operation_id, sources, plan, time.monotonic() + 30) as builds:
+            assignment, _, completed = next(builds)
+            assert fast_finished.is_set() and not release_first.is_set()
+            assert assignment["node_id"] != "master"
+            assert completed.result()["node_id"] == assignment["node_id"]
+            release_first.set()
+            assert len(list(builds)) == 2
+    finally:
+        release_first.set()
+    assert max(concurrency) == 2
+    assert active_builds == []
 
 
 def test_failed_supply_cancels_receivers_and_revokes_file_leases(tmp_path):
@@ -918,7 +1070,7 @@ def test_default_local_cut_precedence_and_named_distribution(startup_pool_case, 
     monkeypatch.setattr(server, "send_to_client", send)
     observed = []
     def collect(**kwargs):
-        assert case.c.get(case.op)["status"] == "available"
+        assert case.c.get(case.op)["status"] == "supplying"
         observed.append(kwargs)
         return {"removed": 1, "reclaimed_bytes": 7, "skipped": {}, "examined": 2}
     case.scheduler._model_supply_worker.collect_garbage = collect
@@ -1074,7 +1226,7 @@ def test_new_peer_after_building_cannot_change_published_plan(startup_pool_case)
     def build(kwargs):
         if kwargs["node_id"] == "master":
             result = case.c.get(case.op)
-            assert result["status"] == "building"
+            assert result["status"] in {"building", "supplying"}
             published.append(result["plan"])
             case.join()
     case.on_build = build

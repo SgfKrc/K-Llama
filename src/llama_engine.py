@@ -395,9 +395,10 @@ class LlamaCppEngine:
 
     def _pipeline_file_sha256(self, path: str, *, use_cache: bool = True) -> str:
         """Share verified file digests with supply; explicit fresh checks read bytes."""
-        from model_supply_assets import _hash_file_cached, sha256_file
+        from model_supply_assets import _hash_file
+        from model_supply_digest_cache import cached_sha256
         try:
-            return (_hash_file_cached if use_cache else sha256_file)(path)
+            return cached_sha256(path, hash_file=_hash_file) if use_cache else _hash_file(path)
         except OSError:
             return ""
 
@@ -743,10 +744,7 @@ class LlamaCppEngine:
                 or getattr(self, "_model_path", "")
                 or ""
             )
-            expected_source_sha256 = self._pipeline_file_sha256(
-                source_path,
-                use_cache=False,
-            ).lower()
+            expected_source_sha256 = self._pipeline_file_sha256(source_path).lower()
         if not expected_source_sha256:
             raise RuntimeError("无法确定预切 GGUF 的源整模摘要，拒绝按层区间猜测工件")
 
@@ -771,10 +769,7 @@ class LlamaCppEngine:
             candidate = directory / artifact
             if not candidate.is_file():
                 continue
-            if self._pipeline_file_sha256(
-                str(candidate),
-                use_cache=False,
-            ).lower() != expected_artifact_sha256:
+            if self._pipeline_file_sha256(str(candidate)).lower() != expected_artifact_sha256:
                 continue
             matches.append(str(candidate))
         if len(matches) > 1:
@@ -829,8 +824,9 @@ class LlamaCppEngine:
         proof = None
         proof_stat = None
         try:
+            from model_supply_digest_cache import file_stamp
             from relay_segment_info import read_artifact_manifest
-            before = os.stat(path)
+            before = file_stamp(path)
             digest = self._pipeline_file_sha256(path)
             for marker in (Path(path).with_suffix(".manifest.json"), Path(str(path) + ".manifest.json")):
                 manifest = read_artifact_manifest(marker) or {}
@@ -840,7 +836,7 @@ class LlamaCppEngine:
                         and manifest.get("artifact_sha256") == digest and re.fullmatch(r"[0-9a-f]{64}", digest)):
                     proof = NativeLayerLoadProof(os.path.abspath(path), digest,
                                                  (int(start_layer), int(end_layer)), total)
-                    proof_stat = (before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino)
+                    proof_stat = before
                     break
         except (OSError, ValueError, TypeError):
             proof = None
@@ -898,8 +894,7 @@ class LlamaCppEngine:
         self._layer_load_proof = None
         if proof is not None:
             try:
-                after = os.stat(path)
-                if proof_stat == (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino):
+                if proof_stat == file_stamp(path):
                     self._layer_load_proof = proof
             except OSError:
                 pass

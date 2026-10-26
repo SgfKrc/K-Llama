@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -201,6 +202,48 @@ def test_gguf_tokenizer_fingerprint_is_order_independent_and_header_only(tmp_pat
     ])
     assert R.read_gguf_tokenizer_sha256(changed) != expected
     assert R.read_gguf_tokenizer_sha256(_write_gguf(tmp_path / "missing.gguf", tokenizer[:1])) is None
+
+
+def test_header_cache_reuses_verified_version_and_invalidates_replacement(tmp_path, monkeypatch):
+    path = _write_gguf(tmp_path / "versioned.gguf", _arch_kvs("qwen2", 8))
+    original = R._gguf_header
+    opened = []
+
+    def record(target):
+        opened.append(Path(target))
+        return original(target)
+
+    monkeypatch.setattr(R, "_gguf_header", record)
+    first = R.read_gguf_layer_info(path)
+    first["n_layer"] = 99
+    assert R.read_gguf_layer_info(path)["n_layer"] == 8
+    assert opened == [path]
+    original_time = path.stat().st_mtime_ns
+    replacement = _write_gguf(tmp_path / "replacement.gguf", _arch_kvs("qwen2", 4))
+    os.utime(replacement, ns=(original_time, original_time))
+    os.replace(replacement, path)
+    assert R.read_gguf_layer_info(path)["n_layer"] == 4
+    assert opened == [path, path]
+
+
+def test_cached_tokenizer_fingerprint_changes_after_same_length_edit(tmp_path):
+    prefix = [("tokenizer.ggml.model", 8, _kv_str("gpt2"))]
+    path = _write_gguf(tmp_path / "tokenizer.gguf", prefix + [
+        ("tokenizer.ggml.tokens", 9, struct.pack("<IQ", 8, 1) + _kv_str("first")),
+    ])
+    original = R.read_gguf_tokenizer_sha256(path)
+    _write_gguf(path, prefix + [
+        ("tokenizer.ggml.tokens", 9, struct.pack("<IQ", 8, 1) + _kv_str("other")),
+    ])
+    assert R.read_gguf_tokenizer_sha256(path) != original
+
+
+def test_header_reader_rejects_truncated_skipped_array(tmp_path):
+    path = _write_gguf(tmp_path / "truncated.gguf", _arch_kvs("qwen2", 8) + [
+        ("tokenizer.ggml.tokens", 9, struct.pack("<IQ", 8, 1) + struct.pack("<Q", 9000)),
+    ])
+    assert R.read_gguf_layer_info(path) is None
+    assert R.read_gguf_tokenizer_sha256(path) is None
 
 
 def test_read_artifact_manifest_reads_layer_range(tmp_path: Path) -> None:

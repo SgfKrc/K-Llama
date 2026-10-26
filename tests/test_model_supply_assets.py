@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import struct
+import subprocess
+import sys
 import threading
 import urllib.parse
 from contextlib import contextmanager
@@ -15,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import model_supply_assets as assets
+import model_supply_digest_cache as digests
 from model_supply_assets import (
     SupplyError, build_gguf_segment, build_safetensors_segment,
     receive_segment, sha256_file, validate_supply_manifest,
@@ -218,13 +221,7 @@ def test_gguf_reuse_detects_tamper_when_identity_changes(gguf_source, tmp_path, 
 
 
 def test_gguf_reuse_skips_rehash_when_identity_unchanged(gguf_source, tmp_path, monkeypatch):
-    """★ 2026-10-24（#125，用户决策）：段是本机不可变缓存，身份未变即复用摘要。
-
-    此前要求"复用也必须 live hash"，使每个复用命中的节点每轮都要对 2.5~5.5 GB
-    重算 sha256（实测三节点合计约 121 s/轮）。取消该要求后：篡改内容但**保留
-    size/mtime_ns** 的段会被当作未变（这是已知且被接受的取舍），因此这里断言
-    "仍能正常复用、且不重新裁剪"，用于固化新契约的行为边界。
-    """
+    """Reuse unchanged cached bytes, but reject same-size edits with restored mtime."""
     out = tmp_path / "out"
     first = build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
     monkeypatch.setattr(assets, "_run_cut", lambda *args: pytest.fail("reuse must not cut again"))
@@ -236,7 +233,8 @@ def test_gguf_reuse_skips_rehash_when_identity_unchanged(gguf_source, tmp_path, 
     artifact.write_bytes(data)
     import os
     os.utime(artifact, ns=(stat.st_atime_ns, stat.st_mtime_ns))   # 恢复身份
-    assert build_gguf_segment(gguf_source, out, **_kwargs(gguf_source)) == first
+    with pytest.raises(SupplyError, match="segment file digest mismatch"):
+        build_gguf_segment(gguf_source, out, **_kwargs(gguf_source))
 
 
 def _track_file_hashes(monkeypatch):
@@ -249,14 +247,144 @@ def _track_file_hashes(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("cold", [False, True])
-def test_gguf_cross_operation_hashes_each_immutable_inode_at_most_once(gguf_source, tmp_path, monkeypatch, cold):
-    monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
+@pytest.mark.parametrize("format_name", ["gguf", "safetensors"])
+def test_overlapping_segments_hash_source_tensors_once_and_verify_every_output(tmp_path, monkeypatch, format_name):
+    source = tmp_path / ("source.gguf" if format_name == "gguf" else "hf")
+    if format_name == "gguf":
+        _make_gguf(source)
+        builder = build_gguf_segment
+    else:
+        _safetensors_fixture(source, sharded=True)
+        builder = build_safetensors_segment
+    calls = []
+    original = assets._range_hash
+    def tracked(path, offset, length, **options):
+        calls.append((assets._hash_file_cached(path), offset, length))
+        return original(path, offset, length, **options)
+    monkeypatch.setattr(assets, "_range_hash", tracked)
+    expected_source_ranges = set()
+    expected_output_ranges = set()
+    for start, end in ((0, 2), (1, 3), (2, 4)):
+        manifest = builder(source, tmp_path / "out", **_kwargs(source, start, end))
+        if format_name == "gguf":
+            metadata, tensors = assets._gguf_table(source)
+            selection = assets._gguf_tensor_selection(tensors, metadata, start, end)
+            expected_source_ranges.update((source, tensors[name][0], tensors[name][1])
+                                          for name in selection.tensor_sources.values())
+            output = Path(manifest["local_files"]["segment.gguf"])
+            _, output_tensors = assets._gguf_table(output)
+            output_digest = assets._hash_file_cached(output)
+            expected_output_ranges.update((output_digest, entry[0], entry[1])
+                                          for entry in output_tensors.values())
+        else:
+            _, source_map, source_headers = assets._source_safetensors(source)
+            directory = Path(next(iter(manifest["local_files"].values()))).parent
+            _, output_map, output_headers = assets._source_safetensors(directory)
+            for name, filename in output_map.items():
+                source_header, source_start = source_headers[source_map[name]]
+                lo, hi = source_header[name]["data_offsets"]
+                expected_source_ranges.add((source / source_map[name], source_start + lo, hi - lo))
+                output_header, output_start = output_headers[filename]
+                lo, hi = output_header[name]["data_offsets"]
+                output_path = directory / filename
+                output_digest = assets._hash_file_cached(output_path)
+                expected_output_ranges.add((output_digest, output_start + lo, hi - lo))
+    from collections import Counter
+    actual = Counter(calls)
+    expected = Counter((assets._hash_file_cached(path), offset, length)
+                       for path, offset, length in expected_source_ranges)
+    expected.update(expected_output_ranges)
+    assert actual == expected
+
+
+@pytest.mark.parametrize("format_name", ["gguf", "safetensors"])
+def test_cross_node_rebind_reuses_both_verified_tensor_digests(tmp_path, monkeypatch, format_name):
+    source = tmp_path / ("source.gguf" if format_name == "gguf" else "hf")
+    if format_name == "gguf":
+        _make_gguf(source)
+        builder = build_gguf_segment
+    else:
+        _safetensors_fixture(source, sharded=True)
+        builder = build_safetensors_segment
+    args = _kwargs(source)
+    root = tmp_path / "supply"
+    first = builder(source, root, **args)
+    original, calls = assets._range_hash, []
+    def tracked(path, offset, length, **options):
+        calls.append((Path(path), offset, length))
+        return original(path, offset, length, **options)
+    monkeypatch.setattr(assets, "_range_hash", tracked)
+    monkeypatch.setattr(assets, "_run_cut", lambda *args, **options: pytest.fail("rebind recut source"))
+    monkeypatch.setattr(assets, "_copy_selected", lambda *args, **options: pytest.fail("rebind repacked source"))
+    second = builder(source, root, **{**args, "node_id": "worker-2", "operation_id": "op-2"})
+    assert second["files"] == first["files"]
+    assert not calls
+    calls.clear()
+    third = builder(source, root, **{**args, "node_id": "worker-3", "operation_id": "op-3"})
+    assert third["files"] == first["files"]
+    assert not calls
+
+
+@pytest.mark.parametrize("change", ["mtime", "size", "inode"])
+def test_source_tensor_digest_cache_rechecks_changed_identity(tmp_path, monkeypatch, change):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"original")
+    expected = assets._range_hashes_cached(source, [(0, 8)])
+    before = source.stat()
+    if change == "inode":
+        replacement = tmp_path / "replacement.bin"
+        replacement.write_bytes(b"modified")
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, source)
+    else:
+        source.write_bytes(b"modified" + (b"extra" if change == "size" else b""))
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    assert assets._range_hashes_cached(source, [(0, 8)]) != expected
+    assert assets._range_hashes_cached(source, [(0, 8)]) == {(0, 8): hashlib.sha256(b"modified").hexdigest()}
+
+
+def test_source_tensor_digest_cache_rejects_changes_during_hash(tmp_path, monkeypatch):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"original")
+    original = assets._range_hash
+    def changed(*args, **options):
+        result = original(*args, **options)
+        source.write_bytes(b"different-size")
+        return result
+    monkeypatch.setattr(assets, "_range_hash", changed)
+    with pytest.raises(SupplyError) as error:
+        assets._range_hashes_cached(source, [(0, 8)])
+    assert error.value.code == "source_digest_mismatch"
+    current = digests._record(digests._store_path(), source.resolve(), digests.file_stamp(source))
+    assert "supply-tensor-range-v1-" not in (current.get("metadata") or {})
+
+
+def test_source_tensor_digest_cache_survives_restart_and_honors_cancellation(tmp_path, monkeypatch):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"original")
+    expected = assets._range_hashes_cached(source, [(0, 8)])
+    code = r"""
+import sys
+from pathlib import Path
+import model_supply_assets as assets
+assets._range_hash = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cache miss"))
+assert assets._range_hashes_cached(Path(sys.argv[1]), [(0, 8)]) == {(0, 8): sys.argv[2]}
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(source), expected[(0, 8)]],
+        capture_output=True, text=True, timeout=20,
+        env={**os.environ, "PYTHONPATH": str(Path(assets.__file__).parent)},
+    )
+    assert result.returncode == 0, result.stderr
+    with pytest.raises(SupplyError) as error:
+        assets._range_hashes_cached(source, [(0, 8)], cancelled=lambda: True)
+    assert error.value.code == "cancelled"
+
+
+def test_gguf_cross_operation_hashes_each_immutable_inode_at_most_once(gguf_source, tmp_path, monkeypatch):
     args = _kwargs(gguf_source)
     root = tmp_path / "operations"
     first = build_gguf_segment(gguf_source, root / "op-1" / "worker-1", **args, reuse_root=root)
-    if cold:
-        monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
     calls = _track_file_hashes(monkeypatch)
     monkeypatch.setattr(assets, "_run_cut", lambda *args, **kwargs: pytest.fail("cache reuse started a cutter"))
     monkeypatch.setattr(assets, "_range_hash", lambda *args, **kwargs: pytest.fail("cache reuse read tensor bytes"))
@@ -271,12 +399,7 @@ def test_gguf_cross_operation_hashes_each_immutable_inode_at_most_once(gguf_sour
             assert assets._hash_file_cached(path) == entry["sha256"]
         directory = Path(result["local_files"]["segment.gguf"]).parent
         assert assets._reuse(directory, validate_supply_manifest(result))["files"] == first["files"]
-        if cold and operation == "op-2":
-            assert len(calls) == 1 + len(first["files"])
-            assert set(calls) == {gguf_source, *(Path(path) for path in first["local_files"].values())}
-            calls.clear()
-        else:
-            assert calls == []
+        assert calls == []
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
@@ -298,7 +421,6 @@ def test_gguf_rebind_copy_fallback_hashes_new_inode_even_with_cached_digest(gguf
                 damaged = bytearray(Path(target).read_bytes())
                 damaged[-1] ^= 1
                 Path(target).write_bytes(damaged)
-            assets._DIGEST_CACHE[assets._file_identity(target)] = first["artifact_sha256"]
         return result
     def cut(*args, **kwargs):
         cuts.append(args)
@@ -319,7 +441,7 @@ def test_gguf_rebind_copy_fallback_hashes_new_inode_even_with_cached_digest(gguf
     calls.clear()
     for entry in second["files"]:
         assert assets._hash_file_cached(second["local_files"][entry["path"]]) == entry["sha256"]
-    assert calls == []
+    assert calls == [], calls
     assert not list(root.glob(".supply-build-*"))
 
 
@@ -419,7 +541,8 @@ def test_cached_hardlink_rejects_identity_changes_during_link(tmp_path, monkeypa
     source, target = tmp_path / "source.bin", tmp_path / "target.bin"
     source.write_bytes(b"verified immutable bytes")
     before = source.stat()
-    entry = {"size_bytes": before.st_size, "sha256": sha256_file(source)}
+    digest = assets._hash_file_cached(source)
+    entry = {"size_bytes": before.st_size, "sha256": digest}
     link = assets.os.link
     def changed_link(original, destination):
         link(original, destination)
@@ -438,10 +561,44 @@ def test_cached_hardlink_rejects_identity_changes_during_link(tmp_path, monkeypa
     assert source.read_bytes() == b"verified immutable bytes"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows share modes enforce the write lock")
+def test_verified_hardlink_carries_digest_under_windows_read_lock(tmp_path, monkeypatch):
+    source, target = tmp_path / "source.bin", tmp_path / "target.bin"
+    source.write_bytes(b"verified immutable bytes")
+    digest = assets._hash_file_cached(source)
+    entry = {"size_bytes": source.stat().st_size, "sha256": digest}
+    link = assets.os.link
+
+    def link_and_probe_write(original, destination):
+        link(original, destination)
+        with pytest.raises(OSError):
+            Path(original).write_bytes(b"same size, changed bytes")
+
+    monkeypatch.setattr(assets.os, "link", link_and_probe_write)
+    monkeypatch.setattr(assets, "_hash_file", lambda *args, **kwargs: pytest.fail("hardlink cache reread bytes"))
+    assert assets._link_verified(source, target, entry, lambda: False, cached=True)
+    assert os.path.samefile(source, target)
+    assert assets._hash_file_cached(target) == digest
+    assert source.read_bytes() == b"verified immutable bytes"
+
+
+def test_hardlink_copy_fallback_checks_space_before_copy(tmp_path, monkeypatch):
+    source, target = tmp_path / "source.bin", tmp_path / "target.bin"
+    source.write_bytes(b"verified immutable bytes")
+    entry = {"size_bytes": source.stat().st_size, "sha256": assets._hash_file_cached(source)}
+    monkeypatch.setattr(assets.os, "link", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unsupported")))
+    monkeypatch.setattr(assets.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 1})())
+    monkeypatch.setattr(assets.shutil, "copyfile", lambda *_args: pytest.fail("copy must not start without space"))
+    with pytest.raises(SupplyError) as error:
+        assets._link_verified(source, target, entry, lambda: False, cached=True)
+    assert error.value.code == "insufficient_disk"
+    assert not target.exists()
+
+
 def test_cached_digest_hit_honors_cancellation(tmp_path, monkeypatch):
     path = tmp_path / "weight.bin"
     path.write_bytes(b"verified")
-    expected = sha256_file(path)
+    expected = assets._hash_file_cached(path)
     calls = _track_file_hashes(monkeypatch)
     assert assets._hash_file_cached(path, lambda: False) == expected
     with pytest.raises(SupplyError) as error:
@@ -450,18 +607,51 @@ def test_cached_digest_hit_honors_cancellation(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_digest_cache_is_bounded_and_evicts_old_entries_in_batches(tmp_path, monkeypatch):
-    limit = assets._DIGEST_CACHE_LIMIT
-    monkeypatch.setattr(assets, "_DIGEST_CACHE", {
-        (-1, index, 0, 0): "0" * 64 for index in range(limit)
-    })
+@pytest.mark.parametrize("phase", ["marker", "rename"])
+def test_publication_rejects_changes_after_inventory(gguf_source, tmp_path, monkeypatch, phase):
+    args = _kwargs(gguf_source)
+    root = tmp_path / "cache"
+    original_write, original_replace = assets._write_json, assets.os.replace
+
+    def mutate(weight):
+        before = weight.stat()
+        with weight.open("r+b") as handle:
+            handle.seek(-1, os.SEEK_END)
+            last = handle.read(1)
+            handle.seek(-1, os.SEEK_END)
+            handle.write(bytes([last[0] ^ 1]))
+        os.utime(weight, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    if phase == "marker":
+        def write(path, payload):
+            original_write(path, payload)
+            if path.name == assets._MARKER:
+                mutate(path.parent / "segment.gguf")
+        monkeypatch.setattr(assets, "_write_json", write)
+    else:
+        def replace(source, target):
+            original_replace(source, target)
+            if Path(source).name.startswith(".supply-build-"):
+                mutate(Path(target) / "segment.gguf")
+        monkeypatch.setattr(assets.os, "replace", replace)
+
+    with pytest.raises(SupplyError) as error:
+        build_gguf_segment(gguf_source, root, **args)
+    assert error.value.code == "file_digest_mismatch"
+    assert not list(root.glob("segment-*"))
+    assert not list(root.glob(".supply-build-*"))
+
+
+def test_digest_cache_rechecks_same_size_change_with_restored_mtime(tmp_path, monkeypatch):
     path = tmp_path / "weight.bin"
-    path.write_bytes(b"new immutable bytes")
+    path.write_bytes(b"original")
+    expected = assets._hash_file_cached(path)
+    before = path.stat()
+    path.write_bytes(b"modified")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
     calls = _track_file_hashes(monkeypatch)
     digest = assets._hash_file_cached(path)
-    assert len(assets._DIGEST_CACHE) == limit - limit // 4 + 1
-    assert (-1, 0, 0, 0) not in assets._DIGEST_CACHE
-    assert (-1, limit - 1, 0, 0) in assets._DIGEST_CACHE
+    assert digest != expected
     assert assets._hash_file_cached(path) == digest
     assert calls == [path]
 
@@ -1005,7 +1195,6 @@ def test_safetensors_hot_build_never_rehashes_source_or_cached_weights(tmp_path,
     else:
         _safetensors_fixture(source, sharded=True)
         args = _kwargs(source)
-    monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
     descriptor_hash = descriptor._sha256_file
     def no_default_gguf_hash(path):
         assert Path(path).suffix != ".gguf", "conversion descriptor bypassed the shared digest"
@@ -1225,8 +1414,8 @@ def test_safetensors_source_change_during_pack_is_rejected(tmp_path, monkeypatch
     root = tmp_path / "hf"
     _safetensors_fixture(root)
     copy = assets._copy_selected
-    def changed(*args):
-        copy(*args)
+    def changed(*args, **kwargs):
+        copy(*args, **kwargs)
         # Core config mutation must not silently acquire the old source SHA.
         (root / "tokenizer_config.json").write_bytes(b'{"changed":true}')
     monkeypatch.setattr(assets, "_copy_selected", changed)

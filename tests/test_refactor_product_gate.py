@@ -265,6 +265,100 @@ def test_local_assignment_uses_inspected_artifact_sha_when_caller_omits_it(monke
     assert frozen["identity"]["artifact_sha256"] == "a" * 64
 
 
+@pytest.mark.parametrize("explicit_engine", [False, True])
+@pytest.mark.parametrize("legacy_path", [None, "stale-legacy.gguf"])
+def test_native_primary_freeze_uses_candidate_artifact(monkeypatch, explicit_engine, legacy_path):
+    from types import SimpleNamespace
+    from model_host import ModelHost
+    calls = []
+    manager = SimpleNamespace(engine_type="llama_cpp",
+        _find_layer_artifact=lambda start, end: calls.append((start, end)) or "supplied-head.gguf",
+        _pipeline_file_sha256=lambda path: calls.append(path) or "b" * 64)
+    host = SimpleNamespace(_require_pipeline_candidate=lambda key: SimpleNamespace(
+        manager=manager, model_sha256="a" * 64, descriptor={"hidden_size": 4096}))
+    if legacy_path is None:
+        monkeypatch.delenv("QLH_LAYER_GGUF", raising=False)
+    else:
+        monkeypatch.setenv("QLH_LAYER_GGUF", legacy_path)
+    assignment = {"start_layer": 0, "end_layer": 24, "has_embedding": True}
+    if explicit_engine:
+        assignment["engine"] = "llama_cpp"
+    frozen = ModelHost.freeze_pipeline_candidate_assignment(
+        host, "candidate", assignment, config_id="config", generation=1)
+    assert calls == [(0, 24), "supplied-head.gguf"]
+    assert frozen["identity"]["artifact_sha256"] == "b" * 64
+    assert frozen["identity"]["stage_model_identity"]["sha256"] == "b" * 64
+    assert frozen["load_spec"]["materialization"] == "gguf_segment"
+
+
+def test_native_primary_freeze_rejects_missing_candidate_despite_legacy_env(monkeypatch):
+    from types import SimpleNamespace
+    from model_host import ModelHost
+    monkeypatch.setenv("QLH_LAYER_GGUF", "legacy.gguf")
+    host = SimpleNamespace(_require_pipeline_candidate=lambda key: SimpleNamespace(
+        manager=SimpleNamespace(engine_type="llama_cpp", _find_layer_artifact=lambda start, end: ""),
+        model_sha256="a" * 64, descriptor={}))
+    with pytest.raises(ValueError, match="deployment_local_artifact_missing"):
+        ModelHost.freeze_pipeline_candidate_assignment(host, "candidate",
+            {"start_layer": 0, "end_layer": 24}, config_id="config", generation=1)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_additional_native_freeze_fallback_shares_scheduler_digest(tmp_path, monkeypatch, changed):
+    import hashlib
+    import os
+    from types import SimpleNamespace
+    import config
+    import model_supply_digest_cache as digests
+    import scheduler
+    from model_host import ModelHost
+
+    artifact = tmp_path / "middle.gguf"
+    original = b"cpu middle 8-24"
+    replacement = b"new middle 8-24"
+    artifact.write_bytes(original)
+    monkeypatch.setenv("QLH_LAYER_GGUF", str(artifact))
+    monkeypatch.setattr(config, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(digests, "_STORES", {})
+    reads = []
+    hash_file = digests._hash_file
+
+    def observed_hash(path, cancelled=None):
+        reads.append(path)
+        return hash_file(path, cancelled)
+
+    monkeypatch.setattr(digests, "_hash_file", observed_hash)
+    assert scheduler._local_cpu_artifact_sha256() == hashlib.sha256(original).hexdigest()
+    if changed:
+        before = artifact.stat()
+        artifact.write_bytes(replacement)
+        os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+    host = SimpleNamespace(_require_pipeline_candidate=lambda key: SimpleNamespace(
+        manager=SimpleNamespace(engine_type="pytorch"), model_sha256="a" * 64, descriptor={}))
+    assignment = {"engine": "llama_cpp", "executor_id": "cpu", "start_layer": 8, "end_layer": 24}
+    expected = hashlib.sha256(replacement if changed else original).hexdigest()
+    for _ in range(2):
+        frozen = ModelHost.freeze_pipeline_candidate_assignment(
+            host, "candidate", assignment, config_id="config", generation=1)
+        assert frozen["identity"]["artifact_sha256"] == expected
+        assert frozen["identity"]["stage_model_identity"]["sha256"] == expected
+    assert len(reads) == (2 if changed else 1)
+
+
+def test_additional_native_executor_keeps_selected_identity_with_pytorch_primary(monkeypatch):
+    from types import SimpleNamespace
+    from model_host import ModelHost
+    monkeypatch.delenv("QLH_LAYER_GGUF", raising=False)
+    host = SimpleNamespace(_require_pipeline_candidate=lambda key: SimpleNamespace(
+        manager=SimpleNamespace(engine_type="pytorch"), model_sha256="a" * 64, descriptor={}))
+    assignment = {"engine": "llama_cpp", "executor_id": "cpu", "start_layer": 8, "end_layer": 24,
+                  "layer_artifact": {"artifact_sha256": "b" * 64}}
+    frozen = ModelHost.freeze_pipeline_candidate_assignment(
+        host, "candidate", assignment, config_id="config", generation=1)
+    assert frozen["identity"]["artifact_sha256"] == "b" * 64
+    assert frozen["load_spec"]["materialization"] == "gguf_segment"
+
+
 from tests.test_pipeline_capacity_freshness import fresh_case
 
 

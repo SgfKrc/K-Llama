@@ -7,6 +7,7 @@ an error, never a wildcard. No tensor payload or native model loader is used.
 from __future__ import annotations
 
 import math
+import mmap
 import struct
 from pathlib import Path
 from typing import Any, Mapping
@@ -31,11 +32,24 @@ def _invalid(message: str) -> None:
 
 
 def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple[dict, dict[str, tuple[int, int, tuple, int]]]:
+    from model_supply_digest_cache import cached_metadata
+
+    def inspect(source):
+        metadata, tensors = _read_gguf_header(source, include_tensors=include_tensors)
+        return {"metadata": metadata, "tensors": tensors}
+
+    result = cached_metadata(path, "gguf-header-v1-" + str(include_tensors), inspect)
+    tensors = {name: (entry[0], entry[1], tuple(entry[2]), entry[3])
+               for name, entry in result["tensors"].items()}
+    return result["metadata"], tensors
+
+
+def _read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple[dict, dict[str, tuple[int, int, tuple, int]]]:
     """Read bounded metadata and tensor ranges, never tensor payloads."""
     from relay_segment_info import _GGML_TYPE_SIZES, _GGUF_SCALAR_TYPES
     path = Path(path)
     size = path.stat().st_size
-    with path.open("rb") as handle:
+    with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as handle:
         position = 0
 
         def read(count):

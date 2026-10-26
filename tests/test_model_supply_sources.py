@@ -53,12 +53,36 @@ def test_source_identity_is_shared_with_segment_builders_and_invalidation(tmp_pa
 def test_source_bundle_identity_reuses_source_verification_digests(tmp_path, monkeypatch):
     import model_supply_assets as assets
     from model_sync import compute_model_sha256
-    path = tmp_path / "model.safetensors"
+    root = tmp_path / "source"
+    root.mkdir()
+    path = root / "model.safetensors"
     path.write_bytes(b"verified-source-weights")
     file_digest = sources._content_sha(path, lambda: False)
     expected = hashlib.sha256(f"{path.name}\0{path.stat().st_size}\0{file_digest}\n".encode()).hexdigest()
     monkeypatch.setattr(assets, "_hash_file", lambda *args, **kwargs: pytest.fail("source bundle reread weight bytes"))
-    assert compute_model_sha256(str(tmp_path), digest=assets._hash_file_cached) == expected
+    assert compute_model_sha256(str(root), digest=assets._hash_file_cached) == expected
+
+
+def test_verified_gguf_metadata_survives_restart_and_rechecks_sidecar(tmp_path, monkeypatch):
+    import model_supply_digest_cache as digests
+    from scripts.model_tools import gguf as tools
+    path = _gguf(tmp_path / "source.gguf")
+    expected = sources._gguf_metadata(path)
+    digests._STORES.clear()
+    original = tools.verify_gguf
+    calls = []
+
+    def inspect(*args, **kwargs):
+        calls.append(Path(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tools, "verify_gguf", inspect)
+    assert sources._gguf_metadata(path) == expected
+    assert calls == []
+    path.with_suffix(".sha256").write_text("f" * 64, encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA256 validation failed"):
+        sources._gguf_metadata(path)
+    assert calls == [path]
 
 
 def _hf(root: Path, *, manifest: bool = False, tokenizer: bool = True) -> Path:

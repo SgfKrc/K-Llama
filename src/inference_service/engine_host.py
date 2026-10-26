@@ -2985,7 +2985,7 @@ class EngineHost:
         if identity != runtime.identity["stage_model_identity"] or fields.get("layer_range") != runtime.identity["layer_range"]:
             raise WorkerPrepareError("worker_prepare_stage_contract_mismatch")
 
-    def _layer_forward_upstream(self):
+    def _layer_forward_upstream(self, *, stage_request=None, provider_cancel_event=None):
         """按 env 配置创建并复用 keep-head 上游（进程隔离由 `KeepHeadUpstream` 自理）。
 
         env（PC 侧没有像 Android 那样的工件目录扫描，这是唯一的配置入口）：
@@ -3025,16 +3025,69 @@ class EngineHost:
 
         from model_supply_worker import selected_gguf_path
         environment = os.environ if self._environment is None else self._environment
-        if self._environment is None:
+        executor_id = str(getattr(stage_request, "executor_id", "") or "")
+        if self._environment is None and not executor_id:
             model_path = selected_gguf_path() or environment.get("QLH_LAYER_GGUF", "").strip()
         else:
             model_path = environment.get("QLH_LAYER_GGUF", "").strip()
+        binding = None
+        artifact_version = None
+        if executor_id:
+            from pathlib import Path
+            from model_supply_digest_cache import cached_sha256, file_stamp
+            from relay_segment_info import read_artifact_manifest
+            from worker_prepare_contract import WorkerPrepareError, validate_stage_identity
+
+            fields = stage_request.stage_fields or {}
+            prepare_identity = validate_stage_identity(fields.get("prepare_identity"))
+            identity = getattr(stage_request, "model_identity", None)
+            if hasattr(identity, "snapshot"):
+                identity = identity.snapshot()
+            if (not isinstance(identity, dict)
+                    or (identity.get("engine"), identity.get("format")) != ("llama_cpp", "gguf")
+                    or identity.get("sha256") != prepare_identity["artifact_sha256"]):
+                raise WorkerPrepareError("local_executor_model_identity_mismatch")
+            span = fields.get("layer_range")
+            if (not isinstance(span, list) or len(span) != 2
+                    or any(type(value) is not int for value in span) or not 0 <= span[0] < span[1]):
+                raise WorkerPrepareError("local_executor_layer_range_mismatch")
+            if not model_path:
+                raise WorkerPrepareError("local_executor_artifact_path_missing")
+            artifact = Path(model_path).resolve()
+            model_path = str(artifact)
+            markers = (artifact.with_suffix(".manifest.json"), Path(model_path + ".manifest.json"))
+
+            def artifact_version():
+                try:
+                    return (file_stamp(artifact), tuple(
+                        file_stamp(marker) if marker.is_file() else None for marker in markers))
+                except OSError as exc:
+                    raise WorkerPrepareError("local_executor_artifact_unavailable") from exc
+
+            version = artifact_version()
+            binding = (executor_id, prepare_identity, dict(identity), tuple(span), model_path, version)
+            if (binding != getattr(self, "_layer_upstream_binding", None)
+                    or self._layer_upstream is None or not self._layer_upstream.is_available):
+                manifest = next((info for marker in markers
+                                 if (info := read_artifact_manifest(marker))), None)
+                if (manifest is None or manifest.get("source_layer_range") != span
+                        or manifest.get("artifact_sha256") != prepare_identity["artifact_sha256"]):
+                    raise WorkerPrepareError("local_executor_artifact_contract_mismatch")
+                cancelled = provider_cancel_event.is_set if provider_cancel_event is not None else None
+                if cached_sha256(artifact, cancelled) != prepare_identity["artifact_sha256"]:
+                    raise WorkerPrepareError("local_executor_artifact_digest_mismatch")
+                if version != artifact_version():
+                    raise WorkerPrepareError("local_executor_artifact_changed")
+            if provider_cancel_event is not None and provider_cancel_event.is_set():
+                raise WorkerPrepareError("local_executor_cancelled")
         if self._layer_upstream is not None:
             previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
-            if (not previous_path or previous_path == model_path) and self._layer_upstream.is_available:
+            if ((not previous_path or previous_path == model_path) and self._layer_upstream.is_available
+                    and binding == getattr(self, "_layer_upstream_binding", None)):
                 return self._layer_upstream
             self._layer_upstream.close()
             self._layer_upstream = None
+            self._layer_upstream_binding = None
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
@@ -3073,6 +3126,17 @@ class EngineHost:
             if owner is not None:
                 self._layer_upstream = owner
             raise StageExecutionError(f"层段 keep-head 上游不可用：{exc}") from exc
+        if artifact_version is not None:
+            try:
+                if version != artifact_version():
+                    raise WorkerPrepareError("local_executor_artifact_changed")
+                if provider_cancel_event is not None and provider_cancel_event.is_set():
+                    raise WorkerPrepareError("local_executor_cancelled")
+            except WorkerPrepareError:
+                self._layer_upstream.close()
+                self._layer_upstream = None
+                raise
+        self._layer_upstream_binding = binding
         return self._layer_upstream
 
     def _unload_supplied_layer_manager(self) -> None:
@@ -3342,7 +3406,10 @@ class EngineHost:
         hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
         from model_supply_worker import get_selected_model
 
-        if getattr(self, "_worker_runtime_managed", False):
+        _local_executor_id = str(getattr(stage_request, "executor_id", "") or "")
+        if _local_executor_id:
+            selected = None
+        elif getattr(self, "_worker_runtime_managed", False):
             selected = self._worker_runtime_active.selected
         else:
             selected = get_selected_model()
@@ -3354,7 +3421,6 @@ class EngineHost:
         #   `supplied_layer_range_mismatch`（实测 12:03:22），而它本该走下面的
         #   `_layer_forward_upstream()`（keep-head）分支。
         #   判据用 `stage_request.executor_id`（本机主段为空 ⇒ 不受影响）。
-        _local_executor_id = str(getattr(stage_request, "executor_id", "") or "")
         supplied = (
             not _local_executor_id
             and selected is not None
@@ -3386,7 +3452,10 @@ class EngineHost:
                 "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
                 "token_argmax": None,
             }
-        upstream = self._layer_forward_upstream()
+        upstream = (
+            self._layer_forward_upstream(stage_request=stage_request, provider_cancel_event=provider_cancel_event)
+            if _local_executor_id else self._layer_forward_upstream()
+        )
         if want_all_tokens and getattr(upstream, "supports_multi_position_argmax", False) is not True:
             raise _StageError("multi_position_argmax_unavailable")
 

@@ -40,6 +40,7 @@ _RESUME_MARKER = ".supply-resume.json"
 _RESUME_INTERVAL = 16 * 1024 * 1024
 _CHUNK = 1024 * 1024
 _MAX_HEADER = 64 * 1024 * 1024
+_COPY_FALLBACK_LOCK = threading.Lock()
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 _FIELDS = {
@@ -75,39 +76,31 @@ def sha256_file(path: str | Path) -> str:
     return _hash_file(path)
 
 
-_DIGEST_CACHE: dict[tuple, str] = {}
-_DIGEST_CACHE_LIMIT = 4096
-_DIGEST_CACHE_LOCK = threading.Lock()
-
-
 def _hash_file_cached(path: str | Path, cancelled: Callable[[], bool] | None = None) -> str:
-    """Reuse a verified immutable file's digest across renames and hardlinks.
-
-    File identity includes device, inode, size and nanosecond mtime. Boundary
-    validation uses _hash_file; operation windows use _file_identity comparisons.
-    """
+    """Use the shared persistent digest store and its complete live file stamp."""
     if cancelled is not None:
         _cancelled(cancelled)
-    key = _file_identity(path)
-    with _DIGEST_CACHE_LOCK:
-        cached = _DIGEST_CACHE.get(key)
-    if cached is not None:
-        return cached
-    return _hash_file(path, cancelled)
+    try:
+        from model_supply_digest_cache import cached_sha256
+        return cached_sha256(path, cancelled, hash_file=_hash_file)
+    except ValueError as exc:
+        code = getattr(exc, "code", "file_digest_mismatch")
+        _fail(code, "artifact digest cache could not verify the file")
 
 
 def _file_identity(path: str | Path) -> tuple | None:
-    """Cheap change detector for "did this file change during the operation?".
-
-    Uses the same `(dev, ino, size, mtime_ns)` signature as `_hash_file`, but reads
-    no bytes. A caller that needs to prove a file was untouched across a window can
-    compare this before/after instead of re-hashing gigabytes a second time.
-    """
+    """Read the shared file version fence without reading tensor payloads."""
     try:
-        info = Path(path).stat()
+        from model_supply_digest_cache import file_stamp
+        stamp = file_stamp(path)
+        return (stamp[4], stamp[3], stamp[0], stamp[1], stamp[2], stamp[5])
     except OSError:
         return None
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _file_stamp(path: str | Path) -> tuple:
+    from model_supply_digest_cache import file_stamp
+    return file_stamp(path)
 
 
 def _hash_file(path: str | Path, cancelled: Callable[[], bool] | None = None) -> str:
@@ -132,14 +125,7 @@ def _hash_file(path: str | Path, cancelled: Callable[[], bool] | None = None) ->
             _cancelled(cancelled)
     except OSError as exc:
         raise SupplyError("file_unavailable", "artifact cannot be read") from exc
-    result = digest.hexdigest()
-    key = signature(current)
-    with _DIGEST_CACHE_LOCK:
-        if key not in _DIGEST_CACHE and len(_DIGEST_CACHE) >= _DIGEST_CACHE_LIMIT:
-            for expired in list(islice(_DIGEST_CACHE, max(1, _DIGEST_CACHE_LIMIT // 4))):
-                _DIGEST_CACHE.pop(expired, None)
-        _DIGEST_CACHE[key] = result
-    return result
+    return digest.hexdigest()
 
 
 def _json_bytes(payload: Any) -> bytes:
@@ -384,20 +370,43 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _inventory(root: Path, names: dict[str, str], *, verified_files=None,
-               cancelled=None) -> list[dict]:
+               cancelled=None, version_stamps=None) -> list[dict]:
     verified = {entry["path"]: entry for entry in verified_files or ()}
     inventory = []
     for name, kind in sorted(names.items()):
         path = _safe_path(root, name)
-        size = path.stat().st_size
-        digest = (_hash_file_cached if name in verified else _hash_file)(path, cancelled)
-        if name in verified:
-            if size != verified[name]["size_bytes"]:
+        stamp = _file_stamp(path)
+        size = stamp[0]
+        verified_entry = verified.get(name)
+        if verified_entry is not None and verified_entry.get("version_stamp") == stamp:
+            digest = verified_entry["sha256"]
+        else:
+            digest = _hash_file_cached(path, cancelled)
+        if stamp != _file_stamp(path):
+            _fail("file_digest_mismatch", "cache changed during publication inventory")
+        if verified_entry is not None:
+            if size != verified_entry["size_bytes"]:
                 _fail("file_size_mismatch", "cache changed before publication")
-            if digest != verified[name]["sha256"]:
+            if digest != verified_entry["sha256"]:
                 _fail("file_digest_mismatch", "cache changed before publication")
+        if version_stamps is not None:
+            version_stamps[name] = stamp
         inventory.append({"path": name, "size_bytes": size, "sha256": digest, "kind": kind})
     return inventory
+
+
+def _check_version_stamps(root: Path, version_stamps: dict[str, tuple]) -> None:
+    for name, expected in version_stamps.items():
+        if _file_stamp(_safe_path(root, name)) != expected:
+            _fail("file_digest_mismatch", "cache changed before publication")
+
+
+def _remove_failed_publication(final: Path) -> None:
+    if (not final.name.startswith("segment-") or _link(final)
+            or any(_link(parent) for parent in final.parents)):
+        _fail("unsafe_path", "refusing to remove an unrelated publication")
+    if final.is_dir():
+        shutil.rmtree(final)
 
 
 def _attach_local(payload: dict, root: Path) -> dict:
@@ -543,32 +552,50 @@ def _segment_content_key(manifest: dict) -> str:
 def _link_verified(source: Path, target: Path, entry: dict, cancelled, *, cached=False) -> bool:
     if any(_link(p) for p in (source, *source.parents)) or not source.is_file():
         return False
+    from model_supply_digest_cache import stable_file_read
+    with stable_file_read(source) as locked:
+        return _link_verified_locked(source, target, entry, cancelled, locked=locked)
+
+
+def _link_verified_locked(source: Path, target: Path, entry: dict, cancelled, *, locked: bool) -> bool:
+    from model_supply_digest_cache import file_stamp, remember_hardlink_sha256
+    digest_stamp = file_stamp(source)
     before = _file_identity(source)
     if (before is None or before[2] != entry["size_bytes"]
-            or (_hash_file_cached if cached else _hash_file)(source, cancelled) != entry["sha256"]):
+            or _hash_file_cached(source, cancelled) != entry["sha256"]
+            or digest_stamp != file_stamp(source)):
         return False
     _cancelled(cancelled)
     target.parent.mkdir(parents=True, exist_ok=True)
     _safe_path(target.parent, target.name)
-    linked = True
-    try:
-        os.link(source, target)
-    except OSError:
+    linked = locked or os.name != "nt"
+    if linked:
+        try:
+            os.link(source, target)
+        except OSError:
+            linked = False
+    if not linked:
         # Never mutate a published source; copy if hardlinks are unsupported.
-        linked = False
-        shutil.copyfile(source, target)
+        with _COPY_FALLBACK_LOCK:
+            _ensure_space(target.parent, entry["size_bytes"])
+            shutil.copyfile(source, target)
     target_identity = _file_identity(target)
-    if (before != _file_identity(source) or target_identity is None
+    source_identity = _file_identity(source)
+    source_changed = (source_identity is None or
+                      (before[:4] != source_identity[:4] if linked else before != source_identity))
+    if (source_changed or target_identity is None
             or target_identity[2] != entry["size_bytes"]
-            or (linked and target_identity != before)
-            or (not linked and _hash_file(target, cancelled) != entry["sha256"])):
+            or (linked and target_identity != source_identity)
+            or (not linked and _hash_file_cached(target, cancelled) != entry["sha256"])):
         target.unlink(missing_ok=True)
         return False
     _cancelled(cancelled)
-    if (before != _file_identity(source) or target_identity != _file_identity(target)
+    if (source_identity != _file_identity(source) or target_identity != _file_identity(target)
             or any(_link(p) for p in (source, *source.parents, target, *target.parents))):
         target.unlink(missing_ok=True)
         return False
+    if linked and locked:
+        remember_hardlink_sha256(source, target, entry["sha256"], digest_stamp)
     return True
 
 
@@ -615,17 +642,19 @@ def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: 
                     _verify_segment(candidate, old)
             else:
                 _verify_segment(candidate, old)
-            if old["node_id"] != identity["node_id"]:
+            if verify_source is not None:
+                verify_source(candidate, old)
+            elif old["node_id"] != identity["node_id"]:
                 # A node label is not content identity, but dropping it must
                 # not promote a self-consistent inventory into source proof.
                 if verify_source is None:
                     continue
-                verify_source(candidate, old)
             payload = dict(old)
             payload["operation_id"] = identity["operation_id"]
             payload["node_id"] = identity["node_id"]
             payload.pop("manifest_sha256")
             stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
+            verified_files = []
             for entry in old["files"]:
                 if upgraded_native is not None and entry["path"] == native_name:
                     # Never modify a hard-linked native manifest in the cache.
@@ -634,8 +663,9 @@ def _rebind_cached_segment(root: Path, final: Path, identity: dict, reuse_root: 
                 if not _link_verified(_safe_path(candidate, entry["path"]),
                                       _safe_path(stage, entry["path"]), entry, cancelled, cached=True):
                     _fail("file_digest_mismatch", "cache changed while rebinding")
+                verified_files.append({**entry, "version_stamp": _file_stamp(_safe_path(stage, entry["path"]))})
             result = _finish(stage, final, payload, {entry["path"]: entry["kind"] for entry in old["files"]},
-                             verified_files=[entry for entry in old["files"]
+                             verified_files=[entry for entry in verified_files
                                              if upgraded_native is None or entry["path"] != native_name],
                              cancelled=cancelled, check_source=check_source)
             result["_reused_bytes"] = sum(e["size_bytes"] for e in old["files"]
@@ -694,14 +724,15 @@ def reuse_segment(manifest: dict, destination_root: Path, *, cancelled=lambda: F
             _verify_files(candidate, old, cancelled=cancelled)
             _verify_segment(candidate, old)
             stage = Path(tempfile.mkdtemp(prefix=".supply-build-", dir=root))
+            verified_files = []
             for entry in payload["files"]:
                 if not _link_verified(_safe_path(candidate, entry["path"]),
                                       _safe_path(stage, entry["path"]), entry, cancelled, cached=True):
                     _fail("file_digest_mismatch", "cache changed while rebinding")
-            _verify_segment(stage, payload)
-            _write_json(stage / _MARKER, payload)
-            _cancelled(cancelled)
-            os.replace(stage, final)
+                verified_files.append({**entry, "version_stamp": _file_stamp(_safe_path(stage, entry["path"]))})
+            _finish(stage, final, payload,
+                    {entry["path"]: entry["kind"] for entry in payload["files"]},
+                    verified_files=verified_files, cancelled=cancelled)
             return _received_result(payload, final, reused=True,
                                     reused_bytes=sum(e["size_bytes"] for e in payload["files"]))
         except (SupplyError, OSError) as exc:
@@ -1001,7 +1032,9 @@ def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str], *,
             _cancelled(cancelled)
         with _safe_path(stage, name).open("r+b") as handle:
             os.fsync(handle.fileno())
-    payload["files"] = _inventory(stage, names, verified_files=verified_files, cancelled=cancelled)
+    version_stamps = {}
+    payload["files"] = _inventory(stage, names, verified_files=verified_files,
+                                  cancelled=cancelled, version_stamps=version_stamps)
     payload["artifact_sha256"] = (
         next(item["sha256"] for item in payload["files"] if item["kind"] == "weights")
         if payload["format"] == "gguf" else _weight_digest(payload["files"])
@@ -1014,18 +1047,45 @@ def _finish(stage: Path, final: Path, payload: dict, names: dict[str, str], *,
         check_source()
     if cancelled is not None:
         _cancelled(cancelled)
+    _check_version_stamps(stage, version_stamps)
     _write_json(stage / _MARKER, payload)
+    marker_stamp = _file_stamp(stage / _MARKER)
     if check_source is not None:
         check_source()
     if cancelled is not None:
         _cancelled(cancelled)
+    _check_version_stamps(stage, version_stamps)
     try:
-        os.replace(stage, final)
+        from model_supply_digest_cache import remember_published_files
+        cached_files = [(stage / entry["path"], final / entry["path"],
+                         version_stamps[entry["path"]], entry["sha256"])
+                        for entry in payload["files"]]
+        published = False
+        for _attempt in range(8):
+            try:
+                os.replace(stage, final)
+                published = True
+                break
+            except OSError as exc:
+                if (sys.platform != "win32"
+                        or getattr(exc, "winerror", None) not in {5, 32, 33}
+                        or _attempt == 7):
+                    raise
+                time.sleep(0.01 * 2 ** _attempt)
     except OSError:
         existing = _reuse(final, payload, cancelled=cancelled)
         if existing is None:
             raise
         return existing
+    if published:
+        try:
+            _check_version_stamps(final, version_stamps)
+            if _file_stamp(final / _MARKER) != marker_stamp:
+                _fail("file_digest_mismatch", "manifest changed during publication")
+        except Exception:
+            _remove_failed_publication(final)
+            raise
+        remember_published_files(cached_files)
     return _attach_local(payload, final)
 
 
@@ -1139,6 +1199,36 @@ def _range_hash(path: Path, offset: int, length: int, *, cancelled=None) -> str:
     return digest.hexdigest()
 
 
+def _range_hashes_cached(path: Path, ranges, *, cancelled=None) -> dict[tuple[int, int], str]:
+    """Cache tensor-range digests independently across overlapping segments."""
+    if cancelled is not None:
+        _cancelled(cancelled)
+    ranges = sorted({(int(offset), int(length)) for offset, length in ranges})
+    if not ranges or any(offset < 0 or length <= 0 for offset, length in ranges):
+        _fail("invalid_artifact", "tensor range inventory is invalid")
+    keys = [f"{offset}:{length}" for offset, length in ranges]
+    content_sha256 = _hash_file_cached(path, cancelled)
+
+    def compute(current, missing):
+        return {key: _range_hash(current, *map(int, key.split(":")), cancelled=cancelled)
+                for key in missing}
+
+    try:
+        from model_supply_digest_cache import cached_metadata_items
+        result = cached_metadata_items(
+            path, "supply-tensor-range-v1-" + content_sha256, keys, compute, cancelled,
+        )
+    except ValueError as exc:
+        code = getattr(exc, "code", "file_digest_mismatch")
+        if code == "file_digest_mismatch":
+            code = "source_digest_mismatch"
+        _fail(code, "tensor range digest cache could not verify the file")
+    try:
+        return {(offset, length): result[f"{offset}:{length}"] for offset, length in ranges}
+    except (KeyError, TypeError):
+        _fail("tensor_digest_mismatch", "cached tensor range inventory is incomplete")
+
+
 def _check_cut_owner(cancelled, deadline):
     if cancelled is not None:
         _cancelled(cancelled)
@@ -1205,6 +1295,7 @@ def _gguf_tensor_selection(tensors: dict, metadata: dict,
             block_count=metadata.get(f"{arch}.block_count"),
             nextn_predict_layers=metadata.get(f"{arch}.nextn_predict_layers", 0),
             start_layer=start_layer, end_layer=end_layer,
+            architecture=arch,
         )
     except ValueError as exc:
         raise SupplyError("invalid_gguf", str(exc)) from exc
@@ -1272,7 +1363,10 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
             raise
         raise SupplyError("gguf_metadata_mismatch", str(exc)) from exc
     root = _storage_root(destination_dir)
-    final = _generation(root, payload)
+    generation_identity = payload
+    if "output.weight" in tensors and "output.weight" not in selection.tensor_sources:
+        generation_identity = {**payload, "_gguf_tensor_selection": 2}
+    final = _generation(root, generation_identity)
     try:
         reused = _reuse(final, payload, cancelled=stopped)
     except SupplyError as exc:
@@ -1280,7 +1374,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
             raise
         # Keep the old ready generation intact. Publish a separate contract
         # generation so a legacy receipt cannot permanently block rebuilding.
-        final = _generation(root, {**payload, "_gguf_metadata_contract": 1})
+        final = _generation(root, {**generation_identity, "_gguf_metadata_contract": 1})
         reused = _reuse(final, payload, cancelled=stopped)
     if reused:
         raw, _ = _gguf_table(Path(reused["local_files"]["segment.gguf"]))
@@ -1293,11 +1387,18 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
         expected = {target: tensors[name] for target, name in selection.tensor_sources.items()}
         if set(expected) != set(cached_tensors):
             _fail("layer_range_mismatch", "cached GGUF tensor set differs from source range")
+        source_hashes = _range_hashes_cached(
+            source, [tensors[source_name][:2] for source_name in selection.tensor_sources.values()],
+            cancelled=stopped,
+        )
+        cached_hashes = _range_hashes_cached(
+            cached_path, [(entry[0], entry[1]) for entry in cached_tensors.values()], cancelled=stopped,
+        )
         for name, entry in expected.items():
             output = cached_tensors[name]
             if (entry[1:] != output[1:]
-                    or _range_hash(source, entry[0], entry[1], cancelled=stopped)
-                    != _range_hash(cached_path, output[0], output[1], cancelled=stopped)):
+                    or source_hashes[(entry[0], entry[1])]
+                    != cached_hashes[(output[0], output[1])]):
                 _fail("tensor_digest_mismatch", "cached GGUF tensor differs from source")
         if _file_identity(source) != source_identity:
             _fail("source_digest_mismatch", "source GGUF changed during cache verification")
@@ -1332,7 +1433,7 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                 or generated.get("source_model_id") != source_model_id
                 or generated.get("hidden_size") != hidden
                 or generated.get("kept_block_count") != end_layer - start_layer
-                or generated.get("artifact_sha256") != _hash_file(artifact, stopped)):
+                or generated.get("artifact_sha256") != _hash_file_cached(artifact, stopped)):
             _fail("cut_manifest_mismatch", "cut manifest differs from actual assignment")
         # --end excludes source MTP blocks at a decoder tail. The cutter calls
         # this CLI shape "middle" even when the verified decoder range ends at
@@ -1354,11 +1455,19 @@ def build_gguf_segment(source: Path, destination_dir: Path, *, source_model_id,
                     for target, source_name in selection.tensor_sources.items()}
         if set(expected) != set(out_tensors):
             _fail("layer_range_mismatch", "cut GGUF tensor set differs from source range")
+        source_hashes = _range_hashes_cached(
+            source, [tensors[source_name][:2] for source_name in selection.tensor_sources.values()],
+            cancelled=stopped,
+        )
+        output_hashes = _range_hashes_cached(
+            artifact, [(entry[0], entry[1]) for entry in out_tensors.values()], cancelled=stopped,
+        )
         for name, entry in expected.items():
             stopped()
             output = out_tensors[name]
-            if (entry[1:] != output[1:] or _range_hash(source, entry[0], entry[1], cancelled=stopped)
-                    != _range_hash(artifact, output[0], output[1], cancelled=stopped)):
+            if (entry[1:] != output[1:]
+                    or source_hashes[(entry[0], entry[1])]
+                    != output_hashes[(output[0], output[1])]):
                 _fail("tensor_digest_mismatch", "cut GGUF tensor bytes differ from source")
         if _layer_sizes(out_tensors, total_layers, start_layer, end_layer, local=True) != layer_bytes:
             _fail("layer_bytes_mismatch", "cut GGUF per-layer bytes differ from source")
@@ -1454,12 +1563,13 @@ def _model_identity(root: Path) -> dict[Path, tuple | None]:
     return {path: _file_identity(path) for path in _model_files(root)}
 
 
-def _model_digest(root: Path) -> str:
+def _model_digest(root: Path, cancelled=None) -> str:
     """model_sync's aggregate recipe, without modifying source/cache files."""
     digest = hashlib.sha256()
     for path in _model_files(root):
+        _cancelled(cancelled)
         relative = path.relative_to(root).as_posix()
-        digest.update(f"{relative}\0{path.stat().st_size}\0{_hash_file_cached(path)}\n".encode("utf-8"))
+        digest.update(f"{relative}\0{path.stat().st_size}\0{_hash_file_cached(path, cancelled)}\n".encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -1506,7 +1616,7 @@ def _source_safetensors(root: Path) -> tuple[dict, dict, dict]:
 
 
 def _copy_selected(source: Path, destination: Path, header: dict, data_start: int,
-                   keys: list[str]) -> None:
+                   keys: list[str], *, cancelled=None, deadline=None) -> None:
     offset, output = 0, {"__metadata__": {"format": "pt"}}
     for key in keys:
         item = header[key]
@@ -1519,15 +1629,29 @@ def _copy_selected(source: Path, destination: Path, header: dict, data_start: in
         writer.write(struct.pack("<Q", len(encoded)))
         writer.write(encoded)
         for key in keys:
+            _check_cut_owner(cancelled, deadline)
             lo, hi = header[key]["data_offsets"]
             reader.seek(data_start + lo)
             remaining = hi - lo
             while remaining:
+                _check_cut_owner(cancelled, deadline)
                 chunk = reader.read(min(_CHUNK, remaining))
                 if not chunk:
                     _fail("invalid_safetensors", "source tensor bytes are truncated")
                 writer.write(chunk)
                 remaining -= len(chunk)
+        writer.flush()
+        os.fsync(writer.fileno())
+
+
+def _copy_file(source: Path, destination: Path, *, cancelled=None, deadline=None) -> None:
+    with source.open("rb") as reader, destination.open("wb") as writer:
+        while True:
+            _check_cut_owner(cancelled, deadline)
+            chunk = reader.read(_CHUNK)
+            if not chunk:
+                break
+            writer.write(chunk)
         writer.flush()
         os.fsync(writer.fileno())
 
@@ -1568,7 +1692,8 @@ def _proof_source(payload: dict) -> dict | None:
     return source
 
 
-def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_map: dict) -> None:
+def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_map: dict,
+                                cancelled=None) -> None:
     """Reverify full source inventory and existing HF-to-GGUF provenance."""
     from pipeline_model_descriptor import (
         PipelineModelDescriptorError, cross_format_pipeline_identity, _decoder_config,
@@ -1578,7 +1703,11 @@ def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_
     if _read_json(root / "cross_format.provenance.json") != payload["conversion_proof"]:
         _fail("conversion_proof_invalid", "supplied proof differs from source provenance")
     try:
-        identity = cross_format_pipeline_identity(root, digest=_hash_file_cached)
+        identity = cross_format_pipeline_identity(
+            root, digest=lambda path: _hash_file_cached(path, cancelled),
+        )
+    except SupplyError:
+        raise
     except (PipelineModelDescriptorError, OSError, ValueError) as exc:
         raise SupplyError("conversion_proof_invalid", "source conversion binding could not be verified") from exc
     if (identity.get("source_model_sha256") != payload["source_model_sha256"]
@@ -1587,6 +1716,7 @@ def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_
     manifest = _read_json(root / "model.manifest.json")
     declared = set()
     for entry in manifest["files"]:
+        _cancelled(cancelled)
         relative = _relative(entry["path"])
         if relative in declared:
             _fail("conversion_proof_invalid", "full source inventory has duplicate paths")
@@ -1612,7 +1742,8 @@ def _verify_cross_format_source(root: Path, payload: dict, config: dict, weight_
 def build_safetensors_segment(source: Path, destination_dir: Path, *, source_model_id,
                               source_model_sha256, tokenizer_sha256, start_layer,
                               end_layer, total_layers, operation_id, node_id,
-                              conversion_proof: dict | None = None, reuse_root: Path | None = None) -> dict:
+                              conversion_proof: dict | None = None, reuse_root: Path | None = None,
+                              cancelled=None, deadline=None) -> dict:
     """Repack selected tensors; source is a HF directory (or its shard).
 
     Source SHA is model_sync's aggregate recipe, or a full GGUF target identity
@@ -1626,6 +1757,10 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
         total_layers=total_layers, operation_id=operation_id, node_id=node_id,
         conversion_proof=conversion_proof,
     )
+    def stopped():
+        _check_cut_owner(cancelled, deadline)
+
+    stopped()
     payload["format"] = "safetensors"
     root_source = Path(source).resolve()
     if root_source.is_file() and root_source.suffix == ".safetensors":
@@ -1646,14 +1781,14 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
             _fail("source_digest_mismatch", "source model changed during segment generation")
     config, weight_map, headers = _source_safetensors(root_source)
     decoder = _decoder_config(config)
-    actual_source = _model_digest(root_source)
+    actual_source = _model_digest(root_source, cancelled=stopped)
     if actual_source != source_model_sha256:
         if not isinstance(conversion_proof, dict) or conversion_proof.get("kind") != "qlh.cross_format_pipeline_identity.v1":
             _fail("source_digest_mismatch", "source model aggregate digest mismatch")
-        _verify_cross_format_source(root_source, payload, config, weight_map)
+        _verify_cross_format_source(root_source, payload, config, weight_map, cancelled=stopped)
     expected_tokenizer = proof_source["tokenizer_sha256"] if proof_source else tokenizer_sha256
     tokenizer_path = _safe_path(root_source, "tokenizer.json")
-    if not tokenizer_path.is_file() or _hash_file_cached(tokenizer_path) != expected_tokenizer:
+    if not tokenizer_path.is_file() or _hash_file_cached(tokenizer_path, stopped) != expected_tokenizer:
         _fail("tokenizer_digest_mismatch", "source tokenizer.json digest mismatch")
     check_source()
     if decoder["num_hidden_layers"] != total_layers:
@@ -1681,7 +1816,7 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
     else:
         _fail("unsafe_path", "segment destination must be outside source model tree")
     final = _generation(root, payload)
-    reused = _reuse(final, payload)
+    reused = _reuse(final, payload, cancelled=stopped)
     if reused:
         check_source()
         return reused
@@ -1690,21 +1825,36 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
                    "model.manifest.json", "cross_format.provenance.json", ".qlh-model-asset.json",
                }]
     def verify_cached_source(directory, manifest):
+        stopped()
         _, cached_map, cached_headers = _source_safetensors(directory)
         if set(cached_map) != {key for keys in selected.values() for key in keys}:
             _fail("layer_range_mismatch", "cached tensor set differs from source range")
         for filename, keys in selected.items():
             header, data_start = headers[filename]
+            source_hashes = _range_hashes_cached(
+                root_source / filename,
+                [(data_start + header[key]["data_offsets"][0],
+                  header[key]["data_offsets"][1] - header[key]["data_offsets"][0]) for key in keys],
+                cancelled=stopped,
+            )
+            cached_name = cached_map[keys[0]]
+            cached_header, cached_start = cached_headers[cached_name]
+            cached_hashes = _range_hashes_cached(
+                _safe_path(directory, cached_name),
+                [(cached_start + cached_header[key]["data_offsets"][0],
+                  cached_header[key]["data_offsets"][1] - cached_header[key]["data_offsets"][0])
+                 for key in keys], cancelled=stopped,
+            )
             for key in keys:
-                cached_name = cached_map[key]
-                output_header, output_start = cached_headers[cached_name]
+                key_cached_name = cached_map[key]
+                output_header, output_start = cached_headers[key_cached_name]
                 original, copied = header[key], output_header[key]
                 lo, hi = original["data_offsets"]
                 out_lo, out_hi = copied["data_offsets"]
                 if (original["dtype"] != copied["dtype"] or original["shape"] != copied["shape"]
                         or hi - lo != out_hi - out_lo
-                        or _range_hash(root_source / filename, data_start + lo, hi - lo)
-                        != _range_hash(_safe_path(directory, cached_name), output_start + out_lo, out_hi - out_lo)):
+                        or source_hashes[(data_start + lo, hi - lo)]
+                        != cached_hashes[(output_start + out_lo, out_hi - out_lo)]):
                     _fail("tensor_digest_mismatch", "cached tensor differs from source")
         check_source()
 
@@ -1724,18 +1874,32 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
         names = {"config.json": "support", "model.safetensors.index.json": "support"}
         filtered, total_size = {}, 0
         for number, (filename, keys) in enumerate(sorted(selected.items()), 1):
+            stopped()
             target = f"assignment-{number:05d}-of-{len(selected):05d}.safetensors"
             header, data_start = headers[filename]
-            _copy_selected(root_source / filename, stage / target, header, data_start, keys)
+            _copy_selected(root_source / filename, stage / target, header, data_start, keys,
+                           cancelled=stopped, deadline=deadline)
             output_header, output_start = _safetensors_header(stage / target)
+            source_hashes = _range_hashes_cached(
+                root_source / filename,
+                [(data_start + header[key]["data_offsets"][0],
+                  header[key]["data_offsets"][1] - header[key]["data_offsets"][0]) for key in keys],
+                cancelled=stopped,
+            )
+            output_hashes = _range_hashes_cached(
+                stage / target,
+                [(output_start + output_header[key]["data_offsets"][0],
+                  output_header[key]["data_offsets"][1] - output_header[key]["data_offsets"][0])
+                 for key in keys], cancelled=stopped,
+            )
             for key in keys:
                 original, copied = header[key], output_header[key]
                 lo, hi = original["data_offsets"]
                 out_lo, out_hi = copied["data_offsets"]
                 if (original["dtype"] != copied["dtype"] or original["shape"] != copied["shape"]
                         or hi - lo != out_hi - out_lo
-                        or _range_hash(root_source / filename, data_start + lo, hi - lo)
-                        != _range_hash(stage / target, output_start + out_lo, out_hi - out_lo)):
+                        or source_hashes[(data_start + lo, hi - lo)]
+                        != output_hashes[(output_start + out_lo, out_hi - out_lo)]):
                     _fail("tensor_digest_mismatch", "repacked tensor differs from source")
                 filtered[key] = target
                 total_size += hi - lo
@@ -1744,14 +1908,16 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
             "metadata": {"total_size": total_size}, "weight_map": filtered,
         })
         # Keep full num_hidden_layers/layer_types for loading absolute indices.
-        shutil.copyfile(root_source / "config.json", stage / "config.json")
+        _copy_file(root_source / "config.json", stage / "config.json",
+                   cancelled=stopped, deadline=deadline)
         for relative in support:
+            stopped()
             if relative in names:
                 _fail("unsafe_path", "support file collides with generated assignment")
             original = _safe_path(root_source, relative)
             destination = _safe_path(stage, relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(original, destination)
+            _copy_file(original, destination, cancelled=stopped, deadline=deadline)
             names[relative] = "support"
         check_source()
         payload.update(
@@ -1759,7 +1925,7 @@ def build_safetensors_segment(source: Path, destination_dir: Path, *, source_mod
             layer_weight_bytes=layer_bytes, has_embedding=start_layer == 0,
             has_lm_head=end_layer == total_layers, tie_word_embeddings=tied,
         )
-        return _finish(stage, final, payload, names, check_source=check_source)
+        return _finish(stage, final, payload, names, cancelled=stopped, check_source=check_source)
     except OSError as exc:
         code = "insufficient_disk" if exc.errno == 28 else "artifact_io_error"
         raise SupplyError(code, "Safetensors segment publication failed") from exc
@@ -1851,8 +2017,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         _fail("http_redirect_rejected", "supply downloads must remain on the master endpoint")
 
 
-def _cancelled(callback: Callable[[], bool]) -> None:
-    if callback():
+def _cancelled(callback: Callable[[], bool] | None) -> None:
+    if callback is not None and callback():
         _fail("cancelled", "segment reception was cancelled")
 
 

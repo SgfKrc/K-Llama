@@ -11,7 +11,6 @@ api_server 的运行时反向 import（scheduler.py 中 12 处 `import api_serve
 
 原生访问使用显式端口；运行态由 RuntimeController 发布。
 """
-import hashlib
 import os
 import threading
 from dataclasses import dataclass
@@ -828,7 +827,17 @@ class ModelHost:
                 str(selected.get("artifact_sha256") or "").strip().lower()
                 if isinstance(selected, Mapping) else ""
             )
-            if selected_sha:
+            if (not assignment.get("executor_id")
+                    and getattr(transaction.manager, "engine_type", "pytorch") == "llama_cpp"):
+                path = transaction.manager._find_layer_artifact(
+                    int(assignment["start_layer"]), int(assignment["end_layer"]),
+                )
+                if not path:
+                    raise ValueError("deployment_local_artifact_missing")
+                artifact_sha = transaction.manager._pipeline_file_sha256(path)
+                if selected_sha and selected_sha != artifact_sha:
+                    raise ValueError("deployment_local_artifact_mismatch")
+            elif selected_sha:
                 artifact_sha = selected_sha
             else:
                 raw_layer = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
@@ -840,11 +849,9 @@ class ModelHost:
                     layer_path = Path(__file__).resolve().parents[1] / layer_path
                 if not layer_path.is_file():
                     raise ValueError("deployment_local_artifact_missing")
-                digest = hashlib.sha256()
-                with open(layer_path, "rb") as handle:
-                    for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                        digest.update(chunk)
-                artifact_sha = digest.hexdigest()
+                from model_supply_digest_cache import cached_sha256
+
+                artifact_sha = cached_sha256(layer_path)
         spec = assignment_load_spec(assignment, artifact_format="gguf" if native else "safetensors")
         result = deepcopy(assignment)
         result["load_spec"] = spec.to_dict()

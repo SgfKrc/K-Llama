@@ -15,11 +15,11 @@ from llama_engine import LlamaCppEngine
 from relay_segment_info import read_gguf_tokenizer_sha256
 
 
-def _write_source(path, *, mtp=0, extras=(), omit_layer=None,
+def _write_source(path, *, mtp=0, extras=(), omit_layer=None, architecture="qwen2",
                   scalar_overrides=None, omit_metadata=()):
     gguf = pytest.importorskip("gguf")
     np = pytest.importorskip("numpy")
-    writer = gguf.GGUFWriter(str(path), "qwen2")
+    writer = gguf.GGUFWriter(str(path), architecture)
     scalars = {"block_count": (4 + mtp, 4), "embedding_length": (8, 4)}
     if mtp:
         scalars["nextn_predict_layers"] = (mtp, 4)
@@ -27,10 +27,10 @@ def _write_source(path, *, mtp=0, extras=(), omit_layer=None,
     for name, (value, kind) in scalars.items():
         if name not in omit_metadata:
             if kind == 9:
-                writer.add_key_value(f"qwen2.{name}", value, gguf.GGUFValueType.ARRAY,
+                writer.add_key_value(f"{architecture}.{name}", value, gguf.GGUFValueType.ARRAY,
                                      gguf.GGUFValueType.UINT32)
             else:
-                writer.add_key_value(f"qwen2.{name}", value, gguf.GGUFValueType(kind))
+                writer.add_key_value(f"{architecture}.{name}", value, gguf.GGUFValueType(kind))
     writer.add_tokenizer_model("gpt2")
     writer.add_token_list(["hello", "world", "!"])
     tensors = {
@@ -130,6 +130,26 @@ def test_without_mtp_all_payload_bytes_remain_in_budget(tmp_path):
     assert descriptor["component_weight_bytes"]["other"] == 96
     assert descriptor["runtime_ignored_components"] == []
     assert descriptor["runtime_ignored_tensor_bytes"] == {}
+
+
+@pytest.mark.parametrize("span", [(0, 2), (1, 3), (2, 4)])
+def test_qwen35_output_weight_is_selected_only_for_tail(tmp_path, span):
+    source = tmp_path / "qwen35.gguf"
+    sizes = _write_source(source, architecture="qwen35")
+    result = assets.build_gguf_segment(
+        source, tmp_path / "out", **_build_args(source, span),
+    )
+    artifact = Path(result["local_files"]["segment.gguf"])
+    _, actual = assets._gguf_table(artifact)
+    selection = select_gguf_tensors(
+        sizes, block_count=4, start_layer=span[0], end_layer=span[1],
+        architecture="qwen35",
+    )
+    assert set(actual) == set(selection.tensor_sources)
+    assert ("output.weight" in actual) is (span[1] == 4)
+    assert actual.keys() == selection.tensor_sources.keys()
+    assert sum(entry[1] for entry in actual.values()) == selection.selected_weight_bytes
+    assert assets.gguf_segment_disk_weight_bytes(source, *span) == selection.selected_weight_bytes
 
 
 @pytest.mark.parametrize("name,mtp", [

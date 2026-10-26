@@ -540,13 +540,39 @@ class WorkerPrepareController:
                     self._candidate_phase = "finalized"
                 self._publish(command, finalized)
 
+    def _collect_finalized_cache(self, command):
+        worker = getattr(self.scheduler, "_model_supply_worker", None)
+        collect = getattr(worker, "collect_garbage", None)
+        if not callable(collect):
+            return
+
+        def interrupted():
+            with self._lock:
+                return (not self._valid(command) or self._runner is not None
+                        or self._current is not None or bool(self._queue)
+                        or self._candidate_phase != "finalized"
+                        or self._active_identity != command.payload["identity"]
+                        or bool(getattr(self.scheduler, "_task_worker_active_attempts", {}))
+                        or bool(getattr(self.scheduler, "_active_pipeline_task_ids", set())))
+
+        if interrupted():
+            return
+        started = time.monotonic()
+        try:
+            report = collect(cancelled=interrupted)
+            logger.info("event=worker_post_finalize_gc elapsed_ms=%d report=%s",
+                        int((time.monotonic() - started) * 1000), report)
+        except Exception:
+            logger.warning("event=worker_post_finalize_gc_failed", exc_info=True)
+
     def _run(self):
+        finalized = None
         while True:
             with self._lock:
                 if not self._queue:
                     self._current = None
                     self._runner = None
-                    return
+                    break
                 command = self._queue.popleft()
                 self._current = command
             if command.payload is None:
@@ -598,6 +624,9 @@ class WorkerPrepareController:
                     exc_info=True,
                 )
             self._send(command, self._ack(command, error=error))
+            finalized = command if not error and command.payload["action"] == "finalize" else None
+        if finalized is not None:
+            self._collect_finalized_cache(finalized)
 
     def check_stage(self, offer):
         """All production layer stages require a committed identity and scope."""

@@ -42,6 +42,28 @@ def node(node_id, capacity_mb, *, role="client", score=10):
     }
 
 
+@pytest.mark.parametrize("executor_score,executor_capacity", [(20, 500), (10, 800)])
+@pytest.mark.parametrize("executor_mode", [None, "middle"])
+def test_primary_precedes_additional_master_executor(executor_score, executor_capacity, executor_mode):
+    primary = {**node("master", 500, role="master"), "candidate_layer_ranges": [[0, 1]]}
+    additional = {
+        **node("master", executor_capacity, role="master", score=executor_score),
+        "executor_id": "cpu", "layer_bounds": [1, 3], "candidate_layer_ranges": [[1, 3]],
+    }
+    if executor_mode is not None:
+        additional["segment_mode"] = executor_mode
+    tail = {**node("tail", 500), "candidate_layer_ranges": [[3, 4]]}
+    plan = solve_pipeline_capacity(
+        descriptor(), [additional, primary, tail], safety_margin=1.0,
+        require_distributed=True, prefer_all_workers=True, required_node_id="master",
+    )
+    assert plan["admitted"] is True
+    assert [(item["node_id"], item.get("executor_id", ""), item["start_layer"], item["end_layer"])
+            for item in plan["assignments"]] == [
+                ("master", "", 0, 1), ("master", "cpu", 1, 3), ("tail", "", 3, 4),
+            ]
+
+
 def test_partial_master_merges_local_worker_bytes_without_full_model():
     partial = descriptor(layer_sizes=(100, 0, 0, 0))
     partial["source_model_sha256"] = "a" * 64

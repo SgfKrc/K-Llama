@@ -651,6 +651,7 @@ def _normalize_nodes(
     usable.sort(
         key=lambda node: (
             node["role"] != "master",
+            bool(node.get("executor_id")) if node["role"] == "master" else False,
             mode_order.get(str(node.get("segment_mode") or "").lower(), 0.5),
             -node["score"],
             -(node["capacity_bytes"] - node["reserve_bytes"]),

@@ -23,6 +23,8 @@ from typing import Any, Callable
 import uuid
 import weakref
 
+from model_supply_digest_cache import file_stamp as _file_stamp
+
 _SHA = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,256}")
 _MAX_JSON_BYTES = 2 * 1024 * 1024
@@ -168,50 +170,6 @@ def _error_code(exc: Exception, fallback: str) -> str:
     return code if isinstance(code, str) and code in _ASSET_CODES else fallback
 
 
-def _change_time(path: Path, stat) -> int:
-    if os.name != "nt":
-        return stat.st_ctime_ns
-    # Python 3.12 Windows st_ctime is still creation time. NTFS ChangeTime
-    # detects byte changes even when an application restores LastWriteTime.
-    import ctypes
-    from ctypes import wintypes
-
-    class FileBasicInfo(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_longlong) for name in (
-            "CreationTime", "LastAccessTime", "LastWriteTime", "ChangeTime")]
-        _fields_.append(("FileAttributes", wintypes.DWORD))
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel.CreateFileW
-    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-    create.restype = wintypes.HANDLE
-    query = kernel.GetFileInformationByHandleEx
-    query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-    query.restype = wintypes.BOOL
-    close = kernel.CloseHandle
-    close.argtypes, close.restype = [wintypes.HANDLE], wintypes.BOOL
-    filename = str(path.resolve())
-    if not filename.startswith("\\\\?\\"):
-        filename = "\\\\?\\UNC\\" + filename[2:] if filename.startswith("\\\\") else "\\\\?\\" + filename
-    handle = create(filename, 0, 7, None, 3, 0x02000000, None)
-    if handle == wintypes.HANDLE(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        info = FileBasicInfo()
-        if not query(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return int(info.ChangeTime) * 100
-    finally:
-        close(handle)
-
-
-def _file_stamp(path: Path) -> tuple:
-    stat = path.stat()
-    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino,
-            _change_time(path, stat))
-
-
 def _file_sha(path: Path, cancelled=None) -> str:
     digest = hashlib.sha256()
     before = _file_stamp(path)
@@ -225,64 +183,27 @@ def _file_sha(path: Path, cancelled=None) -> str:
     return digest.hexdigest()
 
 
-# ★ 2026-10-24（#125）：整模 sha256 是必需的源身份证明，但**不必每轮重算**。
-#   实测清点（inventory）阶段对 5.78 GB 的 GGUF 做全量 sha256 需约 200 s，占整个
-#   供给近三分之一；#133 加的进程内摘要缓存**重启即失效、跨 op 也不复用** ⇒ 每次
-#   供给都重付一遍。这里以 `_file_stamp`（size/mtime_ns/ctime_ns/ino/change_time）
-#   作为失效判据，把结果**持久化**到 worker root，跨重启与跨供给复用。
-_SOURCE_DIGEST_CACHE_NAME = "source-digests.json"
-_source_digest_cache: dict | None = None
+def _file_sha_cached(root: Path, path: Path, cancelled=None) -> str:
+    from model_supply_digest_cache import cached_sha256
+    return cached_sha256(path, cancelled, hash_file=_file_sha, legacy_root=root)
 
 
-def _load_source_digest_cache(root: Path) -> dict:
-    global _source_digest_cache
-    if _source_digest_cache is not None:
-        return _source_digest_cache
-    import json
-    cache: dict = {}
-    try:
-        payload = json.loads((root / _SOURCE_DIGEST_CACHE_NAME).read_text(encoding="utf-8"))
-        entries = payload.get("entries") if isinstance(payload, dict) else None
-        if isinstance(payload, dict) and payload.get("schema_version") == 1 and isinstance(entries, dict):
-            cache = {key: value for key, value in entries.items() if isinstance(value, dict)}
-    except (OSError, ValueError):
-        cache = {}
-    _source_digest_cache = cache
-    return cache
-
-
-def _store_source_digest_cache(root: Path) -> None:
-    import json
-    import os
-    cache = _source_digest_cache
-    if cache is None:
-        return
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        temp = root / (_SOURCE_DIGEST_CACHE_NAME + ".tmp")
-        temp.write_text(json.dumps({"schema_version": 1, "entries": cache},
-                                   ensure_ascii=True, sort_keys=True), encoding="utf-8")
-        os.replace(temp, root / _SOURCE_DIGEST_CACHE_NAME)
-    except OSError:
-        pass
-
-
-def _file_sha_cached(root: Path, path: Path) -> str:
-    """Full-file sha256, reusing the persisted digest while the file is unchanged."""
-    cache = _load_source_digest_cache(root)
-    key = str(path)
-    try:
-        stamp = list(_file_stamp(path))
-    except OSError:
-        return _file_sha(path)
-    entry = cache.get(key)
-    if (isinstance(entry, dict) and entry.get("stamp") == stamp
-            and isinstance(entry.get("sha256"), str) and _sha(entry["sha256"])):
-        return str(entry["sha256"])
-    digest = _file_sha(path)
-    cache[key] = {"stamp": stamp, "sha256": digest}
-    _store_source_digest_cache(root)
-    return digest
+def _source_details_cached(root: Path, path: Path, cancelled=None) -> tuple:
+    from model_supply_digest_cache import cached_metadata
+    from relay_segment_info import read_gguf_layer_info, read_gguf_tokenizer_sha256
+    path = path.resolve(strict=True)
+    before = _file_stamp(path)
+    def read_metadata(source):
+        info = read_gguf_layer_info(source)
+        tokenizer = read_gguf_tokenizer_sha256(source)
+        if not info or not _sha(tokenizer):
+            raise SupplyError("source_model_metadata_mismatch")
+        return {"layer_info": info, "tokenizer_sha256": tokenizer}
+    details = cached_metadata(path, "gguf-source-v1", read_metadata, cancelled)
+    digest = _file_sha_cached(root, path, cancelled)
+    if before != _file_stamp(path):
+        raise SupplyError("artifact_changed")
+    return details["layer_info"], details["tokenizer_sha256"], digest, before[0]
 
 
 def _verify_files(manifest: dict, directory: Path, cancelled=None, *, fresh=False) -> Path:
@@ -331,8 +252,10 @@ def _selection_key(root: Path, pointer_bytes: bytes, directory: Path, manifest: 
     return (hashlib.sha256(pointer_bytes).hexdigest(), tuple(fingerprint))
 
 
-def _remember_selection(root: Path, pointer_bytes: bytes, directory: Path, manifest: dict, model_path: Path) -> None:
-    key = _selection_key(root, pointer_bytes, directory, manifest)
+def _remember_selection(root: Path, pointer_bytes: bytes, directory: Path, manifest: dict, model_path: Path,
+                        *, fingerprint=None) -> None:
+    key = (_selection_key(root, pointer_bytes, directory, manifest) if fingerprint is None
+           else (hashlib.sha256(pointer_bytes).hexdigest(), fingerprint))
     value = {"model_path": str(model_path), "directory": str(directory),
              "manifest": deepcopy(manifest), "manifest_sha256": manifest["manifest_sha256"],
              "artifact_sha256": manifest["artifact_sha256"]}
@@ -660,7 +583,6 @@ class ModelSupplyWorker:
         import config
         from torch_runtime import torch_available
         from local_model_assets import _canonical_id
-        from relay_segment_info import read_gguf_layer_info, read_gguf_tokenizer_sha256
         engines = []
         engine = getattr(config, "INFERENCE_ENGINE", "")
         if engine in {"llama_cpp", "gguf", "auto"}:
@@ -684,6 +606,7 @@ class ModelSupplyWorker:
         selected_id = (_canonical_id(model_id)
                        if isinstance(model_id, str) and _ID.fullmatch(model_id) else "")
         with (self._inventory_lock if model_id != "" else nullcontext()):
+            details = {}
             for source_id, path in (() if model_id == "" else self._source_candidates()):
                 # Discovery pairs a registered *-gguf asset with its canonical
                 # model ID. Compare those source IDs before any weight I/O;
@@ -696,17 +619,13 @@ class ModelSupplyWorker:
                     # A cut segment is an artifact, not a complete local source.
                     if path.with_suffix(".manifest.json").exists() or path.with_suffix(path.suffix + ".manifest.json").exists():
                         continue
-                    info = read_gguf_layer_info(path)
-                    tokenizer = read_gguf_tokenizer_sha256(path)
-                    if not info or not _sha(tokenizer):
-                        continue
-                    # ★ 2026-10-24（#125）：清点阶段对整模做全量 sha256 约需 200 s
-                    #   （5.78 GB），改为带**持久化**缓存的摘要：文件未变即复用，
-                    #   跨重启与跨供给都生效。
-                    digest = _file_sha_cached(self.root, path)
+                    path = path.resolve(strict=True)
+                    if path not in details:
+                        details[path] = _source_details_cached(self.root, path)
+                    _, tokenizer, digest, size = details[path]
                     verified[(source_id, digest, tokenizer)] = path
                     sources.append({"source_model_id": source_id, "source_model_sha256": digest,
-                                    "tokenizer_sha256": tokenizer, "size_bytes": path.stat().st_size})
+                                    "tokenizer_sha256": tokenizer, "size_bytes": size})
                 except (OSError, ValueError):
                     continue
             if model_id != "":
@@ -885,7 +804,6 @@ class ModelSupplyWorker:
             self._progress(op, {"phase": "verifying"})
             self._register(op, directory)
             self._send(op, self._reply(op, "available"))
-            self.collect_garbage()
         except Exception as exc:
             code = _error_code(exc, stage)
             try:
@@ -925,13 +843,13 @@ class ModelSupplyWorker:
                                if sha == key[1] and tokenizer == key[2]), None)
         if source is None:
             raise SupplyError("local_source_unavailable")
-        if _file_sha(source, lambda: self._cancelled(op)) != manifest["source_model_sha256"]:
+        info, tokenizer, digest, _ = _source_details_cached(
+            self.root, source, lambda: self._cancelled(op))
+        if digest != manifest["source_model_sha256"]:
             raise SupplyError("source_model_sha256_mismatch")
-        from relay_segment_info import read_gguf_layer_info, read_gguf_tokenizer_sha256
-        info = read_gguf_layer_info(source)
         if not info or info["n_layer"] != manifest["total_layers"]:
             raise SupplyError("source_model_metadata_mismatch")
-        if read_gguf_tokenizer_sha256(source) != manifest["tokenizer_sha256"]:
+        if tokenizer != manifest["tokenizer_sha256"]:
             raise SupplyError("tokenizer_sha256_mismatch")
         self._progress(op, {"phase": "building"})
         self._check(op)
@@ -1054,7 +972,7 @@ class ModelSupplyWorker:
 
     def collect_garbage(self, *, root: Path | None = None, protected_paths=(),
                         cancelled=lambda: False) -> dict:
-        """Owner entry: supply completion invokes this under execution admission."""
+        """Owner maintenance entry, invoked after finalized preparation or explicitly."""
         from model_supply_assets import collect_supply_segments
         root = Path(root) if root is not None else self.root
         protected = list(protected_paths)
@@ -1071,7 +989,9 @@ class ModelSupplyWorker:
                 with self._lock:
                     active, pending = self._active, self._pending
                 def invalidated():
-                    if cancelled():
+                    if (cancelled()
+                            or getattr(self.scheduler, "_task_worker_active_attempts", {})
+                            or getattr(self.scheduler, "_active_pipeline_task_ids", set())):
                         return True
                     with self._lock:
                         return (self._active is not active or self._pending is not pending
@@ -1168,11 +1088,15 @@ class ModelSupplyWorker:
         with _SELECTION_CACHE_LOCK:
             cached = _SELECTION_CACHE.get(str(self.root.resolve()))
             changed = _selection_files_changed(cached, verified_files)
-        model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op),
-                                  **({"fresh": True} if changed else {}))
+            reused = (cached is not None and cached[0][1] == verified_files
+                      and cached[1]["manifest"] == op.manifest)
+            model_path = Path(cached[1]["model_path"]) if reused else None
+        if not reused:
+            model_path = _verify_files(op.manifest, directory, lambda: self._cancelled(op),
+                                      **({"fresh": True} if changed else {}))
         _t_verify = time.monotonic()
         self._check(op)
-        if _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
+        if not reused and _selection_key(self.root, b"", directory, op.manifest)[1] != verified_files:
             raise SupplyError("artifact_changed")
         _t_key2 = time.monotonic()
         _LOG.info(
@@ -1239,7 +1163,8 @@ class ModelSupplyWorker:
                     published = _read_pointer(current)
                     if json.loads(published) != pointer:
                         raise SupplyError("registration_pointer_visibility_failed")
-                    _remember_selection(self.root, published, directory, op.manifest, model_path)
+                    _remember_selection(self.root, published, directory, op.manifest, model_path,
+                                        fingerprint=verified_files)
                     self._check(op)
                     self.scheduler.refresh_task_worker_capabilities()
                     self._check(op)
