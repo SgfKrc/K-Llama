@@ -2390,6 +2390,23 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 )
                 for item in capacity_plan.get("assignments", []):
                     executor_id = str(item.get("executor_id") or "")
+                    # ★ 2026-10-27：这里**刻意只处理本机节点的附加执行器**，
+                    #   而 `executor_id` 为空（主执行器）一律跳过。
+                    #
+                    #   为什么：主执行器有自己的装载路径（`ModelManager` 走
+                    #   `get_selected_model()` 与既有的 worker prepare/commit 链），
+                    #   本机执行器则是**独立执行器** —— 它的工件由它自己按
+                    #   `QLH_LAYER_GGUF` 加载，不走远端那套工件传输与回执
+                    #   （那些是**物理节点之间**的义务）。两者混在同一循环里会互相
+                    #   覆盖身份块。
+                    #
+                    # ⚠ **已知边界（不是缺陷，但要知道）**：本机执行器因此**不参与
+                    #   就绪检查**（`scheduler_pipeline` 的 `pipeline_nodes` 用
+                    #   `node_id not in master_ids` 把它整体排除）。所以本机 CPU 段
+                    #   若加载失败，供给仍可能报 `ready`，失败要到**第一次 stage**
+                    #   才具名暴露。当前接受这一点：本机段没有 TCP 回执链，硬造一个
+                    #   就绪信号等于把"进程内"伪装成"有握手"，反而更难判真伪。
+                    #   要补这个门，得先有本机执行器自己的就绪上报通道。
                     if not executor_id or item.get("node_id") not in master_ids:
                         continue
                     try:

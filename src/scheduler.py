@@ -2936,13 +2936,37 @@ class Scheduler(
             return plan
         result = dict(plan)
         if capacity_nodes is not None:
+            # ★ 2026-10-27（LOCAL-EXECUTORS-01）：键必须是 `(node_id, executor_id)`。
+            #
+            #   同机可有多个执行器（主段 `executor_id=""` 走 pytorch，CPU 段
+            #   `executor_id="cpu"` 走 llama_cpp），`capacity_nodes` 里它们**共用
+            #   `node_id`**，而 `_local_cpu_executor_record` 是**追加在主记录之后**的。
+            #
+            #   此前用裸 `node_id` 建字典 ⇒ 后写的 CPU 段覆盖主段
+            #   ⇒ `engines["master"] == "llama_cpp"`。求解器产出的 assignment 不带
+            #   `engine`（`capacity.plan_segment_supply` 不产出该键）⇒ 两条 assignment
+            #   都满足回填条件 ⇒ **主段被盖上 CPU 段的引擎**。
+            #
+            #   下游都按它判形态：
+            #     * `model_host.freeze_pipeline_candidate_assignment` 用它定 `native`
+            #       ⇒ 主段被当成 GGUF 段、去取 `QLH_LAYER_GGUF` 的摘要；
+            #     * `pipeline_node_contract` 用它定 `artifact_kind` / `cross_engine`
+            #       ⇒ 同机两段不再被识别为跨引擎接力；
+            #     * `model_supply` 用它推 `quant_type`（`assignments[0]` 是主段）。
+            #
+            #   这是 `model_host.py` 那句注释（"此前用 `transaction.manager` 判
+            #   `native` ⇒ CPU 段被当成 safetensors 段"）的**镜像**：同一个键，
+            #   反方向的错法。
             engines = {
-                item["node_id"]: item["engine"] for item in capacity_nodes
+                (item["node_id"], str(item.get("executor_id") or "")): item["engine"]
+                for item in capacity_nodes
                 if item.get("engine")
             }
             result["assignments"] = [
-                {**item, "engine": engines[item["node_id"]]}
-                if item.get("node_id") in engines and not item.get("engine")
+                {**item, "engine": engines[(
+                    item["node_id"], str(item.get("executor_id") or ""))]}
+                if (item["node_id"], str(item.get("executor_id") or "")) in engines
+                and not item.get("engine")
                 else dict(item)
                 for item in (result.get("assignments") or [])
             ]

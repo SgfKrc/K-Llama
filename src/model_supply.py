@@ -1380,19 +1380,46 @@ class ModelSupplyCoordinator:
             #   注意它**只进容量规划、不进部署**：`scheduler_pipeline` 把带
             #   `executor_id` 的 assignment 归入 `deployment["local_executors"]`，
             #   不走工件传输与回执 —— 那些是**物理节点之间**的义务，本机执行器没有。
-            local_executor_seen: set[str] = set()
+            #   ★ 2026-10-27：**每台机器目前只支持一个附加执行器，且这是显式约束**。
+            #
+            #   此前这里是隐式的"按 `node_id` 去重"（变量名 `local_executor_seen`
+            #   装的是 `node_id`），效果是**静默丢弃**第二台附加执行器。静默丢弃在
+            #   诊断上很坏：将来若加 `cpu2` / `npu`，它不会报错、只是永远不参与规划，
+            #   现场只会看到"某台设备明明配了却没被用上"。
+            #
+            #   产品口径已确认：**当前设计就是每机一个附加执行器**（主段 `""` + 一个
+            #   附加段）。所以把隐式去重换成**显式断言** —— 真出现第二个时立刻带名字
+            #   报错，而不是悄悄少一条记录。放开这件事需要同时改部署侧
+            #   （`deployment["local_executors"]`、控制面白名单、就绪视图），
+            #   不是这里的局部改动。
+            local_executor_by_node: dict[str, str] = {}
             for record in capacity:
                 executor_id = str(record.get("executor_id") or "")
-                if not executor_id or record["node_id"] in local_executor_seen:
+                if not executor_id:
+                    # 主执行器由上面的 inventories 循环负责，这里只收附加执行器
                     continue
-                if record["node_id"] not in inventories:
+                node_id = record["node_id"]
+                previous = local_executor_by_node.get(node_id)
+                if previous is not None:
+                    raise ModelSupplyError(
+                        "SUPPLY_MULTIPLE_LOCAL_EXECUTORS",
+                        f"node {node_id} declares more than one local executor "
+                        f"({previous!r} and {executor_id!r}); only one additional "
+                        f"local executor per node is supported",
+                        diagnostic={
+                            "reason_code": "SUPPLY_MULTIPLE_LOCAL_EXECUTORS",
+                            "node_id": node_id,
+                            "executors": sorted({previous, executor_id}),
+                        },
+                    )
+                if node_id not in inventories:
                     continue
-                local_executor_seen.add(record["node_id"])
+                local_executor_by_node[node_id] = executor_id
                 records.append(dict(record))
                 logger.info(
                     "event=local_executor_entered_supply_plan operation=%s node=%s "
                     "executor=%s layer_ranges=%s bounds=(%s,%s)",
-                    op_id, record["node_id"], executor_id,
+                    op_id, node_id, executor_id,
                     record.get("layer_ranges"),
                     (record.get("layer_budget") or {}).get("min_layer"),
                     (record.get("layer_budget") or {}).get("max_layer"),
@@ -1504,9 +1531,26 @@ class ModelSupplyCoordinator:
                     and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
                 resident_plan = plan
                 resident_diagnostic = copy.deepcopy(plan.get("capacity_diagnostic"))
+                # ★ 2026-10-27（LOCAL-EXECUTORS-01）：**必须同时要求主执行器**。
+                #
+                #   `safetensors_layer_offload` 是"PyTorch 主段把部分层放到主机 RAM"
+                #   的物化形态。同机的 CPU 段（`executor_id="cpu"`）engine 是
+                #   `llama_cpp`、工件是裁层 GGUF —— 它已经**本来就在主机内存里**，
+                #   没有"offload"这回事。
+                #
+                #   此前条件只有 `record["node_id"] == "master"` ⇒ CPU 段也被标成
+                #   `safetensors_layer_offload` ⇒ 进 `model_supply_runtime_capacity`
+                #   的 `if engine != "pytorch": fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID")`
+                #   ⇒ 该异常从这里无 try 地冒泡 ⇒ **整次供给失败**。
+                #
+                #   触发条件是 `host_ram_offload_enabled()`，即
+                #   `QLH_CAPACITY_PLANNING_MODE=balanced`（**缺省值**）或显式
+                #   `QLH_HOST_RAM_OFFLOAD_ENABLED=1`。所以这不是边缘情况：
+                #   本机之所以一直没事，是因为 `.env` 显式钉了 `fastest`。
                 offload_records = [
                     {**record, "materialization": "safetensors_layer_offload"}
-                    if record["node_id"] == "master" else record
+                    if record["node_id"] == "master"
+                    and not record.get("executor_id") else record
                     for record in records
                 ]
                 offload_plan = plan_segment_supply_reuse(
