@@ -266,11 +266,34 @@ class NativePorts:
         #   都收到 `tokens=2644`，直接把一次 prefill 拖到 5 分钟以上。此前链路里
         #   完全看不到 `model_prompt` 到底被拼成了什么 —— 只能在 `/api/chat/clear`
         #   的 `deleted_count` 上间接猜。这里把长度、消息条数和开头露出。
+        #
+        # ★ 2026-10-27（#122）：**拆开历史与当前消息**，否则归因不成立。
+        #   #122 要回答的是"短 message 为什么携带了较长的已拼装上下文"，而只报
+        #   `messages=N` 无法区分两种完全不同的情况：
+        #     * 历史太长 —— `history_messages` 多，窗口该收（`QLH_CHAT_CONTEXT_MESSAGES`）；
+        #     * 单条太肥 —— `history_messages` 少但 `current_chars` 巨大，收窗口没用。
+        #   两者的处置方向相反，所以必须分开报。`history_chars` 一并给出，用于判断
+        #   历史是"条数多而每条短"还是"条数少而每条长"。
+        #   这些字段只进日志，不进任何判据 —— 观测不应改变行为。
+        _messages = list(self.options.get("messages") or ())
+        _history = _messages[:-1] if _messages else []
+        _current = _messages[-1] if _messages else {}
+        _history_chars = sum(
+            len(str(item.get("content") or ""))
+            for item in _history if isinstance(item, Mapping)
+        )
+        _current_chars = (
+            len(str(_current.get("content") or ""))
+            if isinstance(_current, Mapping) else 0
+        )
         _LOG.info(
-            "event=execution_prompt prompt_tokens=%d messages=%d chars=%d thinking=%s "
-            "head=%r",
+            "event=execution_prompt prompt_tokens=%d messages=%d history_messages=%d "
+            "history_chars=%d current_chars=%d chars=%d thinking=%s head=%r",
             self.prompt_length,
-            len(self.options.get("messages") or ()),
+            len(_messages),
+            len(_history),
+            _history_chars,
+            _current_chars,
             len(str(self.model_prompt or "")),
             bool(self.options.get("show_thinking", False)),
             str(self.model_prompt or "")[:200],
@@ -509,6 +532,33 @@ class NativePorts:
             self.thinking_buffer += event["token"]
             marker = self.thinking_buffer.lower().find("</think>")
             if marker < 0:
+                # ★ 2026-10-27（#126）：**静默期必须有心跳**。
+                #
+                #   `suppress_thinking` 的语义是"不要把思考内容发给客户端"
+                #   （`native_thinking_suppression_required`：`
+                #   not show_thinking` 且 prompt 留了没闭合的 `<think` 块）。
+                #   此前这里是裸 `return` —— 于是**整个思考期一个字节都不发**。
+                #
+                #   实测后果（2026-10-26，真机三机 21:34 请求）：
+                #     `distributed_used=True`、`duration_ms=10555`，
+                #     客户端在这 10.5 s 里收不到任何 SSE 帧。
+                #   用户的直接观感是"不开 thinking 还凑合、开了就超时"，
+                #   TUI 则表现为"停刷"—— 因为 Textual 只能靠增量事件驱动重绘。
+                #   思考越长（`enable_thinking=True` 且不展示时尤其长），
+                #   干等越久，越容易撞穿客户端/代理的读超时。
+                #
+                #   修法：**发心跳而不发内容**。`_token_frame` 认得
+                #   `{"thinking": ...}` 但那是给"要求展示思考"的场景；
+                #   这里用一个显式的 `{"heartbeat": True}` 帧，客户端据此知道
+                #   "连接还活着、模型还在算"，同时**不泄露任何思考文本**
+                #   （`suppress_thinking` 的承诺仍然成立）。
+                #   计数器只用于让客户端能区分"卡在同一处"与"仍在推进"。
+                self._suppressed_tokens = getattr(self, "_suppressed_tokens", 0) + 1
+                callback({
+                    "heartbeat": True,
+                    "phase": "thinking",
+                    "suppressed_tokens": self._suppressed_tokens,
+                })
                 return
             event = {"token": self.thinking_buffer[marker + 8:]}
             self.thinking_buffer = ""

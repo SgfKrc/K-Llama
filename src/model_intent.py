@@ -197,13 +197,33 @@ class ModelIntentCoordinator:
             else:
                 result.update(status="preparing", reason_code="", reason="")
             for node_id, node in result.get("nodes", {}).items():
-                ack = (transaction.get("acks") or {}).get(node_id, {})
+                # ★ 2026-10-27（LOCAL-EXECUTORS-01）：视图键可能是 `"master#cpu"`。
+                #
+                #   上面构造 `assigned` 时，附加执行器的键写成 `f"{node_key}#{executor_id}"`
+                #   （本函数约 :162），而 `transaction["acks"]` / `transaction["expected"]`
+                #   的键**都是裸 `node_id`**（回执链是按物理节点建的那一套）。
+                #
+                #   此前直接用 `node_id` 去取 ⇒ `"master#cpu"` 既取不到 ack、
+                #   也不在 `expected` 里 ⇒ 落到最后那个分支之外 ⇒ 它**永远停在初始
+                #   status**（通常 `available`）。实测现象就是"CPU 段在视图里
+                #   长期不亮"。
+                #
+                #   修法：取 ack 前剥掉 `#executor` 后缀；但**带后缀的键不要**
+                #   套用远端那套 `prepared` 判据 —— 本机执行器没有 prepare/commit
+                #   回执链（那些是物理节点之间的义务），硬套只会永远 `loading`。
+                base_node_id, _, view_executor = node_id.partition("#")
+                ack = (transaction.get("acks") or {}).get(base_node_id, {})
+                expected_acks = transaction.get("expected") or {}
                 if result["status"] == "ready":
                     node["status"] = "ready"
                 elif ack.get("status") == "error":
                     node.update(status="failed", reason_code=ack.get("error_code", "WORKER_PREPARE_FAILED"),
                                 reason=ack.get("error", "Worker failed to load its segment"))
-                elif node_id == "master" or node_id in (transaction.get("expected") or {}):
+                elif view_executor:
+                    # 本机附加执行器：它和主段同属一台机器，`result["status"]`
+                    # 已是整次部署的汇总口径；这里只需保证不把它**卡在初始态**。
+                    node["status"] = "ready" if result["status"] == "ready" else "loading"
+                elif base_node_id == "master" or base_node_id in expected_acks:
                     node["status"] = "prepared" if ack.get("phase") == "prepare" and ack.get("loaded") is True else "loading"
         elif record["status"] == "ready" or record.get("config_id"):
             result.update(status="superseded", reason_code="INTENT_PLAN_RETIRED", reason="The selected inference plan has been retired")

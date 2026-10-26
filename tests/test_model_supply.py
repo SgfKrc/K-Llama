@@ -582,6 +582,45 @@ def test_invalid_range_preference_cannot_bypass_alignment_or_full_model_gate(pre
     assert error.value.code=="SUPPLY_PREFERRED_RANGE_INVALID"
 
 
+def test_local_cpu_executor_preferred_ranges_use_executor_identity():
+    """A9：复用偏好（"我手上确实有这个段"）必须能表达给**本机附加执行器**。
+
+    同机 CPU 段与主段共用 `node_id="master"`。此前 `preferred_ranges` 的键只有裸
+    `node_id`，且 `master` 被直接判非法 ⇒ CPU 段**无法**表达"我有 `[2,6)`"，这份硬边界
+    只能靠求解器恰好同意。修法：键改 `(node_id, executor_id)`，且"非主执行器"是**合法**
+    来源（主段仍非法：它的切点每轮新裁）。
+    """
+    source = descriptor(layers=8)
+    records = [
+        node("master", 1000),
+        {**node("master", 1000), "executor_id": "cpu", "engine": "llama_cpp",
+         "segment_mode": "middle", "layer_ranges": [[2, 6]]},
+        node("tail", 1000),
+    ]
+    plan = plan_segment_supply(
+        {"pytorch": source, "llama_cpp": source}, records,
+        master_engine="pytorch", alignment=2, safety_margin=1.0,
+        prefer_all_workers=True,
+        preferred_ranges={("master", "cpu"): [[2, 6]]},
+    )
+    assert plan["admitted"]
+    cpu = next(item for item in plan["assignments"] if item.get("executor_id") == "cpu")
+    assert [cpu["start_layer"], cpu["end_layer"]] == [2, 6]
+    # `layer_ranges` 只会由"命中的偏好"写回（投影阶段已 pop）⇒ 这是偏好生效的直接证据。
+    assert cpu["layer_ranges"] == [[2, 6]]
+
+
+def test_primary_master_still_cannot_declare_reuse_preferences_with_identity_key():
+    source = descriptor(layers=8)
+    records = [node("master", 1000), node("tail", 1000)]
+    with pytest.raises(ModelSupplyError) as error:
+        plan_segment_supply(
+            {"llama_cpp": source}, records, master_engine="llama_cpp", alignment=2,
+            preferred_ranges={("master", ""): [[0, 4]]},
+        )
+    assert error.value.code == "SUPPLY_PREFERRED_RANGE_INVALID"
+
+
 @pytest.mark.parametrize("engine,start,end,tied,expected", [
     ("pytorch", 0, 2, False, 42),
     ("pytorch", 2, 4, False, 22),

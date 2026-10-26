@@ -539,6 +539,27 @@ async def chat_stream(req: ChatRequest, request: Request):
                 SSE yield 允许携带多个 `data:` 帧，因此调用点无需任何改动。
                 """
                 frames = []
+                # ★ 2026-10-27（#126）：**静默期心跳必须透传**。
+                #
+                #   三机线性路径（`_uses_linear_executor`）在
+                #   `enable_thinking=True` 且不展示思考时，`NativePorts.emit`
+                #   会把整个思考期压成"零字节"，客户端只能干等
+                #   （实测 2026-10-26 21:34 请求 `duration_ms=10555`，期间无任何帧；
+                #   观感即"开了 thinking 就超时"、TUI"停刷"）。
+                #
+                #   `emit` 现在每个被抑制的 token 发一个
+                #   `{"heartbeat": True, "phase": "thinking", "suppressed_tokens": n}`
+                #   —— 不含任何思考文本，`suppress_thinking` 的承诺不变；
+                #   这里把它转成 SSE 帧，让客户端知道"连接活着、仍在推进"。
+                #   不认识该字段的旧客户端会忽略它，因此向后兼容。
+                if event.get("heartbeat"):
+                    frames.append(
+                        "data: " + _json.dumps({
+                            "heartbeat": True,
+                            "phase": event.get("phase"),
+                            "suppressed_tokens": event.get("suppressed_tokens"),
+                        }, ensure_ascii=False) + "\n\n"
+                    )
                 thinking = event.get("thinking")
                 if thinking:
                     frames.append(

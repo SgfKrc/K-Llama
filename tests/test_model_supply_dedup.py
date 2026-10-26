@@ -10,6 +10,7 @@ import pytest
 
 import config
 import model_supply_assets as assets
+import model_supply_digest_cache as digests
 from tests.test_model_supply_assets import (
     _kwargs, _make_gguf, _safetensors_fixture, _server, _receive,
 )
@@ -108,29 +109,77 @@ def test_builder_damaged_cache_rebuilds_when_identity_changes(change, tmp_path, 
 
 
 def test_builder_rebinds_hot_cache_when_same_length_tamper_restores_mtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(assets, "_DIGEST_CACHE", {})
+    """同长度篡改 + 恢复 mtime 不是同一版本；hot cache 必须失效并从 live 字节重建。
+
+    原断言 `assets._file_identity(weight) == identity` 在 Windows 上物理不成立：
+    写回同长度字节会更新 NTFS ChangeTime，而 `os.utime` 只恢复 atime/mtime。
+    实测（NTFS，2026-10-27）：同长度写回后 st_dev / st_ino / st_size /
+    st_mtime_ns / st_ctime_ns 五项全部保持原值，唯一变化的是 ChangeTime
+    （`_file_identity` 的 index 5，来自 `GetFileInformationByHandleEx`）。
+    而 `model_supply_digest_cache.file_stamp` 故意包含 ChangeTime
+    （docs/已知问题记录.md #127："继续保留包含 ChangeTime 的完整版本边界，
+    不以忽略版本变化绕过竞争"），所以"内容被换掉但版本未变"这个前提根本
+    构造不出来——它不是实现缺陷，而是版本边界应当具备的敏感度。
+
+    因此把断言改成真正该成立、也更有价值的性质：**差异只落在 ChangeTime**。
+    只比较 size+mtime（伪造者能控制的两项）会命中旧摘要并复用被篡改的字节；
+    完整版本边界必须让缓存失效、重算 live 字节，并重建出正确内容，而不是
+    把污染文件当缓存复用。
+    """
     source = tmp_path / "full.gguf"
     _make_gguf(source)
     kwargs = _kwargs(source)
     first = assets.build_gguf_segment(source, tmp_path / "cache", **kwargs)
     weight = Path(first["local_files"]["segment.gguf"])
+    original_bytes = weight.read_bytes()
     stamp = weight.stat()
     identity = assets._file_identity(weight)
-    damaged = bytearray(weight.read_bytes())
+    damaged = bytearray(original_bytes)
     damaged[-1] ^= 1
     weight.write_bytes(damaged)
     os.utime(weight, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    assert assets._file_identity(weight) == identity
-    monkeypatch.setattr(assets, "_run_cut", lambda *args, **kwargs: pytest.fail("hot cache must not cut"))
-    monkeypatch.setattr(assets, "_hash_file", lambda *args, **kwargs: pytest.fail("unchanged identity must reuse digest"))
-    assert assets._hash_file_cached(weight) == first["artifact_sha256"]
+    damaged_identity = assets._file_identity(weight)
+    assert damaged_identity != identity
+    # 伪造者能回填的字段（size/mtime）连同 inode/device/ctime 全部不变，
+    # 唯一改变的是 ChangeTime：若版本边界不含它，这里就会错误复用旧摘要。
+    assert damaged_identity[:5] == identity[:5]
+    assert damaged_identity[5] != identity[5]
+    assert weight.stat().st_size == stamp.st_size
+    assert weight.stat().st_mtime_ns == stamp.st_mtime_ns
+
+    # 进程内 `_DIGEST_CACHE` 已由 model_supply_digest_cache 的持久化 store 取代
+    # （#127）；store 的 key 是 resolve 后的绝对路径，tmp_path 之间天然隔离，
+    # 无需再清空进程内字典。
+    hashed = []
+    original_hash = assets._hash_file
+    def hash_file(path, cancelled=None):
+        hashed.append(Path(path))
+        return original_hash(path, cancelled)
+    monkeypatch.setattr(assets, "_hash_file", hash_file)
+    cut = []
+    original_cut = assets._run_cut
+    def run_cut(*args, **kw):
+        cut.append(args)
+        return original_cut(*args, **kw)
+    monkeypatch.setattr(assets, "_run_cut", run_cut)
+
+    # 版本边界变化 ⇒ 必须重新读盘；陈旧摘要不得返回。
+    assert assets._hash_file_cached(weight) == assets.sha256_file(weight)
+    assert assets._hash_file_cached(weight) != first["artifact_sha256"]
+    assert weight in hashed
+
     second = assets.build_gguf_segment(source, tmp_path / "cache", **{**kwargs, "operation_id": "op-reuse"})
+    # 被污染的缓存段不能复用：必须重新裁切一次并产出与原始段一致的清单。
+    assert len(cut) == 1
     assert second["operation_id"] == "op-reuse"
     assert second["manifest_sha256"] != first["manifest_sha256"]
     assert second["files"] == first["files"]
-    assert second["_reused_bytes"] == sum(entry["size_bytes"] for entry in first["files"])
-    assert os.path.samefile(weight, second["local_files"]["segment.gguf"])
-    assert Path(second["local_files"]["segment.gguf"]).read_bytes() == damaged
+    assert second["artifact_sha256"] == first["artifact_sha256"]
+    rebuilt = Path(second["local_files"]["segment.gguf"])
+    assert not os.path.samefile(weight, rebuilt)
+    assert rebuilt.read_bytes() == original_bytes
+    # 已发布的损坏缓存不被就地改写（由后续 GC 按保留策略回收）。
+    assert weight.read_bytes() == damaged
 
 
 @pytest.mark.parametrize("change", ["range", "proof"])
@@ -175,8 +224,24 @@ def test_gc_is_bounded_and_refuses_undeclared_members_and_corrupt_sha(tmp_path):
     assert assets._hash_file_cached(bad) == manifest["artifact_sha256"]
     data = bytearray(bad.read_bytes()); data[-1] ^= 1; bad.write_bytes(data)
     os.utime(bad, ns=(before.st_atime_ns, before.st_mtime_ns))
-    assert assets._file_identity(bad) == identity
+    # 原断言 `assets._file_identity(bad) == identity` 在 Windows 上不成立：
+    # 实测（NTFS）写回同长度字节只改 ChangeTime，utime 只恢复 atime/mtime，
+    # 所以 dev/ino/size/mtime/ctime 五项相同、ChangeTime 必变。它的本意是
+    # "摘要缓存仍认为文件是同一版本、因此GC 若信任缓存就会放过损坏段"。
+    # 该前提不能再靠伪造时间戳得到，改为直接构造最坏情形：把 store 的
+    # 一条记录写成"当前完整版本戳 → 篡改前的摘要"，让缓存确实返回陈旧摘要。
+    damaged_identity = assets._file_identity(bad)
+    assert damaged_identity != identity
+    assert damaged_identity[:5] == identity[:5] and damaged_identity[5] != identity[5]
+    assert bad.stat().st_size == before.st_size
+    assert bad.stat().st_mtime_ns == before.st_mtime_ns
+    digests._save(digests._store_path(), bad.resolve(),
+                  {"stamp": list(digests.file_stamp(bad)), "sha256": manifest["artifact_sha256"]})
+    # 前置条件断言：缓存此刻确实会把陈旧摘要交给调用方（否则下面
+    # file_digest_mismatch 就可能是别的代码路径发现差异，覆盖不到
+    # "GC 不信任摘要缓存"这一行为）。
     assert assets._hash_file_cached(bad) == manifest["artifact_sha256"]
+    assert assets.sha256_file(bad) != manifest["artifact_sha256"]
     normal = [_generation(tmp_path, "stale-" + str(i))[1] for i in range(5)]
     report = assets.collect_supply_segments(tmp_path, protected_paths=[current],
         native_paths=[native / "segment.gguf"], keep=0, max_remove=2)
@@ -224,6 +289,21 @@ def test_receiver_operation_receipts_share_bytes_then_owner_gc_reclaims(tmp_path
 
 
 def test_supply_completion_gc_protects_actual_loaded_and_prepared_host(setup, monkeypatch):
+    """owner GC 必须保护真实 loaded engine、prepared candidate 与 selected 指针。
+
+    原测试在 `finish(worker)` 之后断言 `assets.collect_supply_segments` 已被
+    调用，即期待 worker 在 available 发布**之后**自行回收。2026-10-26 的有意
+    修复把回收前移到发布之前（docs/已知问题记录.md #127：operation dirs →
+    segment GC → resident stamp 复核 → check → available），worker 的 `_ensure`
+    不再调用 collect_garbage，所以 observed 必然为空——这不是回归，而是新时序
+    本身。发布前时机的回归由 coordinator 侧覆盖（tests/test_model_supply.py
+    断言 collect_garbage 被调用时 status 仍是 supplying）。
+
+    这里保留 worker 维护入口的强断言：调用时必须持有 full chat 与 candidate
+    锁，native_paths 必须包含真实 loaded 与 prepared candidate，current.json
+    指向的 selected 必须进入 protected_paths，只有 stale 可删；释放原生引用后
+    loaded / candidate 才允许回收，selected 仍受指针保护。
+    """
     monkeypatch.setattr(config, "MODEL_SUPPLY_CACHE_KEEP", 0)
     from model_host import ModelHost, _PipelineCandidateTransaction
     from llama_engine import LlamaCppEngine
@@ -249,15 +329,30 @@ def test_supply_completion_gc_protects_actual_loaded_and_prepared_host(setup, mo
     def collect(*args, **kw):
         assert host.full_chat_execution_lock._is_owned()
         assert host._pipeline_candidate_lock._is_owned()
-        observed.append(kw["native_paths"])
+        observed.append((kw["native_paths"], kw["protected_paths"]))
         return original(*args, **kw)
     monkeypatch.setattr(assets, "collect_supply_segments", collect)
     worker.handle(command(manifest))
     assert client.wait()["status"] == "available"
     finish(worker)
-    assert observed and observed[0] is not None
+    # 供给完成不再触发回收：若有人把 GC 搬回 available 之后（#127 修复前的
+    # 竞争形态），这里会非空并失败。
+    assert observed == []
+    assert stale.is_dir()
     assert selected.is_dir() and loaded.is_dir() and candidate.is_dir()
-    assert not stale.exists()
+
+    observed.clear()
+    report = worker.collect_garbage()
+    assert observed and observed[0] is not None
+    native, protected = observed[0]
+    native = {Path(path).resolve() for path in native}
+    assert (loaded / "segment.gguf").resolve() in native
+    assert (candidate / "segment.gguf").resolve() in native
+    assert selected.resolve() in {Path(path).resolve() for path in protected}
+    # keep=0：三份都只能因"被引用"而保留，并非留存预算或哈希失败。
+    assert report["removed"] == 1 and not stale.exists()
+    assert report["skipped"]["referenced"] == 3
+    assert selected.is_dir() and loaded.is_dir() and candidate.is_dir()
     object.__setattr__(host, "_pipeline_candidate_transaction", None)
     engine._model_path = ""
     report = worker.collect_garbage()

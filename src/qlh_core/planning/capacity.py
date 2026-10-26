@@ -979,6 +979,30 @@ def _self_cut_segment_bytes(node, start, end) -> list[int] | None:
     return [per_layer] * max(0, int(end) - int(start))
 
 
+def _node_executor_label(node_id: Any, executor_id: Any = "") -> str:
+    """节点的**对外诊断身份**：主执行器裸 `node_id`，附加执行器 `node_id#executor_id`。
+
+    ★ 2026-10-27（审计 A6）：身份是 `(node_id, executor_id)`，但
+    `control_only_nodes` / `single_node_full_model_candidates` / `step_time_estimate`
+    都是**对外输出字段**（`/api/cluster/pipeline-capacity`、`/api/cluster/status`
+    的节点投影、android 集群概览、`model_runtime_contracts_v1` 的 plan 投影都会读）。
+    同机 CPU 段（`executor_id="cpu"`）与主段共用 `node_id="master"`，此前这些字段只写
+    裸 `node_id` ⇒ 两个执行器在输出里塌成同一个名字：主段参与、CPU 段闲置时
+    `control_only_nodes` 里看不到 `master#cpu`（被主段"代表"了），于是**闲置的执行器
+    在诊断里不可见**；瓶颈也只能说"master 慢"，无法回答是 GPU 段还是 CPU 段慢。
+
+    为什么不是无条件写成 `node_id#executor_id`：这些字段的既有消费方按裸 `node_id`
+    读取（测试断言 `"master" in control_only_nodes`、`scheduler_cluster` 用裸
+    `node_id` 做 `in` 判断、现场脚本按 `node_id` 对齐）。**兼容规则**：
+    `executor_id` 为空 ⇒ 输出裸 `node_id`（既有拓扑逐字节不变）；**仅附加执行器**
+    才带 `#executor_id` 后缀。这与项目里视图键的既有写法一致
+    （`model_intent.py:162`、`model_supply.py:1811`、`stage_identity()`）。
+    """
+    executor = str(executor_id or "")
+    label = str(node_id)
+    return f"{label}#{executor}" if executor else label
+
+
 def solve_pipeline_capacity(
     descriptor: dict[str, Any],
     nodes: list[dict[str, Any]],
@@ -1072,16 +1096,28 @@ def solve_pipeline_capacity(
     for value in layer_bytes:
         prefix.append(prefix[-1] + value)
 
-    checks: dict[tuple[str, int, int], dict[str, Any]] = {}
+    checks: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     capacity_checks: list[dict[str, Any]] = []
-    exclusions: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    exclusions: dict[tuple[str, str, int, int, str], dict[str, Any]] = {}
     candidate_exclusions: list[dict[str, Any]] = []
 
     def exclude(node, start, end, reason_code, budget=None):
-        exclusions[(node["node_id"], start, end, reason_code)] = {
+        # ★ 2026-10-27（审计 A5）：**排除记录也必须按执行器身份区分**。
+        #   同机 CPU 段与主段共用 `node_id="master"`：此前键只有
+        #   `(node_id, start, end, reason_code)` ⇒ 两段对同一区间、同一原因的排除
+        #   **互相覆盖**，`candidate_exclusions` 只剩后写的那一条；而输出里也没有
+        #   `executor_id` ⇒ 现场读到"master 在 [8,24) 被排除"时无法判断被排除的是
+        #   CPU 段还是主段（项目注释记过这次误判：把 CPU 段的容量不足读成主段）。
+        #   与同函数的 `checks` 保持同一种身份键，两条记录才能对上。
+        executor_id = str(node.get("executor_id") or "")
+        entry = {
             "node_id": node["node_id"], "layer_range": [start, end],
             "reason_code": reason_code, **(budget or {}),
         }
+        # `executor_id` 放在 budget 展开**之后**：预算字段来自 `_node_budget`，即便
+        # 将来它带上同名字段，身份也必须以节点记录为准（不被覆盖）。
+        entry["executor_id"] = executor_id
+        exclusions[(node["node_id"], executor_id, start, end, reason_code)] = entry
 
     base = {
         "schema_version": CAPACITY_PLAN_SCHEMA_VERSION,
@@ -1118,7 +1154,10 @@ def solve_pipeline_capacity(
             "reason": ("同一物理内存域内的执行器申报额度之和超过该域总账；"
                        "按节点分别记账会让同机多执行器各自按整机可用内存申报。"),
             "assignments": [],
-            "control_only_nodes": [node["node_id"] for node in usable],
+            "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
     required_node_index = next((index for index, node in enumerate(usable)
                                 if node["node_id"] == required_node_id), None)
@@ -1128,7 +1167,10 @@ def solve_pipeline_capacity(
             "reason_code": "pipeline_required_node_unavailable",
             "reason": f"required executor {required_node_id} has no usable model capacity",
             "required_node_id": required_node_id,
-            "assignments": [], "control_only_nodes": [node["node_id"] for node in usable],
+            "assignments": [], "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
     if not usable and not relay_only:
         return {
@@ -1151,7 +1193,10 @@ def solve_pipeline_capacity(
             "reason_code": "pipeline_distributed_workers_unavailable",
             "reason": "distributed placement requires at least two usable PC nodes",
             "assignments": [],
-            "control_only_nodes": [node["node_id"] for node in usable],
+            "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
 
     work_total = prefix[layer_budget] or 1
@@ -1512,7 +1557,10 @@ def solve_pipeline_capacity(
                     "reason_code": "pipeline_candidate_layer_range_unsatisfied",
                     "reason": "source coverage or staging ranges cannot form a capacity-safe contiguous split",
                     "assignments": [], "allocatable_bytes": allocatable_bytes,
-                    "control_only_nodes": [node["node_id"] for node in usable],
+                    "control_only_nodes": [
+                        _node_executor_label(node["node_id"], node.get("executor_id"))
+                        for node in usable
+                    ],
                 }
         segment_constrained = any(
             node.get("segment_mode") is not None
@@ -1552,7 +1600,10 @@ def solve_pipeline_capacity(
                         0, raw_model_bytes - allocatable_bytes
                     )}),
                     "assignments": [],
-                    "control_only_nodes": [node["node_id"] for node in usable],
+                    "control_only_nodes": [
+                        _node_executor_label(node["node_id"], node.get("executor_id"))
+                        for node in usable
+                    ],
                 }
         # Distinguish a topology contract failure from a plain memory
         # shortage. Re-run the same admission with the range contract
@@ -1628,7 +1679,10 @@ def solve_pipeline_capacity(
                     **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
                     "assignments": [],
                     "uncovered_layer_ranges": [],
-                    "control_only_nodes": [node["node_id"] for node in usable],
+                    "control_only_nodes": [
+                        _node_executor_label(node["node_id"], node.get("executor_id"))
+                        for node in usable
+                    ],
                 }
             reason = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"
@@ -1649,7 +1703,10 @@ def solve_pipeline_capacity(
                 **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
                 "assignments": [],
                 "uncovered_layer_ranges": [list(gap) for gap in gaps],
-                "control_only_nodes": [node["node_id"] for node in usable],
+                "control_only_nodes": [
+                    _node_executor_label(node["node_id"], node.get("executor_id"))
+                    for node in usable
+                ],
             }
         return {
             **base,
@@ -1663,11 +1720,18 @@ def solve_pipeline_capacity(
             "allocatable_bytes": allocatable_bytes,
             **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
             "assignments": [],
-            "control_only_nodes": [node["node_id"] for node in usable],
+            "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
 
     assignments = []
-    used_ids: set[str] = set()
+    # ★ 2026-10-27（审计 A6）：**参与身份是 `(node_id, executor_id)`**，不是裸 node_id。
+    #   此前用 `set[str]` 只记 node_id ⇒ 同机主段参与后，闲置的 CPU 段因"该 node_id
+    #   已在集合里"而不会被列入 `control_only_nodes`（一个在干活、一个闲置，诊断却
+    #   只有一句话）；反过来若只有 CPU 段参与，主段也会被误判为已参与。
+    used_ids: set[tuple[str, str]] = set()
     for (
         node_index, start, end, raw_bytes, required,
         has_embedding, has_lm_head, artifact_index,
@@ -1677,7 +1741,7 @@ def solve_pipeline_capacity(
             node["layer_artifacts"][artifact_index]
             if artifact_index is not None else None
         )
-        used_ids.add(node["node_id"])
+        used_ids.add((node["node_id"], str(node.get("executor_id") or "")))
         assignment = {
             "node_id": node["node_id"],
             "role": node["role"],
@@ -1812,7 +1876,14 @@ def solve_pipeline_capacity(
             full_bytes = full_quote["weight_bytes"]
         required = _required_bytes(full_bytes, node, safety_margin)
         if required <= node["capacity_bytes"]:
-            full_model_fits.append(node["node_id"])
+            # ★ 2026-10-27（审计 A6）：这里同样是执行器身份。原先写裸 `node_id` ⇒
+            #   同机主段与 CPU 段都能装下整模时列表里出现两个 `"master"`（重复），
+            #   读的人无法判断"整模候选"到底有几个执行器；而如果只有 CPU 段装得下、
+            #   主段装不下，两者仍都显示为 `"master"` ⇒ 漏（错）判。用诊断标签后
+            #   主段仍是 `master`（既有输出逐字节不变），CPU 段为 `master#cpu`。
+            full_model_fits.append(
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+            )
 
     objective = placement_objective(solved)
     base["placement_policy"] = {
@@ -1845,6 +1916,11 @@ def solve_pipeline_capacity(
             layers = int(value[2]) - int(value[1])
             segments_ms.append({
                 "node_id": node["node_id"],
+                # ★ 2026-10-27（审计 A6）：`node_id` 保持裸值（既有读法不变），
+                #   附加执行器另外带 `executor_id`；仅非空时输出 ⇒ 既有单执行器
+                #   拓扑的段报告逐字节不变，而 `master#cpu` 能被认出来。
+                **({"executor_id": str(node.get("executor_id") or "")}
+                   if node.get("executor_id") else {}),
                 "layer_range": [int(value[1]), int(value[2])],
                 "layers_count": layers,
                 "layer_cost_ms": float(cost) if cost else None,
@@ -1856,11 +1932,22 @@ def solve_pipeline_capacity(
             base["step_time_estimate"] = {
                 "basis": "layers_count_x_calibrated_layer_ms",
                 "estimated_step_ms": bottleneck["estimated_ms"],
-                "bottleneck_node_id": bottleneck["node_id"],
+                # ★ 2026-10-27（审计 A6）：瓶颈必须是**执行器**身份，不是物理节点名。
+                #   同机 GPU 段与 CPU 段共用 `node_id="master"`，只报 `"master"` 时
+                #   回答不了"慢的是哪一段"—— 而段成本本来就差 2.3 倍（见上方注释），
+                #   这正是最需要回答的问题。标签规则与 `control_only_nodes` 同源
+                #   （主执行器裸 node_id、附加执行器 `node#executor`，见
+                #   `_node_executor_label`），所以它与 `segments[*]["node_id"]`
+                #   在既有单执行器拓扑下仍然严格相等（既有断言不变）。
+                "bottleneck_node_id": _node_executor_label(
+                    bottleneck["node_id"], bottleneck.get("executor_id")
+                ),
                 "bottleneck_layer_range": bottleneck["layer_range"],
                 "segments": segments_ms,
-                "uncalibrated_segments": [item["node_id"] for item in segments_ms
-                                          if item["estimated_ms"] is None],
+                "uncalibrated_segments": [
+                    _node_executor_label(item["node_id"], item.get("executor_id"))
+                    for item in segments_ms if item["estimated_ms"] is None
+                ],
             }
     participating_count = len(assignments) + len(relay_only)
     return {
@@ -1872,8 +1959,17 @@ def solve_pipeline_capacity(
         "assignments": assignments + _relay_zero_layer_assignments(
             relay_only, total_layers, relay_claims
         ),
+        # ★ 2026-10-27（审计 A6）：**按 `(node_id, executor_id)` 判断谁没参与**。
+        #   此前 `node["node_id"] not in used_ids` 会把"同机另一个执行器"当成同一个
+        #   东西：主段参与、CPU 段闲置时 `master#cpu` 被主段"代表"而不列出 ⇒ 现场
+        #   看不出还有一个执行器闲着；只有 CPU 段参与时又会反过来把主段当成已参与。
+        #   输出用 `_node_executor_label`（主执行器裸 node_id ⇒ 既有断言与前端读法
+        #   不变），`scheduler_cluster._snapshot_nodes` 的 `node_id in control_only`
+        #   判断因此仍然只匹配主执行器那一项，不会把整机误标成 control-only。
         "control_only_nodes": [
-            node["node_id"] for node in usable if node["node_id"] not in used_ids
+            _node_executor_label(node["node_id"], node.get("executor_id"))
+            for node in usable
+            if (node["node_id"], str(node.get("executor_id") or "")) not in used_ids
         ],
         "participating_node_count": participating_count,
         "single_node_full_model_candidates": full_model_fits,

@@ -172,12 +172,26 @@ def explain_supply_capacity(
     if candidate is None:
         return result
     assignments, ordered = candidate
-    originals = {node["node_id"]: node for node in projected_nodes}
-    by_id = {item["node_id"]: item for item in assignments}
+    # ★ 2026-10-27（LOCAL-EXECUTORS-01）：键必须是 `(node_id, executor_id)`。
+    #
+    #   同机可有多个执行器（主段 `""` + CPU 段 `"cpu"`），它们**共用 `node_id`**。
+    #   此前用裸 `node_id` 建 `originals` / `by_id` 字典 ⇒ 同机两段互相覆盖
+    #   ⇒ 本应属于 CPU 段的 `required_bytes` / `layer_range` 被贴到主段行上
+    #   （或反之）⇒ 诊断给出**错配的缺口数字**，现场据此调参会调错方向。
+    #
+    #   这一段已被调用方的 try/except 兜底（`PipelineCapacityError` 等），
+    #   所以它不影响准入判定 —— 但"诊断错"比"没诊断"更坏。
+    def _identity_key(record):
+        return (str((record or {}).get("node_id") or ""),
+                str((record or {}).get("executor_id") or ""))
+
+    originals = {_identity_key(node): node for node in projected_nodes}
+    by_id = {_identity_key(item): item for item in assignments}
     summaries = []
     for node in ordered:
-        row = _node_summary(originals[node["node_id"]])
-        item = by_id.get(node["node_id"])
+        key = _identity_key(node)
+        row = _node_summary(originals[key])
+        item = by_id.get(key)
         if item is not None:
             required = item["required_bytes"]
             row.update(
@@ -185,6 +199,10 @@ def explain_supply_capacity(
                 deficit_bytes=max(0, required - row["available_bytes"]),
                 layer_range=[item["start_layer"] * alignment, item["end_layer"] * alignment],
             )
+        # 同一 node 的第二个执行器行要能区分，否则两份 summary 在界面上无法归属
+        executor_id = key[1]
+        if executor_id:
+            row["executor_id"] = executor_id
         summaries.append(row)
     prefix = _REASONS.get(reason_code, "当前容量与层段约束未通过准入")
     if original_reason:

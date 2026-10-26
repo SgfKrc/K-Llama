@@ -166,10 +166,36 @@ class BackendSupervisor:
                 ):
                     handler.setLevel(logging.CRITICAL + 1)
 
-    def stop(self) -> None:
-        """请求本监督器创建的 server 停止，并短暂等待线程结束。"""
+    def stop(self) -> float | None:
+        """请求本监督器创建的 server 停止，并短暂等待线程结束。
+
+        返回 thread 存活时**已等待的秒数**（`None` 表示无需等待或已正常退出）。
+
+        ★ 2026-10-27（#128）：**放弃等待时必须说出来**。
+
+        此前这里是裸 `join(timeout=3.0)`：超时后线程仍然活着，但函数静默返回，
+        调用方以为后端已停。后果是**旧 TUI 的 Python 进程继续存活**，而新进程
+        恢复旧部署时 `_dispatch_pipeline_model_cleanup` 会依据旧进程 PID 判定
+        "本机清债"并继续等待 ⇒ `GET` 正常但**选模 `POST` 长时间没有新 operation**。
+
+        这里不改变"有界等待"这个决定（进程内硬杀另一个线程本来就不安全），
+        只是把"没等到"变成**可观测的返回值 + 警告日志**，让调用方能提示用户
+        "旧进程仍在，请确认后再启动"。后端侧 `_graceful_exit` 另有
+        `QLH_SHUTDOWN_GRACE_SECONDS` 的兜底强退，两处合起来才能保证旧 PID 消失。
+        """
         if not self.started_here or self.server is None:
-            return
+            return None
         self.server.should_exit = True
         if self.thread is not None and self.thread.is_alive():
+            started_at = time.monotonic()
             self.thread.join(timeout=3.0)
+            waited = time.monotonic() - started_at
+            if self.thread.is_alive():
+                module_logger = logging.getLogger(__name__)
+                module_logger.warning(
+                    "event=backend_stop_thread_alive waited_s=%.1f "
+                    "hint=后端未在等待窗口内退出；旧进程仍在，选模可能被旧部署清理阻塞",
+                    waited,
+                )
+                return waited
+        return None

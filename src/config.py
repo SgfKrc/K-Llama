@@ -763,6 +763,40 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     #:   表现为 `request_deadline_exceeded`，现场只能改源码。现在可用 `QLH_PIPELINE_TIMEOUT`
     #:   调整（默认仍是 120，既有行为不变）。
     PIPELINE_TIMEOUT = _env_int("QLH_PIPELINE_TIMEOUT", 120)   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
+    #: ★ 2026-10-27（#128）：优雅退出时**等待 uvicorn 自行收敛**的上限（秒）。
+    #:
+    #:   `POST /api/system/shutdown` 只把 `server.should_exit` 置真，然后就撒手 ——
+    #:   uvicorn 若正卡在某个长请求或 lifespan shutdown 里，`should_exit` 只是一个
+    #:   它暂时无暇读取的标志位，进程可以长期不退。TUI 侧
+    #:   `BackendSupervisor.stop` 又只 `join(timeout=3.0)`，3 秒后放弃并**不报错**
+    #:   ⇒ 旧 TUI 的 Python 进程存活，而新进程恢复旧部署时
+    #:   `_dispatch_pipeline_model_cleanup` 会依据旧进程 PID 判定"本机清债"
+    #:   继续等待 ⇒ 选模 POST 长时间没有新 operation（只有 GET 正常）。
+    #:
+    #:   超过这个上限后走兜底：自己跑一次 `_shutdown_resources()` 再强制退出，
+    #:   让"退出"这件事有确定终态，而不是把不确定性留给下一个进程。
+    #:   取 10 s：足够覆盖正常 lifespan shutdown，又不至于让 UI 以为卡死。
+    SHUTDOWN_GRACE_SECONDS = _env_float(
+        "QLH_SHUTDOWN_GRACE_SECONDS", 10.0, min_val=1.0, max_val=300.0,
+    )
+    #: ★ 2026-10-27（#122）：对话上下文**一次带多少条历史**。
+    #:
+    #:   此前这个数字在**两个地方各自硬编码成 200**
+    #:   （`chat_context.DEFAULT_CONTEXT_MESSAGES` 与
+    #:   `local_store.load_local_conversation(limit=200)`），且
+    #:   `api_server` 调后者时**不传 limit** ⇒ 想在现场调窗口只能改源码。
+    #:   `docs/已知问题记录.md` 的 #122 记的正是"历史累积与长输入预算缺少
+    #:   独立性能归因"：短 message 携带较长已拼装上下文，触发 prefill 分片，
+    #:   但现场看不到"这次到底带了多少条历史"。
+    #:
+    #:   现在这一项统一到同一个可调源，`chat_context` 与 `local_store` 都读它。
+    #:   窗口是**按条数**计的（不是 token），所以它只是"上限"，真正进入 prompt
+    #:   的 token 数仍由 `event=execution_prompt` 的 `prompt_tokens` 观测 ——
+    #:   两者配合才能判断"是历史太长"还是"单条太肥"。
+    #:   默认 200 = 既有行为，逐字节不变。
+    CHAT_CONTEXT_MESSAGES = _env_int(
+        "QLH_CHAT_CONTEXT_MESSAGES", 200, min_val=1, max_val=2000,
+    )
     PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
         "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 180.0, min_val=1.0, max_val=600.0,
     )                                           # 等待从节点同步模型和分层 ACK

@@ -107,7 +107,7 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                         master_engine: str, alignment: int = 1,
                         safety_margin: float = 1.2,
                         runtime_descriptors: dict[str, dict] | None = None,
-                        preferred_ranges: dict[str, list[list[int]]] | None = None,
+                        preferred_ranges: dict[Any, list[list[int]]] | None = None,
                         runtime_host_ranges: dict[str, list[list[int]]] | None = None,
                         prefer_all_workers: bool | None = None) -> dict:
     """Reuse capacity admission while planning missing, not just existing, assets.
@@ -116,6 +116,10 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
     executor, including the middle, and use aligned groups for hybrid models.
     Each executor uses its exact projected per-layer bytes for the selected
     engine and load specification; packaged size is rechecked before dispatch.
+
+    ★ 2026-10-27（LOCAL-EXECUTORS-01 / A9）：`preferred_ranges` 的键是**执行器身份**
+    `(node_id, executor_id)`（附加执行器如 `("master", "cpu")`）；裸 `node_id` 仍被
+    兼容，但只作用于该节点的**主执行器**。`runtime_host_ranges` 保持裸 `node_id`。
     """
     from model_supply_runtime_capacity import (
         RuntimeCapacityProjectionError, project_supply_capacity_nodes,
@@ -1507,7 +1511,16 @@ class ModelSupplyCoordinator:
             plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
                 planner=capacity_plan, source_model_id=sources["source_model_id"],
                 source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
-                engine_by_node={record["node_id"]:record["engine"] for record in records},
+                # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 问题 3）：**必须按 `(node_id, executor_id)` 建映射**。
+                #
+                #   同机 GPU 段（`("master", "")`，pytorch）与 CPU 段（`("master", "cpu")`，
+                #   llama_cpp）**共用 `node_id`**。此前这里是
+                #   `{record["node_id"]: record["engine"]}` ⇒ 后写的 CPU 段覆盖主段
+                #   ⇒ `engine_by_node["master"] == "llama_cpp"`。即使 `_preserves`/`_candidates`
+                #   已修好身份，主段的 assignment（engine=pytorch）仍会因"引擎不等"被判
+                #   False ⇒ 复用偏好继续退回 `unrestricted`，已裁好的段每轮重新规划。
+                engine_by_node={(record["node_id"], str(record.get("executor_id") or "")):
+                                record["engine"] for record in records},
                 alignment=sources["alignment"])
             # ★ 2026-10-23（#117）：**本机 RAM 是一等承载资源，不是失败兜底**。
             #   此前只在 resident 规划**失败之后**才尝试 `safetensors_layer_offload`
@@ -1555,13 +1568,21 @@ class ModelSupplyCoordinator:
                 ]
                 offload_plan = plan_segment_supply_reuse(
                     sources["descriptors"], capacity, offload_records,
-                    planner=lambda *, preferred_ranges, constrain_host=True: capacity_plan(
+                    # ★ 2026-10-27（LOCAL-EXECUTORS-01 / B1）：**必须转发 `release_candidates`**。
+                    #   此前这个 lambda 只声明 `preferred_ranges/constrain_host` ⇒
+                    #   `plan_segment_supply_reuse` 里两种"放开切点锁"的调用都会
+                    #   `TypeError` 被吞掉（代码里 catch 后 `released = baseline`）⇒
+                    #   offload 物化的路径上释放机制**从未生效**：无解时直接失败、
+                    #   "可行但缺少 CPU 段"时也不会重切。保持与 resident 路径同口径。
+                    planner=lambda *, preferred_ranges, constrain_host=True,
+                            release_candidates=False: capacity_plan(
                         preferred_ranges=preferred_ranges, constrain_host=constrain_host,
-                        plan_records=offload_records),
+                        plan_records=offload_records, release_candidates=release_candidates),
                     source_model_id=sources["source_model_id"],
                     source_model_sha256=sources["source_model_sha256"],
                     tokenizer_sha256=sources["tokenizer_sha256"],
-                    engine_by_node={record["node_id"]: record["engine"] for record in offload_records},
+                    engine_by_node={(record["node_id"], str(record.get("executor_id") or "")):
+                                    record["engine"] for record in offload_records},
                     alignment=sources["alignment"])
 
                 def _local_layers(candidate):

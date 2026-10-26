@@ -361,6 +361,19 @@ def _local_cpu_layer_artifacts(records) -> list:
         return []
     source_sha = ""
     model_id = ""
+    # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 前置）：**复用候选需要完整身份**。
+    #
+    #   `model_supply_plan_reuse._candidates` 的准入判据是"物理身份可证"：工件要带
+    #   `source_model_id` / `source_model_sha256` / `tokenizer_sha256` / `hidden_size`
+    #   与 `models` 证据（engine/format/digest 都对上）。此前这里只抄了
+    #   `source_model_sha256` + `model_id` ⇒ 即使把"跳过 master"改成按
+    #   `(node_id, executor_id)` 放行，本机 CPU 段的段仍然**进不了**候选
+    #   （缺 `source_model_id`/`tokenizer_sha256`/`hidden_size`，`models` 也对不上）
+    #   ⇒ A8 的两处键修复在真机上等于没生效。
+    #   这三项与 `source_model_sha256` 同源（都取自同一批远端工件，同一次供给），
+    #   必须**一起**声明：求解器的 `_normalize_layer_artifacts` 明确要求
+    #   "model preflight fields must be declared together"。
+    contract_fields: dict[str, object] = {}
     for item in records or ():
         if not isinstance(item, dict) or str(item.get("executor_id") or ""):
             continue
@@ -369,6 +382,9 @@ def _local_cpu_layer_artifacts(records) -> list:
             if sha:
                 source_sha = sha
                 model_id = str(artifact.get("model_id", "") or "").strip()
+                for key in ("source_model_id", "tokenizer_sha256", "hidden_size"):
+                    if key in artifact:
+                        contract_fields[key] = artifact[key]
                 break
         if source_sha:
             break
@@ -380,14 +396,18 @@ def _local_cpu_layer_artifacts(records) -> list:
     start, end = int(layer_range[0]), int(layer_range[1])
     if end <= start:
         return []
-    return [{
+    artifact = {
         "layer_range": [start, end],
         "segment_mode": "middle",
         "model_id": model_id,
         "artifact_sha256": artifact_sha,
         "source_model_sha256": source_sha,
         "layer_weight_bytes": [per_layer] * (end - start),
-    }]
+    }
+    # 三项必须齐全才带上（缺一项就整组不声明，退回"不可复用"而不是半真半假）。
+    if set(contract_fields) == {"source_model_id", "tokenizer_sha256", "hidden_size"}:
+        artifact.update(contract_fields)
+    return [artifact]
 
 
 
@@ -2701,6 +2721,21 @@ class Scheduler(
                 _cpu_artifacts = _local_cpu_layer_artifacts(records)
                 if _cpu_artifacts:
                     cpu_record["layer_artifacts"] = _cpu_artifacts
+                    # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 前置）：**本机 CPU 段的物理
+                    #   模型证据**。复用候选要求"引擎/格式/摘要都对得上"（
+                    #   `model_supply_plan_reuse._model_matches`），而这份记录此前没有
+                    #   `models` ⇒ `_candidates` 即使按 `(node_id, executor_id)` 放行，
+                    #   也会在"物理身份不可证"处被拒 ⇒ CPU 段的已验证 GGUF 段仍进不了
+                    #   复用候选（现场表现就是"配了 CPU 段，供给每轮还是不用它"）。
+                    #   `sha256` 用**本段工件自己的摘要**（不是远端那段），`model_id`
+                    #   与 `layer_artifacts[0]` 保持一致，两者才能配对。
+                    cpu_record["models"] = [{
+                        "model_id": _cpu_artifacts[0]["model_id"],
+                        "sha256": _cpu_artifacts[0]["artifact_sha256"],
+                        "engine": "llama_cpp",
+                        "format": "gguf",
+                        "revision": "local",
+                    }]
                     logger.info(
                         "event=local_cpu_executor_artifact_declared "
                         "layer_range=%s layers=%s per_layer_bytes=%s "
@@ -3078,6 +3113,17 @@ class Scheduler(
                         str(item) for item in staged.get("failed_node_ids", [])
                         if str(item)
                     )
+                    # ★ 2026-10-27（A4 联动）：**执行器级**失败也要跨轮累积。
+                    #   上一轮"只有 CPU 执行器坏了"若在下一轮断线时被丢掉，
+                    #   已判死的执行器会重新进入候选（计划退化，等于把一个坏段
+                    #   "复活"到新拓扑里）。元素是 `[node_id, executor_id]` 两元
+                    #   列表（见 `PipelineReshardPlan.to_dict()`），转回二元组后
+                    #   交给 `plan_pipeline_reshard` 显式化为执行器级语义。
+                    for identity in staged.get("failed_executor_ids", []) or ():
+                        if isinstance(identity, (list, tuple)) and len(identity) == 2:
+                            failed_node_ids.add(
+                                (str(identity[0]), str(identity[1] or "").strip()),
+                            )
 
             decision = coordinator.stage_failure(
                 failed_node_ids,
@@ -3142,6 +3188,13 @@ class Scheduler(
                 verified=True,
                 has_embedding=requirement.has_embedding,
                 has_lm_head=requirement.has_lm_head,
+                # ★ 2026-10-27（A3 联动，必须）：`covers()` 现在按
+                #   `(node_id, executor_id)` 判身份 —— 这里若漏抄 `executor_id`，
+                #   同机两段拓扑（`master#""` + `master#cpu`）下每一条 requirement
+                #   的证明都会以 `executor_id=""` 落库 ⇒ CPU 段的 requirement
+                #   永远等不到证明 ⇒ commit 恒 `pipeline_reshard_assets_not_ready`
+                #   （本函数是唯一的证明来源，见上方注释）。
+                executor_id=requirement.executor_id,
             ))
         committed = coordinator.commit(
             staged_plan.plan_id, expected_epoch=staged_plan.base_epoch,
@@ -3333,29 +3386,106 @@ class Scheduler(
                   item.get("layer_ranges"), item.get("candidate_layer_ranges"))
                  for item in (capacity_nodes or [])],
             )
-            if (not result.get("admitted")
-                    and any("candidate_layer_ranges" in node for node in capacity_nodes or [])):
-                # ★ 2026-10-23（#117）：候选区间来自**供给时的切点**（用于锁定复用，
-                #   见 model_supply_capacity 的证据投影）。容量确实不再满足时才放开，
-                #   允许重新切分布局 —— 即"可用内存增加就不动切点、减少才重切"。
+            # ★ 2026-10-27（LOCAL-EXECUTORS-01 / B1）：**"可行但已不该沿用"的布局也要重切**。
+            #
+            #   下面这条释放机制原先只在**解不出来**时触发。问题：只要"不含本机 CPU 段的
+            #   方案仍然可行"，就永远不释放 ⇒ 陈旧切点（`candidate_layer_ranges`，由上一轮
+            #   供给写入、表达"我手上确实有这个段"）作为硬约束永久保留 ⇒ 附加执行器在后续
+            #   轮次被**结构性挤出**拓扑。`model_supply.py:1236-1245` 记的
+            #   "`android[[8,20]]+TABLET[[20,32]]` 占满 `[8,32)`，CPU 段在候选里却从未被选"
+            #   在 prepare 这一层的表现正是这条 —— "可行但已不该沿用"的布局永远不会重切。
+            #
+            #   触发条件除"无解"外再加一条：**本次解里缺少配置了的附加执行器**
+            #   （`capacity_nodes` 里有 `executor_id` 非空的记录，但 `result["assignments"]`
+            #   里没有它拿到层的段）。放开后**认真比较**两案，不盲目取 released：
+            #   优先级链见 `executor_coexistence.plan_rank`（admitted → 期望附加执行器
+            #   参与数 → 参与执行器总数 → 目标函数；打平保留 baseline，保证机制收敛）。
+            #
+            #   ⚠️ 不要放宽 `candidate_layer_ranges` 在求解器里的语义：它表达"我手上确实
+            #   有这个段"，是硬事实（`capacity.py` 有完整论证）。真正要动的是**释放时机**。
+            #   没有候选锁时不重解（释放后是同一个问题，白白多一次 DFS）。
+            from executor_coexistence import (
+                additional_executor_identities,
+                choose_plan,
+                executor_label,
+                has_candidate_locks,
+                missing_additional_executors,
+            )
+            expected_additional = additional_executor_identities(capacity_nodes or [])
+            missing_additional = (
+                missing_additional_executors(result, capacity_nodes or [])
+                if result.get("admitted") else set()
+            )
+            release_reason = ""
+            if not result.get("admitted"):
+                # 与既有行为一致：没有候选锁时"释放后求解"是同一个问题，不做无用重解。
+                release_reason = (
+                    "capacity" if has_candidate_locks(capacity_nodes or []) else ""
+                )
+            elif missing_additional and has_candidate_locks(capacity_nodes or []):
+                release_reason = "missing_additional_executors"
+            if release_reason:
                 released_nodes = [
                     {key: value for key, value in node.items()
                      if key != "candidate_layer_ranges"}
                     for node in capacity_nodes
                 ]
                 logger.info(
-                    "锁定的切点不再满足容量，放开候选约束重排: locked=%s",
+                    "锁定的切点需要放开候选约束重排: reason=%s locked=%s "
+                    "expected_additional=%s missing_additional=%s",
+                    release_reason,
                     [node.get("candidate_layer_ranges") for node in capacity_nodes or []],
+                    sorted(executor_label(item) for item in expected_additional),
+                    sorted(executor_label(item) for item in missing_additional),
                 )
-                result = solve_pipeline_capacity(
-                    descriptor,
-                    released_nodes,
-                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
-                    require_distributed=require_distributed,
-                    local_layer_budget=local_layer_budget,
-                    relay_claims=relay_claims,
-                    prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
-                )
+                # ★ 2026-10-27（B1 收尾）：**baseline 已可行时，released 求解的异常不能反过来
+                #   把整个计划打掉**。无解分支里 released 抛错本来也是失败（没有更好的结果）；
+                #   但"可行但缺少 CPU 段"分支里 baseline 是**好的**，若 released 因节点
+                #   记录问题抛 `PipelineCapacityError`，外层 except 会把 descriptor 判非法 ⇒
+                #   为了修"僵化布局"反而让本来能跑的布局失败。故此处单独兜住、保留 baseline。
+                released_result = None
+                try:
+                    released_result = solve_pipeline_capacity(
+                        descriptor,
+                        released_nodes,
+                        safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                        require_distributed=require_distributed,
+                        local_layer_budget=local_layer_budget,
+                        relay_claims=relay_claims,
+                        prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
+                    )
+                except PipelineCapacityError as exc:
+                    if not result.get("admitted"):
+                        raise
+                    logger.warning(
+                        "切点释放求解失败，保留 baseline: reason=%s detail=%s",
+                        release_reason, exc, exc_info=True,
+                    )
+                if released_result is not None and not result.get("admitted"):
+                    # 原行为：无解时采用 released（它可能仍无解，但诊断更接近真相）。
+                    result = released_result
+                elif released_result is not None:
+                    chosen, decision = choose_plan(
+                        result, released_result, expected_additional,
+                    )
+                    logger.info(
+                        "切点释放取优: decision=%s baseline_admitted=%s "
+                        "released_admitted=%s baseline_assignments=%s "
+                        "released_assignments=%s",
+                        decision, result.get("admitted"),
+                        released_result.get("admitted"),
+                        [(a.get("node_id"), a.get("executor_id", ""),
+                          a.get("start_layer"), a.get("end_layer"))
+                         for a in result.get("assignments", [])],
+                        [(a.get("node_id"), a.get("executor_id", ""),
+                          a.get("start_layer"), a.get("end_layer"))
+                         for a in released_result.get("assignments", [])],
+                    )
+                    if chosen is released_result:
+                        result = released_result
+                        # 下游契约/预检必须看到**实际参与求解**的那份节点记录
+                        # （released 版本没有候选锁），否则引擎回填仍按旧锁读。
+                        capacity_nodes = released_nodes
         except PipelineCapacityError as exc:
             # ★ 2026-10-23（#117）：把**具体**原因打出来。此前调用方只记
             #   reason_code，"描述器非法"到底是缺 total_layers、缺
@@ -3464,14 +3594,25 @@ class Scheduler(
         total_layers = len(layer_bytes)
         node_ids = {str(item.get("node_id", "")) for item in assignments}
         capacity_records = self._get_pipeline_capacity_nodes(node_ids)
+        # ★ 2026-10-27（审计 A7）：键必须是 `(node_id, executor_id)`。
+        #
+        #   同机可有多个执行器（主段 "" + CPU 段 "cpu"），它们**共用 `node_id`**。
+        #   此前用裸 `node_id` 建字典 ⇒ 后写入的 CPU 段记录覆盖主段 ⇒ 手写
+        #   "master 拿 `[0,8)`" 时会拿 CPU 段的额度／引擎／`layer_budget=[8,24)`
+        #   去校验主段 ⇒ 大概率被判 `pipeline_layer_range_coverage_insufficient`
+        #   或 `segment_mode` 不符；反过来也无法把某一段**指定给** CPU 执行器，
+        #   因为 assignment 里的 `executor_id` 从来没被读过。
+        #
+        #   手动分层是"用户明确指定每段给谁"的路径，正需要表达同机两段。
         records = {
-            item["node_id"]: item
+            (item["node_id"], str(item.get("executor_id") or "")): item
             for item in capacity_records
         }
         planned = []
         artifact_source_sha256 = ""
         for item in assignments:
             node_id = str(item.get("node_id", ""))
+            executor_id = str(item.get("executor_id") or "")
             start = int(item.get("start_layer", 0) or 0)
             end = int(item.get("end_layer", 0) or 0)
             if start < 0 or end <= start or end > total_layers:
@@ -3481,12 +3622,18 @@ class Scheduler(
                     "reason": f"node {node_id} has invalid range [{start},{end})",
                     "assignments": [],
                 }
-            record = records.get(node_id)
+            record = records.get((node_id, executor_id))
             if record is None:
+                # 兼容旧调用方：未写 `executor_id` 的手动方案仍然指向主执行器。
+                # 附加执行器**不**回退到主段记录 —— 那正是 A7 要消灭的串味。
+                if not executor_id:
+                    record = records.get(node_id)
+            if record is None:
+                label = f"{node_id}#{executor_id}" if executor_id else node_id
                 return {
                     "status": "rejected", "admitted": False,
                     "reason_code": "pipeline_capacity_manual_node_unavailable",
-                    "reason": f"node {node_id} has no usable capacity",
+                    "reason": f"node {label} has no usable capacity",
                     "assignments": [],
                 }
             local_cut = bool(
@@ -3603,6 +3750,16 @@ class Scheduler(
                         "layer_artifact",
                     )
                 }
+                | (
+                    # ★ 2026-10-27（审计 A7）：`executor_id` 必须进 plan_id。
+                    #   否则"master 主段 [0,8) + master#cpu [8,24)"与
+                    #   "master 主段 [0,8) + master#cpu 换成别的执行器"会得到**同一个**
+                    #   plan_id —— 同机两段的身份在签名里不可区分。
+                    #   **只在非空时加入**，这样既有拓扑（`executor_id == ""`）的
+                    #   plan_id 逐字节不变，不会让缓存/对比失效。
+                    {"executor_id": item.get("executor_id")}
+                    if str(item.get("executor_id") or "") else {}
+                )
                 for item in planned
             ],
         }

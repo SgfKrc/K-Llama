@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import math
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,37 @@ _FLOAT_DTYPES = frozenset({"F8_E4M3", "F8_E5M2", "F16", "BF16", "F32", "F64"})
 _COMPONENTS = (
     "layers", "embedding", "final_norm", "lm_head", "visual", "mtp", "multimodal", "other",
 )
+
+
+def _preferred_ranges_for(
+    preferred_ranges: Any, node_id: str, executor_id: str,
+) -> list[list[int]] | None:
+    """按**执行器身份**取复用偏好区间；旧裸 `node_id` 键只兼容主执行器。
+
+    ★ 2026-10-27（LOCAL-EXECUTORS-01 / A9）：复用偏好的语义是"**我手上确实有这个段**"
+    （本该是硬边界），而键此前只有 `node_id`。同机 CPU 段（`executor_id="cpu"`）与主段
+    共用 `node_id="master"`，于是：
+
+      * CPU 段永远**读不到**写给自己的偏好（`node_id in mapping` 命中的是主段键）；
+      * 主段还被显式判非法（`node_id == "master"` ⇒ `SUPPLY_PREFERRED_RANGE_INVALID`）
+        ⇒ 本机附加执行器无法表达"我手上确实有 `[8,24)`"。
+
+    现在的规则：
+      * 身份键 `(node_id, executor_id)` **优先**；
+      * 裸 `node_id` 键只在 `executor_id == ""`（主执行器）时生效 —— 它不能悄悄
+        落到附加执行器上（那会把主段的偏好当成 CPU 段的偏好）；
+      * 所以 `{"master": ...}` 仍指主段、仍判非法（保持既有语义），
+        而 `{("master", "cpu"): ...}` 是本机 CPU 段的**合法**偏好来源。
+    """
+    if not isinstance(preferred_ranges, Mapping):
+        return None
+    key = (node_id, executor_id)
+    if key in preferred_ranges:
+        return preferred_ranges[key]
+    if not executor_id:
+        return preferred_ranges.get(node_id)
+    return None
+
 
 
 class RuntimeCapacityProjectionError(PipelineModelDescriptorError):
@@ -386,7 +418,7 @@ def project_supply_capacity_nodes(
     descriptors: dict[str, dict], nodes: list[dict], *, master_engine: str,
     alignment: int = 1, safety_margin: float = 1.2,
     runtime_descriptors: dict[str, dict] | None = None,
-    preferred_ranges: dict[str, list[list[int]]] | None = None,
+    preferred_ranges: Mapping[Any, list[list[int]]] | None = None,
     runtime_host_ranges: dict[str, list[list[int]]] | None = None,
 ) -> tuple[dict, list[dict], dict[str, dict]]:
     """Project a new supply operation, never an executable ready advertisement.
@@ -714,16 +746,27 @@ def project_supply_capacity_nodes(
             #     master#cpu  候选数=7      ← 错！middle 段被 host 约束卡在首段
             if mapping is runtime_host_ranges and executor_id:
                 continue
-            if mapping is None or node_id not in mapping:
+            # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A9）：`preferred_ranges` 的键是
+            #   **执行器身份** `(node_id, executor_id)`；`runtime_host_ranges` 保持
+            #   既有裸 `node_id` 契约（它只作用于主执行器，见上一条 skip）。
+            if mapping is preferred_ranges:
+                spans = _preferred_ranges_for(mapping, node_id, executor_id)
+            elif mapping is None or node_id not in mapping:
+                spans = None
+            else:
+                spans = mapping[node_id]
+            if spans is None:
                 continue
-            spans = mapping[node_id]
             if (not isinstance(spans, list)
                     or any(not isinstance(span, list) or len(span) != 2
                            or any(type(value) is not int for value in span)
                            or not 0 <= span[0] < span[1] <= total
                            or span[1] - span[0] == total
                            or span[0] % alignment or span[1] % alignment for span in spans)
-                    or (mapping is preferred_ranges and (node_id == "master" or not spans))):
+                    # ★ A9：**只有主执行器**不能有复用偏好（它的切点每轮新裁）；
+                    #   同机的附加执行器是**合法**来源 —— 它手上确实有那份裁好的段。
+                    #   此前判据是 `node_id == "master"` ⇒ `(master, "cpu")` 也被拒。
+                    or (mapping is preferred_ranges and (is_primary_executor or not spans))):
                 fail(code, "Invalid explicit candidate range constraint")
             # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**两个 mapping 都是层空间，直接比较**。
             #
@@ -806,9 +849,13 @@ def project_supply_capacity_nodes(
         )
         # A preference is intentionally exact within this one candidate attempt;
         # the reuse owner may retry unrestricted if it makes admission impossible.
-        if preferred_ranges and node_id in preferred_ranges:
+        # ★ A9：键是执行器身份 —— 同机 CPU 段的 `[8,24)` 偏好此前永远落不到它头上
+        #   （`node_id in preferred_ranges` 命中的是主段键），于是"我手上确实有这段"
+        #   这个硬边界对附加执行器完全无法表达。
+        preferred_spans = _preferred_ranges_for(preferred_ranges, node_id, executor_id)
+        if preferred_spans:
             node["layer_ranges"] = [[start // alignment, end // alignment]
-                                    for start, end in preferred_ranges[node_id]]
+                                    for start, end in preferred_spans]
         by_id[identity] = {**copy.deepcopy(raw), "engine": engine, "overhead_bytes": overhead}
         projected.append(node)
     grouped = copy.deepcopy(reference)

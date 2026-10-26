@@ -79,8 +79,8 @@ def test_small_pt_head_rebalances_instead_of_locking_a_suboptimal_cached_tail():
     plan, calls = _select(case)
     assert plan["admitted"]
     assert _ranges(plan) == {"master": [0, 4], "surface": [4, 20], "android": [20, 32]}
-    assert calls == [{}, {"android": [[24, 32]], "surface": [[16, 24]]},
-                     {"surface": [[16, 24]]}, {"android": [[24, 32]]}]
+    assert calls == [{}, {("android", ""): [[24, 32]], ("surface", ""): [[16, 24]]},
+                     {("surface", ""): [[16, 24]]}, {("android", ""): [[24, 32]]}]
     assert plan["reuse_preferred_node_ids"] == []
     assert plan["target_preference"] == "unrestricted"
     fixed = plan_segment_supply(case[0], case[2], master_engine="pytorch", alignment=4,
@@ -244,8 +244,8 @@ def test_greedy_order_uses_actual_asset_bytes_and_is_deterministic():
     case[1][2]["layer_artifacts"][0]["layer_weight_bytes"] = [30] * 8
     plan, calls = _select(case)
     assert calls[0] == {}
-    assert calls[2] == {"android": [[24, 32]]}
-    assert calls[3] == {"surface": [[16, 24]]}
+    assert calls[2] == {("android", ""): [[24, 32]]}
+    assert calls[3] == {("surface", ""): [[16, 24]]}
     assert plan["reuse_preferred_node_ids"] == []
     reversed_case = (case[0], list(reversed(case[1])), case[2])
     reversed_plan, reversed_calls = _select(reversed_case)
@@ -332,3 +332,140 @@ def test_equal_quality_single_cached_range_still_gets_reused():
     assert plan["reuse_preferred_node_ids"] == ["android"]
     assert plan["target_preference"] == "greedy_fixed"
     assert len(calls) <= 4
+
+
+# ---------------------------------------------------------------------------
+# 同机附加执行器（LOCAL-EXECUTORS-01 / 审计 A8 + B1）
+# ---------------------------------------------------------------------------
+def _cpu_reuse_case(master_capacity=645):
+    """master 主段 + 本机 CPU 段（`executor_id="cpu"`）+ android 尾段。
+
+    CPU 段与主段**共用 `node_id="master"`**，这是 A8 的目标形态：`_Candidate`、
+    `engine_by_node`、`_preserves` 三处都必须按 `(node_id, executor_id)` 区分，
+    否则本机那份已验证的 GGUF 段永远进不了复用候选 / 方案恒被判不保留。
+    """
+    descriptors, records, nodes = _case(master_capacity=master_capacity)
+    del nodes[1]
+    del records[1]  # 去掉 surface，只留 master 主段 + android 尾段
+    sizes = descriptors["llama_cpp"]["layer_weight_bytes"]
+    cpu_node = {"node_id": "master", "executor_id": "cpu", "role": "master",
+                "engine": "llama_cpp", "capacity_bytes": 1000, "reserve_bytes": 1,
+                "runtime_multiplier": 1.0, "score": 100}
+    nodes.append(cpu_node)
+    cpu_record = copy.deepcopy(cpu_node)
+    cpu_record.update(
+        layer_ranges=[[8, 24]],
+        layer_artifacts=[{
+            "layer_range": [8, 24], "segment_mode": "middle", "model_id": "mid8-24.gguf",
+            "artifact_sha256": "e" * 64, "source_model_id": SOURCE_ID,
+            "source_model_sha256": SOURCE_SHA, "tokenizer_sha256": TOKENIZER_SHA,
+            "hidden_size": 16, "layer_weight_bytes": sizes[8:24],
+        }],
+        models=[{"model_id": "mid8-24.gguf", "sha256": "e" * 64,
+                 "engine": "llama_cpp", "format": "gguf", "revision": "local"}],
+    )
+    records.append(cpu_record)
+    return descriptors, records, nodes
+
+
+def _cpu_engines(nodes):
+    return {(node["node_id"], str(node.get("executor_id") or "")): node["engine"]
+            for node in nodes}
+
+
+def _segment(node_id, executor_id, engine, start, end):
+    item = {"node_id": node_id, "engine": engine, "start_layer": start, "end_layer": end}
+    if executor_id:
+        item["executor_id"] = executor_id
+    return item
+
+
+def test_candidates_include_the_local_cpu_executor_artifact():
+    """A8 问题 2：`_candidates` 不能再按 `node_id == "master"` 跳过本机 CPU 段。"""
+    from model_supply_plan_reuse import _candidates
+    descriptors, records, nodes = _cpu_reuse_case()
+    candidates, total = _candidates(
+        descriptors, records, nodes, source_model_id=SOURCE_ID,
+        source_model_sha256=SOURCE_SHA, tokenizer_sha256=TOKENIZER_SHA,
+        engine_by_node=_cpu_engines(nodes), capabilities_by_node=None, alignment=4,
+    )
+    assert total == 32
+    assert any((item.node_id, item.executor_id, item.start, item.end)
+               == ("master", "cpu", 8, 24) for item in candidates)
+
+
+def test_local_cpu_segment_is_reused_by_executor_identity():
+    """A8 问题 1 + 3：`master` 出现两次合法、引擎按执行器取、偏好键是身份元组。"""
+    descriptors, records, nodes = _cpu_reuse_case()
+    objective = {"node_count": 3, "weighted_work_cost": 1.0,
+                 "memory_pressure_cost": 2.0, "score_total": 3.0}
+    policy = {"prefer_all_workers": True, "work_basis": "x", "objective": "y"}
+    common = {"admitted": True, "placement_policy": policy,
+              "placement_objective": objective}
+    baseline = {**copy.deepcopy(common), "assignments": [
+        _segment("master", "", "pytorch", 0, 8),
+        _segment("master", "cpu", "llama_cpp", 8, 16),
+        _segment("android", "", "llama_cpp", 16, 32),
+    ]}
+    pinned = {**copy.deepcopy(common), "assignments": [
+        _segment("master", "", "pytorch", 0, 8),
+        _segment("master", "cpu", "llama_cpp", 8, 24),
+        _segment("android", "", "llama_cpp", 24, 32),
+    ]}
+    calls = []
+
+    def planner(*, preferred_ranges, release_candidates=False):
+        calls.append(copy.deepcopy(preferred_ranges))
+        return copy.deepcopy(pinned if preferred_ranges else baseline)
+
+    plan = plan_segment_supply_reuse(
+        descriptors, records, nodes, planner=planner,
+        source_model_id=SOURCE_ID, source_model_sha256=SOURCE_SHA,
+        tokenizer_sha256=TOKENIZER_SHA, engine_by_node=_cpu_engines(nodes),
+        alignment=4,
+    )
+    assert plan["admitted"] and plan["target_preference"] == "joint_fixed"
+    assert plan["reuse_preferred_node_ids"] == ["android", "master#cpu"]
+    assert calls[0] == {}
+    assert calls[1] == {("android", ""): [[24, 32]],
+                        ("master", "cpu"): [[8, 24]]}
+
+
+def test_missing_local_executor_releases_stale_locks_and_is_chosen():
+    """B1：baseline 可行但缺少配置了的 CPU 段 ⇒ 放开陈旧切点锁并取优。"""
+    descriptors, records, nodes = _cpu_reuse_case()
+    # 模拟上一轮供给写下的切点锁（两段恰好占满 [0,32)）。
+    for record in records:
+        if record.get("executor_id"):
+            continue
+        record["candidate_layer_ranges"] = (
+            [[0, 4]] if record["node_id"] == "master" else [[4, 8]])
+    objective = {"node_count": 3, "weighted_work_cost": 9.0,
+                 "memory_pressure_cost": 9.0, "score_total": 1.0}
+    baseline = {"admitted": True, "placement_objective": objective, "assignments": [
+        _segment("master", "", "pytorch", 0, 16),
+        _segment("android", "", "llama_cpp", 16, 32),
+    ]}
+    released = {"admitted": True, "placement_objective": objective, "assignments": [
+        _segment("master", "", "pytorch", 0, 8),
+        _segment("master", "cpu", "llama_cpp", 8, 24),
+        _segment("android", "", "llama_cpp", 24, 32),
+    ]}
+    calls = []
+
+    def planner(*, preferred_ranges, release_candidates=False):
+        calls.append((copy.deepcopy(preferred_ranges), release_candidates))
+        return copy.deepcopy(released if release_candidates else baseline)
+
+    plan = plan_segment_supply_reuse(
+        descriptors, records, nodes, planner=planner,
+        source_model_id=SOURCE_ID, source_model_sha256=SOURCE_SHA,
+        tokenizer_sha256=TOKENIZER_SHA, engine_by_node=_cpu_engines(nodes),
+        alignment=4,
+    )
+    assert calls[0] == ({}, False)
+    assert calls[1] == ({}, True)
+    assert plan["target_preference"] == "released_candidates"
+    assert [(item["node_id"], item.get("executor_id", ""))
+            for item in plan["assignments"]] == [
+        ("master", ""), ("master", "cpu"), ("android", "")]

@@ -702,7 +702,35 @@ def save_local_conversation_turn(
     return True
 
 
-def load_local_conversation(session_id: str, limit: int = 200) -> list[dict]:
+def _default_context_messages() -> int:
+    """对话窗口条数 —— 与 `chat_context.default_context_messages()` 同源。
+
+    ★ 2026-10-27（#122）：这里原本是签名里的硬编码 `limit: int = 200`。
+    它和 `chat_context.DEFAULT_CONTEXT_MESSAGES` 是**两个各自独立的 200**，
+    而 `api_server` 调本函数时又不传 `limit` ⇒ 改任何一处都不生效
+    （正是 #122 记的"历史累积缺少独立性能归因"里"窗口调不动"的那一半）。
+
+    现在统一读 `QLH_CHAT_CONTEXT_MESSAGES`；本模块已经依赖 `config` 的
+    `STATE_DIR`/`LOG_DIR`，再加这一项不引入新的分层耦合。
+    """
+    try:
+        from config import CHAT_CONTEXT_MESSAGES
+    except Exception:
+        return 200
+    try:
+        return max(2, int(CHAT_CONTEXT_MESSAGES))
+    except (TypeError, ValueError):
+        return 200
+
+
+def load_local_conversation(session_id: str, limit: int | None = None) -> list[dict]:
+    """按时间顺序读出某个会话最近 `limit` 条消息。
+
+    `limit=None` ⇒ 用 `QLH_CHAT_CONTEXT_MESSAGES`（缺省 200，与既有行为一致）；
+    显式传值仍以传入为准，便于测试钉死窗口。
+    """
+    if limit is None:
+        limit = _default_context_messages()
     connection = _connect()
     try:
         rows = connection.execute(
