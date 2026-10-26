@@ -141,9 +141,25 @@ class ModelIntentCoordinator:
         # Inventory candidates are not necessarily participants in the admitted
         # plan. Project only assigned nodes once the supply owner publishes it;
         # a global ready phase must never promote an unused candidate to ready.
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**视图键要包含执行器身份**。
+        #
+        #   供给侧的部署视图按执行器分条目：主执行器是裸 `node_id`，附加执行器是
+        #   `node_id#executor_id`（同机 CPU 段就是 `master#cpu`）。这里此前只按裸
+        #   `node_id` 过滤 ⇒ 附加执行器被整条丢掉。实测（2026-10-26 08:03，
+        #   `event=supply_view_publish`）：
+        #     view_key=master#cpu  keys=['TABLET','android','master','master#cpu']  ← 写入成功
+        #   而 `intent.nodes` 只有三条 ⇒ 过滤发生在本层，不是写入失败。
+        #   两种键都接受，保持既有客户端契约不变。
         plan = supply.get("plan") or {}
-        assigned = {item.get("node_id") for item in plan.get("assignments", [])
-                    if isinstance(item, dict) and isinstance(item.get("node_id"), str)}
+        assigned: set[str] = set()
+        for item in plan.get("assignments", []):
+            if not isinstance(item, dict) or not isinstance(item.get("node_id"), str):
+                continue
+            node_key = item["node_id"]
+            assigned.add(node_key)
+            executor_id = item.get("executor_id")
+            if isinstance(executor_id, str) and executor_id:
+                assigned.add(f"{node_key}#{executor_id}")
         if plan.get("admitted") is True and assigned:
             result["nodes"] = {node_id: node for node_id, node in result.get("nodes", {}).items()
                                if node_id in assigned}

@@ -137,6 +137,18 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
           item.get("candidate_layer_ranges"), bool(item.get("layer_budget")))
          for item in projected],
     )
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**逐区间精确报价是否生成**。CPU 段按工件实测
+    #   层宽报价（`range_weight_bytes`）与按源描述符层宽报价，数值差 3-4 倍，而两者在
+    #   日志里都只表现为一个 `required_bytes` —— 不看这个字段无法区分是"报价没生成"
+    #   还是"报价生成了但没被采用"。
+    logger.info(
+        "event=supply_range_quotes %s",
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          len(item.get("range_weight_bytes") or ()),
+          (item.get("range_weight_bytes") or [{}])[0].get("weight_bytes")
+          if item.get("range_weight_bytes") else None)
+         for item in projected],
+    )
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
                                     require_distributed=True, prefer_all_workers=prefer_all_workers,
                                     required_node_id="master")
@@ -1539,9 +1551,24 @@ class ModelSupplyCoordinator:
         with self._condition:
             self._check(op_id)
             self._check_receivers(op_id)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**传输身份与视图身份是两回事**。
+            #
+            #   * 连接/回执按**物理机**去重 —— 同机两段（主段 + 本机 CPU 段）共用**一个**
+            #     TCP 连接与一条回执通道，所以这里用裸 `node_id` 是对的。
+            #   * 部署视图按**执行器**分开 —— 同机两段各自成条，否则下面那行过滤会把
+            #     `master#cpu` 整个丢掉。实测（2026-10-26 07:40）：`plan` 里四段齐全、
+            #     磁盘上 `master/` 也确实有两个 segment 目录，但 intent 的 `nodes` 只有
+            #     三条 ⇒ 并存无法从对外视图确认。
+            #
+            #   此前一个 `assigned` 同时干这两件事，于是视图被按物理机过滤。
             assigned = {item["node_id"] for item in plan["assignments"]}
+            assigned_view_keys = {
+                item["node_id"] if not item.get("executor_id")
+                else f"{item['node_id']}#{item['executor_id']}"
+                for item in plan["assignments"]
+            }
             candidate_node_ids = sorted(nodes)
-            nodes = {node_id: value for node_id, value in nodes.items() if node_id in assigned}
+            nodes = {key: value for key, value in nodes.items() if key in assigned_view_keys}
             # Inventory candidates are observations. Once placement is published,
             # only its executors own connection/receipt obligations.
             for key in list(self._connections):
@@ -1603,6 +1630,15 @@ class ModelSupplyCoordinator:
                                    "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
                                    "transfer_granularity": "segment_tensors", "engine": assignment["engine"],
                                    "executor_id": executor_id, "node_id": node_id}
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：留痕「视图里到底有哪些键」。
+                #   同机两段的并存只有在**对外视图**里也能看到时才算可验证；此前
+                #   `plan` 四段齐全、磁盘上 `master/` 也确实有两个 segment 目录，
+                #   但 intent 的 `nodes` 只有三条，无从确认。这一行把每次发布的键集合
+                #   打出来，才能分清是"没写进去"还是"写进去又被覆盖"。
+                logger.info(
+                    "event=supply_view_publish op=%s view_key=%s keys=%s",
+                    op_id, view_key, sorted(nodes),
+                )
                 self._update(op_id, nodes=nodes, status="supplying")
             # ★ 同上：**"本机"是主执行器的性质，不是 `node_id` 的性质**。本机 CPU 段
             #   （llama.cpp）虽然也在 master 上，但它的权重**就地常驻**、由它自己的

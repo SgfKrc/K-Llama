@@ -1157,8 +1157,13 @@ def solve_pipeline_capacity(
             return (max(_calibrated) / _cost_reference) if _calibrated else 1.0
         return float(cost) / _cost_reference
 
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**按执行器身份索引**。同机 CPU 段与主段共用
+    #   `node_id="master"`，用裸 `node_id` 做 key 会让两者的精确区间报价**互相覆盖**
+    #   （后写的胜出）⇒ 一个执行器被按另一个的权重尺寸计费。这与本轮在 `checks`
+    #   （已修）是同一个模式：凡是以 `node_id` 为唯一身份的地方，同机两段就会串味。
     range_quotes = {
-        node["node_id"]: {quote["layer_range"]: quote for quote in node["range_weight_bytes"]}
+        (node["node_id"], str(node.get("executor_id") or "")):
+            {quote["layer_range"]: quote for quote in node["range_weight_bytes"]}
         for node in usable if "range_weight_bytes" in node
     }
     if range_quotes:
@@ -1368,8 +1373,9 @@ def solve_pipeline_capacity(
                     exclude(node, cursor, end, "node_load_spec_components_mismatch")
                     continue
             range_quote = None
-            if node["node_id"] in range_quotes:
-                range_quote = range_quotes[node["node_id"]].get((cursor, end))
+            _identity = (node["node_id"], str(node.get("executor_id") or ""))
+            if _identity in range_quotes:
+                range_quote = range_quotes[_identity].get((cursor, end))
                 if range_quote is None:
                     exclude(node, cursor, end, "node_range_weight_quote_missing")
                     continue
@@ -1681,15 +1687,15 @@ def solve_pipeline_capacity(
                 **artifact,
                 "layer_range": list(artifact["layer_range"]),
             }
-        if node["node_id"] in range_quotes:
-            quote = range_quotes[node["node_id"]][(start, end)]
+        if (node["node_id"], str(node.get("executor_id") or "")) in range_quotes:
+            quote = range_quotes[(node["node_id"], str(node.get("executor_id") or ""))][(start, end)]
             assignment["range_weight_quote"] = {**quote, "layer_range": [start, end]}
         assignments.append(assignment)
 
     selected_layer_bytes = 0
     for index, start, end, raw, _, embedding, lm_head, artifact_index in solved:
         node = usable[index]
-        if node["node_id"] in range_quotes:
+        if (node["node_id"], str(node.get("executor_id") or "")) in range_quotes:
             artifact = node["layer_artifacts"][artifact_index] if artifact_index is not None else {}
             sizes = artifact.get("layer_weight_bytes")
             if sizes is None:
@@ -1755,8 +1761,8 @@ def solve_pipeline_capacity(
             full_bytes = sum(node["layer_weight_bytes"]) + node.get(
                 "retained_component_bytes", embedding_bytes + per_node_bytes + output_bytes,
             )
-        if node["node_id"] in range_quotes:
-            full_quote = range_quotes[node["node_id"]].get((0, total_layers))
+        if (node["node_id"], str(node.get("executor_id") or "")) in range_quotes:
+            full_quote = range_quotes[(node["node_id"], str(node.get("executor_id") or ""))].get((0, total_layers))
             if (full_quote is None or not full_quote["has_embedding"]
                     or not full_quote["has_lm_head"]):
                 continue

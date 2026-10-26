@@ -522,12 +522,54 @@ def project_supply_capacity_nodes(
             if spec is not None and quoted_dtype is not None and spec.dtype != quoted_dtype:
                 fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID", "Layer offload dtype disagrees with its header projection")
         components = source.get("component_weight_bytes") or {}
-        keys = (("embedding", "final_norm", "lm_head", "other")
-                if engine == "llama_cpp" or node_id != "master"
-                else ("embedding", "final_norm", "other"))
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**边界单元预留取决于该段实际持有哪个边界单元，
+        #   而不是引擎**。
+        #
+        #   此前判据是 `engine == "llama_cpp" or node_id != "master"` ⇒ 只要引擎是 llama_cpp
+        #   就预留**全部四项**（embedding + final_norm + lm_head + other）。本机 CPU 段是
+        #   `middle` 段、只有 `final_norm` 是常驻的，却也被要求连 embedding 和 lm_head
+        #   一起预留：
+        #       实测 reserve = 5.42(配置) + 4.88(boundary) = 10.3 GB
+        #       ⇒ 可用额度从 14.26 GB 被压到 **3.96 GB**
+        #       ⇒ 它被误判为"连 4 层都装不下"（`node_capacity_insufficient`）
+        #   正确判据是 `segment_mode`：head 持有 embedding、tail 持有 lm_head、
+        #   middle 两者都没有。`segment_mode` 缺失时（比如主段）保留原有的保守行为。
+        mode = str(node.get("segment_mode") or "")
+        if mode == "head":
+            keys = ("embedding", "final_norm", "other")
+        elif mode == "tail":
+            keys = ("final_norm", "lm_head", "other")
+        elif mode == "middle":
+            keys = ("final_norm",)
+        else:
+            keys = (("embedding", "final_norm", "lm_head", "other")
+                    if engine == "llama_cpp" or node_id != "master"
+                    else ("embedding", "final_norm", "other"))
         if any(type(components.get(key, 0)) is not int or components.get(key, 0) < 0 for key in keys):
             fail("SUPPLY_CAPACITY_INVALID", "Invalid boundary byte quote")
         overhead = sum(components.get(key, 0) for key in keys)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**先取出本机工件的真实每层字节，再 pop**。
+        #
+        #   `layer_budget` 由 scheduler 的 `_local_cpu_executor_record` 依**裁好的 GGUF
+        #   工件**推导（文件大小 ÷ 它覆盖的层数，实测 `mid8-24.gguf` = 3.23 GB / 16 层
+        #   = 216622794 B/层），是这一段的权威尺寸。下面必须 pop 掉 `layer_budget`
+        #   （求解器不认这个字段），但一旦 pop，`else` 分支就只能退回**源描述符**的层宽
+        #   （fp16 整模 0.28 GB/层 × multiplier 2.0 × margin 1.2）。
+        #
+        #   后者对"权重常驻主机、就地计算"的本机 CPU 段是**系统性高估**：
+        #   实测（2026-10-26 06:47，`capacity_diagnostic`）
+        #     master (llama_cpp/cpu): 层段 [12,24) 预算 22756441396，可用 14264373902，
+        #                             缺口 8492067494
+        #   反推每层 ~0.6 GB，是工件真实值（0.207 GB）的近 3 倍
+        #   ⇒ **它永远装不下自己明明握着的段** ⇒ 部署永远到不了 `ready`。
+        artifact_layer_bytes = 0
+        _layer_budget = node.get("layer_budget")
+        if isinstance(_layer_budget, dict):
+            _per_layer = _layer_budget.get("per_layer_bytes")
+            if type(_per_layer) is int and _per_layer > 0:
+                artifact_layer_bytes = _per_layer
+        # 本机 CPU 段（keep-head GGUF）没有 embedding / lm_head，只有 final_norm 是常驻的。
+        _per_node_component_bytes = components.get("final_norm", 0)
         for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models", "range_weight_bytes"):
             node.pop(key, None)
         # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**"必须以 0 开头"是主执行器的性质，不是
@@ -632,6 +674,28 @@ def project_supply_capacity_nodes(
             overhead = 0
         else:
             boundary_reserve = math.ceil(overhead * multiplier * safety_margin)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**用本机工件的真实层宽生成精确区间报价**。
+            #
+            #   默认路径（`prefix[end] - prefix[cursor]`）用的是**源描述符**的逐层字节，
+            #   对持有量化 GGUF 的执行器是系统性高估。这里按工件实测尺寸给每个候选区间
+            #   报一个精确值，走求解器的 `range_quotes` 优先通道
+            #   （`capacity.py`：命中 `range_quote` 时 `raw_bytes = range_quote["weight_bytes"]`，
+            #   不再叠加 `prefix` 的源层宽）。
+            #
+            #   报价构成与 `else` 分支的既有算法保持一致：
+            #         raw_bytes = Σ(该区间的逐层字节) + final_norm
+            #   本机 CPU 段是 `middle` 段，没有 embedding / lm_head，只有 final_norm 常驻。
+            if artifact_layer_bytes > 0:
+                node["range_weight_bytes"] = [
+                    {
+                        "layer_range": [start // alignment, end // alignment],
+                        "weight_bytes": artifact_layer_bytes * (end - start)
+                                         + _per_node_component_bytes,
+                        "has_embedding": start == 0,
+                        "has_lm_head": end == total,
+                    }
+                    for start, end in candidates
+                ]
         node.update(
             engine=engine, role="master" if node_id == "master" else "client",
             layer_weight_bytes=sizes, runtime_multiplier=float(multiplier),
