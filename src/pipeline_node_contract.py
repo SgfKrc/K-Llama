@@ -461,10 +461,42 @@ def validate_pipeline_nodes(
     )
 
 
+def _layout_metadata_for(
+    metadata: Mapping[Any, Mapping[str, Any]] | None,
+    node_id: str,
+    executor_id: str,
+) -> Mapping[str, Any]:
+    """按**完整执行器身份** `(node_id, executor_id)` 取布局元数据。
+
+    ★ 2026-10-27（审计 §9.4 #4）：同机主执行器与附加执行器共用 `node_id`，旧写法
+    `metadata.get(node_id)` 让**附加执行器静默读到主执行器的属性**。实测（2026-10-27
+    纯计算复现，布局 `master#"" + master#cpu + worker`）：候选里 `master#cpu` 的
+    `artifact_kind` 被判成 `safetensors_assignment`（应为 `gguf_segment`），
+    `kind`/`engine`/`federated`/`handoff_at` 同样按主段填 —— 这是 A1
+    （`scheduler._attach_pipeline_node_contract` 用裸 `node_id` 建 engines 表 ⇒
+    主段被盖上 CPU 段引擎）在 reshard 路径的**镜像**：同一个键，反方向的串味。
+
+    **回退只允许主执行器**：旧调用方（`scheduler._pipeline_node_metadata()`、既有
+    测试夹具）传的映射以裸 `node_id` 为键，它描述的本来就只是该物理节点的
+    **主**执行器。附加执行器若回退到裸键，等于又把主段的属性借给 CPU 段 ——
+    正是要消灭的串味。附加执行器宁可拿空 meta（下游按其 assignment 的
+    `engine`/`role` 推导），也不要拿错的那份。
+    """
+    values = metadata if isinstance(metadata, Mapping) else {}
+    entry = values.get((node_id, str(executor_id or "")))
+    if isinstance(entry, Mapping):
+        return entry
+    if not executor_id:
+        legacy = values.get(node_id)
+        if isinstance(legacy, Mapping):
+            return legacy
+    return {}
+
+
 def pipeline_layout_from_capacity_plan(
     plan: Mapping[str, Any],
     *,
-    node_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+    node_metadata: Mapping[Any, Mapping[str, Any]] | None = None,
     default_engine: str = "pytorch",
 ) -> PipelineLayout:
     """Map an admitted ``solve_pipeline_capacity`` result into this contract."""
@@ -482,7 +514,12 @@ def pipeline_layout_from_capacity_plan(
         if not isinstance(assignment, Mapping):
             raise PipelineNodeContractError("capacity assignment must be an object")
         node_id = str(assignment.get("node_id", "") or "")
-        meta = dict(metadata.get(node_id, {}))
+        # ★ 2026-10-27（审计 §9.4 #4）：身份是 `(node_id, executor_id)` —— 同机两段
+        #   共用一个 `node_id`，裸键会让附加执行器读到主段的 `kind`/`engine`/
+        #   `artifact_kind`。回退语义（旧裸键只对主执行器生效）见
+        #   `_layout_metadata_for()`。
+        executor_id = str(assignment.get("executor_id") or "")
+        meta = dict(_layout_metadata_for(metadata, node_id, executor_id))
         start = _non_negative_int(assignment.get("start_layer", 0), "start_layer")
         end = _non_negative_int(assignment.get("end_layer", 0), "end_layer")
         is_local = bool(meta.get(
@@ -551,7 +588,8 @@ def pipeline_layout_from_capacity_plan(
             #   实测（2026-10-26 10:05）：容量求解已经给出
             #     [('master','',0,8), ('master','cpu',8,24), ('android',...), ('TABLET',...)]
             #   却死在布局契约上。缺省 "" ⇒ 与旧的"node_id 唯一"逐位等价。
-            executor_id=str(assignment.get("executor_id") or ""),
+            #   复用上面的局部变量，避免与 `meta` 查找的身份来源再次分叉。
+            executor_id=executor_id,
         ))
     annotated: list[PipelineNode] = []
     previous_engine = ""
@@ -562,6 +600,22 @@ def pipeline_layout_from_capacity_plan(
                 node,
                 cross_engine=True,
                 handoff_at=node.layer_range[0],
+            )
+        elif node.kind == "cross_framework" or node.cross_engine:
+            # ★ 2026-10-27（审计 §9.4 #4 的必然联动）：meta 里的 `kind`/`cross_engine`
+            #   描述的是**旧布局**。同机 CPU 段原本接在主段（PyTorch）之后 ⇒ 是
+            #   跨框架接力；主执行器退场后它成了**首段**，前面没有任何段 ⇒ 接力和
+            #   交接点都不存在了。若不跟着降级，就会留下"kind=cross_framework 但
+            #   handoff_at 已被重算掉"的自相矛盾节点，被契约直接拒绝 ——
+            #   实测（2026-10-27，`failed={("master","")}`，CPU 段成为首段）：
+            #   `pipeline_reshard_input_invalid: cross_framework node requires an
+            #   explicit handoff_at` / `handoff_at must be a pipeline node boundary`。
+            #   kind / cross_engine / handoff_at 三者必须与"引擎序列"同源。
+            node = replace(
+                node,
+                kind="local" if node.location == "local" else "remote_pipeline",
+                cross_engine=False,
+                handoff_at=None,
             )
         annotated.append(node)
         previous_engine = node.engine

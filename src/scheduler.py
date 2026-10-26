@@ -389,9 +389,26 @@ def _local_cpu_layer_artifacts(records) -> list:
         if source_sha:
             break
     if not source_sha or not model_id:
+        # ★ 2026-10-27（审计 §9.4 #6）：**静默不可复用是最难查的形态**。
+        #
+        #   这里返回 `[]` 意味着本机 CPU 段的 `[start,end)` 这十几层在求解器的
+        #   整模视图里**仍然是 0 字节** ⇒ 要么 `pipeline_capacity_descriptor_invalid`
+        #   （描述器缺层），要么 CPU 段直接进不了候选。两种表现的现场症状都离
+        #   "因为远端工件没带 source_model_id"很远，只能靠翻代码猜。
+        #   加一条警告，把"缺哪一项、为什么缺"直接说出来。
+        logger.warning(
+            "event=local_cpu_layer_artifacts_unavailable have_source_sha=%s "
+            "have_model_id=%s executor_id=%s hint=远端工件需同时带 "
+            "source_model_sha256 与 model_id（同一次供给同源）",
+            bool(source_sha), bool(model_id), "cpu",
+        )
         return []
     artifact_sha = _local_cpu_artifact_sha256()
     if not artifact_sha:
+        logger.warning(
+            "event=local_cpu_layer_artifacts_unavailable reason=artifact_digest_missing "
+            "hint=QLH_LAYER_GGUF 指向的裁层工件不存在或不可读",
+        )
         return []
     start, end = int(layer_range[0]), int(layer_range[1])
     if end <= start:
@@ -2711,49 +2728,52 @@ class Scheduler(
                  and not item.get("executor_id")), None)
             if base_record is not None:
                 cpu_record = self._local_cpu_executor_record(base_record)
-                records.append(cpu_record)
-                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**申报本段工件**。
-                #   descriptor 的整模逐层字节只覆盖 master 段，其余靠
-                #   `_merge_source_layer_bytes` 从各节点 `layer_artifacts` 补；
-                #   CPU 段不申报 ⇒ 它那 16 层永远是 0 ⇒ prepare 报
-                #   `every decoder layer must have a positive byte count`。
-                #   源身份取自同一批 records 里远端已申报的工件（同源）。
-                _cpu_artifacts = _local_cpu_layer_artifacts(records)
-                if _cpu_artifacts:
-                    cpu_record["layer_artifacts"] = _cpu_artifacts
-                    # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 前置）：**本机 CPU 段的物理
-                    #   模型证据**。复用候选要求"引擎/格式/摘要都对得上"（
-                    #   `model_supply_plan_reuse._model_matches`），而这份记录此前没有
-                    #   `models` ⇒ `_candidates` 即使按 `(node_id, executor_id)` 放行，
-                    #   也会在"物理身份不可证"处被拒 ⇒ CPU 段的已验证 GGUF 段仍进不了
-                    #   复用候选（现场表现就是"配了 CPU 段，供给每轮还是不用它"）。
-                    #   `sha256` 用**本段工件自己的摘要**（不是远端那段），`model_id`
-                    #   与 `layer_artifacts[0]` 保持一致，两者才能配对。
-                    cpu_record["models"] = [{
-                        "model_id": _cpu_artifacts[0]["model_id"],
-                        "sha256": _cpu_artifacts[0]["artifact_sha256"],
-                        "engine": "llama_cpp",
-                        "format": "gguf",
-                        "revision": "local",
-                    }]
-                    logger.info(
-                        "event=local_cpu_executor_artifact_declared "
-                        "layer_range=%s layers=%s per_layer_bytes=%s "
-                        "source=%s artifact_sha256=%s",
-                        _cpu_artifacts[0]["layer_range"],
-                        len(_cpu_artifacts[0]["layer_weight_bytes"]),
-                        _cpu_artifacts[0]["layer_weight_bytes"][0]
-                        if _cpu_artifacts[0]["layer_weight_bytes"] else 0,
-                        _cpu_artifacts[0]["source_model_sha256"][:12],
-                        _cpu_artifacts[0]["artifact_sha256"][:12],
-                    )
-                else:
-                    # 缺源身份或工件摘要 ⇒ 补齐会失败，宁可现在就喊出来。
-                    logger.warning(
-                        "event=local_cpu_executor_artifact_missing reason=%s",
-                        "no-source-identity" if not _cpu_artifacts
-                        else "unknown",
-                    )
+                # `None` = 缺工件边界（未配 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`）
+                # ⇒ fail-closed，不申报这一执行器（理由见该函数内的注释）。
+                if cpu_record is not None:
+                    records.append(cpu_record)
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**申报本段工件**。
+                    #   descriptor 的整模逐层字节只覆盖 master 段，其余靠
+                    #   `_merge_source_layer_bytes` 从各节点 `layer_artifacts` 补；
+                    #   CPU 段不申报 ⇒ 它那 16 层永远是 0 ⇒ prepare 报
+                    #   `every decoder layer must have a positive byte count`。
+                    #   源身份取自同一批 records 里远端已申报的工件（同源）。
+                    _cpu_artifacts = _local_cpu_layer_artifacts(records)
+                    if _cpu_artifacts:
+                        cpu_record["layer_artifacts"] = _cpu_artifacts
+                        # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 前置）：**本机 CPU 段的物理
+                        #   模型证据**。复用候选要求"引擎/格式/摘要都对得上"（
+                        #   `model_supply_plan_reuse._model_matches`），而这份记录此前没有
+                        #   `models` ⇒ `_candidates` 即使按 `(node_id, executor_id)` 放行，
+                        #   也会在"物理身份不可证"处被拒 ⇒ CPU 段的已验证 GGUF 段仍进不了
+                        #   复用候选（现场表现就是"配了 CPU 段，供给每轮还是不用它"）。
+                        #   `sha256` 用**本段工件自己的摘要**（不是远端那段），`model_id`
+                        #   与 `layer_artifacts[0]` 保持一致，两者才能配对。
+                        cpu_record["models"] = [{
+                            "model_id": _cpu_artifacts[0]["model_id"],
+                            "sha256": _cpu_artifacts[0]["artifact_sha256"],
+                            "engine": "llama_cpp",
+                            "format": "gguf",
+                            "revision": "local",
+                        }]
+                        logger.info(
+                            "event=local_cpu_executor_artifact_declared "
+                            "layer_range=%s layers=%s per_layer_bytes=%s "
+                            "source=%s artifact_sha256=%s",
+                            _cpu_artifacts[0]["layer_range"],
+                            len(_cpu_artifacts[0]["layer_weight_bytes"]),
+                            _cpu_artifacts[0]["layer_weight_bytes"][0]
+                            if _cpu_artifacts[0]["layer_weight_bytes"] else 0,
+                            _cpu_artifacts[0]["source_model_sha256"][:12],
+                            _cpu_artifacts[0]["artifact_sha256"][:12],
+                        )
+                    else:
+                        # 缺源身份或工件摘要 ⇒ 补齐会失败，宁可现在就喊出来。
+                        logger.warning(
+                            "event=local_cpu_executor_artifact_missing reason=%s",
+                            "no-source-identity" if not _cpu_artifacts
+                            else "unknown",
+                        )
                 # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**两段分摊同一份主机内存总账**，
                 #   且必须**幂等**。域校验按主机内存记账（见 `capacity_domains`），若两段
                 #   都按整机申报 ⇒ 之和超总账 ⇒ `pipeline_capacity_domain_exceeded`
@@ -2786,7 +2806,7 @@ class Scheduler(
         return records
 
     @staticmethod
-    def _local_cpu_executor_record(base_record: dict) -> dict:
+    def _local_cpu_executor_record(base_record: dict) -> Optional[dict]:
         """由**主执行器**记录派生出**本机 CPU 执行器**记录（同 node_id，不同 executor_id）。
 
         ★ 2026-10-25（LOCAL-EXECUTORS-01）。抽成纯函数有两个理由：一是它承载了本票最
@@ -2840,11 +2860,26 @@ class Scheduler(
         if layer_range is not None:
             record["layer_ranges"] = [[int(layer_range[0]), int(layer_range[1])]]
         else:
+            # ★ 2026-10-27（审计 §9.4 #6）：**缺工件边界就不该产出这条记录**。
+            #
+            #   此前只打一条 warning 就继续产出，于是这条 CPU 记录**没有
+            #   `layer_ranges`、也没有 `layer_budget.min_layer/max_layer`**
+            #   ⇒ 求解器把它当成"任意区间都能跑"的执行器，可以派它做工件根本没覆盖的
+            #   层。失败表现为**运行期**层号越界／权重缺失，不是规划期报错 ——
+            #   正是上面这条注释already写过的"部署看起来成功、第一次推理才炸"。
+            #
+            #   B1（切点释放）落地后这个风险变大了：它现在会主动重解以**争取**让附加
+            #   执行器参与，也就更容易把它推到边界之外。所以改成 fail-closed：
+            #   没有 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE` 就**不申报**这一执行器，
+            #   让"配了但没配全"在规划期表现为"这台机器的 CPU 段不参与"，而不是在
+            #   第一次推理时炸。
             logger.warning(
-                "event=local_cpu_executor_layer_range_unconstrained executor_id=%s "
-                "hint=请设 QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=start,end 与本机裁层 GGUF 对齐",
+                "event=local_cpu_executor_skipped reason=layer_range_unconstrained "
+                "executor_id=%s hint=请设 QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=start,end "
+                "与本机裁层 GGUF 对齐（未设置时该执行器不参与规划）",
                 LOCAL_CPU_EXECUTOR_ID,
             )
+            return None
         # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**段区间不是硬锁，本机 CPU 段要能自适应切分**。
         #   只给 `layer_ranges` 会让它落到**精确匹配**语义（`[[8,24]]` 只允许整段
         #   `(8,24)`），于是它被迫吃满 16 层。而两个远端各 12 层的方案在目标函数第二项
@@ -3094,7 +3129,7 @@ class Scheduler(
                 "reason_code": "pipeline_reshard_descriptor_unavailable",
             }
         else:
-            from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+            from config import PIPELINE_CAPACITY_SAFETY_MARGIN, prefer_all_workers_enabled
 
             server = self._tcp_server
             get_client_ids = getattr(server, "get_client_ids", None)
@@ -3131,6 +3166,11 @@ class Scheduler(
                 capacity_nodes=self._get_pipeline_capacity_nodes(connected_ids),
                 node_metadata=self._pipeline_node_metadata(),
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                # ★ 2026-10-27（审计 §9.4 #2）：节点数策略必须与 prepare 阶段
+                #   （`get_pipeline_capacity_plan`）**同源**。此前这里没传 ⇒ 恢复计划
+                #   按缺省的"节点数最少"求解 ⇒ 重分片把本机 CPU 段甩掉，而 prepare
+                #   方向想铺开，两条路径的布局来回打架。
+                prefer_all_workers=prefer_all_workers_enabled(),
             )
             report = decision.to_dict()
         with self._layer_config_lock:

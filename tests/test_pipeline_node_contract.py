@@ -259,6 +259,60 @@ def test_capacity_plan_adapter_preserves_selected_segment_artifact():
     assert layout.nodes[-1].handoff_at == 1
 
 
+def test_layout_metadata_keys_are_executor_identities_with_primary_only_fallback():
+    """★ 2026-10-27（审计 §9.4 #4）：`(node_id, executor_id)` 优先，裸键只回退主执行器。
+
+    同机两段共用 `node_id`：旧写法 `metadata.get(node_id)` 让 CPU 段读到主段的
+    `engine`/`artifact_kind`/`kind`（A1 的反方向串味）。回退必须限制在主执行器 ——
+    旧调用方传的裸键本来就只描述主执行器；附加执行器若回退，等于又把主段属性借给它。
+    """
+    plan = {
+        "admitted": True,
+        "total_layers": 2,
+        "model_sha256": MODEL_SHA,
+        "model_type": "qwen2",
+        "assignments": [
+            {
+                "node_id": "master", "executor_id": "", "role": "master",
+                "start_layer": 0, "end_layer": 1,
+                "has_embedding": True, "has_lm_head": False,
+                "capacity_bytes": 100, "required_bytes": 10,
+            },
+            {
+                "node_id": "master", "executor_id": "cpu", "role": "master",
+                "start_layer": 1, "end_layer": 2,
+                "has_embedding": False, "has_lm_head": True,
+                "capacity_bytes": 100, "required_bytes": 10,
+            },
+        ],
+    }
+    # 旧形态：裸 `node_id` 为键（`scheduler._pipeline_node_metadata()` 就是这样）。
+    legacy = pipeline_layout_from_capacity_plan(
+        plan, node_metadata={"master": {"engine": "llama_cpp", "kind": "local"}},
+    )
+    primary, cpu = legacy.nodes
+    assert primary.engine == "llama_cpp"          # 裸键 → 主执行器：允许回退
+    assert primary.kind == "local"
+    assert cpu.engine == "pytorch"                # 附加执行器：**不**回退
+    assert cpu.artifact.artifact_kind == "safetensors_assignment"
+
+    # 新形态：二元组为键 ⇒ 两段各取各的。
+    fresh = pipeline_layout_from_capacity_plan(plan, node_metadata={
+        ("master", ""): {"engine": "pytorch", "kind": "local"},
+        ("master", "cpu"): {
+            "engine": "llama_cpp", "artifact_kind": "gguf_segment",
+            "kind": "cross_framework", "location": "local",
+        },
+    })
+    fresh_primary, fresh_cpu = fresh.nodes
+    assert fresh_primary.engine == "pytorch"
+    assert fresh_primary.artifact.artifact_kind == "safetensors_assignment"
+    assert fresh_cpu.engine == "llama_cpp"
+    assert fresh_cpu.artifact.artifact_kind == "gguf_segment"
+    assert fresh_cpu.kind == "cross_framework"
+    assert fresh_cpu.handoff_at == 1
+
+
 def test_relay_and_rpc_contracts_map_without_control_plane_imports():
     upstream = RelayModelIdentity(
         model_sha256=MODEL_SHA, architecture="qwen35", block_count=5,

@@ -546,7 +546,7 @@ def _primary_record():
     }
 
 
-def test_local_cpu_executor_record_shares_the_physical_node():
+def test_local_cpu_executor_record_shares_the_physical_node(monkeypatch):
     """本机 CPU 执行器记录的三条不变量 —— 这是本票的核心形态。
 
     1. `node_id` 与主执行器**相同**：它就是**同一台物理机**（同一传输身份、同一份 RAM、
@@ -556,13 +556,22 @@ def test_local_cpu_executor_record_shares_the_physical_node():
        物理上装不下的计划。
     3. `segment_mode="middle"`：keep-head 上游的挂点在 `output_norm` **之后**，
        **不能当首段**（首段必须有 embedding）。
+
+    ★ 2026-10-27（审计 §9.4 #6）：**必须显式声明工件边界**。
+    未设 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE` 时 `_local_cpu_executor_record` 现在
+    **返回 `None`**（fail-closed）—— 一条没有 `layer_ranges`、也没有
+    `layer_budget.min_layer/max_layer` 的记录，会让求解器把工件覆盖不到的层派给它，
+    失败拖到执行期（层号越界／权重缺失）。这里钉一个区间，测"配全了之后的记录形态"；
+    "没配全就不申报"由 `test_local_cpu_executor_requires_layer_range` 单独覆盖。
     """
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", "8,24")
     from config import LOCAL_CPU_EXECUTOR_ID, LOCAL_CPU_EXECUTOR_LAYER_COST_MS
     from scheduler import Scheduler
 
     base = _primary_record()
     cpu = Scheduler._local_cpu_executor_record(base)
 
+    assert cpu is not None, "配了工件边界就应该产出记录"
     assert cpu["node_id"] == base["node_id"]              # ★ 同一台物理机
     assert cpu["executor_id"] == LOCAL_CPU_EXECUTOR_ID
     assert cpu["capacity_domain_id"] == base["node_id"]   # ★ 同一份 RAM 总账
@@ -573,21 +582,40 @@ def test_local_cpu_executor_record_shares_the_physical_node():
     assert cpu["engine"] == "llama_cpp"
     assert cpu["execution_device"] == "cpu"
     assert cpu["layer_cost_ms"] == LOCAL_CPU_EXECUTOR_LAYER_COST_MS
+    # 工件边界进了记录（`layer_ranges` 是精确匹配语义的基线，budget 再解锁切分粒度）
+    assert cpu["layer_ranges"] == [[8, 24]]
     # 主执行器记录本身不被改动
     assert base == _primary_record()
 
 
-def test_local_cpu_executor_shares_one_host_budget():
+def test_local_cpu_executor_requires_layer_range(monkeypatch):
+    """没声明工件边界 ⇒ **不申报**这一执行器（fail-closed）。
+
+    ★ 2026-10-27（审计 §9.4 #6）：B1（切点释放）现在会主动重解以**争取**让附加执行器
+    参与，因此"没有边界"的记录更容易被推去算工件没覆盖的层。与其在执行期炸，不如在
+    规划期就表现为"这台机器的 CPU 段不参与"。
+    """
+    monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", raising=False)
+    from scheduler import Scheduler
+
+    assert Scheduler._local_cpu_executor_record(_primary_record()) is None
+
+
+def test_local_cpu_executor_shares_one_host_budget(monkeypatch):
     """同机两段共用一份总账 ⇒ 域校验看得到两者，且不因总账冲突而报错。
 
     这正是"容量无重复计数"在**同机第二执行器**上的体现：若两段各自按整机可用内存申报
     而不声明共享域，求解器会把它们当成两台独立机器，给出物理上装不下的计划。
+
+    ★ 2026-10-27（审计 §9.4 #6）：同上，需要显式声明工件边界才能拿到记录。
     """
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", "8,24")
     from qlh_core.planning.capacity import validate_capacity_domains
     from scheduler import Scheduler
 
     base = _primary_record()
     cpu = Scheduler._local_cpu_executor_record(base)
+    assert cpu is not None, "配了工件边界就应该产出记录"
     nodes = [
         {**base, "executor_id": ""},
         {**cpu},
