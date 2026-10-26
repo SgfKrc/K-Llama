@@ -2,7 +2,7 @@
 
 > Status: **current**
 >
-> Updated: 2026-10-19
+> Updated: 2026-10-26
 >
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
@@ -23,6 +23,8 @@ K-Llama is a **lightweight distributed LLM inference system for heterogeneous ed
 
 For explicit local full-model inference, `select_inference_path` in `src/inference_path_selector.py` chooses the binding or llama-server. LL segments use keep-head/native forwarding; DL uses a PyTorch first segment followed by llama.cpp segments. Current paths and capability boundaries are in the [architecture](整体架构.md#2-当前执行路径).
 
+The two tiers are not mutually exclusive: **one machine can host two executors at once** — the primary executor (the GPU segment, PyTorch) and an additional one (e.g. the CPU segment, llama.cpp keep-head), identified by the pair `(node_id, executor_id)`. The CPU segment's weights stay resident in host memory and are computed in place with **zero PCIe movement** — llama.cpp's offload moves weights, whereas here nothing was ever moved. Capacity is accounted per shared domain `capacity_domain_id` (default = `node_id`), and the two segments on one machine must not exceed the domain total.
+
 In distributed mode the master coordinates and forwards every continuous segment; workers keep star connections. Explicitly leaving compute participation and retiring the segment permits local full-model loading. Insufficient distributed capacity produces a named wait or refusal. Versioned clients and migration are described in [R5 client cutover](重构客户端切换-R5-2026-10-19.md).
 
 Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**.
@@ -33,6 +35,7 @@ Design principles: **data stays in-cluster, offline autonomy, reproducible accep
 |---|---|
 | Dual-machine real-device layer pipeline (QW1.8B layers 0-21 / 21-24; this model has since been retired from the built-in candidate list) | 3× `distributed_required` all passed, RTT 6-12 ms (2026-08-20) |
 | Historical task-chain restart / kill-and-recover + Tailnet IPv6 (the mechanism was retired in ticket 14 R5; historical evidence only) | `wf_330d0aa1…`, reassignment 0 (2026-08-21) |
+| **Same-machine cross-framework segments (GPU + CPU coexisting)** | Four segments coexist on real hardware: `master '' [0,8) pytorch` / `master 'cpu' [8,24) llama_cpp` / android `[24,28)` / TABLET `[28,32)`, `intent=ready`; all six criteria pass: coexistence / no range overrun / no double counting / numerical gate argmax **81/81** / timing **6.84 ms/layer** / byte-identical when disabled by default. End-to-end 21.28 s, and two runs of the same request give a bit-identical token sequence (2026-10-26) |
 | D→L cross-framework relay correctness | Main-repo dual-engine matrix **27/27 per-token identical** (2026-09-21) |
 | D→L capacity gain | qwen2.5-0.5B **1.568×** / qwen3-2b **1.457×** (strict definition: `C` counts only tensors outside every `*.layers.<i>.*`; counting the visual tower gives 1.613×); under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes (2026-09-21) |
 | L→L keep-head channel | `--path l2l_keep_head` / `d2l2l_keep_head` **32/32**, including the three-stage "1 torch upstream + 2 llama downstream" case (2026-09-21) |
@@ -50,6 +53,7 @@ Full matrix, setups and report paths: [cross-framework relay — current baselin
 ## Outstanding work
 
 - The R6 product acceptance was carried out on 2026-10-19 and is documented in the [R6 report](重构产品验收-R6-2026-10-19.md) (actual package startup, production-data migration and multi-device 9B LL/DL are covered by evidence); the remaining device and gain gates are tracked in its §7. Historical device figures retain their table dates; criteria are in the [refactor design](单一事实源重构设计-2026-10-18.md#12-验收与退出标准).
+- Same-machine cross-framework segments already pass all six criteria (table above), but the **end-to-end baseline is still missing**: under `QLH_CAPACITY_PLANNING_MODE=balanced`, let master alone carry those 16 layers (`[0,24)`, about 13.8 GB of host memory) and compare tokens against the four-segment plan. That path measured 221 s to reach `ready`, and its interaction with legacy layer assignment needs review. The numerical gate is already covered offline (same hidden input, only the executor swapped).
 - Cross-master majority replication, physical fault recovery and trusted signed releases retain separate external gates; current status is in the [ticket plan](彻查后修复与重构排票计划-2026-10-09.md).
 - Distributed speculation still requires a local draft, multi-position output and verifiable state rollback. Standalone PoCs have been retired; native local n-gram remains. See the [capability audit](当前功能与事实归属审计-2026-10-18.md#5-推理优化与图依赖边界).
 - Network latency directly affects stepwise relay. Deployment decisions use measured RTT and capacity; comparisons use the same model, quantization, build and sampling setup.
