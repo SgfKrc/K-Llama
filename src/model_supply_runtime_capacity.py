@@ -568,10 +568,109 @@ def project_supply_capacity_nodes(
             _per_layer = _layer_budget.get("per_layer_bytes")
             if type(_per_layer) is int and _per_layer > 0:
                 artifact_layer_bytes = _per_layer
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**工件边界必须在组空间保留下来**。
+        #
+        #   `layer_budget.min_layer/max_layer` 钉住"本执行器工件实际覆盖到哪些层"，
+        #   求解器的 `_normalize_nodes` 会读它把越界候选排除
+        #   （`node_layer_budget_out_of_bounds`）。但那是**层索引**（`[8,24)`），而求解器
+        #   这里的坐标系是**对齐组**（32 ÷ 4 = 8 组）⇒ 必须换算，否则越界判据失效。
+        #
+        #   实测（2026-10-26 08:39）：不保留 bounds 时 capacity plan 给出
+        #     ('master','cpu', 8, 28)
+        #   而工件 `mid8-24.gguf` 只覆盖 `[8,24)` ⇒ **判据 2（不越界）被破坏**，
+        #   执行期会拿 mid8-24 去算 28 层。
+        for key in ("layer_ranges", "layer_budget", "segment_mode", "models", "range_weight_bytes"):
+            node.pop(key, None)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**工件边界用专用字段带到组空间**。
+        #
+        #   `layer_budget` 是**供给侧内部输入**（scheduler 声明"我这份工件多大、能切多宽"），
+        #   既有测试明确要求它**不得出现在求解器输入里**
+        #   （`test_supply_candidates_ignore_old_segments_without_granting_execution_readiness`），
+        #   而且它的 schema 还需要 `available_bytes`/`per_layer_bytes`/`max_layers` 齐全，
+        #   不适合原样透传。
+        #
+        #   但"本执行器工件实际覆盖到哪些层"是**硬事实**，必须让求解器知道 ——
+        #   否则 capacity plan 会给出 `('master','cpu', 8, 28)` 而工件 `mid8-24.gguf`
+        #   只覆盖 `[8,24)`（实测 2026-10-26 08:39），越界到执行期才发现。
+        #   这里换成专用字段 `layer_bounds`（**组空间**，与求解器坐标系一致）。
+        if isinstance(_layer_budget, dict):
+            _min_layer, _max_layer = _layer_budget.get("min_layer"), _layer_budget.get("max_layer")
+            if (type(_min_layer) is int and type(_max_layer) is int
+                    and 0 <= _min_layer < _max_layer <= total
+                    and _min_layer % alignment == 0 and _max_layer % alignment == 0):
+                node["layer_bounds"] = [_min_layer // alignment, _max_layer // alignment]
         # 本机 CPU 段（keep-head GGUF）没有 embedding / lm_head，只有 final_norm 是常驻的。
         _per_node_component_bytes = components.get("final_norm", 0)
-        for key in ("layer_ranges", "layer_artifacts", "layer_budget", "segment_mode", "models", "range_weight_bytes"):
-            node.pop(key, None)
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`layer_artifacts` 不能 pop**。
+        #
+        #   列表里其余几项（`layer_ranges`/`layer_budget`/`segment_mode`/`models`/
+        #   `range_weight_bytes`）都是**供给侧自己会重新生成**的，pop 掉是为了避免
+        #   输入与生成值混淆。但 `layer_artifacts` 是 **worker 申报的输入**
+        #   （hello capabilities 里的本段逐层字节），求解器要靠它把 descriptor 里
+        #   **部分为零**的 `layer_weight_bytes` 补齐：
+        #
+        #       capacity.py `_merge_source_layer_bytes(descriptor, usable)`
+        #         → for artifact in node.get("layer_artifacts", ()): ...
+        #         → if filled <= 0: return descriptor        # 补不进去就原样返回
+        #         → 随后 `_descriptor_costs` 抛
+        #           "every decoder layer must have a positive byte count"
+        #
+        #   跨格式主节点（PyTorch 描述器 + GGUF 层段）的 `layer_weight_bytes` 本来
+        #   就是部分为零的，这是设计使然（接力不加载整模）。此前 pop 掉 ⇒ 补零函数
+        #   拿到空序列 ⇒ 静默返回原 descriptor ⇒ `_descriptor_costs` 抛错 ⇒
+        #   供给卡在 `preparing` 并报 `pipeline_capacity_descriptor_invalid`。
+        #   实测（2026-10-26 08:18）：四段全部 `available`、工件都已落地，
+        #   却在这一步失败 —— 供给实质已完成，死在描述器记账上。
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**把 worker 申报的 `layer_artifacts` 换算到
+        #   组空间**（求解器的工作空间）后再交给它。
+        #
+        #   worker 的 hello capabilities 用**层索引**申报（`layer_range: [24,32]`，
+        #   `layer_weight_bytes` 长度 = 层数），而求解器这里的 `total_layers` 是
+        #   **对齐组数**（32 ÷ alignment 4 = 8）。原样传过去会立刻
+        #   `layer_range[0] exceeds total_layers=8`。
+        #
+        #   换算方式与 `_merge_source_layer_bytes` 的期望一致：区间按组折算，
+        #   逐层字节按 alignment 分组求和。这样补齐后的 `grouped.layer_weight_bytes`
+        #   （本身就是组尺寸）与 artifacts 的报价处在同一坐标系。
+        _artifacts_in = node.get("layer_artifacts")
+        if isinstance(_artifacts_in, (list, tuple)) and _artifacts_in:
+            _converted = []
+            for _artifact in _artifacts_in:
+                if not isinstance(_artifact, dict):
+                    continue
+                _range = _artifact.get("layer_range")
+                _sizes = _artifact.get("layer_weight_bytes")
+                if (not isinstance(_range, (list, tuple)) or len(_range) != 2
+                        or not isinstance(_sizes, (list, tuple)) or not _sizes):
+                    continue
+                try:
+                    _start, _end = int(_range[0]), int(_range[1])
+                except (TypeError, ValueError):
+                    continue
+                if _start < 0 or _end <= _start or _end > total:
+                    continue
+                if _start % alignment or _end % alignment:
+                    continue
+                if len(_sizes) != _end - _start:
+                    continue
+                _group_sizes = [
+                    sum(int(value) for value in _sizes[offset:offset + alignment])
+                    for offset in range(0, _end - _start, alignment)
+                ]
+                _converted.append({
+                    **_artifact,
+                    "layer_range": [_start // alignment, _end // alignment],
+                    "layer_weight_bytes": _group_sizes,
+                })
+            if _converted:
+                node["layer_artifacts"] = _converted
+            else:
+                node.pop("layer_artifacts", None)
+        # ★ 注：`layer_ranges` / `layer_budget` / `segment_mode` / `models` /
+        #   `range_weight_bytes` 已在上面（`_layer_budget` 读取之后、bounds 保留之前）
+        #   统一 pop 过一次；这里**不能再 pop 一遍** —— 那会把刚重建的
+        #   `layer_budget`（组空间的 min_layer/max_layer）也删掉，工件边界判据随即失效
+        #   （实测 08:39 越界给到 `[8,28)`，而工件只覆盖 `[8,24)`）。
         # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**"必须以 0 开头"是主执行器的性质，不是
         #   `node_id` 的性质**。
         #

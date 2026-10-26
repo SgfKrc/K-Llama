@@ -548,6 +548,19 @@ def _normalize_nodes(
                 raw["range_weight_bytes"], f"node[{node_id}].range_weight_bytes",
                 total_layers=total_layers,
             )
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**工件覆盖范围**（组空间，可选）。
+        #   与 `layer_budget.local_cut` 语义不同：`local_cut` 只解锁切分粒度，
+        #   这一项钉住工件实际覆盖到哪些层，显式声明后**无论有没有 local_cut 都生效**。
+        if "layer_bounds" in raw:
+            _bounds = raw["layer_bounds"]
+            if (not isinstance(_bounds, (list, tuple)) or len(_bounds) != 2
+                    or any(type(value) is not int for value in _bounds)
+                    or not 0 <= _bounds[0] < _bounds[1]
+                    or (total_layers is not None and _bounds[1] > total_layers)):
+                raise PipelineCapacityError(
+                    f"node[{node_id}].layer_bounds must be an in-range [start, end) pair"
+                )
+            normalized["layer_bounds"] = (int(_bounds[0]), int(_bounds[1]))
         # Candidate generation constraints are independent of ready artifacts.
         # In particular, local_cut must never relax a host/source range budget.
         if "candidate_layer_ranges" in raw:
@@ -1241,6 +1254,31 @@ def solve_pipeline_capacity(
                 high = advertised_budget.get("max_layer")
                 if low is not None and high is not None:
                     budget_bounds = (int(low), int(high))
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**专用字段 `layer_bounds`**。
+            #
+            #   它表达"本执行器**工件实际覆盖**的组区间"，是硬事实，与
+            #   `layer_budget.local_cut`（能不能在区间内自由切）语义不同：
+            #   `local_cut` 只解锁**切分粒度**，不解锁**工件边界**。
+            #   此前边界只能搭 `layer_budget.min_layer/max_layer` 的车，而
+            #   `layer_budget` 是供给侧内部输入、按契约不该传进求解器
+            #   （`test_supply_candidates_ignore_old_segments_without_granting_execution_readiness`）
+            #   ⇒ 边界信息丢失 ⇒ 实测给出 `('master','cpu', 8, 28)` 而工件只覆盖
+            #   `[8,24)` ⇒ 越界到执行期才暴露。
+            #   两者都给出时取**交集**（更严的那个赢），都不给则不加约束。
+            _bounds = node.get("layer_bounds")
+            if (isinstance(_bounds, (list, tuple)) and len(_bounds) == 2
+                    and all(type(value) is int for value in _bounds)
+                    and 0 <= _bounds[0] < _bounds[1]):
+                budget_bounds = (
+                    (max(budget_bounds[0], _bounds[0]), min(budget_bounds[1], _bounds[1]))
+                    if budget_bounds is not None else (_bounds[0], _bounds[1])
+                )
+            # 工件边界**独立于** `local_cut` 生效：显式声明了就一定不能越界。
+            if budget_bounds is not None and not (
+                budget_bounds[0] <= cursor and end <= budget_bounds[1]
+            ):
+                exclude(node, cursor, end, "node_layer_budget_out_of_bounds")
+                continue
             if advertised_budget is None or not advertised_budget.get("local_cut"):
                 allowed_ranges = node.get("layer_ranges")
                 if allowed_ranges is not None and not any(
@@ -1249,11 +1287,6 @@ def solve_pipeline_capacity(
                 ):
                     exclude(node, cursor, end, "node_layer_range_not_advertised")
                     continue
-            elif budget_bounds is not None and not (
-                budget_bounds[0] <= cursor and end <= budget_bounds[1]
-            ):
-                exclude(node, cursor, end, "node_layer_budget_out_of_bounds")
-                continue
             # ★ 2026-10-05（DIST-3 三机实测）：**段类型约束**。
             #
             #   区间包含判据不够：`layer_ranges` 只说"本节点覆盖哪些层"，不区分工件
