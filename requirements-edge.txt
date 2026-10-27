@@ -2,6 +2,21 @@
 # Keep this file independent from requirements.txt; torch/Transformers are
 # intentionally absent from the edge installation.
 llama-cpp-python==0.3.35
+# ★ 2026-10-27：**`gguf` 必须显式声明，不能指望 llama-cpp-python 传递。**
+#
+#   `scripts/cut_layers.py` 直接 `import gguf`（裁层工具），而
+#   `model_supply_worker.inventory()` 判定本机裁切能力的判据是
+#   `find_spec("gguf") is not None and scripts/cut_layers.py 存在`。
+#
+#   `llama-cpp-python` 的依赖只有 `diskcache`，**不含 `gguf`**（实测
+#   `importlib.metadata.requires("llama-cpp-python")`）。所以只按本文件装出来的
+#   节点虽然自称 "GGUF/llama.cpp profile"，实际 `local_cut=False`。
+#
+#   后果不是"少个优化"，而是**每次供给都退化成内网传段**
+#   （`SUPPLY_NODE_CUTTER_UNAVAILABLE`）：2026-10-27 三机实测，Surface 因此
+#   从网络拉 1.98 GB 用了 628 s（≈3.15 MB/s），冷启动整体 670.83 s；同轮
+#   y700 的 1.1 GB 只用了 11 s。补齐后该节点可直接本地裁层。
+gguf>=0.10.0
 fastapi==0.141.1
 uvicorn[standard]==0.53.0
 psutil==7.2.2
