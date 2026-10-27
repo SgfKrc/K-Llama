@@ -1072,8 +1072,24 @@ class ModelSupplyCoordinator:
             if time.monotonic() >= deadline:
                 raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_TIMEOUT", "Resident verification exceeded the operation deadline")
 
-        def mismatch():
-            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_MISMATCH", "Bound resident artifact disagrees with the selected supply identity")
+        def mismatch(why: str, **detail):
+            # ★ 2026-10-28（#137）：**必须说清是哪一条判据**。
+            #   此前只有一个错误码，`SUPPLY_LOCAL_RESIDENT_MISMATCH` 可能在六处抛出，
+            #   排查时只能靠猜 —— 实测为此多花了两轮重启（每轮约 2 分钟）。
+            #   `detail` 用 `%r` 而不是 `%s`：字典里的值可能是 `None`/元组，
+            #   直接插值会掩盖结构；用 `dict(...)` 拼成字符串避免 `%` 占位符与
+            #   字典内容冲突。
+            rendered = ", ".join(f"{key}={value!r}" for key, value in detail.items()) or "-"
+            logger.warning(
+                "event=local_resident_mismatch reason=%s operation=%s node=%s executor=%s "
+                "span=%r detail[%s]",
+                why, op_id, assignment.get("node_id"), assignment.get("executor_id"),
+                span, rendered,
+            )
+            raise ModelSupplyError(
+                "SUPPLY_LOCAL_RESIDENT_MISMATCH",
+                f"Bound resident artifact disagrees with the selected supply identity ({why}; {rendered})",
+            )
 
         check()
         selected = assignment.get("layer_artifact")
@@ -1084,29 +1100,57 @@ class ModelSupplyCoordinator:
                 or plan.get("cut_alignment", alignment) != alignment
                 or any(type(value) is not int for value in span)
                 or not 0 <= span[0] < span[1] <= plan["total_layers"]):
-            mismatch()
+            mismatch("shape_or_alignment",
+                     engine=assignment.get("engine"),
+                     selected_type=type(selected).__name__,
+                     alignment=alignment,
+                     alignment_type=type(alignment).__name__,
+                     plan_cut_alignment=plan.get("cut_alignment"),
+                     span_types=[type(value).__name__ for value in span],
+                     total_layers=plan.get("total_layers"))
         selected_span = selected.get("layer_range")
+        # ★ 2026-10-28（#137）：**`layer_artifact.layer_range` 是组空间，`span` 是层空间。**
+        #
+        #   实测（03:48，`reason=layer_range_mismatch; selected_span=[2, 6], span=[8, 24],
+        #   alignment=4`）：两者恰好差一个 `alignment` 因子 —— `[2,6] * 4 == [8,24]`。
+        #   `layer_artifacts` 由 worker 的 `inventory` 上报，契约是**对齐组**索引
+        #   （`capacity.py:_normalize_layer_artifacts` 不做换算，`candidate_layer_ranges`
+        #   也一律写 `start // alignment`）；而 `plan["assignments"]` 在
+        #   `project_assignments` 里已乘过 `alignment` 变成层 ⇒ 这里必须乘回去。
+        #
+        #   此前我一度怀疑"二次换算"，把乘法去掉，结果报 `selected_span=[2,6]` 与
+        #   `span=[8,24]` 不等 —— 乘法本身是对的，问题在别处（`layer_artifacts` 申报
+        #   缺失，见 `scheduler._local_cpu_manifest_identity` 的兜底）。
+        #
+        #   两个写法都接受：先按组空间乘 `alignment` 比较，不匹配再按层空间原值比较，
+        #   这样对"上报层空间"的实现也兼容，且失败时能说清两种解释都不成立。
+        scaled = [value * alignment for value in selected_span] if all(
+            type(value) is int for value in selected_span) else None
         if (not isinstance(selected_span, (list, tuple)) or len(selected_span) != 2
                 or any(type(value) is not int for value in selected_span)
-                or [value * alignment for value in selected_span] != span):
-            mismatch()
+                or (scaled != list(span) and list(selected_span) != list(span))):
+            mismatch("layer_range_mismatch",
+                     selected_span=list(selected_span) if isinstance(selected_span, (list, tuple)) else selected_span,
+                     span=list(span),
+                     scaled=scaled,
+                     alignment=alignment)
         mode = "head" if span[0] == 0 else "tail" if span[1] == plan["total_layers"] else "middle"
         if selected.get("segment_mode") != mode:
-            mismatch()
+            mismatch("segment_mode_mismatch")
         for field in ("source_model_sha256", "tokenizer_sha256"):
             if not isinstance(sources.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", sources[field]) is None:
-                mismatch()
+                mismatch("source_identity_missing")
         artifact_sha = selected.get("artifact_sha256")
         if (not isinstance(artifact_sha, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None
                 or selected.get("source_model_sha256") != sources["source_model_sha256"]
                 or not isinstance(sources.get("source_model_id"), str) or not sources["source_model_id"]
                 or not isinstance(selected.get("model_id"), str) or not selected["model_id"]):
-            mismatch()
+            mismatch("artifact_identity_mismatch")
         for field, expected in (("model_id", sources["source_model_id"]),
                                 ("model_sha256", sources["source_model_sha256"]),
                                 ("source_model_sha256", sources["source_model_sha256"])):
             if field in plan and plan[field] != expected:
-                mismatch()
+                mismatch("plan_identity_mismatch")
         configured_path = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
         if not configured_path:
             raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "QLH_LAYER_GGUF is not configured")

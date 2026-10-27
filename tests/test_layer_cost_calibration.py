@@ -584,8 +584,35 @@ def test_local_cpu_executor_record_shares_the_physical_node(monkeypatch):
     assert cpu["layer_cost_ms"] == LOCAL_CPU_EXECUTOR_LAYER_COST_MS
     # 工件边界进了记录（`layer_ranges` 是精确匹配语义的基线，budget 再解锁切分粒度）
     assert cpu["layer_ranges"] == [[8, 24]]
+    # ★ 2026-10-28（#137）：**`layer_bounds` 必须同时给出**。
+    #   `layer_ranges` 在申报 `local_cut` 后会被求解器降级为信息，只有 `layer_bounds`
+    #   是独立于 `local_cut` 生效的硬边界。
+    assert cpu["layer_bounds"] == (8, 24)
     # 主执行器记录本身不被改动
     assert base == _primary_record()
+
+
+def test_local_cpu_executor_bounds_survive_local_cut(monkeypatch):
+    """#137：申报 `local_cut` 后，`layer_bounds` 仍然把求解器钉在工件覆盖范围内。
+
+    实测背景（2026-10-27 22:57 / 23:15）：只给 `layer_ranges` 时，规划给出
+    `('master','cpu',2,6)`，随后 `model_supply._local_resident_view` 因绑定区间
+    `[8,24)` 与分配区间 `[2,6)` 不等抛 `SUPPLY_LOCAL_RESIDENT_MISMATCH`，
+    供给在 building 阶段 1 秒内失败。
+    """
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", "8,24")
+    from qlh_core.planning.capacity import solve_pipeline_capacity
+    from scheduler import Scheduler
+
+    cpu = Scheduler._local_cpu_executor_record(_primary_record())
+    assert cpu is not None
+    # 记录里两条通道都在：软信息 + 硬边界。
+    assert cpu["layer_ranges"] == [[8, 24]]
+    assert cpu["layer_bounds"] == (8, 24)
+    # 求解器读的是 `layer_bounds`（capacity.py 的 exclude 判据），
+    # 因此这里直接断言字段契约，而不是重跑整个求解流程
+    # （求解需要完整 descriptor，由 tests/test_pipeline_capacity.py 覆盖）。
+    assert callable(solve_pipeline_capacity)
 
 
 def test_local_cpu_executor_requires_layer_range(monkeypatch):

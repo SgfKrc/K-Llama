@@ -326,6 +326,51 @@ def _local_cpu_artifact_sha256() -> str:
         return ""
 
 
+def _local_cpu_manifest_identity() -> dict:
+    """Source identity read from the local CPU segment's own artifact manifest.
+
+    The segment artifact records the model it was cut from, so this host can
+    state "this is `qwen3-5-9b` cut from `ada47e14…`" without waiting for a
+    remote peer to publish the same fact. Returns `{}` when the manifest is
+    missing or does not carry a usable identity — callers then fall back to the
+    previous "declare nothing" behaviour.
+    """
+    try:
+        from pathlib import Path
+        import json as _json
+        raw = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
+        if not raw:
+            return {}
+        artifact = Path(raw)
+        if not artifact.is_absolute():
+            artifact = Path(__file__).resolve().parents[1] / artifact
+        for marker in (artifact.with_suffix(".manifest.json"),
+                       Path(str(artifact) + ".manifest.json")):
+            if not marker.is_file():
+                continue
+            try:
+                manifest = _json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            source_sha = str(manifest.get("source_model_sha256") or "").strip().lower()
+            source_id = str(manifest.get("source_model_id") or "").strip()
+            if not source_sha or not source_id:
+                continue
+            identity = {"source_model_sha256": source_sha, "source_model_id": source_id}
+            tokenizer = str(manifest.get("tokenizer_sha256") or "").strip().lower()
+            if tokenizer:
+                identity["tokenizer_sha256"] = tokenizer
+            hidden = manifest.get("hidden_size")
+            if type(hidden) is int and hidden > 0:
+                identity["hidden_size"] = hidden
+            return identity
+    except Exception:  # noqa: BLE001 — identity discovery must never break planning
+        logger.debug("local cpu manifest identity probe failed", exc_info=True)
+    return {}
+
+
 def _local_cpu_layer_artifacts(records) -> list:
     """为本机 CPU 段申报 `layer_artifacts`（求解器补齐整模视图的唯一数据源）。
 
@@ -383,6 +428,40 @@ def _local_cpu_layer_artifacts(records) -> list:
                 break
         if source_sha:
             break
+    if not source_sha or not model_id:
+        # ★ 2026-10-28（#137 的姊妹缺口）：**先从本地工件 manifest 兜底**。
+        #
+        #   上面那段只从「远端节点已申报的 `layer_artifacts`」里抄源身份，隐含前提是
+        #   远端**已经有**工件。清空段缓存后该前提不成立：远端要等本次供给才现场裁层，
+        #   此刻它的 `artifacts` 是空的 ⇒ 拿不到 `source_model_sha256`/`model_id`
+        #   ⇒ 返回 `[]` ⇒ 本机 CPU 段的 `layer_artifact` 为 `None`
+        #   ⇒ `model_supply._local_resident_view` 在 `shape_or_alignment` 直接失败。
+        #
+        #   实测（2026-10-28 03:26:31，三机段缓存清空后）：
+        #     `local_cpu_executor_budget ... bounds=[8,24) artifact=...mid8-24.gguf`
+        #     `local_cpu_layer_artifacts_unavailable have_source_sha=False have_model_id=False`
+        #   而同一份 `mid8-24.manifest.json` 里身份字段**齐全**
+        #   （`source_model_id=qwen3-5-9b`、`source_model_sha256=ada47e14…`、
+        #   `tokenizer_sha256=3dbcec8c…`、`hidden_size=4096`）。
+        #   工件自己就带着身份，不必依赖别人先申报。
+        #
+        #   优先级：远端申报 > 本地 manifest。前者代表"同一次供给的同源证明"，
+        #   后者是工件自证；只在拿不到前者时才启用。
+        local_identity = _local_cpu_manifest_identity()
+        if local_identity:
+            source_sha = local_identity.get("source_model_sha256", "") or ""
+            model_id = local_identity.get("source_model_id", "") or ""
+            contract_fields = {
+                key: local_identity[key]
+                for key in ("source_model_id", "tokenizer_sha256", "hidden_size")
+                if local_identity.get(key) not in (None, "")
+            }
+            if source_sha and model_id:
+                logger.info(
+                    "event=local_cpu_layer_artifacts_from_manifest "
+                    "source_model_id=%s source_model_sha256=%s hidden_size=%s",
+                    model_id, source_sha[:12], contract_fields.get("hidden_size"),
+                )
     if not source_sha or not model_id:
         # ★ 2026-10-27（审计 §9.4 #6）：**静默不可复用是最难查的形态**。
         #
@@ -2697,6 +2776,24 @@ class Scheduler(
         layer_range = local_cpu_executor_layer_range()
         if layer_range is not None:
             record["layer_ranges"] = [[int(layer_range[0]), int(layer_range[1])]]
+            # ★ 2026-10-28（#137）：**同时钉死 `layer_bounds`，它才是硬约束**。
+            #
+            #   `layer_ranges` 只声明"本执行器覆盖哪些层"，在本机执行器申报
+            #   `local_cut` 后会被求解器降级为信息（`capacity.py` 的
+            #   `advertised_budget.get("local_cut")` 分支），因此**拦不住**求解器
+            #   把工件没覆盖的区间派过来。
+            #
+            #   实测（2026-10-27 22:57 / 23:15，两轮）：配了 `QLH_LAYER_GGUF`
+            #   （`mid8-24.gguf`）与 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=8,24` 后，
+            #   规划仍给出 `('master','cpu',2,6)`；随后
+            #   `model_supply._local_resident_view` 因绑定区间与分配区间不等抛
+            #   `SUPPLY_LOCAL_RESIDENT_MISMATCH`，供给在 building 阶段 1 秒内失败。
+            #   把规划模式从 fastest 换成 balanced 也不改变该结果。
+            #
+            #   `layer_bounds` 独立于 `local_cut` 生效（见 `capacity.py` 的
+            #   「工件边界**独立于** `local_cut` 生效」），给出后越界即
+            #   `node_layer_budget_out_of_bounds` 被排除，正是需要的行为。
+            record["layer_bounds"] = (int(layer_range[0]), int(layer_range[1]))
         else:
             # ★ 2026-10-27（审计 §9.4 #6）：**缺工件边界就不该产出这条记录**。
             #
