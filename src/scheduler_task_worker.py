@@ -662,12 +662,32 @@ class SchedulerTaskWorkerMixin:
         }
 
     def _task_worker_local_full_source(self) -> dict | None:
-        """Return metadata and size for one inventory-visible complete GGUF."""
+        """Return metadata and size for one inventory-visible complete GGUF.
+
+        ★ 2026-10-28（#139）：**优先匹配本次供给的目标模型**。
+        此前盲取候选列表的第一个，而一个节点上可能有多份整模（Surface 上
+        `qwen3-0.6b` 排在 `qwen3-5-9b` 之前）⇒ 合成出错误的模型身份
+        （实测 04:46 得到 `models=[{'model_id': 'qwen3-0.6b', …}]`）⇒ 拿不到
+        9B 的层段。目标取自最近一次 inventory 命令；拿不到目标时才回退到第一个。
+        """
         try:
             from model_supply_worker import local_gguf_source_candidates
             from relay_segment_info import read_gguf_layer_info
             worker = getattr(self, "_model_supply_worker", None)
-            candidates = worker._source_candidates() if worker is not None else local_gguf_source_candidates()
+            candidates = list(worker._source_candidates() if worker is not None else local_gguf_source_candidates())
+            target = ""
+            if worker is not None:
+                target = str(getattr(worker, "_last_supply_model_id", "") or "").strip()
+            if target:
+                wanted = target.lower()
+                preferred = [(sid, path) for sid, path in candidates
+                             if str(sid).lower() == wanted]
+                if not preferred:
+                    # 排到前面的精确匹配不存在时，再按包含关系兜底（目录名带模型名）。
+                    preferred = [(sid, path) for sid, path in candidates
+                                 if wanted in str(path).lower() or wanted in str(sid).lower()]
+                if preferred:
+                    candidates = preferred + [item for item in candidates if item not in preferred]
             for _source_id, path in candidates:
                 info = read_gguf_layer_info(path) or {}
                 total = info.get("n_layer")

@@ -579,6 +579,12 @@ class ModelSupplyWorker:
 
     def _inventory_reply(self, op: _Operation, model_id: str | None = None) -> None:
         try:
+            # ★ 2026-10-28（#139）：记住本次供给的目标模型。
+            #   `_task_worker_local_full_source()` 需要按目标挑整模源；此前它盲取
+            #   `_source_candidates()` 的第一个，而 Surface 上 `qwen3-0.6b` 排在
+            #   `qwen3-5-9b` 之前 ⇒ 合成的模型身份是 0.6b ⇒ 拿不到 9B 的层段。
+            if isinstance(model_id, str) and model_id:
+                self._last_supply_model_id = model_id
             # Keep legacy callers (including zero-argument inventory hooks) valid.
             result = self.inventory() if model_id is None else self.inventory(model_id=model_id)
             result.update(action="inventory_result", operation_id=op.operation_id, node_id=op.node_id)
