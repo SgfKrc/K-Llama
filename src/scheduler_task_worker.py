@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from scheduler_types import NodeRole
@@ -625,6 +626,41 @@ class SchedulerTaskWorkerMixin:
         except (ImportError, OSError, ValueError):
             return False
 
+    def _local_cut_model_identity(self, source: dict | None) -> dict | None:
+        """Model identity synthesised from the complete local GGUF (#139).
+
+        A `local_cut` node holds the whole model and cuts segments on demand, so
+        the physical identity of any segment it will produce is the identity of
+        that model. Without this, `models` stays empty and the capacity solver
+        never places a segment on the node — even though its `layer_ranges` and
+        `local_cut` budget say it can.
+
+        Fields mirror `_task_worker_layer_artifact_identity` so both paths are
+        interchangeable to the coordinator.
+        """
+        if not isinstance(source, dict):
+            return None
+        model_id = str(source.get("source_model_id") or "").strip()
+        path = source.get("path")
+        if not model_id or path is None:
+            return None
+        try:
+            # 复用固定段路径同一个带缓存的摘要入口，避免每次 hello 重算整模
+            # （Surface 的 9B 整模 5.4 GB，冷算一次约 10 s）。
+            digest = _verified_layer_artifact_sha256(Path(path))
+        except Exception:  # noqa: BLE001 — identity discovery must not break hello
+            logger.debug("local_cut model identity probe failed", exc_info=True)
+            return None
+        if not digest:
+            return None
+        return {
+            "model_id": model_id,
+            "engine": "llama_cpp",
+            "format": "gguf",
+            "revision": "qlh.segment_supply.v1",
+            "sha256": digest,
+        }
+
     def _task_worker_local_full_source(self) -> dict | None:
         """Return metadata and size for one inventory-visible complete GGUF."""
         try:
@@ -752,6 +788,26 @@ class SchedulerTaskWorkerMixin:
             # An explicitly configured but missing/corrupt GGUF must not keep
             # advertising a stale active range from the previous generation.
             layer_worker = False
+        # ★ 2026-10-28（#139）：**`local_cut` 节点必须也能申报模型身份**。
+        #
+        #   `models` 的唯一填充点是下面的 `artifact_model` 分支，而它依赖
+        #   `_configured_layer_artifact()` —— 后者要求 `QLH_LAYER_GGUF` 指向带
+        #   同名 `.manifest.json` 的**已裁段**。偏偏 `local_cut` 的入口判据是
+        #   `QLH_LAYER_GGUF` **未设置**（见上面 `can_probe_local_cut`）⇒ 两条路径互斥：
+        #   能自由裁层的节点没有任何办法申报"我能跑哪个模型"。
+        #
+        #   实测（2026-10-28 04:16 / 04:30，Surface 7 Pro）：
+        #     TABLET-2TLUCNU8  layer_ranges=[[0,28]]  models=[]      ← 拿不到层段
+        #     android-542cd254 layer_ranges=[[24,32]] models=[qwen3-5-9b]
+        #   容量求解输入里 Surface 的 `local_cut=True`、`max_layers=253`（容量充足），
+        #   输出却恒为 `[('master','',0,8), ('master','cpu',8,24),
+        #   ('android-542cd254',24,32)]` —— 八层全压 y700，它在 161-token prefill
+        #   上卡住，端到端 `remote_accept_timeout`。
+        #
+        #   这里从整模 GGUF 头合成身份：`model_id` 取源标识，`sha256` 取整模摘要
+        #   （`local_cut` 裁出的每段都来自它，故它才是这段权重的物理身份），
+        #   `revision` 与固定段路径同口径（`qlh.segment_supply.v1`）。
+        local_cut_model = self._local_cut_model_identity(local_full_source)
         if local_cut_only:
             # ★ 持整模 + 能自裁 ⇒ 声明整域 [0, total)，让容量求解按能力自由分配，
             #   而不是被某个历史段绑死。已注册的段仍作为可复用工件存在，但**分发
@@ -778,6 +834,10 @@ class SchedulerTaskWorkerMixin:
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
         artifact_model = self._task_worker_layer_artifact_identity(artifact)
+        if artifact_model is None:
+            # ★ 2026-10-28（#139）：固定段路径拿不到身份时，回退到 `local_cut`
+            #   从整模 GGUF 头合成的身份。两条路径各自补齐，`models` 不再恒空。
+            artifact_model = local_cut_model
         if artifact_model is not None and (
             full_model_identity is None
             or (layer_worker and advertisement_supports(engine_schema, FORWARD_LAYERS))
