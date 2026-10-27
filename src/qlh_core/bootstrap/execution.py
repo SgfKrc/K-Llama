@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import logging
+import os
 import threading
 from typing import Mapping
 
@@ -366,10 +367,22 @@ class NativePorts:
         if hidden.ndim != 2 or hidden.shape[0] != len(ids):
             raise ExecutionError("execution_hidden_shape_invalid")
         positions = list(range(position, position + len(ids)))
-        for segment in plan.segments[1:]:
+        # ★ 2026-10-28（#127 的 prefill 一段）：**把下一段的权重页预热放到空窗里**。
+        #
+        #   冷启动时首段前向要为每页做一次同步 major fault，实测三段合计约 27.9 s
+        #   全压在请求关键路径上。页迟早要读，差别只在**什么时候**读。
+        #   在「本段算完、下一段 hidden 还没回来」的窗口里提前发起 advise，
+        #   就把这段等待变成了有用的工作 —— 与 prima.cpp 的
+        #   `manage_graph_tensors`（send 之后、下一子图 compute 之前）同一个发射点思路。
+        #
+        #   预热是纯建议性的：不阻塞、不抛错、不改变读取内容。
+        self._warm_next_segment(plan, 1)
+        for index, segment in enumerate(plan.segments[1:], start=1):
             self._receipt_guard._check(plan, record)
             from qlh_core.contracts.execution import StageIdentity
             identity = StageIdentity.for_segment(plan, segment, record["request_id"], record["attempt_id"], step)
+            # 本段即将开始时，把再下一段也排上：段与段之间通常要等一个往返。
+            self._warm_next_segment(plan, index + 1)
             receipt = self.stage(segment, identity, hidden, record, positions=positions,
                                  all_tokens=all_tokens and segment.head)
             self._receipt_guard._check(plan, record)
@@ -459,6 +472,65 @@ class NativePorts:
         if hidden.ndim != 2:
             raise ExecutionError("execution_hidden_shape_invalid")
         return hidden
+
+    def _local_weight_path(self, segment) -> str:
+        """Local GGUF path backing `segment`, or "" when it is not local.
+
+        Only segments executed on this host are worth warming: a remote worker's
+        page cache is its own business, and advising a path from the master's
+        namespace would either miss or, worse, warm an unrelated file.
+        """
+        if not getattr(segment, "executor_id", ""):
+            return ""
+        try:
+            assignment = json.loads(segment.payload)
+        except (TypeError, ValueError):
+            return ""
+        # The assignment's own artifact pointer wins; the env default is only a
+        # fallback for the single local CPU executor configured that way.
+        for key in ("model_path", "gguf_path", "artifact_path"):
+            value = assignment.get(key)
+            if isinstance(value, str) and value:
+                break
+        else:
+            value = os.environ.get("QLH_LAYER_GGUF", "")
+        if not isinstance(value, str) or not value:
+            return ""
+        try:
+            if not os.path.isabs(value):
+                value = os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__)))), value)
+            return os.path.abspath(value)
+        except (OSError, ValueError):
+            return ""
+
+    def _warm_next_segment(self, plan, index) -> None:
+        """Queue a page-in for `plan.segments[index]` if it runs on this host.
+
+        Advisory only: any failure is swallowed. The first call also lazily
+        creates the warmer, so a process that never runs a local segment pays
+        nothing.
+        """
+        try:
+            segments = getattr(plan, "segments", ())
+            if not 0 <= index < len(segments):
+                return
+            segment = segments[index]
+            path = self._local_weight_path(segment)
+            if not path:
+                return
+            warmer = getattr(self, "_weight_warmup", None)
+            if warmer is None:
+                from worker_weight_warmup import WeightWarmup
+                enabled = os.environ.get("QLH_LAYER_PAGE_WARMUP", "1").strip().lower()
+                warmer = WeightWarmup(enabled=enabled not in {"0", "false", "off", "no"})
+                self._weight_warmup = warmer
+            if not warmer.enabled:
+                return
+            if warmer.warm(path):
+                _LOG.debug("event=weight_warmup_queued path=%s index=%d", path, index)
+        except Exception:  # noqa: BLE001 — warming must never break a request
+            _LOG.debug("event=weight_warmup_skipped index=%d", index, exc_info=True)
 
     def stage(self, segment, identity, hidden, record, *, positions=None, all_tokens=None):
         from execution_provider import ModelIdentity
