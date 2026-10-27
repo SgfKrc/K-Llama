@@ -549,11 +549,12 @@ def _candidate_metadata(
     """
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for key, value in (supplied or {}).items():
+        if not isinstance(key, (tuple, list)):
+            result[(str(key or "").strip(), "")] = dict(value)
+    for key, value in (supplied or {}).items():
         if isinstance(key, (tuple, list)) and len(key) == 2:
             identity = (str(key[0] or "").strip(), str(key[1] or "").strip())
-        else:
-            identity = (str(key or "").strip(), "")
-        result[identity] = dict(value)
+            result[identity] = dict(value)
     for node in current.nodes:
         metadata = result.setdefault(_node_identity(node), {})
         metadata.setdefault("is_local", not node.federated and node.location == "local")
@@ -810,10 +811,24 @@ def plan_pipeline_reshard(
                 )),
                 reason=str(capacity_plan.get("reason", "")),
             )
+        engines = {
+            _capacity_identity(item): item["engine"]
+            for item in survivors if item.get("engine")
+        }
+        capacity_plan = {
+            **capacity_plan,
+            "assignments": [
+                {**item, "engine": engines[_capacity_identity(item)]}
+                if not item.get("engine") and _capacity_identity(item) in engines
+                else dict(item)
+                for item in capacity_plan["assignments"]
+            ],
+        }
         candidate = pipeline_layout_from_capacity_plan(
             capacity_plan,
             node_metadata=_candidate_metadata(validated, node_metadata),
         )
+        capacity_plan["pipeline_layout"] = candidate.to_dict()
         # ★ 2026-10-27（A4）：候选布局的校验同样必须是**执行器级**身份。
         #   只比 `node_id` 时有两个反向错误：失败目标是 `(master, "cpu")` 时，
         #   候选里健康的 `(master, "")` 会与 `"master"` 撞上（若把失败集合统一成

@@ -2927,8 +2927,10 @@ class Scheduler(
             )
         return record
 
-    def _pipeline_node_metadata(self) -> dict[str, dict]:
+    def _pipeline_node_metadata(self) -> dict[Any, dict]:
         """Project live scheduler nodes into opaque layout-location metadata."""
+        from config import LOCAL_CPU_EXECUTOR_ID
+
         local_node_id = (
             "master" if self._effective_role() == "master"
             else self.get_effective_node_id()
@@ -2975,8 +2977,8 @@ class Scheduler(
                 ]
                 if len(normalized) == 1:
                     worker_engines[str(worker.get("node_id", ""))] = normalized[0]
-        return {
-            node_id: {
+        metadata = {
+            (node_id, ""): {
                 "is_local": node_id == local_node_id,
                 # Public plans distinguish local/remote without exporting an
                 # address that belongs to the transport control plane.
@@ -2997,6 +2999,17 @@ class Scheduler(
             }
             for node_id, _node in snapshot
         }
+        local = metadata.get((local_node_id, ""))
+        if local is not None:
+            metadata[(local_node_id, LOCAL_CPU_EXECUTOR_ID)] = {
+                **local, "engine": "llama_cpp", "artifact_kind": "gguf_segment",
+            }
+        metadata.update({
+            node_id: dict(value)
+            for (node_id, executor_id), value in tuple(metadata.items())
+            if not executor_id
+        })
+        return metadata
 
     def _attach_pipeline_node_contract(
         self, plan: dict, *, capacity_nodes: Optional[list[dict]] = None,
@@ -3005,7 +3018,14 @@ class Scheduler(
         if not isinstance(plan, dict) or plan.get("admitted") is not True:
             return plan
         result = dict(plan)
-        if capacity_nodes is not None:
+        coordinator = getattr(self, "_pipeline_reshard_coordinator", None)
+        if result.get("pipeline_layout") is None and coordinator is not None:
+            plan_id = str(result.get("plan_id") or "")
+            for staged in coordinator.snapshot().get("staged", []):
+                if plan_id and staged.get("capacity_plan_id") == plan_id:
+                    result["pipeline_layout"] = staged["candidate_layout"]
+                    break
+        if capacity_nodes is not None and result.get("pipeline_layout") is None:
             # ★ 2026-10-27（LOCAL-EXECUTORS-01）：键必须是 `(node_id, executor_id)`。
             #
             #   同机可有多个执行器（主段 `executor_id=""` 走 pytorch，CPU 段
@@ -3057,7 +3077,10 @@ class Scheduler(
         try:
             layout = pipeline_layout_from_capacity_plan(
                 {**result, "assignments": layout_assignments},
-                node_metadata=self._pipeline_node_metadata(),
+                node_metadata=(
+                    self._pipeline_node_metadata()
+                    if result.get("pipeline_layout") is None else None
+                ),
             )
         except PipelineNodeContractError as exc:
             logger.warning(
@@ -3086,7 +3109,10 @@ class Scheduler(
         """Bind a ready capacity plan to an epoch-fenced recovery topology."""
         try:
             layout = pipeline_layout_from_capacity_plan(
-                plan, node_metadata=self._pipeline_node_metadata(),
+                plan, node_metadata=(
+                    self._pipeline_node_metadata()
+                    if plan.get("pipeline_layout") is None else None
+                ),
             )
             coordinator = PipelineReshardCoordinator(
                 layout,
@@ -3209,8 +3235,11 @@ class Scheduler(
         if staged_plan is None:
             return False
         try:
+            ready_plan = dict(plan)
+            if ready_plan.get("pipeline_layout") is None:
+                ready_plan["pipeline_layout"] = staged_plan.candidate_layout.to_dict()
             ready_layout = pipeline_layout_from_capacity_plan(
-                plan, node_metadata=self._pipeline_node_metadata(),
+                ready_plan,
             )
         except PipelineNodeContractError:
             return False

@@ -124,9 +124,10 @@ def resolve_prepare_selection(scheduler, identity: dict) -> dict:
                 or native.get("n_layer") != identity["total_layers"]
                 or native.get("mode") != identity["segment_mode"]):
             raise WorkerPrepareError("worker_prepare_manifest_mismatch")
-        from model_supply_assets import _gguf_layers, _gguf_table, sha256_file
+        from model_supply_assets import _gguf_layers, _gguf_table, _hash_file
+        from model_supply_digest_cache import cached_sha256
         from relay_segment_info import read_gguf_tokenizer_sha256
-        if (sha256_file(path) != identity["artifact_sha256"]
+        if (cached_sha256(path, hash_file=_hash_file) != identity["artifact_sha256"]
                 or read_gguf_tokenizer_sha256(path) != identity["tokenizer_sha256"]):
             raise WorkerPrepareError("worker_prepare_artifact_mismatch")
         metadata, _ = _gguf_table(path)

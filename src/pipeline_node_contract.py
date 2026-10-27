@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 try:
@@ -509,17 +509,55 @@ def pipeline_layout_from_capacity_plan(
     model_sha256 = str(plan.get("model_sha256", "") or "").strip()
     architecture = str(plan.get("model_type", "") or "")
     metadata = node_metadata or {}
+    frozen_layout = None
+    snapshot = plan.get("pipeline_layout")
+    if snapshot is not None:
+        try:
+            if not isinstance(snapshot, Mapping):
+                raise PipelineNodeContractError("pipeline_layout must be an object")
+            if snapshot.get("schema_version") != PIPELINE_NODE_SCHEMA_VERSION:
+                raise PipelineNodeContractError("pipeline_layout schema is unsupported")
+            frozen_layout = validate_pipeline_nodes([
+                PipelineNode(**{
+                    field.name: item[field.name]
+                    for field in fields(PipelineNode) if field.name in item
+                })
+                for item in snapshot["nodes"]
+            ], total_layers=snapshot["total_layers"])
+        except (KeyError, TypeError) as exc:
+            raise PipelineNodeContractError("pipeline_layout snapshot is invalid") from exc
+        if snapshot.get("contract_sha256") != frozen_layout.contract_sha256:
+            raise PipelineNodeContractError("pipeline_layout snapshot hash mismatch")
+        if (
+            frozen_layout.total_layers != total_layers
+            or frozen_layout.model_sha256 != model_sha256
+            or frozen_layout.architecture != architecture
+        ):
+            raise PipelineNodeContractError("pipeline_layout snapshot model mismatch")
+        metadata = {
+            node.identity_key: {
+                "is_local": not node.federated and node.location == "local",
+                "location": node.location, "kind": node.kind, "engine": node.engine,
+                "federated": node.federated, "cross_engine": node.cross_engine,
+                "handoff_at": node.handoff_at, "artifact": node.artifact,
+                "artifact_kind": node.artifact.artifact_kind,
+                "architecture": node.artifact.architecture,
+            }
+            for node in frozen_layout.nodes
+        }
     nodes: list[PipelineNode] = []
     for assignment in assignments:
         if not isinstance(assignment, Mapping):
             raise PipelineNodeContractError("capacity assignment must be an object")
-        node_id = str(assignment.get("node_id", "") or "")
+        node_id = str(assignment.get("node_id", "") or "").strip()
         # ★ 2026-10-27（审计 §9.4 #4）：身份是 `(node_id, executor_id)` —— 同机两段
         #   共用一个 `node_id`，裸键会让附加执行器读到主段的 `kind`/`engine`/
         #   `artifact_kind`。回退语义（旧裸键只对主执行器生效）见
         #   `_layout_metadata_for()`。
-        executor_id = str(assignment.get("executor_id") or "")
+        executor_id = str(assignment.get("executor_id") or "").strip()
         meta = dict(_layout_metadata_for(metadata, node_id, executor_id))
+        if frozen_layout is not None and not meta:
+            raise PipelineNodeContractError("pipeline_layout snapshot executor mismatch")
         start = _non_negative_int(assignment.get("start_layer", 0), "start_layer")
         end = _non_negative_int(assignment.get("end_layer", 0), "end_layer")
         is_local = bool(meta.get(
@@ -619,7 +657,10 @@ def pipeline_layout_from_capacity_plan(
             )
         annotated.append(node)
         previous_engine = node.engine
-    return validate_pipeline_nodes(annotated, total_layers=total_layers)
+    layout = validate_pipeline_nodes(annotated, total_layers=total_layers)
+    if frozen_layout is not None and layout.contract_sha256 != frozen_layout.contract_sha256:
+        raise PipelineNodeContractError("capacity assignments do not match pipeline_layout snapshot")
+    return layout
 
 
 def pipeline_layout_from_relay_handoff(

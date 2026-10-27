@@ -793,7 +793,7 @@ def _collect_covered_partials(root: Path, protected, *, max_remove, max_hash_byt
                     else:
                         _fail("unexpected_file", "partial contains an unowned member")
         return result
-    candidates = list(_segment_candidates(root, cancelled))
+    candidates = None
     verified = {}
     with os.scandir(root) as entries:
         for ordinal, entry in enumerate(entries):
@@ -836,6 +836,8 @@ def _collect_covered_partials(root: Path, protected, *, max_remove, max_hash_byt
                         sizes += member["size_bytes"]
                 witness = None
                 witness_stamp = None
+                if candidates is None:
+                    candidates = list(_segment_candidates(root, cancelled))
                 for directory in candidates:
                     if any(_link(path) for path in (directory, directory / _MARKER)):
                         continue
@@ -912,8 +914,8 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
     """Collect only verified generations while the caller holds owner admission.
 
     None is an unavailable native ownership proof, rather than an empty proof.
-    All deletion targets are checked within root, with exact manifest members,
-    live SHA and no reparse at any level. Work is bounded in directories/bytes.
+    Retention uses version-fenced digests; deletion still requires live SHA,
+    exact manifest members and no reparse. Work is bounded in directories/bytes.
 
     Keep the newest verified, distinct content inventories within BOTH ``keep``
     and ``max_retained_bytes`` (logical bytes including each supply marker).
@@ -983,11 +985,18 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
                 skip("member_budget")
                 continue
             size = sum(entry["size_bytes"] for entry in manifest["files"])
+            content = _segment_content_key(manifest)
+            retained_size = size + marker.stat().st_size
+            retain = (content not in retained and len(retained) < keep
+                      and report["retained_bytes"] + retained_size <= max_retained_bytes)
+            if not retain and report["removed"] >= max_remove:
+                skip("removal_budget")
+                break
             if hashed + size > max_hash_bytes:
                 skip("hash_budget")
                 break
             hashed += size
-            _verify_files(directory, manifest, cancelled=cancelled, fresh=True)
+            _verify_files(directory, manifest, cancelled=cancelled, fresh=not retain)
             _verify_segment(directory, manifest)
             _cancelled(cancelled)
             # Recheck all members after hashing. Owner locks prevent another
@@ -995,17 +1004,11 @@ def collect_supply_segments(root: Path, *, protected_paths=(), native_paths=None
             if pinned(resolved) or directory.resolve() != resolved:
                 skip("referenced")
                 continue
-            content = _segment_content_key(manifest)
-            retained_size = size + marker.stat().st_size
-            if (content not in retained and len(retained) < keep
-                    and report["retained_bytes"] + retained_size <= max_retained_bytes):
+            if retain:
                 retained.add(content)
                 report["retained"] += 1
                 report["retained_bytes"] += retained_size
                 continue
-            if report["removed"] >= max_remove:
-                skip("removal_budget")
-                break
             if any(_link(path) for path in (directory, *directory.parents)) or any(
                     _link(path) for path in directory.rglob("*")):
                 skip("unsafe_path")

@@ -2022,8 +2022,13 @@ class ModelSupplyCoordinator:
                         nodes[node_id][counter] = result[counter]
                 self._leases.pop((op_id, node_id), None)
                 self._update(op_id, nodes=nodes)
+        started = time.monotonic()
         try:
-            self.collect_operation_directories(keep_operation_ids=(op_id,))
+            report = self.collect_operation_directories(keep_operation_ids=(op_id,))
+            logger.info("event=supply_operations_maintenance_done operation=%s elapsed_ms=%d "
+                        "examined=%s removed=%s reclaimed_bytes=%s",
+                        op_id, int((time.monotonic() - started) * 1000), report.get("examined"),
+                        report.get("removed"), report.get("reclaimed_bytes"))
         except Exception:
             logger.exception("event=supply_operations_reclaim_failed operation=%s", op_id)
         try:
@@ -2064,7 +2069,12 @@ class ModelSupplyCoordinator:
                         or any(path not in leased for lease in self._leases.values()
                                for path in lease["files"].values()))
 
+        started = time.monotonic()
         report = collector(root=self.root, protected_paths=protected, cancelled=invalidated)
+        logger.info("event=supply_cache_collection_done operation=%s elapsed_ms=%d "
+                    "examined=%s retained=%s removed=%s skipped=%s",
+                    op_id, int((time.monotonic() - started) * 1000), report.get("examined"),
+                    report.get("retained"), report.get("removed"), report.get("skipped"))
         self._update(op_id, retention=report)
 
     @contextmanager
