@@ -575,6 +575,15 @@ class EngineHost:
         # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
         #   由它自理；这里只负责按 env 配置创建一次并复用（重载 500MB GGUF 代价高）。
         self._layer_upstream: Any = None
+        # ★ 2026-10-28（#127）：跨 operation 的运行时所有权登记。
+        #   此前复用键是完整 `prepare_identity`，其中含 `operation_id`，因此 owner 一换
+        #   必然 `close()` + 全量重载（实测末段 15–21 s）。现在按工件身份决定能否复用、
+        #   按 owner 身份走一次被记录的转移。见
+        #   `docs/跨operation运行时所有权转移协议-2026-10-27.md`。
+        from worker_runtime_registry import RuntimeRegistry
+        self._runtime_registry = RuntimeRegistry()
+        self._layer_upstream_generation = 0
+        self._layer_upstream_runtime_id = ""
         self._worker_runtime_lock = threading.RLock()
         self._worker_runtime_managed = False
         self._worker_runtime_active = None
@@ -3032,6 +3041,8 @@ class EngineHost:
             model_path = environment.get("QLH_LAYER_GGUF", "").strip()
         binding = None
         artifact_version = None
+        artifact_identity = None
+        owner_identity = None
         if executor_id:
             from pathlib import Path
             from model_supply_digest_cache import cached_sha256, file_stamp
@@ -3065,8 +3076,15 @@ class EngineHost:
                     raise WorkerPrepareError("local_executor_artifact_unavailable") from exc
 
             version = artifact_version()
-            binding = (executor_id, prepare_identity, dict(identity), tuple(span), model_path, version)
-            if (binding != getattr(self, "_layer_upstream_binding", None)
+            # ★ 2026-10-28（#127）：工件身份与 owner 身份拆开。
+            #   工件身份决定运行时**能否**复用；owner 身份决定**归谁**。
+            from worker_prepare_contract import split_identity
+            artifact_identity, owner_identity = split_identity(prepare_identity)
+            artifact_identity["artifact_path"] = model_path
+            artifact_identity["artifact_version"] = repr(version)
+            artifact_identity["executor_id"] = executor_id
+            binding = (executor_id, artifact_identity, dict(identity), tuple(span), model_path, version)
+            if (binding != getattr(self, "_layer_upstream_artifact_binding", None)
                     or self._layer_upstream is None or not self._layer_upstream.is_available):
                 manifest = next((info for marker in markers
                                  if (info := read_artifact_manifest(marker))), None)
@@ -3082,12 +3100,54 @@ class EngineHost:
                 raise WorkerPrepareError("local_executor_cancelled")
         if self._layer_upstream is not None:
             previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
-            if ((not previous_path or previous_path == model_path) and self._layer_upstream.is_available
-                    and binding == getattr(self, "_layer_upstream_binding", None)):
-                return self._layer_upstream
+            # ★ 2026-10-28（#127）：**工件身份相同即可复用，owner 变化走转移**。
+            #
+            #   旧判据要求完整 `binding` 相等，而 `binding` 含 `prepare_identity`，
+            #   后者又含 `operation_id` / `assignment_id` / `generation`。于是即便工件
+            #   逐字节相同（`artifact_sha256`、`manifest_sha256`、`file_stamp` 全一致），
+            #   operation 一换就要 `close()` + `llama_model_load_from_file` + repack。
+            #
+            #   这里把判据拆成两半：`artifact_binding` 只含工件类字段，决定**能否**复用；
+            #   owner 的变化由 `RuntimeRegistry.transfer` 记录并递增 generation，
+            #   使旧 owner 的 `close()` 被拒（`stale_owner`），不再出现"一方在读、
+            #   另一方关句柄"的竞态。
+            artifact_binding = (executor_id, artifact_identity, dict(identity),
+                                tuple(span), model_path, version)
+            same_artifact = (previous_path == model_path and self._layer_upstream.is_available
+                             and artifact_binding == getattr(self, "_layer_upstream_artifact_binding", None))
+            if same_artifact:
+                if owner_identity == getattr(self, "_layer_upstream_owner", None):
+                    return self._layer_upstream
+                try:
+                    receipt = self._runtime_registry.transfer(
+                        getattr(self, "_layer_upstream_owner", None) or {},
+                        owner_identity,
+                        artifact_identity,
+                        expected_generation=getattr(self, "_layer_upstream_generation", 0),
+                        load_spec_digest=str(prepare_identity.get("load_spec_digest", "") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001 — 任何拒绝都落到重建
+                    logger.info(
+                        "event=layer_upstream_transfer_refused node=%s operation=%s code=%s",
+                        self._serving_node_id, prepare_identity.get("operation_id"),
+                        getattr(exc, "code", type(exc).__name__),
+                    )
+                else:
+                    self._layer_upstream_owner = owner_identity
+                    self._layer_upstream_generation = receipt.generation
+                    logger.info(
+                        "event=layer_upstream_transferred node=%s operation=%s runtime=%s generation=%d reuse=1",
+                        self._serving_node_id, prepare_identity.get("operation_id"),
+                        receipt.runtime_id, receipt.generation,
+                    )
+                    return self._layer_upstream
             self._layer_upstream.close()
             self._layer_upstream = None
             self._layer_upstream_binding = None
+            self._layer_upstream_artifact_binding = None
+            self._layer_upstream_owner = None
+            self._layer_upstream_generation = 0
+            self._layer_upstream_runtime_id = ""
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
@@ -3136,7 +3196,24 @@ class EngineHost:
                 self._layer_upstream.close()
                 self._layer_upstream = None
                 raise
+        # ★ 2026-10-28（#127）：创建与复用都落到注册表，使「谁持有」可审计。
+        #   新建时登记 owner（generation=1）；复用分支已在上面完成转移。
         self._layer_upstream_binding = binding
+        self._layer_upstream_artifact_binding = binding
+        if artifact_identity is not None and not getattr(self, "_layer_upstream_runtime_id", ""):
+            entry = self._runtime_registry.register(
+                artifact_identity, owner_identity,
+                load_spec_digest=str(prepare_identity.get("load_spec_digest", "") or ""),
+                payload=self._layer_upstream,
+            )
+            self._layer_upstream_runtime_id = entry.runtime_id
+            self._layer_upstream_owner = owner_identity
+            self._layer_upstream_generation = entry.generation
+            logger.info(
+                "event=layer_upstream_registered node=%s operation=%s runtime=%s generation=%d",
+                self._serving_node_id, prepare_identity.get("operation_id"),
+                entry.runtime_id, entry.generation,
+            )
         return self._layer_upstream
 
     def _unload_supplied_layer_manager(self) -> None:

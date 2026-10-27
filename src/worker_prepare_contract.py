@@ -20,6 +20,22 @@ IDENTITY_FIELDS = frozenset({
 OPTIONAL_IDENTITY_FIELDS = frozenset({"load_spec_digest"})
 STAGE_IDENTITY_FIELDS = frozenset({"operation_id", "config_id", "generation", "assignment_id", "artifact_sha256"})
 
+# ★ 2026-10-28（#127）：`IDENTITY_FIELDS` 同时承载两类语义，此前被压进同一个复用键，
+#   导致 owner 一变就必须关闭并重建 native 运行时（实测末段 15–21 s）。
+#   见 `docs/跨operation运行时所有权转移协议-2026-10-27.md` §3.1。
+#
+#   `ARTIFACT_IDENTITY_FIELDS` 描述「这份权重是什么」，决定运行时**能否**复用；
+#   `OWNER_IDENTITY_FIELDS` 描述「谁在用它」，决定运行时**归谁**。
+#   复用判据只比较前者，后者的变化由所有权转移协议处理。
+ARTIFACT_IDENTITY_FIELDS = frozenset({
+    "model_id", "model_sha256", "stage_model_identity", "artifact_sha256",
+    "manifest_sha256", "source_model_id", "source_model_sha256",
+    "tokenizer_sha256", "layer_range", "total_layers", "hidden_size", "segment_mode",
+})
+OWNER_IDENTITY_FIELDS = frozenset({
+    "operation_id", "config_id", "generation", "assignment_id", "node_id",
+})
+
 
 class WorkerPrepareError(ValueError):
     def __init__(self, code: str):
@@ -45,6 +61,28 @@ def validate_stage_identity(value):
 
 def stage_identity(identity):
     return validate_stage_identity({key: identity[key] for key in STAGE_IDENTITY_FIELDS | OPTIONAL_IDENTITY_FIELDS if key in identity})
+
+
+def split_identity(identity):
+    """Split a validated prepare identity into artifact and owner halves.
+
+    Returns `(artifact_identity, owner_identity)`. Both halves together cover
+    exactly `IDENTITY_FIELDS` plus any optional field present, so no information
+    is dropped: a caller that compares only the artifact half is deliberately
+    ignoring ownership, and the ownership change must be carried by an explicit
+    transfer (see `docs/跨operation运行时所有权转移协议-2026-10-27.md`).
+    """
+    if ARTIFACT_IDENTITY_FIELDS & OWNER_IDENTITY_FIELDS:
+        raise WorkerPrepareError("invalid_identity_split_overlap")
+    if ARTIFACT_IDENTITY_FIELDS | OWNER_IDENTITY_FIELDS != IDENTITY_FIELDS:
+        raise WorkerPrepareError("invalid_identity_split_incomplete")
+    if not isinstance(identity, dict):
+        raise WorkerPrepareError("invalid_prepare_identity")
+    optional = {key: identity[key] for key in OPTIONAL_IDENTITY_FIELDS if key in identity}
+    artifact = {key: identity[key] for key in ARTIFACT_IDENTITY_FIELDS if key in identity}
+    artifact.update(optional)
+    owner = {key: identity[key] for key in OWNER_IDENTITY_FIELDS if key in identity}
+    return artifact, owner
 
 
 def validate_identity(value):
