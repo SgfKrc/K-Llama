@@ -42,6 +42,43 @@ _STRATEGY_REASON_CODES = frozenset({
 })
 
 
+def reuse_candidates(inventory: dict | None, capabilities: dict | None) -> tuple[list, str]:
+    """选出用于判定「段是否可复用」的清单，并报告证据来源。
+
+    ★ 2026-10-27（#135）：**优先以本次清点（inventory）为准，不以 capabilities 快照为准。**
+
+    capabilities 快照只在 hello / 能力变更时刷新。运维清掉段缓存后（磁盘满、迁移、手工
+    回收 —— 都是正常操作），worker 在下一次重扫前仍持有旧清单 ⇒ 若据此改判 `distribute`，
+    接收端会找不到文件、退化成真下载，比直接 `local_cut` 更差（实测卡在
+    11.5 MB / 1.98 GB 超过 7 分钟）。
+
+    worker 的 `inventory()` 现在返回 `artifacts`，且只有段文件真实存在并通过
+    `_verify_files`（尺寸 + 摘要）校验时才会列出。因此：
+
+    - 该键存在（新 worker）⇒ **一律以它为准，即使为空也不回退快照**，
+      否则会重新引入「删缓存后误判复用」。
+    - 该键缺失（旧 worker）⇒ 才回退快照，保持向后兼容。
+
+    返回 `(清单, 证据来源)`，来源取 `"inventory"` / `"capabilities"`，用于日志留痕。
+    """
+    reported = (inventory or {}).get("artifacts")
+    if isinstance(reported, list):
+        return reported, "inventory"
+    return list((capabilities or {}).get("layer_artifacts") or []), "capabilities"
+
+
+def reuse_artifact_matches(artifact: Any, manifest: dict) -> bool:
+    """段工件与待供段是否同身份：层区间 + 三项摘要全等。"""
+    return bool(
+        isinstance(artifact, dict)
+        and list(artifact.get("layer_range") or []) == list(manifest.get("layer_range") or [])
+        and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
+        and artifact.get("source_model_id") == manifest.get("source_model_id")
+        and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
+        and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")
+    )
+
+
 class ModelSupplyError(ValueError):
     def __init__(self, code: str, message: str, *, diagnostic: dict | None = None):
         super().__init__(message)
@@ -1936,41 +1973,41 @@ class ModelSupplyCoordinator:
                 #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
                 cached_hit = False
                 if strategy == "local_cut" and requested == "auto":
-                    try:
-                        control = getattr(self.scheduler, "_task_worker_control", None)
-                        snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
-                        # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
-                        caps = snapshot.get("capabilities") or snapshot
-                    except (AttributeError, KeyError, TypeError, ValueError):
-                        caps = {}
+                    # ★ 2026-10-27（#135）：**以本次清点报出的段为准，不以 capabilities 快照为准。**
+                    #   判据与理由见模块级 `reuse_candidates()`。
                     want_range = list(manifest.get("layer_range") or [])
-                    for artifact in caps.get("layer_artifacts") or []:
-                        if (isinstance(artifact, dict)
-                                and list(artifact.get("layer_range") or []) == want_range
-                                and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
-                                and artifact.get("source_model_id") == manifest.get("source_model_id")
-                                and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
-                                and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")):
-                            cached_hit = True
-                            break
+                    caps = {}
+                    if not isinstance(inventories[node_id].get("artifacts"), list):
+                        # 只有旧 worker 缺该键时才需要快照；新 worker 一律用清点结果。
+                        try:
+                            control = getattr(self.scheduler, "_task_worker_control", None)
+                            snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
+                            # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
+                            caps = snapshot.get("capabilities") or snapshot
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            caps = {}
+                    candidates, evidence = reuse_candidates(inventories[node_id], caps)
+                    cached_hit = any(
+                        reuse_artifact_matches(item, manifest) for item in candidates
+                    )
                 if cached_hit:
                     strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
                     logger.info(
                         "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
-                        "reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
-                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12], reason,
+                        "evidence=%s reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
+                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12], evidence, reason,
                     )
                 elif strategy == "local_cut" and requested == "auto":
                     # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
                     logger.info(
                         "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
-                        "advertised=%d artifact_shas=%s ranges=%s",
-                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12],
-                        len(caps.get("layer_artifacts") or []),
+                        "evidence=%s advertised=%d artifact_shas=%s ranges=%s",
+                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12], evidence,
+                        len(candidates),
                         [str(item.get("artifact_sha256"))[:12]
-                         for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                         for item in candidates if isinstance(item, dict)],
                         [item.get("layer_range")
-                         for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
+                         for item in candidates if isinstance(item, dict)],
                     )
                 # Do not attempt a new local cut when its staging reserve is already
                 # known infeasible; the receiver can still reuse its cached files.

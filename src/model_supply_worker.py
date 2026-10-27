@@ -677,12 +677,56 @@ class ModelSupplyWorker:
                 # The engine remains discoverable, but a new supply plan cannot
                 # admit it without a real runtime dtype and memory budget.
                 runtime = None
+        # ★ 2026-10-27（#135）：**段工件的存在性必须每次清点都重新确认**。
+        #
+        #   master 侧有一处优化：策略已判成 `local_cut` 之后，若发现 worker 手上有
+        #   身份完全一致的段，就改判 `distribute` 让接收端直接 hardlink 复用，避免
+        #   重裁（见 `model_supply.py` 的 `cached_hit`）。该判断原本只依据 worker
+        #   上报的 **capabilities 快照**，而快照只在 hello / 能力变更时刷新。
+        #
+        #   于是运维清掉段缓存后（磁盘满、迁移、手工回收——都是正常操作），worker
+        #   在下一次重扫前仍持有旧清单，master 误判"可复用" ⇒ 改判 `distribute`
+        #   ⇒ 接收端找不到文件 ⇒ 退化成真下载。实测这一步比直接 `local_cut` 更差：
+        #   卡在 11.5 MB / 1.98 GB 超过 7 分钟，重启 worker 让它重扫后才回落到
+        #   `local_cut` 并在 58.7 s 内完成。
+        #
+        #   这里把"此刻磁盘上真实存在、且已通过 `_verify_files`（尺寸 + 摘要）校验"
+        #   的段随清点结果一并报出。`selected_artifact_path()` 走的正是
+        #   `get_selected_model()` → `_verify_files()`，文件被删时会返回 None（或缺
+        #   清单文件），因此 master 只要以本次清点为准，立刻就能发现缓存已失效。
+        artifacts: list[dict] = []
+        try:
+            selected_path = self.selected_artifact_path()
+        except (OSError, SupplyError, ValueError):
+            selected_path = None
+        if selected_path is not None:
+            cut_manifest_path = selected_path.with_suffix(".manifest.json")
+            if not cut_manifest_path.is_file():
+                cut_manifest_path = Path(str(selected_path) + ".manifest.json")
+            cut_manifest = None
+            if cut_manifest_path.is_file():
+                try:
+                    cut_manifest = _json(cut_manifest_path)
+                except (OSError, SupplyError, ValueError):
+                    cut_manifest = None
+            if cut_manifest is not None:
+                layer_range = cut_manifest.get("source_layer_range")
+                if (isinstance(layer_range, list) and len(layer_range) == 2
+                        and all(isinstance(value, int) and not isinstance(value, bool)
+                                for value in layer_range)):
+                    artifacts.append({
+                        "layer_range": list(layer_range),
+                        "artifact_sha256": cut_manifest.get("artifact_sha256"),
+                        "source_model_id": cut_manifest.get("source_model_id"),
+                        "source_model_sha256": cut_manifest.get("source_model_sha256"),
+                        "tokenizer_sha256": cut_manifest.get("tokenizer_sha256"),
+                    })
         return {"node_id": node_id, "distributed": self._distributed(),
                 "disk_free_bytes": max(0, free), "memory_available_bytes": max(0, available_memory),
                 "memory_total_bytes": max(0, total_memory),
                 "local_cut": local_cut, "engines": engines,
                 "execution_device": str(getattr(config, "DEVICE", "cpu")), "pytorch_runtime": runtime,
-                "sources": sources}
+                "sources": sources, "artifacts": artifacts}
 
     @staticmethod
     def _record_transfer_counts(op: _Operation, data: Any) -> None:
