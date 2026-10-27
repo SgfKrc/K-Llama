@@ -1013,6 +1013,7 @@ def solve_pipeline_capacity(
     relay_claims: dict[str, tuple[int, int]] | None = None,
     prefer_all_workers: bool = False,
     required_node_id: str | None = None,
+    required_executors: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, Any]:
     """Return an all-or-nothing contiguous layer placement.
 
@@ -1161,6 +1162,42 @@ def solve_pipeline_capacity(
         }
     required_node_index = next((index for index, node in enumerate(usable)
                                 if node["node_id"] == required_node_id), None)
+    # ★ 2026-10-28（#140）：**必须参与的执行器集合**。
+    #
+    #   `required_node_id` 只表达"某一台必须参与"，粒度是裸 `node_id`，因此无法
+    #   表达"同机两个执行器中的一个必须参与"，也不支持多台同时强制。
+    #   实测（四机全部在线、Surface 已能正确广告 `layer_ranges=[[0,32]]` +
+    #   `models=[qwen3-5-9b]`）：求解目标 `capability_weighted_work_square` 是
+    #   **均衡近似**、不是 makespan，于是恒定选三机（makespan 160.8 ms）而不选
+    #   四机（112.8 ms，优 30%）。见 `已知问题记录.md` #140。
+    #
+    #   本参数给运维一个**不改目标函数**的解法：显式点名必须参与的执行器，
+    #   求解器把它们当作跳不过去的节点（与 `required_node_id` 同一机制）。
+    #   身份用 `(node_id, executor_id)`，缺省 `executor_id` 表示主执行器。
+    required_executor_keys = {
+        (str(node_id), str(executor_id or ""))
+        for node_id, executor_id in required_executors
+    }
+    missing_executors = sorted(
+        key for key in required_executor_keys
+        if not any((node["node_id"], str(node.get("executor_id") or "")) == key
+                   for node in usable)
+    )
+    if missing_executors:
+        return {
+            **base, "status": "rejected", "admitted": False,
+            "reason_code": "pipeline_required_executor_unavailable",
+            "reason": "required executor(s) have no usable model capacity: "
+                      + ", ".join(f"{node}#{executor}" if executor else node
+                                  for node, executor in missing_executors),
+            "required_executors": [
+                [node, executor] for node, executor in missing_executors
+            ],
+            "assignments": [], "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
+        }
     if required_node_id is not None and required_node_index is None:
         return {
             **base, "status": "rejected", "admitted": False,
@@ -1265,6 +1302,19 @@ def solve_pipeline_capacity(
             # on earlier nodes. Past its index, the skip branch below proves use.
             if required_node_index is not None and node_index <= required_node_index:
                 return None
+            # ★ 2026-10-28（#140）：集合版必须在**叶子**处校验 —— 排在其后的
+            #   强制执行器若还没被用到，这个候选就不合法。`search` 的 `used_count`
+            #   只计数、不带身份，所以这里直接查 `node_index` 覆盖范围：
+            #   任一 `required_executor_keys` 的执行器索引 >= `node_index` 即说明
+            #   它尚未被考虑过（跳过分支对该索引是禁止的）。
+            if required_executor_keys:
+                for key in required_executor_keys:
+                    key_index = next((
+                        index for index, node in enumerate(usable)
+                        if (node["node_id"], str(node.get("executor_id") or "")) == key
+                    ), None)
+                    if key_index is not None and key_index >= node_index:
+                        return None
             # ★ Y 档第二条：relay 段**算参与节点**（它承载远端段工件），只是不占本机容量
             #   ⇒ "分布式"的判据是 `本机层节点数 + relay 段数 >= 2`，而不是只看前者。
             #   否则 `master(0-8) + relay 段(8-24)` 这种**合法**拓扑会被误拒。
@@ -1275,9 +1325,15 @@ def solve_pipeline_capacity(
         if node_index >= len(usable):
             return None
         node = usable[node_index]
-        best = None if node["node_id"] == required_node_id else search(
-            node_index + 1, cursor, started, used_count, source_model_sha256,
-        )
+        # ★ 2026-10-28（#140）：集合内的执行器与 `required_node_id` 同一待遇 ——
+        #   不允许走"跳过本节点、由后续节点补齐"的分支。
+        _node_key = (node["node_id"], str(node.get("executor_id") or ""))
+        if node["node_id"] == required_node_id or _node_key in required_executor_keys:
+            best = None
+        else:
+            best = search(
+                node_index + 1, cursor, started, used_count, source_model_sha256,
+            )
         remaining = layer_budget - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count

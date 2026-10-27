@@ -42,6 +42,41 @@ _STRATEGY_REASON_CODES = frozenset({
 })
 
 
+def _required_executors() -> tuple[tuple[str, str], ...]:
+    """Observers named by `QLH_PIPELINE_REQUIRED_EXECUTORS` that must be placed.
+
+    ★ 2026-10-28（#140）：求解目标是 `capability_weighted_work_square`（均衡近似）
+    而非 makespan，因此**多一台可用设备不一定被选中** —— 实测四机全就绪时恒定退化为
+    三机，`[24,32)` 八层全压最慢的 android（makespan 160.8 ms），而四机方案只要
+    112.8 ms。该取舍属目标函数的已知局限（`capacity.py` 的注释自己记过一个 7% 的
+    背离例子），换目标函数需要重新论证 suffix optimum 的可加性，不适合临时改。
+
+    这里给运维一个显式出口：点名必须参与的执行器，求解器把它们当作跳不过去的节点。
+
+    格式：逗号分隔，`node` 表示该节点主执行器，`node#executor` 表示附加执行器。
+    例：`QLH_PIPELINE_REQUIRED_EXECUTORS=master,TABLET-2TLUCNU8`
+    """
+    raw = (os.environ.get("QLH_PIPELINE_REQUIRED_EXECUTORS") or "").strip()
+    if not raw:
+        return ()
+    parsed: list[tuple[str, str]] = []
+    for piece in raw.split(","):
+        token = piece.strip()
+        if not token:
+            continue
+        node_id, _, executor_id = token.partition("#")
+        node_id = node_id.strip()
+        executor_id = executor_id.strip()
+        if not node_id:
+            logger.warning(
+                "event=required_executors_invalid token=%r hint=格式为 node 或 node#executor",
+                token,
+            )
+            continue
+        parsed.append((node_id, executor_id))
+    return tuple(parsed)
+
+
 def reuse_candidates(inventory: dict | None, capabilities: dict | None) -> tuple[list, str]:
     """选出用于判定「段是否可复用」的清单，并报告证据来源。
 
@@ -247,9 +282,39 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
           if item.get("range_weight_bytes") else None)
          for item in projected],
     )
+    required_executors = _required_executors()
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
                                     require_distributed=True, prefer_all_workers=prefer_all_workers,
-                                    required_node_id="master")
+                                    required_node_id="master",
+                                    required_executors=required_executors)
+    # ★ 2026-10-28（#140）：**强制参与不得把可行方案逼成不可行**。
+    #
+    #   `required_executors` 是运维出口（点名必须参与的节点），但它与其它硬约束
+    #   可能互斥：实测（05:49）点名四机后 `master#cpu` 被 `layer_bounds=[8,24)`
+    #   钉住、`master` GPU 又装不下 `[0,8)` 以外的层 ⇒ 求解返回
+    #   `pipeline_candidate_layer_range_unsatisfied`（`master#cpu` 越界 9 次、
+    #   `master` 容量不足 5 次）⇒ 原本可成功的三机方案也一起没了。
+    #
+    #   这里做**一次降级重解**：点名集合导致无解时，退回不点名再解一次。
+    #   强制参与是"尽量用上"的偏好，不该比"能跑起来"更优先。
+    if required_executors and not result.get("admitted"):
+        fallback = solve_pipeline_capacity(
+            grouped, projected, safety_margin=safety_margin,
+            require_distributed=True, prefer_all_workers=prefer_all_workers,
+            required_node_id="master",
+        )
+        if fallback.get("admitted"):
+            logger.warning(
+                "event=required_executors_relaxed reason=%s enforced=%s "
+                "hint=点名集合与固定边界/容量互斥，已退回未点名方案；"
+                "要真正用上这些节点需同时放宽其 layer_bounds",
+                result.get("reason_code"), [list(key) for key in required_executors],
+            )
+            fallback["required_executors_relaxed"] = {
+                "enforced": [list(key) for key in required_executors],
+                "reason_code": result.get("reason_code"),
+            }
+            result = fallback
     logger.info(
         "event=supply_capacity_result admitted=%s reason=%s assignments=%s "
         "excluded_nodes=%s",
