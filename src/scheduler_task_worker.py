@@ -168,6 +168,20 @@ def keep_head_shim_available() -> bool:
     return bool(path) and Path(path).is_file()
 
 
+def _remote_accept_timeout_seconds() -> float:
+    """Accept-wait ceiling for remote layer stages (`QLH_REMOTE_ACCEPT_TIMEOUT_SECONDS`).
+
+    See `config.REMOTE_ACCEPT_TIMEOUT_SECONDS` for the measurement behind the
+    default. Read at construction time so a restart is what changes it — the
+    provider caches per node.
+    """
+    try:
+        import config
+        return float(getattr(config, "REMOTE_ACCEPT_TIMEOUT_SECONDS", 45.0))
+    except (ImportError, TypeError, ValueError):
+        return 45.0
+
+
 def _verified_layer_artifact_sha256(path) -> str:
     """Reuse the shared digest for the same complete live file version."""
     from model_supply_digest_cache import DigestCacheError, cached_sha256
@@ -1557,6 +1571,19 @@ class SchedulerTaskWorkerMixin:
                     send_message=lambda message, bound_node=node_id: (
                         self._send_task_worker_to_node(bound_node, message)
                     ),
+                    # ★ 2026-10-28：**allow accepting a slow link to arm a stage**.
+                    #
+                    #   默认 10 s 对本项目的实际链路不够。实测（06:00）同一 attempt：
+                    #   master `stage_cancel_sent` 05:59:55.345，y700 的 `stage_accept`
+                    #   06:00:22.358 才到达 —— 延迟 **27 s**，而 y700 侧早在 05:59:4x
+                    #   就已 `stage execute start`（它在正常算）。accept 帧在这条链上
+                    #   停滞 ⇒ 必然判超时 ⇒ 端到端 `remote_accept_timeout`，
+                    #   而 worker 其实一直在工作。
+                    #
+                    #   tailscale 对该机的路径经 DERP 中继，实测 RTT 757-833 ms，
+                    #   加上 161-token prefill 期间 CPU 占满 ⇒ accept 帧排队远超 10 s。
+                    #   调到 45 s 覆盖实测量级；上限仍是 adapter 的 60 s 夹逼。
+                    accept_timeout_seconds=_remote_accept_timeout_seconds(),
                 )
                 self._remote_task_worker_providers[node_id] = provider
             return provider

@@ -470,6 +470,21 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
         "QLH_LAYER_COST_MS_DEFAULT", 0.0, min_val=0.0, max_val=100000.0,
     )
 
+    # 2026-10-28：远端 stage 的 **accept 等待上限**（秒）。
+    #
+    #   默认 10 s 对本项目的实际链路不够。实测（06:00）同一 attempt：master
+    #   `stage_cancel_sent` 05:59:55.345，y700 的 `stage_accept` 06:00:22.358
+    #   才到达 —— 延迟 **27 s**，而 y700 侧在 05:59:4x 就已 `stage execute start`
+    #   （它一直在正常算）。accept 帧停滞 ⇒ 必然判超时 ⇒ 端到端
+    #   `remote_accept_timeout`，症状看起来像"远端不接活"，实际是本端等得不够久。
+    #
+    #   tailscale 对该机的路径经 DERP 中继（RTT 实测 757-833 ms），且 161-token
+    #   prefill 期间对端 CPU 占满 ⇒ accept 帧排队远超 10 s。
+    #   adapter 侧会把值夹逼到 [0.1, 60]。
+    REMOTE_ACCEPT_TIMEOUT_SECONDS = _env_float(
+        "QLH_REMOTE_ACCEPT_TIMEOUT_SECONDS", 45.0, min_val=0.1, max_val=60.0,
+    )
+
     def layer_cost_ms_by_node() -> dict[str, float]:
         """`QLH_LAYER_COST_MS` 的解析结果：`{node_id: ms_per_layer}`。
 
