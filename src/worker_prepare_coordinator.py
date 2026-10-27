@@ -239,7 +239,6 @@ class WorkerPrepareCoordinatorMixin:
         return delivered
 
     def _handle_worker_prepare_ack(self, node_id, payload, *, defer_native_work=False):
-        payload = {key: value for key, value in payload.items() if key != "control_certificate"}
         try:
             ack = validate_ack(payload)
         except WorkerPrepareError as exc:

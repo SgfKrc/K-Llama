@@ -26,7 +26,7 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_JSON_NESTING_DEPTH = 64
 FORWARD_TIMEOUT_SECONDS = 30.0
 _OPERATION_ID = re.compile(r"supply_[0-9a-f]{32}")
-_REQUEST_HEADERS = ("Authorization", "X-Request-ID", "X-QLH-Control-Certificate")
+_REQUEST_HEADERS = ("X-Request-ID",)
 _RESPONSE_HEADERS = ("Content-Type", "X-Request-ID", "X-QLH-Error-Code", "Retry-After")
 
 
@@ -243,8 +243,8 @@ def _success_json(content: bytearray):
 async def forward_intent(scheduler, request: Request, suffix: str, body=None):
     """Return successful JSON, or a Response preserving the master's error body.
 
-    Callers must retain their normal source/auth boundary. Only the original
-    Bearer and control certificate are relayed; neither is created or elevated.
+    Callers must retain their normal machine-source boundary. No account token
+    is relayed.
     A timeout after a write does not prove that the master rejected the intent.
     """
     if request is None:

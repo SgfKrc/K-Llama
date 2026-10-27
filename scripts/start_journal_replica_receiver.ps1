@@ -3,9 +3,9 @@
   Start (or dry-run) a journal replica receiver on this node.
 
 .DESCRIPTION
-  #93's quorum barrier only counts replicas that are actually running and
-  durable, so the receiver must be startable from an operator script -- not only
-  from an ad-hoc Python snippet.
+  Explicit journal recovery requires an available durable donor, so the receiver
+  must be startable from an operator script -- not only from an ad-hoc Python
+  snippet.
 
   The receiver itself is scripts/start_journal_replica_receiver.py; this wrapper
   exists for Windows deployments (find python, check the secret is present in the

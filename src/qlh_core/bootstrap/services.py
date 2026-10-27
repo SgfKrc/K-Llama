@@ -5,7 +5,6 @@ import threading
 
 class RuntimeServices:
     def __init__(self, config, *, host=None, callbacks=None):
-        from cluster_fence import ControlFence
         from model_host import ModelHost
         from scheduler import Scheduler
         from qlh_core.adapters.local_store import RuntimeLocalStore
@@ -21,18 +20,15 @@ class RuntimeServices:
         self._stage_host_lock = threading.RLock()
         self.host = host if host is not None else ModelHost(initial_quant=config.quant_type, environment=config.environment_snapshot())
         self.host.configure_catalog(self.catalog_prepare)
-        self.fence = ControlFence.from_environment(config.environment_snapshot())
         self.scheduler = Scheduler(host=self.host, runtime_config=config)
         self.requests = self.scheduler._execution_app.requests
         self.runtime_controller = getattr(self.host, "runtime_controller", None)
         self.scheduler._catalog = self.catalog
-        self.scheduler.set_control_fence(self.fence)
         if callbacks is not None:
             self.scheduler.configure_callbacks(callbacks)
             self.host.configure_scheduler_callbacks(callbacks)
         self.scheduler._worker_prepare.configure_runtime(self.stage_host)
         self.participation = self.scheduler._participation
-        self.auto_role = None
         self.journal = None
         self._closing = False
         self._closed = False
@@ -65,20 +61,9 @@ class RuntimeServices:
             "_bootstrap_api_port": lambda: _bootstrap_api_port(environment=config.environment_snapshot()),
         })
 
-    def configure_authority(self):
-        if self.config.node_role == "auto" and self.auto_role is None:
-            from cluster_auto_role_runtime import install_auto_role_controller
-            self.auto_role = install_auto_role_controller(
-                self.scheduler, self.fence, environment=self.config.environment_snapshot())
-            self.fence = self.scheduler._control_fence
-        return self.auto_role
-
     def start(self, runtime):
         self.store.initialize()
         runtime.mark_component("local_store", True)
-        if runtime.stop_requested.is_set():
-            return
-        self.configure_authority()
         if runtime.stop_requested.is_set():
             return
         self.scheduler.start(host=self.config.server_ip, port=self.config.server_port)
@@ -102,8 +87,6 @@ class RuntimeServices:
             # dependency graph for a later close instead of blocking in unload.
             raise ExceptionGroup("runtime cleanup failed", [exc]) from exc
         actions = []
-        if self.auto_role is not None:
-            actions.append(self.auto_role.close)
         if self._stage_host is not None:
             actions.append(self._stage_host.close)
         if self.journal is not None:

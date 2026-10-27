@@ -412,7 +412,7 @@ def _isolate_api_runtime(_reset_process_wide_chat_state):
             "_runtime_readiness": runtime._readiness,
             "_runtime_startup_done": runtime.startup_done,
             "_runtime_lifecycle_lock": runtime._lock,
-            "_join_ledger_instance": None,
+            "_bootstrap_nonce_ledger_instance": None,
         }
         for name, value in slots.items():
             isolation.setattr(api, name, value)

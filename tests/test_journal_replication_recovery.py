@@ -1,14 +1,4 @@
-"""#93：落后副本的**主动追赶**（跨机重建的拉取方向）。
-
-链路对偶关系：
-- 栅栏（推）：`replicate_journal_to_quorum` ⇒ 多数耐久才回 OK；
-- 追赶（拉）：`request_checkpoint` + `recover_journal_prefix` ⇒ 落后的一方向持有完整
-  前缀的对端讨回一个**已自洽**的 checkpoint 并应用，之后才允许接管。
-
-两条硬约束由测试钉住：
-1. 不自洽的副本**导出不了** checkpoint（不许把没人担保的前缀当已提交发出去）；
-2. 一个对端都没成功 ⇒ `recovered=False`（调用方必须继续拒绝接管）。
-"""
+"""Journal prefix recovery, commitment watermarks, and replica consistency."""
 
 from __future__ import annotations
 
@@ -19,8 +9,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from cluster_auto_role_runtime import AutoRoleRuntimeError, JournalPrefixAuthority  # noqa: E402
-from cluster_control_contract import CommitWatermark  # noqa: E402
+from journal_replication_authority import (  # noqa: E402
+    CommitWatermark,
+    JournalPrefixAuthority,
+    JournalReplicationAuthorityError,
+)
 from journal_replication import (  # noqa: E402
     DurableJournalReplica,
     JournalReplicationError,
@@ -75,19 +68,117 @@ def _replica(tmp_path: Path, name: str) -> DurableJournalReplica:
     )
 
 
+def _populated_replica(tmp_path: Path, name: str, sequences: int) -> DurableJournalReplica:
+    source = SQLiteTaskJournal(str(tmp_path / f"{name}-source.sqlite3"))
+    for sequence in range(1, sequences + 1):
+        _append(source, sequence)
+    replica = _replica(tmp_path, name)
+    _apply(source, replica)
+    source.close()
+    return replica
+
+
 def _apply(source: SQLiteTaskJournal, replica: DurableJournalReplica, *, created_at: float = 1.0):
     return replica.apply_checkpoint(build_checkpoint(
         source, source_node_id=SRC, stream_id=STREAM, workflow_id=WF, created_at=created_at,
     ))
 
 
+def test_authority_held_and_propose_reflect_durable_prefix(tmp_path):
+    replica = _populated_replica(tmp_path, "held", 3)
+    try:
+        authority = JournalPrefixAuthority(replica, workflows=(WF,))
+        held = authority.held(WF)
+        assert held is not None
+        assert held.last_sequence == 3
+        assert authority.propose() == (held,)
+    finally:
+        replica.close()
+
+
+def test_authority_truncates_uncommitted_tail_then_requires_catch_up(tmp_path):
+    replica = _populated_replica(tmp_path, "truncate", 5)
+    try:
+        authority = JournalPrefixAuthority(replica, workflows=(WF,))
+        committed = authority.held(WF)
+        assert committed is not None and committed.last_sequence == 5
+
+        stale = CommitWatermark(workflow_id=WF, last_sequence=3, checkpoint_digest="d" * 64)
+        with pytest.raises(JournalReplicationAuthorityError) as excinfo:
+            authority.enforce(type("Commitment", (), {"commit_watermark": (stale,)})())
+        assert excinfo.value.code == "committed_prefix_behind"
+        assert authority.truncated[WF] == 2
+        assert replica.durable_prefix(WF)["last_sequence"] == 3
+    finally:
+        replica.close()
+
+
+def test_authority_rejects_prefix_behind_the_commitment(tmp_path):
+    replica = _populated_replica(tmp_path, "behind", 3)
+    try:
+        authority = JournalPrefixAuthority(replica, workflows=(WF,))
+        ahead = authority.held(WF)
+        assert ahead is not None
+        later = CommitWatermark(workflow_id=WF, last_sequence=9, checkpoint_digest=ahead.checkpoint_digest)
+        with pytest.raises(JournalReplicationAuthorityError) as excinfo:
+            authority.enforce(type("Commitment", (), {"commit_watermark": (later,)})())
+        assert excinfo.value.code == "committed_prefix_behind"
+    finally:
+        replica.close()
+
+
+def test_authority_rejects_divergent_prefix(tmp_path):
+    replica = _populated_replica(tmp_path, "divergent", 3)
+    try:
+        authority = JournalPrefixAuthority(replica, workflows=(WF,))
+        held = authority.held(WF)
+        assert held is not None
+        forked = CommitWatermark(workflow_id=WF, last_sequence=3, checkpoint_digest="e" * 64)
+        with pytest.raises(JournalReplicationAuthorityError) as excinfo:
+            authority.enforce(type("Commitment", (), {"commit_watermark": (forked,)})())
+        assert excinfo.value.code == "committed_prefix_forked"
+    finally:
+        replica.close()
+
+
+def test_authority_accepts_matching_commitment(tmp_path):
+    replica = _populated_replica(tmp_path, "matching", 3)
+    try:
+        authority = JournalPrefixAuthority(replica, workflows=(WF,))
+        held = authority.held(WF)
+        assert held is not None
+        authority.enforce(type("Commitment", (), {"commit_watermark": (held,)})())
+        assert authority.truncated == {}
+    finally:
+        replica.close()
+
+
 def _settings(peers, **overrides) -> JournalReplicationSettings:
     base = dict(
         enabled=True, source_node_id=SRC, stream_id=STREAM, replica_path="x",
-        timeout_s=2.0, secret=SECRET, quorum_peers=tuple(peers),
+        timeout_s=2.0, secret=SECRET, recovery_peers=tuple(peers),
     )
     base.update(overrides)
     return JournalReplicationSettings(**base)
+
+
+def test_from_env_reads_recovery_donors_and_public_reports_them(monkeypatch):
+    monkeypatch.setenv("QLH_JOURNAL_REPLICATION_ENABLED", "1")
+    monkeypatch.setenv("QLH_JOURNAL_REPLICATION_SOURCE_NODE_ID", SRC)
+    monkeypatch.setenv("QLH_JOURNAL_REPLICATION_REPLICA_PATH", "x")
+    monkeypatch.setenv("QLH_JOURNAL_REPLICATION_SECRET", SECRET.decode())
+    monkeypatch.setenv(
+        "QLH_JOURNAL_REPLICATION_RECOVERY_PEERS",
+        "10.0.0.1:9001,10.0.0.2:9002,10.0.0.1:9001",
+    )
+
+    settings = JournalReplicationSettings.from_env()
+
+    assert settings.recovery_peers == (("10.0.0.1", 9001), ("10.0.0.2", 9002))
+    assert settings.public()["recovery_peers"] == ["10.0.0.1:9001", "10.0.0.2:9002"]
+    assert "quorum" not in settings.public()
+    assert SECRET.decode() not in repr(settings.public())
+    settings.validate()
 
 
 def test_export_checkpoint_refuses_an_inconsistent_replica(tmp_path):
@@ -225,8 +316,44 @@ def test_authority_without_recovery_still_refuses(tmp_path):
     _apply(source, behind)
     authority = JournalPrefixAuthority(behind, workflows=(WF,))
     target = CommitWatermark(workflow_id=WF, last_sequence=3, checkpoint_digest="f" * 64)
-    with pytest.raises(AutoRoleRuntimeError) as excinfo:
+    with pytest.raises(JournalReplicationAuthorityError) as excinfo:
         authority.enforce(type("C", (), {"commit_watermark": (target,)})())
     assert excinfo.value.code == "committed_prefix_behind"
     behind.close()
     source.close()
+
+
+@pytest.mark.parametrize("operation", ["truncate", "checkpoint"])
+def test_recovery_transaction_rolls_back_when_permission_check_fails(tmp_path, operation):
+    from journal_replication import build_checkpoint
+    from tests.test_journal_commit_truncate import SOURCE, STREAM, _replica_with
+
+    source, existing, _ = _replica_with(tmp_path, "wf-permission", 5)
+    replica = existing if operation == "truncate" else DurableJournalReplica(
+        tmp_path / "empty-permission.sqlite3", source_node_id=SOURCE, stream_id=STREAM)
+    calls = []
+
+    def check():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("write permission expired before commit")
+
+    before = replica.durable_prefix("wf-permission")
+    try:
+        with pytest.raises(RuntimeError, match="permission expired"):
+            if operation == "truncate":
+                replica.truncate_to("wf-permission", last_sequence=3, permission_check=check)
+            else:
+                checkpoint = build_checkpoint(
+                    source, source_node_id=SOURCE, stream_id=STREAM,
+                    workflow_id="wf-permission", created_at=1.0,
+                )
+                replica.apply_checkpoint(checkpoint, permission_check=check)
+        assert len(calls) == 2
+        assert replica.durable_prefix("wf-permission") == before
+        assert replica.truncated_watermark("wf-permission") == ""
+    finally:
+        source.close()
+        existing.close()
+        if replica is not existing:
+            replica.close()

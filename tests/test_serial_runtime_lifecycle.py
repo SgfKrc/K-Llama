@@ -37,10 +37,8 @@ initial_constructor = tcp_comm.TCPClient.__init__
 def test_01_leave_constructed_owners(monkeypatch, tmp_path):
     runtime = api_server._get_app_runtime()
     services = runtime.services
-    ledger = api_server._get_join_ledger()
-    ledger._private_store.set("test-pending", "predecessor")
+    ledger = api_server._get_bootstrap_nonce_ledger()
     seen.update(runtime=runtime, services=services, ledger=ledger,
-                private_bytes=ledger._private_store.path.read_bytes(),
                 expected_root=tmp_path)
     # Match hello-owner-worker: a synthetic registered client retires its recv
     # loop, handing off to a real delayed retry. It must be stopped before any
@@ -78,11 +76,10 @@ def test_02_audit_teardown_and_current_paths(tmp_path):
     assert Path(services.store.path).parent == tmp_path
     with services.store.scope():
         assert Path(local_store._sqlite_path()).parent == tmp_path
-    ledger = api_server._get_join_ledger()
+    ledger = api_server._get_bootstrap_nonce_ledger()
     assert ledger is not seen["ledger"]
     assert Path(ledger.path).parent == tmp_path
-    assert ledger._private_store.get("test-pending") == ""
-    assert seen["ledger"]._private_store.path.read_bytes() == seen["private_bytes"]
+    assert not Path(ledger.path).with_name("cluster_join_secrets.json").exists()
 ''')
     result = pytester.runpytest_subprocess("--tb=short", timeout=90)
     result.assert_outcomes(passed=1 if predecessor_fails else 2,

@@ -2,7 +2,7 @@
 
 A Tailnet address is not a credential. Extra source admission requires the
 master's live HMAC-authenticated, ACK-confirmed TCP registration and its real
-socket peer. Bearer auth and the master control fence remain separate gates.
+socket peer. Account sessions are not part of this gate.
 """
 from __future__ import annotations
 

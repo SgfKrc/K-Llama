@@ -997,7 +997,6 @@ class SchedulerSidecarMixin:
 
     def bind_model_runtime_contract(self, profile: str, model_id: str) -> dict:
         """Create an auditable, path-free contract from MODEL-FLEET capacity."""
-        self._require_control_write("cluster.model_runtime.contract.bind")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError(
                 "model runtime contract binding is available only on the master node"
@@ -1134,7 +1133,6 @@ class SchedulerSidecarMixin:
         *, contract_id: Optional[str] = None,
     ) -> dict:
         """Start an explicit experimental chain only from a supplied contract."""
-        self._require_control_write("cluster.model_runtime.sidecar.begin")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         persisted_contract_id = ""
@@ -1166,7 +1164,6 @@ class SchedulerSidecarMixin:
         return {"profile": profile, **result, "production_admitted": False}
 
     def release_model_runtime_sidecar(self, profile: str) -> dict:
-        self._require_control_write("cluster.model_runtime.sidecar.release")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         active_contract_id = self._model_runtime_active_contract_id(profile)
@@ -1191,7 +1188,6 @@ class SchedulerSidecarMixin:
         return {"profile": profile, **result, "production_admitted": False}
 
     def cancel_model_runtime_sidecar(self, profile: str) -> dict:
-        self._require_control_write("cluster.model_runtime.sidecar.cancel")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         active_contract_id = self._model_runtime_active_contract_id(profile)

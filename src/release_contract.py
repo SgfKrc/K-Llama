@@ -17,7 +17,7 @@ from typing import Any, Mapping, MutableMapping
 
 CONTRACT_FILENAME = "release-contract.json"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
-_NODE_ROLES = {"master", "client", "auto"}
+_NODE_ROLES = {"master", "client"}
 
 
 class ReleaseContractError(RuntimeError):

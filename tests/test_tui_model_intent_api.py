@@ -12,7 +12,7 @@ from tui_shared import MODEL_INTENT_STATUSES, format_model_intent, model_intent_
 OP = "supply_" + "a" * 32
 
 
-def test_intent_transport_paths_payload_and_auth(monkeypatch):
+def test_intent_transport_paths_payload_without_account_auth(monkeypatch):
     calls = []
 
     def urlopen(request, timeout):
@@ -22,7 +22,7 @@ def test_intent_transport_paths_payload_and_auth(monkeypatch):
         return io.BytesIO(json.dumps({"schema_version": 2, "revision": 7, "identity": {"boot_id": "tui-test"}, "observed_at": 100, "validity": "valid", "operation_id": OP, "status": "queued"}).encode())
 
     monkeypatch.setattr(api_module.urllib.request, "urlopen", urlopen)
-    api = ApiClient(auth_token="fixture-token")
+    api = ApiClient()
     api_module.create_model_intent(api, "master-model", engine="llama_cpp", quant_type="Q4_K_M")
     api_module.get_model_intent_catalog(api)
     api_module.current_model_intent(api)
@@ -37,7 +37,7 @@ def test_intent_transport_paths_payload_and_auth(monkeypatch):
     assert calls[0][2] == {"model_id": "master-model", "engine": "llama_cpp", "quant_type": "Q4_K_M",
                            "strategy": "auto", "timeout_seconds": 3600}
     assert calls[-1][2] == {}
-    assert all(headers.get("Authorization") == "Bearer fixture-token" for *_, headers in calls)
+    assert all("Authorization" not in headers for *_, headers in calls)
     assert all(url.startswith(api.base_url) for _, url, *_ in calls)
 
 
@@ -145,7 +145,7 @@ def test_chat_streaming_mode_is_explicit_in_local_endpoint_request(monkeypatch, 
         calls.append((request.method, request.full_url, json.loads(request.data), dict(request.header_items())))
         return io.BytesIO(b'data: {"done":true,"response":"forwarded-answer"}\n\n')
     monkeypatch.setattr(api_module.urllib.request, "urlopen", urlopen)
-    api = ApiClient(host="local-worker", auth_token="fixture-token")
+    api = ApiClient(host="local-worker")
     assert list(api_module.iter_chat_payloads(
         api, "hello", streaming_mode=mode, routing_preference="distributed_required",
     )) == [{"done": True, "response": "forwarded-answer"}]
@@ -153,7 +153,7 @@ def test_chat_streaming_mode_is_explicit_in_local_endpoint_request(monkeypatch, 
     assert (method, url) == ("POST", api.base_url + "/api/chat/stream")
     assert body["streaming_mode"] == expected
     assert body["routing_preference"] == "distributed_required"
-    assert headers["Authorization"] == "Bearer fixture-token"
+    assert "Authorization" not in headers
     assert "caller_host" not in body
     assert len(calls) == 1
 

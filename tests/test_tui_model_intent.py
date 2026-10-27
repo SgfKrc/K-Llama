@@ -643,7 +643,7 @@ def test_main_chat_request_uses_owner_mode_and_binding_role(monkeypatch, mode, i
         api.mode = mode
         if is_master is not None:
             api.catalog["binding"]["is_master"] = is_master
-        api._request_headers = tui_api.ApiClient(auth_token="chat-fixture")._request_headers
+        api._request_headers = tui_api.ApiClient()._request_headers
         if route is None:
             app = tt.KoakumaApp(api, interval=2, enable_thinking=False)
         else:
@@ -668,7 +668,7 @@ def test_main_chat_request_uses_owner_mode_and_binding_role(monkeypatch, mode, i
             assert body["routing_preference"] == expected_route
             assert body["enable_thinking"] is False
             assert app.routing_preference == ("auto" if route is None else route)
-            assert headers["Authorization"] == "Bearer chat-fixture"
+            assert "Authorization" not in headers
             assert "caller_host" not in body
             assert all(method == "GET" for method, _, _ in api.calls), "chat must not write mode or select a model"
     asyncio.run(run())

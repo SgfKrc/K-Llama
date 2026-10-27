@@ -87,10 +87,6 @@ from gemma4_pipeline_sidecar import (
     Gemma4PipelineSidecarSession,
     Gemma4SidecarError,
 )
-from cluster_fence import ControlFence
-from cluster_auto_role import AutoRoleController
-from cluster_handoff import HandoffCoordinator
-
 from execution_provider import (
     ModelIdentity as TaskModelIdentity,
     StageRequest as TaskProviderStageRequest,
@@ -147,7 +143,6 @@ assert_worker_liveness_thresholds(HEARTBEAT_INTERVAL)
 
 from scheduler_task_worker import SchedulerTaskWorkerMixin, _TaskWorkerActiveAttempt
 from scheduler_cluster import SchedulerClusterMixin
-from scheduler_auto_role import SchedulerAutoRoleMixin
 from scheduler_pipeline import SchedulerPipelineMixin
 # ★ 2026-10-07（DIST-NEXT-7）：A1 隔离状态自证（独立 namespace，启动即见）。
 from relay_a1_legacy import log_isolation_status
@@ -430,7 +425,7 @@ def _local_cpu_layer_artifacts(records) -> list:
 
 class Scheduler(
     SchedulerSidecarMixin, SchedulerTaskWorkerMixin,
-    SchedulerAutoRoleMixin, SchedulerClusterMixin, SchedulerPipelineMixin,
+    SchedulerClusterMixin, SchedulerPipelineMixin,
 ):
     """
     主节点调度器
@@ -476,14 +471,6 @@ class Scheduler(
         # 推理宿主默认使用全局单例；回调由 API composition root 以具名
         # Protocol bundle 注入，避免 scheduler 反向依赖 api_server。
         self._host = host if host is not None else get_model_host()
-        self._control_fence: ControlFence | None = None
-        self._auto_role_controller: AutoRoleController | None = None
-        self._auto_role_binding_ready = False
-        self._auto_role_bound_role = None
-        self._auto_role_binding_event = threading.Event()
-        self._auto_role_binding_lock = threading.Lock()
-        self._auto_role_binding_thread = None
-        self._handoff_coordinator: HandoffCoordinator | None = None
         self._callbacks = callbacks if callbacks is not None else getattr(
             self._host, "scheduler_callbacks", None,
         )
@@ -646,7 +633,6 @@ class Scheduler(
         # 最大节点数（可动态调整）
         self._max_nodes: int = MAX_NODES
         self._master_connect_lock = threading.Lock()
-        self._role_transition_lock = threading.Lock()
         self._client_health_thread: Optional[threading.Thread] = None
         self._client_health_start_lock = threading.Lock()
         self._layer_config_retry_thread: Optional[threading.Thread] = None
@@ -655,15 +641,6 @@ class Scheduler(
         self._participation = ParticipationService(enabled=self._runtime_settings.get("DISTRIBUTED_INFERENCE_ENABLED", True))
         self._local_device_profile: Optional[dict] = {}
         self._runtime_layer_override: Optional[list] = None
-        self._ha_state_lock = threading.RLock()
-        self._ha_state_loaded = False
-        self._ha_state: dict = {
-            "spare_master": None,
-            "spare_master_active": False,
-            "pending_new_master_id": "",
-            "transfer_logs": [],
-            "spare_master_logs": [],
-        }
         self._task_worker_control = TaskWorkerControlPlane(
             health_timeout_seconds=task_worker_control_plane_health_timeout_seconds(
                 HEARTBEAT_INTERVAL,
@@ -789,41 +766,6 @@ class Scheduler(
         #     「检查后设置」两边都会通过 ⇒ 必须在 `_start_lock` 内占位。
         self._startup_cancel_event.clear()
 
-        # P4.5 HA-ROLE-AUTO-01: construct and start the quorum-backed role
-        # controller at the composition root. Missing key/peer configuration
-        # is reduced to read-only instead of falling back to a static master.
-        if self._runtime_setting("NODE_ROLE") == "auto":
-            runtime = getattr(self, "_auto_role_runtime", None)
-            if getattr(self, "_auto_role_controller", None) is None:
-                try:
-                    from cluster_auto_role_runtime import install_auto_role_controller
-
-                    runtime = install_auto_role_controller(self, self._control_fence, **({"environment": self._runtime_config.environment_snapshot()} if self._runtime_config is not None else {}))
-                except Exception as exc:
-                    from cluster_auto_role import AutoRoleController
-
-                    authority = self._control_fence.authority if self._control_fence is not None else None
-                    self.set_auto_role_controller(
-                        AutoRoleController(
-                            str(self._runtime_setting("NODE_ID") or "auto-node"),
-                            mode="auto",
-                            authority=authority,
-                            fence=self._control_fence,
-                        )
-                    )
-                    runtime = None
-                    logger.error(
-                        "auto role configuration unavailable; entering read-only: %s",
-                        getattr(exc, "code", type(exc).__name__),
-                    )
-            available = runtime.available_voter_ids if runtime is not None else None
-            decision = self.start_auto_role(available_voter_ids=available)
-            logger.info(
-                "event=auto_role_start accepted=%s state=%s runtime_role=%s reason=%s",
-                decision.get("accepted"), decision.get("state"),
-                decision.get("runtime_role"), decision.get("reason"),
-            )
-
         self._model_control.start()
         self._execution_app.requests.start()
         self.init_nodes()
@@ -862,8 +804,6 @@ class Scheduler(
             try:
                 server = create_server(bind_host, actual_port)
                 self._tcp_server = server
-                if self._control_fence is not None:
-                    server.set_control_fence(self._control_fence)
                 server.start(
                     on_message=self._bind_tcp_server_callback(
                         server, self._on_tcp_message,
@@ -894,32 +834,9 @@ class Scheduler(
 
                 # ★ MAC 不匹配时的处理策略
                 if self._master_identity_reason == "mac_mismatch":
-                    # 尝试在本机 bootstrap 配置或 Tailnet 中发现已确认的主节点。
-                    discovery = self.discover_master()
-                    if discovery.get("found"):
-                        # bootstrap/Tailnet 发现已确认主节点 → 自动切换为从节点
-                        stale_note = "（心跳过期，IP 可能已变更）" if discovery.get("stale") else ""
-                        logger.warning(
-                            f"⛔ 主节点身份验证失败！本机 MAC 与本地 SQLite 记录不匹配。\n"
-                            f"   已发现主节点 ({discovery['master_host']}:{discovery['master_port']}){stale_note}，\n"
-                            f"   自动切换为从节点模式并尝试连接..."
-                        )
-                        # 启动后台线程处理切换（避免阻塞 start()）
-                        threading.Thread(
-                            target=self._auto_switch_to_client,
-                            args=(discovery["master_host"], discovery["master_port"]),
-                            name="auto-switch-client",
-                            daemon=True,
-                        ).start()
-                    else:
-                        # 未发现其他主节点：保留本机服务，但不覆盖已有身份记录。
-                        logger.error(
-                            f"⛔ 主节点身份验证失败 — 拒绝覆盖本机 SQLite 身份记录！\n"
-                            f"   本机 MAC 与已记录身份不匹配，且未发现其他主节点。\n"
-                            f"   如需更换主节点机器，请先在原主节点的后台管理中"
-                            f"使用「重置主节点身份」功能。\n"
-                            f"   当前将以单机模式运行（不覆盖本机 SQLite 身份）。"
-                        )
+                    logger.error(
+                        "主节点身份校验失败；保持静态 master 配置并拒绝覆盖身份记录。"
+                    )
                 else:
                     if self._tcp_server and self._tcp_server._running:
                         port_text = self._tcp_server.port
@@ -936,12 +853,6 @@ class Scheduler(
                             "主节点 TCP 未监听，跳过主节点地址广告；"
                             "本地推理仍可用"
                         )
-                # 检查是否需要向备用主节点发送接管通知（转让后新主节点启动）
-                threading.Thread(
-                    target=self.deactivate_spare_master_on_startup,
-                    name="spare-deactivate",
-                    daemon=True,
-                ).start()
             else:
                 logger.info(f"调度器已启动（分布式模式，从节点），监听 {bind_host}:{actual_port}")
                 # 从节点启动后台线程：监控主节点健康状态 + 自动重连
@@ -963,23 +874,6 @@ class Scheduler(
             self._execution_app.requests.start()
             logger.info("流水线请求队列已就绪")
 
-        # 已经是 client 的节点由上面的 auto-connect 唯一路径处理；这里只处理
-        # 尚未确认身份、可能需要从 provisional master 切换的节点。
-        if (self._effective_role() == "master"
-                and self._master_identity_reason != "startup_deferred"
-                and self.can_join_existing_master()):
-            threading.Thread(
-                target=self._auto_join_tailnet_master_on_startup,
-                name="tailnet-master-discovery",
-                daemon=True,
-            ).start()
-
-        self._auto_role_bound_role = self._effective_role()
-        self._auto_role_binding_ready = True
-        runtime = getattr(self, "_auto_role_runtime", None)
-        if runtime is not None:
-            runtime.tcp_port = self._tcp_server.port if self._tcp_server is not None else 0
-            runtime.start_lease_renewal(self._auto_role_controller, on_decision=self._on_auto_role_decision)
 
     def _start_deferred_network_identity(self) -> None:
         """Schedule network address, identity, and discovery work after start."""
@@ -1008,45 +902,15 @@ class Scheduler(
 
             if self._effective_role() != "master":
                 return
-            if self._auto_role_controller is not None and self._auto_role_controller.mode == "auto":
-                if self._tcp_server is not None:
-                    with self._nodes_lock:
-                        if "master" in self.nodes:
-                            self.nodes["master"].address = f"{self._lan_ip}:{self._tcp_server.port}"
-                return
             self._verify_master_identity()
             if self._master_identity_reason == "mac_mismatch":
-                discovery = self.discover_master()
-                if discovery.get("found"):
-                    logger.warning(
-                        "master identity mismatch; switching to discovered master "
-                        "%s:%s",
-                        discovery["master_host"], discovery["master_port"],
-                    )
-                    threading.Thread(
-                        target=self._auto_switch_to_client,
-                        args=(discovery["master_host"], discovery["master_port"]),
-                        name="auto-switch-client",
-                        daemon=True,
-                    ).start()
-                else:
-                    logger.error(
-                        "master identity mismatch; no confirmed master discovered",
-                    )
+                logger.error("master identity mismatch; static role remains master")
             elif self._tcp_server and self._tcp_server._running:
                 if "master" in self.nodes:
                     self.nodes["master"].address = (
                         f"{self._lan_ip}:{self._tcp_server.port}"
                     )
 
-            if (self._master_identity_reason != "mac_mismatch"
-                    and self._effective_role() == "master"
-                    and self.can_join_existing_master()):
-                threading.Thread(
-                    target=self._auto_join_tailnet_master_on_startup,
-                    name="tailnet-master-discovery",
-                    daemon=True,
-                ).start()
         except Exception as exc:
             self._master_identity_reason = "network_probe_failed"
             logger.warning("deferred network identity initialization failed: %s", exc)
@@ -1054,20 +918,9 @@ class Scheduler(
     def stop(self) -> None:
         """停止调度器"""
         self._running = False
-        self._auto_role_binding_ready = False
         self._startup_cancel_event.set()
         self._execution_app.requests.close()
         self._cleanup_task_worker_prepare("worker_prepare_stopped", close=True)
-        runtime = getattr(self, "_auto_role_runtime", None)
-        if runtime is not None:
-            runtime.stop_lease_renewal()
-        self._stop_auto_role_binding()
-        controller = getattr(self, "_auto_role_controller", None)
-        if controller is not None:
-            try:
-                controller.stop()
-            except Exception:
-                logger.debug("停止自动主节点控制器失败", exc_info=True)
         tcp_client = getattr(self, "_tcp_client", None)
         if tcp_client is not None:
             tcp_client.on_disconnect = None
@@ -1142,24 +995,9 @@ class Scheduler(
     # ================================================================
 
     def _effective_role(self) -> str:
-        """
-        返回当前节点的有效角色。
-
-        正常情况返回 scheduler 模块持有的运行时 NODE_ROLE；若 MAC 不匹配
-        时自动切换到 client 模式，则返回 "client"（通过 _role_override 覆盖）。
-        node_config/bootstrap 会同步这个模块级值，不能回读启动时已经过期的
-        config.NODE_ROLE。
-        """
+        """Return the configured static role, failing legacy values to client."""
         configured_role = self._runtime_setting("NODE_ROLE")
-        controller = getattr(self, "_auto_role_controller", None)
-        if configured_role == "auto":
-            return controller.runtime_role if controller is not None else "client"
-        override = getattr(self, '_role_override', None)
-        if override:
-            return override
-        if controller is not None:
-            return controller.runtime_role
-        return configured_role
+        return "master" if configured_role == "master" else "client"
 
     # ================================================================
     # 动态模型分层
@@ -3114,10 +2952,7 @@ class Scheduler(
                     if plan.get("pipeline_layout") is None else None
                 ),
             )
-            coordinator = PipelineReshardCoordinator(
-                layout,
-                lease_book=RpcShardLeaseBook(control_fence=self._control_fence),
-            )
+            coordinator = PipelineReshardCoordinator(layout)
         except (PipelineNodeContractError, ValueError) as exc:
             logger.warning("未启用自动重分片合同: %s", exc)
             with self._layer_config_lock:
@@ -3941,7 +3776,6 @@ class Scheduler(
         Returns:
             {status, message, current_assignments}
         """
-        self._require_control_write("cluster.layers.override")
         total_layers = self._get_total_model_layers()
 
         def invalid(reason_code: str, reason: str) -> dict:
@@ -4537,34 +4371,6 @@ class Scheduler(
                     len(data.get("content", "")),
                 )
 
-        elif msg_type == "role_transfer":
-            # 从节点收到主节点转让通知
-            self._handle_role_transfer(client_id, msg)
-
-        elif msg_type == "role_transfer_ack":
-            # 主节点收到从节点的转让确认
-            self._handle_role_transfer_ack(client_id, msg)
-
-        elif msg_type == "spare_master_designate":
-            # 从节点收到备用主节点指定通知
-            self._handle_spare_master_designate(client_id, msg)
-
-        elif msg_type == "spare_master_designate_ack":
-            # 主节点收到从节点的备用指定确认
-            self._handle_spare_master_designate_ack(client_id, msg)
-
-        elif msg_type == "spare_master_activate":
-            # 备用主节点收到激活（暂代主节点职责）通知
-            self._handle_spare_master_activate(client_id, msg)
-
-        elif msg_type == "spare_master_activate_ack":
-            # 主节点收到备用主节点的激活确认
-            self._handle_spare_master_activate_ack(client_id, msg)
-
-        elif msg_type == "spare_master_deactivate":
-            # 备用主节点收到新主节点的接管通知
-            self._handle_spare_master_deactivate(client_id, msg)
-
         elif msg_type == "node_list_sync":
             # ---- 从节点收到主节点推送的全量节点列表 ----
             data = msg.get("data", {})
@@ -4931,15 +4737,13 @@ class Scheduler(
             else:
                 self.push_layer_config_to_clients()
 
-    def _on_master_connection_lost(self, source_client=None, *, notify_auto_role=True) -> None:
+    def _on_master_connection_lost(self, source_client=None) -> None:
         """Worker-side cleanup when PIPELINE_DONE/ABORT can no longer arrive."""
         if (source_client is not None
                 and getattr(self, "_tcp_client", None) is not source_client):
             logger.debug("忽略旧主节点连接的迟到断连回调")
             return
 
-        if notify_auto_role:
-            self.auto_role_on_disconnect()
         self._cleanup_task_worker_prepare("coordinator_disconnected", client=source_client)
         self._task_worker_control.disconnect_coordinator()
         with self._task_worker_stage_lock:
@@ -4987,18 +4791,6 @@ class Scheduler(
     # ================================================================
     # 节点列表同步（主 → 从）
     # ================================================================
-
-    # ================================================================
-    # 角色转让 — 主节点身份转移
-    # ================================================================
-
-    # ================================================================
-    # 备用主节点管理
-    # ================================================================
-
-    # ---- 备用主节点：激活（暂代） / 接管（退出暂代） ----
-
-    # ---- 新主节点启动：向备用主节点发送接管通知 ----
 
     # ================================================================
     # 任务调度

@@ -158,10 +158,6 @@ class _Command:
     client: object
     registration_epoch: object
     connection_generation: object
-    fence: object
-    authority: object
-    certificate: object
-    authority_identity: object
     epoch: int
     cancelled: threading.Event = field(default_factory=threading.Event)
     retirement: _Retirement | None = None
@@ -207,14 +203,9 @@ class WorkerPrepareController:
         with self._lock:
             return self._managed
 
-    def _scope(self, payload, client, certificate):
-        fence = getattr(self.scheduler, "_control_fence", None)
-        authority = getattr(fence, "authority", None)
-        current = authority.current_certificate() if authority is not None else None
+    def _scope(self, payload, client):
         return _Command(payload, client, getattr(client, "registration_epoch", None),
-                        getattr(client, "_connection_generation", None), fence, authority,
-                        deepcopy(certificate), authority.authority_identity() if authority is not None else None,
-                        self._epoch)
+                        getattr(client, "_connection_generation", None), self._epoch)
 
     def _valid(self, command, *, check_mode=True):
         sched, client = self.scheduler, command.client
@@ -223,18 +214,10 @@ class WorkerPrepareController:
                 or not getattr(client, "is_registered", False)
                 or getattr(client, "registration_epoch", None) != command.registration_epoch
                 or getattr(client, "_connection_generation", None) != command.connection_generation
-                or sched._effective_role() != "client"
-                or getattr(sched, "_control_fence", None) is not command.fence):
+                or sched._effective_role() != "client"):
             return False
         if check_mode and not sched.get_distributed_inference_enabled():
             return False
-        if command.authority is not None:
-            if getattr(command.fence, "authority", None) is not command.authority:
-                return False
-            try:
-                command.authority.admit_bound_identity(command.authority_identity)
-            except Exception:
-                return False
         return True
 
     def handle(self, payload, client=None):
@@ -242,7 +225,6 @@ class WorkerPrepareController:
         if not isinstance(payload, dict):
             return False
         data = deepcopy(payload)
-        certificate = data.pop("control_certificate", None)
         try:
             data = validate_command(data)
         except WorkerPrepareError:
@@ -252,15 +234,9 @@ class WorkerPrepareController:
             if data["action"] == "prepare" and (self._retire_waiters or (retirement is not None and not retirement.done.is_set())):
                 return False
             captured = client if client is not None else getattr(self.scheduler, "_tcp_client", None)
-            command = self._scope(data, captured, certificate)
+            command = self._scope(data, captured)
             if not self._valid(command) or data["identity"]["node_id"] != self.scheduler.get_effective_node_id():
                 return False
-            fence = command.fence
-            if fence is not None and fence.required:
-                try:
-                    fence.admit(certificate, action="tcp.receive.model_prepare", source="tcp")
-                except Exception:
-                    return False
             if len(self._queue) >= 64:
                 return False
             self._managed = True
@@ -674,7 +650,7 @@ class WorkerPrepareController:
             self._active_scope = None
             self._latest_prepare = None
             self._candidate_phase = "released"
-            cleanup = self._scope(None, getattr(self.scheduler, "_tcp_client", None), None)
+            cleanup = self._scope(None, getattr(self.scheduler, "_tcp_client", None))
             cleanup.retirement = self._cleanup_retirement = _Retirement(self._epoch)
             self._queue.append(cleanup)
             self._start_locked()

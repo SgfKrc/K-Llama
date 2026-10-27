@@ -48,7 +48,6 @@ API_PATHS = {
     "distributed_config": "/cluster/config/distributed-inference",
     "cluster_resources": "/cluster/resources",
     "cluster_control_plane": "/cluster/control-plane",
-    "cluster_management_score": "/cluster/management-score",
     "cluster_layers": "/cluster/layers",
     "cluster_pipeline_capacity": "/cluster/pipeline-capacity",
     "cluster_pipeline_reshard": "/cluster/pipeline-reshard",
@@ -82,12 +81,8 @@ API_PATHS = {
     "logs_download": "/logs/download",            # GET 下载
     "logs_file": "/logs/{filename}",              # GET 读单文件 / DELETE 删单文件
     "logs_nodes_summary": "/logs/nodes-summary",  # GET 各节点日志汇总
-    # ---- 2026-09-19 补缺口 E：集群高可用（备用主节点 / 主节点转让 / 身份重置）----
-    "cluster_master_health": "/cluster/master-health",       # GET 主节点健康
-    "cluster_transfer_logs": "/cluster/transfer-logs",       # GET 角色转让日志
-    "cluster_spare_master": "/cluster/spare-master",         # GET 查询 / POST 指定 / DELETE 清除
-    "cluster_spare_master_logs": "/cluster/spare-master/logs",  # GET 备用主节点操作日志
-    "cluster_transfer_master": "/cluster/transfer-master",   # POST ⚠️ 高危（需重启）
+    # ---- Static cluster role maintenance ----
+    "cluster_master_health": "/cluster/master-health",       # GET configured master health
     "cluster_reset_identity": "/cluster/reset-identity",     # POST ⚠️ 高危（需 confirm="reset"）
     # ---- 2026-09-19 补缺口 C：模型资产浏览（只读）----
     "models_available": "/models/available",       # GET 可选模型配置 + 可用引擎
@@ -101,15 +96,6 @@ API_PATHS = {
     "session_info": "/sessions/{session_id}",              # GET 会话元数据
     "session_turn": "/sessions/{session_id}/turns/{turn_index}",  # DELETE 删单轮
     "conversation_sync_status": "/conversations/sync-status",  # GET 持久化状态
-    # ---- 2026-09-19 补缺口 G-⑤：认证与账户（monolith 内实现）----
-    "auth_capability": "/auth/capability",           # GET 能力（required / bootstrap_open）
-    "auth_login": "/auth/login",                     # POST {username,password,totp_code?}
-    "auth_logout": "/auth/logout",                   # POST
-    "auth_me": "/auth/me",                           # GET
-    "auth_totp_provision": "/auth/totp/provision",   # POST
-    "auth_totp_verify": "/auth/totp/verify",         # POST {code}
-    "auth_users": "/users",                          # GET 列表 / POST 创建
-    "auth_user": "/users/{username}",                # PATCH 修改 / DELETE 删除
 }
 
 # ============================================================
@@ -540,15 +526,6 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/cancel", "args": "", "desc": "取消当前生成"},
     {"name": "/logs", "args": "list | download <file> | read <file> | delete <file> | nodes",
      "desc": "日志细粒度：文件列表 / 下载 / 查看 / 删除（需确认）/ 各节点汇总"},
-    {"name": "/login", "args": "<username> <password> [totp_code]",
-     "desc": "登录（若账户已绑定 Auth App，需附 6 位验证码）——凭据仅本进程内存持有，不落盘"},
-    {"name": "/logout", "args": "", "desc": "注销（服务端吊销当前登录态）"},
-    {"name": "/whoami", "args": "", "desc": "显示当前登录主体与认证能力"},
-    {"name": "/users", "args": "list | add <name> <pass> [role] | role <name> <role> "
-                               "| disable|enable <name> | passwd <name> <pass> | del <name>",
-     "desc": "账户管理（需 admin）：列表 / 创建 / 改角色 / 启用禁用 / 重置口令 / 删除"},
-    {"name": "/totp", "args": "provision | verify <code>",
-     "desc": "Auth App 绑定：provision 生成密钥与 otpauth URI；verify 校验一次"},
     {"name": "/history", "args": "[<session_id>] [limit] | sync-status | info <session_id> "
                               "| drop-turn <session_id> <turn_index>",
      "desc": "会话历史：查看对话（默认当前会话）/ 本地持久化状态 / 会话详情 / "
@@ -556,10 +533,8 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/assets", "args": "available | registry | downloadable | gguf",
      "desc": "模型资产浏览（只读）：可选模型与引擎 / 已注册实验模型 / 可下载清单 / 本地 GGUF"},
     {"name": "/storage", "args": "", "desc": "存储与数据库健康（只读）"},
-    {"name": "/ha", "args": "health | transfer-logs | spare | spare-logs | designate <node> "
-                            "| clear-spare | transfer <node> | reset-identity",
-     "desc": "集群高可用：健康 / 转让日志 / 备用主节点；⚠️ transfer 与 reset-identity 为高危"
-             "（转让后需重启，身份重置不可撤销）"},
+    {"name": "/ha", "args": "health | reset-identity",
+     "desc": "静态集群主节点：健康检查 / 重置本机身份"},
     {"name": "/clear", "args": "", "desc": "清空本地显示（不动后端；清后端用 /reset）"},
     {"name": "/help", "args": "", "desc": "显示本帮助"},
     {"name": "/quit", "args": "", "desc": "退出聊天页"},

@@ -35,8 +35,7 @@ def isolated_client_type():
                                                                    begin_generation=lambda *_: None),
                      detect_network_type=lambda: "test", detect_lan_ip=lambda: "127.0.0.1",
                      build_auth_signature=lambda *_: {}, format_host_port=lambda host, port: f"{host}:{port}",
-                     MessageType=SimpleNamespace(REGISTER="register", HEARTBEAT_ACK=SimpleNamespace(value="heartbeat_ack")),
-                     ControlFenceError=type("ControlFenceError", (Exception,), {}))
+                     MessageType=SimpleNamespace(REGISTER="register", HEARTBEAT_ACK=SimpleNamespace(value="heartbeat_ack")))
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
     return namespace["TCPClient"], namespace
 

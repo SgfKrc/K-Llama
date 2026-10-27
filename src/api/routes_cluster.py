@@ -4,23 +4,15 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from fastapi import APIRouter, Depends
-import auth_service
+from fastapi import APIRouter
 from api._routing import configure_route_module
 
 router = APIRouter()
 _api_module: ModuleType | None = None
 _RESOLUTION_NAMES = (
     "AndroidPresenceRequest",
-    "CastVoteRequest",
-    "ClusterJoinConsume",
-    "ClusterJoinGrantIssue",
-    "ClusterJoinRequestCreate",
-    "ClusterSecretRotateRequest",
     "ClusterStatus",
     "ConnectToMasterRequest",
-    "ControlCertificateRequest",
-    "CreateReviewRequest",
     "DistributedInferenceRequest",
     "FirstConnectBootstrapRequest",
     "LayerOverrideRequest",
@@ -29,24 +21,48 @@ _RESOLUTION_NAMES = (
     "ModelRuntimeContractBindRequest",
     "ModelRuntimeSidecarActionRequest",
     "ModelRuntimeSidecarBeginRequest",
-    "Optional",
     "Qwen3LocalChainBeginRequest",
     "Qwen3LocalChainExecuteRequest",
     "Qwen3LocalChainParityRequest",
     "Request",
     "ResetIdentityRequest",
-    "SetQueueStrategyRequest",
-    "SpareMasterRequest",
-    "TaskGraphConfigRequest",
-    "TransferMasterRequest",
     "UpdateMaxNodesRequest",
 )
 
 def configure_api_module(module: ModuleType) -> None:
     configure_route_module(globals(), module, _RESOLUTION_NAMES)
 
+
+def _require_static_master(action: str) -> None:
+    if _api_module.scheduler._effective_role() != "master":
+        raise _api_module.HTTPException(
+            403,
+            {"code": "not_master", "message": f"仅静态主节点可执行: {action}"},
+        )
+
 def exported_handlers() -> dict[str, object]:
-    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'rotate_cluster_secret', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'quorum_voter_rpc', 'get_queue_detail', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
+    names = (
+        "get_cluster_status", "get_cluster_nodes", "get_cluster_resources",
+        "deregister_node", "delete_cluster_node", "get_cluster_config",
+        "get_my_role", "update_max_nodes", "get_invite_info",
+        "first_connect_bootstrap", "bootstrap_info", "connect_to_master",
+        "manual_register_node", "register_android_presence",
+        "heartbeat_android_presence", "check_master_health", "reset_master_identity", "discover_master",
+        "get_control_plane_status",
+        "get_queue_detail", "pause_queue", "resume_queue", "clear_queue",
+        "cancel_queue_task", "get_distributed_inference_config",
+        "set_distributed_inference_config", "get_layer_assignments",
+        "get_pipeline_capacity_plan", "get_pipeline_reshard_status",
+        "override_layer_assignments", "reset_layer_assignments",
+        "get_model_runtime_sidecar_status", "get_model_runtime_contracts",
+        "bind_model_runtime_contract", "begin_model_runtime_sidecar",
+        "release_model_runtime_sidecar", "cancel_model_runtime_sidecar",
+        "get_qwen3_local_chain_status", "begin_qwen3_local_chain",
+        "run_qwen3_local_prefill", "run_qwen3_local_decode",
+        "verify_qwen3_local_parity", "release_qwen3_local_chain",
+        "cancel_qwen3_local_chain",
+    )
+    return {name: globals()[name] for name in names}
 
 async def get_cluster_status():
     """
@@ -77,15 +93,13 @@ async def get_cluster_resources():
     """Return the read-only aggregate CPU, RAM, and GPU resource view."""
     return await _api_module.run_in_threadpool(_api_module.scheduler.get_aggregate_resource_view)
 
-async def deregister_node(
-    node_id: str,
-    _principal=Depends(auth_service.require_authenticated_role("admin")),
-):
+async def deregister_node(node_id: str):
     """
     强制注销一个从节点。
 
     仅在分布式模式下有效；master 节点不可注销。
     """
+    _require_static_master("deregister node")
     if node_id == "master":
         raise _api_module.HTTPException(400, "主节点不可注销")
 
@@ -99,15 +113,13 @@ async def deregister_node(
         "node_id": node_id,
     }
 
-async def delete_cluster_node(
-    node_id: str,
-    _principal=Depends(auth_service.require_authenticated_role("admin")),
-):
+async def delete_cluster_node(node_id: str):
     """
     删除离线节点记录（区别于 deregister：deregister 仅标记离线）。
 
     用于移除手动注册的 Android / 离线占位节点。
     """
+    _require_static_master("delete node")
     result = _api_module.scheduler.delete_node(node_id)
     status = result.get("status")
     if status == "denied":
@@ -146,8 +158,7 @@ async def update_max_nodes(req: UpdateMaxNodesRequest, request: Request):
 
     仅修改容量上限，不预创建空槽位。从节点通过 TCP 注册动态加入。
     """
-    if _api_module.control_fence.enabled:
-        _api_module.control_fence.require_current_permit(action="cluster.config.max_nodes")
+    _require_static_master("update cluster capacity")
     result = _api_module.scheduler.update_max_nodes(req.max_nodes)
     if result.get("status") == "denied":
         raise _api_module.HTTPException(403, result.get("reason", "权限不足"))
@@ -163,208 +174,6 @@ async def get_invite_info():
     用户将此信息提供给从节点，从节点在后台管理中输入并连接。
     """
     return _api_module.scheduler.get_invite_info()
-
-async def create_cluster_join_request(req: ClusterJoinRequestCreate):
-    """Create a client-only request code on the node that wants to join."""
-    try:
-        current_node_id = _api_module.scheduler.get_effective_node_id()
-        target_node_id = req.target_node_id or current_node_id
-        # A provisional master is still reported as ``master`` until the
-        # explicit role transition. Predict the same stable ID that
-        # Scheduler.get_effective_node_id() will use after client activation.
-        if target_node_id == "master":
-            target_node_id = "client_%s" % __import__("socket").gethostname()
-        elif req.target_node_id and target_node_id != current_node_id:
-            raise _api_module.JoinContractError(
-                "target_node_id must match this node identity", code="request_mismatch"
-            )
-        cluster_id = req.cluster_id.strip() or _api_module.os.environ.get("QLH_CLUSTER_ID", "qlh-default")
-        keypair = _api_module.generate_join_keypair()
-        request = _api_module.build_join_request(
-            master_endpoint=req.master_endpoint,
-            cluster_id=cluster_id,
-            target_node_id=target_node_id,
-            target_public_key=keypair.public_key,
-            request_ttl_seconds=req.request_ttl_seconds,
-            capabilities=req.capabilities,
-        )
-        ledger = _api_module._get_join_ledger()
-        ledger.save_pending_request(request, keypair)
-        code = _api_module.encode_join_request(request)
-        return {
-            "status": "created",
-            "request": request,
-            "request_code": code,
-            "qr_payload": code,
-            "target_node_id": target_node_id,
-            "expires_at": request["request_expires_at"],
-            "storage": "sqlite",
-        }
-    except _api_module.JoinContractError as exc:
-        raise _api_module.HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
-    except Exception as exc:
-        _api_module.logger.error("cluster join request creation failed: %s", exc, exc_info=True)
-        raise _api_module.HTTPException(503, "本地入群请求存储不可用") from exc
-
-async def issue_cluster_join_grant(
-    req: ClusterJoinGrantIssue,
-    request: Request,
-    principal=Depends(auth_service.require_role("admin")),
-):
-    """Issue a short-lived client-only grant after local TOTP confirmation."""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(403, "仅主节点可签发入群授权")
-    _api_module.auth_service.verify_totp_confirmation(
-        principal, req.otp_code, source=_api_module.auth_service.request_source(request)
-    )
-    try:
-        if bool(req.request_code) == bool(req.request):
-            raise _api_module.JoinContractError("request_code 或 request 必须且只能提供一个", code="invalid_request")
-        join_request = (
-            _api_module.decode_join_request(req.request_code)
-            if req.request_code else dict(req.request or {})
-        )
-        if req.request is not None:
-            _api_module.encode_join_request(join_request)
-        ledger = _api_module._get_join_ledger()
-        key_id, keypair = ledger.get_or_create_issuer_keypair()
-        grant = _api_module.issue_join_grant(
-            join_request,
-            issuer_key_id=key_id,
-            issuer_private_key=_api_module.load_join_private_key(keypair.private_key),
-            issuer_public_key=keypair.public_key,
-            ttl_seconds=req.ttl_seconds,
-        )
-        code = _api_module.encode_join_grant(grant)
-        return {
-            "status": "issued",
-            "grant_code": code,
-            "qr_payload": code,
-            "issuer_key_id": key_id,
-            "issuer_public_key": keypair.public_key,
-            "target_node_id": join_request["target_node_id"],
-            "expires_at": grant["payload"]["expires_at"],
-            "auth_method": "totp",
-        }
-    except _api_module.JoinContractError as exc:
-        status = 409 if exc.code in {"request_expired", "nonce_replayed"} else 400
-        raise _api_module.HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
-    except Exception as exc:
-        _api_module.logger.error("cluster join grant issuance failed: %s", exc, exc_info=True)
-        raise _api_module.HTTPException(503, "本地主节点入群密钥不可用") from exc
-
-async def rotate_cluster_secret(
-    req: ClusterSecretRotateRequest,
-    request: Request,
-    principal=Depends(auth_service.require_role("admin")),
-):
-    """Rotate the cluster root after Tailnet revocation and drop live peers."""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(403, "only master can rotate cluster credentials")
-    if not req.tailnet_revocation_completed:
-        raise _api_module.HTTPException(
-            409,
-            {
-                "code": "tailnet_revocation_required",
-                "message": "remove the revoked node from the Tailnet before rotation",
-            },
-        )
-    _api_module.auth_service.verify_totp_confirmation(
-        principal,
-        req.otp_code,
-        source=_api_module.auth_service.request_source(request),
-    )
-
-    try:
-        tcp_server = getattr(_api_module.scheduler, "_tcp_server", None)
-        if tcp_server is not None:
-            rotation, disconnected = await _api_module.run_in_threadpool(
-                tcp_server.disconnect_all_clients,
-                "cluster credential rotation",
-                before_disconnect=_api_module._rotate_cluster_credential,
-            )
-        else:
-            rotation = await _api_module.run_in_threadpool(
-                _api_module._rotate_cluster_credential,
-            )
-            disconnected = 0
-        _secret, epoch = rotation
-        return {
-            "status": "rotated",
-            "cluster_secret_epoch": epoch,
-            "disconnected_clients": disconnected,
-            "rebootstrap_required": True,
-        }
-    except Exception as exc:
-        _api_module.logger.error(
-            "cluster credential rotation failed: %s", exc, exc_info=True,
-        )
-        raise _api_module.HTTPException(
-            503,
-            {
-                "code": "cluster_credential_rotation_failed",
-                "message": "cluster credential rotation failed",
-            },
-        ) from exc
-
-
-async def consume_cluster_join_grant(req: ClusterJoinConsume):
-    """Verify a one-time grant, switch this node to client, and connect."""
-    try:
-        grant = _api_module.decode_join_grant(req.grant_code)
-        payload = grant["payload"]
-        pending = _api_module._get_join_ledger().load_pending_request(str(payload.get("request_digest", "")))
-        if pending is None:
-            raise _api_module.JoinContractError("本节点没有对应的待处理入群请求", code="request_not_found")
-        expected_request, _target_keypair = pending
-        current_node_id = _api_module.scheduler.get_effective_node_id()
-        if current_node_id != expected_request.get("target_node_id"):
-            raise _api_module.JoinContractError("授权目标节点与本节点不匹配", code="request_mismatch")
-        issuer_public_key = str(payload.get("issuer_public_key") or "")
-        ledger = _api_module._get_join_ledger()
-        # The one-time authorization must be consumed before role, config or
-        # network side effects. A failed connection requires a fresh grant;
-        # replay can never enter the switch/connect path.
-        verified = _api_module.verify_and_consume_join_grant(
-            req.grant_code,
-            issuer_public_key=issuer_public_key,
-            expected_request=expected_request,
-            ledger=ledger,
-        )
-        ledger.delete_pending_request(str(expected_request["request_digest"]))
-        master_host, master_port = _api_module._join_endpoint_parts(str(payload["master_endpoint"]))
-        if _api_module.scheduler._effective_role() == "master":
-            if not _api_module.scheduler.can_join_existing_master():
-                raise _api_module.JoinContractError("当前主节点不允许降级加入其他集群", code="role_switch_denied")
-            switch_result = await _api_module.run_in_threadpool(
-                _api_module.scheduler.activate_client_mode, master_host, master_port
-            )
-            if switch_result.get("status") == "denied":
-                raise _api_module.JoinContractError(
-                    switch_result.get("reason", "无法切换为从节点"), code="role_switch_denied"
-                )
-            connection_result = switch_result.get("connect_result") or switch_result
-        else:
-            connection_result = await _api_module.run_in_threadpool(
-                _api_module.scheduler.connect_to_master, master_host, master_port
-            )
-        if connection_result.get("status") not in {"connected", "unchanged", "switched"}:
-            raise _api_module.JoinContractError(
-                connection_result.get("reason", "连接主节点失败"), code="connect_failed"
-            )
-        return {
-            "status": "connected",
-            "role": "client",
-            "node_id": verified["target_node_id"],
-            "master_endpoint": verified["master_endpoint"],
-            "message": "已验证一次性授权并降级为从节点",
-        }
-    except _api_module.JoinContractError as exc:
-        status = 409 if exc.code in {"nonce_replayed", "request_not_found", "role_switch_denied", "connect_failed"} else 400
-        raise _api_module.HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
-    except Exception as exc:
-        _api_module.logger.error("cluster join grant consumption failed: %s", exc, exc_info=True)
-        raise _api_module.HTTPException(500, "入群授权消费失败") from exc
 
 async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Request):
     """
@@ -444,7 +253,7 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
             sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii")).hexdigest()
-        _api_module._get_join_ledger().consume_bootstrap_request(
+        _api_module._get_bootstrap_nonce_ledger().consume(
             nonce=req.credential_request_nonce,
             request_digest=request_digest,
         )
@@ -453,7 +262,7 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         raise _api_module.HTTPException(
             status, {"code": exc.code, "message": str(exc)}
         ) from exc
-    except _api_module.JoinContractError as exc:
+    except _api_module.BootstrapNonceError as exc:
         status = 409 if exc.code == "nonce_replayed" else 400
         raise _api_module.HTTPException(
             status, {"code": exc.code, "message": str(exc)}
@@ -533,15 +342,8 @@ async def connect_to_master(req: ConnectToMasterRequest):
     调用后本节点将通过 TCP 向指定主节点发起注册，
     注册成功后主节点的节点列表中将出现本节点。
     """
-    force_bootstrap = False
     if _api_module.scheduler._effective_role() == "master":
-        if not req.switch_to_client or not _api_module.scheduler.can_join_existing_master():
-            raise _api_module.HTTPException(403, "当前主节点已确认或已有从节点，不能切换为从节点")
-        # 角色切换可能阻塞在角色迁移锁上，放入线程池避免卡死事件循环
-        switch_result = await _api_module.run_in_threadpool(_api_module.scheduler.activate_client_mode)
-        if switch_result.get("status") == "denied":
-            raise _api_module.HTTPException(409, switch_result.get("reason", "无法切换为从节点"))
-        force_bootstrap = True
+        raise _api_module.HTTPException(403, "静态主节点不能切换为从节点")
 
     # connect_to_master 内部含多次 TCP 重试（最长可达数十秒），
     # 必须放入线程池执行，否则会阻塞事件循环冻结所有 HTTP 接口
@@ -549,7 +351,6 @@ async def connect_to_master(req: ConnectToMasterRequest):
         _api_module.scheduler.connect_to_master,
         req.master_host,
         req.master_port,
-        force_bootstrap=force_bootstrap,
         persist_preference=True,
     )
     if result.get("status") == "denied":
@@ -671,7 +472,6 @@ async def discover_master():
 
 async def reset_master_identity(
     req: ResetIdentityRequest,
-    _principal=Depends(auth_service.require_authenticated_role("admin")),
 ):
     """
     重置主节点身份标识（仅主节点可调用）。
@@ -681,6 +481,7 @@ async def reset_master_identity(
 
     调用成功后立即绑定当前物理 MAC，无需重启后端服务。
     """
+    _require_static_master("reset master identity")
     if req.confirm.strip().lower() != "reset":
         raise _api_module.HTTPException(400, "请输入 'reset' 确认重置操作")
     result = _api_module.scheduler.reset_master_identity()
@@ -691,55 +492,15 @@ async def reset_master_identity(
     return result
 
 async def get_control_plane_status():
-    """Read-only fencing status; it remains available while writes are fenced."""
-    result = _api_module.control_fence.snapshot()
-    result["auto_role"] = _api_module.scheduler.get_auto_role_snapshot()
-    return result
-
-async def get_cluster_management_score():
-    """Return the versioned, read-only management-capability score snapshot."""
-
-    def _build_snapshot() -> dict[str, Any]:
-        try:
-            import config as _config
-
-            secret = str(getattr(_config, "CLUSTER_SECRET", "") or "")
-        except Exception:
-            secret = _api_module.os.environ.get("QLH_CLUSTER_SECRET", "")
-        return _api_module.build_management_score_snapshot(
-            _api_module.scheduler.get_nodes(),
-            signing_secret=secret,
-        )
-
-    return await _api_module.run_in_threadpool(_build_snapshot)
-
-async def install_control_plane_certificate(req: ControlCertificateRequest):
-    """Install a certificate already issued by the quorum protocol."""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(403, {"code": "not_master", "message": "only master may install a control certificate"})
-    try:
-        result = _api_module.control_fence.install_certificate(req.certificate)
-    except _api_module.ControlFenceError as exc:
-        status = 503 if exc.code == "control_fence_unavailable" else 409
-        raise _api_module.HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
-    return {"status": "installed", **result}
-
-
-async def quorum_voter_rpc(request: Request):
-    """Serve the authenticated local voter used by an auto-role peer."""
-    runtime = (
-        getattr(_api_module, "auto_role_runtime", None)
-        or getattr(_api_module.scheduler, "_auto_role_runtime", None)
-    )
-    if runtime is None:
-        raise _api_module.HTTPException(503, {"code": "quorum_unavailable", "message": "automatic role is not configured"})
-    if not runtime.authenticate(request.headers.get("X-QLH-Quorum-Secret")):
-        raise _api_module.HTTPException(403, {"code": "quorum_auth_failed", "message": "voter authentication failed"})
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise _api_module.HTTPException(400, {"code": "quorum_unavailable", "message": "voter request is invalid"}) from exc
-    return runtime.handle_rpc(payload)
+    """Report the statically configured role authority."""
+    role = _api_module.scheduler._effective_role()
+    return {
+        "enabled": False,
+        "available": role in {"master", "client"},
+        "authority": "static_role",
+        "role": role,
+        "leader_id": _api_module.scheduler.get_effective_node_id() if role == "master" else None,
+    }
 
 async def get_queue_detail():
     """
@@ -756,28 +517,19 @@ async def get_queue_detail():
 
 async def pause_queue(request: Request):
     """暂停接受新请求。仅主节点。"""
-    if _api_module.control_fence.enabled:
-        _api_module.control_fence.require_current_permit(action="cluster.queue.pause")
-    if not _api_module.scheduler._effective_role() == "master":
-        raise _api_module.HTTPException(403, "仅主节点可暂停请求队列")
+    _require_static_master("pause queue")
     _api_module.scheduler._execution_app.requests.pause()
     return {"success": True, "paused": True}
 
 async def resume_queue(request: Request):
     """恢复接受新请求。仅主节点。"""
-    if _api_module.control_fence.enabled:
-        _api_module.control_fence.require_current_permit(action="cluster.queue.resume")
-    if not _api_module.scheduler._effective_role() == "master":
-        raise _api_module.HTTPException(403, "仅主节点可恢复请求队列")
+    _require_static_master("resume queue")
     _api_module.scheduler._execution_app.requests.resume()
     return {"success": True, "paused": False}
 
 async def clear_queue(request: Request):
     """清空所有排队任务（不影响执行中的任务）。仅主节点。"""
-    if _api_module.control_fence.enabled:
-        _api_module.control_fence.require_current_permit(action="cluster.queue.clear")
-    if not _api_module.scheduler._effective_role() == "master":
-        raise _api_module.HTTPException(403, "仅主节点可清空请求队列")
+    _require_static_master("clear queue")
     count = _api_module.scheduler._execution_app.requests.clear()
     return {"success": True, "cleared": count}
 
@@ -788,10 +540,7 @@ async def cancel_queue_task(task_id: str, request: Request):
     执行中的流水线任务会在当前 token step 完成后通过 PIPELINE_ABORT 中止。
     仅主节点。
     """
-    if _api_module.control_fence.enabled:
-        _api_module.control_fence.require_current_permit(action="cluster.queue.cancel")
-    if not _api_module.scheduler._effective_role() == "master":
-        raise _api_module.HTTPException(403, "仅主节点可取消队列任务")
+    _require_static_master("cancel queue task")
     ok = _api_module.scheduler._execution_app.requests.cancel(task_id)
     if ok:
         return _api_module.CancelTaskResponse(success=True, task_id=task_id, message="任务已取消")
@@ -1000,281 +749,6 @@ async def cancel_qwen3_local_chain():
     except Exception as exc:
         _api_module._raise_qwen3_local_http(exc)
 
-async def transfer_master_role(req: TransferMasterRequest):
-    """
-    将主节点身份转让给指定从节点（仅主节点可调用）。
-
-    流程:
-      1. 主节点通过 TCP 向目标从节点发送 ROLE_TRANSFER 消息
-      2. 从节点保存升级日志、返回 ACK
-      3. 主节点保存降级日志、更新数据库中的主节点信息
-      4. 建议双方重启以应用新角色
-
-    注意: 转让后需要重启服务才能生效：
-      - 原主节点重启后以从节点模式运行
-      - 新主节点重启后以主节点模式运行
-    """
-    # 内部同步等待从节点 ACK（最长 15s），放入线程池避免阻塞事件循环
-    result = await _api_module.run_in_threadpool(
-        _api_module.scheduler.transfer_master_role, req.target_node_id
-    )
-    if result.get("status") == "denied":
-        raise _api_module.HTTPException(403, result.get("reason", "权限不足"))
-    if result.get("status") == "invalid":
-        raise _api_module.HTTPException(400, result.get("reason", "参数无效"))
-    if result.get("status") == "timeout":
-        raise _api_module.HTTPException(408, result.get("reason", "超时"))
-    if result.get("status") == "error":
-        raise _api_module.HTTPException(500, result.get("reason", "操作失败"))
-    return result
-
-async def get_transfer_logs():
-    """
-    获取角色转让日志（降级 + 升级）。
-
-    Returns:
-        { logs: [{direction, from_role, to_role, related_node, timestamp, ...}] }
-    """
-    logs = _api_module.scheduler.get_transfer_logs()
-    return {"logs": logs, "count": len(logs)}
-
-async def get_spare_master():
-    """
-    获取当前备用主节点信息。
-
-    Returns:
-        { spare_master: {node_id, hostname, address, designated_at, is_online, state} | null }
-    """
-    spare = _api_module.scheduler.get_spare_master()
-    return {"spare_master": spare}
-
-async def designate_spare_master(req: SpareMasterRequest):
-    """
-    指定一个在线从节点为备用主节点（仅主节点可调用）。
-
-    规则:
-      - 集群节点数 ≥ 2
-      - 目标节点必须在线且为 client
-
-    Returns:
-        { status, message, spare_master, ... }
-    """
-    # 内部同步等待从节点 ACK（最长 15s），放入线程池避免阻塞事件循环
-    result = await _api_module.run_in_threadpool(
-        _api_module.scheduler.designate_spare_master, req.target_node_id
-    )
-    if result.get("status") == "denied":
-        raise _api_module.HTTPException(403, result.get("reason", "权限不足"))
-    if result.get("status") == "invalid":
-        raise _api_module.HTTPException(400, result.get("reason", "参数无效"))
-    if result.get("status") == "timeout":
-        raise _api_module.HTTPException(408, result.get("reason", "超时"))
-    if result.get("status") == "duplicate":
-        return result  # 不抛异常，返回已有信息
-    if result.get("status") == "error":
-        raise _api_module.HTTPException(500, result.get("reason", "操作失败"))
-    return result
-
-async def clear_spare_master():
-    """
-    清除备用主节点指定（仅主节点可调用）。
-
-    Returns:
-        { status, message }
-    """
-    result = _api_module.scheduler.clear_spare_master()
-    if result.get("status") == "denied":
-        raise _api_module.HTTPException(403, result.get("reason", "权限不足"))
-    return result
-
-async def get_spare_master_logs():
-    """
-    获取备用主节点操作日志。
-
-    Returns:
-        { logs: [{direction, timestamp, details, ...}] }
-    """
-    logs = _api_module.scheduler.get_spare_master_logs()
-    return {"logs": logs, "count": len(logs)}
-
-async def create_review_ticket(req: CreateReviewRequest):
-    """
-    创建主节点转让审查工单（仅 master 可用）。
-
-    需要先指定备用主节点。
-    创建成功后通过 TUI/API 查询和处理工单。
-    """
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(status_code=403, detail="仅主节点可创建审查工单")
-
-    # 检查 spare master
-    spare = _api_module.scheduler.get_spare_master()
-    if not spare or not spare.get("node_id"):
-        raise _api_module.HTTPException(
-            status_code=400,
-            detail="未指定备用主节点。请先在「备用主节点」中指定后再创建审查工单。",
-        )
-
-    try:
-        from review import ReviewManager
-        review_mgr = ReviewManager()
-        ticket = await _api_module.run_in_threadpool(
-            review_mgr.create_ticket,
-            created_by=_api_module.scheduler.get_effective_node_id(),
-            target_node_id=req.target_node_id,
-            reason=req.reason,
-            timeout_hours=req.timeout_hours,
-        )
-        if ticket is None:
-            raise _api_module.HTTPException(status_code=503, detail="主节点 SQLite 不可用，无法创建审查工单")
-        return ticket.to_dict()
-    except _api_module.HTTPException:
-        raise
-    except Exception as e:
-        _api_module.logger.error(f"创建审查工单失败: {e}", exc_info=True)
-        raise _api_module.HTTPException(status_code=500, detail=f"创建审查工单失败: {e}")
-
-async def cast_review_vote(req: CastVoteRequest):
-    """
-    对审查工单投票（仅 PC 独显节点可投票）。
-
-    投票值: -1（阻止）、0（弃权）、+1（赞同）。
-    同一节点重复投票会更新之前的投票。
-
-    阈值: >= +2 通过，<= -2 阻止。
-    """
-    node_id = _api_module.scheduler.get_effective_node_id()
-
-    # 验证投票资格
-    can_vote, reason = _api_module.scheduler.can_node_vote(node_id)
-    if not can_vote:
-        raise _api_module.HTTPException(status_code=403, detail=reason)
-
-    if req.vote not in (-1, 0, 1):
-        raise _api_module.HTTPException(status_code=400, detail="投票值必须为 -1、0 或 +1")
-
-    try:
-        from review import ReviewManager
-        review_mgr = ReviewManager()
-        ticket = await _api_module.run_in_threadpool(
-            review_mgr.cast_vote,
-            ticket_id=req.ticket_id,
-            voter_node_id=node_id,
-            vote_value=req.vote,
-            comment=req.comment,
-        )
-        if ticket is None:
-            raise _api_module.HTTPException(status_code=404, detail=f"工单 '{req.ticket_id}' 不存在或已关闭")
-        return ticket.to_dict()
-    except _api_module.HTTPException:
-        raise
-    except Exception as e:
-        _api_module.logger.error(f"投票失败: {e}", exc_info=True)
-        raise _api_module.HTTPException(status_code=500, detail=f"投票失败: {e}")
-
-def _safe_review_timestamp(value):
-    import math
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) and number >= 0 else None
-
-async def list_review_tickets(
-    status: Optional[str] = None,
-    limit: int = 20,
-    summary: bool = False,
-):
-    """列出审查工单。可选过滤: ?status=pending"""
-    try:
-        from review import ReviewManager
-        review_mgr = ReviewManager()
-        safe_limit = max(1, min(int(limit), 8 if summary else 100))
-        tickets = review_mgr.list_tickets(status)[:safe_limit]
-        if summary:
-            tickets = [
-                {
-                    "ticket_id": ticket.ticket_id,
-                    "status": ticket.status.value,
-                    "created_at": _safe_review_timestamp(ticket.created_at),
-                    "target_node_id": str(ticket.target_node_id or ""),
-                    "score": max(-100, min(int(ticket.score or 0), 100)),
-                    "expires_at": _safe_review_timestamp(ticket.expires_at),
-                    "resolved_at": _safe_review_timestamp(ticket.resolved_at),
-                    "vote_count": min(len(ticket.votes), 100),
-                }
-                for ticket in tickets
-            ]
-        return {
-            "tickets": [t if isinstance(t, dict) else t.to_dict() for t in tickets],
-            "count": len(tickets),
-        }
-    except Exception as e:
-        raise _api_module.HTTPException(status_code=500, detail=f"获取工单列表失败: {e}")
-
-async def get_review_ticket(ticket_id: str):
-    """获取单个审查工单详情。"""
-    try:
-        from review import ReviewManager
-        review_mgr = ReviewManager()
-        ticket = review_mgr.get_ticket(ticket_id)
-        if ticket is None:
-            raise _api_module.HTTPException(status_code=404, detail=f"工单 '{ticket_id}' 不存在")
-        return ticket.to_dict()
-    except _api_module.HTTPException:
-        raise
-    except Exception as e:
-        raise _api_module.HTTPException(status_code=500, detail=f"获取工单失败: {e}")
-
-async def check_can_vote():
-    """检查当前节点是否有审查投票资格。"""
-    node_id = _api_module.scheduler.get_effective_node_id()
-    can_vote, reason = _api_module.scheduler.can_node_vote(node_id)
-    return {
-        "node_id": node_id,
-        "can_vote": can_vote,
-        "reason": reason,
-    }
-
-async def trigger_expire_check():
-    """手动触发审查工单过期检查。"""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(status_code=403, detail="仅主节点可执行此操作")
-    try:
-        from review import ReviewManager
-        review_mgr = ReviewManager()
-        expired = await _api_module.run_in_threadpool(review_mgr.resolve_expired)
-        return {"expired": expired, "count": len(expired)}
-    except Exception as e:
-        raise _api_module.HTTPException(status_code=500, detail=f"过期检查失败: {e}")
-
-async def delete_review_ticket(ticket_id: str):
-    """删除单个审查工单（所有状态均可）。"""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(status_code=403, detail="仅主节点可执行此操作")
-    try:
-        from review import ReviewManager
-        ok = ReviewManager().delete_ticket(ticket_id)
-        if not ok:
-            raise _api_module.HTTPException(status_code=404, detail=f"工单 {ticket_id} 不存在或删除失败")
-        return {"status": "deleted", "ticket_id": ticket_id}
-    except _api_module.HTTPException:
-        raise
-    except Exception as e:
-        raise _api_module.HTTPException(status_code=500, detail=f"删除工单失败: {e}")
-
-async def delete_resolved_review_tickets():
-    """批量删除所有已解决（approved/rejected/expired）的审查工单。"""
-    if _api_module.scheduler._effective_role() != "master":
-        raise _api_module.HTTPException(status_code=403, detail="仅主节点可执行此操作")
-    try:
-        from review import ReviewManager
-        count = ReviewManager().delete_resolved()
-        return {"status": "deleted", "count": count}
-    except Exception as e:
-        raise _api_module.HTTPException(status_code=500, detail=f"批量删除工单失败: {e}")
-
-
 def register_routes() -> None:
     router.add_api_route('/api/cluster/status', get_cluster_status, methods=['GET'], response_model=ClusterStatus, response_model_exclude_unset=True)
     router.add_api_route('/api/cluster/nodes', get_cluster_nodes, methods=['GET'])
@@ -1285,10 +759,6 @@ def register_routes() -> None:
     router.add_api_route('/api/cluster/my-role', get_my_role, methods=['GET'])
     router.add_api_route('/api/cluster/config/max-nodes', update_max_nodes, methods=['PUT'])
     router.add_api_route('/api/cluster/invite', get_invite_info, methods=['GET'])
-    router.add_api_route('/api/cluster/join/request', create_cluster_join_request, methods=['POST'])
-    router.add_api_route('/api/cluster/join/grant', issue_cluster_join_grant, methods=['POST'])
-    router.add_api_route('/api/cluster/credentials/rotate', rotate_cluster_secret, methods=['POST'])
-    router.add_api_route('/api/cluster/join/consume', consume_cluster_join_grant, methods=['POST'])
     router.add_api_route('/api/bootstrap/first-connect', first_connect_bootstrap, methods=['POST'])
     router.add_api_route('/api/bootstrap/info', bootstrap_info, methods=['GET'])
     router.add_api_route('/api/cluster/connect', connect_to_master, methods=['POST'])
@@ -1299,9 +769,6 @@ def register_routes() -> None:
     router.add_api_route('/api/cluster/discover', discover_master, methods=['GET'])
     router.add_api_route('/api/cluster/reset-identity', reset_master_identity, methods=['POST'])
     router.add_api_route('/api/cluster/control-plane', get_control_plane_status, methods=['GET'])
-    router.add_api_route('/api/cluster/management-score', get_cluster_management_score, methods=['GET'])
-    router.add_api_route('/api/cluster/control-plane/certificate', install_control_plane_certificate, methods=['POST'])
-    router.add_api_route('/api/cluster/quorum/voter', quorum_voter_rpc, methods=['POST'])
     router.add_api_route('/api/cluster/queue', get_queue_detail, methods=['GET'])
     router.add_api_route('/api/cluster/queue/pause', pause_queue, methods=['POST'])
     router.add_api_route('/api/cluster/queue/resume', resume_queue, methods=['POST'])
@@ -1327,17 +794,3 @@ def register_routes() -> None:
     router.add_api_route('/api/cluster/qwen3/local-chain/parity', verify_qwen3_local_parity, methods=['POST'])
     router.add_api_route('/api/cluster/qwen3/local-chain/release', release_qwen3_local_chain, methods=['POST'])
     router.add_api_route('/api/cluster/qwen3/local-chain', cancel_qwen3_local_chain, methods=['DELETE'])
-    router.add_api_route('/api/cluster/transfer-master', transfer_master_role, methods=['POST'])
-    router.add_api_route('/api/cluster/transfer-logs', get_transfer_logs, methods=['GET'])
-    router.add_api_route('/api/cluster/spare-master', get_spare_master, methods=['GET'])
-    router.add_api_route('/api/cluster/spare-master', designate_spare_master, methods=['POST'])
-    router.add_api_route('/api/cluster/spare-master', clear_spare_master, methods=['DELETE'])
-    router.add_api_route('/api/cluster/spare-master/logs', get_spare_master_logs, methods=['GET'])
-    router.add_api_route('/api/cluster/review/create', create_review_ticket, methods=['POST'])
-    router.add_api_route('/api/cluster/review/vote', cast_review_vote, methods=['POST'])
-    router.add_api_route('/api/cluster/review/tickets', list_review_tickets, methods=['GET'])
-    router.add_api_route('/api/cluster/review/tickets/{ticket_id}', get_review_ticket, methods=['GET'])
-    router.add_api_route('/api/cluster/review/can-vote', check_can_vote, methods=['GET'])
-    router.add_api_route('/api/cluster/review/expire-check', trigger_expire_check, methods=['POST'])
-    router.add_api_route('/api/cluster/review/tickets/{ticket_id}', delete_review_ticket, methods=['DELETE'])
-    router.add_api_route('/api/cluster/review/tickets', delete_resolved_review_tickets, methods=['DELETE'])

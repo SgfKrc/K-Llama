@@ -6,13 +6,15 @@ K-Llama（Llama for Koakuma）是面向异构边缘设备的分布式推理核�
 
 > 状态：**现行**
 >
-> 更新日期：2026-10-25
+> 更新日期：2026-10-28
 >
 > 本 README 只描述主仓当前边界和可复现入口。实验记录、历史实现和外置子项目不等同于主仓生产能力。
 >
 > 单一事实源重构（票 14）R0–R5 软件门已于 2026-10-18/19 完成，R6 产品验收已于 2026-10-19 实施（剩余设备与收益门见 [R6 报告](docs/重构产品验收-R6-2026-10-19.md)），当前重心是 [PERF 系列性能票](docs/异构推理吞吐瓶颈与外部技术调研-2026-10-24.md#6-实验排期与退出判据)；主线已从任务图调度／独立投机 PoC／抢占式队列／独立 Launcher 切到**线性接力 + 版本化快照**。详见[重构设计](docs/单一事实源重构设计-2026-10-18.md)与 [R5 交付报告](docs/重构客户端切换-R5-2026-10-19.md)。
 >
 > English: [docs/README.en.md](docs/README.en.md)
+
+> **集群控制边界（2026-10-27）**：采用静态主节点，唯一 master 由 `QLH_NODE_ROLE=master` 显式指定；其他节点默认为 client。人类账户认证与自动选主已从支持产品运行时退役，机器身份与 bootstrap 安全边界保留。部署说明见[静态主节点决策](docs/静态主节点部署与认证退役决策-2026-10-27.md)。
 
 ## 主仓做什么
 
@@ -205,7 +207,8 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 
 | 能力 | 当前口径 |
 | --- | --- |
-| Textual TUI | 统一 `qlh` 入口；聊天页 + 8 个功能屏（状态／模型／集群／节点／队列／日志／设备／设置）与 1 个调试兜底屏共用一个进程，可在本机按需启动后端；模型下载/搜索/预检/登记、集群配置、节点管理、日志筛选/统计/导出、设备配置、用户设置等写操作经确认框闸门 |
+| Textual TUI | 统一 `qlh` 入口；聊天页 + 8 个功能屏（状态／模型／集群／节点／队列／日志／设备／设置）与 1 个调试兜底屏共用一个进程，可在本机按需启动后端；模型与资产、日志、设备配置和本地用户设置等写操作经确认框闸门，集群/节点操作以运行时实际支持为准 |
+| 集群角色 | 静态 master/client；只有显式配置的唯一 master 协调节点，client 不晋升，master 故障不自动接管；人类账户认证已退役，节点间 HMAC/bootstrap 与可信来源检查保留 |
 | Edge <=1B 单机 | 已有模型画像、GGUF/llama.cpp 路径和边缘预检；默认不加载 torch |
 | 同机双进程 RPC | 已有 llama host + `ggml-rpc-server` 模拟及合同测试；不等同于跨机生产准入 |
 | **同机跨框架层段（GPU 段 + CPU 段并存）** | **真机通过**（2026-10-26）：master 上 `('master','',0,8)` GPU 段与 `('master','cpu',8,24)` llama.cpp keep-head 段**同时**在供给 plan 里，各担其层；CPU 段权重常驻主机内存、就地计算（零 PCIe 搬运）。六条判据全过：并存、不越界、容量无重复计数、数值门 argmax **81/81**、计时 **6.84 ms/层**、缺省关闭时逐字节不回归。端到端 21.28 s，四段连续覆盖 `[0,8)[8,24)[24,28)[28,32)` |
@@ -276,8 +279,8 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 
 | 分组 | 代表模块 |
 | --- | --- |
-| 控制面与入口 | `app_bootstrap.py`（单一组合入口）、`api_server.py`、`api_errors.py`、`execution_errors.py`、`config.py`、`bootstrap.py`、`model_api_access.py`、`review.py`、`local_store.py`、`api/routes_client_state.py` |
-| 调度与集群 | `scheduler.py`、`scheduler_svc_http.py`、`cluster_join.py`、`cluster_transport.py`、`edge_cluster.py`、`node_config.py`、`node_runtime.py`、`transport_runtime.py`、`transport_port.py`、`network_address.py`、`network_path.py`、`proxy_config.py`、`wss_loopback.py` |
+| 控制面与入口 | `app_bootstrap.py`（单一组合入口）、`api_server.py`、`api_errors.py`、`execution_errors.py`、`config.py`、`bootstrap.py`、`bootstrap_nonce_ledger.py`、`model_api_access.py`、`local_store.py`、`api/routes_client_state.py` |
+| 调度与集群 | `scheduler.py`、`scheduler_svc_http.py`、`cluster_transport.py`、`edge_cluster.py`、`node_config.py`、`node_runtime.py`、`transport_runtime.py`、`transport_port.py`、`network_address.py`、`network_path.py`、`proxy_config.py`、`wss_loopback.py` |
 | 引擎 | `llama_engine.py`（L 档）、`model_module.py`（D 档层拆分）、`island_engine.py`、`koakuma_engine.py`、`tcp_comm.py`、`inference_client.py`、`inference_svc_main.py`、`inference_service/`、`paged_kv_cache.py`、`external_provider.py` |
 | RPC 与层接力 | `llama_rpc_contract.py`、`llama_rpc_device.py`、`llama_rpc_planner.py`、`relay_contract.py`、`relay_planner.py`、`relay_transport.py` |
 | 层段/层流水线合同 | `pipeline_node_contract.py`、`pipeline_assignment_manifest.py`、`pipeline_model_descriptor.py`、`pipeline_reshard.py`、`cache_unit_layout.py`；容量求解已迁至 `qlh_core/planning/capacity.py`（`pipeline_capacity.py` 为 21 行兼容门面） |
@@ -411,10 +414,11 @@ python -m venv .venv-test
 - **单一事实源重构（票 14）**：[设计](docs/单一事实源重构设计-2026-10-18.md) · [合同与行为基线 R0](docs/重构合同与行为基线-R0-2026-10-18.md) · [启动与控制权 R1](docs/重构启动与控制权-R1-2026-10-18.md) · [模型目录与能力 R2](docs/重构模型目录与能力-R2-2026-10-18.md) · [供给与部署 R3](docs/重构供给与部署-R3-2026-10-18.md) · [接力执行 R4](docs/重构接力执行-R4-2026-10-18.md) · [客户端切换 R5](docs/重构客户端切换-R5-2026-10-19.md) · [事实归属审计](docs/当前功能与事实归属审计-2026-10-18.md)
 - [跨框架接力-当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)（接力方向的索引文档）· [项目报告](docs/跨框架层接力-项目报告.md) · [容量收益实测](docs/跨框架层接力-容量收益实测-2026-09-21.md)
 - [TUI 使用指南](docs/TUI使用指南.md) · [TUI 指令集](docs/TUI指令集.md)
+- [静态主节点部署与认证退役决策](docs/静态主节点部署与认证退役决策-2026-10-27.md)
 - [测试与评判标准](docs/测试与评判标准.md) · [测试通道运行说明](docs/测试通道运行说明.md) · [发行物门](docs/发行物门-RELEASE-ARTIFACTS.md)
-- [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [主节点动态选举与分布式管理 P4.5 立项](docs/主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
+- [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5 动态选主方案（历史参考，已被静态部署决策取代）](docs/主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [分布式推理并行与跨框架路线调研汇总](docs/archive/relay/分布式推理并行与跨框架路线调研汇总-2026-09-15.md) · [KTransformers 优化迁移调研与算法数据层优化方向](docs/KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
-- [遗留清单（当前台账）](docs/遗留清单-2026-10-07.md) · [已知问题记录](docs/已知问题记录.md) · [验收清单与资源限制登记](docs/验收清单与资源限制登记.md) · [未完成工作备忘（历史登记）](docs/archive/misc/未完成工作备忘-2026-09-23.md) · [DIST 后续核心链路缺陷审计](docs/archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
+- [遗留清单（2026-10-07 历史快照）](docs/遗留清单-2026-10-07.md) · [已知问题记录](docs/已知问题记录.md) · [验收清单与资源限制登记](docs/验收清单与资源限制登记.md) · [未完成工作备忘（历史登记）](docs/archive/misc/未完成工作备忘-2026-09-23.md) · [DIST 后续核心链路缺陷审计](docs/archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
 - [文档状态与清理清单](docs/文档状态与清理清单.md) · [归档索引](docs/archive/README.md)
 - [Android 验证替代路径](android/Android验证替代路径-2026-09-18.md)
 

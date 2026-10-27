@@ -108,19 +108,21 @@ async def catalog(request: Request):
 
 
 async def connect(request: Request):
-    """Use existing authenticated discovery/bootstrap, with no caller-supplied host."""
+    """Discover and connect a statically configured client to its master."""
     require_model_intent_source(request, _api_module.scheduler)
     scheduler = _api_module.scheduler
+    if _master():
+        raise HTTPException(409, {"code": "INTENT_STATIC_MASTER", "message": "A statically configured master cannot join another cluster"})
     if not scheduler.get_distributed_inference_enabled():
         raise HTTPException(409, {"code": "INTENT_LOCAL_MODE", "message": "Switch to distributed inference to join the cluster"})
     binding = get_binding(scheduler, _api_module.API_PORT)
-    if binding["status"] == "connected" and not (_master() and scheduler.can_join_existing_master()):
+    if binding["status"] == "connected":
         return binding
     found = await run_in_threadpool(scheduler.discover_master)
     if not found.get("found"):
         raise HTTPException(409, {"code": "INTENT_MASTER_NOT_FOUND", "message": "Start the master on an approved network and retry discovery"})
     from api.routes_cluster import connect_to_master
-    req = _api_module.ConnectToMasterRequest(master_host=found["master_host"], master_port=found["master_port"], switch_to_client=True)
+    req = _api_module.ConnectToMasterRequest(master_host=found["master_host"], master_port=found["master_port"])
     await connect_to_master(req)
     return get_binding(scheduler, _api_module.API_PORT)
 

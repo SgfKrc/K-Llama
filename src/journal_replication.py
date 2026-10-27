@@ -1,11 +1,12 @@
 """Durable, transport-neutral replication of task-journal checkpoints.
 
-This module deliberately stops below leader election and consensus. It gives
-the HA layer a durable follower store with a tamper-evident event chain, atomic
-batch application, idempotent replay, and a recovery gate. Hashes detect
-inconsistency but do not authenticate a source; the companion transport binds
-the source identity to a shared HMAC secret. The replica never exposes an
-unverified or partial checkpoint as recoverable.
+This module provides explicit checkpoint replication and recovery for the
+statically configured cluster. It gives a configured donor a durable replica
+store with a tamper-evident event chain, atomic batch application, idempotent
+replay, and a recovery gate. Hashes detect inconsistency but do not authenticate
+a source; the companion transport binds the source identity to a shared HMAC
+secret. The replica never exposes an unverified or partial checkpoint as
+recoverable.
 """
 
 from __future__ import annotations

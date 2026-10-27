@@ -40,43 +40,12 @@ def test_common_api_boundary_rejects_untrusted_remote_before_handler(
     assert response.json()["detail"]["code"] == "MODEL_API_SOURCE_UNTRUSTED"
 
 
-def test_common_api_boundary_enforces_bearer_when_enabled(monkeypatch):
-    monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
-    with TestClient(api_server.app, client=("127.0.0.1", 50000)) as client:
-        response = client.get("/api/cluster/nodes")
-    assert response.status_code == 401
-    assert response.json()["detail"]["code"] == "auth_required"
-
-
-@pytest.mark.parametrize("method,path,payload", [
-    ("post", "/api/cluster/nodes/worker-1/deregister", None),
-    ("delete", "/api/cluster/nodes/worker-1", None),
-    ("post", "/api/cluster/reset-identity", {"confirm": "reset"}),
-])
-def test_destructive_cluster_endpoints_require_named_admin_when_auth_is_optional(
-    method, path, payload, monkeypatch,
-):
-    monkeypatch.delenv("QLH_AUTH_REQUIRED", raising=False)
-    with TestClient(api_server.app, client=("127.0.0.1", 50000)) as client:
-        response = client.request(method.upper(), path, json=payload)
-    assert response.status_code == 401
-    assert response.json()["detail"]["code"] == "auth_required"
-
-
-def test_first_user_bootstrap_remains_open_when_auth_is_forced(monkeypatch):
-    monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
-    monkeypatch.setattr(api_server.auth_service, "is_bootstrap_open", lambda: True)
-    principal = api_server.auth_service.require_session(authorization=None)
-    assert principal.username == "anonymous"
-    assert principal.is_admin is True
-
-
 def test_first_connect_returns_only_target_encrypted_cluster_credential(
     monkeypatch, tmp_path,
 ):
     import bootstrap_credentials
     import node_config
-    from cluster_join import JoinGrantLedger
+    from bootstrap_nonce_ledger import BootstrapRequestNonceLedger
 
     class MasterScheduler:
         _lan_ip = "100.64.0.1"
@@ -94,8 +63,8 @@ def test_first_connect_returns_only_target_encrypted_cluster_credential(
     monkeypatch.setattr(api_server, "_bootstrap_cluster_credential", lambda: ("s" * 32, 5))
     monkeypatch.setattr(
         api_server,
-        "_get_join_ledger",
-        lambda: JoinGrantLedger(tmp_path / "bootstrap.sqlite3"),
+        "_get_bootstrap_nonce_ledger",
+        lambda: BootstrapRequestNonceLedger(tmp_path / "bootstrap.sqlite3"),
     )
     exchange = bootstrap_credentials.create_bootstrap_credential_request()
     response = asyncio.run(api_server.first_connect_bootstrap(
@@ -307,11 +276,6 @@ def test_cluster_mutation_endpoints_map_scheduler_denials_to_forbidden(
             del host, port, force_bootstrap, persist_preference
             return {"status": "denied", "reason": "client denied"}
 
-        @staticmethod
-        def transfer_master_role(target_node_id):
-            del target_node_id
-            return {"status": "denied", "reason": "client denied"}
-
     monkeypatch.setattr(api_server, "scheduler", DeniedScheduler())
 
     with pytest.raises(HTTPException) as reset:
@@ -322,16 +286,8 @@ def test_cluster_mutation_endpoints_map_scheduler_denials_to_forbidden(
         asyncio.run(api_server.connect_to_master(
             api_server.ConnectToMasterRequest(master_host="100.64.0.10"),
         ))
-    with pytest.raises(HTTPException) as transfer:
-        asyncio.run(api_server.transfer_master_role(
-            api_server.TransferMasterRequest(target_node_id="worker-next"),
-        ))
-
-    assert {
-        reset.value.status_code,
-        connect.value.status_code,
-        transfer.value.status_code,
-    } == {403}
+    assert reset.value.status_code == 403
+    assert connect.value.status_code == 403
 
 
 def test_manual_cluster_connect_persists_the_explicit_endpoint_preference(
@@ -364,158 +320,3 @@ def test_manual_cluster_connect_persists_the_explicit_endpoint_preference(
     assert calls == [
         ("fd7a:115c:a1e0::8d01:4cc5", 8888, False, True),
     ]
-
-
-def test_review_create_and_vote_keep_their_role_and_eligibility_gates(
-    monkeypatch,
-):
-    class UntrustedReviewScheduler:
-        @staticmethod
-        def _effective_role():
-            return "client"
-
-        @staticmethod
-        def get_effective_node_id():
-            return "worker-no-gpu"
-
-        @staticmethod
-        def can_node_vote(node_id):
-            assert node_id == "worker-no-gpu"
-            return False, "not eligible"
-
-    monkeypatch.setattr(api_server, "scheduler", UntrustedReviewScheduler())
-
-    with pytest.raises(HTTPException) as create:
-        asyncio.run(api_server.create_review_ticket(
-            api_server.CreateReviewRequest(target_node_id="worker-next"),
-        ))
-    with pytest.raises(HTTPException) as vote:
-        asyncio.run(api_server.cast_review_vote(
-            api_server.CastVoteRequest(ticket_id="review-test", vote=1),
-        ))
-
-    assert create.value.status_code == 403
-    assert vote.value.status_code == 403
-
-
-def test_review_side_effect_endpoints_require_master_role(monkeypatch):
-    class ClientScheduler:
-        @staticmethod
-        def _effective_role():
-            return "client"
-
-    monkeypatch.setattr(api_server, "scheduler", ClientScheduler())
-
-    endpoints = (
-        lambda: api_server.trigger_expire_check(),
-        lambda: api_server.delete_review_ticket("review-test"),
-        api_server.delete_resolved_review_tickets,
-    )
-    for endpoint in endpoints:
-        with pytest.raises(HTTPException) as rejected:
-            asyncio.run(endpoint())
-        assert rejected.value.status_code == 403
-        assert rejected.value.detail == "仅主节点可执行此操作"
-
-
-def test_review_side_effect_endpoints_execute_for_master(monkeypatch):
-    import review
-
-    class MasterScheduler:
-        @staticmethod
-        def _effective_role():
-            return "master"
-
-    class FakeReviewManager:
-        def resolve_expired(self):
-            return ["review-expired"]
-
-        def delete_ticket(self, ticket_id):
-            assert ticket_id == "review-test"
-            return True
-
-        def delete_resolved(self):
-            return 2
-
-    monkeypatch.setattr(api_server, "scheduler", MasterScheduler())
-    monkeypatch.setattr(review, "ReviewManager", FakeReviewManager)
-    assert asyncio.run(api_server.trigger_expire_check()) == {
-        "expired": ["review-expired"],
-        "count": 1,
-    }
-    assert asyncio.run(api_server.delete_review_ticket("review-test")) == {
-        "status": "deleted",
-        "ticket_id": "review-test",
-    }
-    assert asyncio.run(api_server.delete_resolved_review_tickets()) == {
-        "status": "deleted",
-        "count": 2,
-    }
-
-
-# ================================================================
-# T-3 读端点开放契约（§4.2.1 矩阵 3/4/5）：网络信任域内读开放，
-# 不因部署角色变化而 403（写端点的 master 门在
-# test_review_side_effect_endpoints_* 已覆盖）
-# ================================================================
-
-def test_review_read_endpoints_stay_open_for_non_master(monkeypatch):
-    class ClientScheduler:
-        @staticmethod
-        def _effective_role():
-            return "client"
-
-        @staticmethod
-        def get_effective_node_id():
-            return "node-client"
-
-        @staticmethod
-        def can_node_vote(node_id):
-            return True, ""
-
-    monkeypatch.setattr(api_server, "scheduler", ClientScheduler())
-    # 列表：非 master 角色必须可读（不 403）
-    result = asyncio.run(api_server.list_review_tickets())
-    assert "tickets" in result and "count" in result
-    # can-vote 自查询：开放
-    result = asyncio.run(api_server.check_can_vote())
-    assert "can_vote" in result
-
-
-def test_review_summary_is_bounded_and_does_not_return_comments(monkeypatch):
-    import review
-
-    class FakeReviewManager:
-        def list_tickets(self, status=None):
-            return [SimpleNamespace(
-                ticket_id=f"review-{index}",
-                status=SimpleNamespace(value="pending"),
-                created_at=float(index),
-                target_node_id="node-target",
-                score=0,
-                expires_at=100.0,
-                resolved_at=None,
-                votes=[SimpleNamespace(comment="secret") for _ in range(20)],
-                transfer_reason="private reason",
-            ) for index in range(20)]
-
-    monkeypatch.setattr(review, "ReviewManager", FakeReviewManager)
-    result = asyncio.run(api_server.list_review_tickets(limit=50, summary=True))
-    assert result["count"] == 8
-    assert len(result["tickets"]) == 8
-    assert result["tickets"][0]["vote_count"] == 20
-    assert "transfer_reason" not in result["tickets"][0]
-    assert "votes" not in result["tickets"][0]
-
-
-def test_review_ticket_detail_missing_is_404_not_403_for_non_master(monkeypatch):
-    class ClientScheduler:
-        @staticmethod
-        def _effective_role():
-            return "client"
-
-    monkeypatch.setattr(api_server, "scheduler", ClientScheduler())
-    with pytest.raises(HTTPException) as missing:
-        asyncio.run(api_server.get_review_ticket("ticket-does-not-exist"))
-    # 非 master 读不存在工单 → 404（资源不存在优先于角色拒绝，契约 4）
-    assert missing.value.status_code == 404

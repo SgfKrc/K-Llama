@@ -906,22 +906,16 @@ class PipelineReshardCoordinator:
         *,
         lease_book: RpcShardLeaseBook | None = None,
         artifact_availability: Iterable[PipelineArtifactAvailability] = (),
-        control_certificate: Mapping[str, Any] | None = None,
     ) -> None:
         self._layout = validate_pipeline_nodes(layout.nodes, total_layers=layout.total_layers)
         self._lock = threading.RLock()
         self._lease_book = lease_book or RpcShardLeaseBook()
-        self._control_certificate = control_certificate
-        if self._lease_book._control_fence is not None and control_certificate is None:
-            control_certificate = self._lease_book._control_fence.current_certificate()
-            self._control_certificate = control_certificate
         self._topology_lease = self._lease_book.assign(
             self._TOPOLOGY_SHARD_ID,
             self._COORDINATOR_ID,
             self._layout.model_sha256,
             {"contract_sha256": self._layout.contract_sha256},
             lease_seconds=86400.0,
-            certificate=control_certificate,
         )
         self._availability = list(_availability_values(
             self._layout, set(), artifact_availability,
@@ -1009,10 +1003,7 @@ class PipelineReshardCoordinator:
         with self._lock:
             return self._staged.get(str(plan_id))
 
-    def commit(
-        self, plan_id: str, *, expected_epoch: int,
-        control_certificate: Mapping[str, Any] | None = None,
-    ) -> PipelineReshardCommitDecision:
+    def commit(self, plan_id: str, *, expected_epoch: int) -> PipelineReshardCommitDecision:
         with self._lock:
             plan = self._staged.get(str(plan_id))
             current_epoch = self._topology_lease.epoch
@@ -1050,9 +1041,7 @@ class PipelineReshardCoordinator:
                 {"contract_sha256": plan.candidate_layout.contract_sha256},
                 reason="reshard",
                 lease_seconds=86400.0,
-                certificate=control_certificate or self._control_certificate,
             )
-            self._control_certificate = control_certificate or self._control_certificate
             self._layout = plan.candidate_layout
             self._topology_lease = next_lease
             self._staged.clear()

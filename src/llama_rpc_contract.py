@@ -8,9 +8,6 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
-from cluster_control_contract import ControlContractError, QuorumCertificate, validate_certificate
-
-
 @dataclass(frozen=True)
 class RpcShardLease:
     shard_id: str
@@ -24,8 +21,6 @@ class RpcShardLease:
     issued_at: float = 0.0
     lease_expires_at: float = 0.0
     lease_ttl_seconds: float = 30.0
-    control_term: int = 0
-    certificate_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,20 +38,9 @@ class RpcShardLeaseBook:
     invalidates the previous lease before a new worker can commit.
     """
 
-    def __init__(self, *, control_fence=None) -> None:
+    def __init__(self) -> None:
         self._current: dict[str, RpcShardLease] = {}
         self._leases: dict[str, RpcShardLease] = {}
-        self._control_fence = control_fence
-
-    def set_control_fence(self, control_fence) -> None:
-        self._control_fence = control_fence
-
-    def _admit(self, certificate, *, action: str):
-        if self._control_fence is None:
-            return None
-        if certificate is None:
-            return self._control_fence.require_current_permit(action=action)
-        return self._control_fence.admit(certificate, action=action, source="lease")
 
     def assign(
         self,
@@ -66,9 +50,7 @@ class RpcShardLeaseBook:
         allocation: Mapping[str, Any],
         *,
         lease_seconds: float = 30.0,
-        certificate: QuorumCertificate | Mapping[str, Any] | None = None,
     ) -> RpcShardLease:
-        permit = self._admit(certificate, action="lease.assign")
         previous = self._current.get(shard_id)
         if previous and previous.status == "active":
             raise ValueError(f"shard {shard_id} already has an active lease")
@@ -87,8 +69,6 @@ class RpcShardLeaseBook:
             issued_at=now,
             lease_expires_at=now + ttl,
             lease_ttl_seconds=ttl,
-            control_term=permit.term if permit else 0,
-            certificate_digest=permit.certificate_digest if permit else "",
         )
         self._current[shard_id] = lease
         self._leases[lease.lease_id] = lease
@@ -103,7 +83,6 @@ class RpcShardLeaseBook:
         *,
         reason: str = "worker_lost",
         lease_seconds: float = 30.0,
-        certificate: QuorumCertificate | Mapping[str, Any] | None = None,
     ) -> RpcShardLease:
         previous = self._current.get(shard_id)
         if previous and previous.status == "active":
@@ -113,14 +92,9 @@ class RpcShardLeaseBook:
         return self.assign(
             shard_id, worker_id, model_sha256, allocation,
             lease_seconds=lease_seconds,
-            certificate=certificate,
         )
 
-    def renew(self, lease_id: str, epoch: int, certificate: QuorumCertificate | Mapping[str, Any] | None = None) -> LeaseDecision:
-        try:
-            permit = self._admit(certificate, action="lease.renew")
-        except ControlContractError as exc:
-            return LeaseDecision(False, exc.code)
+    def renew(self, lease_id: str, epoch: int) -> LeaseDecision:
         lease = self._leases.get(lease_id)
         if lease is None:
             return LeaseDecision(False, "unknown_lease")
@@ -136,8 +110,6 @@ class RpcShardLeaseBook:
             self._current[expired.shard_id] = expired
             self._leases[expired.lease_id] = expired
             return LeaseDecision(False, "lease_expired", expired)
-        if permit and (permit.term < current.control_term or permit.certificate_digest != current.certificate_digest):
-            return LeaseDecision(False, "control_certificate_stale", current)
         renewed_until = max(
             time.time() + max(1.0, current.lease_ttl_seconds),
             current.lease_expires_at + 0.001,
@@ -171,12 +143,7 @@ class RpcShardLeaseBook:
         lease_id: str,
         epoch: int,
         result: bytes | str,
-        certificate: QuorumCertificate | Mapping[str, Any] | None = None,
     ) -> LeaseDecision:
-        try:
-            permit = self._admit(certificate, action="lease.commit")
-        except ControlContractError as exc:
-            return LeaseDecision(False, exc.code)
         lease = self._leases.get(lease_id)
         if lease is None:
             return LeaseDecision(False, "unknown_lease")
@@ -192,8 +159,6 @@ class RpcShardLeaseBook:
             self._current[expired.shard_id] = expired
             self._leases[expired.lease_id] = expired
             return LeaseDecision(False, "lease_expired", expired)
-        if permit and (permit.term < current.control_term or permit.certificate_digest != current.certificate_digest):
-            return LeaseDecision(False, "control_certificate_stale", current)
         payload = result.encode("utf-8") if isinstance(result, str) else bytes(result)
         digest = hashlib.sha256(payload).hexdigest()
         committed = replace(current, status="committed")

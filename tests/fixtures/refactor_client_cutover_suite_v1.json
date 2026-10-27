@@ -12,12 +12,9 @@
     "tests/test_api_contract_keys.py",
     "tests/test_distributed_inference.py",
     "tests/test_external_provider.py",
-    "tests/test_ha_crosshost.py",
-    "tests/test_ha_role_auto.py",
     "tests/test_inference_routing.py",
     "tests/test_inference_service_protocol.py",
     "tests/test_island_engine.py",
-    "tests/test_journal_replication_quorum.py",
     "tests/test_linear_simulation.py",
     "tests/test_model_intent_access.py",
     "tests/test_model_intent_discovery.py",
@@ -70,5 +67,34 @@
     "Android JVM/APK/native",
     "frontend typecheck/build/Playwright",
     "docs and architecture boundaries"
+  ],
+  "retirement_decision": {
+    "id": "R6-static-role-account-api-retirement",
+    "date": "2026-10-27",
+    "source": "User ruling; see docs/静态主节点部署与认证退役决策-2026-10-27.md",
+    "ruling": "Remove human account/login/TOTP and join-grant/credential-rotation APIs, quorum RPC/cert, and transfer/spare/review APIs. Use one manually configured master and clients that never auto-promote.",
+    "recorded_date": "2026-10-28"
+  },
+  "retired_targets": [
+    {
+      "target": "tests/test_ha_crosshost.py",
+      "reason": "Cross-host automatic election and automatic-role behavior are no longer supported product runtime."
+    },
+    {
+      "target": "tests/test_ha_role_auto.py",
+      "reason": "Cross-host automatic election and automatic-role behavior are no longer supported product runtime."
+    },
+    {
+      "target": "tests/test_ha_handoff.py",
+      "reason": "HA role-transfer orchestration is retired in the static master/client model."
+    },
+    {
+      "target": "tests/test_ha_partition.py",
+      "reason": "Partition and double-primary quorum-election tests are retired."
+    },
+    {
+      "target": "tests/test_ha_crosshost_physical_smoke.py",
+      "reason": "Physical HA/quorum acceptance is retired with automatic election."
+    }
   ]
 }

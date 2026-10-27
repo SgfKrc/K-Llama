@@ -1,13 +1,7 @@
-"""#93：接管前必须能丢掉「未提交尾部」。
+"""Journal replica truncation keeps recovery bounded to a real hash-chain point.
 
-旧主可能在拿到多数耐久确认**之前**就把事件写到本地；新主若原样接管，就会把这些
-从未提交的事件当成既成事实。`DurableJournalReplica.truncate_to` 提供这个能力，
-并且**只允许**截到本地哈希链上真实存在的点（不允许凭空造点或截错链头）。
-
-注意：截断后副本**必然**处于「前缀不完整」状态（`recovery_status.verified` 为 False，
-因为快照仍对应被丢弃的更高点）——这是**正确的**语义：它还不能被当成已提交前缀，
-必须靠后续 checkpoint 追赶（跨机重建）才能重新自洽。因此断言走只读诊断
-`durable_prefix`，而不是 `recovery_projection`（后者会、也应该拒绝）。
+After truncation, the snapshot still refers to the removed tail, so the replica is
+intentionally unverified until a later checkpoint restores a consistent prefix.
 """
 
 from __future__ import annotations

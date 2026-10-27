@@ -362,7 +362,7 @@ def test_retry_uses_new_request_attempt_and_does_not_resume_old_kv(service):
 
 
 def test_request_domain_is_independent_from_workflow_and_floor_cannot_disappear(repository):
-    from cluster_auto_role_runtime import JournalPrefixAuthority, AutoRoleRuntimeError
+    from journal_replication_authority import JournalPrefixAuthority, JournalReplicationAuthorityError
     repo, _ = repository
     service = RequestService(repo, boot_id="boot")
     service.start()
@@ -374,9 +374,9 @@ def test_request_domain_is_independent_from_workflow_and_floor_cannot_disappear(
     assert prefix.propose() == (held,)
     prefix.enforce(SimpleNamespace(commit_watermark=(held,)))
     prefix.requests = None
-    with pytest.raises(AutoRoleRuntimeError, match="required recovery floor"):
+    with pytest.raises(JournalReplicationAuthorityError, match="required recovery floor"):
         prefix.propose()
-    with pytest.raises(AutoRoleRuntimeError, match="owner recovery domain"):
+    with pytest.raises(JournalReplicationAuthorityError, match="owner recovery domain"):
         prefix.enforce(SimpleNamespace(commit_watermark=(held,)))
     service.close()
 

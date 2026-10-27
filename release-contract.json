@@ -7,7 +7,7 @@
   },
   "profile": {
     "name": "linear-production-v2",
-    "default_node_role": "master",
+    "default_node_role": "client",
     "fixed_environment": {
       "QLH_ROUTE_A_STAGE_OFFER": "1",
       "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": "1",

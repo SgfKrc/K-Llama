@@ -68,7 +68,7 @@ def test_packaged_role_is_deterministic_without_user_state(
     _clear_role_env(monkeypatch)
     monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
     monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "missing.json"))
-    assert node_config.resolve_initial_node_role() == "master"
+    assert node_config.resolve_initial_node_role() == "client"
 
 
 def test_unconfirmed_persisted_role_does_not_override_release_default(
@@ -82,7 +82,7 @@ def test_unconfirmed_persisted_role_does_not_override_release_default(
     _clear_role_env(monkeypatch)
     monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
     monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(config_path))
-    assert node_config.resolve_initial_node_role() == "master"
+    assert node_config.resolve_initial_node_role() == "client"
 
 
 def test_invalid_explicit_role_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

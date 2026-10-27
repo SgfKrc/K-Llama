@@ -1,23 +1,17 @@
 {
   "schema_version": 1,
   "base_suite": "refactor_suite_v1.json",
-  "scope": "R1 bootstrap, authority and retained product contracts; temporary state only",
+  "scope": "R1 bootstrap credentials and retained static-role product contracts; temporary state only",
   "additional_targets": [
     "tests/test_refactor_bootstrap.py",
-    "tests/test_refactor_bootstrap_authority.py",
     "tests/test_api_cold_start.py",
     "tests/test_worker_prepare_runtime.py",
     "tests/test_bootstrap.py",
     "tests/test_bootstrap_credentials.py",
     "tests/test_release_contract.py",
     "tests/test_runtime_source.py",
-    "tests/test_cluster_quorum.py",
-    "tests/test_cluster_auto_role_runtime.py",
-    "tests/test_cluster_fence.py",
-    "tests/test_ha_handoff.py",
     "tests/test_journal_replication.py",
     "tests/test_journal_commit_truncate.py",
-    "tests/test_journal_replication_recovery.py",
     "tests/test_journal_replication_service.py",
     "tests/test_api_logging.py",
     "tests/test_keep_head_shim.py",
@@ -29,7 +23,75 @@
     "tests/test_tui_backend.py",
     "tests/test_refactor_characterization_baseline.py",
     "tests/test_refactor_largefile_baseline.py",
-    "tests/test_refactor_bootstrap_entrypoints.py",
-    "tests/test_api_cluster_join.py"
+    "tests/test_refactor_bootstrap_entrypoints.py"
+  ],
+  "retirement_decision": {
+    "id": "R6-static-role-account-api-retirement",
+    "date": "2026-10-27",
+    "source": "User ruling; see docs/静态主节点部署与认证退役决策-2026-10-27.md",
+    "ruling": "Remove human account/login/TOTP and join-grant/credential-rotation APIs, quorum RPC/cert, and transfer/spare/review APIs. Use one manually configured master and clients that never auto-promote.",
+    "recorded_date": "2026-10-28"
+  },
+  "retired_targets": [
+    {
+      "target": "tests/test_refactor_bootstrap_authority.py",
+      "reason": "Target exercises the retired join-grant, control-certificate, quorum-election, handoff, or quorum-authority recovery runtime. Bootstrap credential exchange remains covered."
+    },
+    {
+      "target": "tests/test_cluster_quorum.py",
+      "reason": "Target exercises the retired join-grant, control-certificate, quorum-election, handoff, or quorum-authority recovery runtime. Bootstrap credential exchange remains covered."
+    },
+    {
+      "target": "tests/test_cluster_auto_role_runtime.py",
+      "reason": "Target exercises the retired join-grant, control-certificate, quorum-election, handoff, or quorum-authority recovery runtime. Bootstrap credential exchange remains covered."
+    },
+    {
+      "target": "tests/test_cluster_fence.py",
+      "reason": "Target exercises the retired join-grant, control-certificate, quorum-election, handoff, or quorum-authority recovery runtime. Bootstrap credential exchange remains covered."
+    },
+    {
+      "target": "tests/test_ha_handoff.py",
+      "reason": "Target exercises the retired join-grant, control-certificate, quorum-election, handoff, or quorum-authority recovery runtime. Bootstrap credential exchange remains covered."
+    },
+    {
+      "target": "tests/test_api_cluster_join.py",
+      "reason": "Target exercises the retired join-grant, control-certificate, quorum-election, handoff, or quorum-authority recovery runtime. Bootstrap credential exchange remains covered."
+    },
+    {
+      "target": "tests/test_cluster_control_contract.py",
+      "reason": "Quorum-certificate contract tests are retired; static-role API contracts remain active."
+    },
+    {
+      "target": "tests/test_cluster_commit_watermark.py",
+      "reason": "Quorum-certificate watermark tests are retired; journal prefix recovery coverage remains active."
+    },
+    {
+      "target": "tests/test_ha_partition.py",
+      "reason": "Quorum partition and double-primary HA tests are retired."
+    },
+    {
+      "target": "tests/test_ha_role_auto.py",
+      "reason": "Automatic master-election tests are retired."
+    },
+    {
+      "target": "tests/test_ha_crosshost.py",
+      "reason": "Cross-host quorum and handoff tests are retired; transport generation tests remain covered by TCP suites."
+    },
+    {
+      "target": "tests/test_cluster_score.py",
+      "reason": "Management-candidate ranking tests are retired with automatic election."
+    },
+    {
+      "target": "tests/test_cluster_device_qualification.py",
+      "reason": "Voter qualification tests are retired with automatic election."
+    },
+    {
+      "target": "tests/test_cluster_state_catalog.py",
+      "reason": "P4.5 HA state-catalog tests are retired with automatic election and quorum state."
+    },
+    {
+      "target": "tests/test_ha_crosshost_physical_smoke.py",
+      "reason": "Physical HA/quorum acceptance tests are retired with automatic election."
+    }
   ]
 }

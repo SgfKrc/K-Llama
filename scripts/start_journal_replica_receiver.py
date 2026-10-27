@@ -1,9 +1,9 @@
-"""Start one journal replica receiver (the durable half of #93's quorum barrier).
+"""Start one journal replica receiver for explicit journal recovery.
 
 Why this exists: the receiver was only constructible from Python
 (``JournalReplicaReceiver`` has no product entrypoint), so the 2026-10-11 drills
-had to use a throwaway script.  A node that wants its checkpoint to count
-towards the quorum barrier needs this process to be *running and persistent*.
+had to use a throwaway script. A configured recovery donor needs this process
+to be *running and persistent*.
 
 Typical use (Windows):
 
@@ -50,7 +50,7 @@ MIN_SECRET_BYTES = 32
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Start a journal replica receiver (counts toward the quorum barrier).",
+        description="Start a journal replica receiver for journal recovery.",
     )
     parser.add_argument("--replica", required=True, help="sqlite path owned by this receiver")
     parser.add_argument("--port", type=int, required=True, help="TCP port to listen on")

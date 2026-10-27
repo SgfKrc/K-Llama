@@ -670,15 +670,6 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                 "process_id": os.getpid(), "process_start_time": psutil.Process(os.getpid()).create_time()}
 
     def _model_control_authority(self):
-        fence = getattr(self, "_control_fence", None)
-        authority = getattr(fence, "authority", None)
-        if fence is not None and getattr(fence, "required", False):
-            certificate = authority.current_certificate() if authority is not None else None
-            fence.admit(certificate, action="model_deployment", source="scheduler")
-        identity = authority.authority_identity() if authority is not None else None
-        if identity is not None:
-            from dataclasses import asdict
-            return asdict(identity)
         return {"mode": "static", "node_id": self.get_effective_node_id(), "role": self._effective_role()}
 
     def _model_control_connections(self, transaction=None):

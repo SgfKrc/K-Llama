@@ -942,6 +942,48 @@
   },
   "migration_from": "refactor_product_api_v1.json",
   "retired_http": {
+    "/api/auth/capability": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/auth/login": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/auth/logout": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/auth/me": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/auth/totp/provision": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/auth/totp/verify": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
     "/api/cluster/config/task-graph": {
       "methods": [
         "get",
@@ -950,12 +992,135 @@
       "disposition": "retire",
       "phase": "R5"
     },
+    "/api/cluster/control-plane/certificate": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/credentials/rotate": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/join/consume": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/join/grant": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/join/request": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/management-score": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
     "/api/cluster/queue/strategy": {
       "methods": [
         "post"
       ],
       "disposition": "retire",
       "phase": "R5"
+    },
+    "/api/cluster/quorum/voter": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/review/can-vote": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/review/create": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/review/expire-check": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/review/tickets": {
+      "methods": [
+        "delete",
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/review/tickets/{ticket_id}": {
+      "methods": [
+        "delete",
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/review/vote": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/spare-master": {
+      "methods": [
+        "delete",
+        "get",
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/spare-master/logs": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/transfer-logs": {
+      "methods": [
+        "get"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/cluster/transfer-master": {
+      "methods": [
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
     },
     "/api/experimental/speculative": {
       "methods": [
@@ -970,6 +1135,22 @@
       ],
       "disposition": "retire",
       "phase": "R5"
+    },
+    "/api/users": {
+      "methods": [
+        "get",
+        "post"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
+    },
+    "/api/users/{username}": {
+      "methods": [
+        "delete",
+        "patch"
+      ],
+      "disposition": "retire",
+      "phase": "R6"
     },
     "/api/workflows": {
       "methods": [
@@ -1013,5 +1194,135 @@
       "disposition": "retire",
       "phase": "R5"
     }
-  }
+  },
+  "retirement_decision": {
+    "id": "R6-static-role-account-api-retirement",
+    "date": "2026-10-27",
+    "source": "User ruling; see docs/静态主节点部署与认证退役决策-2026-10-27.md",
+    "ruling": "Remove human account/login/TOTP and join-grant/credential-rotation APIs, quorum RPC/cert, and transfer/spare/review APIs. Use one manually configured master and clients that never auto-promote.",
+    "preserve": [
+      "cluster_secret",
+      "bootstrap credential exchange",
+      "TCP HMAC node authentication",
+      "trusted-source checks",
+      "local user settings and chat sessions"
+    ],
+    "recorded_date": "2026-10-28"
+  },
+  "retired_schemas": [
+    {
+      "name": "ClusterJoinRequestCreate",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/join/request"
+      ]
+    },
+    {
+      "name": "ClusterJoinGrantIssue",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/join/grant"
+      ]
+    },
+    {
+      "name": "ClusterJoinConsume",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/join/consume"
+      ]
+    },
+    {
+      "name": "ClusterSecretRotateRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/credentials/rotate"
+      ]
+    },
+    {
+      "name": "ControlCertificateRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/control-plane/certificate"
+      ]
+    },
+    {
+      "name": "LoginRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/auth/login"
+      ]
+    },
+    {
+      "name": "CreateUserRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/users"
+      ]
+    },
+    {
+      "name": "PatchUserRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/users/{username}"
+      ]
+    },
+    {
+      "name": "TotpVerifyRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/auth/totp/verify"
+      ]
+    },
+    {
+      "name": "TransferMasterRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/transfer-master"
+      ]
+    },
+    {
+      "name": "SpareMasterRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/spare-master"
+      ]
+    },
+    {
+      "name": "CreateReviewRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/review/create"
+      ]
+    },
+    {
+      "name": "CastVoteRequest",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/review/vote"
+      ]
+    },
+    {
+      "name": "quorum-voter RPC request/response (inline)",
+      "disposition": "retire",
+      "phase": "R6",
+      "routes": [
+        "/api/cluster/quorum/voter"
+      ],
+      "openapi_components": [],
+      "note": "The retired endpoint used inline dictionary payloads; there were no named OpenAPI components to remove."
+    }
+  ]
 }

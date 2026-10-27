@@ -128,12 +128,14 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
 
 
     def _normalize_node_role(value: str) -> str:
-        role = (value or "master").strip().lower()
+        role = (value or "client").strip().lower()
         if role == "auto":
-            return "auto"
+            return "client"
         if role in {"slave", "worker", "client"}:
             return "client"
-        return "master"
+        if role == "master":
+            return "master"
+        raise ValueError("QLH_NODE_ROLE must be 'master' or 'client'")
 
 
     # ============================================================
@@ -824,7 +826,7 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
         # Keep a safe source-checkout fallback even when optional config imports
         # are unavailable during a minimal diagnostic import.
         _initial_role = environment.get(
-            "QLH_NODE_ROLE", "auto" if getattr(sys, "frozen", False) else "client"
+            "QLH_NODE_ROLE", "client"
         )
     NODE_ROLE = _normalize_node_role(_initial_role)
     _default_node_id = "master" if NODE_ROLE == "master" else f"client_{socket.gethostname()}"
@@ -861,11 +863,6 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     # 仅当数据库不可用时才回退到此配置值。
     CLIENT_MASTER_HOST = _env_first("QLH_CLIENT_MASTER_HOST", "QLH_MASTER_HOST", default="")
     CLIENT_MASTER_PORT = _env_int("QLH_CLIENT_MASTER_PORT", _env_int("QLH_MASTER_PORT", 8888))
-
-    # P3: 主节点转让审查配置（详见 src/review.py）
-    REVIEW_TIMEOUT_HOURS = 48            # 审查工单超时时间（小时）
-    REVIEW_APPROVE_THRESHOLD = 2         # 通过阈值: score >= +2
-    REVIEW_REJECT_THRESHOLD = -2         # 阻止阈值: score <= -2
 
     # ============================================================
     # 6. 集群安全

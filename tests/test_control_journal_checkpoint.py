@@ -151,12 +151,12 @@ def test_byte_budget_and_vacuum_reclaim_without_changing_head(journal_case):
     assert bounded.recovery_status() == before
 
 
-def test_model_checkpoint_keeps_quorum_watermark_identity(journal_case):
+def test_model_checkpoint_preserves_journal_prefix_identity(journal_case):
     prefix, adapter, _, _, connect, transaction = journal_case
     if prefix != "model_control":
         pytest.skip("model owner watermark")
     from types import SimpleNamespace
-    from cluster_auto_role_runtime import JournalPrefixAuthority
+    from journal_replication_authority import JournalPrefixAuthority
     from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN
     repository = adapter(connect=connect, transaction=transaction, max_events=1000)
     append(repository, 12)

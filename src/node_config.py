@@ -27,7 +27,7 @@ from release_contract import (
 
 _ROLE_ALIASES = {
     "master": "master",
-    "auto": "auto",
+    "auto": "client",
     "slave": "client",
     "worker": "client",
     "client": "client",
@@ -198,6 +198,11 @@ def load_node_config() -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         return {}
+
+    node = data.get("node") if isinstance(data.get("node"), dict) else {}
+    if str(node.get("role", "")).strip().lower() == "auto":
+        data["node"] = {**node, "role": "client", "role_confirmed": True}
+        write_node_config(data)
 
     cluster = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
     legacy_plaintext = bool(str(cluster.get("cluster_secret", "") or "").strip())

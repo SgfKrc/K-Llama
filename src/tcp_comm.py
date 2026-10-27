@@ -38,8 +38,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Callable
 
-from cluster_fence import ControlFence, ControlFenceError
-
 try:  # torch is optional: the edge runtime omits it; tensor APIs then fail closed
     import torch
 except ImportError:  # pragma: no cover - exercised by the edge venv
@@ -309,15 +307,6 @@ class MessageType(str, Enum):
     LAYER_WORKER_OPT_OUT = "layer_worker_opt_out"  # 从节点 → 主节点：退出分层计算
     LAYER_WORKER_OPT_IN = "layer_worker_opt_in"  # 从节点 → 主节点：重新加入分层计算
     TASK_WORKER = "task_worker"      # PC Full Worker v2 控制面/后续 Stage envelope
-    # 角色转让
-    ROLE_TRANSFER = "role_transfer"          # 主节点 → 从节点：转让主节点身份
-    ROLE_TRANSFER_ACK = "role_transfer_ack"  # 从节点 → 主节点：确认接收转让
-    # 备用主节点
-    SPARE_MASTER_DESIGNATE = "spare_master_designate"          # 主节点 → 从节点：指定为备用主节点
-    SPARE_MASTER_DESIGNATE_ACK = "spare_master_designate_ack"  # 从节点 → 主节点：确认接收备用身份
-    SPARE_MASTER_ACTIVATE = "spare_master_activate"            # 主节点 → 备用：激活暂代主节点职责
-    SPARE_MASTER_ACTIVATE_ACK = "spare_master_activate_ack"    # 备用 → 主节点：确认激活
-    SPARE_MASTER_DEACTIVATE = "spare_master_deactivate"        # 新主节点 → 备用：接管完成，退出暂代
     # 节点列表同步
     NODE_LIST_SYNC = "node_list_sync"            # 主节点 → 从节点：全量节点列表同步
     NODE_UPDATE = "node_update"                  # 主节点 → 从节点：单节点变更 (add/update/remove)
@@ -338,69 +327,6 @@ class MessageType(str, Enum):
 # ================================================================
 # 网络类型检测
 # ================================================================
-
-# Control messages that can mutate cluster ownership or execution topology.
-FENCED_CONTROL_MESSAGE_TYPES = frozenset({
-    MessageType.TASK_START.value, MessageType.TASK_STOP.value,
-    MessageType.LAYER_CONFIG.value, MessageType.LAYER_CONFIG_ACK.value,
-    MessageType.MODEL_SUPPLY.value, MessageType.MODEL_PREPARE.value,
-    MessageType.QWEN3_PIPELINE_DRY_RUN.value,
-    MessageType.QWEN3_PIPELINE_DRY_RUN_ACK.value,
-    MessageType.LAYER_WORKER_OPT_OUT.value, MessageType.LAYER_WORKER_OPT_IN.value,
-    MessageType.TASK_WORKER.value, MessageType.ROLE_TRANSFER.value,
-    MessageType.ROLE_TRANSFER_ACK.value, MessageType.SPARE_MASTER_DESIGNATE.value,
-    MessageType.SPARE_MASTER_DESIGNATE_ACK.value,
-    MessageType.SPARE_MASTER_ACTIVATE.value, MessageType.SPARE_MASTER_ACTIVATE_ACK.value,
-    MessageType.SPARE_MASTER_DEACTIVATE.value, MessageType.NODE_LIST_SYNC.value,
-    MessageType.NODE_UPDATE.value, MessageType.PIPELINE_PAUSE.value,
-    MessageType.PIPELINE_RESUME.value,
-})
-
-
-def _is_fenced_control_message(msg_type: MessageType | str) -> bool:
-    value = msg_type.value if isinstance(msg_type, MessageType) else str(msg_type)
-    return value in FENCED_CONTROL_MESSAGE_TYPES
-
-
-def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFence | None, *, peer=False) -> Any:
-    if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
-        return data
-    if not isinstance(data, dict):
-        raise ControlFenceError("control_certificate_invalid", "fenced control messages require an object payload")
-    payload = dict(data)
-    if "control_certificate" not in payload:
-        certificate = fence.current_certificate()
-        if certificate is None:
-            raise ControlFenceError("control_certificate_missing", "fenced control message has no current certificate")
-        payload["control_certificate"] = certificate
-    if peer:
-        fence.admit_peer(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}")
-    else:
-        fence.admit(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}", source="tcp")
-    return payload
-
-
-def _admit_inbound_control_message(
-    msg: dict, fence: ControlFence | None, *, peer: bool = False,
-) -> None:
-    msg_type = msg.get("type", "")
-    if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
-        return
-    data = msg.get("data")
-    certificate = data.get("control_certificate") if isinstance(data, dict) else None
-    action = f"tcp.receive.{msg_type}"
-    if peer:
-        fence.admit_peer(certificate, action=action, observe=True)
-    else:
-        fence.admit(certificate, action=action, source="tcp")
-
-    # The certificate belongs to the TCP control wrapper, not the task-worker
-    # protocol envelope. Remove it only after the fence has admitted it.
-    if msg_type == MessageType.TASK_WORKER.value and isinstance(data, dict):
-        sanitized_data = dict(data)
-        sanitized_data.pop("control_certificate", None)
-        msg["data"] = sanitized_data
-
 
 def detect_network_type() -> str:
     """
@@ -1262,17 +1188,11 @@ class TCPServer:
         # Called only after a successful REGISTER ACK has been written to the
         # socket.  Scheduler-side layer/config pushes must wait for this edge.
         self.on_registration_confirmed: Optional[Callable] = None
-        self._control_fence: ControlFence | None = None
         # ★ #106/#114：本集群要求 task-worker 协商的节点。主节点在加 fence 的
         #   同一边沿写入这里，REGISTER ACK 据此带上声明；否则客户端只能靠自己的
         #   本地实验开关猜——没开的节点永远不发 hello，而 fence 只能由 hello
         #   解除，它的 release 债务就永远投递不出去。
         self._task_worker_hello_required: set[str] = set()
-
-    def set_control_fence(self, fence: ControlFence | None) -> None:
-        if fence is not None and not isinstance(fence, ControlFence):
-            raise TypeError("control fence must be a ControlFence or None")
-        self._control_fence = fence
 
     def set_task_worker_hello_required(self, client_id: str, required: bool) -> None:
         """声明（或撤销）一次注册的 task-worker 握手要求。
@@ -1286,9 +1206,6 @@ class TCPServer:
                 self._task_worker_hello_required.add(str(client_id))
             else:
                 self._task_worker_hello_required.discard(str(client_id))
-
-    def _admit_inbound_control(self, msg: dict) -> None:
-        _admit_inbound_control_message(msg, self._control_fence)
 
     def start(self, on_message: Callable = None,
               on_disconnect: Callable = None,
@@ -1428,18 +1345,6 @@ class TCPServer:
                 # 声明在先、ACK 在后：客户端在 connect() 返回前就能据它决定是否
                 # 发 hello，从而不再依赖客户端本地的实验开关（#106/#114）。
                 data["task_worker_hello_required"] = True
-        fence = self._control_fence
-        if status == "registered" and fence is not None and fence.enabled:
-            certificate = fence.current_certificate()
-            if certificate is None:
-                raise ControlFenceError(
-                    "control_certificate_missing",
-                    "fenced registration requires a current control certificate",
-                    action="tcp.register_ack",
-                )
-            fence.admit(certificate, action="tcp.register_ack", source="tcp")
-            data["control_fence_required"] = True
-            data["control_certificate"] = certificate
         conn.sendall(build_message(MessageType.REGISTER, data))
 
     def confirm_registration(self, client_id: str) -> bool:
@@ -1468,7 +1373,7 @@ class TCPServer:
                 if self._pending_registrations.get(client_id) is client:
                     self._pending_registrations.pop(client_id, None)
             return True
-        except (OSError, ControlFenceError) as e:
+        except OSError as e:
             logger.warning("注册确认发送失败: %s", e, exc_info=True)
             return False
 
@@ -1631,20 +1536,6 @@ class TCPServer:
                 msg_type = msg.get("type", "")
                 registration_pending = False
 
-                try:
-                    self._admit_inbound_control(msg)
-                except ControlFenceError as exc:
-                    logger.warning("TCP control frame rejected code=%s type=%s", exc.code, msg_type)
-                    try:
-                        self.send_to_client(
-                            client_id,
-                            {"status": "rejected", "error_code": exc.code},
-                            MessageType.ERROR,
-                        )
-                    except Exception:
-                        pass
-                    continue
-
                 # ---- 消息分发 ----
                 if msg_type == MessageType.REGISTER.value:
                     # 注册消息：提取客户端身份信息
@@ -1700,12 +1591,7 @@ class TCPServer:
                                 "registered",
                                 client_id=client_id,
                             )
-                        except (OSError, ControlFenceError) as exc:
-                            if isinstance(exc, ControlFenceError):
-                                logger.warning(
-                                    "fenced REGISTER ACK unavailable: client=%s code=%s",
-                                    client_id, exc.code,
-                                )
+                        except OSError:
                             self._pop_client_if_same(client_id, current)
                             break
                         else:
@@ -2032,7 +1918,6 @@ class TCPServer:
         conn = self._get_client(client_id)
         if conn is None:
             raise ConnectionError(f"从节点 {client_id} 未连接")
-        data = _decorate_control_payload(data, msg_type, self._control_fence)
         packet = build_message(msg_type, data, binary_body=binary_body)
         try:
             # 心跳 ACK、控制消息和大张量会由不同线程发送，必须保持完整帧原子写入。
@@ -2298,8 +2183,6 @@ class TCPClient:
         self.reconnect_state = "idle"
         self.last_reconnect_error = ""
         self.next_reconnect_at = 0.0
-        self._control_fence: ControlFence | None = None
-
     @staticmethod
     def received_registration_owner() -> tuple | None:
         """Return the owner of this thread's current TCP callback, if any."""
@@ -2325,14 +2208,6 @@ class TCPClient:
                     or owner[2] is not self.sock):
                 return None
             return action()
-
-    def set_control_fence(self, fence: ControlFence | None) -> None:
-        if fence is not None and not isinstance(fence, ControlFence):
-            raise TypeError("control fence must be a ControlFence or None")
-        self._control_fence = fence
-
-    def _admit_inbound_control(self, msg: dict) -> None:
-        _admit_inbound_control_message(msg, self._control_fence, peer=True)
 
     def _transport_runtime_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         runtime = self.transport_runtime
@@ -2779,11 +2654,6 @@ class TCPClient:
                     if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
                         self._handle_heartbeat_ack(msg, connection_generation)
                         continue  # 不向上层转发
-                    try:
-                        self._admit_inbound_control(msg)
-                    except ControlFenceError as exc:
-                        logger.warning("TCP control frame rejected code=%s type=%s", exc.code, msg.get("type"))
-                        continue
                     if self.on_message:
                         previous_owner = getattr(_CLIENT_RECEIVE_CONTEXT, "owner", None)
                         _CLIENT_RECEIVE_CONTEXT.owner = received_owner
@@ -2863,7 +2733,6 @@ class TCPClient:
                   connection_sock: socket.socket = None,
                   binary_body: Optional[bytes] = None) -> None:
         """向主节点发送数据"""
-        data = _decorate_control_payload(data, msg_type, self._control_fence, peer=True)
         packet = build_message(msg_type, data, binary_body=binary_body)
         self._transport_runtime_call(
             "observe_legacy_send",

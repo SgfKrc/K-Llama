@@ -13,8 +13,7 @@
 * follower 侧 ``JournalReplicaReceiver``：`DurableJournalReplica` + `JournalReplicationTcpServer`。
 
 **本模块刻意不做的**（留给后续，别把它当已完成）：
-* 不自动挂 `lifespan`、不随 `NODE_ROLE` 自动启停、不参与 leader 选举 —— 那些属 P4.5 的 HA
-  生产启用（`NODE_ROLE=auto` 至今默认关，`production_availability_claim` 仍为 `false`）；
+* 不自动挂 `lifespan` 或随节点角色自动启停；
 * 因此这里只提供**显式可调用**的入口，由 `src/api/routes_tasks.py` 的端点驱动。
 
 **安全**：HMAC 只做认证，**不加密**；默认 bind loopback。生产部署需要受保护的传输与密钥托管
@@ -90,28 +89,8 @@ def _env_timeout(env: Mapping[str, str], name: str, default: float = 5.0) -> flo
     return value
 
 
-def _env_int(
-    env: Mapping[str, str],
-    name: str,
-    default: int = 0,
-    *,
-    minimum: int = 0,
-    maximum: int = 4096,
-) -> int:
-    raw = env.get(name)
-    if raw is None or str(raw).strip() == "":
-        return default
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return default
-    if not (minimum <= value <= maximum):
-        return default
-    return value
-
-
-def _parse_quorum_peers(value: str) -> tuple[tuple[str, int], ...]:
-    """解析 ``host:port,host:port``；**非法项直接丢弃**（绝不猜端口、绝不回退到默认端口）。"""
+def _parse_peer_endpoints(value: str) -> tuple[tuple[str, int], ...]:
+    """Parse comma-separated recovery peers; ignore malformed entries."""
 
     peers: list[tuple[str, int]] = []
     seen: set[tuple[str, int]] = set()
@@ -149,22 +128,11 @@ class JournalReplicationSettings:
     peer_port: int = 0
     timeout_s: float = 5.0
     secret: bytes = b""
-    #: #93：**回包前栅栏**的多数耐久目标。空 = 不做多数判定（退回单 peer 语义，行为不变）。
-    quorum_peers: tuple[tuple[str, int], ...] = ()
-    quorum_size: int = 0
+    recovery_peers: tuple[tuple[str, int], ...] = ()
 
     @property
     def secret_bytes(self) -> bytes:
         return bytes(self.secret)
-
-    @property
-    def required_quorum(self) -> int:
-        """栅栏阈值：未显式指定时按**多数**取（``len(peers)//2 + 1``）；无对端 ⇒ 0。"""
-        if not self.quorum_peers:
-            return 0
-        if self.quorum_size > 0:
-            return min(self.quorum_size, len(self.quorum_peers))
-        return len(self.quorum_peers) // 2 + 1
 
     def validate(self) -> None:
         """配置自检。**只在开启时才严格要求** —— 关着的时候允许缺项。"""
@@ -183,11 +151,6 @@ class JournalReplicationSettings:
             raise JournalReplicationError(
                 f"QLH_JOURNAL_REPLICATION_SECRET must be at least {MIN_SECRET_BYTES} bytes"
             )
-        if self.quorum_size > len(self.quorum_peers):
-            raise JournalReplicationError(
-                "QLH_JOURNAL_REPLICATION_QUORUM_SIZE cannot exceed the configured quorum peers"
-            )
-
     def require_enabled(self) -> None:
         if not self.enabled:
             raise JournalReplicationDisabled(
@@ -204,13 +167,13 @@ class JournalReplicationSettings:
                 "QLH_JOURNAL_REPLICATION_PEER_HOST / _PEER_PORT are required to push a checkpoint"
             )
 
-    def require_quorum_peers(self) -> None:
-        """#93：回包前栅栏需要**多个** replica 目标，否则「多数」没有意义。"""
+    def require_recovery_peers(self) -> None:
+        """Require at least one configured checkpoint donor."""
 
         self.require_enabled()
-        if not self.quorum_peers:
+        if not self.recovery_peers:
             raise JournalReplicationError(
-                "QLH_JOURNAL_REPLICATION_QUORUM_PEERS is required for the quorum barrier"
+                "QLH_JOURNAL_REPLICATION_RECOVERY_PEERS is required for recovery"
             )
 
     def public(self) -> dict[str, Any]:
@@ -225,11 +188,7 @@ class JournalReplicationSettings:
             "peer": {"host": self.peer_host, "port": self.peer_port},
             "timeout_s": self.timeout_s,
             "secret_present": len(self.secret_bytes) >= MIN_SECRET_BYTES,
-            "quorum": {
-                "peers": [f"{host}:{port}" for host, port in self.quorum_peers],
-                "size": self.quorum_size,
-                "required": self.required_quorum,
-            },
+            "recovery_peers": [f"{host}:{port}" for host, port in self.recovery_peers],
         }
 
     @classmethod
@@ -259,10 +218,9 @@ class JournalReplicationSettings:
             peer_port=_env_port(env, "QLH_JOURNAL_REPLICATION_PEER_PORT", 0),
             timeout_s=_env_timeout(env, "QLH_JOURNAL_REPLICATION_TIMEOUT_S", 5.0),
             secret=secret_text.encode("utf-8"),
-            quorum_peers=_parse_quorum_peers(
-                _env_text(env, "QLH_JOURNAL_REPLICATION_QUORUM_PEERS")
+            recovery_peers=_parse_peer_endpoints(
+                _env_text(env, "QLH_JOURNAL_REPLICATION_RECOVERY_PEERS")
             ),
-            quorum_size=_env_int(env, "QLH_JOURNAL_REPLICATION_QUORUM_SIZE", 0),
         )
 
 
@@ -308,70 +266,6 @@ def replicate_journal_once(
     }
 
 
-def replicate_journal_to_quorum(
-    journal: Any,
-    *,
-    workflow_id: str,
-    settings: JournalReplicationSettings | None = None,
-) -> dict[str, Any]:
-    """#93「回包前栅栏」：把**同一个** checkpoint 推给多个 replica，达到多数耐久才回 OK。
-
-    与 `replicate_journal_once` 的差别就是**不**在第一个 ACK 上返回：
-
-    - 只做一次 `build_checkpoint` ⇒ 所有目标看到的是**同一个**快照与摘要（不会各拿一份）；
-    - 单个目标失败**不抛**（要能继续收集多数），失败原因逐个记进 `failures`；
-    - 返回 `accepted`（是否达到 `required_quorum`）与 `durable_acks`，HTTP 语义交给调用方；
-      调用方在 `accepted=False` 时**必须**回错误，否则这道栅栏等于不存在。
-
-    `send_checkpoint` 自身已校验对端回显的 `durable_sequence` / `checkpoint_digest`
-    ⇒ 这里的一个 ACK 就等于「对端**耐久**持有到该点」。
-    """
-
-    resolved = settings or JournalReplicationSettings.from_env()
-    resolved.require_quorum_peers()
-    if not isinstance(workflow_id, str) or not workflow_id:
-        raise JournalReplicationError("workflow_id is required")
-
-    checkpoint: JournalCheckpoint = build_checkpoint(
-        journal,
-        source_node_id=resolved.source_node_id,
-        stream_id=resolved.stream_id,
-        workflow_id=workflow_id,
-    )
-    required = resolved.required_quorum
-    durable: list[str] = []
-    failures: dict[str, str] = {}
-    for host, port in resolved.quorum_peers:
-        label = f"{host}:{port}"
-        try:
-            send_checkpoint(
-                host,
-                port,
-                checkpoint,
-                secret=resolved.secret_bytes,
-                timeout=resolved.timeout_s,
-            )
-        except (JournalReplicationTransportError, OSError) as exc:
-            failures[label] = type(exc).__name__
-            continue
-        durable.append(label)
-    accepted = len(durable) >= required
-    return {
-        "status": "replicated" if accepted else "quorum_not_reached",
-        "accepted": accepted,
-        "workflow_id": workflow_id,
-        "source_node_id": resolved.source_node_id,
-        "stream_id": resolved.stream_id,
-        "durable_sequence": checkpoint.last_sequence,
-        "checkpoint_digest": checkpoint.checkpoint_digest,
-        "event_count": len(checkpoint.records),
-        "durable_acks": len(durable),
-        "required_quorum": required,
-        "durable_peers": durable,
-        "failures": failures,
-    }
-
-
 def recover_journal_prefix(
     replica: Any,
     *,
@@ -380,21 +274,17 @@ def recover_journal_prefix(
     mutation_guard=None,
     permission_check=None,
 ) -> dict[str, Any]:
-    """#93：让**落后的副本主动追赶** —— 从对端拉回一个已自洽的 checkpoint 并应用。
-
-    与栅栏（推）严格对偶：单个目标失败**不抛**（要能继续试别的目标），但**一个都没成功**
-    时返回 `recovered=False` ⇒ 调用方必须继续拒绝接管，绝不允许「凑合上线」。
-    """
+    """Recover a lagging replica from the first reachable configured donor."""
 
     resolved = settings or JournalReplicationSettings.from_env()
-    resolved.require_quorum_peers()
+    resolved.require_recovery_peers()
     if not isinstance(workflow_id, str) or not workflow_id:
         raise JournalReplicationError("workflow_id is required")
 
     applied: list[str] = []
     failures: dict[str, str] = {}
     durable_sequence: int | None = None
-    for host, port in resolved.quorum_peers:
+    for host, port in resolved.recovery_peers:
         label = f"{host}:{port}"
         try:
             checkpoint = request_checkpoint(
@@ -486,6 +376,5 @@ __all__ = [
     "JournalReplicationSettings",
     "JournalReplicationTransportError",
     "replicate_journal_once",
-    "replicate_journal_to_quorum",
     "recover_journal_prefix",
 ]

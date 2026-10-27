@@ -7,7 +7,7 @@
     gateway/test/fake-scheduler.ts + docs/TUI适配实施计划.md §2.2
   - 端点实现 = api_server 对应薄壳端点的等价复制（api_server.py:5169-5928
     cluster 区 + 1820-1960 device 区），scheduler → 注入实例；源文件不动
-  - review 域（/api/cluster/review/*）由 legacy-control 承载，不在此实现
+  - 节点角色为静态配置，不提供选主、角色转让、备用主节点或转让审查端点
   - bootstrap 域属 control-svc（阶段 3），不在此实现
   - device 画像：scheduler 启动时不自动检测，壳内惰性检测并缓存
     （device_profiler.get_profile()），同步 scheduler._local_device_profile
@@ -38,10 +38,6 @@ class UpdateMaxNodesRequest(BaseModel):
 class ConnectToMasterRequest(BaseModel):
     master_host: str = Field(..., description="主节点 IP 地址", min_length=1)
     master_port: int = Field(8888, ge=1, le=65535, description="主节点端口")
-    switch_to_client: bool = Field(
-        False,
-        description="待配置节点显式切换为从节点后加入现有集群",
-    )
 
 
 class Qwen3LocalChainBeginRequest(BaseModel):
@@ -292,15 +288,8 @@ async def connect_to_master(req: ConnectToMasterRequest):
     调用后本节点将通过 TCP 向指定主节点发起注册，
     注册成功后主节点的节点列表中将出现本节点。
     """
-    force_bootstrap = False
     if _scheduler()._effective_role() == "master":
-        if not req.switch_to_client or not _scheduler().can_join_existing_master():
-            raise HTTPException(403, "当前主节点已确认或已有从节点，不能切换为从节点")
-        # 角色切换可能阻塞在角色迁移锁上，放入线程池避免卡死事件循环
-        switch_result = await run_in_threadpool(_scheduler().activate_client_mode)
-        if switch_result.get("status") == "denied":
-            raise HTTPException(409, switch_result.get("reason", "无法切换为从节点"))
-        force_bootstrap = True
+        raise HTTPException(403, "节点角色为静态配置；请将本节点配置为 client 并重启")
 
     # connect_to_master 内部含多次 TCP 重试（最长可达数十秒），
     # 必须放入线程池执行，否则会阻塞事件循环冻结所有 HTTP 接口
@@ -308,7 +297,6 @@ async def connect_to_master(req: ConnectToMasterRequest):
         _scheduler().connect_to_master,
         req.master_host,
         req.master_port,
-        force_bootstrap=force_bootstrap,
         persist_preference=True,
     )
     if result.get("status") == "denied":
@@ -809,149 +797,6 @@ async def cancel_qwen3_local_chain():
         raise
     except Exception as exc:
         _raise_qwen3_local_http(exc)
-
-
-# ============================================================
-# 角色转让 API
-# ============================================================
-
-class TransferMasterRequest(BaseModel):
-    target_node_id: str = Field(..., min_length=1, max_length=64,
-                                 description="目标从节点 ID（将升级为新主节点）")
-
-
-@router.post("/cluster/transfer-master")
-async def transfer_master_role(req: TransferMasterRequest):
-    """
-    将主节点身份转让给指定从节点（仅主节点可调用）。
-
-    流程:
-      1. 主节点通过 TCP 向目标从节点发送 ROLE_TRANSFER 消息
-      2. 从节点保存升级日志、返回 ACK
-      3. 主节点保存降级日志、更新数据库中的主节点信息
-      4. 建议双方重启以应用新角色
-
-    注意: 转让后需要重启服务才能生效：
-      - 原主节点重启后以从节点模式运行
-      - 新主节点重启后以主节点模式运行
-    """
-    # 内部同步等待从节点 ACK（最长 15s），放入线程池避免阻塞事件循环
-    result = await run_in_threadpool(
-        _scheduler().transfer_master_role, req.target_node_id
-    )
-    if result.get("status") == "denied":
-        raise HTTPException(403, result.get("reason", "权限不足"))
-    if result.get("status") == "invalid":
-        raise HTTPException(400, result.get("reason", "参数无效"))
-    if result.get("status") == "timeout":
-        raise HTTPException(408, result.get("reason", "超时"))
-    if result.get("status") == "error":
-        raise HTTPException(500, result.get("reason", "操作失败"))
-    return result
-
-
-@router.get("/cluster/transfer-logs")
-async def get_transfer_logs():
-    """
-    获取角色转让日志（降级 + 升级）。
-
-    Returns:
-        { logs: [{direction, from_role, to_role, related_node, timestamp, ...}] }
-    """
-    logs = _scheduler().get_transfer_logs()
-    return {"logs": logs, "count": len(logs)}
-
-
-# ============================================================
-# 备用主节点管理 API
-# ============================================================
-
-class SpareMasterRequest(BaseModel):
-    target_node_id: str
-
-
-@router.get("/cluster/spare-master")
-async def get_spare_master():
-    """
-    获取当前备用主节点信息。
-
-    Returns:
-        { spare_master: {node_id, hostname, address, designated_at, is_online, state} | null }
-    """
-    spare = _scheduler().get_spare_master()
-    return {"spare_master": spare}
-
-
-@router.post("/cluster/spare-master")
-async def designate_spare_master(req: SpareMasterRequest):
-    """
-    指定一个在线从节点为备用主节点（仅主节点可调用）。
-
-    规则:
-      - 集群节点数 ≥ 2
-      - 目标节点必须在线且为 client
-
-    Returns:
-        { status, message, spare_master, ... }
-    """
-    # 内部同步等待从节点 ACK（最长 15s），放入线程池避免阻塞事件循环
-    result = await run_in_threadpool(
-        _scheduler().designate_spare_master, req.target_node_id
-    )
-    if result.get("status") == "denied":
-        raise HTTPException(403, result.get("reason", "权限不足"))
-    if result.get("status") == "invalid":
-        raise HTTPException(400, result.get("reason", "参数无效"))
-    if result.get("status") == "timeout":
-        raise HTTPException(408, result.get("reason", "超时"))
-    if result.get("status") == "duplicate":
-        return result  # 不抛异常，返回已有信息
-    if result.get("status") == "error":
-        raise HTTPException(500, result.get("reason", "操作失败"))
-    return result
-
-
-@router.delete("/cluster/spare-master")
-async def clear_spare_master():
-    """
-    清除备用主节点指定（仅主节点可调用）。
-
-    Returns:
-        { status, message }
-    """
-    result = _scheduler().clear_spare_master()
-    if result.get("status") == "denied":
-        raise HTTPException(403, result.get("reason", "权限不足"))
-    return result
-
-
-@router.get("/cluster/spare-master/logs")
-async def get_spare_master_logs():
-    """
-    获取备用主节点操作日志。
-
-    Returns:
-        { logs: [{direction, timestamp, details, ...}] }
-    """
-    logs = _scheduler().get_spare_master_logs()
-    return {"logs": logs, "count": len(logs)}
-
-
-# ============================================================
-# P3: 主节点转让审查 API
-# ============================================================
-
-class CreateReviewRequest(BaseModel):
-    target_node_id: str = Field(..., description="拟转让的目标从节点 ID")
-    reason: str = Field(default="", description="转让原因")
-    timeout_hours: float = Field(default=48.0, description="超时时间（小时）")
-
-
-class CastVoteRequest(BaseModel):
-    ticket_id: str = Field(..., description="工单 ID")
-    vote: int = Field(..., description="-1（阻止）、0（弃权）、+1（赞同）")
-    comment: str = Field(default="", description="投票附言")
-
 
 
 # =====================================================================

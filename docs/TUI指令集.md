@@ -2,7 +2,7 @@
 
 > 状态：**现行**
 >
-> 更新日期：2026-10-02
+> 更新日期：2026-10-28
 >
 > 适用范围：交互外壳聊天页（`src/tui_textual.py` 的 `ChatPane`）里以 `/` 开头的命令。命令的唯一事实源是 `src/tui_shared.py` 的 `COMMAND_SPECS`（`/help` 与执行分支同源，未实现的命令不登记）。功能屏的按键操作、启动方式与排障见 [TUI 使用指南](TUI使用指南.md)。
 
@@ -14,9 +14,9 @@
 2. 参数用位置参数与子命令，`/model load <id> [engine] [quant]` 这类子命令按源码解析。
 3. 破坏性操作在执行前弹确认框：`/delete-session`、`/reset`、`/model load|unload`、`/queue clear`、`/logs delete`、`/history drop-turn`。
 4. `/model` 的加载/卸载要求后端在 loopback 上：远程后端需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
-5. 凭据（`/login`）仅在本进程内存中持有，不落盘。
+5. 人类账户登录、账户管理、TOTP 和 HA 角色管理已退役；本指南只记录仍属支持范围的交互命令。角色与连接配置见[静态部署决策](静态主节点部署与认证退役决策-2026-10-27.md)。
 
-## 二、命令表（25 条，来源 `src/tui_shared.py` 的 `COMMAND_SPECS`）
+## 二、命令表（来源 `src/tui_shared.py` 的 `COMMAND_SPECS`）
 
 ### 会话
 
@@ -60,21 +60,10 @@
 | --- | --- | --- |
 | `/logs` | `list \| download <file> \| read <file> \| delete <file> \| nodes` | 文件列表 / 下载 / 查看 / 删除（需确认）/ 各节点汇总 |
 
-### 账户与认证
+### 界面
 
 | 命令 | 参数 | 说明 |
 | --- | --- | --- |
-| `/login` | `<username> <password> [totp_code]` | 登录（账户已绑定 Auth App 时需附 6 位验证码）；凭据仅本进程内存持有 |
-| `/logout` | — | 注销（服务端吊销当前登录态） |
-| `/whoami` | — | 显示当前登录主体与认证能力 |
-| `/users` | `list \| add <name> <pass> [role] \| role <name> <role> \| disable\|enable <name> \| passwd <name> <pass> \| del <name>` | 账户管理（需 admin） |
-| `/totp` | `provision \| verify <code>` | Auth App 绑定：`provision` 生成密钥与 otpauth URI，`verify` 校验一次 |
-
-### 集群与界面
-
-| 命令 | 参数 | 说明 |
-| --- | --- | --- |
-| `/ha` | `health \| transfer-logs \| spare \| spare-logs \| designate <node> \| clear-spare \| transfer <node> \| reset-identity` | 集群高可用：健康 / 转让日志 / 备用主节点；`transfer` 与 `reset-identity` 为高危（转让后需重启，身份重置不可撤销） |
 | `/help` | — | 显示本帮助 |
 | `/quit` | — | 退出聊天页 |
 

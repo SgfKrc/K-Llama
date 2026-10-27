@@ -329,14 +329,6 @@ def initialize_local_store(path: str | None = None, *, migrate_legacy: bool = Tr
                 );
                 CREATE INDEX IF NOT EXISTS idx_model_download_jobs_created
                   ON model_download_jobs(created_at DESC);
-                CREATE TABLE IF NOT EXISTS review_tickets (
-                  ticket_id TEXT PRIMARY KEY,
-                  status TEXT NOT NULL,
-                  created_at REAL NOT NULL,
-                  payload TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_review_tickets_created
-                  ON review_tickets(created_at DESC);
                 CREATE TABLE IF NOT EXISTS python_local_store_meta (
                   key TEXT PRIMARY KEY,
                   value TEXT NOT NULL,
@@ -1027,99 +1019,6 @@ def delete_local_experimental_model(model_id: str, *, expected_revision: int | N
         snapshot = get_local_model_registry_snapshot(model_id)
         expected_revision = snapshot.registry_revision
     return _catalog_service().remove(str(model_id), expected_revision=expected_revision)
-
-
-def upsert_local_review_ticket(ticket: dict) -> dict:
-    payload = dict(ticket)
-    payload["ticket_id"] = str(payload.get("ticket_id", ""))
-    payload["status"] = str(payload.get("status", "pending"))
-    payload["created_at"] = float(payload.get("created_at", 0.0) or 0.0)
-    with _write_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO review_tickets(ticket_id, status, created_at, payload)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(ticket_id) DO UPDATE SET
-              status=excluded.status, created_at=excluded.created_at, payload=excluded.payload
-            """,
-            (payload["ticket_id"], payload["status"], payload["created_at"],
-             json.dumps(payload, ensure_ascii=False)),
-        )
-    return payload
-
-
-def get_local_review_ticket(ticket_id: str) -> Optional[dict]:
-    connection = _connect()
-    try:
-        row = connection.execute(
-            "SELECT payload FROM review_tickets WHERE ticket_id = ?", (str(ticket_id),)
-        ).fetchone()
-        if not row:
-            return None
-        value = json.loads(row["payload"])
-        return value if isinstance(value, dict) else None
-    except (TypeError, json.JSONDecodeError):
-        return None
-    finally:
-        connection.close()
-
-
-def update_local_review_ticket(ticket_id: str, updates: dict) -> Optional[dict]:
-    current = get_local_review_ticket(ticket_id)
-    if current is None:
-        return None
-    current.update({key: value for key, value in updates.items() if key in {
-        "status", "score", "votes", "resolved_at",
-        "transfer_reason", "expires_at",
-    }})
-    return upsert_local_review_ticket(current)
-
-
-def list_local_review_tickets(status: str | None = None) -> list[dict]:
-    connection = _connect()
-    try:
-        if status:
-            rows = connection.execute(
-                "SELECT payload FROM review_tickets WHERE status = ? ORDER BY created_at DESC",
-                (str(status),),
-            ).fetchall()
-        else:
-            rows = connection.execute(
-                "SELECT payload FROM review_tickets ORDER BY created_at DESC"
-            ).fetchall()
-        result = []
-        for row in rows:
-            try:
-                value = json.loads(row["payload"])
-                if isinstance(value, dict):
-                    result.append(value)
-            except (TypeError, json.JSONDecodeError):
-                continue
-        return result
-    finally:
-        connection.close()
-
-
-def delete_local_review_ticket(ticket_id: str) -> bool:
-    with _write_connection() as connection:
-        result = connection.execute("DELETE FROM review_tickets WHERE ticket_id = ?", (str(ticket_id),))
-        return int(result.rowcount) > 0
-
-
-def delete_local_resolved_review_tickets() -> int:
-    with _write_connection() as connection:
-        result = connection.execute(
-            "DELETE FROM review_tickets WHERE status IN ('approved', 'rejected', 'expired')"
-        )
-        return int(result.rowcount)
-        for key, value in values.items():
-            connection.execute(
-                """
-                INSERT INTO cluster_settings(key, value, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                """,
-                (key, value, now),
-            )
 
 
 def get_local_save_history() -> bool:

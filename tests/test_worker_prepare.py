@@ -189,7 +189,7 @@ def test_failed_close_never_acknowledges_released_and_can_retry(setup):
     assert not run(setup, "release", value, cleanup_id="release-one")["loaded"]
 
 
-@pytest.mark.parametrize("change", ["generation", "client", "mode", "authority"])
+@pytest.mark.parametrize("change", ["generation", "client", "mode"])
 def test_native_completion_rechecks_scope_and_never_ready_after_drift(setup, change):
     entered, complete = threading.Event(), threading.Event()
     original = setup.host._build_worker_runtime
@@ -212,8 +212,6 @@ def test_native_completion_rechecks_scope_and_never_ready_after_drift(setup, cha
         setup.scheduler._tcp_client = Client()
     elif change == "mode":
         setup.scheduler.enabled = False
-    else:
-        setup.scheduler._control_fence = object()
     complete.set()
     drain(setup.controller)
     assert not any(ack["status"] == "prepared" for ack in client.acks)

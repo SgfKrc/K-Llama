@@ -295,10 +295,9 @@ def test_get_body_is_not_forwarded(setup):
     assert not setup.calls
 
 
-def test_only_authorization_trace_and_certificate_from_caller_are_forwarded(setup):
+def test_only_allowlisted_headers_are_forwarded(setup):
     headers = {
         "Authorization": "Bearer caller-token", "X-Request-ID": "request-1",
-        "X-QLH-Control-Certificate": "certificate-exact",
         "Host": "attacker.test", "Content-Length": "999", "Cookie": "session=secret",
         "Forwarded": "for=127.0.0.1", "X-Forwarded-For": "127.0.0.1",
         "X-Forwarded-Host": "attacker.test", "X-Forwarded-Proto": "https",
@@ -310,6 +309,7 @@ def test_only_authorization_trace_and_certificate_from_caller_are_forwarded(setu
     sent = setup.calls[0].headers
     for name in gateway._REQUEST_HEADERS:
         assert sent[name] == headers[name]
+    assert "Authorization" not in sent
     assert sent[gateway.HOP_HEADER] == "1"
     assert sent["Host"] == "master-api.tailnet.test:18000"
     assert sent["Accept-Encoding"] == "identity"
@@ -319,7 +319,7 @@ def test_only_authorization_trace_and_certificate_from_caller_are_forwarded(setu
     assert "never-send-bootstrap-secret" not in str(sent)
 
 
-def test_no_bearer_or_control_certificate_is_synthesized(setup):
+def test_gateway_does_not_synthesize_auth_headers(setup):
     forward(setup)
     assert "Authorization" not in setup.calls[0].headers
     assert "X-QLH-Control-Certificate" not in setup.calls[0].headers
@@ -338,9 +338,9 @@ def test_hop_or_forwarded_headers_cannot_bypass_local_source_gate(setup):
 
 
 @pytest.mark.parametrize("status,raw", [
-    (401, b'{"detail":{"code":"auth_required","message":"login"}}'),
+    (400, b'{"detail":{"code":"model_intent_invalid"}}'),
     (403, b'{"detail":{"code":"MODEL_API_SOURCE_UNTRUSTED"},"extra":true}'),
-    (409, b'{"detail":{"code":"control_certificate_stale"}}'),
+    (409, b'{"detail":{"code":"model_intent_conflict"}}'),
     (500, b"upstream error with original formatting\n"),
 ])
 def test_master_errors_keep_original_body_status_and_safe_response_headers(setup, status, raw):

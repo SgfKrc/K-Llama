@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "base_suite": "refactor_client_cutover_suite_v1.json",
-  "scope": "R6 software regressions for physical-product fixes; real-device acceptance is recorded separately",
+  "scope": "R6 software regressions for physical-product fixes under static node roles; real-device acceptance is recorded separately",
   "additional_targets": [
     "tests/test_packaging_keep_head.py",
     "tests/test_refactor_product_gate.py",
@@ -12,8 +12,6 @@
     "tests/test_cut_layers_metadata_contract.py",
     "tests/test_cut_layers.py",
     "tests/test_cut_layers_pipeline.py",
-    "tests/test_refactor_auto_role_supervision.py",
-    "tests/test_refactor_auto_role_process.py",
     "tests/test_model_supply_cache_retention.py",
     "tests/test_pc_supply_layer_budget.py",
     "tests/test_serial_runtime_lifecycle.py",
@@ -26,5 +24,22 @@
     "disconnect/rejoin, cancellation/next request, local exit/rejoin and model switch",
     "recoverable SAF/disk-space failures",
     "clean-source release evidence, packaging/Android and documentation checks"
+  ],
+  "retirement_decision": {
+    "id": "R6-static-role-account-api-retirement",
+    "date": "2026-10-27",
+    "source": "User ruling; see docs/静态主节点部署与认证退役决策-2026-10-27.md",
+    "ruling": "Remove human account/login/TOTP and join-grant/credential-rotation APIs, quorum RPC/cert, and transfer/spare/review APIs. Use one manually configured master and clients that never auto-promote.",
+    "recorded_date": "2026-10-28"
+  },
+  "retired_targets": [
+    {
+      "target": "tests/test_refactor_auto_role_supervision.py",
+      "reason": "Automatic-role supervision/process tests assert the retired master-election runtime."
+    },
+    {
+      "target": "tests/test_refactor_auto_role_process.py",
+      "reason": "Automatic-role supervision/process tests assert the retired master-election runtime."
+    }
   ]
 }

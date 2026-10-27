@@ -393,6 +393,70 @@ class TestLocalStoreStats:
 
 
 class TestSqliteCompatibility:
+    def test_new_store_does_not_create_retired_review_schema(self, temp_store_dir):
+        from local_store import initialize_local_store
+
+        path = initialize_local_store()
+        connection = sqlite3.connect(path)
+        try:
+            schema = connection.execute(
+                "SELECT name FROM sqlite_master WHERE tbl_name = 'review_tickets'"
+            ).fetchall()
+        finally:
+            connection.close()
+
+        assert schema == []
+
+    def test_existing_review_schema_and_data_survive_initialization(
+            self, temp_store_dir, monkeypatch):
+        import local_store
+
+        path = temp_store_dir["sqlite_path"]
+        ticket = ("legacy-review", "approved", 123.0, '{"score": 2}')
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE review_tickets (
+                  ticket_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL,
+                  created_at REAL NOT NULL,
+                  payload TEXT NOT NULL
+                );
+                CREATE INDEX idx_review_tickets_created
+                  ON review_tickets(created_at DESC);
+                PRAGMA user_version = 5;
+                """
+            )
+            connection.execute("INSERT INTO review_tickets VALUES (?, ?, ?, ?)", ticket)
+            connection.commit()
+            original_schema = connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name = 'review_tickets' ORDER BY type, name"
+            ).fetchall()
+        finally:
+            connection.close()
+
+        local_store.initialize_local_store()
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        local_store.initialize_local_store()
+        local_store.create_local_session("after-review-retirement", "Still available")
+        connection = sqlite3.connect(path)
+        try:
+            preserved_schema = connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name = 'review_tickets' ORDER BY type, name"
+            ).fetchall()
+            preserved_tickets = connection.execute("SELECT * FROM review_tickets").fetchall()
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
+
+        assert preserved_schema == original_schema
+        assert preserved_tickets == [ticket]
+        assert version == 5
+        assert local_store.get_local_session("after-review-retirement")["title"] == "Still available"
+
     def test_python_store_does_not_claim_schema_version(self, temp_store_dir):
         from local_store import initialize_local_store
 

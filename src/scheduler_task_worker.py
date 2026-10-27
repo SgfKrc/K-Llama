@@ -522,14 +522,10 @@ class SchedulerTaskWorkerMixin:
                 version=TASK_WORKER_PROTOCOL_VERSION,
                 binary_hidden=binary_hidden,
             )
-            # TCP adds its current control certificate after protocol validation.
-            # Include those exact bytes before choosing direct return or chunks.
-            client = getattr(self, "_tcp_client", None)
-            fence = getattr(client, "_control_fence", None)
-            if binary_hidden and fence is not None and fence.enabled:
+            if binary_hidden:
                 snapshot, body = split_task_worker_hidden(message.snapshot(), enabled=True)
                 if body is not None and binary_hidden_frame_bytes(
-                    snapshot, len(body), control_certificate=fence.current_certificate(),
+                    snapshot, len(body),
                 ) > MAX_BINARY_FRAME_BYTES:
                     raise WorkerProtocolError(
                         "message exceeds maximum size", code="message_too_large", field="message",

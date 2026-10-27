@@ -106,9 +106,11 @@ def test_first_local_load_keeps_api_and_model_catalog_available(monkeypatch, mod
 
 
 @pytest.mark.parametrize("role_source, role", [
-    ("none", "master"), ("unconfirmed-master", "master"),
-    ("environment", "client"), ("confirmed", "client"),
-    ("bootstrap", "client"), ("auto", "auto"), ("dotenv", "client"),
+    ("none", "client"), ("unconfirmed-master", "client"),
+    ("environment", "client"), ("env-master", "master"),
+    ("confirmed", "client"),
+    ("bootstrap", "client"), ("auto", "client"),
+    ("legacy-auto", "client"), ("dotenv", "client"),
 ])
 def test_interactive_entrypoint_uses_product_default_and_keeps_explicit_roles(monkeypatch, tmp_path, role_source, role):
     import node_config
@@ -123,13 +125,20 @@ def test_interactive_entrypoint_uses_product_default_and_keeps_explicit_roles(mo
     monkeypatch.setenv("QLH_STATE_DIR", str(tmp_path / "state"))
     dot = tmp_path / ".env"
     dot.write_text("QLH_NODE_ROLE=client\n" if role_source == "dotenv" else "", encoding="utf-8")
-    if role_source in {"environment", "auto"}:
+    if role_source in {"environment", "env-master"}:
         monkeypatch.setenv("QLH_NODE_ROLE", role)
+    elif role_source == "auto":
+        monkeypatch.setenv("QLH_NODE_ROLE", "auto")
     elif role_source in {"confirmed", "bootstrap", "unconfirmed-master"}:
         (tmp_path / "node.json").write_text(json.dumps({
             "bootstrapped": role_source == "bootstrap",
             "node": {"role": "master" if role_source == "unconfirmed-master" else role,
                      "role_confirmed": role_source == "confirmed"},
+        }), encoding="utf-8")
+    elif role_source == "legacy-auto":
+        (tmp_path / "node.json").write_text(json.dumps({
+            "bootstrapped": True,
+            "node": {"role": "auto", "role_confirmed": True},
         }), encoding="utf-8")
     before = dict(__import__("os").environ)
     options = qlh._shell_options(["--auto-start"])
@@ -154,7 +163,6 @@ def test_single_node_role_binding_preserves_real_admission(monkeypatch, tmp_path
     import httpx
     import api_server
     from api import routes_model_intent
-    from cluster_fence import ControlFence
     from model_supply import ModelSupplyCoordinator
     from qlh_core.adapters.settings import SettingsStore
     from scheduler import Scheduler
@@ -174,7 +182,6 @@ def test_single_node_role_binding_preserves_real_admission(monkeypatch, tmp_path
     monkeypatch.setattr(api_server, "model_manager", host)
     monkeypatch.setattr(api_server, "API_PORT", 18191)
     monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
-    monkeypatch.setattr(api_server, "control_fence", ControlFence(required=False))
     monkeypatch.setattr(api_server, "_get_all_model_configs", lambda: [])
     monkeypatch.setattr(routes_model_intent, "_coordinator", None)
     monkeypatch.setattr(routes_model_intent, "_preflight_selection", lambda intent: None)

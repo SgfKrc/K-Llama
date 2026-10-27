@@ -107,6 +107,8 @@ class IdentityStore:
                 environment.update(QLH_CLUSTER_SECRET=secret, QLH_CLUSTER_SECRET_EPOCH=str(epoch))
             node = dict(document.get("node") or {})
             node["node_id"] = config.node_id
+            if str(node.get("role") or "").strip().lower() == "auto":
+                node.update(role="client", role_confirmed=True)
             document["node"] = node
             pending = document.get("identity_migration") or {}
             if pending.get("legacy_document"):
@@ -196,11 +198,7 @@ class IdentityStore:
                     raise ValueError("bootstrap credential would regress or fork the stored epoch")
             document = {**existing, **build_bootstrap_config(response, existing=existing)}
             node = document["node"]
-            if config.node_role == "auto":
-                if node.get("node_id") != config.node_id:
-                    raise ValueError("bootstrap cannot replace an automatic voter's identity")
-                node["role"] = "auto"
-            if not node.get("node_id") or node.get("role") not in {"client", "auto", "master"}:
+            if not node.get("node_id") or node.get("role") not in {"client", "master"}:
                 raise ValueError("bootstrap response contains an invalid node identity")
             return self._persist_config(config, document, secret, epoch)
 
@@ -325,8 +323,10 @@ class SettingsStore:
         if release_profile_enforced(environment):
             environment["QLH_RELEASE_PROFILE_ENFORCE"] = "1"
         role = str(environment.get("QLH_NODE_ROLE") or (DEFAULT_PACKAGED_NODE_ROLE if release_profile_enforced(environment) else self._default_node_role or "client")).lower()
+        if role == "auto":
+            role = "client"
         role = {"worker": "client", "slave": "client"}.get(role, role)
-        if role not in {"auto", "master", "client"}:
+        if role not in {"master", "client"}:
             raise ValueError("invalid node role")
         run_mode = environment.get("QLH_RUN_MODE", "distributed")
         if run_mode not in {"single", "distributed"}:

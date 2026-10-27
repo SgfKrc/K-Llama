@@ -68,32 +68,9 @@ class TestApiResponseKeys:
             "local_store", "scheduler", "device_profile",
         }
 
-    def test_auth_capability_is_explicit_when_running_direct_api(self, client, monkeypatch):
-        """★ 2026-09-19：认证改为 **monolith 内实现**（抛弃 control-svc 反代）。
-
-        原契约假设认证由独立 control-svc 承载 ⇒ `available=False` +
-        `reason_code="auth_control_plane_unavailable"`，并允许用 `QLH_CONTROL_URL` 探测。
-        改造后**不再有反代层**，本进程**自带**认证实现 ⇒ `available=True`、`service="api_server"`，
-        且 `QLH_CONTROL_URL` **不再被读取**。
-
-        保留的原意：**端点必须显式返回能力对象，而不是 404**（让 UI 能区分
-        “未启用认证”与“端点不存在”）。
-        """
-        # 该变量已不再影响行为（回归断言：设了也不改变结果）
-        monkeypatch.setenv("QLH_CONTROL_URL", "http://127.0.0.1:1")
+    def test_retired_account_auth_endpoint_is_not_available(self, client):
         res = client.get("/api/auth/capability")
-        assert res.status_code == 200, "应显式返回 200 能力对象，而不是 404"
-        body = res.json()
-        assert body["service"] == "api_server", "实现已回到 monolith 进程内"
-        assert body["available"] is True, "本进程自带认证实现"
-        assert body["mode"] == "local_totp"
-        # 默认不强制登录（保持既有可用性）
-        assert body["required"] is False
-        assert body["enforced"] is False
-        # 新增字段：首次引导可见性（原控制面的 bootstrap 能力的本地替代）
-        assert "bootstrap_open" in body and "user_count" in body
-        # 不再有「控制面不可用」这一失败态
-        assert "reason_code" not in body or body.get("reason_code") != "auth_control_plane_unavailable"
+        assert res.status_code == 404
 
     def test_storage_health_is_local_first_and_retired_remote(self, client, monkeypatch):
         monkeypatch.setattr(

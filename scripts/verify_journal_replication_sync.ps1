@@ -1,25 +1,12 @@
 <#
 .SYNOPSIS
-  Verify the files required by the commit-proof chain (#93) are in sync per node.
+  Verify explicit journal recovery files are in sync per node.
 
 .DESCRIPTION
-  Real incident (2026-10-11, three-machine takeover drill): the remote voter was
-  updated with cluster_auto_role_runtime.py but NOT cluster_control_contract.py,
-  so it died at import time with
-
-      ImportError: cannot import name 'CommitWatermark'
-
-  The node then simply did not listen on 9102, and the master only saw a generic
-  "quorum unavailable" -- which looks like a network problem, not a version skew.
-
-  Version skew is therefore a first-class deployment hazard. This script prints
-  the local SHA256 of the required set and, when -Remote is given (an ssh alias),
-  compares it against that host's copy. The probe script is fed to the remote
-  interpreter over stdin, so nothing is written on the remote side.
-
-  Two groups:
-    * control-plane-trio  - changing #93 semantics always touches all three;
-    * journal-set         - the replication/commit stack itself.
+  This script prints the local SHA256 of the journal recovery dependencies and,
+  when -Remote is given (an ssh alias), compares it against that host's copy.
+  The probe script is fed to the remote interpreter over stdin, so nothing is
+  written on the remote side.
 
 .EXAMPLE
   powershell -File scripts\verify_journal_replication_sync.ps1
@@ -51,16 +38,11 @@ if (-not $LocalRoot) { $LocalRoot = Join-Path $repo 'src' }
 if (-not (Test-Path $LocalRoot)) { throw "local src directory not found: $LocalRoot" }
 
 $groups = [ordered]@{
-  'control-plane-trio' = @(
-    'cluster_control_contract.py',
-    'cluster_quorum.py',
-    'cluster_auto_role_runtime.py'
-  )
-  'journal-set' = @(
+  'journal-recovery' = @(
     'journal_replication.py',
     'journal_replication_transport.py',
     'journal_replication_service.py',
-    'task_journal.py'
+    'recovery_journal.py'
   )
 }
 

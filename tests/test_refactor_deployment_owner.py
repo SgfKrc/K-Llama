@@ -174,19 +174,22 @@ def test_journal_corruption_fails_closed(control):
 @pytest.mark.parametrize("domain", ["configured", "removed_from_configuration"])
 def test_required_floor_never_disappears_after_read_failure(domain):
     from types import SimpleNamespace
-    from cluster_auto_role_runtime import JournalPrefixAuthority, AutoRoleRuntimeError
-    from cluster_control_contract import CommitWatermark
+    from journal_replication_authority import (
+        CommitWatermark,
+        JournalPrefixAuthority,
+        JournalReplicationAuthorityError,
+    )
     floor = CommitWatermark(workflow_id="model-control:v1", last_sequence=3, checkpoint_digest="a" * 64)
     prefix = JournalPrefixAuthority(SimpleNamespace(recovery_status=lambda _: {"verified": False}),
                                     workflows=(floor.workflow_id,) if domain == "configured" else ())
     prefix.floor_provider = lambda: (floor,)
-    with pytest.raises(AutoRoleRuntimeError, match="floor is unavailable"):
+    with pytest.raises(JournalReplicationAuthorityError, match="floor is unavailable"):
         prefix.propose()
 
 
 def test_model_recovery_floor_never_uses_workflow_replica(control):
     from types import SimpleNamespace
-    from cluster_auto_role_runtime import JournalPrefixAuthority
+    from journal_replication_authority import JournalPrefixAuthority
     owner, repository, _ = control
     def forbidden(*_args, **_kwargs):
         pytest.fail("model control was routed to graph recovery")

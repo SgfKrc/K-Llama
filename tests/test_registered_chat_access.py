@@ -193,18 +193,12 @@ def test_connected_android_without_current_registration_ack_cannot_chat(register
 
 
 @pytest.mark.parametrize("path", CHAT_PATHS)
-def test_valid_registered_text_shape_still_requires_bearer(registered_chat, path, monkeypatch):
+def test_valid_registered_text_shape_ignores_retired_account_auth(registered_chat, path, monkeypatch):
     owner = registered_chat
-    monkeypatch.setattr(owner.server.auth_service, "auth_required", lambda: True)
-    monkeypatch.setattr(owner.server.auth_service, "resolve_bearer",
-                        lambda value: object() if value == "Bearer valid-session" else None)
-    client = _client(owner)
-    for headers in ({}, {"Authorization": "Bearer invalid"}, {"X-QLH-Intent-Hop": "1"}):
-        response = client.post(path, json=_payload(owner), headers=headers)
-        assert response.status_code == 401, response.text
-        assert _error_code(response) == "auth_required"
-    assert not owner.calls
-    _assert_success(client.post(path, json=_payload(owner), headers={"Authorization": "Bearer valid-session"}), path)
+    monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
+    response = _client(owner).post(
+        path, json=_payload(owner), headers={"Authorization": "Bearer invalid"})
+    _assert_success(response, path)
     assert len(owner.calls) == 1
 
 
@@ -223,19 +217,17 @@ def _replace_peer(owner, change):
 @pytest.mark.parametrize("change", ["connection", "epoch"])
 def test_middleware_to_handler_reconnect_cannot_execute_or_adopt_new_session(registered_chat, path, change, monkeypatch):
     owner = registered_chat
-    monkeypatch.setattr(owner.server.auth_service, "auth_required", lambda: True)
+    original_gate = owner.server.require_model_intent_source
 
-    def resolve(_authorization):
+    def admit_then_replace(request, scheduler):
+        original_gate(request, scheduler)
         _replace_peer(owner, change)
-        return object()
 
-    monkeypatch.setattr(owner.server.auth_service, "resolve_bearer", resolve)
-    response = _client(owner).post(path, json=_payload(owner), headers={"Authorization": "Bearer valid"})
-    _assert_source_rejected(response)
+    monkeypatch.setattr(owner.server, "require_model_intent_source", admit_then_replace)
+    _assert_source_rejected(_client(owner).post(path, json=_payload(owner)))
     assert not owner.calls
-    # A fresh request can use the valid replacement; only the captured request is denied.
-    monkeypatch.setattr(owner.server.auth_service, "resolve_bearer", lambda _authorization: object())
-    _assert_success(_client(owner).post(path, json=_payload(owner), headers={"Authorization": "Bearer valid"}), path)
+    monkeypatch.setattr(owner.server, "require_model_intent_source", original_gate)
+    _assert_success(_client(owner).post(path, json=_payload(owner)), path)
     assert len(owner.calls) == 1
 
 

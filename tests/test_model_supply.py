@@ -231,7 +231,6 @@ def test_assigned_range_file_endpoint_requires_lease_and_supports_resume(tmp_pat
             raise ModelSupplyError("SUPPLY_FILE_FORBIDDEN", "Invalid file lease")
         return file
     monkeypatch.setattr(api_server.scheduler._model_supply, "authorize_file", authorize)
-    monkeypatch.setattr(api_server.auth_service, "auth_required", lambda: True)
     client = TestClient(api_server.app, client=("192.0.2.50", 1234))
     url = "/api/models/supply/supply_" + "a" * 32 + "/files/worker/weights.gguf"
     assert client.get(url).status_code == 403

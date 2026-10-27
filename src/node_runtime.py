@@ -22,11 +22,11 @@ class NodeRuntime:
     def __init__(self):
         try:
             import config as _cfg
-            self._node_id: str = str(getattr(_cfg, "NODE_ID", "master"))
-            self._node_role: str = str(getattr(_cfg, "NODE_ROLE", "master"))
+            self._node_id: str = str(getattr(_cfg, "NODE_ID", "client"))
+            self._node_role: str = str(getattr(_cfg, "NODE_ROLE", "client"))
         except Exception:
-            self._node_id = "master"
-            self._node_role = "master"
+            self._node_id = "client"
+            self._node_role = "client"
         self._lock = threading.RLock()
 
     # ---- node_id ----

@@ -1,4 +1,4 @@
-"""HA-RECOVERY-01 journal and fenced-handoff recovery gates."""
+"""Journal recovery policy gates."""
 
 from __future__ import annotations
 
@@ -65,15 +65,6 @@ def test_recovery_policy_prefers_cancel_request_over_retry():
     decision = decide_recovery(snapshot)
     assert decision.action == "cancel"
     assert decision.reason == "recovered_cancel_request"
-
-
-def test_recovery_policy_marks_fenced_handoff_timeout():
-    snapshot = _running_snapshot(
-        "wf_timeout01", handoff_pending=True, handoff_state="awaiting_quorum",
-    )
-    decision = decide_recovery(snapshot)
-    assert decision.action == "handoff_timeout"
-    assert decision.reason == "handoff_timeout"
 
 
 def test_recovery_policy_can_continue_an_explicitly_continuable_projection():

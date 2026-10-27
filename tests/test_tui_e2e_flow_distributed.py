@@ -37,7 +37,7 @@ def test_dual_host_tui_routed_pipeline_streams_text(monkeypatch):
     from tui_api import ApiClient, ApiError
     import tui_textual
     from textual.widgets import Input, Static
-    api = ApiClient(HOST, PORT, timeout=15, auth_token=os.environ.get('QLH_PRODUCT_AUTH_TOKEN', ''))
+    api = ApiClient(HOST, PORT, timeout=15)
     try:
         before = api.get('/client/state')
         prepared(before, minimum_nodes=MIN_NODES)

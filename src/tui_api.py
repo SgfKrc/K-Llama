@@ -50,16 +50,13 @@ class ApiClient:
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  timeout: float = 5.0, log_token: str = "",
-                 auth_token: str = "", client_id: str = "") -> None:
+                 client_id: str = "") -> None:
         self.client_id = client_id or "tui:" + uuid.uuid4().hex
         self._snapshot_cache = {}
         self.host = host
         self.port = port
         self.timeout = timeout
         self.log_token = log_token
-        #: ★ 2026-09-19（G-⑤）：登录态 Bearer token。由 TUI 的 /login 写入，
-        #   之后所有请求自动带 `Authorization: Bearer <token>`。
-        self.auth_token = auth_token
 
     def accept_snapshot(self, value, *, stream="model_control"):
         if value is None:
@@ -89,16 +86,13 @@ class ApiClient:
 
         The API source boundary is the direct TCP peer observed by the
         backend; it is intentionally not represented by a caller-controlled
-        source header.  Authentication and optional log credentials are the
-        only client headers that need to be propagated here.
+        source header. Only the optional log credential is propagated here.
         """
         headers = {"Accept": accept, "X-QLH-Client-ID": self.client_id}
         if content_type:
             headers["Content-Type"] = "application/json"
         if with_log_token and self.log_token:
             headers["X-QLH-Log-Token"] = self.log_token
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
         return headers
 
     # ------------------------------------------------------------ 底层请求
@@ -406,8 +400,6 @@ def cancel_queue_task(api: ApiClient, task_id: str) -> Dict[str, Any]:
     """
     path = API_PATHS["cluster_queue_task_cancel"].format(**_quoted(task_id=task_id))
     return _as_dict(api.request("DELETE", path))
-
-
 def list_log_files(api: ApiClient) -> Dict[str, Any]:
     """列出后端日志文件（GET ``/logs``）。★ 补缺口 B。"""
     return _as_dict(api.get(API_PATHS["logs_list"], with_log_token=True))
@@ -435,55 +427,17 @@ def logs_nodes_summary(api: ApiClient) -> Dict[str, Any]:
     """各节点日志汇总（GET ``/logs/nodes-summary``）。★ 补缺口 B。"""
     return _as_dict(api.get(API_PATHS["logs_nodes_summary"], with_log_token=True))
 
-# ---------------------------------------------------------------- 集群高可用(E)
+# ---------------------------------------------------------------- 静态主节点维护
 def master_health(api: ApiClient) -> Dict[str, Any]:
-    """主节点健康（GET ``/cluster/master-health``）。★ 补缺口 E。"""
+    """配置主节点健康（GET ``/cluster/master-health``）。"""
     return _as_dict(api.get(API_PATHS["cluster_master_health"]))
-
-
-def transfer_logs(api: ApiClient) -> Dict[str, Any]:
-    """角色转让日志（GET ``/cluster/transfer-logs``）。★ 补缺口 E。"""
-    return _as_dict(api.get(API_PATHS["cluster_transfer_logs"]))
-
-
-def get_spare_master(api: ApiClient) -> Dict[str, Any]:
-    """查询备用主节点（GET ``/cluster/spare-master``）。★ 补缺口 E。"""
-    return _as_dict(api.get(API_PATHS["cluster_spare_master"]))
-
-
-def spare_master_logs(api: ApiClient) -> Dict[str, Any]:
-    """备用主节点操作日志（GET ``/cluster/spare-master/logs``）。★ 补缺口 E。"""
-    return _as_dict(api.get(API_PATHS["cluster_spare_master_logs"]))
-
-
-def designate_spare_master(api: ApiClient, target_node_id: str) -> Dict[str, Any]:
-    """指定备用主节点（POST ``/cluster/spare-master``，仅主节点）。
-
-    ⚠️ 变更集群角色配置：集群节点数需 >= 2，目标须在线且为 client。★ 补缺口 E。
-    """
-    return _as_dict(api.post(API_PATHS["cluster_spare_master"],
-                             {"target_node_id": target_node_id}))
-
-
-def clear_spare_master(api: ApiClient) -> Dict[str, Any]:
-    """清除备用主节点指定（DELETE ``/cluster/spare-master``，仅主节点）。★ 补缺口 E。"""
-    return _as_dict(api.request("DELETE", API_PATHS["cluster_spare_master"]))
-
-
-def transfer_master(api: ApiClient, target_node_id: str) -> Dict[str, Any]:
-    """把主节点身份转让给指定从节点（POST ``/cluster/transfer-master``，仅主节点）。
-
-    ⚠️⚠️ **高危**：转让后**双方需重启**才生效（原主转从、新主转主）。★ 补缺口 E。
-    """
-    return _as_dict(api.post(API_PATHS["cluster_transfer_master"],
-                             {"target_node_id": target_node_id}))
 
 
 def reset_master_identity(api: ApiClient) -> Dict[str, Any]:
     """重置主节点身份标识（POST ``/cluster/reset-identity``，仅主节点）。
 
     ⚠️⚠️ **高危**：替换主节点 SQLite 里的 MAC 记录（更换机器/网卡后用），绑定当前物理 MAC。
-    后端要求请求体 ``confirm == "reset"``；本函数已固定填入。★ 补缺口 E。
+    后端要求请求体 ``confirm == "reset"``；本函数已固定填入。
     """
     return _as_dict(api.post(API_PATHS["cluster_reset_identity"], {"confirm": "reset"}))
 
@@ -649,72 +603,4 @@ def delete_turn(api: ApiClient, session_id: str, turn_index: int) -> Dict[str, A
     """
     path = API_PATHS["session_turn"].format(
         **_quoted(session_id=session_id), turn_index=int(turn_index))
-    return _as_dict(api.request("DELETE", path))
-
-
-# ---------------------------------------------------- 认证与账户(G-⑤, 2026-09-19)
-def auth_capability(api: ApiClient) -> Dict[str, Any]:
-    """认证能力（GET ``/auth/capability``）：是否强制登录 / 是否处于首次引导。"""
-    return _as_dict(api.get(API_PATHS["auth_capability"]))
-
-
-def auth_login(api: ApiClient, username: str, password: str,
-               totp_code: Optional[str] = None) -> Dict[str, Any]:
-    """登录（POST ``/auth/login``）。返回含明文 ``token``；**调用方须写入 api.auth_token**。"""
-    body: Dict[str, Any] = {"username": username, "password": password}
-    if totp_code:
-        body["totp_code"] = totp_code
-    return _as_dict(api.post(API_PATHS["auth_login"], body))
-
-
-def auth_logout(api: ApiClient) -> Dict[str, Any]:
-    """注销（POST ``/auth/logout``）——服务端吊销当前 Bearer。"""
-    return _as_dict(api.post(API_PATHS["auth_logout"]))
-
-
-def auth_me(api: ApiClient) -> Dict[str, Any]:
-    """当前主体（GET ``/auth/me``）。"""
-    return _as_dict(api.get(API_PATHS["auth_me"]))
-
-
-def auth_totp_provision(api: ApiClient) -> Dict[str, Any]:
-    """生成并绑定 TOTP 密钥（POST ``/auth/totp/provision``）⇒ 返回 ``otpauth_uri``。"""
-    return _as_dict(api.post(API_PATHS["auth_totp_provision"]))
-
-
-def auth_totp_verify(api: ApiClient, code: str) -> Dict[str, Any]:
-    """校验 TOTP（POST ``/auth/totp/verify``）。"""
-    return _as_dict(api.post(API_PATHS["auth_totp_verify"], {"code": code}))
-
-
-def list_auth_users(api: ApiClient) -> Dict[str, Any]:
-    """账户列表（GET ``/users``，需 admin）。"""
-    return _as_dict(api.get(API_PATHS["auth_users"]))
-
-
-def create_auth_user(api: ApiClient, username: str, password: str,
-                     role: str = "viewer") -> Dict[str, Any]:
-    """创建账户（POST ``/users``）。**首次引导**时可无登录调用（仅允许 admin）。"""
-    return _as_dict(api.post(API_PATHS["auth_users"],
-                             {"username": username, "password": password, "role": role}))
-
-
-def patch_auth_user(api: ApiClient, username: str, *, role: Optional[str] = None,
-                    disabled: Optional[bool] = None,
-                    password: Optional[str] = None) -> Dict[str, Any]:
-    """修改账户（PATCH ``/users/{username}``）：角色 / 禁用 / 重置口令。"""
-    path = API_PATHS["auth_user"].format(**_quoted(username=username))
-    body: Dict[str, Any] = {}
-    if role is not None:
-        body["role"] = role
-    if disabled is not None:
-        body["disabled"] = bool(disabled)
-    if password is not None:
-        body["password"] = password
-    return _as_dict(api.request("PATCH", path, body))
-
-
-def delete_auth_user(api: ApiClient, username: str) -> Dict[str, Any]:
-    """删除账户（DELETE ``/users/{username}``）。"""
-    path = API_PATHS["auth_user"].format(**_quoted(username=username))
     return _as_dict(api.request("DELETE", path))

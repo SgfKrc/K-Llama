@@ -89,78 +89,6 @@ def test_detect_lan_ip_prefers_assigned_tailscale_address(monkeypatch):
     assert tcp_comm_mod.detect_lan_ip() == "100.88.9.10"
 
 
-@pytest.mark.parametrize(
-    ("transport_class", "peer"),
-    [(TCPServer, False), (TCPClient, True)],
-)
-def test_task_worker_certificate_is_removed_only_after_fence_admission(
-    transport_class, peer,
-):
-    transport = transport_class()
-    fence = MagicMock()
-    fence.enabled = True
-    transport._control_fence = fence
-    certificate = {"term": 7, "proof": "signed"}
-    message = {
-        "type": MessageType.TASK_WORKER.value,
-        "data": {
-            "control_certificate": certificate,
-            "protocol": "qlh.task_worker",
-            "unrelated_transport_field": "preserved",
-        },
-    }
-
-    transport._admit_inbound_control(message)
-
-    if peer:
-        fence.admit_peer.assert_called_once_with(
-            certificate,
-            action="tcp.receive.task_worker",
-            observe=True,
-        )
-        fence.admit.assert_not_called()
-    else:
-        fence.admit.assert_called_once_with(
-            certificate,
-            action="tcp.receive.task_worker",
-            source="tcp",
-        )
-        fence.admit_peer.assert_not_called()
-    assert "control_certificate" not in message["data"]
-    assert message["data"]["protocol"] == "qlh.task_worker"
-    assert message["data"]["unrelated_transport_field"] == "preserved"
-
-
-def test_task_worker_certificate_remains_when_fence_admission_fails():
-    transport = TCPServer()
-    fence = MagicMock()
-    fence.enabled = True
-    fence.admit.side_effect = ValueError("invalid certificate")
-    transport._control_fence = fence
-    message = {
-        "type": MessageType.TASK_WORKER.value,
-        "data": {"control_certificate": {"proof": "invalid"}},
-    }
-
-    with pytest.raises(ValueError, match="invalid certificate"):
-        transport._admit_inbound_control(message)
-
-    assert "control_certificate" in message["data"]
-
-
-def test_task_worker_certificate_is_not_stripped_without_an_enabled_fence():
-    transport = TCPServer()
-    transport.set_control_fence(None)
-    message = {
-        "type": MessageType.TASK_WORKER.value,
-        "data": {"control_certificate": {"proof": "unverified"}},
-    }
-
-    transport._admit_inbound_control(message)
-
-    assert "control_certificate" in message["data"]
-
-
 class TestRegistrationAuthentication:
     def test_verify_auth_signature_rejects_missing_fields(self, monkeypatch):
         monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
@@ -304,10 +232,6 @@ class TestMessageType:
             "layer_config", "layer_config_ack",
             "layer_worker_opt_out", "layer_worker_opt_in",
             "task_worker",
-            "role_transfer", "role_transfer_ack",
-            "spare_master_designate", "spare_master_designate_ack",
-            "spare_master_activate", "spare_master_activate_ack",
-            "spare_master_deactivate",
             "node_list_sync", "node_update",
             "layer_forward", "layer_result", "chain_forward",
             "pipeline_done", "pipeline_abort",
@@ -318,6 +242,17 @@ class TestMessageType:
         actual = set(MessageType.__members__.keys())
         for t in expected:
             assert t.upper() in actual, f"缺少消息类型: {t}"
+
+    @pytest.mark.parametrize("message_type", [
+        "role_transfer", "role_transfer_ack",
+        "spare_master_designate", "spare_master_designate_ack",
+        "spare_master_activate", "spare_master_activate_ack",
+        "spare_master_deactivate",
+    ])
+    def test_retired_ha_types_are_not_defined(self, message_type):
+        with pytest.raises(ValueError):
+            MessageType(message_type)
+        assert message_type not in {member.value for member in MessageType}
 
     def test_string_enum(self):
         """MessageType 应为字符串枚举"""
@@ -1492,117 +1427,6 @@ class TestTCPServerConnectionManagement:
         finally:
             server.stop()
             cli_sock.close()
-
-    def test_fenced_registered_ack_carries_admitted_control_certificate(self):
-        server = TCPServer(host="127.0.0.1", port=0)
-        server_sock, client_sock = socket.socketpair()
-        certificate = {"term": 7, "proof": "signed"}
-        fence = MagicMock()
-        fence.enabled = True
-        fence.current_certificate.return_value = certificate
-        server._control_fence = fence
-        try:
-            server._send_register_ack(
-                server_sock, "registered", client_id="worker-1",
-            )
-
-            header = recv_exact(client_sock, HEADER_LEN)
-            payload = recv_exact(client_sock, unpack_header(header))
-            ack = parse_message(payload)
-
-            assert ack["data"] == {
-                "status": "registered",
-                "client_id": "worker-1",
-                "control_fence_required": True,
-                "control_certificate": certificate,
-            }
-            fence.admit.assert_called_once_with(
-                certificate, action="tcp.register_ack", source="tcp",
-            )
-        finally:
-            server_sock.close()
-            client_sock.close()
-
-    def test_fenced_registered_ack_fails_closed_without_current_certificate(self):
-        class RecordingSocket:
-            def __init__(self):
-                self.packets = []
-
-            def sendall(self, packet):
-                self.packets.append(packet)
-
-        server = TCPServer(host="127.0.0.1", port=0)
-        sock = RecordingSocket()
-        fence = MagicMock()
-        fence.enabled = True
-        fence.current_certificate.return_value = None
-        server._control_fence = fence
-
-        with pytest.raises(tcp_comm_mod.ControlFenceError) as rejected:
-            server._send_register_ack(sock, "registered", client_id="worker-1")
-
-        assert rejected.value.code == "control_certificate_missing"
-        assert sock.packets == []
-        fence.admit.assert_not_called()
-
-    def test_missing_fenced_ack_certificate_cleans_pending_registration(self, monkeypatch):
-        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
-        server = TCPServer(host="127.0.0.1", port=0)
-        server._running = True
-        fence = MagicMock()
-        fence.enabled = True
-        fence.current_certificate.return_value = None
-        server._control_fence = fence
-        confirmation_results = []
-        confirmed_edges = []
-        server.on_message = lambda client_id, _msg: confirmation_results.append(
-            server.confirm_registration(client_id),
-        )
-        server.on_registration_confirmed = confirmed_edges.append
-        server_sock, client_sock = socket.socketpair()
-        try:
-            thread = threading.Thread(
-                target=server._handle_client,
-                args=(server_sock, ("127.0.0.1", 54324), "pending_54324"),
-                daemon=True,
-            )
-            thread.start()
-            client_sock.sendall(build_message(MessageType.REGISTER, {
-                "client_id": "worker-fenced",
-                "role": "client",
-                "auth": tcp_comm_mod.build_auth_signature("worker-fenced"),
-            }))
-
-            thread.join(timeout=2)
-
-            assert not thread.is_alive()
-            assert client_sock.recv(1) == b""
-            assert confirmation_results == [False]
-            assert confirmed_edges == []
-            assert server.get_client_ids() == []
-            assert server._pending_registrations == {}
-        finally:
-            server._running = False
-            client_sock.close()
-
-    def test_unfenced_registered_ack_keeps_legacy_payload(self):
-        class RecordingSocket:
-            def __init__(self):
-                self.packets = []
-
-            def sendall(self, packet):
-                self.packets.append(packet)
-
-        server = TCPServer(host="127.0.0.1", port=0)
-        sock = RecordingSocket()
-
-        server._send_register_ack(sock, "registered", client_id="worker-1")
-
-        ack = parse_message(sock.packets[0][HEADER_LEN:])
-        assert ack["data"] == {
-            "status": "registered",
-            "client_id": "worker-1",
-        }
 
     def test_confirm_registration_send_failure_stays_unconfirmed_and_reject_cleans(self):
         """ACK 发送失败时不应把 pending 连接标记为 registered。"""

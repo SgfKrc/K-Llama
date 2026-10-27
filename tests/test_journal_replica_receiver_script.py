@@ -1,8 +1,7 @@
 """Tests for the journal replica receiver launcher (#93 deployment gap).
 
 The launcher must be safe to dry-run and must fail closed on a missing/short
-shared secret, because a receiver with a wrong secret silently never counts
-towards the quorum barrier.
+shared secret, so the receiver never accepts unauthenticated checkpoint traffic.
 """
 
 from __future__ import annotations

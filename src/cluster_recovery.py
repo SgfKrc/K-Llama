@@ -110,9 +110,7 @@ def decide_recovery(
     handoff_state = str(
         snapshot.get("handoff_state") or snapshot.get("handoff_status") or ""
     )
-    if bool(snapshot.get("handoff_pending")) or handoff_state in {
-        "prepared", "awaiting_quorum", "fenced"
-    }:
+    if bool(snapshot.get("handoff_pending")) or handoff_state in {"prepared", "fenced"}:
         return RecoveryDecision(
             workflow_id, "handoff_timeout", "handoff_timeout", state,
         )

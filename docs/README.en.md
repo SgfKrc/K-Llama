@@ -6,13 +6,15 @@ K-Llama (Llama for Koakuma) is a distributed inference core for heterogeneous ed
 
 > Status: **current**
 >
-> Updated: 2026-10-25
+> Updated: 2026-10-28
 >
 > This README describes only the current boundary of the main repository and its reproducible entry points. Experiment logs, historical implementations and external sub-projects are not equivalent to production capability.
 >
 > The single-source-of-truth refactor (ticket 14) passed its R0–R5 software gates on 2026-10-18/19; its R6 product acceptance was carried out on 2026-10-19 (the remaining device and gain gates are tracked in the [R6 report](重构产品验收-R6-2026-10-19.md)), and the current focus is the [PERF performance series](异构推理吞吐瓶颈与外部技术调研-2026-10-24.md#6-实验排期与退出判据). The mainline moved from task-graph scheduling / standalone speculative PoC / preemptive queues / a standalone Launcher to **linear relay + versioned snapshots**. See the [refactor design](单一事实源重构设计-2026-10-18.md) and the [R5 delivery report](重构客户端切换-R5-2026-10-19.md).
 >
 > 中文: [../README.md](../README.md) - this file: docs/README.en.md
+
+> **Cluster control boundary (2026-10-27)**: The cluster uses a static master explicitly configured with `QLH_NODE_ROLE=master`; other nodes default to clients. Human-account authentication and automatic election are retired from the supported product runtime. Machine identity and bootstrap security remain. See the [static-master decision](静态主节点部署与认证退役决策-2026-10-27.md).
 
 ## What the Main Repository Does
 
@@ -205,7 +207,8 @@ The TUI and API top level only need aggregate resources (GPU/CPU/memory) and whe
 
 | Capability | Current statement |
 | --- | --- |
-| Textual TUI | Unified `qlh` entry; the chat page plus 8 functional screens (status / models / cluster / nodes / queue / logs / device / settings) and 1 debug fallback screen share one process and can start the backend on demand locally; write operations (model download/search/preflight/registration, cluster config, node management, log filtering/stats/export, device config, user settings) go through confirmation gates |
+| Textual TUI | Unified `qlh` entry; the chat page plus 8 functional screens (status / models / cluster / nodes / queue / logs / device / settings) and 1 debug fallback screen share one process and can start the backend on demand locally; model/asset, log, device configuration and local preference writes use confirmation gates; cluster/node operations depend on runtime support |
+| Cluster roles | Static master/client; only the explicitly configured master coordinates, clients never promote, and master failure has no automatic takeover. Human-account authentication is retired; node HMAC/bootstrap and trusted-source checks remain |
 | Edge <=1B single machine | Model profiling, the GGUF/llama.cpp path and edge preflight exist; torch is not loaded by default |
 | Same-host two-process RPC | llama host + `ggml-rpc-server` simulation and contract tests exist; not equivalent to cross-host production admission |
 | **Same-machine cross-framework segments (GPU + CPU coexisting)** | **Verified on real hardware** (2026-10-26): on master the GPU segment `('master','',0,8)` and the llama.cpp keep-head segment `('master','cpu',8,24)` appear in the supply plan **at the same time**, each carrying its own layers; the CPU segment's weights stay resident in host memory and are computed in place (zero PCIe movement). All six criteria pass: coexistence, no range overrun, no double counting, numerical gate argmax **81/81**, timing **6.84 ms/layer**, and byte-identical behaviour when disabled by default. End-to-end 21.28 s over the contiguous coverage `[0,8)[8,24)[24,28)[28,32)` |
@@ -276,8 +279,8 @@ The main project keeps no image-generation runtime or assets; image generation b
 
 | Group | Representative modules |
 | --- | --- |
-| Control plane and entry | `app_bootstrap.py` (single composition entry), `api_server.py`, `api_errors.py`, `execution_errors.py`, `config.py`, `bootstrap.py`, `model_api_access.py`, `review.py`, `local_store.py`, `api/routes_client_state.py` |
-| Scheduling and cluster | `scheduler.py`, `scheduler_svc_http.py`, `cluster_join.py`, `cluster_transport.py`, `edge_cluster.py`, `node_config.py`, `node_runtime.py`, `transport_runtime.py`, `transport_port.py`, `network_address.py`, `network_path.py`, `proxy_config.py`, `wss_loopback.py` |
+| Control plane and entry | `app_bootstrap.py` (single composition entry), `api_server.py`, `api_errors.py`, `execution_errors.py`, `config.py`, `bootstrap.py`, `bootstrap_nonce_ledger.py`, `model_api_access.py`, `local_store.py`, `api/routes_client_state.py` |
+| Scheduling and cluster | `scheduler.py`, `scheduler_svc_http.py`, `cluster_transport.py`, `edge_cluster.py`, `node_config.py`, `node_runtime.py`, `transport_runtime.py`, `transport_port.py`, `network_address.py`, `network_path.py`, `proxy_config.py`, `wss_loopback.py` |
 | Engines | `llama_engine.py` (tier L), `model_module.py` (tier D layer splitting), `island_engine.py`, `koakuma_engine.py`, `tcp_comm.py`, `inference_client.py`, `inference_svc_main.py`, `inference_service/`, `paged_kv_cache.py`, `external_provider.py` |
 | RPC and layer relay | `llama_rpc_contract.py`, `llama_rpc_device.py`, `llama_rpc_planner.py`, `relay_contract.py`, `relay_planner.py`, `relay_transport.py` |
 | Layer-segment/layer-pipeline contracts | `pipeline_node_contract.py`, `pipeline_assignment_manifest.py`, `pipeline_model_descriptor.py`, `pipeline_reshard.py`, `cache_unit_layout.py`; capacity solving moved to `qlh_core/planning/capacity.py` (`pipeline_capacity.py` is a 21-line compatibility facade) |
@@ -411,10 +414,11 @@ Real hardware, cross-host networks, Android ARM64, performance and long-run soak
 - **Single-source-of-truth refactor (ticket 14)**: [design](单一事实源重构设计-2026-10-18.md) · [contracts and behaviour baseline R0](重构合同与行为基线-R0-2026-10-18.md) · [bootstrap and authority R1](重构启动与控制权-R1-2026-10-18.md) · [catalog and capabilities R2](重构模型目录与能力-R2-2026-10-18.md) · [supply and deployment R3](重构供给与部署-R3-2026-10-18.md) · [relay execution R4](重构接力执行-R4-2026-10-18.md) · [client cutover R5](重构客户端切换-R5-2026-10-19.md) · [fact-ownership audit](当前功能与事实归属审计-2026-10-18.md)
 - [Cross-framework relay — current baseline and follow-up plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) (index for the relay direction) · [project report](跨框架层接力-项目报告.md) · [capacity-gain measurements](跨框架层接力-容量收益实测-2026-09-21.md)
 - [TUI guide](TUI使用指南.md) · [TUI command set](TUI指令集.md)
+- [Static master deployment and authentication retirement decision](静态主节点部署与认证退役决策-2026-10-27.md)
 - [Testing and acceptance criteria](测试与评判标准.md) · [test channel notes](测试通道运行说明.md) · [release artifact gate](发行物门-RELEASE-ARTIFACTS.md)
-- [Mainline plan: distributed inference and edge optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5: dynamic master election and distributed management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
+- [Mainline plan: distributed inference and edge optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5: dynamic master election (superseded historical proposal)](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Parallelism and cross-framework survey](archive/relay/分布式推理并行与跨框架路线调研汇总-2026-09-15.md) · [KTransformers migration survey](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
-- [Outstanding work ledger (current)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](archive/misc/未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
+- [Outstanding work ledger (2026-10-07 historical snapshot)](遗留清单-2026-10-07.md) · [Known issues](已知问题记录.md) · [Acceptance ledger and resource limits](验收清单与资源限制登记.md) · [Outstanding work notes (historical archive)](archive/misc/未完成工作备忘-2026-09-23.md) · [DIST follow-up core-path defect audit](archive/misc/DIST后续核心链路缺陷审计-2026-10-07.md)
 - [Document status and cleanup list](文档状态与清理清单.md) · [Archive index](archive/README.md)
 - [Android validation alternatives](../android/Android验证替代路径-2026-09-18.md)
 

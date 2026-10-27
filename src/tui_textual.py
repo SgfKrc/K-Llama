@@ -92,40 +92,24 @@ from tui_api import (  # noqa: E402
     cancel_model_intent,
     connect_model_intent,
     set_model_mode,
-    clear_spare_master,
-    designate_spare_master,
-    get_spare_master,
     logs_nodes_summary,
     master_health,
     read_log_file,
     reset_master_identity,
-    spare_master_logs,
     conversation_sync_status,
-    create_auth_user,
     db_health,
-    delete_auth_user,
     delete_turn,
     get_conversation,
     list_local_gguf,
     list_model_registry,
     list_models_available,
-    list_auth_users,
     list_models_downloadable,
-    patch_auth_user,
     session_info,
     storage_health,
-    transfer_logs,
-    transfer_master,
     pause_queue,
     rename_session,
     resume_queue,
     unload_model,
-    auth_capability,
-    auth_login,
-    auth_logout,
-    auth_me,
-    auth_totp_provision,
-    auth_totp_verify,
 )
 from tui_shared import (
     API_PATHS, COMMAND_SPECS, MODEL_INTENT_TERMINAL, format_metrics,
@@ -171,7 +155,7 @@ PAGES: List[Tuple[str, str, str]] = [
     ("status", "状态", "运行概览 · /health /status /models"),
     ("models", "模型", "选模 · L 自动供给并准备 · U 卸载 · C 取消选模"),
     ("cluster", "分布式", "配置 · 容量 · 层段 · /cluster/*"),
-    ("nodes", "节点", "成员 · 入群 · 邀请 · 连接 · /cluster/nodes"),
+    ("nodes", "节点", "成员 · 邀请 · 连接主节点 · /cluster/nodes"),
     ("queue", "队列", "FIFO · P 暂停/恢复 · C 清空排队"),
     ("logs", "日志", "筛选 · 统计 · 导出 · /logs/*"),
     ("device", "设备", "画像 · 自动配置 · GPU · /device/*"),
@@ -594,21 +578,6 @@ class ChatPane(Vertical):
         if text.startswith("/history"):
             self.cmd_history(text)
             return
-        if text.startswith("/login"):
-            self.cmd_login(text)
-            return
-        if text.strip() == "/logout":
-            self.cmd_logout()
-            return
-        if text.strip() == "/whoami":
-            self.cmd_whoami()
-            return
-        if text.startswith("/totp"):
-            self.cmd_totp(text)
-            return
-        if text.startswith("/users"):
-            self.cmd_users(text)
-            return
         if text.startswith("/storage"):
             self.cmd_storage(text)
             return
@@ -683,139 +652,6 @@ class ChatPane(Vertical):
     def model_call(self, kind: str, model_id: str, engine: str, quant: str) -> None:
         if self.app.main_screen:
             self.app.main_screen.run_model_action(kind, model_id, engine, quant)
-
-    def cmd_login(self, text: str) -> None:
-        """★ 2026-09-19（G-⑤）：登录。`/login <username> <password> [totp_code]`。
-
-        ⚠️ **凭据只在本进程内存中短暂持有**（密码用完即弃）；登录态 token 写入
-        `app.api.auth_token`，**不落盘**。已绑定 Auth App 的账户必须附 6 位验证码。
-        """
-        parts = text.split(maxsplit=3)
-        if len(parts) < 3:
-            self.status_line("用法: /login <username> <password> [totp_code]")
-            return
-        username, password = parts[1], parts[2]
-        totp_code = parts[3] if len(parts) > 3 else None
-        self.auth_call("login", username, password, totp_code)
-
-    def cmd_logout(self) -> None:
-        """注销（服务端吊销登录态，并清空本地 token）。"""
-        self.auth_call("logout")
-
-    def cmd_whoami(self) -> None:
-        """显示当前主体与认证能力（是否强制登录 / 是否首次引导）。"""
-        self.auth_call("whoami")
-
-    def cmd_totp(self, text: str) -> None:
-        """Auth App：`provision` 生成密钥与 otpauth URI；`verify <code>` 校验一次。"""
-        parts = text.split()
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        if sub == "provision":
-            self.auth_call("totp-provision")
-            return
-        if sub == "verify" and len(parts) == 3:
-            self.auth_call("totp-verify", parts[2])
-            return
-        self.status_line("用法: /totp provision | verify <code>")
-
-    def cmd_users(self, text: str) -> None:
-        """账户管理（需 admin）：list / add / role / disable / enable / passwd / del。"""
-        parts = text.split()
-        sub = parts[1].lower() if len(parts) > 1 else "list"
-        if sub == "list":
-            self.auth_call("users-list")
-            return
-        if sub == "add" and len(parts) >= 4:
-            role = parts[4] if len(parts) > 4 else "viewer"
-            self.auth_call("user-add", parts[2], parts[3], role)
-            return
-        if sub == "role" and len(parts) == 4:
-            self.auth_call("user-role", parts[2], parts[3])
-            return
-        if sub in {"disable", "enable"} and len(parts) == 3:
-            self.auth_call("user-disable" if sub == "disable" else "user-enable", parts[2])
-            return
-        if sub == "passwd" and len(parts) == 4:
-            self.auth_call("user-passwd", parts[2], parts[3])
-            return
-        if sub == "del" and len(parts) == 3:
-            target = parts[2]
-            self.app.confirm(
-                f"删除账户 {target}",
-                "将删除该账户及其 Auth App 绑定与全部登录态，**不可撤销**。",
-                lambda: self.auth_call("user-delete", target),
-                confirm_label="删除")
-            return
-        self.status_line(
-            "用法: /users list | add <name> <pass> [role] | role <name> <role>"
-            " | disable|enable <name> | passwd <name> <pass> | del <name>")
-
-    @work(thread=True, exclusive=True, group="authctl")
-    def auth_call(self, action: str, a: str = "", b: str = "", c: str = "") -> None:
-        app = self.app
-        self.app.call_from_thread(self.status_line, f"认证操作 {action} …")
-        try:
-            if action == "login":
-                result = auth_login(app.api, a, b, totp_code=c or None)
-                app.api.auth_token = str(result.get("token") or "")
-                text = (f"[green]已登录[/] {result.get('username')}"
-                        f"（role={result.get('role')}）")
-            elif action == "logout":
-                result = auth_logout(app.api)
-                app.api.auth_token = ""
-                text = f"[green]已注销[/]（revoked={result.get('revoked')}）"
-            elif action == "whoami":
-                me = auth_me(app.api)
-                cap = auth_capability(app.api)
-                text = (f"[green]当前主体[/] {me.get('username')}"
-                        f"（role={me.get('role')}）\n"
-                        f"[dim]认证：required={cap.get('required')} "
-                        f"available={cap.get('available')} "
-                        f"bootstrap_open={cap.get('bootstrap_open')} "
-                        f"users={cap.get('user_count')}[/]")
-            elif action == "totp-provision":
-                result = auth_totp_provision(app.api)
-                text = ("[green]Auth App 已绑定[/]\n"
-                        f"密钥: {result.get('secret')}\n"
-                        f"URI : {result.get('otpauth_uri')}\n"
-                        f"[dim]算法 {result.get('algorithm')} / {result.get('digits')} 位 / "
-                        f"{result.get('period')}s。⚠️ 重新 provision 会使旧条目失效。[/]")
-            elif action == "totp-verify":
-                result = auth_totp_verify(app.api, a)
-                ok = bool(result.get("verified"))
-                text = (f"[{'green' if ok else 'red'}]TOTP 校验 "
-                        f"{'通过' if ok else '未通过'}[/]")
-            elif action == "users-list":
-                result = list_auth_users(app.api)
-                rows = result.get("users") or []
-                lines = [f"  {u.get('username'):<16} {u.get('role'):<9} "
-                         f"{'disabled' if u.get('disabled') else 'active':<9} "
-                         f"totp={'yes' if u.get('totp_bound') else 'no'}"
-                         for u in rows]
-                text = "[green]账户[/]\n" + ("\n".join(lines) if lines else "  （无）")
-            elif action == "user-add":
-                result = create_auth_user(app.api, a, b, role=c or "viewer")
-                text = (f"[green]已创建[/] {result.get('username')}"
-                        f"（role={result.get('role')}）")
-            elif action == "user-role":
-                patch_auth_user(app.api, a, role=b)
-                text = f"[green]已改角色[/] {a} → {b}"
-            elif action in {"user-disable", "user-enable"}:
-                disabled = action == "user-disable"
-                patch_auth_user(app.api, a, disabled=disabled)
-                text = f"[green]{'已禁用' if disabled else '已启用'}[/] {a}"
-            elif action == "user-passwd":
-                patch_auth_user(app.api, a, password=b)
-                text = f"[green]已重置口令[/] {a}"
-            elif action == "user-delete":
-                delete_auth_user(app.api, a)
-                text = f"[green]已删除账户[/] {a}"
-            else:
-                raise ValueError(f"未知认证动作: {action}")
-        except (ApiError, ValueError) as exc:
-            text = f"[red]认证 {action} 失败[/]：{exc}"
-        self.app.call_from_thread(self.write_line, text)
-        self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
     def cmd_history(self, text: str) -> None:
         """★ 2026-09-19 补缺口 F：会话细粒度。
@@ -932,41 +768,11 @@ class ChatPane(Vertical):
         self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
     def cmd_ha(self, text: str) -> None:
-        """★ 2026-09-19 补缺口 E：集群高可用（备用主节点 / 主节点转让 / 身份重置）。
-
-        ⚠️ **分级**：``health`` / ``transfer-logs`` / ``spare`` / ``spare-logs`` 为**只读**；
-        ``designate`` / ``clear-spare`` / ``transfer`` / ``reset-identity`` 为**写操作**，
-        一律先经 ``self.app.confirm`` 二次确认，且**文案点明后果**。
-        """
+        """Inspect the static master or maintain its local identity."""
         parts = text.split()
         sub = parts[1].lower() if len(parts) > 1 else ""
-        if sub in {"health", "transfer-logs", "spare", "spare-logs"}:
+        if sub == "health":
             self.ha_call(sub)
-            return
-        if sub == "designate" and len(parts) == 3:
-            node = parts[2]
-            self.app.confirm(
-                f"指定备用主节点 {node}",
-                "变更集群高可用配置：该节点将成为主节点宕机时的接管候选。"
-                "要求集群节点数 >= 2 且目标在线。",
-                lambda: self.ha_call("designate", node),
-                confirm_label="指定")
-            return
-        if sub == "clear-spare":
-            self.app.confirm(
-                "清除备用主节点指定",
-                "将取消当前的备用主节点配置。",
-                lambda: self.ha_call("clear-spare"),
-                confirm_label="清除")
-            return
-        if sub == "transfer" and len(parts) == 3:
-            node = parts[2]
-            self.app.confirm(
-                f"⚠️ 转让主节点身份给 {node}",
-                "**高危操作**：主节点身份将转让给该从节点，"
-                "**双方都需要重启服务**才能生效（原主转从、新主转主）。",
-                lambda: self.ha_call("transfer", node),
-                confirm_label="转让")
             return
         if sub == "reset-identity":
             self.app.confirm(
@@ -977,39 +783,23 @@ class ChatPane(Vertical):
                 confirm_label="重置")
             return
         self.status_line(
-            "用法: /ha health | transfer-logs | spare | spare-logs | designate <node>"
-            " | clear-spare | transfer <node> | reset-identity")
+            "用法: /ha health | reset-identity")
 
     @work(thread=True, exclusive=True, group="hactl")
     def ha_call(self, action: str, value: str = "") -> None:
         app = self.app
-        self.app.call_from_thread(self.status_line, f"高可用操作 {action} …")
+        self.app.call_from_thread(self.status_line, f"静态主节点操作 {action} …")
         try:
             if action == "health":
                 result = master_health(app.api)
-            elif action == "transfer-logs":
-                result = transfer_logs(app.api)
-            elif action == "spare":
-                result = get_spare_master(app.api)
-            elif action == "spare-logs":
-                result = spare_master_logs(app.api)
-            elif action == "designate":
-                result = designate_spare_master(app.api, value)
-            elif action == "clear-spare":
-                result = clear_spare_master(app.api)
-            elif action == "transfer":
-                result = transfer_master(app.api, value)
             elif action == "reset-identity":
                 result = reset_master_identity(app.api)
             else:
-                raise ValueError(f"未知高可用动作: {action}")
+                raise ValueError(f"未知静态主节点操作: {action}")
             body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
-            text = f"[green]高可用 {action}[/] → {value}\n{body}" if value else \
-                f"[green]高可用 {action}[/]\n{body}"
-            if action == "transfer":
-                text += "\n[yellow]提示：转让后需重启双方服务才生效[/]"
+            text = f"[green]静态主节点 {action}[/]\n{body}"
         except (ApiError, ValueError) as exc:
-            text = f"[red]高可用 {action} 失败[/]：{exc}"
+            text = f"[red]静态主节点 {action} 失败[/]：{exc}"
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
@@ -1358,9 +1148,6 @@ class MainScreen(Screen):
         Binding("t", "cluster_toggle", "分布式开关"),
         Binding("m", "cluster_max_nodes", "最大节点"),
         Binding("j", "cluster_connect", "连接主节点"),
-        Binding("b", "cluster_join_request", "生成入群请求"),
-        Binding("k", "cluster_join_consume", "消费入群授权"),
-        Binding("o", "cluster_join_grant", "签发入群授权"),
         Binding("g", "device_auto_config", "设备配置"),
         Binding("h", "device_select_gpu", "选择 GPU"),
         Binding("e", "logs_export", "导出日志"),
@@ -1378,7 +1165,7 @@ class MainScreen(Screen):
         "chat": "/help 看命令",
         "models": "L 选模 · U 卸载 · C 取消选模/下载 · J 发现/重试连接",
         "cluster": "T 分布式 · M 最大节点 · R 刷新容量",
-        "nodes": "I 邀请 · J 连接 · B 请求码 · O 签发授权 · K 消费授权 · X 注销",
+        "nodes": "I 邀请 · J 连接主节点 · X 注销",
         "queue": "P 暂停/恢复 · S 策略 · C 清空排队",
         "logs": "F 筛选 · S 统计 · E 导出 · X 清理",
         "device": "G 自动配置 · H 选择 GPU",
@@ -2365,9 +2152,6 @@ class MainScreen(Screen):
             for name, path in (
                 ("config", "/cluster/config"),
                 ("role", "/cluster/my-role"),
-                ("fence", API_PATHS["cluster_control_plane"]),
-                ("score", API_PATHS["cluster_management_score"]),
-                ("transfer_logs", API_PATHS["cluster_transfer_logs"]),
                 ("distributed", "/cluster/config/distributed-inference"),
                 ("capacity", "/cluster/pipeline-capacity"),
                 ("reshard", "/cluster/pipeline-reshard"),
@@ -2380,70 +2164,14 @@ class MainScreen(Screen):
                 self._cluster_aux_inflight = False
 
     def render_ha_status(self, payload: Dict[str, Any]) -> str:
-        """Render the read-only HA projection without inventing missing state."""
-
-        fence = payload.get("fence") if isinstance(payload.get("fence"), dict) else {}
+        """Render the configured node role and manual recovery action."""
         role = payload.get("role") if isinstance(payload.get("role"), dict) else {}
-        auto = role.get("auto_role") if isinstance(role.get("auto_role"), dict) else {}
         role_name = str(role.get("node_role") or role.get("runtime_node_role") or "").lower()
-        leader = (
-            fence.get("leader_id")
-            or role.get("master_node_id")
-            or role.get("leader_id")
-            or (role.get("node_id") if role_name == "master" else None)
-            or "unknown"
-        )
-        term = fence.get("committed_term")
-        if term is None:
-            term = auto.get("term")
-        epoch = fence.get("voter_set_epoch")
-        certificate = str(fence.get("certificate_digest") or "none")
-        if len(certificate) > 16:
-            certificate = certificate[:16] + "..."
-
-        outcome = auto.get("last_outcome") if isinstance(auto.get("last_outcome"), dict) else {}
-        if fence.get("enabled") is False:
-            majority = "not enabled"
-        elif outcome.get("accepted") is True:
-            majority = "available"
-        elif auto.get("state") == "read_only" or str(outcome.get("reason")) in {
-            "quorum_unavailable", "quorum_requires_witness",
-        }:
-            majority = "unavailable"
-        elif fence.get("available") is False:
-            majority = "unavailable"
-        elif fence.get("read_only_reason"):
-            majority = "unavailable"
-        else:
-            majority = "unknown (not exposed)"
-
-        score_payload = payload.get("score") if isinstance(payload.get("score"), dict) else {}
-        score_version = str(score_payload.get("algorithm_version") or "").strip()
-        if not score_version:
-            score_version = "not reported"
-
-        transfer = payload.get("transfer_logs")
-        logs = transfer.get("logs") if isinstance(transfer, dict) else []
-        latest = logs[-1] if isinstance(logs, list) and logs and isinstance(logs[-1], dict) else {}
-        handoff_reason = (
-            latest.get("reason") or latest.get("result") or latest.get("event_type") or "none"
-        )
-        read_only = (
-            fence.get("read_only_reason")
-            or auto.get("reason")
-            or "none"
-        )
-        if fence.get("_error"):
-            read_only = str(fence["_error"])
-            majority = "unavailable"
-
         return "\n".join((
-            "[b $accent]HA control (read-only)[/]",
-            f"leader: {leader}    term/epoch: {term if term is not None else 'unknown'}/{epoch if epoch is not None else 'unknown'}",
-            f"certificate: {certificate}    majority: {majority}",
-            f"score version: {score_version}",
-            f"last handoff: {handoff_reason}",
-            f"read-only reason: {read_only}",
+            "[b $accent]Static cluster role[/]",
+            f"configured role: {role_name or 'unknown'}",
+            f"node id: {role.get('node_id') or 'unknown'}",
+            "master recovery: reconfigure the selected node manually",
         ))
 
     def fill_cluster_aux(self, payload: Dict[str, Any]) -> None:
@@ -2514,137 +2242,6 @@ class MainScreen(Screen):
     def submit_cluster_connect(self, values: Dict[str, str]) -> None:
         # Kept for callers of the former form; discovery owns the destination.
         self.connect_intent()
-
-    def action_cluster_join_request(self) -> None:
-        if PAGES[self.page_index][0] != "nodes":
-            return
-        self.open_form(
-            "生成入群请求码",
-            "在待加入节点生成一次性请求码；主节点仍需通过 Auth App/TOTP 审批后签发授权。",
-            [
-                ("master_endpoint", "主节点地址（host:port）", ""),
-                ("target_node_id", "目标节点 ID（可选）", ""),
-                ("cluster_id", "集群 ID（可选）", "qlh-default"),
-                ("capabilities", "能力标签（逗号分隔）", "presence,task"),
-                ("request_ttl_seconds", "请求有效期（60-3600 秒）", "600"),
-            ],
-            self.submit_cluster_join_request,
-            confirm_label="生成",
-        )
-
-    def submit_cluster_join_request(self, values: Dict[str, str]) -> None:
-        endpoint = values.get("master_endpoint", "").strip()
-        if not endpoint:
-            self.write_status("[red]必须填写主节点地址[/]")
-            return
-        try:
-            ttl = max(60, min(3600, int(values.get("request_ttl_seconds", "600"))))
-        except ValueError:
-            self.write_status("[red]请求有效期必须是整数[/]")
-            return
-        capabilities = [item.strip() for item in values.get("capabilities", "").split(",") if item.strip()]
-        body: Dict[str, Any] = {
-            "master_endpoint": endpoint,
-            "cluster_id": values.get("cluster_id", "").strip(),
-            "capabilities": capabilities or ["presence", "task"],
-            "request_ttl_seconds": ttl,
-        }
-        target_node_id = values.get("target_node_id", "").strip()
-        if target_node_id:
-            body["target_node_id"] = target_node_id
-        self.run_cluster_join_request(body)
-
-    @work(thread=True, exclusive=True, group="nodectl")
-    def run_cluster_join_request(self, body: Dict[str, Any]) -> None:
-        try:
-            result = self.app.api.request("POST", "/cluster/join/request", body=body)
-            self.app.call_from_thread(self.show_cluster_join_request, result)
-        except ApiError as exc:
-            self.app.call_from_thread(self.write_status, f"[red]生成入群请求失败[/]：{exc}")
-
-    def show_cluster_join_request(self, result: Any) -> None:
-        self.node_aux["join_request"] = result
-        code = result.get("request_code") if isinstance(result, dict) else None
-        pane = self.query_one("#nodes-pane", Static)
-        if code:
-            pane.update(
-                "入群请求码（交给主节点 Auth App/TOTP 审批流程）：\n"
-                + str(code)
-                + "\n\nK 消费主节点签发的 grant_code。")
-            self.write_status("[green]入群请求码已生成[/]")
-        else:
-            pane.update("入群请求响应：" + json.dumps(result, ensure_ascii=False, separators=(", ", ": ")))
-            self.write_status("[yellow]后端未返回 request_code[/]")
-
-    def action_cluster_join_consume(self) -> None:
-        if PAGES[self.page_index][0] != "nodes":
-            return
-        self.open_form(
-            "消费入群授权",
-            "消费一次性 grant_code；成功后本节点会切换为从节点并连接主节点。",
-            [("grant_code", "一次性授权码", "")],
-            self.submit_cluster_join_consume,
-            confirm_label="消费授权",
-        )
-
-    def action_cluster_join_grant(self) -> None:
-        if PAGES[self.page_index][0] != "nodes":
-            return
-        self.open_form(
-            "签发入群授权",
-            "主节点管理员必须输入当前 Auth App/TOTP 一次性验证码；旧布尔审批不会被接受。",
-            [
-                ("request_code", "目标节点请求码", ""),
-                ("otp_code", "Auth App 一次性验证码", ""),
-                ("ttl_seconds", "授权有效期（60-900 秒）", "300"),
-            ],
-            self.submit_cluster_join_grant,
-            confirm_label="签发",
-        )
-
-    def submit_cluster_join_grant(self, values: Dict[str, str]) -> None:
-        request_code = values.get("request_code", "").strip()
-        otp_code = values.get("otp_code", "").strip()
-        if not request_code:
-            self.write_status("[red]必须填写 request_code[/]")
-            return
-        if not otp_code:
-            self.write_status("[red]必须填写 Auth App 一次性验证码[/]")
-            return
-        try:
-            ttl = max(60, min(900, int(values.get("ttl_seconds", "300"))))
-        except ValueError:
-            self.write_status("[red]授权有效期必须是整数[/]")
-            return
-        body = {
-            "request_code": request_code,
-            "otp_code": otp_code,
-            "ttl_seconds": ttl,
-        }
-        self.app.confirm(
-            "签发入群授权",
-            f"将为请求 {request_code[:32]}... 签发一次性客户端授权；验证码不会显示在确认文本中。",
-            lambda: self.run_json_operation(
-                "POST", "/cluster/join/grant", body,
-                success="入群授权签发请求已发送",
-                refresh=(self.load_pages, self.load_cluster_aux),
-            ),
-            confirm_label="签发",
-        )
-
-    def submit_cluster_join_consume(self, values: Dict[str, str]) -> None:
-        grant_code = values.get("grant_code", "").strip()
-        if not grant_code:
-            self.write_status("[red]必须填写 grant_code[/]")
-            return
-        self.app.confirm(
-            "消费入群授权",
-            "成功后当前节点将切换为从节点并连接授权中的主节点；一次性授权不可重复使用。",
-            lambda: self.run_json_operation(
-                "POST", "/cluster/join/consume", {"grant_code": grant_code},
-                success="入群授权消费请求已发送", refresh=(self.load_pages, self.load_cluster_aux)),
-            confirm_label="消费",
-        )
 
     # ------------------------------------------------------------ 运维面（节点/队列/日志）
 
@@ -2727,7 +2324,7 @@ class MainScreen(Screen):
         pane = self.query_one("#nodes-pane", Static)
         pane.update(
             f"节点 {len(items)} · 在线 {sum(1 for item in items if isinstance(item, dict) and str(item.get('state', '')).lower() == 'online')}"
-            " · I 邀请 · J 连接 · B 请求码 · K 消费授权 · X 注销")
+            " · I 邀请 · J 连接主节点 · X 注销")
 
     def selected_node_id(self) -> str:
         table = self.query_one("#nodes-table", DataTable)

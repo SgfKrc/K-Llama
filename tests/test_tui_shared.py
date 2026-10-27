@@ -315,10 +315,16 @@ class TestApiPaths:
     def test_cluster_resources_path(self):
         assert API_PATHS["cluster_resources"] == "/cluster/resources"
 
-    def test_ha_observation_paths(self):
+    def test_static_role_observation_paths(self):
         assert API_PATHS["cluster_control_plane"] == "/cluster/control-plane"
-        assert API_PATHS["cluster_management_score"] == "/cluster/management-score"
-        assert API_PATHS["cluster_transfer_logs"] == "/cluster/transfer-logs"
+        for retired_path in (
+            "cluster_management_score",
+            "cluster_transfer_logs",
+            "cluster_spare_master",
+            "cluster_spare_master_logs",
+            "cluster_transfer_master",
+        ):
+            assert retired_path not in API_PATHS
 
     def test_pipeline_observation_paths(self):
         assert API_PATHS["cluster_layers"] == "/cluster/layers"

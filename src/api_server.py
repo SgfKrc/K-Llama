@@ -76,11 +76,11 @@ def _torch_cuda_available() -> bool:
         pass
     return cuda_available(load=should_load)
 
-from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException, Request,
+from fastapi import (FastAPI, File, Form, HTTPException, Request,
                     UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
@@ -116,9 +116,6 @@ from execution_provider import (
     StageRequest as ProviderStageRequest,
 )
 import model_config as mc
-# ★ 2026-09-19：认证改为 monolith 内实现（抛弃 control-svc 反代）
-import auth_app
-import auth_service
 from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -177,23 +174,7 @@ from request_outcome import (
 )
 import model_download_jobs
 import model_search
-from cluster_join import (
-    JoinContractError,
-    JoinGrantLedger,
-    build_join_request,
-    decode_join_request,
-    decode_join_grant,
-    encode_join_grant,
-    encode_join_request,
-    generate_join_keypair,
-    issue_join_grant,
-    load_join_private_key,
-    verify_join_grant,
-    verify_and_consume_join_grant,
-)
-from cluster_fence import ControlFence, ControlFenceError
-from cluster_score import build_management_score_snapshot
-from node_config import load_node_config, write_node_config
+from bootstrap_nonce_ledger import BootstrapNonceError, BootstrapRequestNonceLedger
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 _conversation_transaction_depth: ContextVar[int] = ContextVar(
@@ -207,33 +188,18 @@ LOG_AGGREGATE_DEADLINE_SECONDS = 3.0
 LOG_AGGREGATE_MAX_CONCURRENCY = 8
 _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
-_join_ledger_lock = threading.RLock()
-_join_ledger_instance: JoinGrantLedger | None = None
+_bootstrap_nonce_ledger_lock = threading.RLock()
+_bootstrap_nonce_ledger_instance: BootstrapRequestNonceLedger | None = None
 
-# P4.5 fencing is opt-in until a voter set/certificate distribution path is
-# configured.  When enabled, the middleware below covers control-plane writes;
-# read/status routes remain available in read-only mode.
-# Resolved through the explicit runtime only on use; import opens no voter IO.
-control_fence = None
-
-
-def _get_join_ledger() -> JoinGrantLedger:
-    """Use the same user-owned local SQLite file as the control plane."""
-    global _join_ledger_instance
-    with _join_ledger_lock:
-        if _join_ledger_instance is None:
-            _join_ledger_instance = JoinGrantLedger(_local_store.initialize_local_store())
-        return _join_ledger_instance
-
-
-def _join_endpoint_parts(endpoint: str) -> tuple[str, int]:
-    """Split host:port while preserving IPv6 bracket notation."""
-    from urllib.parse import urlsplit
-
-    parsed = urlsplit(f"//{endpoint}")
-    if not parsed.hostname or parsed.port is None:
-        raise JoinContractError("master_endpoint is invalid", code="invalid_endpoint")
-    return parsed.hostname, int(parsed.port)
+def _get_bootstrap_nonce_ledger() -> BootstrapRequestNonceLedger:
+    """Use the local SQLite store for durable bootstrap replay protection."""
+    global _bootstrap_nonce_ledger_instance
+    with _bootstrap_nonce_ledger_lock:
+        if _bootstrap_nonce_ledger_instance is None:
+            _bootstrap_nonce_ledger_instance = BootstrapRequestNonceLedger(
+                _local_store.initialize_local_store(),
+            )
+        return _bootstrap_nonce_ledger_instance
 
 
 class RequestIdFilter(logging.Filter):
@@ -434,46 +400,8 @@ _API_SOURCE_EXEMPT_PATHS = frozenset({
     "/api/bootstrap/info",
     "/api/bootstrap/first-connect",
 })
-_API_AUTH_EXEMPT_PATHS = frozenset({
-    "/api/health",
-    "/api/ready",
-    "/api/bootstrap/info",
-    "/api/bootstrap/first-connect",
-    "/api/auth/capability",
-    "/api/auth/login",
-    # These are node-to-node contracts. They remain source-gated, but do not
-    # require a human Bearer session when auth is enabled.
-    "/api/cluster/join/request",
-    "/api/cluster/join/consume",
-    "/api/cluster/android/register",
-    "/api/cluster/android/heartbeat",
-    "/api/cluster/quorum/voter",
-})
-
-
 def _boundary_response(status_code: int, detail: object) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail})
-
-
-def _is_control_write_path(request: Request) -> bool:
-    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
-        return False
-    path = request.url.path
-    if path.startswith("/api/models/intent") and scheduler._effective_role() == "master":
-        return True
-    if path.startswith("/api/cluster/queue"):
-        return True
-    if path.startswith("/api/cluster/config") or path.startswith("/api/cluster/layers"):
-        return True
-    if path.startswith("/api/cluster/model-runtime") or path.startswith("/api/cluster/qwen3"):
-        return True
-    if path.startswith("/api/cluster/transfer-master") or path.startswith("/api/cluster/spare-master"):
-        return True
-    if path.startswith("/api/cluster/reset-identity"):
-        return True
-    if "/api/cluster/nodes/" in path and path.endswith("/deregister"):
-        return True
-    return False
 
 
 @app.middleware("http")
@@ -486,7 +414,7 @@ async def api_boundary_middleware(request: Request, call_next):
 
 
 async def _api_boundary_impl(request: Request, call_next):
-    """Apply the common source/auth boundary before route validation or work.
+    """Apply the common source boundary before route validation or work.
 
     Individual handlers still keep their role and node-state checks. This
     layer prevents a newly added API route from accidentally bypassing the
@@ -522,50 +450,13 @@ async def _api_boundary_impl(request: Request, call_next):
         except HTTPException as exc:
             return _boundary_response(exc.status_code, exc.detail)
 
-    if (
-        auth_service.auth_required()
-        and not supply_file_request
-        and path not in _API_AUTH_EXEMPT_PATHS
-        and not (path == "/api/users" and request.method == "POST"
-                 and auth_service.is_bootstrap_open())
-    ):
-        authorization = request.headers.get("Authorization")
-        if auth_service.resolve_bearer(authorization) is None:
-            return _boundary_response(
-                401,
-                {"code": "auth_required", "message": "需要登录（Bearer token）"},
-            )
-
-    if _is_control_write_path(request) and control_fence.enabled:
+    response = await call_next(request)
+    if intent_source_request:
         try:
-            control_fence.admit_http(
-                request.headers,
-                action=f"http.{request.method.lower()}.{request.url.path}",
-                request_id=_request_id_ctx.get("-"),
-            )
-        except ControlFenceError as exc:
-            control_fence.clear_context()
-            status = 503 if exc.code == "control_fence_unavailable" else 409
-            return _boundary_response(
-                status,
-                {"code": exc.code, "message": str(exc)},
-            )
-
-    try:
-        response = await call_next(request)
-        if intent_source_request:
-            try:
-                require_model_intent_source(request, scheduler)
-            except HTTPException as exc:
-                return _boundary_response(exc.status_code, exc.detail)
-        return response
-    except ControlFenceError as exc:
-        status = 503 if exc.code == "control_fence_unavailable" else 409
-        return _boundary_response(status, {"code": exc.code, "message": str(exc)})
-    finally:
-        services = _app_runtime._services
-        if services is not None and services.fence.enabled:
-            services.fence.clear_context()
+            require_model_intent_source(request, scheduler)
+        except HTTPException as exc:
+            return _boundary_response(exc.status_code, exc.detail)
+    return response
 
 def _normalize_request_id(value: str | None) -> str:
     if not value:
@@ -741,8 +632,6 @@ def require_model_api_source(request):
 
 
 scheduler = LazyResource(lambda: _get_app_runtime().services.scheduler)
-control_fence = LazyResource(lambda: _get_app_runtime().services.fence)
-auto_role_runtime = None
 _RUNTIME_FEATURE_ENV_NAMES = frozenset(FIXED_RELEASE_ENV)
 
 
@@ -1023,10 +912,6 @@ def _initialize_legacy_runtime_settings():
     scheduler.configure_callbacks(_scheduler_callbacks)
 
 
-def _rotate_cluster_credential():
-    return _get_app_runtime().rotate_cluster_credential()
-
-
 def _bootstrap_cluster_credential():
     return _get_app_runtime().cluster_credential()
 
@@ -1044,9 +929,6 @@ def _run_runtime_startup() -> None:
             _app_runtime.config.environment_snapshot(),
         )
         setup_logging()
-        _app_runtime.services.configure_authority()
-        global auto_role_runtime
-        auto_role_runtime = _app_runtime.services.auto_role
         with _app_runtime.services.store.scope():
             _startup_device_detection()
     except BaseException as exc:  # keep liveness available and report /ready
@@ -1128,30 +1010,6 @@ def _startup_device_detection():
 
     logger.info("主节点 SQLite 已就绪")
 
-    # P3: 启动审查工单过期检查后台线程（仅 master，每 5 分钟）
-    try:
-        if active_scheduler._effective_role() == "master":
-            import threading as _th2
-            def _review_expire_loop():
-                import time as _time
-                from review import ReviewManager
-                if _runtime_background_stop.wait(120):
-                    return
-                while not _runtime_background_stop.is_set() and getattr(active_scheduler, '_running', True):
-                    try:
-                        ReviewManager().resolve_expired()
-                    except Exception:
-                        pass
-                    _runtime_background_stop.wait(300)
-            _t = _th2.Thread(target=_review_expire_loop, daemon=True, name="review-expire")
-            _runtime_background_threads.append(_t)
-            _t.start()
-            logger.info("⏳ 审查工单过期检查线程已启动 (master)")
-    except Exception as e:
-        logger.warning(f"审查工单过期检查启动失败: {e}")
-
-
-# ============================================================
 # 关闭事件 — 资源清理（通过 lifespan 调用）
 # ============================================================
 
@@ -1506,48 +1364,6 @@ class UpdateMaxNodesRequest(BaseModel):
 class ConnectToMasterRequest(BaseModel):
     master_host: str = Field(..., description="主节点 IP 地址", min_length=1)
     master_port: int = Field(8888, ge=1, le=65535, description="主节点端口")
-    switch_to_client: bool = Field(
-        False,
-        description="待配置节点显式切换为从节点后加入现有集群",
-    )
-
-
-class ClusterJoinRequestCreate(BaseModel):
-    master_endpoint: str = Field(..., min_length=3, max_length=256)
-    target_node_id: Optional[str] = Field(default=None, max_length=128)
-    cluster_id: str = Field(default="", max_length=128)
-    capabilities: list[str] = Field(default_factory=lambda: ["presence", "task"], max_length=16)
-    request_ttl_seconds: int = Field(default=600, ge=60, le=3600)
-
-
-class ClusterJoinGrantIssue(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    request_code: Optional[str] = Field(default=None, max_length=16 * 1024)
-    request: Optional[dict[str, Any]] = None
-    otp_code: Optional[str] = Field(
-        default=None,
-        max_length=16,
-        description="当前已登录管理员的 Auth App/TOTP 一次性确认码",
-    )
-    ttl_seconds: int = Field(default=300, ge=60, le=900)
-
-
-class ClusterSecretRotateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    otp_code: Optional[str] = Field(default=None, max_length=16)
-    tailnet_revocation_completed: bool = Field(
-        default=False,
-        description=(
-            "Operator attestation that the revoked node was removed from the Tailnet; "
-            "the service does not query or prove Tailscale control-plane state"
-        ),
-    )
-
-
-class ClusterJoinConsume(BaseModel):
-    grant_code: str = Field(..., min_length=12, max_length=16 * 1024)
 
 
 class FirstConnectBootstrapRequest(BaseModel):
@@ -4902,63 +4718,6 @@ def _client_supports_forward_layers(node_type: str, capabilities: dict | None) -
 
 
 # ============================================================
-# 认证与账户（2026-09-19：**monolith 内实现**，抛弃 control-svc 反代）
-# ------------------------------------------------------------
-# 背景：原设计把账户/登录态/TOTP 放在独立的 control-svc（127.0.0.1:8030），
-# 本进程只做反代。微服务改造叫停后该服务已不存在，反代恒 503 ⇒ 现改为在
-# **本进程内**实现，并复用同一个用户级 SQLite（auth_store）。
-# 差异：无独立进程/端口、无网络跳、无「control service unavailable」。
-# ============================================================
-
-class LoginRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=128)
-    password: str = Field(..., min_length=1, max_length=512)
-    totp_code: Optional[str] = Field(default=None, max_length=16,
-                                     description="已绑定 Auth App 时必填的 6 位码")
-
-
-class CreateUserRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=128)
-    password: str = Field(..., min_length=8, max_length=512)
-    role: Literal["admin", "operator", "viewer"] = "viewer"
-
-
-class PatchUserRequest(BaseModel):
-    role: Optional[Literal["admin", "operator", "viewer"]] = None
-    disabled: Optional[bool] = None
-    password: Optional[str] = Field(default=None, min_length=8, max_length=512)
-
-
-class TotpVerifyRequest(BaseModel):
-    code: str = Field(..., min_length=1, max_length=16)
-
-
-def _principal_payload(p) -> dict:
-    return {"username": p.username, "role": p.role, "is_admin": bool(getattr(p, "is_admin", False))}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class ManualRegisterRequest(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=64, description="节点标识")
     hostname: str = Field(default="", description="主机名")
@@ -4999,16 +4758,6 @@ class ResetIdentityRequest(BaseModel):
 # ============================================================
 # 有界 FIFO 请求队列 API
 # ============================================================
-
-
-
-class ControlCertificateRequest(BaseModel):
-    certificate: dict = Field(..., description="已由 quorum voter set 签发的控制证书")
-
-
-
-
-
 
 
 
@@ -5140,79 +4889,6 @@ def _raise_qwen3_local_http(exc: Exception) -> None:
 
 
 
-
-
-
-
-# ============================================================
-# 角色转让 API
-# ============================================================
-
-class TransferMasterRequest(BaseModel):
-    target_node_id: str = Field(..., min_length=1, max_length=64,
-                                 description="目标从节点 ID（将升级为新主节点）")
-
-
-
-
-
-
-# ============================================================
-# 备用主节点管理 API
-# ============================================================
-
-class SpareMasterRequest(BaseModel):
-    target_node_id: str
-
-
-
-
-
-
-
-
-
-
-# ============================================================
-# P3: 主节点转让审查 API
-# ============================================================
-
-class CreateReviewRequest(BaseModel):
-    target_node_id: str = Field(..., description="拟转让的目标从节点 ID")
-    reason: str = Field(default="", description="转让原因")
-    timeout_hours: float = Field(default=48.0, description="超时时间（小时）")
-
-
-class CastVoteRequest(BaseModel):
-    ticket_id: str = Field(..., description="工单 ID")
-    vote: int = Field(..., description="-1（阻止）、0（弃权）、+1（赞同）")
-    comment: str = Field(default="", description="投票附言")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ============================================================
-# 用户偏好设置 API（本地 SQLite 为事实源）
-# ============================================================
-
-
-
-class UserSettingsRequest(BaseModel):
-    settings: dict = Field(default={}, description="完整的用户设置 JSON")
 
 
 
@@ -5635,7 +5311,7 @@ from api import routes_cluster as _cluster_routes
 from api import routes_models as _models_routes
 from api import routes_model_supply as _supply_routes
 from api import routes_model_intent as _intent_routes
-from api import routes_auth as _auth_routes
+from api import routes_user_settings as _user_settings_routes
 from api import routes_sessions as _sessions_routes
 from api import routes_tasks as _tasks_routes
 from api import routes_client_state as _client_routes
@@ -5645,7 +5321,7 @@ from api import routes_system as _system_routes
 
 _api_route_modules = (
     _health_routes, _device_routes, _cluster_routes, _models_routes, _supply_routes, _intent_routes,
-    _auth_routes, _sessions_routes, _tasks_routes, _chat_routes,
+    _user_settings_routes, _sessions_routes, _tasks_routes, _chat_routes,
     _system_routes, _logs_routes, _diagnostics_routes, _client_routes,
 )
 for _route_module in _api_route_modules:
@@ -5653,6 +5329,18 @@ for _route_module in _api_route_modules:
     _route_module.register_routes()
     app.include_router(_route_module.router)
     globals().update(_route_module.exported_handlers())
+
+
+async def _unknown_api_route(api_path: str):
+    raise HTTPException(404, "Not Found")
+
+
+app.add_api_route(
+    "/api/{api_path:path}",
+    _unknown_api_route,
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
 
 
 def _resolve_frontend_dist():

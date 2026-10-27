@@ -213,7 +213,7 @@ class TestComputeLayerAssignment:
     @pytest.fixture
     def sched(self):
         s = Scheduler()
-        s._role_override = "master"
+        s._runtime_settings["NODE_ROLE"] = "master"
         # 注入模拟节点
         s.nodes = {
             "master": NodeInfo(
@@ -250,7 +250,7 @@ class TestComputeLayerAssignment:
     def test_pipeline_node_metadata_uses_task_worker_engine(
             self, sched, monkeypatch):
         monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._task_worker_control.status = lambda role: {
             "workers": [{
                 "node_id": "client1",
@@ -431,7 +431,7 @@ class TestComputeLayerAssignment:
         assert "silent" not in ids
 
     def test_aggregate_resource_view_combines_online_nodes_without_addresses(self, sched):
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
@@ -528,7 +528,7 @@ class TestComputeLayerAssignment:
     def test_master_capacity_uses_live_memory_instead_of_startup_snapshot(
             self, sched, monkeypatch):
         gib = 1024 ** 3
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
@@ -552,7 +552,7 @@ class TestComputeLayerAssignment:
     def test_android_task_worker_ranges_reach_capacity_solver(self, sched, monkeypatch):
         """Admitted v3 ranges are preserved as solver constraints."""
         monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._task_worker_control.status = lambda role: {
             "workers": [{
                 "node_id": "android-worker",
@@ -580,7 +580,7 @@ class TestComputeLayerAssignment:
     def test_android_task_worker_artifacts_reach_capacity_solver(
             self, sched, monkeypatch):
         monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         artifact = {
             "layer_range": [4, 16],
             "segment_mode": "middle",
@@ -622,7 +622,7 @@ class TestComputeLayerAssignment:
         是"本地裁层后能承载的上限"；两者都要到求解器手上，它才能决策。
         """
         monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._task_worker_control.status = lambda role: {
             "workers": [{
                 "node_id": "android-worker",
@@ -1210,7 +1210,7 @@ class TestComputeLayerAssignment:
         ]
 
     def test_different_candidate_conflicts_with_active_transaction(self, sched):
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._pipeline_load_transaction = {
             "config_id": "cfg-active",
             "generation": 3,
@@ -1871,7 +1871,7 @@ class TestComputeLayerAssignment:
                 captured.update(kwargs)
                 return _Decision()
 
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         # Keep the unit topology independent from the host process NODE_ID.
         monkeypatch.setattr(sched, "get_effective_node_id", lambda: "master")
         sched._pipeline_reshard_coordinator = _Coordinator()
@@ -2183,7 +2183,7 @@ class TestLocalDeviceProfileSync:
     def test_master_profile_updates_node_invalidates_cache_and_repushes(
             self, monkeypatch):
         sched = Scheduler()
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
@@ -2203,7 +2203,7 @@ class TestLocalDeviceProfileSync:
     def test_client_profile_is_reported_after_background_detection(
             self, monkeypatch):
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker1")
         sched.nodes = {
             "worker1": NodeInfo(
@@ -2236,7 +2236,7 @@ class TestLocalDeviceProfileSync:
 
     def test_failed_profile_report_remains_retryable(self, monkeypatch):
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         sched._local_device_profile = PROFILE_IGPU_ONLY
         monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker1")
         sched.nodes = {
@@ -2266,7 +2266,7 @@ class TestLocalDeviceProfileSync:
 
     def test_master_profile_report_recomputes_layer_config(self, monkeypatch):
         sched = Scheduler()
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes = {
             "worker1": NodeInfo(
                 node_id="worker1", role="client", state=NodeState.ONLINE,
@@ -2292,7 +2292,7 @@ class TestManualLayerAssignmentNormalization:
 
     def test_manual_ranges_gain_counts_roles_scores_and_io_heads(self, monkeypatch):
         sched = Scheduler()
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
@@ -2321,7 +2321,7 @@ class TestManualLayerAssignmentNormalization:
 
     def test_manual_ranges_reject_master_outside_first_segment(self, monkeypatch):
         sched = Scheduler()
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes = {
             "master": NodeInfo(node_id="master", role="master", state=NodeState.ONLINE, device_info=_engine_contract("pytorch", "pytorch_cpu")),
             "worker": NodeInfo(node_id="worker", role="client", state=NodeState.ONLINE, device_info=_engine_contract("pytorch", "pytorch_cpu")),
@@ -3469,7 +3469,7 @@ class TestPipelineReadiness:
         """管理状态不能把仅 TCP 在线但仍在同步模型的 worker 标为 active。"""
         from model_host import model_host as _host
 
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes["client1"] = NodeInfo(
             node_id="client1", role="client", state=NodeState.ONLINE,
             address="100.64.1.2:8888", last_heartbeat=time.time(),
@@ -3508,7 +3508,7 @@ class TestPipelineReadiness:
         """Recovery readiness may be fenced without hiding a live TCP peer."""
         from model_host import model_host as _host
 
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched.nodes["client1"] = NodeInfo(
             node_id="client1", role="client", state=NodeState.ONLINE,
             address="100.64.1.2:8888", last_heartbeat=time.time(),
@@ -5896,7 +5896,7 @@ class TestChainTopology:
         from tcp_comm import MessageType
 
         sent = []
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         sched._pipeline_worker_reserved = True
         sched._tcp_client = type("Client", (), {
             "_running": True,
@@ -5962,7 +5962,7 @@ class TestChainTopology:
                 node_type="pc", device_info=PROFILE_ULTRABOOK,
             ),
         }
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sent = []
         sched._tcp_server = type("Server", (), {
             "_running": True,
@@ -6020,7 +6020,7 @@ class TestChainTopology:
                 node_type="pc", device_info=PROFILE_ULTRABOOK,
             ),
         }
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
 
         sched._handle_layer_worker_opt_out("client1", {"data": {
@@ -6033,7 +6033,7 @@ class TestChainTopology:
 
     def test_enabling_distributed_requests_worker_opt_in(self, sched, monkeypatch):
         calls = []
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         monkeypatch.setattr(
             sched,
             "_request_pipeline_worker_opt_in",
@@ -6056,7 +6056,7 @@ class TestChainTopology:
                 node_type="pc", device_info=PROFILE_ULTRABOOK,
             ),
         }
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._pipeline_worker_opt_out.add("client1")
         pushed = []
         monkeypatch.setattr(
@@ -6512,7 +6512,7 @@ class TestCheckMasterHealthTcp:
 
     def test_registered_tcp_is_online_without_database(self, sched):
         """无数据库时，已注册且活跃的 TCP 连接仍必须判定主节点在线。"""
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         sched._tcp_client = type("MockTCPClient", (), {
             "is_registered": True,
             "_running": True,
@@ -6530,7 +6530,7 @@ class TestCheckMasterHealthTcp:
 
     def test_disconnected_client_uses_local_connection_target(self, sched):
         """断线不得查询旧数据库，仍应保留本机的重连目标。"""
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         sched._tcp_client = type("MockTCPClient", (), {
             "is_registered": False,
             "_running": False,
@@ -6685,63 +6685,6 @@ class TestGpuIsIntegrated:
         assert self._gpu_is_integrated({"name": "Foo Bar"}) is True
 
 
-class TestReviewVoteEligibility:
-    """测试审查投票资格的本机 CUDA 独显判断。"""
-
-    @pytest.fixture
-    def sched_master(self, monkeypatch):
-        s = Scheduler()
-        monkeypatch.setattr(s, "_effective_role", lambda: "master")
-        s.nodes["master"] = NodeInfo(
-            node_id="master", role="master", state=NodeState.ONLINE,
-            node_type="pc", hostname="master-host",
-            device_info=PROFILE_WORKSTATION,
-        )
-        return s
-
-    def test_can_vote_uses_discrete_gpu_from_gpus_list(self, sched_master):
-        """current gpu 是集显时，应使用 gpus 列表里的 CUDA 独显判断投票资格。"""
-        sched_master.nodes["master"].device_info = PROFILE_MULTI_GPU
-
-        ok, reason = sched_master.can_node_vote("master")
-
-        assert ok is True, reason
-
-    def test_can_vote_accepts_custom_master_node_id(self, sched_master, monkeypatch):
-        """主节点自定义 NODE_ID 时，投票检查应回退到 master 自身记录。"""
-        monkeypatch.setattr(sched_master, "get_effective_node_id", lambda: "gaming-laptop")
-        sched_master.nodes["master"].device_info = PROFILE_LAPTOP
-
-        ok, reason = sched_master.can_node_vote("gaming-laptop")
-
-        assert ok is True, reason
-
-    def test_can_vote_uses_local_profile_when_master_profile_is_stale(self, sched_master, monkeypatch):
-        """主节点表里的旧画像只有集显时，应允许用实时本机画像兜底。"""
-        import device_profiler
-
-        class DummyProfile:
-            def to_dict(self):
-                return PROFILE_MULTI_GPU
-
-        sched_master.nodes["master"].device_info = PROFILE_IGPU_ONLY
-        monkeypatch.setattr(device_profiler, "get_profile", lambda: DummyProfile())
-
-        ok, reason = sched_master.can_node_vote("master")
-
-        assert ok is True, reason
-
-    def test_can_vote_rejects_android_node(self, sched_master):
-        sched_master.nodes["android-1"] = NodeInfo(
-            node_id="android-1", role="client", state=NodeState.ONLINE,
-            node_type="android", hostname="phone",
-            device_info=PROFILE_MULTI_GPU,
-        )
-
-        ok, reason = sched_master.can_node_vote("android-1")
-
-        assert ok is False
-        assert "PC" in reason
 
 
 # ================================================================
@@ -6863,7 +6806,7 @@ class TestPipelineOrchestrationIntegration:
         monkeypatch.setattr(node_runtime, "_node_role", "master")
         s = Scheduler()
         # 伪装为主节点
-        s._role_override = "master"
+        s._runtime_settings["NODE_ROLE"] = "master"
         monkeypatch.setattr(s, "_effective_role", lambda: "master")
         # 注入假 TCP 服务端（满足就绪检查和 get_status 的属性访问）
         fake_server = type('FakeTCPServer', (), {
@@ -7309,7 +7252,7 @@ class TestPipelineOrchestrationIntegration:
 
         # 在新 scheduler 上运行 init_nodes（避免 sched_master fixture 已初始化）
         s2 = Scheduler()
-        s2._role_override = "master"
+        s2._runtime_settings["NODE_ROLE"] = "master"
         monkeypatch.setattr(s2, "_effective_role", lambda: "master")
         s2._tcp_server = sched_master._tcp_server
         s2.init_nodes()
@@ -7340,31 +7283,33 @@ class TestPipelineOrchestrationIntegration:
 class TestEffectiveRole:
     """测试 _effective_role() 的实现逻辑（非 mock）。"""
 
-    def test_default_role_from_config(self):
-        """默认角色来自 NODE_ROLE 配置。"""
-        s = Scheduler()
-        # 新 Scheduler 未设置 _role_override，直接读 NODE_ROLE
-        role = s._effective_role()
-        assert role in ("master", "client"), \
-            f"有效角色应为 master 或 client，实际: {role}"
+    @pytest.mark.parametrize("configured_role", ["master", "client"])
+    def test_role_from_static_config(self, monkeypatch, configured_role):
+        import scheduler as scheduler_module
 
-    def test_role_override_takes_precedence(self):
-        """_role_override 应优先于 NODE_ROLE。"""
-        s = Scheduler()
-        s._role_override = "client"
-        assert s._effective_role() == "client"
+        monkeypatch.setattr(scheduler_module, "NODE_ROLE", configured_role)
+        sched = Scheduler()
 
-    def test_role_override_empty_falls_through_to_config(self):
-        """空字符串 override 应回退到 NODE_ROLE（falsy 值处理）。"""
-        s = Scheduler()
-        s._role_override = ""
-        role = s._effective_role()
-        # 空字符串为 falsy → or 短路 → NODE_ROLE
-        assert role in ("master", "client")
+        assert sched._effective_role() == configured_role
+
+    @pytest.mark.parametrize(
+        ("configured_role", "legacy_override"),
+        [("master", "client"), ("client", "master"), ("master", ""), ("client", "")],
+    )
+    def test_legacy_override_cannot_change_static_role(
+        self, monkeypatch, configured_role, legacy_override,
+    ):
+        import scheduler as scheduler_module
+
+        monkeypatch.setattr(scheduler_module, "NODE_ROLE", configured_role)
+        sched = Scheduler()
+        sched._role_override = legacy_override
+
+        assert sched._effective_role() == configured_role
 
 
-class TestProvisionalMasterRole:
-    """Fresh packaged nodes can join an existing master without DB access."""
+class TestStaticMasterRole:
+    """Configured masters never become provisional or switch to client."""
 
     @staticmethod
     def _set_master_role(monkeypatch, tmp_path):
@@ -7381,12 +7326,12 @@ class TestProvisionalMasterRole:
         monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
         monkeypatch.delenv("QLH_NODE_ROLE", raising=False)
 
-    def test_local_only_master_is_not_provisional(self, monkeypatch, tmp_path):
-        """本地 SQLite 主节点不因远端数据库退场而降级。"""
+    def test_unverified_master_is_not_provisional(self, monkeypatch, tmp_path):
+        """身份尚未确认不得改变静态主节点配置。"""
         self._set_master_role(monkeypatch, tmp_path)
         sched = Scheduler()
-        sched._master_identity_verified = True
-        sched._master_identity_reason = "db_unavailable"
+        sched._master_identity_verified = False
+        sched._master_identity_reason = "unverified"
 
         role = sched.get_my_role()
 
@@ -7429,9 +7374,13 @@ class TestProvisionalMasterRole:
         sched._tcp_server = MagicMock()
         sched._tcp_server.get_client_ids.return_value = ["client-1"]
 
-        result = sched.activate_client_mode()
+        role = sched.get_my_role()
 
-        assert result["status"] == "denied"
+        assert role["is_master"] is True
+        assert role["is_provisional"] is False
+        assert role["can_join_existing_master"] is False
+        assert sched.can_join_existing_master() is False
+        assert not hasattr(sched, "activate_client_mode")
         assert sched._effective_role() == "master"
 
 
@@ -7451,7 +7400,7 @@ class TestLocalMasterIdentity:
                             lambda: ["AA-BB-CC-DD-EE-FF"], raising=False)
 
         sched = Scheduler()
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._mac_addresses = ["AA-BB-CC-DD-EE-FF"]
 
         sched._verify_master_identity()
@@ -7511,7 +7460,7 @@ class TestMasterIdentityAdvertiseAndReset:
         )
 
         sched = Scheduler()
-        sched._role_override = "master"
+        sched._runtime_settings["NODE_ROLE"] = "master"
         sched._mac_addresses = ["de-ad-be-ef-00-01"]          # 陈旧 / 被污染的缓存
 
         result = sched.reset_master_identity()
@@ -7533,138 +7482,6 @@ class TestMasterIdentityAdvertiseAndReset:
         assert invite["master_host"] == "192.168.1.61"
 
 
-class TestSchedulerHighAvailabilitySQLite:
-    """HA control state stays local, bounded, and restart-safe."""
-
-    @pytest.fixture
-    def scheduler(self, monkeypatch, tmp_path):
-        import local_store
-
-        monkeypatch.setenv("QLH_SQLITE_PATH", str(tmp_path / "control.sqlite3"))
-        monkeypatch.setattr(local_store, "_initialized_paths", set())
-        instance = Scheduler()
-        instance._role_override = "master"
-        return instance
-
-    def test_ha_state_persists_across_scheduler_instances(self, scheduler):
-        scheduler._update_ha_state(
-            spare_master={"node_id": "worker-spare", "hostname": "spare"},
-            spare_master_active=True,
-            pending_new_master_id="worker-next",
-        )
-        scheduler._append_ha_log(
-            "transfer_logs",
-            "promotion",
-            {"transfer_id": "transfer-test"},
-        )
-
-        restored = Scheduler()
-        spare = restored.get_spare_master()
-
-        assert spare == {
-            "node_id": "worker-spare",
-            "hostname": "spare",
-            "is_online": False,
-            "state": "unknown",
-            "is_active": True,
-        }
-        assert restored._ha_state["pending_new_master_id"] == "worker-next"
-        assert restored.get_transfer_logs()[0]["details"] == {
-            "transfer_id": "transfer-test",
-        }
-
-    def test_ha_log_is_bounded_and_rejects_unknown_category(self, scheduler):
-        for index in range(260):
-            scheduler._append_ha_log(
-                "spare_master_logs",
-                "designated",
-                {"sequence": index},
-            )
-
-        restored = Scheduler()
-        logs = restored.get_spare_master_logs()
-
-        assert len(logs) == 256
-        assert logs[0]["details"]["sequence"] == 4
-        assert logs[-1]["details"]["sequence"] == 259
-        with pytest.raises(ValueError, match="unknown HA log category"):
-            scheduler._append_ha_log("unknown", "ignored", {})
-
-    def test_clear_spare_master_is_role_gated_and_persisted(self, scheduler):
-        scheduler._update_ha_state(
-            spare_master={"node_id": "worker-spare"},
-            spare_master_active=True,
-            pending_new_master_id="worker-next",
-        )
-        scheduler._role_override = "client"
-        assert scheduler.clear_spare_master()["status"] == "denied"
-
-        scheduler._role_override = "master"
-        assert scheduler.clear_spare_master()["status"] == "ok"
-
-        restored = Scheduler()
-        assert restored.get_spare_master() is None
-        assert restored._ha_state["pending_new_master_id"] == ""
-        assert restored.get_spare_master_logs()[-1]["direction"] == "undesignated"
-
-    def test_role_transfer_message_persists_promotion_and_acknowledges(
-        self, scheduler,
-    ):
-        sent = []
-
-        class FakeClient:
-            sock = object()
-
-            @staticmethod
-            def send_data(payload, message_type):
-                sent.append((payload, message_type))
-
-        scheduler._tcp_client = FakeClient()
-        scheduler._handle_role_transfer("old-master", {"data": {
-            "transfer_id": "transfer-promote",
-            "old_master_id": "old-master",
-            "new_master_id": "new-master",
-            "spare_master": {"node_id": "worker-spare"},
-        }})
-
-        assert sent[0][0]["transfer_id"] == "transfer-promote"
-        assert sent[0][0]["ack"]["accepted"] is True
-        assert scheduler._ha_state["spare_master_active"] is True
-        assert scheduler._ha_state["pending_new_master_id"] == "new-master"
-        assert scheduler.get_transfer_logs()[-1]["direction"] == "promotion"
-
-    def test_startup_deactivation_notifies_spare_and_clears_state(
-        self, scheduler, monkeypatch,
-    ):
-        import scheduler as scheduler_module
-
-        sent = []
-
-        class FakeServer:
-            _running = True
-
-            @staticmethod
-            def get_client_ids():
-                return ["worker-spare"]
-
-            @staticmethod
-            def send_to_client(node_id, payload, message_type):
-                sent.append((node_id, payload, message_type))
-
-        monkeypatch.setitem(scheduler._runtime_settings, "NODE_ID", "worker-next")
-        scheduler._tcp_server = FakeServer()
-        scheduler._update_ha_state(
-            spare_master={"node_id": "worker-spare"},
-            spare_master_active=True,
-            pending_new_master_id="worker-next",
-        )
-
-        scheduler.deactivate_spare_master_on_startup()
-
-        assert sent[0][0] == "worker-spare"
-        assert sent[0][1]["new_master_id"] == "worker-next"
-        assert scheduler._ha_state["spare_master_active"] is False
-        assert scheduler._ha_state["pending_new_master_id"] == ""
 
 
 # ================================================================
@@ -7741,7 +7558,7 @@ class TestForwardInferenceRequestId:
         import scheduler as scheduler_mod
 
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client")
 
         class FakeClient:
@@ -7772,7 +7589,7 @@ class TestForwardInferenceRequestId:
         import scheduler as scheduler_mod
 
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client")
         sent = []
 
@@ -7794,7 +7611,7 @@ class TestForwardInferenceRequestId:
         import scheduler as scheduler_mod
 
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client")
         sent = []
 
@@ -8039,7 +7856,7 @@ class TestConnectToMasterBootstrapRecovery:
         monkeypatch.delenv("QLH_MASTER_API_PORT", raising=False)
 
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
 
         first_connect_calls = []
 
@@ -8099,7 +7916,7 @@ class TestConnectToMasterBootstrapRecovery:
 
     def test_existing_registered_connection_is_reused(self):
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         existing = MagicMock()
         existing._running = True
         existing.is_registered = True
@@ -8151,7 +7968,7 @@ class TestConnectToMasterBootstrapRecovery:
                 self.disconnect_calls += 1
 
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         previous_callback = object()
         existing = MagicMock()
         existing._running = True
@@ -8220,7 +8037,7 @@ class TestConnectToMasterBootstrapRecovery:
                 pass
 
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
 
         def observe(_client_id, _msg):
             active_client = cast(Any, sched._tcp_client)
@@ -8247,7 +8064,7 @@ class TestConnectToMasterBootstrapRecovery:
         monkeypatch.setattr(scheduler_mod, "NODE_ID", "client-profile", raising=False)
         sent = []
         sched = Scheduler()
-        sched._role_override = "client"
+        sched._runtime_settings["NODE_ROLE"] = "client"
         sched._local_device_profile = None
 
         class FakeTCPClient:
@@ -8308,8 +8125,6 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         "_verify_master_identity",
         lambda: setattr(sched, "_master_identity_reason", "first_run"),
     )
-    monkeypatch.setattr(sched, "deactivate_spare_master_on_startup", lambda: None)
-    monkeypatch.setattr(sched, "can_join_existing_master", lambda: False)
 
     try:
         sched.start(host="0.0.0.0", port=8888)
@@ -8383,8 +8198,6 @@ def test_distributed_start_defers_network_identity(monkeypatch):
 
     sched = Scheduler()
     monkeypatch.setattr(sched, "init_nodes", lambda: None)
-    monkeypatch.setattr(sched, "deactivate_spare_master_on_startup", lambda: None)
-    monkeypatch.setattr(sched, "can_join_existing_master", lambda: False)
 
     start_done = threading.Event()
     errors = []
@@ -8487,53 +8300,7 @@ class TestSchedulerStartupDecisions:
             "source": "none",
         }
 
-    def test_auto_switch_wait_is_cancellable_and_activates_after_ready(
-            self, monkeypatch):
-        sched = Scheduler()
-        wait = _ImmediateStartupWait()
-        monkeypatch.setattr(sched, "_startup_cancel_event", wait)
-        activated = []
-        monkeypatch.setattr(
-            sched,
-            "activate_client_mode",
-            lambda host, port: activated.append((host, port)) or {"message": "ok"},
-        )
 
-        sched._auto_switch_to_client("100.64.0.10", 8888)
-        assert activated == [("100.64.0.10", 8888)]
-        assert wait.timeouts == [2]
-
-        activated.clear()
-        wait.cancelled = True
-        sched._auto_switch_to_client("100.64.0.11", 8889)
-        assert activated == []
-
-    def test_auto_join_requires_running_joinable_node_and_discovered_master(
-            self, monkeypatch):
-        sched = Scheduler()
-        wait = _ImmediateStartupWait()
-        monkeypatch.setattr(sched, "_startup_cancel_event", wait)
-        sched._running = True
-        monkeypatch.setattr(sched, "can_join_existing_master", lambda: True)
-        monkeypatch.setattr(
-            sched,
-            "discover_master",
-            lambda: {"found": True, "master_host": "100.64.0.12", "master_port": 8890},
-        )
-        activated = []
-        monkeypatch.setattr(
-            sched,
-            "activate_client_mode",
-            lambda host, port: activated.append((host, port)),
-        )
-
-        sched._auto_join_tailnet_master_on_startup()
-        assert activated == [("100.64.0.12", 8890)]
-
-        activated.clear()
-        sched._running = False
-        sched._auto_join_tailnet_master_on_startup()
-        assert activated == []
 
     def test_auto_connect_retries_tailnet_discovery_after_config_failure(
             self, monkeypatch):

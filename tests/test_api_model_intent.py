@@ -54,21 +54,54 @@ def test_untrusted_source_is_blocked_before_intent_work(api, path, method):
     assert fake.create.await_count == 0
 
 
-def test_worker_catalog_preserves_master_auth_error_response(api, monkeypatch):
+def test_worker_catalog_preserves_master_failure_response(api, monkeypatch):
     server, routes, _ = api
     monkeypatch.setattr(server.scheduler, "_effective_role", lambda: "client")
-    monkeypatch.setattr(routes, "forward_intent", AsyncMock(return_value=Response(content='{"detail":{"code":"auth_required"}}', status_code=401, media_type="application/json")))
+    monkeypatch.setattr(routes, "forward_intent", AsyncMock(return_value=Response(content='{"detail":{"code":"master_unavailable"}}', status_code=503, media_type="application/json")))
     response = TestClient(server.app).get("/api/models/intent/catalog")
-    assert response.status_code == 401 and response.json()["detail"]["code"] == "auth_required"
+    assert response.status_code == 503 and response.json()["detail"]["code"] == "master_unavailable"
 
 
-def test_master_intent_write_is_a_control_fence_action_but_worker_relay_is_not(api, monkeypatch):
-    server, _, _ = api
-    from starlette.requests import Request
-    request = Request({"type": "http", "method": "POST", "path": "/api/models/intent", "headers": []})
-    assert server._is_control_write_path(request)
-    monkeypatch.setattr(server.scheduler, "_effective_role", lambda: "client")
-    assert not server._is_control_write_path(request)
+def test_static_master_intent_connect_does_not_discover_or_switch_roles(registered_api, monkeypatch):
+    owner = registered_api
+    monkeypatch.setattr(
+        owner.server.scheduler,
+        "discover_master",
+        lambda: pytest.fail("a static master cannot discover a replacement master"),
+    )
+
+    response = TestClient(owner.server.app, client=("127.0.0.1", 50000)).post(
+        "/api/models/intent/connect",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "INTENT_STATIC_MASTER"
+
+
+def test_static_client_intent_connect_uses_discovery_without_role_switch(registered_api, monkeypatch):
+    from api import routes_cluster
+
+    owner = registered_api
+    monkeypatch.setattr(owner.server.scheduler, "_effective_role", lambda: "client")
+    bindings = iter(({"status": "disconnected"}, {"status": "connected"}))
+    monkeypatch.setattr(owner.routes, "get_binding", lambda *_: next(bindings))
+    monkeypatch.setattr(
+        owner.server.scheduler,
+        "discover_master",
+        lambda: {"found": True, "master_host": "100.64.1.2", "master_port": 18888},
+    )
+    connect = AsyncMock(return_value={"status": "connected"})
+    monkeypatch.setattr(routes_cluster, "connect_to_master", connect)
+
+    response = TestClient(owner.server.app, client=("127.0.0.1", 50000)).post(
+        "/api/models/intent/connect",
+    )
+
+    assert response.status_code == 200
+    request = connect.await_args.args[0]
+    assert request.master_host == "100.64.1.2"
+    assert request.master_port == 18888
+    assert not hasattr(request, "switch_to_client")
 
 
 def test_unknown_operations_do_not_fall_through_to_catalog(api):
@@ -83,12 +116,9 @@ def test_unknown_operations_do_not_fall_through_to_catalog(api):
 def registered_api(api, monkeypatch):
     """Publish a real HMAC/ACK TCP registration without opening a socket."""
     import tcp_comm
-    from cluster_fence import ControlFence
 
     server, routes, fake = api
     monkeypatch.delenv("QLH_MODEL_API_TRUSTED_CIDRS", raising=False)
-    monkeypatch.setattr(server.auth_service, "auth_required", lambda: False)
-    monkeypatch.setattr(server, "control_fence", ControlFence(required=False))
     monkeypatch.setattr(tcp_comm, "_get_cluster_secret", lambda: "intent-api-bootstrap-credential-32")
     monkeypatch.setattr(tcp_comm, "_get_cluster_secret_epoch", lambda: 3)
     tcp_server = tcp_comm.TCPServer(host="100.64.1.2", port=18888)
@@ -150,73 +180,38 @@ def test_new_source_admission_keeps_intent_schema_path_free(registered_api, fiel
     assert owner.coordinator.create.await_count == 0
 
 
-def test_registered_intent_source_still_requires_bearer(registered_api):
+def test_registered_intent_source_does_not_require_account_bearer(registered_api):
     owner = registered_api
-    owner.monkeypatch.setattr(owner.server.auth_service, "auth_required", lambda: True)
-    owner.monkeypatch.setattr(owner.server.auth_service, "resolve_bearer",
-                              lambda value: object() if value == "Bearer valid-session" else None)
+    owner.monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
     client = TestClient(owner.server.app, client=(owner.peer, 50000))
-    for headers in ({}, {"X-QLH-Intent-Hop": "1"}, {"Authorization": "Bearer invalid"}):
-        result = client.post("/api/models/intent", json={"model_id": "fixture"}, headers=headers)
-        assert result.status_code == 401 and result.json()["detail"]["code"] == "auth_required"
-    assert owner.coordinator.create.await_count == 0
-    assert client.post("/api/models/intent", json={"model_id": "fixture"},
-                       headers={"Authorization": "Bearer valid-session"}).status_code == 200
+    result = client.post("/api/models/intent", json={"model_id": "fixture"},
+                         headers={"Authorization": "Bearer invalid"})
+    assert result.status_code == 200
     assert owner.coordinator.create.await_count == 1
-
-
-def test_registered_intent_write_keeps_real_control_certificate_validation(registered_api):
-    import base64
-    import time
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-    from cluster_control_contract import ControlPlaneAuthority, VoterIdentity, VoterSet, QuorumCertificate, sign_certificate
-    from cluster_fence import ControlFence, encode_certificate_header
-
-    owner = registered_api
-    key = Ed25519PrivateKey.generate()
-    public = base64.urlsafe_b64encode(key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode().rstrip("=")
-    voters = VoterSet(cluster_id="intent-source-test", voter_set_epoch=1,
-                      voters=[VoterIdentity(voter_id="master", public_key=public)])
-    unsigned = QuorumCertificate(cluster_id=voters.cluster_id, voter_set_epoch=1, term=1, leader_id="master",
-                                 lease_id="intent-lease", expires_at_ms=int(time.time() * 1000) + 60000, signatures=())
-    certificate = unsigned.with_signatures((sign_certificate(unsigned, voter_id="master", private_key=key),))
-    fence = ControlFence(ControlPlaneAuthority(cluster_id=voters.cluster_id, voter_set=voters), required=True)
-    fence.install_certificate(certificate)
-    owner.monkeypatch.setattr(owner.server, "control_fence", fence)
-    client = TestClient(owner.server.app, client=(owner.peer, 50000))
-    missing = client.post("/api/models/intent", json={"model_id": "fixture"}, headers={"X-QLH-Intent-Hop": "1"})
-    assert missing.status_code == 409 and missing.json()["detail"]["code"] == "control_certificate_missing"
-    invalid = client.post("/api/models/intent", json={"model_id": "fixture"},
-                          headers={"X-QLH-Control-Certificate": "forged"})
-    assert invalid.status_code == 409 and invalid.json()["detail"]["code"] == "control_certificate_invalid"
-    assert owner.coordinator.create.await_count == 0
-    admitted = client.post("/api/models/intent", json={"model_id": "fixture"},
-                           headers={"X-QLH-Control-Certificate": encode_certificate_header(certificate)})
-    assert admitted.status_code == 200 and owner.coordinator.create.await_count == 1
-    assert fence.current_permit() is None
 
 
 @pytest.mark.parametrize("change", ["remove", "replace", "stop", "unconfirm"])
 def test_reconnect_between_middleware_and_handler_cannot_invoke_intent(registered_api, change):
     from copy import copy
     owner = registered_api
-    owner.monkeypatch.setattr(owner.server.auth_service, "auth_required", lambda: True)
+    original_gate = owner.server.require_model_intent_source
 
-    def resolve(_authorization):
+    def admit_then_replace(request, scheduler):
+        original_gate(request, scheduler)
         if change == "remove":
             owner.tcp.clients.clear()
         elif change == "replace":
             owner.tcp.clients[owner.node_id] = copy(owner.tcp.clients[owner.node_id])
         elif change == "stop":
             owner.tcp._running = False
-        elif change == "unconfirm":
+        else:
             owner.tcp.clients[owner.node_id].registration_confirmed = False
-        return object()
-    owner.monkeypatch.setattr(owner.server.auth_service, "resolve_bearer", resolve)
-    value = TestClient(owner.server.app, client=(owner.peer, 50000)).post(
-        "/api/models/intent", json={"model_id": "fixture"}, headers={"Authorization": "Bearer valid"})
-    assert value.status_code == 403 and value.json()["detail"]["code"] == "MODEL_API_SOURCE_UNTRUSTED"
+
+    owner.monkeypatch.setattr(owner.server, "require_model_intent_source", admit_then_replace)
+    response = TestClient(owner.server.app, client=(owner.peer, 50000)).post(
+        "/api/models/intent", json={"model_id": "fixture"})
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "MODEL_API_SOURCE_UNTRUSTED"
     assert owner.coordinator.create.await_count == 0
 
 

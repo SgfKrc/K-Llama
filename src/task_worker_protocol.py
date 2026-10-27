@@ -1377,19 +1377,13 @@ def _validate_payload(
                 )
 
 
-def binary_hidden_frame_bytes(
-    message: Mapping[str, Any], raw_bytes: int, *,
-    control_certificate: Mapping[str, Any] | None = None,
-) -> int:
+def binary_hidden_frame_bytes(message: Mapping[str, Any], raw_bytes: int) -> int:
     """Exact TCP binary frame budget, excluding the first metadata length header.
 
     Match tcp_comm.build_message's default json.dumps encoding, including spaces
     and ASCII escaping. Canonical inner JSON is smaller and is not a wire budget.
-    Callers can include the certificate that TCP appends before serializing data.
     """
     data = dict(message)
-    if control_certificate is not None and "control_certificate" not in data:
-        data["control_certificate"] = dict(control_certificate)
     meta = {
         "type": "task_worker", "format": "binary",
         "binary_bytes": raw_bytes, "data": data,
