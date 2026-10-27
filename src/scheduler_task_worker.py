@@ -629,54 +629,37 @@ class SchedulerTaskWorkerMixin:
         except (ImportError, OSError, ValueError):
             return False
 
-    def _task_worker_local_full_layers(self) -> int | None:
-        """Layer count of the installed *complete* local GGUF source, if any.
-
-        A node holding a whole GGUF can host any contiguous range, so it may join
-        the layer pool without a pre-cut segment. Only cheap header reads are
-        used (`verify_hashes=False`); nothing is hashed on this path.
-        """
+    def _task_worker_local_full_source(self) -> dict | None:
+        """Return metadata and size for one inventory-visible complete GGUF."""
         try:
-            from pathlib import Path
-            from local_model_assets import discover_local_model_assets, _app_root
+            from model_supply_worker import local_gguf_source_candidates
             from relay_segment_info import read_gguf_layer_info
-            root = Path(_app_root())
-            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
-                relative = asset.get("gguf_path")
-                if not isinstance(relative, str) or not relative:
-                    continue
-                path = (root / relative).resolve()
-                if not path.is_file():
-                    continue
+            worker = getattr(self, "_model_supply_worker", None)
+            candidates = worker._source_candidates() if worker is not None else local_gguf_source_candidates()
+            for _source_id, path in candidates:
                 info = read_gguf_layer_info(path) or {}
                 total = info.get("n_layer")
                 if isinstance(total, int) and total > 0:
-                    return total
+                    return {"source_model_id": _source_id, "path": path,
+                            "total_layers": total, "size_bytes": int(path.stat().st_size)}
         except Exception:
             logger.debug("local full GGUF source probe failed", exc_info=True)
         return None
+
+    def _task_worker_local_full_layers(self) -> int | None:
+        """Layer count of the installed complete local GGUF source, if any."""
+        source = self._task_worker_local_full_source()
+        return source["total_layers"] if source is not None else None
 
     def _task_worker_local_full_source_available(self) -> bool:
         return self._task_worker_local_full_layers() is not None
 
     def _task_worker_local_full_source_bytes(self) -> int:
         """Size of the installed complete local GGUF source, 0 when absent."""
-        try:
-            from pathlib import Path
-            from local_model_assets import discover_local_model_assets, _app_root
-            root = Path(_app_root())
-            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
-                relative = asset.get("gguf_path")
-                if not isinstance(relative, str) or not relative:
-                    continue
-                path = (root / relative).resolve()
-                if path.is_file():
-                    return int(path.stat().st_size)
-        except Exception:
-            logger.debug("local full GGUF size probe failed", exc_info=True)
-        return 0
+        source = self._task_worker_local_full_source()
+        return source["size_bytes"] if source is not None else 0
 
-    def _task_worker_local_cut_layer_budget(self) -> dict | None:
+    def _task_worker_local_cut_layer_budget(self, source: dict | None = None) -> dict | None:
         """Device-advertised layer budget, mirroring Android's computeLayerBudget.
 
         `layer_ranges=[[0, total]]` says "I can take any range" but **not** how many
@@ -685,10 +668,11 @@ class SchedulerTaskWorkerMixin:
         11.4GB、缺口 5.65GB，`waiting_nodes` 因此每 20~30 秒重算一次（白烧 4 分钟），
         而空闲 9.6GB 的 android 反而一个层段都拿不到。
         """
-        total = self._task_worker_local_full_layers()
-        size = self._task_worker_local_full_source_bytes()
-        if not total or not size:
+        if source is None:
+            source = self._task_worker_local_full_source()
+        if source is None:
             return None
+        total, size = source["total_layers"], source["size_bytes"]
         try:
             import psutil
 
@@ -742,14 +726,15 @@ class SchedulerTaskWorkerMixin:
         # `QLH_LOCAL_CUT_SELF=0` 可显式关闭自裁广告（测试默认关闭：该判据要探测
         # 本地完整 GGUF 源，而开发机 `models/` 里就有整模，否则每个用例都会被
         # 误判成自裁节点）。生产侧默认开启，无需配置。
-        local_cut_only = bool(
+        can_probe_local_cut = bool(
             not host_has_model
             and not os.environ.get("QLH_LAYER_GGUF", "").strip()
             and os.environ.get("QLH_LOCAL_CUT_SELF", "1").strip().lower()
             not in {"0", "false", "no", "off"}
             and self._task_worker_local_cut_available()
-            and self._task_worker_local_full_source_available()
         )
+        local_full_source = self._task_worker_local_full_source() if can_probe_local_cut else None
+        local_cut_only = can_probe_local_cut and local_full_source is not None
         layer_worker = bool(
             active_layer_config
             or getattr(self._host, "layer_range", None)
@@ -775,7 +760,7 @@ class SchedulerTaskWorkerMixin:
             # ★ 持整模 + 能自裁 ⇒ 声明整域 [0, total)，让容量求解按能力自由分配，
             #   而不是被某个历史段绑死。已注册的段仍作为可复用工件存在，但**分发
             #   契约**以"能承担任意连续层段"为准（否则早期乱切的段会永久固化布局）。
-            total = self._task_worker_local_full_layers()
+            total = local_full_source["total_layers"]
             if total:
                 layer_ranges.append([0, int(total)])
             layer_worker = True
@@ -844,7 +829,7 @@ class SchedulerTaskWorkerMixin:
         if not stage_types:
             stage_types = ["aggregate"]
         local_cut_budget = (
-            self._task_worker_local_cut_layer_budget() if local_cut_only else None
+            self._task_worker_local_cut_layer_budget(local_full_source) if local_cut_only else None
         )
         capabilities = {
             "engine_capabilities": engine_schema,

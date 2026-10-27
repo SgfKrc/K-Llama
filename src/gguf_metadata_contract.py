@@ -9,8 +9,12 @@ from __future__ import annotations
 import math
 import mmap
 import struct
+from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
+import threading
 from typing import Any, Mapping
+import weakref
 
 GGUF_METADATA_KEYS = (
     "architecture", "block_count", "head_count_kv", "key_length",
@@ -25,6 +29,19 @@ _CONTRACT_SUFFIXES = (
     ".attention.key_length", ".full_attention_interval", ".embedding_length",
     ".nextn_predict_layers",
 )
+_HEADER_CACHE_LIMIT = 32
+_HEADER_CACHE = OrderedDict()
+_HEADER_CACHE_LOCK = threading.RLock()
+_HEADER_FILE_LOCKS = weakref.WeakValueDictionary()
+
+
+def _header_file_lock(key):
+    with _HEADER_CACHE_LOCK:
+        lock = _HEADER_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _HEADER_FILE_LOCKS[key] = lock
+        return lock
 
 
 def _invalid(message: str) -> None:
@@ -32,11 +49,26 @@ def _invalid(message: str) -> None:
 
 
 def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple[dict, dict[str, tuple[int, int, tuple, int]]]:
-    from model_supply_digest_cache import cached_metadata
+    from model_supply_digest_cache import cached_metadata, file_stamp
 
     def inspect(source):
-        metadata, tensors = _read_gguf_header(source, include_tensors=include_tensors)
-        return {"metadata": metadata, "tensors": tensors}
+        before = file_stamp(source)
+        key = ("gguf-header-v2", include_tensors, before)
+        with _header_file_lock(key):
+            with _HEADER_CACHE_LOCK:
+                cached = _HEADER_CACHE.get(key)
+                if cached is not None:
+                    _HEADER_CACHE.move_to_end(key)
+            if cached is None:
+                metadata, tensors = _read_gguf_header(source, include_tensors=include_tensors)
+                if before != file_stamp(source):
+                    _invalid("GGUF changed during header read")
+                cached = {"metadata": metadata, "tensors": tensors}
+                with _HEADER_CACHE_LOCK:
+                    _HEADER_CACHE[key] = deepcopy(cached)
+                    while len(_HEADER_CACHE) > _HEADER_CACHE_LIMIT:
+                        _HEADER_CACHE.popitem(last=False)
+            return deepcopy(cached)
 
     result = cached_metadata(path, "gguf-header-v1-" + str(include_tensors), inspect)
     tensors = {name: (entry[0], entry[1], tuple(entry[2]), entry[3])

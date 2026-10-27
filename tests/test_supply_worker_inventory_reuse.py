@@ -102,6 +102,26 @@ def test_shared_digest_uses_one_store_across_worker_roots(tmp_path, monkeypatch)
     assert list(json.loads(cache.read_text())["entries"]) == [str(source.resolve())]
 
 
+def test_tokenizer_metadata_cache_crosses_verified_hardlink(tmp_path, monkeypatch):
+    source = gguf(tmp_path / "source.gguf", 4)
+    expected = relay_segment_info.read_gguf_tokenizer_sha256(source)
+    source_stamp = digests.file_stamp(source)
+    source_digest = digests.cached_sha256(source)
+    alias = tmp_path / "alias.gguf"
+    try:
+        os.link(source, alias)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    assert digests.remember_hardlink_sha256(source, alias, source_digest, source_stamp)
+    relay_segment_info._GGUF_HEADER_CACHE.clear()
+    monkeypatch.setattr(
+        relay_segment_info, "_gguf_header",
+        lambda *_args: pytest.fail("verified hardlink reparsed tokenizer metadata"),
+    )
+
+    assert relay_segment_info.read_gguf_tokenizer_sha256(alias) == expected
+
+
 def test_digest_rejects_same_size_mtime_restored_change(tmp_path):
     source = gguf(tmp_path / "source.gguf")
     old = digests.cached_sha256(source)
@@ -316,6 +336,7 @@ def test_inventory_reuses_metadata_for_aliases_rounds_and_restart(setup, tmp_pat
                         recording("tokenizer", relay_segment_info.read_gguf_tokenizer_sha256))
     first = worker.inventory()["sources"]
     assert len(first) == 2
+    assert {item["total_layers"] for item in first} == {4}
     assert worker.inventory()["sources"] == first
     digests._STORES.clear()
     original_open = Path.open

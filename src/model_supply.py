@@ -79,6 +79,42 @@ def reuse_artifact_matches(artifact: Any, manifest: dict) -> bool:
     )
 
 
+def inventory_local_cut_budget(inventory: dict, sources: dict) -> dict | None:
+    """Calculate a cut budget from the exact GGUF source selected for this supply."""
+    if not inventory.get("local_cut"):
+        return None
+    source_sha = sources.get("source_model_sha256")
+    tokenizer_sha = sources.get("tokenizer_sha256")
+    descriptor = (sources.get("descriptors") or {}).get("llama_cpp") or {}
+    total_layers = descriptor.get("total_layers")
+    if (not isinstance(source_sha, str) or not isinstance(tokenizer_sha, str)
+            or type(total_layers) is not int or total_layers <= 0):
+        return None
+    inventory_sources = inventory.get("sources")
+    if not isinstance(inventory_sources, list):
+        return None
+    source = next((item for item in inventory_sources
+                   if isinstance(item, dict)
+                   and item.get("source_model_sha256") == source_sha
+                   and item.get("tokenizer_sha256") == tokenizer_sha
+                   and (item.get("total_layers") is None
+                        or (type(item.get("total_layers")) is int
+                            and item.get("total_layers") == total_layers))), None)
+    if source is None:
+        return None
+    size_bytes = source.get("size_bytes")
+    available = inventory.get("memory_available_bytes")
+    if type(size_bytes) is not int or size_bytes <= 0 or type(available) is not int or available <= 0:
+        return None
+    per_layer_bytes = size_bytes // total_layers
+    available_bytes = int(available * 0.6)
+    max_layers = available_bytes // per_layer_bytes if per_layer_bytes > 0 else 0
+    if max_layers <= 0:
+        return None
+    return {"available_bytes": available_bytes, "per_layer_bytes": per_layer_bytes,
+            "max_layers": max_layers, "local_cut": True}
+
+
 class ModelSupplyError(ValueError):
     def __init__(self, code: str, message: str, *, diagnostic: dict | None = None):
         super().__init__(message)
@@ -1328,6 +1364,17 @@ class ModelSupplyCoordinator:
                     "pytorch" if "pytorch" in engines and "pytorch" in sources["descriptors"] else "")
                 if not engine:
                     raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No compatible source for {node_id}")
+                source_layer_budget = (
+                    inventory_local_cut_budget(inventory, sources)
+                    if engine == "llama_cpp" else None
+                )
+                advertised_budget = base.get("layer_budget")
+                if source_layer_budget is not None:
+                    base["layer_budget"] = source_layer_budget
+                elif isinstance(advertised_budget, dict) and advertised_budget.get("local_cut") is True:
+                    # A generic HELLO budget may describe another installed GGUF.
+                    # Only this operation's inventory proves the selected source.
+                    base.pop("layer_budget", None)
                 if engine == "llama_cpp":
                     # ★ 2026-10-23（#117）：**自裁节点按原生量化宽度物化**。GGUF 段是
                     #   从整模按原生 Q4_K_M 直接切出来的，worker 侧没有 fp16→fp32 的

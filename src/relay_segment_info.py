@@ -23,6 +23,7 @@ import json
 import os
 import struct
 import threading
+import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -86,6 +87,7 @@ _MAX_GGUF_STRING_BYTES = 64 * 1024 * 1024
 
 _GGUF_HEADER_CACHE = OrderedDict()
 _GGUF_HEADER_LOCK = threading.RLock()
+_GGUF_READER_LOCKS = weakref.WeakValueDictionary()
 
 
 def _gguf_version(path):
@@ -103,15 +105,34 @@ def _cached_gguf_reader(reader):
                 if key in _GGUF_HEADER_CACHE:
                     _GGUF_HEADER_CACHE.move_to_end(key)
                     return deepcopy(_GGUF_HEADER_CACHE[key])
-                result = reader(path)
-                if version != _gguf_version(path):
-                    return None
+                lock = _GGUF_READER_LOCKS.get(key)
+                if lock is None:
+                    lock = threading.RLock()
+                    _GGUF_READER_LOCKS[key] = lock
+            with lock:
+                with _GGUF_HEADER_LOCK:
+                    if key in _GGUF_HEADER_CACHE:
+                        _GGUF_HEADER_CACHE.move_to_end(key)
+                        return deepcopy(_GGUF_HEADER_CACHE[key])
+                if reader.__name__ in {"read_gguf_layer_info", "read_gguf_tokenizer_sha256"}:
+                    from model_supply_digest_cache import cached_metadata
+
+                    namespace = "relay-gguf-reader-v2-" + reader.__name__
+                    result = cached_metadata(
+                        path, namespace,
+                        lambda source: {"value": reader(source)},
+                    )["value"]
+                else:
+                    result = reader(path)
+                    if version != _gguf_version(path):
+                        return None
                 if result is not None:
-                    _GGUF_HEADER_CACHE[key] = deepcopy(result)
-                    while len(_GGUF_HEADER_CACHE) > 128:
-                        _GGUF_HEADER_CACHE.popitem(last=False)
-                return result
-        except OSError:
+                    with _GGUF_HEADER_LOCK:
+                        _GGUF_HEADER_CACHE[key] = deepcopy(result)
+                        while len(_GGUF_HEADER_CACHE) > 128:
+                            _GGUF_HEADER_CACHE.popitem(last=False)
+                return deepcopy(result)
+        except (OSError, ValueError):
             return None
     return read
 

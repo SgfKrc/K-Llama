@@ -53,6 +53,48 @@ class SupplyError(ValueError):
         super().__init__(code)
 
 
+def _registered_gguf_source_candidates():
+    """Yield trusted registry and discovery paths before file qualification."""
+    from model_config import get_builtin_models, resolve_model_path
+    from local_model_assets import discover_local_model_assets, _app_root
+    import local_store
+
+    seen = set()
+    for row in local_store.get_local_experimental_models():
+        source_id, configured = row.get("model_id"), row.get("gguf_path")
+        if isinstance(source_id, str) and _ID.fullmatch(source_id) and isinstance(configured, str) and configured:
+            path = Path(resolve_model_path(configured)).resolve()
+            if (source_id, path) not in seen:
+                seen.add((source_id, path))
+                yield source_id, path
+    for model in get_builtin_models():
+        if getattr(model, "gguf_path", ""):
+            path = Path(resolve_model_path(model.gguf_path)).resolve()
+            if (model.model_id, path) not in seen:
+                seen.add((model.model_id, path))
+                yield model.model_id, path
+    app_root = _app_root()
+    for asset in discover_local_model_assets(verify_hashes=False)["assets"]:
+        if asset.get("gguf_path"):
+            path = (app_root / asset["gguf_path"]).resolve()
+            if (asset["model_id"], path) not in seen:
+                seen.add((asset["model_id"], path))
+                yield asset["model_id"], path
+
+
+def local_gguf_source_candidates():
+    """Yield complete trusted GGUF sources shared by inventory and capacity."""
+    for source_id, path in _registered_gguf_source_candidates():
+        try:
+            if (not path.is_file() or path.suffix.lower() != ".gguf"
+                    or path.with_suffix(".manifest.json").exists()
+                    or path.with_suffix(path.suffix + ".manifest.json").exists()):
+                continue
+            yield source_id, path.resolve(strict=True)
+        except OSError:
+            continue
+
+
 def _default_root() -> Path:
     from config import STATE_DIR
     return Path(STATE_DIR) / "model-supply" / "received"
@@ -550,32 +592,7 @@ class ModelSupplyWorker:
 
     def _source_candidates(self):
         """Trusted local registry/discovery only; no request-supplied paths."""
-        from model_config import get_builtin_models, resolve_model_path
-        from local_model_assets import discover_local_model_assets, _app_root
-        import local_store
-        rows = local_store.get_local_experimental_models()
-        seen = set()
-        # Local user registrations can override a builtin's source location.
-        for row in rows:
-            source_id, configured = row.get("model_id"), row.get("gguf_path")
-            if isinstance(source_id, str) and _ID.fullmatch(source_id) and isinstance(configured, str) and configured:
-                path = Path(resolve_model_path(configured)).resolve()
-                if (source_id, path) not in seen:
-                    seen.add((source_id, path))
-                    yield source_id, path
-        for model in get_builtin_models():
-            if getattr(model, "gguf_path", ""):
-                path = Path(resolve_model_path(model.gguf_path)).resolve()
-                if (model.model_id, path) not in seen:
-                    seen.add((model.model_id, path))
-                    yield model.model_id, path
-        app_root = _app_root()
-        for asset in discover_local_model_assets(verify_hashes=False)["assets"]:
-            if asset.get("gguf_path"):
-                path = (app_root / asset["gguf_path"]).resolve()
-                if (asset["model_id"], path) not in seen:
-                    seen.add((asset["model_id"], path))
-                    yield asset["model_id"], path
+        yield from local_gguf_source_candidates()
 
     def inventory(self, model_id: str | None = None) -> dict:
         """Verify selected sources; an empty ID samples resources without discovery."""
@@ -622,10 +639,11 @@ class ModelSupplyWorker:
                     path = path.resolve(strict=True)
                     if path not in details:
                         details[path] = _source_details_cached(self.root, path)
-                    _, tokenizer, digest, size = details[path]
+                    layer_info, tokenizer, digest, size = details[path]
                     verified[(source_id, digest, tokenizer)] = path
                     sources.append({"source_model_id": source_id, "source_model_sha256": digest,
-                                    "tokenizer_sha256": tokenizer, "size_bytes": size})
+                                    "tokenizer_sha256": tokenizer, "size_bytes": size,
+                                    "total_layers": layer_info["n_layer"]})
                 except (OSError, ValueError):
                     continue
             if model_id != "":

@@ -339,6 +339,10 @@ def test_layer_budget_supersedes_fixed_layer_ranges():
             {
                 **node("worker-a", 500),
                 "layer_ranges": [[0, 1]],
+                "layer_artifacts": [{
+                    "layer_range": [0, 1], "segment_mode": "head",
+                    "model_id": "stale-cache.gguf", "artifact_sha256": "b" * 64,
+                }],
                 "layer_budget": {
                     "available_bytes": 500 * MIB,
                     "per_layer_bytes": 100 * MIB,

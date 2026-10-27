@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from model_supply import ModelSupplyCoordinator, ModelSupplyError, plan_segment_supply
+from model_supply import (ModelSupplyCoordinator, ModelSupplyError,
+                          inventory_local_cut_budget, plan_segment_supply)
 from task_worker_adapter import TaskWorkerControlPlane
 
 
@@ -19,6 +20,36 @@ def descriptor(layers=8, layer_bytes=10, components=4):
             "layer_weight_bytes": [layer_bytes] * layers,
             "component_weight_bytes": {"embedding": components, "final_norm": components,
                                        "lm_head": components, "other": 0}}
+
+
+def test_inventory_local_cut_budget_matches_selected_source_identity():
+    inventory = {
+        "local_cut": True,
+        "memory_available_bytes": 10_000,
+        "sources": [
+            {"source_model_sha256": "c" * 64, "tokenizer_sha256": "d" * 64,
+             "size_bytes": 600, "total_layers": 2},
+            {"source_model_sha256": "a" * 64, "tokenizer_sha256": "b" * 64,
+             "size_bytes": 6_000, "total_layers": 6},
+        ],
+    }
+    selected = {"source_model_sha256": "a" * 64, "tokenizer_sha256": "b" * 64,
+                "descriptors": {"llama_cpp": {"total_layers": 6}}}
+    assert inventory_local_cut_budget(inventory, selected) == {
+        "available_bytes": 6_000, "per_layer_bytes": 1_000,
+        "max_layers": 6, "local_cut": True,
+    }
+    android_inventory = copy.deepcopy(inventory)
+    for item in android_inventory["sources"]:
+        item.pop("total_layers")
+    assert inventory_local_cut_budget(android_inventory, selected) == {
+        "available_bytes": 6_000, "per_layer_bytes": 1_000,
+        "max_layers": 6, "local_cut": True,
+    }
+    assert inventory_local_cut_budget(inventory, {
+        **selected, "source_model_sha256": "e" * 64,
+    }) is None
+    assert inventory_local_cut_budget({**inventory, "local_cut": False}, selected) is None
 
 
 def node(node_id, capacity=80):
@@ -956,6 +987,7 @@ def startup_pool_case(tmp_path, monkeypatch):
         build_calls=[], capacity_pools=[], inventory_hooks={}, blocked_inventory=set(),
         source_entered=threading.Event(), release_source=threading.Event(), waiting=threading.Event(),
         inventory_sent={}, on_source=None, on_build=None, budgets={}, engines={}, runtime_source=None,
+        inventory_sources={}, local_cut_nodes=set(), advertised_layer_budgets={},
         proof={"source_owner": "verified-conversion"})
     monkeypatch.setattr(config, "PIPELINE_CAPACITY_RESERVE_MB", 0)
     monkeypatch.setattr(config, "PIPELINE_CAPACITY_SAFETY_MARGIN", 1.0)
@@ -984,7 +1016,9 @@ def startup_pool_case(tmp_path, monkeypatch):
     def inventory(node_id):
         value = {"distributed": True, "engines": case.engines.get(node_id, ["llama_cpp"]),
                  "memory_available_bytes": case.budgets.get(node_id, 10**4),
-                 "disk_free_bytes": 10**12, "sources": []}
+                 "disk_free_bytes": 10**12,
+                 "local_cut": node_id in case.local_cut_nodes,
+                 "sources": case.inventory_sources.get(node_id, [])}
         if "pytorch" in value["engines"]:
             value["pytorch_runtime"] = {"execution_device": "cpu", "target_element_size": 2,
                                         "available_bytes": value["memory_available_bytes"]}
@@ -1037,8 +1071,13 @@ def startup_pool_case(tmp_path, monkeypatch):
 
     def capacity(eligible):
         case.capacity_pools.append(set(eligible))
-        return [{**node(node_id, case.budgets.get(node_id, 10**4)), "reserve_bytes": 0}
-                for node_id in sorted(eligible)]
+        records = []
+        for node_id in sorted(eligible):
+            record = {**node(node_id, case.budgets.get(node_id, 10**4)), "reserve_bytes": 0}
+            if node_id in case.advertised_layer_budgets:
+                record["layer_budget"] = copy.deepcopy(case.advertised_layer_budgets[node_id])
+            records.append(record)
+        return records
     scheduler._get_pipeline_capacity_nodes = capacity
     def build(source, directory, **kwargs):
         assert not c._condition._is_owned(), "builder held the supply lock"
@@ -1124,6 +1163,40 @@ def test_default_local_cut_precedence_and_named_distribution(startup_pool_case, 
     assert all(call["reuse_root"] == case.c.root for call in case.build_calls)
     assert observed and case.c.root / case.op in observed[0]["protected_paths"]
     assert result["retention"]["removed"] == 1
+
+
+def test_supply_capacity_budget_uses_inventory_source_matching_selected_model(
+        startup_pool_case, monkeypatch):
+    import model_supply_plan_reuse
+
+    case = startup_pool_case
+    case.local_cut_nodes.add("worker")
+    case.inventory_sources["worker"] = [
+        {"source_model_id": "fixture", "source_model_sha256": "c" * 64,
+         "tokenizer_sha256": "d" * 64, "size_bytes": 600, "total_layers": 2},
+        {"source_model_id": "fixture", "source_model_sha256": "a" * 64,
+         "tokenizer_sha256": "b" * 64, "size_bytes": 6_000, "total_layers": 6},
+    ]
+    case.advertised_layer_budgets["worker"] = {
+        "available_bytes": 6_000, "per_layer_bytes": 300,
+        "max_layers": 20, "local_cut": True,
+    }
+    observed = []
+    original = model_supply_plan_reuse.plan_segment_supply_reuse
+
+    def capture(*args, **kwargs):
+        observed.append(copy.deepcopy(args[2]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_supply_plan_reuse, "plan_segment_supply_reuse", capture)
+    case.release_source.set()
+    runner = case.start()
+    _assert_startup_available(case, runner, {"master", "worker"})
+    worker = next(record for record in observed[0] if record["node_id"] == "worker")
+    assert worker["layer_budget"] == {
+        "available_bytes": 6_000, "per_layer_bytes": 1_000,
+        "max_layers": 6, "local_cut": True,
+    }
 
 
 def test_source_window_new_android_waits_pending_ack_then_enters_three_node_plan(startup_pool_case):

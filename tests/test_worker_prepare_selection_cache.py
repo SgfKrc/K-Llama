@@ -236,9 +236,19 @@ def test_warm_digest_and_descriptor_cannot_hide_dead_native_sidecar(env_prepare)
 def test_prepare_recheck_uses_existing_versioned_parser_caches(env_prepare, monkeypatch):
     import gguf_metadata_contract
     import relay_segment_info
+    import model_supply_digest_cache
 
     case = env_prepare
     monkeypatch.setattr(relay_segment_info, "_GGUF_HEADER_CACHE", OrderedDict())
+    stamp = model_supply_digest_cache.file_stamp(case.path)
+    entry = model_supply_digest_cache._record(
+        model_supply_digest_cache._store_path(), case.path.resolve(), stamp,
+    )
+    metadata = entry.get("metadata", {})
+    metadata.pop("relay-gguf-reader-v2-read_gguf_tokenizer_sha256", None)
+    model_supply_digest_cache._save(
+        model_supply_digest_cache._store_path(), case.path.resolve(), entry,
+    )
     parses = {"tokenizer": 0, "table": 0}
     original_tokenizer_header = relay_segment_info._gguf_header
     original_table = gguf_metadata_contract._read_gguf_header
