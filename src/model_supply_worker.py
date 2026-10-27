@@ -584,7 +584,21 @@ class ModelSupplyWorker:
             #   `_source_candidates()` 的第一个，而 Surface 上 `qwen3-0.6b` 排在
             #   `qwen3-5-9b` 之前 ⇒ 合成的模型身份是 0.6b ⇒ 拿不到 9B 的层段。
             if isinstance(model_id, str) and model_id:
+                previous = str(getattr(self, "_last_supply_model_id", "") or "")
                 self._last_supply_model_id = model_id
+                # ★ 2026-10-28（#139）：**目标模型一变就重发 hello**。
+                #   hello 在 worker 启动时先于第一次 inventory 发出，那时还没有目标
+                #   ⇒ `_task_worker_local_full_source()` 只能盲取第一个整模源
+                #   （Surface 上是 `qwen3-0.6b`），合成出错误的模型身份
+                #   ⇒ 容量求解永不选中它。实测 04:56 仍是 `qwen3-0.6b`。
+                #   拿到目标后重发一次，让 `models` 反映真正要跑的模型。
+                if model_id != previous:
+                    resend = getattr(self, "_send_task_worker_hello", None)
+                    if callable(resend):
+                        try:
+                            resend()
+                        except Exception:  # noqa: BLE001 — capability refresh is best effort
+                            pass
             # Keep legacy callers (including zero-argument inventory hooks) valid.
             result = self.inventory() if model_id is None else self.inventory(model_id=model_id)
             result.update(action="inventory_result", operation_id=op.operation_id, node_id=op.node_id)
