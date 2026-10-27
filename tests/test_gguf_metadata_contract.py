@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import builtins
+import os
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -62,6 +64,39 @@ def test_reader_preserves_integer_arrays_and_skips_unrelated_arrays(tmp_path):
     assert tensors == {}
     assert normalize_gguf_metadata(raw) == actual
     assert project_gguf_metadata(actual, 1, 3)["head_count_kv"] == [2, 3]
+
+
+def test_header_parse_is_reused_across_hardlink_paths_and_invalidated_on_change(
+        tmp_path, monkeypatch):
+    import gguf_metadata_contract as contract
+
+    source = _header(tmp_path / "source.gguf")
+    alias = tmp_path / "alias.gguf"
+    try:
+        os.link(source, alias)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    contract._HEADER_CACHE.clear()
+    calls = []
+    original = contract._read_gguf_header
+
+    def counted(path, *, include_tensors=True):
+        calls.append(Path(path))
+        return original(path, include_tensors=include_tensors)
+
+    monkeypatch.setattr(contract, "_read_gguf_header", counted)
+    first = contract.read_gguf_header(source, include_tensors=False)
+    second = contract.read_gguf_header(alias, include_tensors=False)
+    assert first == second and calls == [source]
+
+    original_bytes = source.read_bytes()
+    old_value = _string("qwen2.block_count") + struct.pack("<II", 4, 4)
+    new_value = _string("qwen2.block_count") + struct.pack("<II", 4, 5)
+    assert original_bytes.count(old_value) == 1
+    source.write_bytes(original_bytes.replace(old_value, new_value))
+    changed, _ = contract.read_gguf_header(alias, include_tensors=False)
+    assert changed["qwen2.block_count"] == 5
+    assert calls == [source, alias]
 
 
 @pytest.mark.parametrize("key", GGUF_METADATA_REQUIRED_KEYS)

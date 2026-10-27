@@ -2374,7 +2374,22 @@ class EngineHost:
         # The internal helper remains usable for legacy native unit fixtures.
         if stage_request.stage_type == "layer_forward":
             with self._worker_layer_lock():
-                self._check_worker_runtime_stage(stage_request, required=True)
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机执行器没有 prepare/commit gate**。
+                #
+                #   `_check_worker_runtime_stage(required=True)` 校验的是远端 worker 的
+                #   prepare 生命周期（`_worker_runtime_phase` 必须已 `committed` 且
+                #   `_worker_runtime_active` 已 loaded）。同机 CPU 段是**本进程内**
+                #   的执行器，从不经过那条链路 ⇒ 阶段恒为 `idle`
+                #   ⇒ `worker_prepare_stage_fenced`（实测 11:57:25：CPU 段第一次真正
+                #   进入引擎执行就被这一条挡下）。
+                #
+                #   判据用 provider_id：本机 provider 由
+                #   `_ensure_local_task_worker_provider` 构造，命名固定为
+                #   `"local-" + key.replace("#", "-")`。
+                _provider_id = str(getattr(stage_request, "provider_id", "") or "")
+                _local_executor = _provider_id.startswith("local-")
+                if not _local_executor:
+                    self._check_worker_runtime_stage(stage_request, required=True)
                 return self._execute_layer_forward_stage_locked(stage_request, provider_cancel_event)
         from execution_errors import DEPENDENCY_FAILURES_KEY, StageExecutionError
         root_input = stage_request.root_input
@@ -2970,7 +2985,7 @@ class EngineHost:
         if identity != runtime.identity["stage_model_identity"] or fields.get("layer_range") != runtime.identity["layer_range"]:
             raise WorkerPrepareError("worker_prepare_stage_contract_mismatch")
 
-    def _layer_forward_upstream(self):
+    def _layer_forward_upstream(self, *, stage_request=None, provider_cancel_event=None):
         """按 env 配置创建并复用 keep-head 上游（进程隔离由 `KeepHeadUpstream` 自理）。
 
         env（PC 侧没有像 Android 那样的工件目录扫描，这是唯一的配置入口）：
@@ -2978,6 +2993,13 @@ class EngineHost:
           * `QLH_KEEP_HEAD_SHIM`     —— `qlh_keep_head.dll` 路径（必填）
           * `QLH_LAYER_N_CTX` / `QLH_LAYER_N_BATCH` / `QLH_LAYER_THREADS` /
             `QLH_LAYER_N_SEQ_MAX`   —— 可选，缺省 4096 / 2048 / 8 / 1
+          * `QLH_LAYER_SKIP_LOGITS`  —— ★ 2026-10-26（PERF-SKIP-LOGITS-01）可选，缺省**关**。
+            `1/true/yes/on` ⇒ 本段（只要 hidden）不再请求 logits ⇒ llama.cpp 的 `n_outputs`
+            变 0，`output.weight`（9B 中间段上每步几百 MB）的矩阵乘不再执行。
+            **末段 argmax 不受影响**（`forward_hidden_to_token[s]` 恒开 logits）；
+            hidden 输出逐位不变。需 shim 带 `qlh_kh_set_skip_hidden_logits`（旧 shim 缺该
+            符号时 fail-loud，不静默退回）。实测 9B 中间段 122.6 → 102.6 ms/步（见
+            `local_docs/perf-skiplogits-20261026/`）。
 
         ⚠️ 不要图省事绕开隔离：`qlh_keep_head.dll` 经 `libllama.dll` 依赖**按 basename**
         解析的 `ggml-base.dll` / `ggml.dll`，与 pip `llama_cpp` 是**同名不同版本**；
@@ -3003,16 +3025,69 @@ class EngineHost:
 
         from model_supply_worker import selected_gguf_path
         environment = os.environ if self._environment is None else self._environment
-        if self._environment is None:
+        executor_id = str(getattr(stage_request, "executor_id", "") or "")
+        if self._environment is None and not executor_id:
             model_path = selected_gguf_path() or environment.get("QLH_LAYER_GGUF", "").strip()
         else:
             model_path = environment.get("QLH_LAYER_GGUF", "").strip()
+        binding = None
+        artifact_version = None
+        if executor_id:
+            from pathlib import Path
+            from model_supply_digest_cache import cached_sha256, file_stamp
+            from relay_segment_info import read_artifact_manifest
+            from worker_prepare_contract import WorkerPrepareError, validate_stage_identity
+
+            fields = stage_request.stage_fields or {}
+            prepare_identity = validate_stage_identity(fields.get("prepare_identity"))
+            identity = getattr(stage_request, "model_identity", None)
+            if hasattr(identity, "snapshot"):
+                identity = identity.snapshot()
+            if (not isinstance(identity, dict)
+                    or (identity.get("engine"), identity.get("format")) != ("llama_cpp", "gguf")
+                    or identity.get("sha256") != prepare_identity["artifact_sha256"]):
+                raise WorkerPrepareError("local_executor_model_identity_mismatch")
+            span = fields.get("layer_range")
+            if (not isinstance(span, list) or len(span) != 2
+                    or any(type(value) is not int for value in span) or not 0 <= span[0] < span[1]):
+                raise WorkerPrepareError("local_executor_layer_range_mismatch")
+            if not model_path:
+                raise WorkerPrepareError("local_executor_artifact_path_missing")
+            artifact = Path(model_path).resolve()
+            model_path = str(artifact)
+            markers = (artifact.with_suffix(".manifest.json"), Path(model_path + ".manifest.json"))
+
+            def artifact_version():
+                try:
+                    return (file_stamp(artifact), tuple(
+                        file_stamp(marker) if marker.is_file() else None for marker in markers))
+                except OSError as exc:
+                    raise WorkerPrepareError("local_executor_artifact_unavailable") from exc
+
+            version = artifact_version()
+            binding = (executor_id, prepare_identity, dict(identity), tuple(span), model_path, version)
+            if (binding != getattr(self, "_layer_upstream_binding", None)
+                    or self._layer_upstream is None or not self._layer_upstream.is_available):
+                manifest = next((info for marker in markers
+                                 if (info := read_artifact_manifest(marker))), None)
+                if (manifest is None or manifest.get("source_layer_range") != span
+                        or manifest.get("artifact_sha256") != prepare_identity["artifact_sha256"]):
+                    raise WorkerPrepareError("local_executor_artifact_contract_mismatch")
+                cancelled = provider_cancel_event.is_set if provider_cancel_event is not None else None
+                if cached_sha256(artifact, cancelled) != prepare_identity["artifact_sha256"]:
+                    raise WorkerPrepareError("local_executor_artifact_digest_mismatch")
+                if version != artifact_version():
+                    raise WorkerPrepareError("local_executor_artifact_changed")
+            if provider_cancel_event is not None and provider_cancel_event.is_set():
+                raise WorkerPrepareError("local_executor_cancelled")
         if self._layer_upstream is not None:
             previous_path = str(getattr(self, "_layer_upstream_model_path", "") or "")
-            if (not previous_path or previous_path == model_path) and self._layer_upstream.is_available:
+            if ((not previous_path or previous_path == model_path) and self._layer_upstream.is_available
+                    and binding == getattr(self, "_layer_upstream_binding", None)):
                 return self._layer_upstream
             self._layer_upstream.close()
             self._layer_upstream = None
+            self._layer_upstream_binding = None
         # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
         #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
         #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
@@ -3051,6 +3126,17 @@ class EngineHost:
             if owner is not None:
                 self._layer_upstream = owner
             raise StageExecutionError(f"层段 keep-head 上游不可用：{exc}") from exc
+        if artifact_version is not None:
+            try:
+                if version != artifact_version():
+                    raise WorkerPrepareError("local_executor_artifact_changed")
+                if provider_cancel_event is not None and provider_cancel_event.is_set():
+                    raise WorkerPrepareError("local_executor_cancelled")
+            except WorkerPrepareError:
+                self._layer_upstream.close()
+                self._layer_upstream = None
+                raise
+        self._layer_upstream_binding = binding
         return self._layer_upstream
 
     def _unload_supplied_layer_manager(self) -> None:
@@ -3265,7 +3351,27 @@ class EngineHost:
         if root_input.get("cleanup_only") is True:
             active = getattr(self, "_worker_runtime_active", None)
             if active is None:
-                raise _StageError("execution_kv_cleanup_runtime_missing")
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机执行器的 KV 由它自己的
+                #   keep-head 上游持有**，不经过 `_worker_runtime_active`（那是远端
+                #   prepare 生命周期的产物）。同 `execute_task_worker_stage` 跳过
+                #   fenced gate 是同一类情形。
+                #   此前这里无条件要求 `active` ⇒ 本机 CPU 段清理时抛
+                #   `execution_kv_cleanup_runtime_missing` ⇒ 上一层
+                #   `NativePorts.cleanup` 返回 False ⇒ `requests.py:203` 把整个
+                #   deployment 加入 `_quarantine` ⇒ **之后所有请求**都被
+                #   `request_runtime_cleanup_pending` 挡下（实测 12:54 起连发 503）。
+                #   上游可能从未建立（该段没执行过），那也算"无 KV 可清"。
+                #   ⚠️ 判据必须带 `executor_id`：只有**本机附加执行器**才可能没有
+                #   `_worker_runtime_active`；远端 worker 缺它就是真的契约破损，
+                #   必须继续 fail-closed。
+                if not str(getattr(stage_request, "executor_id", "") or ""):
+                    raise _StageError("execution_kv_cleanup_runtime_missing")
+                upstream = getattr(self, "_layer_upstream", None)
+                if upstream is not None:
+                    upstream.reset()
+                self._supplied_layer_caches = {}
+                self._supplied_layer_workflow = None
+                return {"kv_cleared": True}
             if active.upstream is not None:
                 active.upstream.reset()
             self._supplied_layer_caches = {}
@@ -3300,11 +3406,26 @@ class EngineHost:
         hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
         from model_supply_worker import get_selected_model
 
-        if getattr(self, "_worker_runtime_managed", False):
+        _local_executor_id = str(getattr(stage_request, "executor_id", "") or "")
+        if _local_executor_id:
+            selected = None
+        elif getattr(self, "_worker_runtime_managed", False):
             selected = self._worker_runtime_active.selected
         else:
             selected = get_selected_model()
-        supplied = selected is not None and selected["manifest"]["format"] == "safetensors"
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机附加执行器不落全局主模型**。
+        #
+        #   `get_selected_model()` 返回的是供给选中的**全局**模型（主段那份
+        #   safetensors）。同机 CPU 段有自己的本机工件（GGUF 层段），若在这里被判成
+        #   `supplied=True`，就会拿主段的 manifest 去比本段的 layer_range ⇒
+        #   `supplied_layer_range_mismatch`（实测 12:03:22），而它本该走下面的
+        #   `_layer_forward_upstream()`（keep-head）分支。
+        #   判据用 `stage_request.executor_id`（本机主段为空 ⇒ 不受影响）。
+        supplied = (
+            not _local_executor_id
+            and selected is not None
+            and selected["manifest"]["format"] == "safetensors"
+        )
         if (not supplied or getattr(self, "_supplied_layer_key", None)
                 != self._supplied_layer_selection_key(selected)):
             self._unload_supplied_layer_manager()
@@ -3331,7 +3452,10 @@ class EngineHost:
                 "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
                 "token_argmax": None,
             }
-        upstream = self._layer_forward_upstream()
+        upstream = (
+            self._layer_forward_upstream(stage_request=stage_request, provider_cancel_event=provider_cancel_event)
+            if _local_executor_id else self._layer_forward_upstream()
+        )
         if want_all_tokens and getattr(upstream, "supports_multi_position_argmax", False) is not True:
             raise _StageError("multi_position_argmax_unavailable")
 

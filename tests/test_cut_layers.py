@@ -21,7 +21,8 @@ N_LAYERS = 4
 
 
 def _make_gguf(path: Path, n_layers: int = N_LAYERS, interval: int | None = None,
-               nextn: int = 0) -> None:
+               nextn: int = 0, *, architecture: str = ARCH,
+               with_output_weight: bool = False) -> None:
     """合成一个结构上合法（但不含真实权重语义）的迷你 GGUF。
 
     `nextn > 0` 时额外写 MTP 层 —— **挂在 `blk.(n_layers-1)` 上**并置
@@ -31,14 +32,14 @@ def _make_gguf(path: Path, n_layers: int = N_LAYERS, interval: int | None = None
     import numpy as np
     import torch
 
-    writer = gguf.GGUFWriter(str(path), ARCH)
+    writer = gguf.GGUFWriter(str(path), architecture)
     writer.add_block_count(n_layers)
     writer.add_embedding_length(8)
     if interval is not None:
-        writer.add_key_value(f"{ARCH}.full_attention_interval", interval,
+        writer.add_key_value(f"{architecture}.full_attention_interval", interval,
                              gguf.GGUFValueType.INT32)
     if nextn:
-        writer.add_key_value(f"{ARCH}.nextn_predict_layers", nextn,
+        writer.add_key_value(f"{architecture}.nextn_predict_layers", nextn,
                              gguf.GGUFValueType.UINT32)
     for layer in range(n_layers):
         writer.add_tensor(f"blk.{layer}.attn_norm.weight",
@@ -51,6 +52,8 @@ def _make_gguf(path: Path, n_layers: int = N_LAYERS, interval: int | None = None
                               np.ones(8, dtype=np.float32))
     writer.add_tensor("token_embd.weight", np.ones((8, 8), dtype=np.float32))
     writer.add_tensor("output_norm.weight", np.ones(8, dtype=np.float32))
+    if with_output_weight:
+        writer.add_tensor("output.weight", np.ones((8, 8), dtype=np.float32))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -228,6 +231,39 @@ class TestHeadAndMiddleModes:
 
         ok = _run("--src", str(src), "--k", "2", "--end", "4", "--dry-run")      # 对齐 ⇒ 通过
         assert ok.returncode == 0, ok.stdout
+
+
+@pytest.mark.parametrize("span,arguments", [
+    ((0, 2), ("--keep-head", "2")),
+    ((1, 3), ("--k", "1", "--end", "3")),
+    ((2, 4), ("--k", "2")),
+])
+def test_qwen35_non_tail_cut_omits_only_output_weight(tmp_path, span, arguments):
+    source = tmp_path / "qwen35.gguf"
+    destination = tmp_path / "segment.gguf"
+    manifest_path = tmp_path / "segment.json"
+    _make_gguf(source, architecture="qwen35", with_output_weight=True)
+    result = _run("--src", str(source), "--dst", str(destination), *arguments,
+                  "--manifest", str(manifest_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    source_reader = gguf.GGUFReader(str(source))
+    output_reader = gguf.GGUFReader(str(destination))
+    source_names = {tensor.name for tensor in source_reader.tensors}
+    actual_names = {tensor.name for tensor in output_reader.tensors}
+    expected_names = {
+        f"blk.{local}.{suffix}"
+        for local in range(span[1] - span[0])
+        for suffix in ("attn_norm.weight", "ffn_norm.weight")
+    } | {"token_embd.weight", "output_norm.weight"}
+    if span[1] == N_LAYERS:
+        expected_names.add("output.weight")
+    assert actual_names == expected_names
+    assert {name for name in source_names if not name.startswith("blk.")} - actual_names == (
+        {"output.weight"} if span[1] < N_LAYERS else set()
+    )
+    declaration = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert declaration["artifact_contains"]["output_weight"] is (span[1] == N_LAYERS)
 
 
 class TestNextnMtpHandling:

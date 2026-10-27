@@ -7,9 +7,14 @@ an error, never a wildcard. No tensor payload or native model loader is used.
 from __future__ import annotations
 
 import math
+import mmap
 import struct
+from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
+import threading
 from typing import Any, Mapping
+import weakref
 
 GGUF_METADATA_KEYS = (
     "architecture", "block_count", "head_count_kv", "key_length",
@@ -24,6 +29,19 @@ _CONTRACT_SUFFIXES = (
     ".attention.key_length", ".full_attention_interval", ".embedding_length",
     ".nextn_predict_layers",
 )
+_HEADER_CACHE_LIMIT = 32
+_HEADER_CACHE = OrderedDict()
+_HEADER_CACHE_LOCK = threading.RLock()
+_HEADER_FILE_LOCKS = weakref.WeakValueDictionary()
+
+
+def _header_file_lock(key):
+    with _HEADER_CACHE_LOCK:
+        lock = _HEADER_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _HEADER_FILE_LOCKS[key] = lock
+        return lock
 
 
 def _invalid(message: str) -> None:
@@ -31,11 +49,39 @@ def _invalid(message: str) -> None:
 
 
 def read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple[dict, dict[str, tuple[int, int, tuple, int]]]:
+    from model_supply_digest_cache import cached_metadata, file_stamp
+
+    def inspect(source):
+        before = file_stamp(source)
+        key = ("gguf-header-v2", include_tensors, before)
+        with _header_file_lock(key):
+            with _HEADER_CACHE_LOCK:
+                cached = _HEADER_CACHE.get(key)
+                if cached is not None:
+                    _HEADER_CACHE.move_to_end(key)
+            if cached is None:
+                metadata, tensors = _read_gguf_header(source, include_tensors=include_tensors)
+                if before != file_stamp(source):
+                    _invalid("GGUF changed during header read")
+                cached = {"metadata": metadata, "tensors": tensors}
+                with _HEADER_CACHE_LOCK:
+                    _HEADER_CACHE[key] = deepcopy(cached)
+                    while len(_HEADER_CACHE) > _HEADER_CACHE_LIMIT:
+                        _HEADER_CACHE.popitem(last=False)
+            return deepcopy(cached)
+
+    result = cached_metadata(path, "gguf-header-v1-" + str(include_tensors), inspect)
+    tensors = {name: (entry[0], entry[1], tuple(entry[2]), entry[3])
+               for name, entry in result["tensors"].items()}
+    return result["metadata"], tensors
+
+
+def _read_gguf_header(path: str | Path, *, include_tensors: bool = True) -> tuple[dict, dict[str, tuple[int, int, tuple, int]]]:
     """Read bounded metadata and tensor ranges, never tensor payloads."""
     from relay_segment_info import _GGML_TYPE_SIZES, _GGUF_SCALAR_TYPES
     path = Path(path)
     size = path.stat().st_size
-    with path.open("rb") as handle:
+    with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as handle:
         position = 0
 
         def read(count):

@@ -202,6 +202,15 @@ class StageRequest:
     # Protocol fields that belong to the selected stage, rather than its root
     # input.  Layer-forward requests use this to carry the hidden contract.
     stage_fields: dict = field(default_factory=dict, compare=False, repr=False)
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**节点内执行器身份**。
+    #
+    #   同一物理节点上的主段（`""`）与附加执行器（如 `"cpu"`）共用 `node_id`，
+    #   靠它区分。执行侧需要它判断"这一段的工件由谁持有"：本机附加执行器有自己的
+    #   本机工件（GGUF 层段），**不能**落到 `get_selected_model()` 拿到的全局主模型
+    #   —— 那会让 CPU 段误走 safetensors 路径并报 `supplied_layer_range_mismatch`
+    #   （实测 12:03:22：`fields["layer_range"]=[8,24]` 对上了主段 manifest 才暴露）。
+    #   必须留在**末尾且带默认值**；缺省 "" ⇒ 与改动前逐位等价。
+    executor_id: str = ""
 
 
 @dataclass(frozen=True)

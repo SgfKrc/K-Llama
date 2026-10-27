@@ -23,6 +23,35 @@ DEFAULT_SESSION_ID = "default"
 DEFAULT_CONTEXT_MESSAGES = 200
 
 
+def default_context_messages() -> int:
+    """对话窗口条数 —— 统一到 `QLH_CHAT_CONTEXT_MESSAGES`（缺省 200）。
+
+    ★ 2026-10-27（#122）：此前这个数字在**两处各自硬编码 200**
+    （本模块的 `DEFAULT_CONTEXT_MESSAGES` 与
+    `local_store.load_local_conversation(limit=200)`），且 `api_server`
+    调后者时不传 limit ⇒ 现场想调窗口只能改源码。
+
+    这里**延迟到调用时**读取而不是模块级常量：`config` 的 `.env` 提升
+    发生在进程启动早期（`koakuma.bat` 的 `:promote_qlh`），模块常量会在
+    `import` 那一刻固化下来，一旦加载顺序变化就会读到一个不生效的旧值 ——
+    这个项目已经在 `LOCAL_CPU_EXECUTOR_ENABLED` 上踩过一次同样的坑
+    （见 `config.local_cpu_executor_enabled()` 的注释）。
+
+    窗口按**条数**计，不是 token，所以它只是上限；真正进入 prompt 的规模
+    仍由 `event=execution_prompt` 的 `prompt_tokens` 观测（见
+    `qlh_core/bootstrap/execution.py`），两者配合才能判断"是历史太长"
+    还是"单条太肥"。
+    """
+    try:
+        from config import CHAT_CONTEXT_MESSAGES
+    except Exception:                       # 独立使用本模块时不应因缺 config 崩掉
+        return DEFAULT_CONTEXT_MESSAGES
+    try:
+        return max(2, int(CHAT_CONTEXT_MESSAGES))
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_MESSAGES
+
+
 @dataclass(frozen=True)
 class PreparedChatContext:
     session_id: str
@@ -55,12 +84,15 @@ class ConversationContextService:
             [str, str, str, Optional[dict]], bool | TurnPersistenceResult
         ],
         default_session_id: str = DEFAULT_SESSION_ID,
-        max_messages: int = DEFAULT_CONTEXT_MESSAGES,
+        max_messages: Optional[int] = None,
     ) -> None:
         self._load_history = load_history
         self._persist_turn = persist_turn
         self.default_session_id = self._normalize_session_id(default_session_id)
-        self.max_messages = max(2, int(max_messages))
+        # `None` ⇒ 调用时读 `QLH_CHAT_CONTEXT_MESSAGES`；显式传入仍以传入值为准
+        # （测试与嵌入式用法可以钉死窗口，不受环境变量影响）。
+        self.max_messages = max(
+            2, int(max_messages) if max_messages is not None else default_context_messages())
         self._active_by_client: dict[str, str] = {}
         self._kv_session_id: Optional[str] = None
         self.histories: MutableMapping[str, list[dict]] = {}

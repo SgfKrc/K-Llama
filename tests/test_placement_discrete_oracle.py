@@ -90,8 +90,21 @@ def _ordered_nodes(nodes):
             "reserve_bytes": reserve,
             "runtime_multiplier": float(raw.get("runtime_multiplier", 1.0)),
         })
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：与 `_normalize_nodes` 的排序保持**逐字一致**。
+    #   段类型必须参与：head → 未声明 → middle → tail。
+    #   - 排序决定 DFS 遍历次序，而 DFS 是**单向**的（`cursor` 只前进、不回头）⇒
+    #     `middle` 段若排在 `head` 段之前，在 `cursor=0` 会被 `cursor != 0` 拒掉，
+    #     之后 `cursor` 前进而 DFS 不回头 ⇒ 它永远拿不到本可承载的中间区间。
+    #   - **未声明 `segment_mode` 的节点排在 head 之后、middle 之前**：它最灵活，
+    #     选择多，越早安排越不会被别人挤掉。放到最后反而会无解（有约束的 tail 先占
+    #     末段 ⇒ 灵活节点无处安放）。
+    #   本函数复刻求解器的排序，漏掉这一项就会让 oracle 与求解器对
+    #   `control_only_nodes` 的期望分歧（实测 seed-11 报
+    #   `['worker-a','worker-z'] == ['worker-z','worker-a']`）。
+    mode_order = {"head": 0, "": 0.5, "middle": 1, "tail": 2}
     return sorted(normalized, key=lambda node: (
         node["role"] != "master",
+        mode_order.get(str(node.get("segment_mode") or "").lower(), 0.5),
         -node["score"],
         -(node["capacity_bytes"] - node["reserve_bytes"]),
         node["node_id"],
@@ -106,6 +119,12 @@ def _enumerate_candidates(descriptor, nodes, *, safety_margin=1.0,
     Byte scaling and objective arithmetic use rational numbers. All multipliers
     and margins in this suite are dyadic, so a rational ceiling also agrees
     with the solver's single floating-point multiplication/ceiling at this size.
+
+    ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`candidate_layer_ranges` 是硬约束**，本枚举
+    按此建模（受 `test_candidate_ranges_and_layer_limits_remain_hard_with_local_cut`
+    约束）。一度试过在这里也枚举"去掉候选"的解空间以迁就真机上的自锁，但那方向是错的：
+    候选表达的是"**我手上确实有这个段**"，放宽它等于把设备规划到并不存在的工件上。
+    真机自锁要修的是**写入侧**（谁把上一轮切点写成了这一轮的候选）。
     """
     sizes = descriptor["layer_weight_bytes"]
     total_layers, total_work = len(sizes), sum(sizes)

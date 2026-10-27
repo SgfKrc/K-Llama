@@ -128,6 +128,7 @@ from config import (
     PIPELINE_TIMEOUT,
     PIPELINE_RELAY_ENABLED,
     PIPELINE_RELAY_PROBE_ONLY,
+    SHUTDOWN_GRACE_SECONDS,
 )
 
 # ★ 2026-10-04 裁定「一个节点只能是一种角色」：这两个开关此前从未出现在同一
@@ -1221,13 +1222,49 @@ def stop_api_servers() -> None:
 
 
 def _graceful_exit() -> None:
-    """在后台线程中触发后端优雅退出（先等响应返回）。"""
+    """在后台线程中触发后端优雅退出（先等响应返回）。
+
+    ★ 2026-10-27（#128）：**退出必须有确定终态**。
+
+    此前这里置完 `server.should_exit = True` 就 `return` 了。`should_exit` 只是
+    uvicorn 主循环**有空时才会读到**的标志位 —— 若进程正卡在长请求或
+    lifespan shutdown 里，它可以长期不退出。而 TUI 侧
+    `BackendSupervisor.stop` 只 `join(timeout=3.0)` 且**放弃时不报错**，于是：
+    旧 TUI 的 Python 进程存活 ⇒ 新进程恢复旧部署时
+    `_dispatch_pipeline_model_cleanup` 依据**旧进程 PID** 判定"本机清债"继续等待
+    ⇒ `_retire_before_supply` 卡住 ⇒ 选模 POST 长时间没有新 operation（GET 正常）。
+    现场表现就是"重启后选模没反应"，只能靠人手动去确认旧 PID 已消失。
+
+    现在分三段收口：
+      1. 置 `should_exit`，**有界等待** uvicorn 自己退出（`QLH_SHUTDOWN_GRACE_SECONDS`，
+         默认 10 s）；正常情况它会很快把 `started` 置回 False，我们随即返回。
+      2. 超时仍未退出 ⇒ 不再无限等，**自己跑一次 `_shutdown_resources()`** 把
+         该释放的释放掉（尽力而为，失败只记日志），然后强制退出进程。
+      3. 无论走哪条兜底，都留一条带耗时的日志，便于事后判断"是优雅退出还是被强杀"。
+    """
     time.sleep(0.5)
     servers = list(_uvicorn_servers)
     if servers:
         for server in servers:
             server.should_exit = True
         logger.info("event=system_shutdown trigger=uvicorn_should_exit")
+        started_at = time.monotonic()
+        deadline = started_at + max(1.0, float(SHUTDOWN_GRACE_SECONDS))
+        while time.monotonic() < deadline:
+            if not any(bool(getattr(server, "started", False)) for server in servers):
+                logger.info(
+                    "event=system_shutdown uvicorn_exited elapsed_s=%.1f",
+                    time.monotonic() - started_at,
+                )
+                return
+            time.sleep(0.1)
+        logger.warning(
+            "event=system_shutdown uvicorn_exit_timeout elapsed_s=%.1f grace_s=%.1f "
+            "hint=QLH_SHUTDOWN_GRACE_SECONDS",
+            time.monotonic() - started_at,
+            float(SHUTDOWN_GRACE_SECONDS),
+        )
+        _force_exit_after_cleanup(trigger="uvicorn_exit_timeout")
         return
     if os.name != "nt":
         import signal
@@ -1235,12 +1272,22 @@ def _graceful_exit() -> None:
         logger.info("event=system_shutdown trigger=signal_sigterm")
         return
     # Windows 兜底：直接清理资源（uvicorn 主循环不感知，需自行收尾）
+    _force_exit_after_cleanup(trigger="direct_cleanup (未注册 uvicorn server)")
+
+
+def _force_exit_after_cleanup(*, trigger: str) -> None:
+    """尽力清理后强制退出 —— 让"退出"有确定终态，而不是把不确定性留给下一个进程。
+
+    清理失败**不阻断**退出：此处的目标是"旧 PID 必须消失"，否则新进程会一直
+    等一个永远不会完成的"清债"。清理异常会带 traceback 记一条日志，不吞掉。
+    """
     import asyncio
-    logger.warning("event=system_shutdown trigger=direct_cleanup (未注册 uvicorn server)")
+    logger.warning("event=system_shutdown trigger=%s", trigger)
     try:
         asyncio.run(_shutdown_resources())
-    except Exception as e:
-        logger.warning(f"优雅退出清理异常: {e}")
+    except BaseException as exc:                      # noqa: BLE001 - 退出路径必须落地
+        logger.warning("event=system_shutdown cleanup_failed err=%s: %s",
+                       type(exc).__name__, exc, exc_info=True)
     os._exit(0)
 
 

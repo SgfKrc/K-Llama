@@ -68,6 +68,16 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
            本机 CUDA              x86_64 Windows         ARM64 Android           本机 llama.cpp
 ```
 
+同一台机器上也能构成四段 —— 跨的是引擎而不是网络（2026-10-26 实测）：
+
+```
+prompt → torch(0..7) →hidden→ llama.cpp keep-head(8..23) →hidden→ y700(24..27) →hidden→ Surface(28..31+head) → token
+         master GPU 段              master CPU 段                   ARM64 Android        x86_64 Windows
+         ('master','',0,8)        ('master','cpu',8,24)            android-542cd254      TABLET-2TLUCNNU8
+```
+
+前两段在**同一个进程、同一台物理机**上，靠 `(node_id, executor_id)` 区分；CPU 段的权重就常驻主机内存、原地参与计算，全程不经过 PCIe。
+
 判据是**与同精度整模逐 token argmax 一致**；分叉即标 FAIL，不使用近似判据。逐段记录见[跨框架接力当前有效基线](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)。
 
 两层的验证强度不同，改动落点决定验证成本：
@@ -93,10 +103,14 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 | `remote_rpc` | 借来的算力（Android/PC 上的 `ggml-rpc-server`） | llama.cpp | 网络（ggml RPC） |
 | `cross_framework` | 跨引擎的层段接力（torch 上游 + llama.cpp 下游） | 两种 | 进程内或 stdio |
 
+**身份是二元组 `(node_id, executor_id)`，不是 `node_id`。** 一台物理机可以同时承载多个执行器：主执行器 `executor_id=""`（GPU 段，PyTorch）与附加执行器（如 `"cpu"`，llama.cpp keep-head 段）。两者共用同一个 `node_id` —— 同一台机器、同一个传输身份、同一份主机内存 —— 但各自持有**不同的层段与工件**。缺省 `executor_id` 为空串时，`(node_id, "")` 与旧的"`node_id` 唯一"逐位等价，既有拓扑零回归。
+
+容量按**共享域**记账：`capacity_domain_id`（缺省 = `node_id`）标识"哪些执行器共用同一份物理预算"。同机两段各自申报的量之和必须 ≤ 域总账，超额 fail closed；否则求解器会把它们当成两台独立机器，给出物理上装不下的计划却仍然准入（这是本抽象建立前实测踩到的坑）。
+
 实现与端点：
 
-- `src/pipeline_node_contract.py`：`PipelineNode` 合同、既有产物映射、布局 fail-closed 校验；
-- 容量求解在 `src/qlh_core/planning/capacity.py`（`src/pipeline_capacity.py` 已退为 21 行兼容门面），`src/pipeline_assignment_manifest.py` 分配 manifest；
+- `src/pipeline_node_contract.py`：`PipelineNode` 合同（含 `executor_id`，唯一性判据为 `identity_key = (node_id, executor_id)`）、既有产物映射、布局 fail-closed 校验；
+- 容量求解在 `src/qlh_core/planning/capacity.py`（`src/pipeline_capacity.py` 已退为 21 行兼容门面），`src/pipeline_assignment_manifest.py` 分配 manifest；求解器是**纯函数**，不读环境变量或 ambient state；
 - `src/pipeline_reshard.py`：容量重解 + 工件就绪门 + epoch 原子提交；
 - `GET /api/cluster/layers`、`GET /api/cluster/pipeline-capacity`、`GET /api/cluster/pipeline-reshard`；
 - 客户端消费 `GET /api/client/state` 与 `GET /api/client/events`（版本化快照 + revision 游标，见 `src/api/routes_client_state.py` 与 `src/qlh_core/contracts/snapshots.py`）。
@@ -127,6 +141,49 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 
 报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-*.json`；票号口径见[验收清单](docs/验收清单与资源限制登记.md)。
 
+### 同机跨框架层段（GPU 段 + CPU 段并存）
+
+D→L 接力的一种特殊形态：**上游与下游在同一台物理机上**，跨的是引擎而不是网络。
+
+master 同时承载两个执行器 —— GPU 段 `('master', '', 0, 8)`（PyTorch，将来换 NInfer）与 CPU 段 `('master', 'cpu', 8, 24)`（llama.cpp keep-head，权重常驻主机内存、就地计算）。CPU 段的权重**不上 PCIe**：它已经是主机内存里的文件，被直接映射后原地参与前向，这正是"offload"与"placement"的区别 —— llama.cpp 的 offload 是搬家，而这里从没搬过。
+
+真机四段并存（`intent=ready`，2026-10-26）：
+
+```
+master          ''     [0,8)    pytorch    cuda
+master          'cpu'  [8,24)   llama_cpp  cpu     ← 同机第二段
+android-542cd254 ''    [24,28)  llama_cpp  cpu
+TABLET-2TLUCNNU8 ''    [28,32)  llama_cpp  cpu
+```
+
+判据与实测（缺一不可）：
+
+| 判据 | 口径 | 结果 |
+| --- | --- | --- |
+| 并存 | 供给 plan 里**同时**出现主段与 `executor_id='cpu'` 段 | 通过（上表四段） |
+| 不越界 | CPU 段区间必须落在工件实际覆盖范围内（`QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`，默认 `8,24`） | 通过（`[8,24)` 恰为 `mid8-24.gguf` 覆盖范围） |
+| 容量无重复计数 | 同机两段申报之和 ≤ 共享域总账，超额 fail closed | 通过（`capacity_domain_id` 按 `node_id` 记账） |
+| 数值门 | 同一 hidden 输入，CPU 段（Q4_K_M）与同层段（PyTorch fp16）逐元素比对 | **argmax 81/81 一致**（短 prompt 12/12、长 prompt 69/69）；cosine 0.994、相对 L2 11.0%，误差完全来自量化 |
+| 计时门 | 本机 CPU 段 ms/层 | **6.84 ms/层**（i9-13900H，`n_threads=8`）；对照 rog 8.7 / android 20.1 |
+| 不回归 | `QLH_LOCAL_CPU_EXECUTOR` 缺省关闭时行为逐字节一致 | 通过（关闭时无任何 CPU 段事件、供给输入恰好两个执行器） |
+
+端到端一次请求 21.28 s，`layer_segments = [0,8) [8,24) [24,28) [28,32)`，`distributed_used=true fallback=false`；同一请求两次运行的 token 序列**逐位相同**。
+
+数值门的验证脚本是 [`scripts/probe_local_cpu_segment_numerics.py`](scripts/probe_local_cpu_segment_numerics.py) —— 它把"执行器差异"与"拓扑差异"拆开：固定同一份真实 hidden，只换执行器。之所以不用端到端 token 对比做这条判据，是因为关掉 CPU 段会连带改变层段划分与供给拓扑，那样量到的差异无法归因。
+
+**为什么"逐位一致"在这里不适用**：CPU 段的工件是 Q4_K_M 量化的 GGUF，而基线是 fp16 safetensors，两者不可能逐位相同。决定生成 token 的量是 argmax，那一项 100% 命中，因此该段可等效替代 fp16 段。
+
+配置（`.env`）：
+
+```bash
+QLH_LOCAL_CPU_EXECUTOR=1                        # 总开关；缺省关闭 ⇒ 与改动前逐字节一致
+QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=8,24         # CPU 段区间，必须落在工件覆盖范围内
+QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION=0.7        # 该执行器在共享主机内存域中的分摊比例
+QLH_LAYER_GGUF=models/.../q35-9b-local-mid8-24.gguf
+QLH_KEEP_HEAD_SHIM=build/keephead/build-cpu/bin/qlh_keep_head.dll
+QLH_LAYER_N_BATCH=4096                          # 必须 ≥ prefill token 数，否则 worker init 后立刻退出
+```
+
 ### torch.compile 与层循环开关
 
 分段前向要吃到 `torch.compile` 收益，靠 `src/config.py` 的两个开关配合（可用环境变量覆盖）：
@@ -151,10 +208,11 @@ TUI 与 API 顶层只需知道聚合资源（GPU/CPU/内存）和是否分布式
 | Textual TUI | 统一 `qlh` 入口；聊天页 + 8 个功能屏（状态／模型／集群／节点／队列／日志／设备／设置）与 1 个调试兜底屏共用一个进程，可在本机按需启动后端；模型下载/搜索/预检/登记、集群配置、节点管理、日志筛选/统计/导出、设备配置、用户设置等写操作经确认框闸门 |
 | Edge <=1B 单机 | 已有模型画像、GGUF/llama.cpp 路径和边缘预检；默认不加载 torch |
 | 同机双进程 RPC | 已有 llama host + `ggml-rpc-server` 模拟及合同测试；不等同于跨机生产准入 |
+| **同机跨框架层段（GPU 段 + CPU 段并存）** | **真机通过**（2026-10-26）：master 上 `('master','',0,8)` GPU 段与 `('master','cpu',8,24)` llama.cpp keep-head 段**同时**在供给 plan 里，各担其层；CPU 段权重常驻主机内存、就地计算（零 PCIe 搬运）。六条判据全过：并存、不越界、容量无重复计数、数值门 argmax **81/81**、计时 **6.84 ms/层**、缺省关闭时逐字节不回归。端到端 21.28 s，四段连续覆盖 `[0,8)[8,24)[24,28)[28,32)` |
 | PC RPC | 有设备评分、自动层数规划、租约/断线回退和资产同步合同；吞吐收益未宣称，容量收益与 D→L 分开验收 |
-| 层段合同与自动重分片 | 合同、布局 fail-closed 校验、容量重解与 epoch 原子提交的开发门已完成；真实 PC/Android 故障注入、长时和性能验收待做 |
-| 跨框架逐层接力（D→L） | 正确性已准入（27/27 逐 token 一致）；跨机长时（LL/DL 三段 `gen=256`，256/256）与多段切点组合（32/32）已通过；资产自动分发与故障注入验收待补。默认路由优先可直接整模运行的 L/RPC 路径 |
-| PyTorch D 档 | 层拆分/层间流水线/多节点层段承载的实现方，兼作对照实验；不进入 Edge 默认依赖 |
+| 层段合同与自动重分片 | 合同、布局 fail-closed 校验（唯一性判据已从 `node_id` 放宽到 `(node_id, executor_id)`）、容量重解与 epoch 原子提交的开发门已完成；真实 PC/Android 故障注入、长时和性能验收待做 |
+| 跨框架逐层接力（D→L） | 正确性已准入（27/27 逐 token 一致）；跨机长时（LL/DL 三段 `gen=256`，256/256）与多段切点组合（32/32）已通过；同机形态见上一行。资产自动分发与故障注入验收待补。默认路由优先可直接整模运行的 L/RPC 路径 |
+| PyTorch D 档 | 层拆分/层间流水线/多节点层段承载的实现方，兼作对照实验；不进入 Edge 默认依赖。同机 CPU 段并存时它只承担自己的 GPU 段 |
 | Relay R | L→L、D→L、f32/采样矩阵和 SSH 跨机证据已完成正确性验证；容量收益已量化；默认路由不替代可直接整模的 L/RPC |
 | Android | `qlh-android` P0 交叉编译/JNI 已完成；P1 的设备运行、RPC worker、断线、热/电和安全证据未完成 |
 | 运行环境 | 版本窗口以 [`requirements.txt`](requirements.txt) 为准（`transformers>=5.17.0,<5.18.0`、`llama-cpp-python==0.3.35`）；全部 PyTorch 侧车统一到 5.17.0；Windows 原生 `torch.compile` 需另装 [`requirements-compile.txt`](requirements-compile.txt) 的 `triton-windows`（本机 `.venv-test` 已装 3.8.0.post28；`requirements-test.txt` 不含它） |
@@ -338,6 +396,8 @@ python -m venv .venv-test
 ```
 
 串行全量基线分两档记录（2026-10-19）：重构 R0–R5 固定集合 **4309 passed / 27 skipped / 0 failed**（串行与四进程逐项状态一致）；根 Python 全量（四进程，过滤 `real_model`／`external`／`requires_gpu`）**8301 passed / 32 skipped**。分仓另计：packaging **459 passed / 9 skipped**、Web Playwright **110 passed / 1 skipped**、Android JVM **710 passed / 4 skipped**。xdist 并发下偶有 flaky，判定以串行为准。
+
+`pytest.ini` 的默认并发为 `-n 6`（2026-10-26 从 `-n 4` 上调）：本机已升到 31.6 GB 内存 / 20 逻辑核，实测 6 个 worker 把可用内存从 ~15.5 GB 压到 ~13.2 GB，余量充足。`-n 4` 是 16 GB 时代的产物（当时 `-n auto` 的 ~20 worker 会因大量 torch 测试同时初始化 CUDA 而击穿内存）；现在仍不用 `auto`。内存更小的机器可下调，或设 `QLH_TEST_WORKERS` 覆盖通道脚本。
 
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯不替代这些证据。测试通道划分与标记语义见[测试通道运行说明](docs/测试通道运行说明.md)，判据与对照组见[测试与评判标准](docs/测试与评判标准.md)。
 

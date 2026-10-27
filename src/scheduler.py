@@ -272,6 +272,161 @@ def _node_supports_forward_layers(node: "NodeInfo") -> bool:
     return node_supports_forward_layers(node)
 
 
+def _local_cpu_layer_artifact() -> str:
+    """本机 CPU 段要常驻的**裁层 GGUF** 路径（`QLH_LAYER_GGUF`）。未设返回空串。
+
+    刻意直读环境变量而非新增 config 常量：`engine_host._layer_forward_upstream()`
+    也是直读同一个键（`environment.get("QLH_LAYER_GGUF")`）。两处同源，才不会出现
+    "规划按 A 文件算、执行却加载 B 文件"这种只在推理时才炸的错位。
+    """
+    raw = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    if not path.is_absolute():
+        # 相对路径按仓库根解析（`.env` 里写的是 `models/...`），与 `koakuma.bat`
+        # 的工作目录一致。`src/scheduler.py` 的上一级就是仓库根。
+        path = Path(__file__).resolve().parents[1] / path
+    return str(path)
+
+
+def _local_cpu_layer_bytes() -> int:
+    """由裁好的 GGUF 工件推导**每层字节**（文件大小 ÷ 覆盖层数）。取不到返回 0。
+
+    工件就是本机 CPU 段要常驻主机内存的权重本身 ⇒ 尺寸是权威来源，不需要另设旋钮
+    （少一个要对齐的配置项，就少一处"看起来生效其实没接上"的隐患）。层数由
+    `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE` 给出。
+
+    返回 0 时调用方**不给** `layer_budget`，退化为精确区间匹配的既有行为 ——
+    规划期少一点灵活性，好过按错误的每层字节算出装不下的计划。
+    """
+    from config import local_cpu_executor_layer_range
+
+    layer_range = local_cpu_executor_layer_range()
+    if layer_range is None:
+        return 0
+    layers = int(layer_range[1]) - int(layer_range[0])
+    if layers <= 0:
+        return 0
+    artifact = _local_cpu_layer_artifact()
+    if not artifact:
+        return 0
+    try:
+        size = Path(artifact).stat().st_size
+    except OSError:
+        return 0
+    return size // layers if size > 0 else 0
+
+
+def _local_cpu_artifact_sha256() -> str:
+    """本机 CPU 段工件的 SHA-256（取不到返回空串）。"""
+    from model_supply_digest_cache import DigestCacheError, cached_sha256
+
+    artifact = _local_cpu_layer_artifact()
+    if not artifact:
+        return ""
+    try:
+        return cached_sha256(artifact)
+    except (OSError, DigestCacheError):
+        return ""
+
+
+def _local_cpu_layer_artifacts(records) -> list:
+    """为本机 CPU 段申报 `layer_artifacts`（求解器补齐整模视图的唯一数据源）。
+
+    ★ 2026-10-26（LOCAL-EXECUTORS-01）：**这是"同机两段并存"的最后一环。**
+
+    求解器要用**整模**的逐层字节（`_descriptor_costs` 要求每层正字节），而跨格式
+    主节点（PyTorch 描述器 + GGUF 层段）的 descriptor **只覆盖 master 自己那 8 层**，
+    其余靠 `_merge_source_layer_bytes(descriptor, usable)` 从各节点的
+    `layer_artifacts` 平移拼出来。
+
+    主段 `[0,8)`、本机 CPU 段 `[8,24)`、远端各占其余 ⇒ CPU 段**不申报**，
+    `[8,24)` 这 16 层就永远是 0。实测（2026-10-26 09:58）：
+
+        PipelineCapacityError: every decoder layer must have a positive byte count
+          (zero at layers [8..19]...; total_layers=32, zero_count=24)
+
+    ⇒ `prepare` 直接失败（`pipeline_capacity_descriptor_invalid`），
+    而此时四段工件其实**全部已就位**（视图里全是 `available`）。
+
+    `source_model_sha256` **必须与描述器一致**，否则补齐函数会静默跳过本工件；
+    它取自其他节点已申报的工件身份（同一次供给里它们同源）。
+    """
+    from config import local_cpu_executor_layer_range
+
+    layer_range = local_cpu_executor_layer_range()
+    per_layer = _local_cpu_layer_bytes()
+    if layer_range is None or per_layer <= 0:
+        return []
+    source_sha = ""
+    model_id = ""
+    # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 前置）：**复用候选需要完整身份**。
+    #
+    #   `model_supply_plan_reuse._candidates` 的准入判据是"物理身份可证"：工件要带
+    #   `source_model_id` / `source_model_sha256` / `tokenizer_sha256` / `hidden_size`
+    #   与 `models` 证据（engine/format/digest 都对上）。此前这里只抄了
+    #   `source_model_sha256` + `model_id` ⇒ 即使把"跳过 master"改成按
+    #   `(node_id, executor_id)` 放行，本机 CPU 段的段仍然**进不了**候选
+    #   （缺 `source_model_id`/`tokenizer_sha256`/`hidden_size`，`models` 也对不上）
+    #   ⇒ A8 的两处键修复在真机上等于没生效。
+    #   这三项与 `source_model_sha256` 同源（都取自同一批远端工件，同一次供给），
+    #   必须**一起**声明：求解器的 `_normalize_layer_artifacts` 明确要求
+    #   "model preflight fields must be declared together"。
+    contract_fields: dict[str, object] = {}
+    for item in records or ():
+        if not isinstance(item, dict) or str(item.get("executor_id") or ""):
+            continue
+        for artifact in item.get("layer_artifacts") or ():
+            sha = str(artifact.get("source_model_sha256", "") or "").strip().lower()
+            if sha:
+                source_sha = sha
+                model_id = str(artifact.get("model_id", "") or "").strip()
+                for key in ("source_model_id", "tokenizer_sha256", "hidden_size"):
+                    if key in artifact:
+                        contract_fields[key] = artifact[key]
+                break
+        if source_sha:
+            break
+    if not source_sha or not model_id:
+        # ★ 2026-10-27（审计 §9.4 #6）：**静默不可复用是最难查的形态**。
+        #
+        #   这里返回 `[]` 意味着本机 CPU 段的 `[start,end)` 这十几层在求解器的
+        #   整模视图里**仍然是 0 字节** ⇒ 要么 `pipeline_capacity_descriptor_invalid`
+        #   （描述器缺层），要么 CPU 段直接进不了候选。两种表现的现场症状都离
+        #   "因为远端工件没带 source_model_id"很远，只能靠翻代码猜。
+        #   加一条警告，把"缺哪一项、为什么缺"直接说出来。
+        logger.warning(
+            "event=local_cpu_layer_artifacts_unavailable have_source_sha=%s "
+            "have_model_id=%s executor_id=%s hint=远端工件需同时带 "
+            "source_model_sha256 与 model_id（同一次供给同源）",
+            bool(source_sha), bool(model_id), "cpu",
+        )
+        return []
+    artifact_sha = _local_cpu_artifact_sha256()
+    if not artifact_sha:
+        logger.warning(
+            "event=local_cpu_layer_artifacts_unavailable reason=artifact_digest_missing "
+            "hint=QLH_LAYER_GGUF 指向的裁层工件不存在或不可读",
+        )
+        return []
+    start, end = int(layer_range[0]), int(layer_range[1])
+    if end <= start:
+        return []
+    artifact = {
+        "layer_range": [start, end],
+        "segment_mode": "middle",
+        "model_id": model_id,
+        "artifact_sha256": artifact_sha,
+        "source_model_sha256": source_sha,
+        "layer_weight_bytes": [per_layer] * (end - start),
+    }
+    # 三项必须齐全才带上（缺一项就整组不声明，退回"不可复用"而不是半真半假）。
+    if set(contract_fields) == {"source_model_id", "tokenizer_sha256", "hidden_size"}:
+        artifact.update(contract_fields)
+    return [artifact]
+
+
 
 class Scheduler(
     SchedulerSidecarMixin, SchedulerTaskWorkerMixin,
@@ -523,6 +678,16 @@ class Scheduler(
         self._remote_task_worker_providers: dict[
             str, RemoteFullWorkerProvider
         ] = {}
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机执行器 provider**。键为
+        #   `node_id` 或 `node_id#executor_id`。本机执行器（例如 master 上的 CPU 段）
+        #   与远端 worker 共用同一套 `StageRequest`/`ProviderExecutor` 契约，但**没有
+        #   TCP 连接** ⇒ 不能走 `RemoteFullWorkerProvider`（它按 node_id 发帧、并把
+        #   故障归属绑到连接世代上）。
+        self._local_task_worker_providers: dict[str, Any] = {}
+        # 懒建、进程内共用：`EngineHost` 只在本机执行器首次被调度时才构造，且它的
+        # keep-head 上游（`QLH_LAYER_GGUF`）是**首次执行才加载** ⇒ 不执行就不加载，
+        # 对既有拓扑零影响。
+        self._local_engine_host: Any = None
         self._task_worker_stage_lock = threading.RLock()
         self._task_worker_active_attempts: dict[
             str, _TaskWorkerActiveAttempt
@@ -2023,7 +2188,15 @@ class Scheduler(
     ) -> list[dict]:
         """Project live layer-worker profiles into explicit free-memory budgets."""
         from contextlib import nullcontext
-        from config import PIPELINE_CAPACITY_RESERVE_MB
+        from config import (
+            HOST_RAM_MAX_FRACTION,
+            LOCAL_CPU_EXECUTOR_ID,
+            LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            PIPELINE_CAPACITY_RESERVE_MB,
+            local_cpu_executor_enabled,
+            local_cpu_executor_host_fraction,
+            local_cpu_executor_layer_range,
+        )
         from koakuma_engine import canonical_backend
 
         # ★ 2026-10-07（DIST-NEXT-4b）：规划前先回收「心跳已过期且没有在跑 attempt」的
@@ -2348,6 +2521,46 @@ class Scheduler(
                 "engine": engine,
                 "score": self._compute_node_weight(device_info, execution_device=execution_device),
             }
+            # ★ 2026-10-25：**按节点标定的每层推理成本**（毫秒，相对量）。切点求解原先
+            #   按解码器**字节**份额均衡，把最慢的设备当成和最快的设备一样贵 —— 实测
+            #   三机每层差 2.3 倍（master 12.6 / rog-5060 8.7 / android-542cd254 20.1 ms，
+            #   见 docs/本机跨框架层段成本与干扰实测-2026-10-25.md），典型后果是 rog 扛
+            #   24 层成瓶颈而最慢的 android 只扛 8 层。
+            #   读取点必须在这里：`qlh_core.planning.capacity` 是**纯求解器**，契约禁止
+            #   它访问 ambient state（tests/test_refactor_capacity_load_spec.py 会把
+            #   `logging.Logger._log` patch 成 forbidden 来断言这一点），所以标定值由
+            #   调用方填进节点记录。未标定 ⇒ 不填 ⇒ 求解器按 1.0，与旧行为逐字节等价。
+            from config import LAYER_COST_MS_DEFAULT, layer_cost_ms_by_node
+            node_cost_ms = layer_cost_ms_by_node().get(node_id, LAYER_COST_MS_DEFAULT)
+            if node_cost_ms and node_cost_ms > 0:
+                record["layer_cost_ms"] = float(node_cost_ms)
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**主机内存额度**。
+            #   此前**只有** `model_supply.py:1018` 会产生 `host_capacity_bytes`，而
+            #   `scheduler` 的记录从不填它 ⇒ 下游（例如本机 CPU 执行器记录的域总账
+            #   `domain_total_bytes`）只能回落到 `capacity_bytes`（即时 available RAM）。
+            #   两者语义不同：额度是"这台机器允许多少 RAM 给模型"，而 available 会被
+            #   **上一轮供给尚未释放的残留**压低 —— 实测同一份配置在规划期与加载期两次
+            #   取值相差一倍（18.6 GB → 8.6 GB），直接把本机 CPU 段挤到无解。
+            #   这里按 `model_supply.py` 的**同一公式**补上，保证来源单一。
+            if node_id == local_node_id or node.role == NodeRole.MASTER:
+                try:
+                    import psutil
+
+                    memory = psutil.virtual_memory()
+                    # ⚠️ 用 `getattr` 取值：既有测试会 mock `psutil.virtual_memory()`
+                    #    成一个只带 `available` 的 `SimpleNamespace`（见
+                    #    tests/test_pipeline_execution_capacity.py），直接取 `.total`
+                    #    会 `AttributeError` 打断整条规划路径。
+                    total_ram = int(getattr(memory, "total", 0) or 0)
+                    available_ram = int(getattr(memory, "available", 0) or 0)
+                    if total_ram > 0:
+                        allowed = int(total_ram * HOST_RAM_MAX_FRACTION)
+                        record["host_capacity_bytes"] = max(
+                            0, min(available_ram, allowed))
+                    elif available_ram > 0:
+                        record["host_capacity_bytes"] = available_ram
+                except (ImportError, OSError, ValueError):
+                    pass
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
             if node_id in layer_artifacts_by_node:
@@ -2380,7 +2593,27 @@ class Scheduler(
                 and "layer_ranges" not in record
                 and node_id not in layer_ranges_by_node
             ):
-                local_artifact = self._configured_layer_artifact()
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机 CPU 段启用时，主段不得借用它的工件声明**。
+                #
+                #   `QLH_LAYER_GGUF` 指向的是 **CPU 段**的裁层工件（`mid8-24`）；
+                #   `_configured_layer_artifact()` 读 `get_selected_model()`，也会落到那份
+                #   工件上。若主段据此声明 `[[8,24]] + segment_mode="middle"`，它就**当不了
+                #   首段**（head 要求 `cursor == 0`），而 `[0,8)` 无人承担 ⇒ 整盘无解。
+                #
+                #   实测（2026-10-26 02:55）：
+                #     event=supply_release_candidates_supplied
+                #     nodes=[('master','',[[8,24]],None), ..., ('master','cpu',[[8,24]],None)]
+                #     ⇒ baseline/released 双双 `pipeline_candidate_layer_range_unsatisfied`
+                #   （注意 `had=[False,False,False,False]` —— **候选压根不是原因**，最初几轮
+                #   我一直朝候选锁的方向查，方向错了。）
+                #
+                #   ⇒ CPU 段启用时，主段的区间留给它**自己的运行时**决定：它在 CUDA 上跑
+                #   PyTorch、按显存规划（这正是 `local_executor_entered_supply_plan` 之后的
+                #   正常路径）。CPU 段的工件只描述 CPU 段自己。
+                local_cpu_executor_on = local_cpu_executor_enabled()
+                local_artifact = (
+                    None if local_cpu_executor_on else self._configured_layer_artifact()
+                )
                 if local_artifact:
                     record["layer_ranges"] = [
                         [int(local_artifact["start"]), int(local_artifact["end"])],
@@ -2388,11 +2621,316 @@ class Scheduler(
                     local_mode = str(local_artifact.get("segment_mode") or local_artifact.get("mode", "") or "").lower()
                     if local_mode in {"head", "middle", "tail"}:
                         record["segment_mode"] = local_mode
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机节点如实声明"能按分配本地裁层"**。
+            #
+            #   远端节点的 `layer_budget` 来自 v3 hello capabilities；本机**没有** hello
+            #   握手，于是在求解器里 `advertised_budget` 为 None ⇒ 走 `layer_ranges`
+            #   **硬约束**分支（`capacity.py` 的判据：
+            #   `if advertised_budget is None or not advertised_budget.get("local_cut")`）。
+            #   而本机的 `layer_ranges` 来自 `_configured_layer_artifact`
+            #   （`scheduler_task_worker.py:365`），它读的是 `get_selected_model()`
+            #   —— **上一轮供给留下的段** ⇒ 循环依赖：规划被旧段约束，于是永远切不出
+            #   新段。
+            #
+            #   实测后果：master 声明 `[0,8)`、本机 CPU 段声明 `[4,24)`，在 `[4,8)`
+            #   重叠 ⇒ 37 个候选被 `node_layer_range_not_advertised` 排除 ⇒ 无解。
+            #   而同一份日志显示 `allocatable_bytes=15370092544`、域超额全为 0
+            #   ⇒ **容量根本不是瓶颈**，卡住的是这个循环依赖。
+            #
+            #   本机**确实**具备本地裁层能力（`materialize_pipeline_candidate` 会按分配
+            #   区间裁段），所以声明 `local_cut=True` 是**如实声明既有能力**，语义与远端
+            #   `local_cut=true` 完全一致 —— 声明后 `layer_ranges` 降级为"当前已就绪"的
+            #   信息，而不是硬约束。
+            #
+            #   `per_layer_bytes` 取不到 descriptor 时**不声明**（不填占位值）：额度必须
+            #   有依据，塞一个 1 会让 `max_layers` 变成天文数字，比不声明更坏。
+            try:
+                local_descriptor = self._host.get_pipeline_descriptor()
+                # ⚠️ 键名是 `layer_weight_bytes`（`pipeline_model_descriptor.py:659`
+                #    的 `inspect_pipeline_model` 返回），**不是** `layer_bytes` ——
+                #    第一版写错，取到 0 ⇒ 判定"无依据" ⇒ 不声明 ⇒ 循环依赖照旧。
+                #    两个键都试是为了容忍不同引擎（llama_engine 侧）的表述差异。
+                descriptor_layers = list(
+                    local_descriptor.get("layer_weight_bytes")
+                    or local_descriptor.get("layer_bytes") or []
+                )
+                per_layer_bytes = int(descriptor_layers[0]) if descriptor_layers else 0
+            except Exception:
+                per_layer_bytes = 0
+            if per_layer_bytes > 0:
+                record["layer_budget"] = {
+                    "available_bytes": int(record["capacity_bytes"]),
+                    "per_layer_bytes": per_layer_bytes,
+                    "max_layers": max(1, int(record["capacity_bytes"]) // per_layer_bytes),
+                    "local_cut": True,
+                }
+            if node_id in {"master", local_node_id} and not record.get("executor_id"):
+                logger.info(
+                    "event=local_primary_budget_declared has_budget=%s local_cut=%s "
+                    "per_layer_bytes=%s max_layers=%s ranges=%s",
+                    record.get("layer_budget") is not None,
+                    (record.get("layer_budget") or {}).get("local_cut"),
+                    per_layer_bytes,
+                    (record.get("layer_budget") or {}).get("max_layers"),
+                    record.get("layer_ranges"),
+                )
             records.append(record)
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机 CPU 执行器（同机第二个执行器）**。
+        #   由 `QLH_LOCAL_CPU_EXECUTOR=1` 开启（默认关 ⇒ 既有拓扑逐位不变）。
+        #   三个要点：
+        #     * `node_id` 与主执行器**相同** —— 它就是**同一台物理机**（同一传输身份、
+        #       同一份 RAM、同一断线归属）；靠 `executor_id` 区分。
+        #       刻意**不做**成"重复注册虚拟物理节点"：那样 RAM 共享、断线、设备竞争都会
+        #       被两套独立记账掩盖（`NInfer…:120` 反对的正是这个）。
+        #     * `capacity_domain_id` = 主执行器 node_id、`domain_total_bytes` = 本机 host
+        #       容量 ⇒ 两段**共用一份总账**，求解器不会给出物理上装不下的计划
+        #       （`validate_capacity_domains` 会 fail closed）。
+        #     * `segment_mode="middle"` —— keep-head 上游的挂点在 `output_norm` **之后**，
+        #       所以它**不能当首段**（首段必须有 embedding）。
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**探针**。本机 CPU 段的启用判据有三个
+        #   独立的输入（开关、角色、工件区间），任何一个是空值都会让整段静默消失，
+        #   而日志里只表现成"CPU 段不在 plan 里"——无法区分是哪一项没满足。
+        #   实测（2026-10-26 09:50）：`.env` 写明 `QLH_LOCAL_CPU_EXECUTOR=1`，但
+        #   CPU 段始终不申报，全靠逐个变量猜。这一行把三项一次打出来。
+        logger.info(
+            "event=local_cpu_executor_probe enabled=%s role=%s layer_range=%s "
+            "host_fraction=%.2f env_raw=%r",
+            local_cpu_executor_enabled(), self._effective_role(),
+            local_cpu_executor_layer_range(), local_cpu_executor_host_fraction(),
+            os.environ.get("QLH_LOCAL_CPU_EXECUTOR"),
+        )
+        if local_cpu_executor_enabled() and self._effective_role() == "master":
+            # ★ 2026-10-25：**把本机主段的层区间打出来**。求解器报
+            #   `node_layer_range_not_advertised` 时，`candidate_exclusions` 只能指出
+            #   "master 的哪些候选被排除"，却看不到它**实际声明了**什么区间 —— 而两者
+            #   相减才是根因。实测环境门卡住正是如此：master 声明的是**上一轮供给残留**
+            #   的段（`_configured_layer_artifact` 从 `get_selected_model()` 推导），
+            #   与 CPU 段的 `[4,24)` 在 `[4,8)` 重叠 ⇒ 无法连续切分 ⇒ 无解，而日志里
+            #   完全看不到这个区间值。
+            if self._effective_role() == "master":
+                local_ranges = next((
+                    item.get("layer_ranges") for item in records
+                    if item["node_id"] in {"master", local_node_id}
+                    and not item.get("executor_id")
+                ), None)
+                logger.info(
+                    "event=local_primary_layer_ranges ranges=%s",
+                    local_ranges,
+                )
+            # ⚠️ 匹配判据必须同时认字面量 `"master"` 与 `get_effective_node_id()`：
+            #    主节点的本地 ID 在 records 里是**字面量** `"master"`，而后者返回
+            #    `_configured_node_id()`（可能是主机名），两者**不等** —— 同一文件
+            #    `_pipeline_node_metadata` 上方（`record["layer_ranges"]` 那处）已经为
+            #    这个坑留过注释，这里重复踩过一次（测试直接抓到 extra 为空）。
+            base_record = next(
+                (item for item in records
+                 if item["node_id"] in {"master", local_node_id}
+                 and not item.get("executor_id")), None)
+            if base_record is not None:
+                cpu_record = self._local_cpu_executor_record(base_record)
+                # `None` = 缺工件边界（未配 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`）
+                # ⇒ fail-closed，不申报这一执行器（理由见该函数内的注释）。
+                if cpu_record is not None:
+                    records.append(cpu_record)
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**申报本段工件**。
+                    #   descriptor 的整模逐层字节只覆盖 master 段，其余靠
+                    #   `_merge_source_layer_bytes` 从各节点 `layer_artifacts` 补；
+                    #   CPU 段不申报 ⇒ 它那 16 层永远是 0 ⇒ prepare 报
+                    #   `every decoder layer must have a positive byte count`。
+                    #   源身份取自同一批 records 里远端已申报的工件（同源）。
+                    _cpu_artifacts = _local_cpu_layer_artifacts(records)
+                    if _cpu_artifacts:
+                        cpu_record["layer_artifacts"] = _cpu_artifacts
+                        # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 前置）：**本机 CPU 段的物理
+                        #   模型证据**。复用候选要求"引擎/格式/摘要都对得上"（
+                        #   `model_supply_plan_reuse._model_matches`），而这份记录此前没有
+                        #   `models` ⇒ `_candidates` 即使按 `(node_id, executor_id)` 放行，
+                        #   也会在"物理身份不可证"处被拒 ⇒ CPU 段的已验证 GGUF 段仍进不了
+                        #   复用候选（现场表现就是"配了 CPU 段，供给每轮还是不用它"）。
+                        #   `sha256` 用**本段工件自己的摘要**（不是远端那段），`model_id`
+                        #   与 `layer_artifacts[0]` 保持一致，两者才能配对。
+                        cpu_record["models"] = [{
+                            "model_id": _cpu_artifacts[0]["model_id"],
+                            "sha256": _cpu_artifacts[0]["artifact_sha256"],
+                            "engine": "llama_cpp",
+                            "format": "gguf",
+                            "revision": "local",
+                        }]
+                        logger.info(
+                            "event=local_cpu_executor_artifact_declared "
+                            "layer_range=%s layers=%s per_layer_bytes=%s "
+                            "source=%s artifact_sha256=%s",
+                            _cpu_artifacts[0]["layer_range"],
+                            len(_cpu_artifacts[0]["layer_weight_bytes"]),
+                            _cpu_artifacts[0]["layer_weight_bytes"][0]
+                            if _cpu_artifacts[0]["layer_weight_bytes"] else 0,
+                            _cpu_artifacts[0]["source_model_sha256"][:12],
+                            _cpu_artifacts[0]["artifact_sha256"][:12],
+                        )
+                    else:
+                        # 缺源身份或工件摘要 ⇒ 补齐会失败，宁可现在就喊出来。
+                        logger.warning(
+                            "event=local_cpu_executor_artifact_missing reason=%s",
+                            "no-source-identity" if not _cpu_artifacts
+                            else "unknown",
+                        )
+                # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**两段分摊同一份主机内存总账**，
+                #   且必须**幂等**。域校验按主机内存记账（见 `capacity_domains`），若两段
+                #   都按整机申报 ⇒ 之和超总账 ⇒ `pipeline_capacity_domain_exceeded`
+                #   （实测超额 1.56 GB，而物理上并不冲突）。
+                #   ⚠️ 不能"在 `host_capacity_bytes` 上原地做减法"：那个字段还承载
+                #   `safetensors_layer_offload` 的 host 预算，扣它会连带削掉 offload 额度；
+                #   而且 `_get_pipeline_capacity_nodes` **会被多次调用、每次重建 records**，
+                #   原地扣减只对那一次返回值生效，供给拿到的仍是未扣快照（实测踩到）。
+                #   正确做法：走**专用**通道 `domain_allocatable_bytes`，每段的值都从
+                #   `domain_total_bytes`（即主机额度本身）**重新推导** ⇒ 与调用次数无关。
+                host_total = int(cpu_record["domain_total_bytes"])
+                cpu_share = max(0, int(cpu_record["capacity_bytes"]))
+                cpu_record["domain_allocatable_bytes"] = cpu_share
+                base_record["domain_total_bytes"] = host_total
+                base_record["domain_allocatable_bytes"] = max(0, host_total - cpu_share)
+                logger.info(
+                    "event=local_host_budget_split primary_allocatable=%s "
+                    "cpu_share=%s domain_total=%s",
+                    base_record["domain_allocatable_bytes"],
+                    cpu_share,
+                    host_total,
+                )
+                logger.info(
+                    "event=local_cpu_executor_declared node_id=%s executor_id=%s "
+                    "capacity_bytes=%s domain_total_bytes=%s layer_cost_ms=%s",
+                    cpu_record["node_id"], cpu_record["executor_id"],
+                    cpu_record["capacity_bytes"], cpu_record["domain_total_bytes"],
+                    cpu_record["layer_cost_ms"],
+                )
         return records
 
-    def _pipeline_node_metadata(self) -> dict[str, dict]:
+    @staticmethod
+    def _local_cpu_executor_record(base_record: dict) -> Optional[dict]:
+        """由**主执行器**记录派生出**本机 CPU 执行器**记录（同 node_id，不同 executor_id）。
+
+        ★ 2026-10-25（LOCAL-EXECUTORS-01）。抽成纯函数有两个理由：一是它承载了本票最
+        核心的三条不变量（见下），值得被单独测试；二是 `_get_pipeline_capacity_nodes`
+        在既有 fixture 里会被整体替换掉，藏在里面的逻辑无从验证。
+
+        三条不变量：
+          * `node_id` 与主执行器**相同** —— 它就是**同一台物理机**（同一传输身份、同一
+            份 RAM、同一断线归属）。刻意**不做**成"重复注册虚拟物理节点"：那样 RAM
+            共享、断线、设备竞争都会被两套独立记账掩盖（`NInfer…:120` 反对的正是这个）。
+          * `capacity_domain_id` = 主执行器 node_id、`domain_total_bytes` = 本机 host
+            容量 ⇒ 两段**共用一份总账**，求解器不会给出物理上装不下的计划
+            （`validate_capacity_domains` 会 fail closed）。
+          * `segment_mode="middle"` —— keep-head 上游的挂点在 `output_norm` **之后**，
+            所以它**不能当首段**（首段必须有 embedding）。
+        """
+        from config import (
+            LOCAL_CPU_EXECUTOR_ID,
+            LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            local_cpu_executor_host_fraction,
+            local_cpu_executor_layer_range,
+        )
+
+        host_total = int(base_record.get("host_capacity_bytes")
+                         or base_record["capacity_bytes"])
+        record = {
+            "node_id": base_record["node_id"],
+            "role": base_record["role"],
+            "executor_id": LOCAL_CPU_EXECUTOR_ID,
+            "capacity_domain_id": base_record["node_id"],
+            "domain_total_bytes": host_total,
+            "capacity_bytes": max(
+                0, int(host_total * local_cpu_executor_host_fraction())),
+            "reserve_bytes": base_record["reserve_bytes"],
+            "reserve_source": "config.PIPELINE_CAPACITY_RESERVE_MB",
+            "runtime_multiplier": base_record["runtime_multiplier"],
+            "execution_device": "cpu",
+            "capacity_source": "local_cpu_executor_host_ram",
+            "engine": "llama_cpp",
+            "score": base_record["score"],
+            "layer_cost_ms": LOCAL_CPU_EXECUTOR_LAYER_COST_MS,
+            "segment_mode": "middle",
+        }
+        # ★ 2026-10-25：把**裁好的 GGUF 工件的层区间**钉给求解器
+        #   （`QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`，例 `4,24` 对应
+        #   `q35-9b-local-mid4-24.gguf`）。不给它约束的话，求解器可能切出工件不覆盖的
+        #   层 —— 而那种失败表现为**运行期**层号越界/权重缺失，不是规划期报错，属于
+        #   "部署看起来成功、第一次推理才炸"的最坏形态。
+        #   判据与远端 worker 的 `layer_ranges` 同源（那里来自 hello capabilities）。
+        layer_range = local_cpu_executor_layer_range()
+        if layer_range is not None:
+            record["layer_ranges"] = [[int(layer_range[0]), int(layer_range[1])]]
+        else:
+            # ★ 2026-10-27（审计 §9.4 #6）：**缺工件边界就不该产出这条记录**。
+            #
+            #   此前只打一条 warning 就继续产出，于是这条 CPU 记录**没有
+            #   `layer_ranges`、也没有 `layer_budget.min_layer/max_layer`**
+            #   ⇒ 求解器把它当成"任意区间都能跑"的执行器，可以派它做工件根本没覆盖的
+            #   层。失败表现为**运行期**层号越界／权重缺失，不是规划期报错 ——
+            #   正是上面这条注释already写过的"部署看起来成功、第一次推理才炸"。
+            #
+            #   B1（切点释放）落地后这个风险变大了：它现在会主动重解以**争取**让附加
+            #   执行器参与，也就更容易把它推到边界之外。所以改成 fail-closed：
+            #   没有 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE` 就**不申报**这一执行器，
+            #   让"配了但没配全"在规划期表现为"这台机器的 CPU 段不参与"，而不是在
+            #   第一次推理时炸。
+            logger.warning(
+                "event=local_cpu_executor_skipped reason=layer_range_unconstrained "
+                "executor_id=%s hint=请设 QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=start,end "
+                "与本机裁层 GGUF 对齐（未设置时该执行器不参与规划）",
+                LOCAL_CPU_EXECUTOR_ID,
+            )
+            return None
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**段区间不是硬锁，本机 CPU 段要能自适应切分**。
+        #   只给 `layer_ranges` 会让它落到**精确匹配**语义（`[[8,24]]` 只允许整段
+        #   `(8,24)`），于是它被迫吃满 16 层。而两个远端各 12 层的方案在目标函数第二项
+        #   `Σ work²/weight`（均衡项）上更优 ⇒ 同样 3 段，求解器选了远端组合、CPU 段空转
+        #   （2026-10-26 真机实测：`master[0,8) + android[8,20) + TABLET[20,32)`，
+        #   而 CPU 段在候选里却没被选）。
+        #   远端 worker 靠 `layer_budget.local_cut=True` 获得同等的灵活性（供给记录里
+        #   这条来自 hello capabilities），本机执行器此前缺的正是这一项。
+        #   每层字节由**裁好的 GGUF 工件**推导（文件大小 ÷ 它覆盖的层数）—— 工件就是
+        #   要常驻内存的权重本身，尺寸是权威，且不需要读求解器不该碰的环境状态。
+        #   取不到尺寸时**不给** budget（退化为精确匹配的既有行为），并留一条诊断。
+        per_layer_bytes = _local_cpu_layer_bytes()
+        if per_layer_bytes > 0:
+            capacity = int(record["capacity_bytes"])
+            budget = {
+                "available_bytes": capacity,
+                "per_layer_bytes": per_layer_bytes,
+                "max_layers": max(1, capacity // per_layer_bytes),
+                "local_cut": True,
+            }
+            if layer_range is not None:
+                # ★ 工件边界：`local_cut` 只解锁**切分粒度**（能在区间内任意切），
+                #   但本机 CPU 段手上只有**裁好的部分工件**、不能自裁到任意区间
+                #   ⇒ 用 `min_layer`/`max_layer` 钉住它的可切范围。
+                #   缺了这两项，求解器会把工件覆盖不到的层派给它，而失败发生在**执行期**
+                #   （层号越界/权重缺失）—— 真机实测踩到过：capacity plan 给
+                #   `('master','cpu',0,8)`，工件却是 `mid8-24`。
+                budget["min_layer"] = int(layer_range[0])
+                budget["max_layer"] = int(layer_range[1])
+            record["layer_budget"] = budget
+            logger.info(
+                "event=local_cpu_executor_budget per_layer_bytes=%s max_layers=%s "
+                "bounds=%s artifact=%s",
+                per_layer_bytes,
+                budget["max_layers"],
+                f"[{budget.get('min_layer')},{budget.get('max_layer')})"
+                if "min_layer" in budget else "(unbounded)",
+                _local_cpu_layer_artifact() or "(unset)",
+            )
+        else:
+            logger.warning(
+                "event=local_cpu_executor_budget_unavailable executor_id=%s "
+                "hint=QLH_LAYER_GGUF 指向的裁层工件不存在或不可读 ⇒ 回落到精确区间匹配",
+                LOCAL_CPU_EXECUTOR_ID,
+            )
+        return record
+
+    def _pipeline_node_metadata(self) -> dict[Any, dict]:
         """Project live scheduler nodes into opaque layout-location metadata."""
+        from config import LOCAL_CPU_EXECUTOR_ID
+
         local_node_id = (
             "master" if self._effective_role() == "master"
             else self.get_effective_node_id()
@@ -2439,8 +2977,8 @@ class Scheduler(
                 ]
                 if len(normalized) == 1:
                     worker_engines[str(worker.get("node_id", ""))] = normalized[0]
-        return {
-            node_id: {
+        metadata = {
+            (node_id, ""): {
                 "is_local": node_id == local_node_id,
                 # Public plans distinguish local/remote without exporting an
                 # address that belongs to the transport control plane.
@@ -2461,6 +2999,17 @@ class Scheduler(
             }
             for node_id, _node in snapshot
         }
+        local = metadata.get((local_node_id, ""))
+        if local is not None:
+            metadata[(local_node_id, LOCAL_CPU_EXECUTOR_ID)] = {
+                **local, "engine": "llama_cpp", "artifact_kind": "gguf_segment",
+            }
+        metadata.update({
+            node_id: dict(value)
+            for (node_id, executor_id), value in tuple(metadata.items())
+            if not executor_id
+        })
+        return metadata
 
     def _attach_pipeline_node_contract(
         self, plan: dict, *, capacity_nodes: Optional[list[dict]] = None,
@@ -2469,14 +3018,45 @@ class Scheduler(
         if not isinstance(plan, dict) or plan.get("admitted") is not True:
             return plan
         result = dict(plan)
-        if capacity_nodes is not None:
+        coordinator = getattr(self, "_pipeline_reshard_coordinator", None)
+        if result.get("pipeline_layout") is None and coordinator is not None:
+            plan_id = str(result.get("plan_id") or "")
+            for staged in coordinator.snapshot().get("staged", []):
+                if plan_id and staged.get("capacity_plan_id") == plan_id:
+                    result["pipeline_layout"] = staged["candidate_layout"]
+                    break
+        if capacity_nodes is not None and result.get("pipeline_layout") is None:
+            # ★ 2026-10-27（LOCAL-EXECUTORS-01）：键必须是 `(node_id, executor_id)`。
+            #
+            #   同机可有多个执行器（主段 `executor_id=""` 走 pytorch，CPU 段
+            #   `executor_id="cpu"` 走 llama_cpp），`capacity_nodes` 里它们**共用
+            #   `node_id`**，而 `_local_cpu_executor_record` 是**追加在主记录之后**的。
+            #
+            #   此前用裸 `node_id` 建字典 ⇒ 后写的 CPU 段覆盖主段
+            #   ⇒ `engines["master"] == "llama_cpp"`。求解器产出的 assignment 不带
+            #   `engine`（`capacity.plan_segment_supply` 不产出该键）⇒ 两条 assignment
+            #   都满足回填条件 ⇒ **主段被盖上 CPU 段的引擎**。
+            #
+            #   下游都按它判形态：
+            #     * `model_host.freeze_pipeline_candidate_assignment` 用它定 `native`
+            #       ⇒ 主段被当成 GGUF 段、去取 `QLH_LAYER_GGUF` 的摘要；
+            #     * `pipeline_node_contract` 用它定 `artifact_kind` / `cross_engine`
+            #       ⇒ 同机两段不再被识别为跨引擎接力；
+            #     * `model_supply` 用它推 `quant_type`（`assignments[0]` 是主段）。
+            #
+            #   这是 `model_host.py` 那句注释（"此前用 `transaction.manager` 判
+            #   `native` ⇒ CPU 段被当成 safetensors 段"）的**镜像**：同一个键，
+            #   反方向的错法。
             engines = {
-                item["node_id"]: item["engine"] for item in capacity_nodes
+                (item["node_id"], str(item.get("executor_id") or "")): item["engine"]
+                for item in capacity_nodes
                 if item.get("engine")
             }
             result["assignments"] = [
-                {**item, "engine": engines[item["node_id"]]}
-                if item.get("node_id") in engines and not item.get("engine")
+                {**item, "engine": engines[(
+                    item["node_id"], str(item.get("executor_id") or ""))]}
+                if (item["node_id"], str(item.get("executor_id") or "")) in engines
+                and not item.get("engine")
                 else dict(item)
                 for item in (result.get("assignments") or [])
             ]
@@ -2497,7 +3077,10 @@ class Scheduler(
         try:
             layout = pipeline_layout_from_capacity_plan(
                 {**result, "assignments": layout_assignments},
-                node_metadata=self._pipeline_node_metadata(),
+                node_metadata=(
+                    self._pipeline_node_metadata()
+                    if result.get("pipeline_layout") is None else None
+                ),
             )
         except PipelineNodeContractError as exc:
             logger.warning(
@@ -2526,7 +3109,10 @@ class Scheduler(
         """Bind a ready capacity plan to an epoch-fenced recovery topology."""
         try:
             layout = pipeline_layout_from_capacity_plan(
-                plan, node_metadata=self._pipeline_node_metadata(),
+                plan, node_metadata=(
+                    self._pipeline_node_metadata()
+                    if plan.get("pipeline_layout") is None else None
+                ),
             )
             coordinator = PipelineReshardCoordinator(
                 layout,
@@ -2569,7 +3155,7 @@ class Scheduler(
                 "reason_code": "pipeline_reshard_descriptor_unavailable",
             }
         else:
-            from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+            from config import PIPELINE_CAPACITY_SAFETY_MARGIN, prefer_all_workers_enabled
 
             server = self._tcp_server
             get_client_ids = getattr(server, "get_client_ids", None)
@@ -2588,6 +3174,17 @@ class Scheduler(
                         str(item) for item in staged.get("failed_node_ids", [])
                         if str(item)
                     )
+                    # ★ 2026-10-27（A4 联动）：**执行器级**失败也要跨轮累积。
+                    #   上一轮"只有 CPU 执行器坏了"若在下一轮断线时被丢掉，
+                    #   已判死的执行器会重新进入候选（计划退化，等于把一个坏段
+                    #   "复活"到新拓扑里）。元素是 `[node_id, executor_id]` 两元
+                    #   列表（见 `PipelineReshardPlan.to_dict()`），转回二元组后
+                    #   交给 `plan_pipeline_reshard` 显式化为执行器级语义。
+                    for identity in staged.get("failed_executor_ids", []) or ():
+                        if isinstance(identity, (list, tuple)) and len(identity) == 2:
+                            failed_node_ids.add(
+                                (str(identity[0]), str(identity[1] or "").strip()),
+                            )
 
             decision = coordinator.stage_failure(
                 failed_node_ids,
@@ -2595,6 +3192,11 @@ class Scheduler(
                 capacity_nodes=self._get_pipeline_capacity_nodes(connected_ids),
                 node_metadata=self._pipeline_node_metadata(),
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                # ★ 2026-10-27（审计 §9.4 #2）：节点数策略必须与 prepare 阶段
+                #   （`get_pipeline_capacity_plan`）**同源**。此前这里没传 ⇒ 恢复计划
+                #   按缺省的"节点数最少"求解 ⇒ 重分片把本机 CPU 段甩掉，而 prepare
+                #   方向想铺开，两条路径的布局来回打架。
+                prefer_all_workers=prefer_all_workers_enabled(),
             )
             report = decision.to_dict()
         with self._layer_config_lock:
@@ -2633,8 +3235,11 @@ class Scheduler(
         if staged_plan is None:
             return False
         try:
+            ready_plan = dict(plan)
+            if ready_plan.get("pipeline_layout") is None:
+                ready_plan["pipeline_layout"] = staged_plan.candidate_layout.to_dict()
             ready_layout = pipeline_layout_from_capacity_plan(
-                plan, node_metadata=self._pipeline_node_metadata(),
+                ready_plan,
             )
         except PipelineNodeContractError:
             return False
@@ -2652,6 +3257,13 @@ class Scheduler(
                 verified=True,
                 has_embedding=requirement.has_embedding,
                 has_lm_head=requirement.has_lm_head,
+                # ★ 2026-10-27（A3 联动，必须）：`covers()` 现在按
+                #   `(node_id, executor_id)` 判身份 —— 这里若漏抄 `executor_id`，
+                #   同机两段拓扑（`master#""` + `master#cpu`）下每一条 requirement
+                #   的证明都会以 `executor_id=""` 落库 ⇒ CPU 段的 requirement
+                #   永远等不到证明 ⇒ commit 恒 `pipeline_reshard_assets_not_ready`
+                #   （本函数是唯一的证明来源，见上方注释）。
+                executor_id=requirement.executor_id,
             ))
         committed = coordinator.commit(
             staged_plan.plan_id, expected_epoch=staged_plan.base_epoch,
@@ -2831,29 +3443,118 @@ class Scheduler(
                 relay_claims=relay_claims,
                 prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
             )
-            if (not result.get("admitted")
-                    and any("candidate_layer_ranges" in node for node in capacity_nodes or [])):
-                # ★ 2026-10-23（#117）：候选区间来自**供给时的切点**（用于锁定复用，
-                #   见 model_supply_capacity 的证据投影）。容量确实不再满足时才放开，
-                #   允许重新切分布局 —— 即"可用内存增加就不动切点、减少才重切"。
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**打印真正喂给求解器的区间**。
+            #   排查持续了几轮的原因正是这里：scheduler 侧自己的诊断
+            #   （`local_primary_layer_ranges`）显示 `[[0,8]]`，而求解器却把 `(0,8)`
+            #   也判为 `node_layer_range_not_advertised` —— 两边看到的**不是同一个值**
+            #   （`_normalize_nodes` 会做规范化、`candidate_layer_ranges` 另有来源）。
+            #   把入口值打出来，才能停止在两侧各自的视图里推测。
+            logger.info(
+                "容量输入区间: %s",
+                [(item.get("node_id"), item.get("executor_id", ""),
+                  item.get("layer_ranges"), item.get("candidate_layer_ranges"))
+                 for item in (capacity_nodes or [])],
+            )
+            # ★ 2026-10-27（LOCAL-EXECUTORS-01 / B1）：**"可行但已不该沿用"的布局也要重切**。
+            #
+            #   下面这条释放机制原先只在**解不出来**时触发。问题：只要"不含本机 CPU 段的
+            #   方案仍然可行"，就永远不释放 ⇒ 陈旧切点（`candidate_layer_ranges`，由上一轮
+            #   供给写入、表达"我手上确实有这个段"）作为硬约束永久保留 ⇒ 附加执行器在后续
+            #   轮次被**结构性挤出**拓扑。`model_supply.py:1236-1245` 记的
+            #   "`android[[8,20]]+TABLET[[20,32]]` 占满 `[8,32)`，CPU 段在候选里却从未被选"
+            #   在 prepare 这一层的表现正是这条 —— "可行但已不该沿用"的布局永远不会重切。
+            #
+            #   触发条件除"无解"外再加一条：**本次解里缺少配置了的附加执行器**
+            #   （`capacity_nodes` 里有 `executor_id` 非空的记录，但 `result["assignments"]`
+            #   里没有它拿到层的段）。放开后**认真比较**两案，不盲目取 released：
+            #   优先级链见 `executor_coexistence.plan_rank`（admitted → 期望附加执行器
+            #   参与数 → 参与执行器总数 → 目标函数；打平保留 baseline，保证机制收敛）。
+            #
+            #   ⚠️ 不要放宽 `candidate_layer_ranges` 在求解器里的语义：它表达"我手上确实
+            #   有这个段"，是硬事实（`capacity.py` 有完整论证）。真正要动的是**释放时机**。
+            #   没有候选锁时不重解（释放后是同一个问题，白白多一次 DFS）。
+            from executor_coexistence import (
+                additional_executor_identities,
+                choose_plan,
+                executor_label,
+                has_candidate_locks,
+                missing_additional_executors,
+            )
+            expected_additional = additional_executor_identities(capacity_nodes or [])
+            missing_additional = (
+                missing_additional_executors(result, capacity_nodes or [])
+                if result.get("admitted") else set()
+            )
+            release_reason = ""
+            if not result.get("admitted"):
+                # 与既有行为一致：没有候选锁时"释放后求解"是同一个问题，不做无用重解。
+                release_reason = (
+                    "capacity" if has_candidate_locks(capacity_nodes or []) else ""
+                )
+            elif missing_additional and has_candidate_locks(capacity_nodes or []):
+                release_reason = "missing_additional_executors"
+            if release_reason:
                 released_nodes = [
                     {key: value for key, value in node.items()
                      if key != "candidate_layer_ranges"}
                     for node in capacity_nodes
                 ]
                 logger.info(
-                    "锁定的切点不再满足容量，放开候选约束重排: locked=%s",
+                    "锁定的切点需要放开候选约束重排: reason=%s locked=%s "
+                    "expected_additional=%s missing_additional=%s",
+                    release_reason,
                     [node.get("candidate_layer_ranges") for node in capacity_nodes or []],
+                    sorted(executor_label(item) for item in expected_additional),
+                    sorted(executor_label(item) for item in missing_additional),
                 )
-                result = solve_pipeline_capacity(
-                    descriptor,
-                    released_nodes,
-                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
-                    require_distributed=require_distributed,
-                    local_layer_budget=local_layer_budget,
-                    relay_claims=relay_claims,
-                    prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
-                )
+                # ★ 2026-10-27（B1 收尾）：**baseline 已可行时，released 求解的异常不能反过来
+                #   把整个计划打掉**。无解分支里 released 抛错本来也是失败（没有更好的结果）；
+                #   但"可行但缺少 CPU 段"分支里 baseline 是**好的**，若 released 因节点
+                #   记录问题抛 `PipelineCapacityError`，外层 except 会把 descriptor 判非法 ⇒
+                #   为了修"僵化布局"反而让本来能跑的布局失败。故此处单独兜住、保留 baseline。
+                released_result = None
+                try:
+                    released_result = solve_pipeline_capacity(
+                        descriptor,
+                        released_nodes,
+                        safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                        require_distributed=require_distributed,
+                        local_layer_budget=local_layer_budget,
+                        relay_claims=relay_claims,
+                        prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
+                    )
+                except PipelineCapacityError as exc:
+                    if not result.get("admitted"):
+                        raise
+                    logger.warning(
+                        "切点释放求解失败，保留 baseline: reason=%s detail=%s",
+                        release_reason, exc, exc_info=True,
+                    )
+                if released_result is not None and not result.get("admitted"):
+                    # 原行为：无解时采用 released（它可能仍无解，但诊断更接近真相）。
+                    result = released_result
+                elif released_result is not None:
+                    chosen, decision = choose_plan(
+                        result, released_result, expected_additional,
+                    )
+                    logger.info(
+                        "切点释放取优: decision=%s baseline_admitted=%s "
+                        "released_admitted=%s baseline_assignments=%s "
+                        "released_assignments=%s",
+                        decision, result.get("admitted"),
+                        released_result.get("admitted"),
+                        [(a.get("node_id"), a.get("executor_id", ""),
+                          a.get("start_layer"), a.get("end_layer"))
+                         for a in result.get("assignments", [])],
+                        [(a.get("node_id"), a.get("executor_id", ""),
+                          a.get("start_layer"), a.get("end_layer"))
+                         for a in released_result.get("assignments", [])],
+                    )
+                    if chosen is released_result:
+                        result = released_result
+                        # 下游契约/预检必须看到**实际参与求解**的那份节点记录
+                        # （released 版本没有候选锁），否则引擎回填仍按旧锁读。
+                        capacity_nodes = released_nodes
         except PipelineCapacityError as exc:
             # ★ 2026-10-23（#117）：把**具体**原因打出来。此前调用方只记
             #   reason_code，"描述器非法"到底是缺 total_layers、缺
@@ -2884,11 +3585,40 @@ class Scheduler(
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
         logger.info(
-            "容量求解结果: admitted=%s reason=%s assignments=%s",
+            "容量求解结果: admitted=%s reason=%s assignments=%s "
+            "allocatable_bytes=%s deficit_bytes=%s uncovered=%s domains=%s",
             result.get("admitted"), result.get("reason_code"),
-            [(a.get("node_id"), a.get("start_layer"), a.get("end_layer"))
-             for a in result.get("assignments", [])],
+            [(a.get("node_id"), a.get("executor_id", ""), a.get("start_layer"),
+              a.get("end_layer")) for a in result.get("assignments", [])],
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：这三个字段是"为什么没解"的**唯一**
+            #   现场证据 —— 只有 `admitted=False reason=...insufficient` 时，无法区分
+            #   "总容量不足"（deficit>0）与"总容量够但切分后某节点不够"（deficit==0，
+            #   见 assert 那段注释里的实测教训），也无法看出是不是域校验拦下的。
+            result.get("allocatable_bytes"),
+            result.get("raw_capacity_deficit_bytes"),
+            result.get("uncovered_layer_ranges"),
+            {key: value.get("excess_bytes")
+             for key, value in (result.get("capacity_domains") or {}).items()
+             if isinstance(value, dict)},
         )
+        # ★ 2026-10-25：**候选排除原因**。求解器把每个被排除的 (节点, 区间) 及**具名
+        #   原因**（`node_segment_mode_mismatch` / `node_capacity_insufficient` 等）收在
+        #   `candidate_exclusions` 里，但此前**从未被打出来** ⇒ 无解时只能看到
+        #   `...insufficient` 这一句，完全看不出是哪条约束在起作用（实测环境门就被
+        #   这个盲区挡住：日志显示 android 有 7.24 GB 且区间覆盖，却无解）。
+        #   只在**未准入**时打，避免成功路径刷日志。
+        if not result.get("admitted"):
+            exclusions = result.get("candidate_exclusions") or []
+            logger.info(
+                "容量候选排除: count=%d detail=%s",
+                len(exclusions),
+                [
+                    (item.get("node_id"), item.get("reason_code"),
+                     item.get("layer_range") or [item.get("start_layer"),
+                                                 item.get("end_layer")])
+                    for item in exclusions[:24]
+                ],
+            )
         if result.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
             result["reason"] = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"
@@ -2933,14 +3663,25 @@ class Scheduler(
         total_layers = len(layer_bytes)
         node_ids = {str(item.get("node_id", "")) for item in assignments}
         capacity_records = self._get_pipeline_capacity_nodes(node_ids)
+        # ★ 2026-10-27（审计 A7）：键必须是 `(node_id, executor_id)`。
+        #
+        #   同机可有多个执行器（主段 "" + CPU 段 "cpu"），它们**共用 `node_id`**。
+        #   此前用裸 `node_id` 建字典 ⇒ 后写入的 CPU 段记录覆盖主段 ⇒ 手写
+        #   "master 拿 `[0,8)`" 时会拿 CPU 段的额度／引擎／`layer_budget=[8,24)`
+        #   去校验主段 ⇒ 大概率被判 `pipeline_layer_range_coverage_insufficient`
+        #   或 `segment_mode` 不符；反过来也无法把某一段**指定给** CPU 执行器，
+        #   因为 assignment 里的 `executor_id` 从来没被读过。
+        #
+        #   手动分层是"用户明确指定每段给谁"的路径，正需要表达同机两段。
         records = {
-            item["node_id"]: item
+            (item["node_id"], str(item.get("executor_id") or "")): item
             for item in capacity_records
         }
         planned = []
         artifact_source_sha256 = ""
         for item in assignments:
             node_id = str(item.get("node_id", ""))
+            executor_id = str(item.get("executor_id") or "")
             start = int(item.get("start_layer", 0) or 0)
             end = int(item.get("end_layer", 0) or 0)
             if start < 0 or end <= start or end > total_layers:
@@ -2950,12 +3691,18 @@ class Scheduler(
                     "reason": f"node {node_id} has invalid range [{start},{end})",
                     "assignments": [],
                 }
-            record = records.get(node_id)
+            record = records.get((node_id, executor_id))
             if record is None:
+                # 兼容旧调用方：未写 `executor_id` 的手动方案仍然指向主执行器。
+                # 附加执行器**不**回退到主段记录 —— 那正是 A7 要消灭的串味。
+                if not executor_id:
+                    record = records.get(node_id)
+            if record is None:
+                label = f"{node_id}#{executor_id}" if executor_id else node_id
                 return {
                     "status": "rejected", "admitted": False,
                     "reason_code": "pipeline_capacity_manual_node_unavailable",
-                    "reason": f"node {node_id} has no usable capacity",
+                    "reason": f"node {label} has no usable capacity",
                     "assignments": [],
                 }
             local_cut = bool(
@@ -3072,6 +3819,16 @@ class Scheduler(
                         "layer_artifact",
                     )
                 }
+                | (
+                    # ★ 2026-10-27（审计 A7）：`executor_id` 必须进 plan_id。
+                    #   否则"master 主段 [0,8) + master#cpu [8,24)"与
+                    #   "master 主段 [0,8) + master#cpu 换成别的执行器"会得到**同一个**
+                    #   plan_id —— 同机两段的身份在签名里不可区分。
+                    #   **只在非空时加入**，这样既有拓扑（`executor_id == ""`）的
+                    #   plan_id 逐字节不变，不会让缓存/对比失效。
+                    {"executor_id": item.get("executor_id")}
+                    if str(item.get("executor_id") or "") else {}
+                )
                 for item in planned
             ],
         }
@@ -3282,6 +4039,26 @@ class Scheduler(
         with self._layer_config_push_lock:
             if not self.get_distributed_inference_enabled():
                 return
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**供给事务在手时 legacy 分层整体退让**。
+            #
+            #   本函数有 14 个调用点（注册确认、hello、节点增删、心跳、集群角色切换、
+            #   api_server 与 engine_host 侧等），逐个加判据既不现实也必然漏 ——
+            #   所以收口在这里。它的下游 `_push_layer_config_to_clients_locked` 走的是
+            #   `compute_layer_assignment` 的 `simple_weight` 加权切分，与供给求解器的
+            #   `capacity_plan.assignments` 是**两个独立答案**。
+            #   实测（2026-10-26 13:20，balanced）：
+            #     供给   = master[0,24) / android[24,28) / TABLET[28,32)
+            #     legacy = master[0,20) / android[20,22) / TABLET[22,24)
+            #   ⇒ worker 认了这边丢那边 ⇒ 主节点「重发分层配置」无限重试
+            #   ⇒ 供给 15 分钟到不了 `ready`，而日志看起来只像"慢"。
+            #
+            #   判据用 `_pipeline_load_transaction`：供给事务存在即代表本次分层由
+            #   求解器负责；供给结束事务清空 ⇒ legacy 恢复原行为，无回归。
+            if getattr(self, "_pipeline_load_transaction", None) is not None:
+                logger.debug(
+                    "layer_config_push skipped reason=pipeline_supply_active"
+                )
+                return
             # Keep the transition check under the same lock used by the
             # publisher.  Otherwise a transition can begin after the check
             # but before the publish and still leak a transient release.
@@ -3490,6 +4267,26 @@ class Scheduler(
         elif task_worker_handshake_pending:
             logger.info(
                 "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
+                client_id,
+            )
+        elif getattr(self, "_pipeline_load_transaction", None) is not None:
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**供给事务在手时 legacy 分层必须退让**。
+            #
+            #   `push_layer_config_to_clients()` 走的是旧路径
+            #   （`compute_layer_assignment` → `_simple_weight_assignment` 的
+            #   `simple_weight` 加权切分），它算出的切点与供给求解器给出的
+            #   `capacity_plan.assignments` **是两个独立答案**。
+            #   实测（2026-10-26 13:20，`QLH_CAPACITY_PLANNING_MODE=balanced`）：
+            #     供给 plan  = master[0,24) / android[24,28) / TABLET[28,32)
+            #     legacy     = master[0,20) / android[20,22) / TABLET[22,24)
+            #   ⇒ 两条路径各自往同一批 worker 推配置 ⇒ worker 认了这边丢了那边
+            #   ⇒ 主节点「重发分层配置」无限重试（attempt 11、12…）⇒ 供给永远到不了
+            #   `ready`（15 分钟无进展，而单看日志像是"慢"）。
+            #
+            #   判据用 `_pipeline_load_transaction`：供给事务存在即代表本次分层由
+            #   求解器负责。供给结束后该事务清空，legacy 恢复原有行为 ⇒ 无回归。
+            logger.info(
+                "legacy_layer_config skipped reason=pipeline_supply_active node=%s",
                 client_id,
             )
         else:

@@ -89,6 +89,191 @@ def test_snapshot_revision_race_returns_pending_instead_of_mixed_read(applicatio
     assert result['validity']=='pending' and not result['runnable']
     assert result['reason_detail']['code']=='snapshot_revision_changed'
 
+
+@pytest.fixture
+def query_client(application, monkeypatch):
+    app, _, state = application
+    selected = 'selected'
+    state.update(revision=1, boot_id='boot', selected_operation=selected, commit_scope='local_sqlite',
+                 operations={selected: {'operation_id': selected, 'status': 'waiting_capacity'}},
+                 supplies={selected: {'operation_id': selected, 'status': 'waiting_nodes',
+                                      'nodes': {'tail': {'status': 'supplying', 'phase': 'verify'}}}})
+    scheduler = app.scheduler
+    scheduler.get_distributed_inference_enabled = lambda: True
+    scheduler._participation = ParticipationService(enabled=True)
+    owner = scheduler._model_control
+    reads = {'snapshot': 0, 'query': 0, 'stamp': 0, 'freeze': 0}
+    original = owner.snapshot
+    snapshots = []
+
+    def snapshot():
+        reads['snapshot'] += 1
+        return original()
+
+    def query_snapshot(operation_id=None):
+        reads['query'] += 1
+        value = original()
+        operation = operation_id if operation_id is not None else value['selected_operation']
+        value['operations'] = {operation: value['operations'][operation]} if operation in value['operations'] else {}
+        value['supplies'] = {operation: value['supplies'][operation]} if operation in value['supplies'] else {}
+        snapshots.append(value)
+        return value
+
+    def query_stamp():
+        reads['stamp'] += 1
+        return {field: state[field] for field in ('revision', 'boot_id')}
+
+    def freeze():
+        reads['freeze'] += 1
+
+    monkeypatch.setattr(owner, 'snapshot', snapshot)
+    monkeypatch.setattr(owner, 'query_reads_enabled', True, raising=False)
+    monkeypatch.setattr(owner, 'query_snapshot', query_snapshot, raising=False)
+    monkeypatch.setattr(owner, 'query_stamp', query_stamp, raising=False)
+    scheduler._execution_app = SimpleNamespace(requests=app.requests, freeze=freeze)
+    return SimpleNamespace(app=app, scheduler=scheduler, state=state, owner=owner, reads=reads, snapshots=snapshots)
+
+
+@pytest.mark.parametrize('selected', [False, True])
+def test_query_client_reuses_initial_snapshot_for_operation(query_client, monkeypatch, selected):
+    from model_intent import ModelIntentCoordinator
+    case = query_client
+    if not selected:
+        case.state['selected_operation'] = ''
+    before = deepcopy(case.state)
+    original = ModelIntentCoordinator._project
+
+    def project(self, operation_id, *, snapshot=None):
+        assert snapshot is case.snapshots[0]
+        return original(self, operation_id, snapshot=snapshot)
+
+    monkeypatch.setattr(ModelIntentCoordinator, '_project', project)
+    value = ClientSnapshots(case.scheduler).current()
+    assert value['runnable'] and value['deployment']['validity'] == 'valid'
+    assert case.reads == {'snapshot': 0, 'query': 1, 'stamp': 3 if selected else 1, 'freeze': 1}
+    assert case.state == before
+    if selected:
+        assert value['operation']['status'] == 'waiting_capacity'
+        assert value['operation']['nodes']['tail']['status'] == 'verifying'
+        assert case.snapshots[0]['supplies']['selected']['nodes']['tail']['status'] == 'supplying'
+    else:
+        assert value['operation'] is None
+
+
+@pytest.mark.parametrize('capability', ['disabled', 'no_flag', 'no_snapshot', 'no_stamp'])
+def test_query_client_preserves_legacy_reads_without_explicit_capability(query_client, monkeypatch, capability):
+    case = query_client
+    if capability == 'disabled':
+        case.owner.query_reads_enabled = False
+    else:
+        monkeypatch.delattr(case.owner, {'no_flag': 'query_reads_enabled', 'no_snapshot': 'query_snapshot',
+                                        'no_stamp': 'query_stamp'}[capability])
+    value = ClientSnapshots(case.scheduler).current()
+    assert value['runnable'] and value['operation']['status'] == 'waiting_capacity'
+    assert case.reads == {'snapshot': 6, 'query': 0, 'stamp': 0, 'freeze': 1}
+
+
+@pytest.mark.parametrize('field', ['revision', 'boot_id'])
+@pytest.mark.parametrize('settles', [False, True])
+def test_query_client_retries_revision_and_boot_races(query_client, monkeypatch, field, settles):
+    case = query_client
+    case.state['selected_operation'] = ''
+    original = case.owner.query_stamp
+
+    def racing():
+        attempt = case.reads['stamp'] + 1
+        if not settles or attempt == 1:
+            if field == 'revision':
+                case.state[field] += 1
+            else:
+                case.owner.boot_id = case.state[field] = f'boot-{attempt}'
+        return original()
+
+    monkeypatch.setattr(case.owner, 'query_stamp', racing)
+    value = ClientSnapshots(case.scheduler).current()
+    attempts = 2 if settles else 3
+    assert case.reads == {'snapshot': 0, 'query': attempts, 'stamp': attempts, 'freeze': attempts}
+    if settles:
+        assert value['validity'] == 'valid' and value['runnable']
+        assert value['revision'] == case.state['revision'] and value['identity']['boot_id'] == case.owner.boot_id
+    else:
+        assert value['validity'] == 'pending' and not value['runnable']
+        assert value['reason_detail']['code'] == 'snapshot_revision_changed'
+
+
+@pytest.mark.parametrize('field', ['revision', 'boot_id'])
+def test_query_client_final_stamp_detects_changes_after_operation_projection(query_client, monkeypatch, field):
+    case = query_client
+    original = case.owner.query_stamp
+
+    def racing():
+        if case.reads['stamp'] == 2:
+            if field == 'revision':
+                case.state[field] += 1
+            else:
+                case.owner.boot_id = case.state[field] = 'new-boot'
+            case.state['operations']['selected']['reason'] = 'fresh projection'
+        return original()
+
+    monkeypatch.setattr(case.owner, 'query_stamp', racing)
+    value = ClientSnapshots(case.scheduler).current()
+    assert value['runnable'] and value['operation']['reason'] == 'fresh projection'
+    assert value['revision'] == case.state['revision'] and value['identity']['boot_id'] == case.owner.boot_id
+    assert case.reads == {'snapshot': 0, 'query': 2, 'stamp': 6, 'freeze': 2}
+
+
+@pytest.mark.parametrize('change', ['queue', 'mode', 'participation'])
+def test_query_client_still_validates_live_composition_inputs(query_client, monkeypatch, change):
+    case = query_client
+    case.state['selected_operation'] = ''
+    observed = []
+    if change == 'queue':
+        def queue_snapshot():
+            observed.append(True)
+            return {'revision': len(observed)}
+        monkeypatch.setattr(case.scheduler._execution_app.requests, 'queue_snapshot', queue_snapshot)
+    elif change == 'mode':
+        def enabled():
+            observed.append(True)
+            return bool(len(observed) % 2)
+        case.scheduler.get_distributed_inference_enabled = enabled
+    else:
+        def participation():
+            observed.append(True)
+            return {'revision': len(observed)}
+        monkeypatch.setattr(case.scheduler._participation, 'snapshot', participation)
+    value = ClientSnapshots(case.scheduler).current()
+    assert value['validity'] == 'pending' and not value['runnable']
+    assert value['reason_detail']['code'] == 'snapshot_revision_changed'
+    assert case.reads['query'] == case.reads['stamp'] == 3 and case.reads['snapshot'] == 0
+
+
+@pytest.mark.parametrize('change', ['deployment', 'authority', 'connection'])
+def test_query_client_checks_live_execution_admission_at_same_revision(query_client, change):
+    case = query_client
+    case.scheduler._execution_app = case.app
+    deployment = case.state['deployments']['deployment']
+
+    def runnable(deployment_id, *, authority, connections, **kwargs):
+        return (deployment_id == 'deployment' and deployment['status'] == 'active'
+                and authority == deployment['authority'] and connections == deployment['connections'])
+
+    case.owner.runnable = runnable
+    first = ClientSnapshots(case.scheduler).current()
+    assert first['runnable']
+    if change == 'deployment':
+        deployment['status'] = 'invalidated'
+    elif change == 'authority':
+        case.scheduler._model_control_authority = lambda: {'term': 2}
+    else:
+        case.scheduler._model_control_connections = lambda: {'worker': 2}
+    value = ClientSnapshots(case.scheduler).current()
+    assert not value['runnable'] and value['deployment']['validity'] == 'invalid'
+    assert value['reason_detail']['code'] == ('execution_deployment_unavailable' if change == 'deployment'
+                                            else 'execution_deployment_fenced')
+    assert value['revision'] == first['revision']
+
+
 def test_participation_persists_intent_and_exposes_transition_before_runtime_returns():
     calls=[];owner=ParticipationService(enabled=True,persist=calls.append)
     def retire(mode):

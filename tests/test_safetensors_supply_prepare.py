@@ -171,7 +171,29 @@ def prepared_supply(tmp_path, monkeypatch):
     }
     return SimpleNamespace(worker=worker, host=host, active=active, candidate=candidate,
                            root=root, manifest=manifest, directory=directory,
-                           selected=selected, payload=payload, build=build, select=select)
+                           selected=selected, payload=payload, build=build, select=select,
+                           source=source, source_sha=source_sha, tokenizer_sha=tokenizer_sha)
+
+
+def test_safetensors_build_cancels_during_copy_and_cleans_stage(prepared_supply, monkeypatch):
+    case = prepared_supply
+    stopped = [False]
+    original_copy = assets._copy_selected
+
+    def cancel_before_copy(*args, **kwargs):
+        stopped[0] = True
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(assets, "_copy_selected", cancel_before_copy)
+    with pytest.raises(assets.SupplyError, match="cancelled"):
+        assets.build_safetensors_segment(
+            case.source, case.root.parent / "cancelled-build",
+            source_model_id="source-qwen2", source_model_sha256=case.source_sha,
+            tokenizer_sha256=case.tokenizer_sha, start_layer=0, end_layer=2,
+            total_layers=4, operation_id="op-cancel", node_id="worker",
+            cancelled=lambda: stopped[0],
+        )
+    assert not list((case.root.parent / "cancelled-build").glob(".supply-build-*"))
 
 
 @pytest.mark.parametrize("assignment_manifest", [False, True])

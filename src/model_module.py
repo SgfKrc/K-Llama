@@ -465,6 +465,7 @@ class _LayerOffloadRuntime:
     def _promote(self, tensor, *, preserve_dtype=False):
         dtype = self.dtype if tensor.is_floating_point() and not preserve_dtype else tensor.dtype
         converted = None
+        staged = None
         try:
             converted = tensor.to(dtype=dtype)
             if converted is not tensor:
@@ -473,10 +474,28 @@ class _LayerOffloadRuntime:
                 )
             # Separating the CPU cast from the transfer prevents a source-dtype
             # CUDA allocation in addition to the target-dtype allocation.
-            return converted.to(device=self.execution_device)
+            #
+            # ★ 2026-10-25（PERF-NATIVE-COST-01）：页锁定 + 非阻塞 H2D。
+            #   pageable 内存上的 `non_blocking=True` 会被 CUDA 静默降级成同步，所以
+            #   必须先 pin。pinned 拷贝走 DMA、不阻塞 Python 线程；同一 stream 上的后续
+            #   kernel 仍与拷贝保序，正确性不变。实测链路是 Gen2 x8 ≈ 4 GB/s，pinned 是
+            #   逼近该上限的前提。pin 会多占一份主机内存，按实测口径并入
+            #   `host_conversion_peak_bytes` 使观测值与真实峰值一致；设备或平台不支持
+            #   pin 时（异常/断言）回退成原来的同步拷贝，行为与改动前等价。
+            try:
+                staged = converted.pin_memory()
+            except (RuntimeError, AssertionError):
+                staged = converted
+            if staged is not converted:
+                self.host_conversion_peak_bytes = max(
+                    self.host_conversion_peak_bytes,
+                    staged.numel() * staged.element_size(),
+                )
+            return staged.to(device=self.execution_device, non_blocking=True)
         finally:
             # Transfer errors may be retained for diagnostics after unloading.
             converted = None
+            staged = None
 
     def call(self, module, *args, **kwargs):
         if self.active:
@@ -2242,6 +2261,14 @@ class ModelManager:
             # the one-unit placement contract. The eager loop owns transfers.
             self._compiled_transformer = None
             self._compiled_layer_loop = None
+            # ★ 2026-10-25（PERF-NATIVE-COST-01）：**只跳过 compile，仍应用融合 RMSNorm**。
+            #   融合 RMSNorm 是**算子级替换**（`_apply_fused_rmsnorm` 只换前向实现，
+            #   不持有 GPU 权重、不跨调用驻留显存），与「一次一个执行单元」的放置契约
+            #   不冲突；它省下的正是 offload 每步都要付的 `2 × 层数` 次 `.to(float32)`
+            #   往返，而 offload 恰恰是"每步都慢"的场景。原实现在此直接 return，把
+            #   同样受益的融合也一并关掉了。仍受 `USE_FUSED_RMSNORM` 开关约束
+            #   （默认关闭 ⇒ 行为与改动前一致）。
+            self._maybe_apply_fused_rmsnorm()
             return
         self._maybe_apply_compile()
         # ★ R-R7 rank3：层分段路径（load_layer_range）同样应用融合 RMSNorm —— 与本方法并列，
@@ -4218,7 +4245,22 @@ class ModelManager:
                     )
                 input_ids = input_ids.to(device)
                 batch_size, seq_len = input_ids.shape
-                hidden_states = self._call_layer_unit(transformer.embed_tokens, input_ids).to(dtype=dtype)
+                # ★ 2026-10-25（PERF-NATIVE-COST-01）：offload 下 embedding 表常驻 CPU，而
+                #   `_call_layer_unit` 会把它**整张搬进显存**（qwen3-5-9b 的
+                #   `embed_tokens.weight` 是 1.94 GB BF16），只为查 seq_len 行 —— 每步白付
+                #   1.94 GB 的 PCIe 流量（实测链路 Gen2 x8 ≈ 4 GB/s，约合 0.6 s/步）。
+                #   这里改为**CPU 就地查表**（权重本来就在 CPU），只把查出的
+                #   [batch, seq, hidden] 激活搬过去（单 token 时 8 KB）。查表与 dtype
+                #   无关、数值完全一致；`stage_count` 因此不再包含 embedding 那次搬运，
+                #   观测口径与实际流量一致（`_LayerOffloadRuntime` 的单元语义未变）。
+                if getattr(self, "_layer_offload", None) is not None:
+                    looked_up = transformer.embed_tokens(input_ids.to("cpu"))
+                    hidden_states = looked_up.to(device=device, dtype=dtype)
+                    del looked_up
+                else:
+                    hidden_states = self._call_layer_unit(
+                        transformer.embed_tokens, input_ids,
+                    ).to(dtype=dtype)
             else:
                 batch_size = hidden_states.shape[0]
                 seq_len = hidden_states.shape[1]

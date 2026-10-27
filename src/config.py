@@ -18,6 +18,7 @@ AppRuntime 通过 build_settings(environment) 解析独立快照。
 
 import os
 import sys
+import math
 import socket
 import hashlib
 
@@ -439,6 +440,157 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     PIPELINE_PREFER_ALL_WORKERS = _env_bool(
         "QLH_PIPELINE_PREFER_ALL_WORKERS", CAPACITY_PLANNING_MODE == "fastest",
     )
+    # ★ 2026-10-25（#117 收尾）：**offload 单层相对 resident 单层的成本比**。
+    #   `model_supply` 在 `resident` 与 `safetensors_layer_offload` 两种物化间并列求解后
+    #   要选优，而原先的准则只数"本机承担层数多"、**完全不含速度项** ⇒ 它会主动选中
+    #   每步慢一个数量级的 offload（20 层 > 8 层）。offload 每层都要把权重从主机内存
+    #   搬过 PCIe 再算，单层代价远高于就地计算。实测（本机 RTX 4060 Laptop，链路
+    #   Gen2 x8 ≈ 4 GB/s）：
+    #       resident  8 层 ⇒ 101 ms/步  ⇒ 12.6 ms/层
+    #       offload  20 层 ⇒ 1535 ms/步 ⇒ 76.8 ms/层   ⇒ 约 6.1 倍
+    #   取 6.0 作默认。这是**硬件相关量**（链路代次/宽度、主机内存带宽），换机器应重测；
+    #   置 1.0 即恢复旧行为（纯按层数选优）。
+    OFFLOAD_LAYER_COST_RATIO = _env_float(
+        "QLH_OFFLOAD_LAYER_COST_RATIO", 6.0, min_val=1.0, max_val=64.0,
+    )
+    # ★ 2026-10-25：**按节点标定的每层推理成本（毫秒）**，供切点求解按实测成本均衡。
+    #   求解器原先按"解码器**字节**份额"均衡（`capacity.py` 的 `placement_work_fraction`），
+    #   于是把最慢的设备当成和最快的设备一样贵 —— 实测三机每层成本差 2.3 倍
+    #   （docs/本机跨框架层段成本与干扰实测-2026-10-25.md）：
+    #       master（pytorch+cuda，resident）  12.6 ms/层
+    #       rog-5060（llama_cpp）             8.7 ms/层
+    #       android-542cd254（llama_cpp）    20.1 ms/层
+    #   典型后果：`rog` 扛 24 层成为瓶颈，而最慢的 `android` 却只扛 8 层。
+    #   格式 `QLH_LAYER_COST_MS="rog-5060=8.7,android-542cd254=20.1"`（逗号分隔 `node=ms`）。
+    #   未列出的节点用 `LAYER_COST_MS_DEFAULT`（默认 0 ⇒ 倍数 1.0 ⇒ 与旧行为**逐字节
+    #   等价**，这是可回归的保证）。求解器只比较**相对**成本。
+    LAYER_COST_MS_DEFAULT = _env_float(
+        "QLH_LAYER_COST_MS_DEFAULT", 0.0, min_val=0.0, max_val=100000.0,
+    )
+
+    def layer_cost_ms_by_node() -> dict[str, float]:
+        """`QLH_LAYER_COST_MS` 的解析结果：`{node_id: ms_per_layer}`。
+
+        只解析、不校验节点是否存在（求解器按 node_id 查表，缺省走
+        `LAYER_COST_MS_DEFAULT`）。非法项被忽略而不是抛错：标定值属于**运行期调优
+        参数**，一个手误不应该让整次供给失败；但如果**所有**项都非法，会退化成
+        全部走 default ⇒ 与未配置等价，仍是安全方向。
+        """
+        raw = os.environ.get("QLH_LAYER_COST_MS") or ""
+        out: dict[str, float] = {}
+        for item in raw.split(","):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            node_id, _, value = item.partition("=")
+            node_id = node_id.strip()
+            try:
+                cost = float(value.strip())
+            except (TypeError, ValueError):
+                continue
+            if node_id and math.isfinite(cost) and cost > 0:
+                out[node_id] = cost
+        return out
+
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**本机 CPU 执行器**（同一物理节点上的第二个
+    #   执行器）。开启后 master 除了自己的 GPU 段（PyTorch，`local_assignment`）之外，
+    #   还能在**同一台机器**上再跑一段中间层：llama.cpp keep-head，权重常驻主机内存、
+    #   CPU 就地计算 —— **零 PCIe 搬运**。
+    #   实测（docs/本机跨框架层段成本与干扰实测-2026-10-25.md）：本机 9B 中间段
+    #   6.84 ms/层（n_threads=8），比 rog-5060 的 8.7 / android 的 20.1 都快，且比
+    #   `safetensors_layer_offload` 的 76.8（权重在 RAM、每步经 PCIe 搬上 GPU）**快 11.2 倍**。
+    #   0 = **关闭**（默认）⇒ 既有三机拓扑与部署权威逐位不变。
+    #   ⚠️ 这一档**刻意不做**成"重复注册虚拟物理节点"：CPU 段与 GPU 段共用同一个
+    #   `node_id`（同一传输身份、同一份 RAM），靠 `executor_id` 区分，容量按
+    #   `capacity_domain_id` 合并记账（见 `validate_capacity_domains`）。
+    LOCAL_CPU_EXECUTOR_ENABLED = bool(_env_int("QLH_LOCAL_CPU_EXECUTOR", 0, min_val=0, max_val=1))
+
+    def local_cpu_executor_enabled() -> bool:
+        """主节点是否启用本机 CPU 分段执行器（运行时读 env，**不要用模块常量**）。
+
+        ⚠️ 与 `host_ram_offload_enabled` 是**同一类陷阱**：`.env` 由 `SettingsStore`
+        在**模块 import 之后**才写入 `os.environ`（见本文件顶部
+        "Import is a read-only compatibility view. Explicit SettingsStore startup
+        owns .env"）。 模块常量 `LOCAL_CPU_EXECUTOR_ENABLED` 会在 import 那一刻就
+        定死为默认值 `False`，于是 `.env` 里写了 `QLH_LOCAL_CPU_EXECUTOR=1`
+        也**永远不生效**。
+
+        实测（2026-10-26 09:44）：`.env` 明确写着 `=1`，而进程内
+        `os.environ.get("QLH_LOCAL_CPU_EXECUTOR")` 是 `None`、
+        `LOCAL_CPU_EXECUTOR_ENABLED` 是 `False` ⇒ 本机 CPU 段从未申报
+        ⇒ 三机供给退化成"master 独扛 28 层" ⇒ 只用 VRAM 4.47 GB ⇒ 无解
+        （`master#:node_capacity_insufficient`，用户原话："只算了 VRAM 没算 RAM"）。
+
+        保留模块常量是为了兼容既有导入点；**判断"是否启用"必须调用本函数**。
+
+        ⚠️ 还有第二层陷阱：`build_settings` 内部的 `_env_int` 读的是它的
+        `environment` **参数快照**（`dict(os.environ)`），运行时再改 `os.environ`
+        对它无效。所以这里直接读 `os.environ`（与 `host_ram_offload_enabled` 一致）。
+        """
+        raw = os.environ.get("QLH_LOCAL_CPU_EXECUTOR")
+        if raw is None or str(raw).strip() == "":
+            return False
+        try:
+            return int(raw) == 1
+        except (TypeError, ValueError):
+            return False
+    # 该执行器的标识（进入 `Segment.executor_id` / `PipelineNode.executor_id`）。
+    LOCAL_CPU_EXECUTOR_ID = (os.environ.get("QLH_LOCAL_CPU_EXECUTOR_ID") or "cpu").strip() or "cpu"
+    # 该执行器的每层成本（ms）。缺省用实测值 6.84。
+    LOCAL_CPU_EXECUTOR_LAYER_COST_MS = _env_float(
+        "QLH_LOCAL_CPU_EXECUTOR_LAYER_COST_MS", 6.84, min_val=0.0, max_val=100000.0,
+    )
+    # 从 host 容量里划给它的**上限比例**（余下留给 GPU 段与系统）。
+    LOCAL_CPU_EXECUTOR_HOST_FRACTION = _env_float(
+        "QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION", 0.5, min_val=0.0, max_val=1.0,
+    )
+
+    def local_cpu_executor_host_fraction() -> float:
+        """同上，**运行时读 `os.environ`**（模块常量会被 import 时的快照固化）。
+
+        影响域账里本机 CPU 段占的那份 host RAM；读不到就退回默认 0.5。
+        """
+        raw = os.environ.get("QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION")
+        if raw is None or str(raw).strip() == "":
+            return 0.5
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.5
+        return value if 0.0 <= value <= 1.0 else 0.5
+    # ★ 2026-10-25：该执行器承载的**层区间**（`"start,end"`，闭开）。
+    #   本机 keep-head 用的是**裁好的 GGUF 工件**（例：`q35-9b-local-mid4-24.gguf`
+    #   对应 `4,24`），求解器**必须**被钉到该区间：否则它可能切出工件不覆盖的层，
+    #   而那种失败表现为**运行期**的层号越界 / 权重缺失，不是规划期的清晰报错 ——
+    #   属于"部署看起来成功、第一次推理才炸"的最坏形态。
+    #   空 = 不约束（求解器自由切），此时应由使用者自行保证工件覆盖被分到的区间。
+    LOCAL_CPU_EXECUTOR_LAYER_RANGE = (
+        os.environ.get("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE") or ""
+    ).strip()
+
+    def local_cpu_executor_layer_range() -> tuple[int, int] | None:
+        """解析 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`（`"start,end"`）。
+
+        非法输入返回 None（并在调用处退化为"不约束"）而不是抛错：这是运行期配置，
+        一次手误不该让整次供给失败 —— 但**不静默假装约束有效**，调用处会记日志。
+
+        ⚠️ **必须运行时读 `os.environ`，不能用模块常量**
+        `LOCAL_CPU_EXECUTOR_LAYER_RANGE`：`.env` 由 `SettingsStore` 在 import 之后
+        才写入 `os.environ` ⇒ 模块常量会停在 import 那一刻的空串 ⇒ 本函数返回 None
+        ⇒ **工件边界不再受限** ⇒ 求解器可能把工件覆盖不到的层派给本机 CPU 段
+        （实测给出 `[8,28)` 而 `mid8-24.gguf` 只覆盖 `[8,24)`）⇒ 验收判据 2 失守，
+        且失败发生在**执行期**（层号越界/权重缺失），属于"部署看起来成功、
+        第一次推理才炸"的最坏形态。
+        """
+        raw = (os.environ.get("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE") or "").strip()
+        if not raw:
+            return None
+        parts = [piece.strip() for piece in raw.replace(":", ",").replace("-", ",").split(",")]
+        try:
+            start, end = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            return None
+        return (start, end) if 0 <= start < end else None
 
     # ★ 2026-10-24（#117）：**清点阶段的等待上限**（秒）。此前 `model_supply.py` 里
     #   硬编码 `min(90, ...)`，而"未登记候选"的本地源核对需要对整模做一次全量
@@ -611,6 +763,40 @@ def build_settings(environment=None, *, probe_device=False) -> dict:
     #:   表现为 `request_deadline_exceeded`，现场只能改源码。现在可用 `QLH_PIPELINE_TIMEOUT`
     #:   调整（默认仍是 120，既有行为不变）。
     PIPELINE_TIMEOUT = _env_int("QLH_PIPELINE_TIMEOUT", 120)   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
+    #: ★ 2026-10-27（#128）：优雅退出时**等待 uvicorn 自行收敛**的上限（秒）。
+    #:
+    #:   `POST /api/system/shutdown` 只把 `server.should_exit` 置真，然后就撒手 ——
+    #:   uvicorn 若正卡在某个长请求或 lifespan shutdown 里，`should_exit` 只是一个
+    #:   它暂时无暇读取的标志位，进程可以长期不退。TUI 侧
+    #:   `BackendSupervisor.stop` 又只 `join(timeout=3.0)`，3 秒后放弃并**不报错**
+    #:   ⇒ 旧 TUI 的 Python 进程存活，而新进程恢复旧部署时
+    #:   `_dispatch_pipeline_model_cleanup` 会依据旧进程 PID 判定"本机清债"
+    #:   继续等待 ⇒ 选模 POST 长时间没有新 operation（只有 GET 正常）。
+    #:
+    #:   超过这个上限后走兜底：自己跑一次 `_shutdown_resources()` 再强制退出，
+    #:   让"退出"这件事有确定终态，而不是把不确定性留给下一个进程。
+    #:   取 10 s：足够覆盖正常 lifespan shutdown，又不至于让 UI 以为卡死。
+    SHUTDOWN_GRACE_SECONDS = _env_float(
+        "QLH_SHUTDOWN_GRACE_SECONDS", 10.0, min_val=1.0, max_val=300.0,
+    )
+    #: ★ 2026-10-27（#122）：对话上下文**一次带多少条历史**。
+    #:
+    #:   此前这个数字在**两个地方各自硬编码成 200**
+    #:   （`chat_context.DEFAULT_CONTEXT_MESSAGES` 与
+    #:   `local_store.load_local_conversation(limit=200)`），且
+    #:   `api_server` 调后者时**不传 limit** ⇒ 想在现场调窗口只能改源码。
+    #:   `docs/已知问题记录.md` 的 #122 记的正是"历史累积与长输入预算缺少
+    #:   独立性能归因"：短 message 携带较长已拼装上下文，触发 prefill 分片，
+    #:   但现场看不到"这次到底带了多少条历史"。
+    #:
+    #:   现在这一项统一到同一个可调源，`chat_context` 与 `local_store` 都读它。
+    #:   窗口是**按条数**计的（不是 token），所以它只是"上限"，真正进入 prompt
+    #:   的 token 数仍由 `event=execution_prompt` 的 `prompt_tokens` 观测 ——
+    #:   两者配合才能判断"是历史太长"还是"单条太肥"。
+    #:   默认 200 = 既有行为，逐字节不变。
+    CHAT_CONTEXT_MESSAGES = _env_int(
+        "QLH_CHAT_CONTEXT_MESSAGES", 200, min_val=1, max_val=2000,
+    )
     PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
         "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 180.0, min_val=1.0, max_val=600.0,
     )                                           # 等待从节点同步模型和分层 ACK

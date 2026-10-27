@@ -277,11 +277,36 @@ def _normalize_layer_budget(value: Any, field: str) -> dict[str, Any]:
     local_cut = value.get("local_cut", False)
     if not isinstance(local_cut, bool):
         raise PipelineCapacityError(f"{field}.local_cut must be a boolean")
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**可切区间**（可选，`min_layer`/`max_layer`）。
+    #
+    #   `local_cut` 只解锁**切分粒度**（能在工件覆盖的区间内任意切），**不解锁工件边界**。
+    #   持有**整模**、真能自裁的 worker 不需要这两项（给了也不影响：没声明就不检查，
+    #   行为与改动前逐字节一致）。而只持有**裁好的部分工件**的执行器 —— 例如本机 CPU 段的
+    #   `q35-9b-local-mid8-24.gguf`（只含 `[8,24)`）—— **必须**声明它们；否则求解器会把
+    #   工件覆盖不到的层派给它，而那种失败发生在**执行期**（层号越界/权重缺失），
+    #   不是规划期报错，属于"部署显示成功、第一次推理才炸"的最坏形态（真机实测踩到过：
+    #   `assignments=[('master','cpu',0,8), ...]`，而工件是 `mid8-24`）。
+    bounds: dict[str, int] = {}
+    low = value.get("min_layer")
+    high = value.get("max_layer")
+    if (low is None) != (high is None):
+        raise PipelineCapacityError(
+            f"{field}.min_layer and {field}.max_layer must be given together"
+        )
+    if low is not None and high is not None:
+        low_value = _non_negative_int(low, f"{field}.min_layer")
+        high_value = _non_negative_int(high, f"{field}.max_layer")
+        if high_value <= low_value:
+            raise PipelineCapacityError(
+                f"{field}.max_layer must be greater than {field}.min_layer"
+            )
+        bounds = {"min_layer": low_value, "max_layer": high_value}
     return {
         "available_bytes": available_bytes,
         "per_layer_bytes": per_layer_bytes,
         "max_layers": max_layers,
         "local_cut": local_cut,
+        **bounds,
     }
 
 
@@ -299,7 +324,16 @@ def _descriptor_costs(
         for index, value in enumerate(raw_layers)
     ]
     if any(value <= 0 for value in layer_bytes):
-        raise PipelineCapacityError("every decoder layer must have a positive byte count")
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**带出是哪些层为 0**。
+        #   本函数是纯求解器、不能记日志（`test_refactor_capacity_load_spec` 会把
+        #   `logging.Logger._log` patch 成禁止），所以异常消息是唯一的诊断通道。
+        #   只报"每层必须有正字节数"无法判断是补零没生效、还是补了但覆盖不全。
+        zeros = [index for index, value in enumerate(layer_bytes) if value <= 0]
+        raise PipelineCapacityError(
+            "every decoder layer must have a positive byte count "
+            f"(zero at layers {zeros[:12]}{'...' if len(zeros) > 12 else ''}; "
+            f"total_layers={total_layers}, zero_count={len(zeros)})"
+        )
 
     components = descriptor.get("component_weight_bytes")
     if not isinstance(components, dict):
@@ -359,14 +393,21 @@ def _normalize_nodes(
         raise PipelineCapacityError("nodes must be a list")
     usable: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for raw in nodes:
         if not isinstance(raw, dict):
             raise PipelineCapacityError("each node capacity record must be an object")
         node_id = str(raw.get("node_id", "") or "").strip()
-        if not node_id or node_id in seen:
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：唯一性判据由 `node_id` 放宽到
+        #   `(node_id, executor_id)` —— 同一物理节点上的 GPU 段与 CPU 段**必须**能共存
+        #   （本票的目标形态）。这与阶段 2 对 `ExecutionPlan` / `validate_pipeline_nodes`
+        #   的改动**同源**；那两处改了、这里漏了，实测环境门就卡在
+        #   `pipeline_capacity_descriptor_invalid: node_id must be non-empty and unique`。
+        #   `executor_id` 缺省 "" ⇒ 键退化为 `(node_id, "")` ⇒ 与改动前逐位等价。
+        executor_id = str(raw.get("executor_id") or "").strip()
+        if not node_id or (node_id, executor_id) in seen:
             raise PipelineCapacityError("node_id must be non-empty and unique")
-        seen.add(node_id)
+        seen.add((node_id, executor_id))
         capacity_bytes = _non_negative_int(raw.get("capacity_bytes", 0), "capacity_bytes")
         reserve_bytes = _non_negative_int(raw.get("reserve_bytes", 0), "reserve_bytes")
         capacity_source = str(raw.get("capacity_source", "explicit") or "explicit")
@@ -402,6 +443,52 @@ def _normalize_nodes(
             "capacity_source": capacity_source,
             "execution_device": str(raw.get("execution_device", "unknown") or "unknown"),
         }
+        # ★ 2026-10-25（#117 收尾）：**物化模式与主机内存额度必须随节点透传到求解器**。
+        #   `_node_budget` 要据此把主机内存计入可分配容量 —— `safetensors_layer_offload`
+        #   下权重驻留主机内存，只按 `capacity_bytes`（对 pytorch+cuda 是**显存**，实测
+        #   7451181056 ≈ 7.45 GB）参与求解，会把 master 从能扛 24 层压到只有 8 层，
+        #   主机那 ~32 GB 全程闲置（这正是"容量不准入（只算了 VRAM）"的根因）。
+        #   上面是白名单式字段挑拣，二者此前不在其中 ⇒ `_node_budget` 永远读不到，
+        #   求解器侧的改动会形同虚设。仅在实际出现时附加：未标注物化的节点
+        #   （既有拓扑与既有测试）行为完全不变。
+        if raw.get("materialization"):
+            normalized["materialization"] = str(raw["materialization"])
+        if "host_capacity_bytes" in raw:
+            normalized["host_capacity_bytes"] = _non_negative_int(
+                raw["host_capacity_bytes"], "host_capacity_bytes")
+        # ★ 2026-10-25：**每层推理成本标定值**（毫秒，相对量）。求解器原先按解码器
+        #   **字节**份额均衡，把最慢的设备当成和最快的设备一样贵 —— 实测三机每层成本
+        #   差 2.3 倍（master 12.6 / rog-5060 8.7 / android 20.1 ms），典型后果是 rog
+        #   扛 24 层成为瓶颈而最慢的 android 只扛 8 层。标定值由**调用方**（读
+        #   `QLH_LAYER_COST_MS`）填入：本模块是纯求解器，不读环境（见
+        #   tests/test_refactor_capacity_load_spec.py 的 ambient-state 契约）。
+        #   缺省不填 ⇒ 求解器按 1.0，与旧行为逐字节等价。
+        if "layer_cost_ms" in raw:
+            cost = raw["layer_cost_ms"]
+            if type(cost) not in (int, float) or not math.isfinite(cost) or cost <= 0:
+                raise PipelineCapacityError(
+                    f"node[{node_id}].layer_cost_ms must be a positive number")
+            normalized["layer_cost_ms"] = float(cost)
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**执行器身份与共享内存域**。
+        #   `executor_id` 缺省 ""（= 该节点的默认/主执行器 = 今天的行为）；
+        #   `capacity_domain_id` 缺省 = `node_id`（= 每节点一个独立域 = 今天的行为）。
+        #   只有显式给出 `capacity_domain_id` **且** 同域有多个执行器时，容量才按
+        #   **物理机总账**校验（见 `validate_capacity_domains`）—— 否则同一台物理机上的
+        #   两个执行器会各自按整机可用内存记账，静默给出物理上装不下的计划。
+        if "executor_id" in raw:
+            normalized["executor_id"] = str(raw["executor_id"] or "")
+        if raw.get("capacity_domain_id"):
+            normalized["capacity_domain_id"] = str(raw["capacity_domain_id"])
+        if "domain_total_bytes" in raw:
+            normalized["domain_total_bytes"] = _non_negative_int(
+                raw["domain_total_bytes"], "domain_total_bytes")
+        # ★ 2026-10-25：**域内申报额**（专用通道，与 `host_capacity_bytes` 分开）。
+        #   调用方用它来表达"这个执行器在该共享域里占多少"，且**每次重新推导** ⇒ 幂等。
+        #   不能复用 `host_capacity_bytes`：那个字段还承载 `safetensors_layer_offload`
+        #   的 host 预算（见 `_node_budget`），扣减它会连带削掉 offload 额度。
+        if "domain_allocatable_bytes" in raw:
+            normalized["domain_allocatable_bytes"] = _non_negative_int(
+                raw["domain_allocatable_bytes"], "domain_allocatable_bytes")
         if "configured_reserve_bytes" in raw or "retained_component_reserve_bytes" in raw:
             for field in ("configured_reserve_bytes", "retained_component_reserve_bytes"):
                 if type(raw.get(field)) is not int or raw[field] < 0:
@@ -470,6 +557,19 @@ def _normalize_nodes(
                 raw["range_weight_bytes"], f"node[{node_id}].range_weight_bytes",
                 total_layers=total_layers,
             )
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**工件覆盖范围**（组空间，可选）。
+        #   与 `layer_budget.local_cut` 语义不同：`local_cut` 只解锁切分粒度，
+        #   这一项钉住工件实际覆盖到哪些层，显式声明后**无论有没有 local_cut 都生效**。
+        if "layer_bounds" in raw:
+            _bounds = raw["layer_bounds"]
+            if (not isinstance(_bounds, (list, tuple)) or len(_bounds) != 2
+                    or any(type(value) is not int for value in _bounds)
+                    or not 0 <= _bounds[0] < _bounds[1]
+                    or (total_layers is not None and _bounds[1] > total_layers)):
+                raise PipelineCapacityError(
+                    f"node[{node_id}].layer_bounds must be an in-range [start, end) pair"
+                )
+            normalized["layer_bounds"] = (int(_bounds[0]), int(_bounds[1]))
         # Candidate generation constraints are independent of ready artifacts.
         # In particular, local_cut must never relax a host/source range budget.
         if "candidate_layer_ranges" in raw:
@@ -529,9 +629,30 @@ def _normalize_nodes(
         usable.append(normalized)
     # The execution contract puts a participating master at the input stage.
     # This order chooses stage positions; the objective below chooses amounts.
+    #
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**段类型必须参与排序**。
+    #   排序决定 DFS 的遍历次序，而 DFS 是**单向**的（`cursor` 只前进、不回头）
+    #   ⇒ 段类型必须与层顺序一致。实测（`scripts/probe_local_executor_placement.py`）：
+    #   `fastest`（`prefer_all_workers` 为真、目标第一项就是 `-len(candidate)`，3 段必
+    #   优于 2 段）下求解器仍只输出 2 段 —— 因为本机 CPU 段**继承了主段的
+    #   `role="master"`**，与主段同组后按容量降序排到**第一位**（11.2 GB > 主段 6.4 GB），
+    #   而它是 `middle`，在 `cursor=0` 被 `cursor != 0` 拒掉后再不被回看 ⇒ 结构性跳过。
+    #
+    #   次序与理由（**不是**"最灵活就排最后"）：
+    #     head (0)      —— 强制首段（必须含 embedding），必须最先落位；
+    #     未声明 (0.5)  —— 最灵活，可作任意段 ⇒ **越早越好**：它选择多，先安排不会
+    #                      挤掉别人。放到最后反而会被有约束的节点占满位置 ⇒ 无解
+    #                      （实测 `test_per_artifact_modes_select_the_matching_range_and_identity`：
+    #                      未声明 mode 的 `edge` 排到 `tail` 之后 ⇒ tail 先占末段 ⇒
+    #                      `edge` 无处安放 ⇒ `admitted=False`）；
+    #     middle (1)    —— 不能是首段也不能是末段；
+    #     tail (2)      —— 强制末段，约束最强，兜底。
+    mode_order = {"head": 0, "": 0.5, "middle": 1, "tail": 2}
     usable.sort(
         key=lambda node: (
             node["role"] != "master",
+            bool(node.get("executor_id")) if node["role"] == "master" else False,
+            mode_order.get(str(node.get("segment_mode") or "").lower(), 0.5),
             -node["score"],
             -(node["capacity_bytes"] - node["reserve_bytes"]),
             node["node_id"],
@@ -575,8 +696,24 @@ def capacity_budget(
 
 
 def _node_budget(raw_bytes: int, node: dict[str, Any], safety_margin: float) -> dict[str, int]:
+    # ★ 2026-10-25（#117 收尾）：**offload 节点的可分配额度应以主机内存为准**。
+    #   `safetensors_layer_offload` 的语义是权重**驻留主机内存**、显存只放下当前执行的
+    #   那一个单元（见 `_LayerOffloadRuntime`：逐执行单元 stage → 用完释放）。但求解器
+    #   此前只认 `capacity_bytes`，而对 `pytorch`+`cuda` 的 master 那是**显存**
+    #   （实测 7451181056 ≈ 7.45 GB）⇒ master 只能拿到显存装得下的 8 层，主机那 ~32 GB
+    #   全程闲置（实测 master 恒为 `[0,8)`）。这正是"容量不准入（只算了 VRAM）"的根因。
+    #   上游 `project_supply_capacity_nodes` 已按 `host_capacity_bytes` 把**装不下的候选
+    #   区间筛掉**（`host_weight_peak_bytes × margin + reserve > host_available` 即跳过），
+    #   因此这里把额度换成主机额度是**自洽**的：候选合法性由 host 峰值决定，额度也由
+    #   host 决定，不再拿显存去衡量放在主机里的权重。
+    #   仅在该物化被显式标注时生效；未标注的节点（既有拓扑与既有测试）行为完全不变。
+    capacity = node.get("capacity_bytes", 0)
+    if node.get("materialization") == "safetensors_layer_offload":
+        host_capacity = node.get("host_capacity_bytes")
+        if host_capacity:
+            capacity = host_capacity
     return capacity_budget(
-        raw_bytes, capacity_bytes=node.get("capacity_bytes", 0),
+        raw_bytes, capacity_bytes=capacity,
         reserve_bytes=node["reserve_bytes"],
         runtime_multiplier=node.get("runtime_multiplier", 1.0),
         safety_margin=safety_margin,
@@ -586,6 +723,99 @@ def _node_budget(raw_bytes: int, node: dict[str, Any], safety_margin: float) -> 
 def _required_bytes(raw_bytes: int, node: dict[str, Any], safety_margin: float) -> int:
     """Compatibility for manual plans and existing budget channels."""
     return _node_budget(raw_bytes, node, safety_margin)["required_bytes"]
+
+
+def capacity_domains(usable: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """One entry per **shared physical budget**.
+
+    ★ 2026-10-25（LOCAL-EXECUTORS-01）：一台物理机可以承载多个执行器（例如
+    master 的 GPU 段 + 同一台机器的 CPU 段）。它们共享同一份 RAM，但容量是按
+    `node_id` 记账的 ⇒ 两个执行器会各自按整机可用内存申报，求解器则把它们当成
+    两台独立物理机，于是给出**物理上装不下**的计划却 `admitted=True`（实测：
+    两节点各 200 容量、合计需求 242，仍被准入，且每段都显示 headroom=79）。
+
+    `capacity_domain_id` 就是这个共享域的键；**缺省 = `node_id`**，即每个节点自成一域
+    ——这正是今天的行为，所以既有调用方的记账**逐字节不变**。
+    """
+    domains: dict[str, dict[str, Any]] = {}
+    for node in usable:
+        domain_id = str(node.get("capacity_domain_id") or node["node_id"])
+        entry = domains.get(domain_id)
+        if entry is None:
+            entry = domains[domain_id] = {"domain_total_bytes": None, "executors": []}
+        total = node.get("domain_total_bytes")
+        if total is not None:
+            total = int(total)
+            if entry["domain_total_bytes"] is None:
+                entry["domain_total_bytes"] = total
+            elif int(entry["domain_total_bytes"]) != total:
+                raise PipelineCapacityError(
+                    f"capacity domain {domain_id!r} declares conflicting "
+                    f"domain_total_bytes ({entry['domain_total_bytes']} vs {total})")
+        # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**域账必须用同一类资源**。
+        #   `capacity_bytes` 对 CUDA 节点是 **VRAM**（`capacity_source="gpu.vram_free_gb"`），
+        #   对纯 CPU/GGUF 执行器是 **RAM** —— 直接把两者相加会把两种资源混成一份总账。
+        #   实测：主段 VRAM 6.0 GB + 本机 CPU 段 RAM 10.2 GB = 16.2 GB > 总账 14.6 GB
+        #   ⇒ 报 `pipeline_capacity_domain_exceeded` 超额 1.56 GB，而物理上并不冲突
+        #   （VRAM 与 RAM 是两份独立资源）。
+        #   共享**内存**域的本质是"同一份 RAM"，所以按主机内存记账，优先级：
+        #     1. `domain_allocatable_bytes` —— **调用方显式声明的域内额度**。这是唯一
+        #        幂等的通道：份额由声明值推导（例如按 `QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION`
+        #        从 `domain_total_bytes` 重新计算），而不是"在上一次结果上做减法"。
+        #        实测教训：先前直接对 `host_capacity_bytes` 原地扣减，而
+        #        `_get_pipeline_capacity_nodes` **会被多次调用、每次重建 records**
+        #        ⇒ 扣除只对那一次返回值生效，供给拿到的仍是未扣的快照 ⇒ 超额照旧。
+        #        也不能直接改 `host_capacity_bytes`：它另有用途（`safetensors_layer_offload`
+        #        的 host 预算，见 `_node_budget`），扣它会连带削掉 offload 额度。
+        #     2. `host_capacity_bytes` —— 主机内存额度。
+        #     3. `capacity_bytes` —— 兜底（对纯 CPU/GGUF 节点与前两者同义）。
+        explicit_budget = node.get("domain_allocatable_bytes")
+        if explicit_budget is not None:
+            host_budget = explicit_budget
+        elif node.get("host_capacity_bytes") is not None:
+            host_budget = node["host_capacity_bytes"]
+        else:
+            host_budget = node["capacity_bytes"]
+        entry["executors"].append({
+            "node_id": node["node_id"],
+            "executor_id": str(node.get("executor_id") or ""),
+            "allocatable_bytes": max(0, int(host_budget) - int(node["reserve_bytes"])),
+        })
+    return domains
+
+
+def validate_capacity_domains(
+    usable: list[dict[str, Any]],
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Fail closed when one domain's executors claim more than its total.
+
+    只对**显式声明了总账**的域校验（`domain_total_bytes is not None`）：单执行器域与
+    未声明总账的域一律视为"无需跨执行器校验"，因此既有拓扑与既有测试零影响。
+    方向是**宁可多拒**（安全方向）：过度拒绝只是少用一台机器，静默超配会让部署在
+    真实内存压力下崩掉。
+    """
+    domains = capacity_domains(usable)
+    report: dict[str, dict[str, Any]] = {}
+    admitted = True
+    for domain_id, entry in domains.items():
+        total = entry["domain_total_bytes"]
+        claimed = sum(item["allocatable_bytes"] for item in entry["executors"])
+        excess = 0 if total is None else max(0, claimed - int(total))
+        if excess:
+            admitted = False
+        report[domain_id] = {
+            "domain_total_bytes": total,
+            "claimed_allocatable_bytes": claimed,
+            "excess_bytes": excess,
+            "executors": entry["executors"],
+        }
+    return admitted, report
+
+
+def _domain_report_is_informative(report: dict[str, dict[str, Any]]) -> bool:
+    """有无**跨执行器**域需要报告（单执行器域不占篇幅、也不改变既有输出形态）。"""
+    return any(entry["domain_total_bytes"] is not None or len(entry["executors"]) > 1
+               for entry in report.values())
 
 
 def _relay_zero_layer_assignments(
@@ -749,6 +979,30 @@ def _self_cut_segment_bytes(node, start, end) -> list[int] | None:
     return [per_layer] * max(0, int(end) - int(start))
 
 
+def _node_executor_label(node_id: Any, executor_id: Any = "") -> str:
+    """节点的**对外诊断身份**：主执行器裸 `node_id`，附加执行器 `node_id#executor_id`。
+
+    ★ 2026-10-27（审计 A6）：身份是 `(node_id, executor_id)`，但
+    `control_only_nodes` / `single_node_full_model_candidates` / `step_time_estimate`
+    都是**对外输出字段**（`/api/cluster/pipeline-capacity`、`/api/cluster/status`
+    的节点投影、android 集群概览、`model_runtime_contracts_v1` 的 plan 投影都会读）。
+    同机 CPU 段（`executor_id="cpu"`）与主段共用 `node_id="master"`，此前这些字段只写
+    裸 `node_id` ⇒ 两个执行器在输出里塌成同一个名字：主段参与、CPU 段闲置时
+    `control_only_nodes` 里看不到 `master#cpu`（被主段"代表"了），于是**闲置的执行器
+    在诊断里不可见**；瓶颈也只能说"master 慢"，无法回答是 GPU 段还是 CPU 段慢。
+
+    为什么不是无条件写成 `node_id#executor_id`：这些字段的既有消费方按裸 `node_id`
+    读取（测试断言 `"master" in control_only_nodes`、`scheduler_cluster` 用裸
+    `node_id` 做 `in` 判断、现场脚本按 `node_id` 对齐）。**兼容规则**：
+    `executor_id` 为空 ⇒ 输出裸 `node_id`（既有拓扑逐字节不变）；**仅附加执行器**
+    才带 `#executor_id` 后缀。这与项目里视图键的既有写法一致
+    （`model_intent.py:162`、`model_supply.py:1811`、`stage_identity()`）。
+    """
+    executor = str(executor_id or "")
+    label = str(node_id)
+    return f"{label}#{executor}" if executor else label
+
+
 def solve_pipeline_capacity(
     descriptor: dict[str, Any],
     nodes: list[dict[str, Any]],
@@ -842,16 +1096,28 @@ def solve_pipeline_capacity(
     for value in layer_bytes:
         prefix.append(prefix[-1] + value)
 
-    checks: dict[tuple[str, int, int], dict[str, Any]] = {}
+    checks: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     capacity_checks: list[dict[str, Any]] = []
-    exclusions: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    exclusions: dict[tuple[str, str, int, int, str], dict[str, Any]] = {}
     candidate_exclusions: list[dict[str, Any]] = []
 
     def exclude(node, start, end, reason_code, budget=None):
-        exclusions[(node["node_id"], start, end, reason_code)] = {
+        # ★ 2026-10-27（审计 A5）：**排除记录也必须按执行器身份区分**。
+        #   同机 CPU 段与主段共用 `node_id="master"`：此前键只有
+        #   `(node_id, start, end, reason_code)` ⇒ 两段对同一区间、同一原因的排除
+        #   **互相覆盖**，`candidate_exclusions` 只剩后写的那一条；而输出里也没有
+        #   `executor_id` ⇒ 现场读到"master 在 [8,24) 被排除"时无法判断被排除的是
+        #   CPU 段还是主段（项目注释记过这次误判：把 CPU 段的容量不足读成主段）。
+        #   与同函数的 `checks` 保持同一种身份键，两条记录才能对上。
+        executor_id = str(node.get("executor_id") or "")
+        entry = {
             "node_id": node["node_id"], "layer_range": [start, end],
             "reason_code": reason_code, **(budget or {}),
         }
+        # `executor_id` 放在 budget 展开**之后**：预算字段来自 `_node_budget`，即便
+        # 将来它带上同名字段，身份也必须以节点记录为准（不被覆盖）。
+        entry["executor_id"] = executor_id
+        exclusions[(node["node_id"], executor_id, start, end, reason_code)] = entry
 
     base = {
         "schema_version": CAPACITY_PLAN_SCHEMA_VERSION,
@@ -866,6 +1132,33 @@ def solve_pipeline_capacity(
         "capacity_checks": capacity_checks,
         "candidate_exclusions": candidate_exclusions,
     }
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**同机容量去重**。
+    #   一台物理机可以承载多个执行器（master 的 GPU 段 + 同机 CPU 段），它们共享同一份
+    #   RAM，但容量按 `node_id` 记账 ⇒ 两个执行器各自按整机可用内存申报，求解器把它们
+    #   当成两台独立物理机，于是给出**物理上装不下**的计划却 `admitted=True`（实测：
+    #   两节点各 200 容量、合计需求 242，仍被准入，且每段都显示 headroom=79）。
+    #   位置：relay 已剔除（relay 段不占层、不计容量，不该参与域账），且 `base` 已构造
+    #   （拒绝分支与既有分支保持同形）。
+    #   生效条件：只对**显式声明总账**的域校验（`domain_total_bytes`）。未声明 ⇒ 每节点
+    #   自成一域、一律不校验 ⇒ 既有拓扑与既有测试零影响；域报告也只在"有跨执行器域"
+    #   时才写进结果，避免改动既有输出形态。
+    domains_admitted, domain_report = validate_capacity_domains(usable)
+    if _domain_report_is_informative(domain_report):
+        base["capacity_domains"] = domain_report
+    if not domains_admitted:
+        return {
+            **base,
+            "status": "rejected",
+            "admitted": False,
+            "reason_code": "pipeline_capacity_domain_exceeded",
+            "reason": ("同一物理内存域内的执行器申报额度之和超过该域总账；"
+                       "按节点分别记账会让同机多执行器各自按整机可用内存申报。"),
+            "assignments": [],
+            "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
+        }
     required_node_index = next((index for index, node in enumerate(usable)
                                 if node["node_id"] == required_node_id), None)
     if required_node_id is not None and required_node_index is None:
@@ -874,7 +1167,10 @@ def solve_pipeline_capacity(
             "reason_code": "pipeline_required_node_unavailable",
             "reason": f"required executor {required_node_id} has no usable model capacity",
             "required_node_id": required_node_id,
-            "assignments": [], "control_only_nodes": [node["node_id"] for node in usable],
+            "assignments": [], "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
     if not usable and not relay_only:
         return {
@@ -897,12 +1193,45 @@ def solve_pipeline_capacity(
             "reason_code": "pipeline_distributed_workers_unavailable",
             "reason": "distributed placement requires at least two usable PC nodes",
             "assignments": [],
-            "control_only_nodes": [node["node_id"] for node in usable],
+            "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
 
     work_total = prefix[layer_budget] or 1
+    # ★ 2026-10-25：切点求解的**成本加权**。`placement_work_fraction` 原先只按解码器
+    #   **字节**算份额，于是求解器把"每层 20.1 ms 的 android"和"每层 8.7 ms 的 rog"
+    #   当成同等昂贵，均衡结果与真实端到端步时脱节（实测：rog 扛 24 层成瓶颈，最慢的
+    #   android 却只扛 8 层）。这里把每个执行器的字节份额乘以它的**每层成本倍数**，
+    #   `stage_placement_cost` 本身不改 —— 它的均衡条件 `w_i/w_j = weight_i/weight_j`
+    #   于是作用于"成本"而非"字节"，这正是我们要的。
+    #
+    #   归一化与缺省：
+    #     * 全部未标定（`costs` 为空）⇒ 所有倍数恒为 1.0 ⇒ **与旧行为逐字节等价**
+    #       （可作回归门）。
+    #     * 有标定时以**最快**者为基准 1.0；未标定的执行器取"已标定中最慢"的倍数，
+    #       避免它因为没有数据反而被当成最快而被**过度分配**（安全方向）。
+    #     * `work_total` 保持**未加权**：它是同一候选空间里的公共常数，公共缩放不改变
+    #       argmin（目标第一项整体乘同一个因子），而让它随分配变化会破坏
+    #       `placement.py` 的可加性论证（suffix optimum 依赖目标可加）。
+    _calibrated = [float(node["layer_cost_ms"]) for node in usable
+                   if node.get("layer_cost_ms")]
+    _cost_reference = min(_calibrated) if _calibrated else 1.0
+
+    def layer_cost_multiplier(node):
+        cost = node.get("layer_cost_ms")
+        if not cost:
+            return (max(_calibrated) / _cost_reference) if _calibrated else 1.0
+        return float(cost) / _cost_reference
+
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**按执行器身份索引**。同机 CPU 段与主段共用
+    #   `node_id="master"`，用裸 `node_id` 做 key 会让两者的精确区间报价**互相覆盖**
+    #   （后写的胜出）⇒ 一个执行器被按另一个的权重尺寸计费。这与本轮在 `checks`
+    #   （已修）是同一个模式：凡是以 `node_id` 为唯一身份的地方，同机两段就会串味。
     range_quotes = {
-        node["node_id"]: {quote["layer_range"]: quote for quote in node["range_weight_bytes"]}
+        (node["node_id"], str(node.get("executor_id") or "")):
+            {quote["layer_range"]: quote for quote in node["range_weight_bytes"]}
         for node in usable if "range_weight_bytes" in node
     }
     if range_quotes:
@@ -911,7 +1240,8 @@ def solve_pipeline_capacity(
     @lru_cache(maxsize=None)
     def placement_objective(candidate):
         costs = [stage_placement_cost(
-            (prefix[value[2]] - prefix[value[1]]) / work_total,
+            ((prefix[value[2]] - prefix[value[1]]) / work_total)
+            * layer_cost_multiplier(usable[value[0]]),
             usable[value[0]]["score"], value[4], usable[value[0]]["capacity_bytes"],
         ) for value in candidate]
         return (
@@ -960,9 +1290,50 @@ def solve_pipeline_capacity(
             if advertised_budget is not None and count > advertised_budget["max_layers"]:
                 exclude(node, cursor, end, "node_layer_budget_exceeded")
                 continue
-            # 只有当设备声明"能按分配在本地裁层"（`local_cut=true`）时，`layer_ranges`
-            # 才降级为"当前已就绪"的信息、不再限制分配；否则它仍是硬约束 ——
-            # 派给设备一个它手上没有工件的区间，请求必然失败。
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`local_cut` 只解锁切分粒度，不解锁工件边界**。
+            #
+            #   `local_cut=true` 的原意是"本设备手上有整模，能按分配在本地裁层"⇒ 任意区间
+            #   都行，故 `layer_ranges` 降级为信息、不再约束。但本机 CPU 段拿的是**裁好的
+            #   部分工件**（`q35-9b-local-mid8-24.gguf` 只含 `[8,24)`），它**不能**自裁到
+            #   任意区间。此前直接复用 `local_cut` ⇒ 边界失效 ⇒ 真机实测把 `[0,8)` 派给
+            #   了它（2026-10-26 01:04 `assignments=[('master','cpu',0,8), ...]`），而执行期
+            #   要拿 `mid8-24.gguf` 去算 `[0,8)` ⇒ 层号越界/权重缺失，正是"部署显示成功、
+            #   第一次推理才炸"的最坏形态。
+            #
+            #   修法：`layer_budget` 可携带 `min_layer`/`max_layer` 声明**可切区间**。
+            #   给了边界就必须落在边界内；**没给边界则保持原行为（不检查）** —— 远端
+            #   worker 的 budget 来自 hello capabilities、不含这两项，逐字节不变。
+            budget_bounds: tuple[int, int] | None = None
+            if advertised_budget is not None:
+                low = advertised_budget.get("min_layer")
+                high = advertised_budget.get("max_layer")
+                if low is not None and high is not None:
+                    budget_bounds = (int(low), int(high))
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**专用字段 `layer_bounds`**。
+            #
+            #   它表达"本执行器**工件实际覆盖**的组区间"，是硬事实，与
+            #   `layer_budget.local_cut`（能不能在区间内自由切）语义不同：
+            #   `local_cut` 只解锁**切分粒度**，不解锁**工件边界**。
+            #   此前边界只能搭 `layer_budget.min_layer/max_layer` 的车，而
+            #   `layer_budget` 是供给侧内部输入、按契约不该传进求解器
+            #   （`test_supply_candidates_ignore_old_segments_without_granting_execution_readiness`）
+            #   ⇒ 边界信息丢失 ⇒ 实测给出 `('master','cpu', 8, 28)` 而工件只覆盖
+            #   `[8,24)` ⇒ 越界到执行期才暴露。
+            #   两者都给出时取**交集**（更严的那个赢），都不给则不加约束。
+            _bounds = node.get("layer_bounds")
+            if (isinstance(_bounds, (list, tuple)) and len(_bounds) == 2
+                    and all(type(value) is int for value in _bounds)
+                    and 0 <= _bounds[0] < _bounds[1]):
+                budget_bounds = (
+                    (max(budget_bounds[0], _bounds[0]), min(budget_bounds[1], _bounds[1]))
+                    if budget_bounds is not None else (_bounds[0], _bounds[1])
+                )
+            # 工件边界**独立于** `local_cut` 生效：显式声明了就一定不能越界。
+            if budget_bounds is not None and not (
+                budget_bounds[0] <= cursor and end <= budget_bounds[1]
+            ):
+                exclude(node, cursor, end, "node_layer_budget_out_of_bounds")
+                continue
             if advertised_budget is None or not advertised_budget.get("local_cut"):
                 allowed_ranges = node.get("layer_ranges")
                 if allowed_ranges is not None and not any(
@@ -995,9 +1366,29 @@ def solve_pipeline_capacity(
                         # safely as an executable segment.
                         exclude(node, cursor, end, "node_layer_artifact_unavailable")
                         continue
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**`local_cut` 让段类型失效，前提是它真有整模**。
+            #
+            #   原判据：只要 `local_cut` 为真，`segment_mode` 就取 `None` ⇒ head/middle/tail
+            #   约束**全部跳过**。这对"手上有整模、能按分配裁出任意段"的 worker 是对的。
+            #   但**只持有裁好的部分工件**的执行器（本机 CPU 段的 `mid8-24.gguf`）不能当
+            #   首段/末段 —— 它没有 embedding、也没有 `lm_head`/`final_norm`。若因为
+            #   `local_cut` 而跳过段类型检查，求解器可能把它摆到 tail 位置，而那种失败
+            #   发生在**执行期**（缺 `lm_head` ⇒ `Stage error`），不是规划期报错。
+            #   实测（2026-10-26，`scripts/probe_local_executor_placement.py` 场景 E/F）：
+            #   本机 CPU 段正是靠 `local_cut` 才被允许拿非 middle 位置。
+            #
+            #   判据：`layer_budget` 带了**可切边界**（`min_layer`/`max_layer`）⇒ 说明它
+            #   只有部分工件 ⇒ 段类型**仍然生效**；没带边界（整模）⇒ 保持原行为跳过。
+            has_partial_artifact = bool(
+                advertised_budget is not None
+                and advertised_budget.get("min_layer") is not None
+                and advertised_budget.get("max_layer") is not None
+            )
             segment_mode = (
                 matching_artifact.get("segment_mode")
                 if matching_artifact is not None
+                else node.get("segment_mode")
+                if has_partial_artifact
                 else None if advertised_budget is not None
                 and advertised_budget.get("local_cut")
                 else node.get("segment_mode")
@@ -1070,8 +1461,9 @@ def solve_pipeline_capacity(
                     exclude(node, cursor, end, "node_load_spec_components_mismatch")
                     continue
             range_quote = None
-            if node["node_id"] in range_quotes:
-                range_quote = range_quotes[node["node_id"]].get((cursor, end))
+            _identity = (node["node_id"], str(node.get("executor_id") or ""))
+            if _identity in range_quotes:
+                range_quote = range_quotes[_identity].get((cursor, end))
                 if range_quote is None:
                     exclude(node, cursor, end, "node_range_weight_quote_missing")
                     continue
@@ -1091,8 +1483,15 @@ def solve_pipeline_capacity(
                     raw_bytes += output_bytes
             budget = _node_budget(raw_bytes, node, safety_margin)
             required = budget["required_bytes"]
-            checks[(node["node_id"], cursor, end)] = {
-                "node_id": node["node_id"], "layer_range": [cursor, end],
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**检查结果按执行器身份区分**。
+            #   同机 CPU 段与主段共用 `node_id="master"`，此前 key 只用
+            #   `(node_id, cursor, end)` ⇒ 两者的检查结果**互相覆盖**，对外只剩后写的
+            #   那一条 —— 实测把**主段**的显存额度（4.47 GB）安到了 **CPU 段**的区间上，
+            #   于是一条"CPU 段被要求 28 层、只有 3.96 GB"的假记录，掩盖了真实原因。
+            executor_id = str(node.get("executor_id") or "")
+            checks[(node["node_id"], executor_id, cursor, end)] = {
+                "node_id": node["node_id"], "executor_id": executor_id,
+                "layer_range": [cursor, end],
                 "raw_weight_bytes": raw_bytes, **budget,
                 "reason_code": "node_capacity_insufficient" if budget["shortfall_bytes"] else "",
             }
@@ -1126,6 +1525,16 @@ def solve_pipeline_capacity(
     solved = search(0, 0, False, 0, "")
     capacity_checks.extend(checks[key] for key in sorted(checks))
     candidate_exclusions.extend(exclusions[key] for key in sorted(exclusions))
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：这里**不**放宽 `candidate_layer_ranges`。
+    #
+    #   一度想让"带候选 / 去掉候选"两种都解、按目标取优，理由是真机上 `android [[8,20]]`
+    #   + `TABLET [[20,32]]` 把 `[8,32)` 占满、本机 CPU 段挤不进去。但那是**方向错了**：
+    #   候选区间表达的是"**我手上确实有这个段**"这个事实，它**就该是硬约束**
+    #   （`test_candidate_ranges_and_layer_limits_remain_hard_with_local_cut` 这个名字
+    #   就是设计意图的直述），放宽它等于允许把一个设备的算力规划到它并没有的工件上。
+    #
+    #   真正的问题在**写入侧**：`model_supply_capacity` 把**上一轮**的切点当成这一轮的
+    #   候选，于是每轮沿用上轮切点、布局被锁死。要修的是"谁写了这个候选、凭什么"。
     if solved is None:
         allocatable_bytes = sum(
             _node_budget(0, node, safety_margin)["allocatable_bytes"]
@@ -1148,7 +1557,10 @@ def solve_pipeline_capacity(
                     "reason_code": "pipeline_candidate_layer_range_unsatisfied",
                     "reason": "source coverage or staging ranges cannot form a capacity-safe contiguous split",
                     "assignments": [], "allocatable_bytes": allocatable_bytes,
-                    "control_only_nodes": [node["node_id"] for node in usable],
+                    "control_only_nodes": [
+                        _node_executor_label(node["node_id"], node.get("executor_id"))
+                        for node in usable
+                    ],
                 }
         segment_constrained = any(
             node.get("segment_mode") is not None
@@ -1188,7 +1600,10 @@ def solve_pipeline_capacity(
                         0, raw_model_bytes - allocatable_bytes
                     )}),
                     "assignments": [],
-                    "control_only_nodes": [node["node_id"] for node in usable],
+                    "control_only_nodes": [
+                        _node_executor_label(node["node_id"], node.get("executor_id"))
+                        for node in usable
+                    ],
                 }
         # Distinguish a topology contract failure from a plain memory
         # shortage. Re-run the same admission with the range contract
@@ -1264,7 +1679,10 @@ def solve_pipeline_capacity(
                     **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
                     "assignments": [],
                     "uncovered_layer_ranges": [],
-                    "control_only_nodes": [node["node_id"] for node in usable],
+                    "control_only_nodes": [
+                        _node_executor_label(node["node_id"], node.get("executor_id"))
+                        for node in usable
+                    ],
                 }
             reason = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"
@@ -1285,7 +1703,10 @@ def solve_pipeline_capacity(
                 **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
                 "assignments": [],
                 "uncovered_layer_ranges": [list(gap) for gap in gaps],
-                "control_only_nodes": [node["node_id"] for node in usable],
+                "control_only_nodes": [
+                    _node_executor_label(node["node_id"], node.get("executor_id"))
+                    for node in usable
+                ],
             }
         return {
             **base,
@@ -1299,11 +1720,18 @@ def solve_pipeline_capacity(
             "allocatable_bytes": allocatable_bytes,
             **({} if range_quotes else {"raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes)}),
             "assignments": [],
-            "control_only_nodes": [node["node_id"] for node in usable],
+            "control_only_nodes": [
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+                for node in usable
+            ],
         }
 
     assignments = []
-    used_ids: set[str] = set()
+    # ★ 2026-10-27（审计 A6）：**参与身份是 `(node_id, executor_id)`**，不是裸 node_id。
+    #   此前用 `set[str]` 只记 node_id ⇒ 同机主段参与后，闲置的 CPU 段因"该 node_id
+    #   已在集合里"而不会被列入 `control_only_nodes`（一个在干活、一个闲置，诊断却
+    #   只有一句话）；反过来若只有 CPU 段参与，主段也会被误判为已参与。
+    used_ids: set[tuple[str, str]] = set()
     for (
         node_index, start, end, raw_bytes, required,
         has_embedding, has_lm_head, artifact_index,
@@ -1313,7 +1741,7 @@ def solve_pipeline_capacity(
             node["layer_artifacts"][artifact_index]
             if artifact_index is not None else None
         )
-        used_ids.add(node["node_id"])
+        used_ids.add((node["node_id"], str(node.get("executor_id") or "")))
         assignment = {
             "node_id": node["node_id"],
             "role": node["role"],
@@ -1331,8 +1759,20 @@ def solve_pipeline_capacity(
             "execution_device": node["execution_device"],
             "capacity_source": node["capacity_source"],
             "score": node["score"],
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**执行器身份与共享内存域必须随
+            #   assignment 一起流到部署侧**。否则下游（`scheduler_pipeline` 的部署构造）
+            #   无法把"同一物理节点上的第二个执行器"认出来，本机 CPU 段永远不会被规划
+            #   出来 —— 执行通路虽然接好了，却没有任何东西会去用它。
+            #   仅**非空**时输出 ⇒ 既有计划的 assignment 形态与逐位内容不变（回归门）。
+            **({"executor_id": str(node.get("executor_id") or "")}
+               if node.get("executor_id") else {}),
+            **({"capacity_domain_id": str(node["capacity_domain_id"])}
+               if node.get("capacity_domain_id") else {}),
             "placement_weight": placement_weight(node["score"]),
-            "placement_work_fraction": (prefix[end] - prefix[start]) / work_total,
+            # 必须与 `placement_objective` 用**同一个**成本倍数，否则报告与实际选择
+            # 脱节（这个字段被下游当"该段占了多大份额"读）。
+            "placement_work_fraction": ((prefix[end] - prefix[start]) / work_total)
+            * layer_cost_multiplier(node),
             **_node_budget(raw_bytes, node, safety_margin),
         }
         for field in ("configured_reserve_bytes", "retained_component_reserve_bytes",
@@ -1354,15 +1794,15 @@ def solve_pipeline_capacity(
                 **artifact,
                 "layer_range": list(artifact["layer_range"]),
             }
-        if node["node_id"] in range_quotes:
-            quote = range_quotes[node["node_id"]][(start, end)]
+        if (node["node_id"], str(node.get("executor_id") or "")) in range_quotes:
+            quote = range_quotes[(node["node_id"], str(node.get("executor_id") or ""))][(start, end)]
             assignment["range_weight_quote"] = {**quote, "layer_range": [start, end]}
         assignments.append(assignment)
 
     selected_layer_bytes = 0
     for index, start, end, raw, _, embedding, lm_head, artifact_index in solved:
         node = usable[index]
-        if node["node_id"] in range_quotes:
+        if (node["node_id"], str(node.get("executor_id") or "")) in range_quotes:
             artifact = node["layer_artifacts"][artifact_index] if artifact_index is not None else {}
             sizes = artifact.get("layer_weight_bytes")
             if sizes is None:
@@ -1428,15 +1868,22 @@ def solve_pipeline_capacity(
             full_bytes = sum(node["layer_weight_bytes"]) + node.get(
                 "retained_component_bytes", embedding_bytes + per_node_bytes + output_bytes,
             )
-        if node["node_id"] in range_quotes:
-            full_quote = range_quotes[node["node_id"]].get((0, total_layers))
+        if (node["node_id"], str(node.get("executor_id") or "")) in range_quotes:
+            full_quote = range_quotes[(node["node_id"], str(node.get("executor_id") or ""))].get((0, total_layers))
             if (full_quote is None or not full_quote["has_embedding"]
                     or not full_quote["has_lm_head"]):
                 continue
             full_bytes = full_quote["weight_bytes"]
         required = _required_bytes(full_bytes, node, safety_margin)
         if required <= node["capacity_bytes"]:
-            full_model_fits.append(node["node_id"])
+            # ★ 2026-10-27（审计 A6）：这里同样是执行器身份。原先写裸 `node_id` ⇒
+            #   同机主段与 CPU 段都能装下整模时列表里出现两个 `"master"`（重复），
+            #   读的人无法判断"整模候选"到底有几个执行器；而如果只有 CPU 段装得下、
+            #   主段装不下，两者仍都显示为 `"master"` ⇒ 漏（错）判。用诊断标签后
+            #   主段仍是 `master`（既有输出逐字节不变），CPU 段为 `master#cpu`。
+            full_model_fits.append(
+                _node_executor_label(node["node_id"], node.get("executor_id"))
+            )
 
     objective = placement_objective(solved)
     base["placement_policy"] = {
@@ -1450,6 +1897,58 @@ def solve_pipeline_capacity(
         "memory_pressure_cost": objective[2],
         "score_total": -objective[3],
     }
+    # ★ 2026-10-25：**makespan 报告**（**不参与选择**，只让"切点好不好"可测）。
+    #   求解目标 `capability_weighted_work_square` 是**均衡近似**，不是端到端步时
+    #   （= 最长段）。实测证明两者会背离：`fastest` 档下按**成本**均衡把 rog 推成
+    #   新瓶颈 174 ms，而按**字节**均衡的最长段只有 161 ms（端到端反而慢 7%）——
+    #   见 docs/本机跨框架层段成本与干扰实测-2026-10-25.md。
+    #   所以"选了哪条切点"与"这条切点实际多快"必须能分别看到，否则无法判断是否值得
+    #   为 makespan 另开一条求解路径（那需要重新论证最优性，因为现有 suffix optimum
+    #   依赖目标**可加**，而 max 不可加）。
+    #   数据来自调用方填的 `layer_cost_ms`（本模块是纯求解器、不读环境）。只要有任意
+    #   一个**参与**节点带标定就给出报告；未标定段的 `estimated_ms` 留 None 而不猜，
+    #   并单列在 `uncalibrated_segments` 里 —— 半真半假的步时估计比没有更危险。
+    if any(usable[value[0]].get("layer_cost_ms") for value in solved):
+        segments_ms = []
+        for value in solved:
+            node = usable[value[0]]
+            cost = node.get("layer_cost_ms")
+            layers = int(value[2]) - int(value[1])
+            segments_ms.append({
+                "node_id": node["node_id"],
+                # ★ 2026-10-27（审计 A6）：`node_id` 保持裸值（既有读法不变），
+                #   附加执行器另外带 `executor_id`；仅非空时输出 ⇒ 既有单执行器
+                #   拓扑的段报告逐字节不变，而 `master#cpu` 能被认出来。
+                **({"executor_id": str(node.get("executor_id") or "")}
+                   if node.get("executor_id") else {}),
+                "layer_range": [int(value[1]), int(value[2])],
+                "layers_count": layers,
+                "layer_cost_ms": float(cost) if cost else None,
+                "estimated_ms": (layers * float(cost)) if cost else None,
+            })
+        measured = [item for item in segments_ms if item["estimated_ms"] is not None]
+        if measured:
+            bottleneck = max(measured, key=lambda item: item["estimated_ms"])
+            base["step_time_estimate"] = {
+                "basis": "layers_count_x_calibrated_layer_ms",
+                "estimated_step_ms": bottleneck["estimated_ms"],
+                # ★ 2026-10-27（审计 A6）：瓶颈必须是**执行器**身份，不是物理节点名。
+                #   同机 GPU 段与 CPU 段共用 `node_id="master"`，只报 `"master"` 时
+                #   回答不了"慢的是哪一段"—— 而段成本本来就差 2.3 倍（见上方注释），
+                #   这正是最需要回答的问题。标签规则与 `control_only_nodes` 同源
+                #   （主执行器裸 node_id、附加执行器 `node#executor`，见
+                #   `_node_executor_label`），所以它与 `segments[*]["node_id"]`
+                #   在既有单执行器拓扑下仍然严格相等（既有断言不变）。
+                "bottleneck_node_id": _node_executor_label(
+                    bottleneck["node_id"], bottleneck.get("executor_id")
+                ),
+                "bottleneck_layer_range": bottleneck["layer_range"],
+                "segments": segments_ms,
+                "uncalibrated_segments": [
+                    _node_executor_label(item["node_id"], item.get("executor_id"))
+                    for item in segments_ms if item["estimated_ms"] is None
+                ],
+            }
     participating_count = len(assignments) + len(relay_only)
     return {
         **base,
@@ -1460,8 +1959,17 @@ def solve_pipeline_capacity(
         "assignments": assignments + _relay_zero_layer_assignments(
             relay_only, total_layers, relay_claims
         ),
+        # ★ 2026-10-27（审计 A6）：**按 `(node_id, executor_id)` 判断谁没参与**。
+        #   此前 `node["node_id"] not in used_ids` 会把"同机另一个执行器"当成同一个
+        #   东西：主段参与、CPU 段闲置时 `master#cpu` 被主段"代表"而不列出 ⇒ 现场
+        #   看不出还有一个执行器闲着；只有 CPU 段参与时又会反过来把主段当成已参与。
+        #   输出用 `_node_executor_label`（主执行器裸 node_id ⇒ 既有断言与前端读法
+        #   不变），`scheduler_cluster._snapshot_nodes` 的 `node_id in control_only`
+        #   判断因此仍然只匹配主执行器那一项，不会把整机误标成 control-only。
         "control_only_nodes": [
-            node["node_id"] for node in usable if node["node_id"] not in used_ids
+            _node_executor_label(node["node_id"], node.get("executor_id"))
+            for node in usable
+            if (node["node_id"], str(node.get("executor_id") or "")) not in used_ids
         ],
         "participating_node_count": participating_count,
         "single_node_full_model_candidates": full_model_fits,

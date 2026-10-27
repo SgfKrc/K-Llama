@@ -286,6 +286,93 @@ def test_retention_cancellation_during_hash_preserves_generation(tmp_path, monke
     assert error.value.code == "cancelled" and _directory(manifest).is_dir()
 
 
+@pytest.mark.parametrize("fmt", ["gguf", "safetensors"])
+def test_warm_retention_does_not_rehash_weight_payloads(fmt, tmp_path, monkeypatch):
+    source, root = _source(tmp_path, fmt), tmp_path / "cache"
+    manifest = _builder(fmt)(source, root, **_kwargs(source))
+    assets._verify_files(_directory(manifest), manifest)
+    hashes, scans = [], []
+    original_hash, original_candidates = assets._hash_file, assets._segment_candidates
+
+    def hash_file(path, cancelled=None):
+        hashes.append(Path(path))
+        return original_hash(path, cancelled)
+
+    def candidates(*args, **kwargs):
+        scans.append(True)
+        return original_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(assets, "_hash_file", hash_file)
+    monkeypatch.setattr(assets, "_segment_candidates", candidates)
+    for _ in range(2):
+        report = _collect(root, receive_idle=True)
+        assert report["retained"] == 1 and report["removed"] == 0
+        assert report["retained_bytes"] == _size(manifest)
+    weights = {Path(manifest["local_files"][entry["path"]])
+               for entry in manifest["files"] if entry["kind"] == "weights"}
+    assert weights.isdisjoint(hashes)
+    assert len(scans) == 2
+
+
+@pytest.mark.parametrize("fmt", ["gguf", "safetensors"])
+def test_retention_revalidates_changed_cached_weights(fmt, tmp_path, monkeypatch):
+    source, root = _source(tmp_path, fmt), tmp_path / "cache"
+    manifest = _builder(fmt)(source, root, **_kwargs(source))
+    directory = _directory(manifest)
+    assets._verify_files(directory, manifest)
+    weight = Path(next(manifest["local_files"][entry["path"]]
+                       for entry in manifest["files"] if entry["kind"] == "weights"))
+    before = weight.stat()
+    content = bytearray(weight.read_bytes())
+    content[-1] ^= 1
+    weight.write_bytes(content)
+    os.utime(weight, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    hashes, original = [], assets._hash_file
+
+    def hash_file(path, cancelled=None):
+        hashes.append(Path(path))
+        return original(path, cancelled)
+
+    monkeypatch.setattr(assets, "_hash_file", hash_file)
+    report = _collect(root)
+    assert report["retained"] == report["removed"] == 0
+    assert report["skipped"]["file_digest_mismatch"] == 1
+    assert weight in hashes and directory.is_dir()
+
+
+@pytest.mark.parametrize("fmt", ["gguf", "safetensors"])
+def test_eviction_still_hashes_live_weights_after_cached_retention(fmt, tmp_path, monkeypatch):
+    source, root = _source(tmp_path, fmt), tmp_path / "cache"
+    manifest = _builder(fmt)(source, root, **_kwargs(source))
+    assert _collect(root)["retained"] == 1
+    hashes, original = [], assets._hash_file
+
+    def hash_file(path, cancelled=None):
+        hashes.append(Path(path))
+        return original(path, cancelled)
+
+    monkeypatch.setattr(assets, "_hash_file", hash_file)
+    report = assets.collect_supply_segments(root, native_paths=[], keep=0)
+    weights = {Path(manifest["local_files"][entry["path"]])
+               for entry in manifest["files"] if entry["kind"] == "weights"}
+    assert report["removed"] == 1 and not _directory(manifest).exists()
+    assert weights.issubset(hashes)
+
+
+def test_exhausted_removal_budget_does_not_hash_an_eviction_candidate(tmp_path, monkeypatch):
+    source, root = _source(tmp_path, "gguf"), tmp_path / "cache"
+    manifest = assets.build_gguf_segment(source, root, **_kwargs(source))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an exhausted removal budget must not trigger payload verification")
+
+    monkeypatch.setattr(assets, "_hash_file", forbidden)
+    monkeypatch.setattr(assets, "_verify_segment", forbidden)
+    report = assets.collect_supply_segments(root, native_paths=[], keep=0, max_remove=0)
+    assert report["removed"] == 0 and _directory(manifest).is_dir()
+    assert report["skipped"] == {"removal_budget": 1}
+
+
 def _historical_operations(root, count):
     root.mkdir()
     for index in range(count):

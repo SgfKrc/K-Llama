@@ -188,6 +188,26 @@ def _attach_memory_ledger(coordinator):
     return state
 
 
+def _read_node_ledger(path):
+    """Read a live node's ledger without losing to a transient Windows scanner.
+
+    与 `tests/helpers/qwen3_network_node.py` 的写入侧同一个坑：本机的 360 主动
+    防御（360sd/360tray）与 Windows SearchIndexer 会在文件刚写出时以独占句柄
+    打开它，`read_text` 可能拿到 `PermissionError: [WinError 5]`。这里只在
+    win32 上做有界等待（2 秒），文件缺失或内容不对仍然照常失败，不改变断言。
+    注意：读取本身也会短暂挡住子进程的 `os.replace`，所以子进程的保存必须
+    像 `atomic_json.atomic_write_json` 那样带重试（见 helper 注释）。
+    """
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except PermissionError:
+            if sys.platform != "win32" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
 class _Session:
     def __init__(self, index, layer_range, *, fail_phase=None):
         self.index = index
@@ -907,8 +927,8 @@ def test_same_machine_process_target_chain_executes_and_releases_outputs(
         assert all(
             any(
                 record["status"] == "released"
-                for record in json.loads(
-                    (root / node_id / "qwen3-network-ledger.json").read_text(encoding="utf-8")
+                for record in _read_node_ledger(
+                    root / node_id / "qwen3-network-ledger.json"
                 )["outputs"].values()
             )
             for node_id in (["node-b"] if segment_count == 3 else [])
@@ -1152,7 +1172,7 @@ def test_same_machine_process_ttl_epoch_revoke_and_terminal_ledger(tmp_path):
         status = default_transfer_request("GET", status_url, {}, None)
         assert status.status_code == 200
         ledger_path = state_dir / "qwen3-network-ledger.json"
-        expired = json.loads(ledger_path.read_text(encoding="utf-8"))
+        expired = _read_node_ledger(ledger_path)
         assert expired["transfers"][transfer_id]["status"] == "expired"
         assert not list((state_dir / "qwen3" / "network_artifacts").glob("*.part"))
 
@@ -1168,7 +1188,7 @@ def test_same_machine_process_ttl_epoch_revoke_and_terminal_ledger(tmp_path):
         epoch["value"] = 1
         expired_cancel = target.coordinator.cancel_transfer(transfer_id)
         assert expired_cancel["status"] == "missing"
-        terminal = json.loads(ledger_path.read_text(encoding="utf-8"))
+        terminal = _read_node_ledger(ledger_path)
         assert terminal["transfers"][transfer_id]["status"] == "expired"
         assert not list((state_dir / "qwen3" / "network_artifacts").glob("**/*.part"))
 
@@ -1194,7 +1214,7 @@ def test_same_machine_process_ttl_epoch_revoke_and_terminal_ledger(tmp_path):
         epoch["value"] = 2
         fenced_cancel = target.coordinator.cancel_transfer(active_id)
         assert fenced_cancel["status"] == "missing"
-        fenced = json.loads(ledger_path.read_text(encoding="utf-8"))
+        fenced = _read_node_ledger(ledger_path)
         assert fenced["transfers"][active_id]["status"] == "invalidated"
         assert not list((state_dir / "qwen3" / "network_artifacts").glob("**/*.part"))
     finally:

@@ -712,6 +712,141 @@ def ready_intent(tmp_path):
     return SimpleNamespace(c=c, scheduler=scheduler, supply=supply, op=op)
 
 
+@pytest.fixture
+def query_intent(ready_intent, monkeypatch):
+    case = ready_intent
+    owner = case.scheduler._model_control
+    owner.state["supplies"][case.op] = deepcopy(case.supply.operations[case.op])
+    reads = {"snapshot": 0, "query": 0, "stamp": 0}
+    original = owner.snapshot
+    snapshots = []
+
+    def snapshot():
+        reads["snapshot"] += 1
+        return original()
+
+    def query_snapshot(operation_id=None):
+        reads["query"] += 1
+        state = original()
+        selected = operation_id if operation_id is not None else state["selected_operation"]
+        state["operations"] = {selected: state["operations"][selected]} if selected in state["operations"] else {}
+        state["supplies"] = {selected: state["supplies"][selected]} if selected in state["supplies"] else {}
+        snapshots.append(state)
+        return state
+
+    def query_stamp():
+        reads["stamp"] += 1
+        return {field: owner.state[field] for field in ("revision", "boot_id")}
+
+    monkeypatch.setattr(owner, "snapshot", snapshot)
+    monkeypatch.setattr(owner, "query_reads_enabled", True, raising=False)
+    monkeypatch.setattr(owner, "query_snapshot", query_snapshot, raising=False)
+    monkeypatch.setattr(owner, "query_stamp", query_stamp, raising=False)
+    case.reads, case.snapshots = reads, snapshots
+    return case
+
+
+@pytest.mark.parametrize("reader", ["get", "current", "supplied"])
+def test_query_projection_reuses_snapshot_without_mutating_input(query_intent, reader):
+    case = query_intent
+    owner = case.scheduler._model_control
+    before = deepcopy(owner.state)
+    if reader == "current":
+        result = case.c.current()
+    elif reader == "supplied":
+        state = owner.query_snapshot(operation_id=case.op)
+        result = case.c.get(case.op, snapshot=state)
+    else:
+        result = case.c.get(case.op)
+    assert result["loaded_ready"] and result["runnable"]
+    assert case.reads == {"snapshot": 0, "query": 1, "stamp": 1}
+    assert owner.state == before and case.snapshots == [before]
+    result["nodes"]["tail"]["status"] = "changed"
+    assert case.snapshots[0] == before
+
+
+@pytest.mark.parametrize("capability", ["disabled", "no_flag", "no_snapshot", "no_stamp"])
+def test_query_projection_preserves_legacy_path_without_explicit_capability(query_intent, monkeypatch, capability):
+    case = query_intent
+    owner = case.scheduler._model_control
+    if capability == "disabled":
+        owner.query_reads_enabled = False
+    else:
+        monkeypatch.delattr(owner, {"no_flag": "query_reads_enabled", "no_snapshot": "query_snapshot",
+                                    "no_stamp": "query_stamp"}[capability])
+    result = case.c.get(case.op, snapshot={"revision": -1})
+    assert result["loaded_ready"] and result["revision"] == owner.state["revision"]
+    assert case.reads == {"snapshot": 3, "query": 0, "stamp": 0}
+
+
+@pytest.mark.parametrize("field", ["revision", "boot_id"])
+@pytest.mark.parametrize("settles", [False, True])
+@pytest.mark.parametrize("supplied", [False, True])
+def test_query_projection_retries_revision_and_boot_races(query_intent, monkeypatch, field, settles, supplied):
+    case = query_intent
+    owner = case.scheduler._model_control
+    original = owner.query_stamp
+
+    def racing():
+        attempt = case.reads["stamp"] + 1
+        if not settles or attempt == 1:
+            if field == "revision":
+                owner.state[field] += 1
+            else:
+                owner.boot_id = owner.state[field] = f"boot-{attempt}"
+            owner.state["supplies"][case.op]["source_progress"] = {"attempt": attempt}
+        return original()
+
+    monkeypatch.setattr(owner, "query_stamp", racing)
+    initial = owner.query_snapshot(operation_id=case.op) if supplied else None
+    result = case.c.get(case.op, snapshot=initial)
+    attempts = 2 if settles else 3
+    assert case.reads == {"snapshot": 0, "query": attempts, "stamp": attempts}
+    if settles:
+        assert result["validity"] == "valid" and result["loaded_ready"]
+        assert result["source_progress"] == {"attempt": 1}
+        assert result["identity"]["boot_id"] == owner.boot_id
+    else:
+        assert result["validity"] == "pending" and not result["runnable"] and not result["loaded_ready"]
+        assert result["reason_detail"]["code"] == "snapshot_revision_changed"
+
+
+@pytest.mark.parametrize("evidence", ["connection", "loaded", "retiring", "execution"])
+def test_query_projection_rechecks_native_readiness_at_same_revision(query_intent, evidence):
+    case = query_intent
+    freezes = []
+
+    def freeze():
+        freezes.append(True)
+        return SimpleNamespace(deployment_id="config")
+
+    case.scheduler._execution_app = SimpleNamespace(freeze=freeze)
+    first = case.c.get(case.op)
+    assert first["loaded_ready"] and len(freezes) == 1
+    if evidence == "connection":
+        case.scheduler._assignment_connection_generation = lambda node: 12
+    elif evidence == "loaded":
+        tx = case.scheduler._pipeline_load_transaction
+        receipt = deepcopy(tx["acks"]["worker"])
+        receipt["loaded"] = False
+        case.scheduler._worker_assignments.begin("worker", config_id="config", connection_generation=11,
+            expected_config=tx["expected"]["worker"], acknowledgement=receipt)
+        case.scheduler._worker_assignments.transition("worker", phase=PHASE_READY)
+    elif evidence == "retiring":
+        case.c._retire_requested = True
+    else:
+        def unavailable():
+            freezes.append(True)
+            raise RuntimeError("execution unavailable")
+        case.scheduler._execution_app.freeze = unavailable
+    result = case.c.get(case.op)
+    assert result["status"] == "ready" and not result["loaded_ready"] and not result["runnable"]
+    assert result["deployment_reason_code"]
+    assert result["revision"] == first["revision"]
+    assert len(freezes) == (1 if evidence == "retiring" else 2)
+    assert case.reads == {"snapshot": 0, "query": 2, "stamp": 2}
+
+
 @pytest.mark.parametrize("node", ["tail", "worker"])
 @pytest.mark.parametrize("stage", ["register_pending", "register_confirmed", "new_hello"])
 def test_ready_projection_rejects_same_node_reconnect_without_fresh_native_commit(ready_intent, node, stage):

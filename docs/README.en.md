@@ -68,6 +68,16 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
            local CUDA          x86_64 Windows        ARM64 Android           local llama.cpp
 ```
 
+Four stages can also be formed on a **single machine** — what gets crossed is the engine, not the network (measured 2026-10-26):
+
+```
+prompt → torch(0..7) →hidden→ llama.cpp keep-head(8..23) →hidden→ y700(24..27) →hidden→ Surface(28..31+head) → token
+         master GPU segment        master CPU segment             ARM64 Android        x86_64 Windows
+         ('master','',0,8)        ('master','cpu',8,24)          android-542cd254      TABLET-2TLUCNNU8
+```
+
+The first two stages live in the **same process on the same physical machine**, distinguished by `(node_id, executor_id)`; the CPU segment's weights stay resident in host memory and are computed in place, never crossing PCIe.
+
 The acceptance criterion is **per-token argmax equality with the same-precision monolithic model**; any divergence is reported as FAIL, with no approximate substitute. Per-segment records: [current relay baseline](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md).
 
 The two layers carry different verification cost, so the change site determines the required evidence:
@@ -93,10 +103,14 @@ The layer pipeline reduces "who holds which layers, with which engine, where, an
 | `remote_rpc` | Borrowed compute (the `ggml-rpc-server` on an Android/PC node) | llama.cpp | network (ggml RPC) |
 | `cross_framework` | Relay across engines (torch upstream + llama.cpp downstream) | both | in-process or stdio |
 
+**Identity is the pair `(node_id, executor_id)`, not `node_id`.** One physical machine can host several executors at once: the primary executor `executor_id=""` (the GPU segment, PyTorch) and additional executors (e.g. `"cpu"`, a llama.cpp keep-head segment). They share one `node_id` — same machine, same transport identity, same host memory — but each holds **its own layer range and artifact**. With the default empty `executor_id`, `(node_id, "")` is byte-for-byte equivalent to the old "`node_id` is unique", so existing topologies do not regress.
+
+Capacity is accounted per **shared domain**: `capacity_domain_id` (default = `node_id`) identifies which executors share one physical budget. The amounts declared by two segments on the same machine must sum to no more than the domain total, and an excess fails closed. Without this, the solver treats them as two independent machines and admits a plan that physically does not fit — a pitfall measured before this abstraction existed.
+
 Implementation and endpoints:
 
-- `src/pipeline_node_contract.py`: the `PipelineNode` contract, mapping of existing artifacts, fail-closed layout validation;
-- capacity solving now lives in `src/qlh_core/planning/capacity.py` (`src/pipeline_capacity.py` is a 21-line compatibility facade), `src/pipeline_assignment_manifest.py` for the assignment manifest;
+- `src/pipeline_node_contract.py`: the `PipelineNode` contract (including `executor_id`; the uniqueness criterion is `identity_key = (node_id, executor_id)`), mapping of existing artifacts, fail-closed layout validation;
+- capacity solving now lives in `src/qlh_core/planning/capacity.py` (`src/pipeline_capacity.py` is a 21-line compatibility facade), `src/pipeline_assignment_manifest.py` for the assignment manifest; the solver is a **pure function** and never reads environment variables or ambient state;
 - `src/pipeline_reshard.py`: capacity re-solve + artifact readiness gate + atomic epoch commit;
 - `GET /api/cluster/layers`, `GET /api/cluster/pipeline-capacity`, `GET /api/cluster/pipeline-reshard`;
 - clients consume `GET /api/client/state` and `GET /api/client/events` (versioned snapshots + revision cursor, see `src/api/routes_client_state.py` and `src/qlh_core/contracts/snapshots.py`).
@@ -127,6 +141,49 @@ It solves two things: letting a model that does not fit on one machine be carrie
 
 Reports: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-*.json`; ticket-level statements in the [acceptance ledger](验收清单与资源限制登记.md).
 
+### Same-machine cross-framework segments (GPU segment + CPU segment coexisting)
+
+A special form of D→L relay: **upstream and downstream live on the same physical machine**, and what gets crossed is the engine, not the network.
+
+master hosts two executors at once — the GPU segment `('master', '', 0, 8)` (PyTorch, to be replaced by NInfer) and the CPU segment `('master', 'cpu', 8, 24)` (llama.cpp keep-head, weights resident in host memory, computed in place). The CPU segment's weights **never cross PCIe**: they are already a file in host memory, mapped and consumed in place. This is exactly the difference between "offload" and "placement" — llama.cpp's offload moves weights, whereas here nothing was ever moved.
+
+Four segments coexisting on real hardware (`intent=ready`, 2026-10-26):
+
+```
+master          ''     [0,8)    pytorch    cuda
+master          'cpu'  [8,24)   llama_cpp  cpu     ← second segment, same machine
+android-542cd254 ''    [24,28)  llama_cpp  cpu
+TABLET-2TLUCNNU8 ''    [28,32)  llama_cpp  cpu
+```
+
+Criteria and measurements (all required):
+
+| Criterion | Definition | Result |
+| --- | --- | --- |
+| Coexistence | the supply plan contains the primary segment **and** an `executor_id='cpu'` segment at the same time | pass (four segments above) |
+| No range overrun | the CPU segment's range must fall inside what its artifact actually covers (`QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE`, default `8,24`) | pass (`[8,24)` is exactly the coverage of `mid8-24.gguf`) |
+| No double counting | the two declarations on one machine sum to no more than the shared domain total; excess fails closed | pass (`capacity_domain_id` accounted per `node_id`) |
+| Numerical gate | same hidden input, CPU segment (Q4_K_M) vs the same layers in PyTorch fp16, compared element-wise | **argmax 81/81 identical** (short prompt 12/12, long prompt 69/69); cosine 0.994, relative L2 11.0%, the error is entirely quantization |
+| Timing gate | local CPU segment ms/layer | **6.84 ms/layer** (i9-13900H, `n_threads=8`); rog 8.7, android 20.1 for comparison |
+| No regression | with `QLH_LOCAL_CPU_EXECUTOR` off by default, behaviour is byte-identical | pass (no CPU-segment events at all when off; the supply input has exactly two executors) |
+
+One end-to-end request takes 21.28 s with `layer_segments = [0,8) [8,24) [24,28) [28,32)` and `distributed_used=true fallback=false`; two runs of the same request produce a **bit-identical** token sequence.
+
+The numerical gate is verified by [`scripts/probe_local_cpu_segment_numerics.py`](../scripts/probe_local_cpu_segment_numerics.py), which separates "executor difference" from "topology difference": it pins one real hidden input and swaps only the executor. End-to-end token comparison is deliberately not used for this criterion, because turning the CPU segment off also changes the layer split and the supply topology, so the measured difference could not be attributed.
+
+**Why "bit-identical" does not apply here**: the CPU segment's artifact is a Q4_K_M-quantized GGUF while the baseline is fp16 safetensors, so the two cannot be bit-identical. The quantity that decides the generated token is the argmax, and that matches 100%, so this segment can stand in for the fp16 one.
+
+Configuration (`.env`):
+
+```bash
+QLH_LOCAL_CPU_EXECUTOR=1                        # master switch; off by default ⇒ byte-identical to before
+QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE=8,24         # CPU segment range, must stay inside the artifact coverage
+QLH_LOCAL_CPU_EXECUTOR_HOST_FRACTION=0.7        # this executor's share of the shared host-memory domain
+QLH_LAYER_GGUF=models/.../q35-9b-local-mid8-24.gguf
+QLH_KEEP_HEAD_SHIM=build/keephead/build-cpu/bin/qlh_keep_head.dll
+QLH_LAYER_N_BATCH=4096                          # must be ≥ prefill token count, else the worker exits right after init
+```
+
 ### torch.compile and the layer-loop switch
 
 Serving segmented forward passes with `torch.compile` uses two switches in `src/config.py` (overridable by environment variables):
@@ -151,10 +208,11 @@ The TUI and API top level only need aggregate resources (GPU/CPU/memory) and whe
 | Textual TUI | Unified `qlh` entry; the chat page plus 8 functional screens (status / models / cluster / nodes / queue / logs / device / settings) and 1 debug fallback screen share one process and can start the backend on demand locally; write operations (model download/search/preflight/registration, cluster config, node management, log filtering/stats/export, device config, user settings) go through confirmation gates |
 | Edge <=1B single machine | Model profiling, the GGUF/llama.cpp path and edge preflight exist; torch is not loaded by default |
 | Same-host two-process RPC | llama host + `ggml-rpc-server` simulation and contract tests exist; not equivalent to cross-host production admission |
+| **Same-machine cross-framework segments (GPU + CPU coexisting)** | **Verified on real hardware** (2026-10-26): on master the GPU segment `('master','',0,8)` and the llama.cpp keep-head segment `('master','cpu',8,24)` appear in the supply plan **at the same time**, each carrying its own layers; the CPU segment's weights stay resident in host memory and are computed in place (zero PCIe movement). All six criteria pass: coexistence, no range overrun, no double counting, numerical gate argmax **81/81**, timing **6.84 ms/layer**, and byte-identical behaviour when disabled by default. End-to-end 21.28 s over the contiguous coverage `[0,8)[8,24)[24,28)[28,32)` |
 | PC RPC | Device scoring, automatic layer planning, lease/disconnect fallback and artifact-sync contracts exist; throughput gains are not claimed, and capacity gains are verified separately from D→L |
-| Layer-segment contract and automatic resharding | Contract, fail-closed layout validation, capacity re-solve and atomic epoch commit have passed the development gate; real PC/Android fault injection, long-run and performance acceptance remain |
-| Cross-framework relay (D→L) | Correctness admitted (27/27 per-token identical); cross-host long-run (LL/DL three-segment `gen=256`, 256/256) and multi-segment cut-point combinations (32/32) passed; artifact auto-distribution and fault-injection acceptance remain. Default routing prefers the directly runnable L/RPC path |
-| PyTorch D track | The implementation of layer splitting, the layer pipeline and multi-node layer-segment hosting, and the control experiments; not part of the Edge default dependency set |
+| Layer-segment contract and automatic resharding | Contract, fail-closed layout validation (the uniqueness criterion has been relaxed from `node_id` to `(node_id, executor_id)`), capacity re-solve and atomic epoch commit have passed the development gate; real PC/Android fault injection, long-run and performance acceptance remain |
+| Cross-framework relay (D→L) | Correctness admitted (27/27 per-token identical); cross-host long-run (LL/DL three-segment `gen=256`, 256/256) and multi-segment cut-point combinations (32/32) passed; the same-machine form is in the row above. Artifact auto-distribution and fault-injection acceptance remain. Default routing prefers the directly runnable L/RPC path |
+| PyTorch D track | The implementation of layer splitting, the layer pipeline and multi-node layer-segment hosting, and the control experiments; not part of the Edge default dependency set. When a same-machine CPU segment coexists it carries only its own GPU segment |
 | Relay R | L→L, D→L, the f32/sampling matrix and SSH cross-host evidence all passed correctness verification; capacity gains quantified; default routing does not replace directly runnable L/RPC |
 | Android | `qlh-android` P0 cross-compilation/JNI done; P1 device run, RPC worker, disconnect, thermal/power and security evidence outstanding |
 | Runtime | Version windows follow [`requirements.txt`](../requirements.txt) (`transformers>=5.17.0,<5.18.0`, `llama-cpp-python==0.3.35`); all PyTorch sidecars are on 5.17.0; native Windows `torch.compile` needs the `triton-windows` entry from [`requirements-compile.txt`](../requirements-compile.txt) (this machine's `.venv-test` has 3.8.0.post28; `requirements-test.txt` does not include it) |
@@ -338,6 +396,8 @@ Targeted checks on high-risk mainlines:
 ```
 
 Baselines are recorded in two tiers (2026-10-19): the refactor R0–R5 fixed set is **4309 passed / 27 skipped / 0 failed** (identical per-case status serially and with four workers); the root Python full run (four workers, filtering `real_model` / `external` / `requires_gpu`) is **8301 passed / 32 skipped**. Per repository: packaging **459 passed / 9 skipped**, Web Playwright **110 passed / 1 skipped**, Android JVM **710 passed / 4 skipped**. Occasional flakiness appears under xdist; the serial run is authoritative.
+
+`pytest.ini` now defaults to `-n 6` (raised from `-n 4` on 2026-10-26): this machine has been upgraded to 31.6 GB of RAM and 20 logical cores, and with six workers the measured free memory drops from ~15.5 GB to ~13.2 GB, leaving ample headroom. `-n 4` was a 16 GB-era decision (back then `-n auto`'s ~20 workers would exhaust memory as many torch tests initialise CUDA at the same time); `auto` is still not used. Machines with less memory can lower it, or set `QLH_TEST_WORKERS` to override the channel scripts.
 
 Real hardware, cross-host networks, Android ARM64, performance and long-run soak must store the raw command, environment, model digest, topology, output and failure boundary; a green test suite is not a substitute. Test channel split and marker semantics: [test channel notes](测试通道运行说明.md); criteria and control groups: [testing and acceptance criteria](测试与评判标准.md).
 

@@ -208,9 +208,25 @@ def preflight_pipeline_artifacts(
             tokenizer_sha256=expected_tokenizer,
         )
 
+    # ★ 2026-10-27（审计 §9.4 #5）：**键必须是 `(node_id, executor_id)`**。
+    #
+    #   同机可有多个执行器（主段 `""` + CPU 段 `"cpu"`），它们**共用 `node_id`**。
+    #   此前用裸 `node_id` 建索引 ⇒ 同机两段取到**同一条**节点记录（后写入的赢），
+    #   于是一方的 `layer_artifacts` 被拿去证明另一方的 assignment：
+    #   实测表现为 CPU 段的段被主段的工件覆盖（或反之），preflight 给出错配结论。
+    #
+    #   这类"用 A 执行器的工件给 B 执行器作证"的串味，在审计里反复出现
+    #   （A1/A3/A7/A8/A9/A12 都是同一形状）；这里是它在预检路径上的最后一处。
     node_by_id = {
-        str(node.get("node_id", "") or ""): node
+        (str(node.get("node_id", "") or ""), str(node.get("executor_id") or "")): node
         for node in nodes if isinstance(node, Mapping)
+    }
+    # 兼容回退：旧调用方可能传不带 `executor_id` 的记录，那份只代表**主执行器**。
+    # 附加执行器**不**回退到主段记录 —— 那正是上面要消灭的串味。
+    node_by_primary = {
+        str(node.get("node_id", "") or ""): node
+        for node in nodes
+        if isinstance(node, Mapping) and not str(node.get("executor_id") or "")
     }
     problems: list[dict[str, Any]] = []
     bindings: list[dict[str, Any]] = []
@@ -261,11 +277,17 @@ def preflight_pipeline_artifacts(
 
     for assignment in selected:
         node_id = str(assignment.get("node_id", "") or "")
+        executor_id = str(assignment.get("executor_id") or "")
         requested = _range([
             assignment.get("start_layer"), assignment.get("end_layer"),
         ])
         expected_artifact = assignment.get("layer_artifact")
-        node = node_by_id.get(node_id)
+        node = node_by_id.get((node_id, executor_id))
+        if node is None and not executor_id:
+            # 旧记录/旧调用方不带 `executor_id`：只让**主执行器**回退到裸键记录。
+            # 附加执行器拿到 None 是**正确**结果 —— 缺它自己的记录就该报缺失，
+            # 而不是借主段的工件把自己证明成就绪。
+            node = node_by_primary.get(node_id)
         node_problems: list[dict[str, Any]] = []
         if requested is None:
             node_problems.append({

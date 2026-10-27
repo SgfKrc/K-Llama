@@ -49,6 +49,25 @@ typedef struct qlh_keep_head {
     int mode;        /* 0 = nextn, 1 = layer_inp */
     int cut_layer;
     int n_pos_per_embd;  /* ★ M-RoPE 模型 = 4（每个 token 的位置分量数），否则 1 */
+    /* ★ 2026-10-26（PERF-SKIP-LOGITS-01）：**输出 hidden 的入口**是否连 logits 一起要。
+     *
+     * 0（缺省，= 既有行为）：每行都标 `batch.logits[i] = 1`。
+     * 1：输出 hidden 的入口（`qlh_kh_forward` / `qlh_kh_forward_embd` /
+     *    `qlh_kh_forward_embd_seq`）**一行都不标** ⇒ llama.cpp 的 `n_outputs = 0`，
+     *    `lm_head` 矩阵乘退化为 0 行 ⇒ 不再读 `output.weight`。
+     *
+     * 为什么这是纯收益：这些入口的语义就是"交出 hidden"，调用方（`KeepHeadUpstream.
+     * forward_tokens_to_hidden` / `forward_hidden_to_hidden`）从不取 logits；而
+     * `output.weight` 在 9B 中间段工件上是**每步几百 MB** 的内存流量，本项目瓶颈正是
+     * 内存带宽（见 docs/本机跨框架层段成本与干扰实测-2026-10-25.md §2）。
+     *
+     * ⚠️ **argmax 入口不受本开关影响**（`qlh_kh_forward_embd_token` /
+     *    `qlh_kh_forward_embd_tokens` 恒为每行标 1）：末段要靠 logits 出 token，
+     *    若把它们也关掉，末段会直接失败 —— 这是本改动的**数值门**。
+     *
+     * 由 `qlh_kh_set_skip_hidden_logits()` 设置（不读环境变量：开关属于调用方的配置，
+     * 不该藏在 native 层里，否则同进程多实例无法分别控制）。 */
+    int32_t skip_hidden_logits;
     /* ★ 2026-09-24：最近一次 `llama_decode` 的**原始**返回码（0 = 无错误）。
      * 此前 decode 失败一律折成 -2，把 llama.cpp 的具体错误码丢了 ⇒ 长时 decode 的 ctx 边界
      * 问题无法定位。每次 forward 入口清零（读到的就是本次错误），`qlh_kh_reset` 也清零。 */
@@ -90,7 +109,29 @@ void * qlh_kh_load(const char * model_path,
     struct llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = (uint32_t) (n_ctx > 0 ? n_ctx : 4096);
     cparams.n_batch         = (uint32_t) (n_batch > 0 ? n_batch : 512);
-    cparams.n_ubatch        = (uint32_t) (n_batch > 0 ? n_batch : 512);
+    /* ★ 2026-10-25（PERF-NATIVE-COST-01）：**n_ubatch 不再跟着 n_batch**。
+     *
+     * llama.cpp 按 `min(n_ctx, n_ubatch)` 做 worst-case 图预留，而 QWEN35 的
+     * `graph_max_nodes = n_tokens * 40` ⇒ n_ubatch=4096 时每次 memory update 都要
+     * 预留约 16.4 万节点。ROG 的 native 日志实测 `sched_reserve: CPU compute
+     * buffer size = 4168.16 MiB`，就是这个值撑出来的（而它只有 15.15 GB 可见内存、
+     * 热数据是 1646 MiB 的匿名 repack buffer，4 GB 预留会直接挤压它）。
+     *
+     * `n_batch` 仍必须够装下整段序列 —— M-RoPE 会把 embd 批次按 4× 放大
+     * （见 llama_engine.py 关于上游 #28963 的记录），所以保留调用方传入值不动。
+     * 但 **`n_ubatch` 只需覆盖一次内部微批量**。
+     *
+     * Android 侧早已如此（android/.../qlh_llama_jni.cpp：`n_ubatch = min(512,
+     * batch_limit)`），且真机实测过不放大的代价：`n_batch = n_ubatch = n_ctx = 32768`
+     * ⇒ 1062 tokens × 4 层 **>43 秒**（超 stage 超时）。PC shim 至今未移植，
+     * 这里对齐同一取值。 */
+    {
+        uint32_t ubatch = (uint32_t) (n_batch > 0 ? n_batch : 512);
+        if (ubatch > 512) {
+            ubatch = 512;
+        }
+        cparams.n_ubatch = ubatch;
+    }
     cparams.n_threads       = (n_threads > 0 ? n_threads : 4);
     cparams.n_threads_batch = (n_threads > 0 ? n_threads : 4);
     cparams.n_seq_max       = (uint32_t) (n_seq_max > 0 ? n_seq_max : 1);
@@ -104,9 +145,10 @@ void * qlh_kh_load(const char * model_path,
     /* ★ 2026-09-24：把**实际生效**的 ctx 参数打出来。长时 decode 在 ~481 帧报
      * `llama_decode rc=1`（llama.cpp 的 "failed to find a memory slot for batch"）时，必须能
      * 一眼看出 llama.cpp 是否真按我们请求的 `n_ctx` / `n_batch` 分配了 KV。 */
-    fprintf(stderr, "[qlh_keep_head] ctx ready: n_ctx=%u n_batch=%u "
+    fprintf(stderr, "[qlh_keep_head] ctx ready: n_ctx=%u n_batch=%u n_ubatch=%u "
                     "(requested n_ctx=%d n_batch=%d n_seq_max=%d)\n",
-            llama_n_ctx(ctx), llama_n_batch(ctx), n_ctx, n_batch, n_seq_max);
+            llama_n_ctx(ctx), llama_n_batch(ctx), cparams.n_ubatch,
+            n_ctx, n_batch, n_seq_max);
 
     const int n_layer = llama_model_n_layer(model);
     if (mode == 1 && (cut_layer < 0 || cut_layer >= n_layer)) {
@@ -175,17 +217,25 @@ static int32_t qlh_extract_hidden(qlh_keep_head * handle, int32_t n_tokens, floa
     return 0;
 }
 
-/* 统一标注：**每个 token 都要标输出**。
+/* 统一标注：默认**每个 token 都要标输出**。
  * 历史原因：旧的 nextn 通道只对「有输出的行」计算末层 hidden，若只标最后一行，取 n_tokens 行
  * 就会踩到 GGML_ASSERT "tensor read out of bounds"（实测踩过）。现在两个模式都走 layer_inp
- * 通道，这条约束不再是硬性的，但保持"全行标输出"可以不必依赖具体的 sched 行为 ——
- * 上游不需要 logits，只需要**行数完整**。 */
-static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_t n_past) {
+ * 通道，这条约束不再是硬性的，但保持"全行标输出"可以不必依赖具体的 sched 行为。
+ *
+ * ★ 2026-10-26（PERF-SKIP-LOGITS-01）：`want_logits = 0` 时**一行都不标**（`n_outputs = 0`）。
+ *   这条路正是为"只要 hidden、不要 logits"的段准备的 —— 它换来的是 llama.cpp 不再执行
+ *   `output.weight` 的矩阵乘。是否走这条路由 `qlh_kh_set_skip_hidden_logits()` 控制，
+ *   缺省仍是 `want_logits = 1`（既有行为不变）。
+ *   ⚠️ `layer_inp` 的提取与 `batch.logits` **无关**（`llama-context.cpp` 的
+ *   `extract_layer_inputs()` 不看 `n_outputs`，`llama-graph.cpp::set_outputs()` 也按
+ *   `cparams.embeddings_layer_inp` 独立 `ggml_set_output`），因此 hidden 仍然完整。 */
+static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_t n_past,
+                            int32_t want_logits) {
     for (int32_t i = 0; i < n_tokens; ++i) {
         batch->pos[i]       = n_past + i;
         batch->n_seq_id[i]  = 1;
         batch->seq_id[i][0] = 0;
-        batch->logits[i]    = 1;
+        batch->logits[i]    = want_logits ? 1 : 0;
     }
     batch->n_tokens = n_tokens;
 }
@@ -198,13 +248,13 @@ static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_
  *    "tokens ... have inconsistent sequence positions" 而 decode 失败（实测踩过）。 */
 static void qlh_fill_explicit(struct llama_batch * batch, int32_t n_tokens, int32_t n_past,
                               const int32_t * n_seq_id, const int32_t * seq_ids,
-                              const int32_t * positions) {
+                              const int32_t * positions, int32_t want_logits) {
     for (int32_t i = 0; i < n_tokens; ++i) {
         const int32_t per_token = (n_seq_id == NULL) ? 1 : n_seq_id[i];
         batch->n_seq_id[i]  = per_token > 0 ? per_token : 1;
         batch->seq_id[i][0] = (seq_ids == NULL) ? 0 : seq_ids[i];
         batch->pos[i]       = (positions == NULL) ? (n_past + i) : positions[i];
-        batch->logits[i]    = 1;
+        batch->logits[i]    = want_logits ? 1 : 0;
     }
     batch->n_tokens = n_tokens;
 }
@@ -267,7 +317,7 @@ int32_t qlh_kh_forward(void * handle_void,
     for (int32_t i = 0; i < n_tokens; ++i) {
         batch.token[i] = tokens[i];
     }
-    qlh_fill_common(&batch, n_tokens, n_past);
+    qlh_fill_common(&batch, n_tokens, n_past, handle->skip_hidden_logits ? 0 : 1);
 
     const int32_t rc = llama_decode(handle->ctx, batch);
     llama_batch_free(batch);
@@ -321,7 +371,8 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
     handle->last_error = 0;
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
-    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
+    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions,
+                      handle->skip_hidden_logits ? 0 : 1);
     if (qlh_fill_pos_planar(&batch, n_tokens, n_past, positions,
                             handle->n_pos_per_embd) != 0) {
         llama_batch_free(batch);
@@ -357,7 +408,9 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
     handle->last_error = 0;
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
-    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
+    /* ★ PERF-SKIP-LOGITS-01：本入口要**末位 argmax** ⇒ logits 恒开，**不跟随**
+     *   `skip_hidden_logits`（末段是数值门的终点，缺了 logits 就直接失败）。 */
+    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions, 1);
     if (qlh_fill_pos_planar(&batch, n_tokens, n_past, positions,
                             handle->n_pos_per_embd) != 0) {
         llama_batch_free(batch);
@@ -453,7 +506,8 @@ int32_t qlh_kh_forward_embd_tokens(void * handle_void,
         return -5;
     }
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
-    qlh_fill_explicit(&batch, n_tokens, pos_start, n_seq_id, seq_ids, positions);
+    /* ★ PERF-SKIP-LOGITS-01：多位置 argmax 同样**恒开** logits（原因同上）。 */
+    qlh_fill_explicit(&batch, n_tokens, pos_start, n_seq_id, seq_ids, positions, 1);
     if (qlh_fill_pos_planar(&batch, n_tokens, pos_start, positions,
                             handle->n_pos_per_embd) != 0) {
         llama_batch_free(batch);
@@ -538,6 +592,28 @@ int32_t qlh_kh_last_error(void * handle_void) {
         return 0;
     }
     return handle->last_error;
+}
+
+/* ★ 2026-10-26（PERF-SKIP-LOGITS-01）：**只影响"输出 hidden"的入口**的 logits 策略。
+ *
+ * `skip = 1` ⇒ `qlh_kh_forward` / `qlh_kh_forward_embd` / `qlh_kh_forward_embd_seq`
+ * 一行都不标 `batch.logits`，llama.cpp 的 `n_outputs` 变 0，`lm_head`（`output.weight`）
+ * 不再产生有效计算 ⇒ 省掉每步几百 MB 的权重读取。hidden 输出**不变**（`layer_inp`
+ * 通道与 logits 掩码无关）。
+ *
+ * `skip = 0`（`qlh_kh_load` 后的初值）⇒ 保持既有行为（每行都标）。
+ *
+ * 返回 0 成功，-1 参数非法（NULL 句柄或 skip 不是 0/1）。
+ *
+ * ⚠️ 这是**可选符号**：旧版 shim 没有它 ⇒ Python 侧必须按 optional 处理
+ *    （`hasattr`），缺了又要求跳过时必须 fail-loud，不能静默退回"仍算 logits"。 */
+int32_t qlh_kh_set_skip_hidden_logits(void * handle_void, int32_t skip) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || (skip != 0 && skip != 1)) {
+        return -1;
+    }
+    handle->skip_hidden_logits = skip;
+    return 0;
 }
 
 /* ★ P3：清空 KV / recurrent 记忆。跨机服务在**同一进程**里服务多条连接时必须调用 ——

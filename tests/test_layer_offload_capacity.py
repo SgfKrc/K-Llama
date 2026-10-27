@@ -112,8 +112,11 @@ def test_offload_projection_and_solver_use_max_unit_with_independent_host_hard_b
     head = next(a for a in plan["assignments"] if a["node_id"] == "master")
     assert head["required_bytes"] == math.ceil(60 * 1.2) + 7
     assert head["range_weight_quote"]["weight_bytes"] == 60
-    assert by_id["master"]["materialization"] == "safetensors_layer_offload"
-    selected = {**head, "runtime_materialization": by_id["master"]["materialization"]}
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：`by_id` 的键是 `(node_id, executor_id)` ——
+    #   同一物理机的多个执行器各持有不同工件，必须能分别查表。主执行器的 `executor_id`
+    #   是空串 ⇒ 既有的 `by_id["master"]` 写法在这里显式写成 `("master", "")`。
+    assert by_id[("master", "")]["materialization"] == "safetensors_layer_offload"
+    selected = {**head, "runtime_materialization": by_id[("master", "")]["materialization"]}
     policy = assignment_load_spec(selected, artifact_format="safetensors", context_size=32)
     assert policy.materialization == "safetensors_layer_offload"
     assert set(policy.components) == {"layers", "final_norm", "embedding"}

@@ -6,12 +6,14 @@ assignment-scoped files from that master; no worker-to-worker transfer is create
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
 import hmac
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import shutil
@@ -38,6 +40,79 @@ _STRATEGY_REASON_CODES = frozenset({
     "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT", "SUPPLY_LOCAL_CUT_BUDGET_EXCEEDED",
     "SUPPLY_LOCAL_CUT_UNSUPPORTED", "SUPPLY_NODE_CUTTER_UNAVAILABLE",
 })
+
+
+def reuse_candidates(inventory: dict | None, capabilities: dict | None) -> tuple[list, str]:
+    """选出用于判定「段是否可复用」的清单，并报告证据来源。
+
+    ★ 2026-10-27（#135）：**优先以本次清点（inventory）为准，不以 capabilities 快照为准。**
+
+    capabilities 快照只在 hello / 能力变更时刷新。运维清掉段缓存后（磁盘满、迁移、手工
+    回收 —— 都是正常操作），worker 在下一次重扫前仍持有旧清单 ⇒ 若据此改判 `distribute`，
+    接收端会找不到文件、退化成真下载，比直接 `local_cut` 更差（实测卡在
+    11.5 MB / 1.98 GB 超过 7 分钟）。
+
+    worker 的 `inventory()` 现在返回 `artifacts`，且只有段文件真实存在并通过
+    `_verify_files`（尺寸 + 摘要）校验时才会列出。因此：
+
+    - 该键存在（新 worker）⇒ **一律以它为准，即使为空也不回退快照**，
+      否则会重新引入「删缓存后误判复用」。
+    - 该键缺失（旧 worker）⇒ 才回退快照，保持向后兼容。
+
+    返回 `(清单, 证据来源)`，来源取 `"inventory"` / `"capabilities"`，用于日志留痕。
+    """
+    reported = (inventory or {}).get("artifacts")
+    if isinstance(reported, list):
+        return reported, "inventory"
+    return list((capabilities or {}).get("layer_artifacts") or []), "capabilities"
+
+
+def reuse_artifact_matches(artifact: Any, manifest: dict) -> bool:
+    """段工件与待供段是否同身份：层区间 + 三项摘要全等。"""
+    return bool(
+        isinstance(artifact, dict)
+        and list(artifact.get("layer_range") or []) == list(manifest.get("layer_range") or [])
+        and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
+        and artifact.get("source_model_id") == manifest.get("source_model_id")
+        and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
+        and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")
+    )
+
+
+def inventory_local_cut_budget(inventory: dict, sources: dict) -> dict | None:
+    """Calculate a cut budget from the exact GGUF source selected for this supply."""
+    if not inventory.get("local_cut"):
+        return None
+    source_sha = sources.get("source_model_sha256")
+    tokenizer_sha = sources.get("tokenizer_sha256")
+    descriptor = (sources.get("descriptors") or {}).get("llama_cpp") or {}
+    total_layers = descriptor.get("total_layers")
+    if (not isinstance(source_sha, str) or not isinstance(tokenizer_sha, str)
+            or type(total_layers) is not int or total_layers <= 0):
+        return None
+    inventory_sources = inventory.get("sources")
+    if not isinstance(inventory_sources, list):
+        return None
+    source = next((item for item in inventory_sources
+                   if isinstance(item, dict)
+                   and item.get("source_model_sha256") == source_sha
+                   and item.get("tokenizer_sha256") == tokenizer_sha
+                   and (item.get("total_layers") is None
+                        or (type(item.get("total_layers")) is int
+                            and item.get("total_layers") == total_layers))), None)
+    if source is None:
+        return None
+    size_bytes = source.get("size_bytes")
+    available = inventory.get("memory_available_bytes")
+    if type(size_bytes) is not int or size_bytes <= 0 or type(available) is not int or available <= 0:
+        return None
+    per_layer_bytes = size_bytes // total_layers
+    available_bytes = int(available * 0.6)
+    max_layers = available_bytes // per_layer_bytes if per_layer_bytes > 0 else 0
+    if max_layers <= 0:
+        return None
+    return {"available_bytes": available_bytes, "per_layer_bytes": per_layer_bytes,
+            "max_layers": max_layers, "local_cut": True}
 
 
 class ModelSupplyError(ValueError):
@@ -82,11 +157,30 @@ def _segment_disk_weight_bytes(descriptor: dict, assignment: dict, source_path: 
     )
 
 
+def _segment_disk_overhead_bytes(engine: str, source_path: Path) -> int:
+    from model_supply_assets import _MAX_HEADER, _gguf_table
+
+    if engine == "llama_cpp":
+        if not source_path.is_file():
+            return _MAX_HEADER
+        _, tensors = _gguf_table(source_path)
+        return _MAX_HEADER + len(tensors) * 32
+
+    from pipeline_assignment_manifest import _support_files
+
+    source_root = Path(source_path)
+    if source_root.is_file() and source_root.suffix == ".safetensors":
+        source_root = source_root.parent
+    excluded = {"model.manifest.json", "cross_format.provenance.json", ".qlh-model-asset.json"}
+    support = (name for name in _support_files(source_root) if Path(name).name not in excluded)
+    return _MAX_HEADER + sum((source_root / name).stat().st_size for name in support)
+
+
 def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                         master_engine: str, alignment: int = 1,
                         safety_margin: float = 1.2,
                         runtime_descriptors: dict[str, dict] | None = None,
-                        preferred_ranges: dict[str, list[list[int]]] | None = None,
+                        preferred_ranges: dict[Any, list[list[int]]] | None = None,
                         runtime_host_ranges: dict[str, list[list[int]]] | None = None,
                         prefer_all_workers: bool | None = None) -> dict:
     """Reuse capacity admission while planning missing, not just existing, assets.
@@ -95,6 +189,10 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
     executor, including the middle, and use aligned groups for hybrid models.
     Each executor uses its exact projected per-layer bytes for the selected
     engine and load specification; packaged size is rechecked before dispatch.
+
+    ★ 2026-10-27（LOCAL-EXECUTORS-01 / A9）：`preferred_ranges` 的键是**执行器身份**
+    `(node_id, executor_id)`（附加执行器如 `("master", "cpu")`）；裸 `node_id` 仍被
+    兼容，但只作用于该节点的**主执行器**。`runtime_host_ranges` 保持裸 `node_id`。
     """
     from model_supply_runtime_capacity import (
         RuntimeCapacityProjectionError, project_supply_capacity_nodes,
@@ -114,19 +212,131 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         raise ModelSupplyError("SUPPLY_PLACEMENT_POLICY_INVALID", "prefer_all_workers must be a boolean")
     reference = descriptors.get("llama_cpp") or descriptors.get(master_engine)
     total = int(reference["total_layers"])
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**描述符层数必须与目标模型一致**。
+    #   实测（03:05）供给侧 `candidate_layer_ranges` 只有 `[[0,1]..[7,8]]` —— 那是**8 层**
+    #   模型的全集，而目标是 32 层 ⇒ 求解器认为每个执行器都只能装 8 层 ⇒ 整盘无解。
+    #   层数来自 `descriptors`（各引擎的源描述符）；把 reference 与各引擎的长度一起打出，
+    #   才能确认是哪一份跑偏（llama_cpp 来自 CPU 段的裁层 GGUF，pytorch 来自主段）。
+    logger.info(
+        "event=supply_descriptor_reference master_engine=%s reference_total_layers=%s "
+        "reference_layer_bytes=%s descriptors=%s",
+        master_engine, total, len(reference.get("layer_weight_bytes") or []),
+        {key: [value.get("total_layers"), len(value.get("layer_weight_bytes") or [])]
+         for key, value in (descriptors or {}).items()},
+    )
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：打印**供给侧**真正喂给求解器的输入与结果。
+    #   排查连续几轮都在两套视图之间推测（scheduler 侧的 `容量输入区间` 与供给侧的
+    #   `projected` 不是同一份数据）。把它打出来，才能一次看清"谁持有什么工件、
+    #   谁声明了什么段类型、求解器最终选了谁"。
+    logger.info(
+        "event=supply_capacity_input nodes=%s",
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          item.get("layer_ranges"), item.get("segment_mode"),
+          item.get("candidate_layer_ranges"), bool(item.get("layer_budget")))
+         for item in projected],
+    )
+    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**逐区间精确报价是否生成**。CPU 段按工件实测
+    #   层宽报价（`range_weight_bytes`）与按源描述符层宽报价，数值差 3-4 倍，而两者在
+    #   日志里都只表现为一个 `required_bytes` —— 不看这个字段无法区分是"报价没生成"
+    #   还是"报价生成了但没被采用"。
+    logger.info(
+        "event=supply_range_quotes %s",
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          len(item.get("range_weight_bytes") or ()),
+          (item.get("range_weight_bytes") or [{}])[0].get("weight_bytes")
+          if item.get("range_weight_bytes") else None)
+         for item in projected],
+    )
     result = solve_pipeline_capacity(grouped, projected, safety_margin=safety_margin,
                                     require_distributed=True, prefer_all_workers=prefer_all_workers,
                                     required_node_id="master")
+    logger.info(
+        "event=supply_capacity_result admitted=%s reason=%s assignments=%s "
+        "excluded_nodes=%s",
+        result.get("admitted"), result.get("reason_code"),
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          item.get("start_layer"), item.get("end_layer"))
+         for item in (result.get("assignments") or [])],
+        [(item.get("node_id"), str(item.get("executor_id") or ""),
+          item.get("reason_code"))
+         for item in (result.get("excluded_nodes") or [])],
+    )
+    # 候选被逐条排除的理由（按 (node, reason) 去重计数），无解时必须看它。
+    _excl: dict[tuple, int] = {}
+    for _item in (result.get("candidate_exclusions") or []):
+        _key = (_item.get("node_id"), str(_item.get("executor_id") or ""),
+                _item.get("reason_code"))
+        _excl[_key] = _excl.get(_key, 0) + 1
+    if _excl and not result.get("admitted"):
+        logger.info("event=supply_capacity_exclusions %s",
+                    sorted((f"{k[0]}#{k[1]}:{k[2]}", v) for k, v in _excl.items()))
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**容量不足的具体缺口**。只看排除计数无法
+        #   判断是"显存不够"还是"host 暂存预算不够"——两者都会记成
+        #   `node_capacity_insufficient`，而修法完全不同。把 required / allocatable /
+        #   shortfall 三项一起打出来，才能一次定位。
+        _short = [
+            (check.get("node_id"), str(check.get("executor_id") or ""),
+             check.get("layer_range"),
+             check.get("required_bytes"), check.get("allocatable_bytes"),
+             check.get("shortfall_bytes"))
+            for check in (result.get("capacity_checks") or [])
+            if check.get("shortfall_bytes")
+        ]
+        if _short:
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**必须带 `executor_id`**。同机 CPU 段与主段
+            #   共用 `node_id="master"`，只打 `node_id` 时两者在日志里完全无法区分 ——
+            #   我据此误判过"主段被要求承担 28 层"，实际那条是 CPU 段的。
+            logger.info(
+                "event=supply_capacity_shortfalls count=%s "
+                "(node, executor, range, required, allocatable, shortfall)=%s",
+                len(_short),
+                sorted(_short, key=lambda item: -(item[5] or 0))[:6],
+            )
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**额度来源**。`_node_budget` 只在
+            #   `node["materialization"] == "safetensors_layer_offload"` 时才改用
+            #   `host_capacity_bytes`；否则一律用 `capacity_bytes`（对 CUDA 主段是**显存**）。
+            #   把这两个字段一起打出来，才能判断"拿显存判主机权重"是不是这个分支没走到。
+            logger.info(
+                "event=supply_capacity_budget_source %s",
+                [(item.get("node_id"), item.get("materialization"),
+                  item.get("capacity_bytes"), item.get("host_capacity_bytes"),
+                  item.get("runtime_multiplier"), item.get("reserve_bytes"))
+                 for item in projected],
+            )
     if result.get("reason_code") == "pipeline_required_node_unavailable":
         result = {**result, "reason_code": "SUPPLY_MASTER_CAPACITY_INSUFFICIENT",
                   "reason": "主节点当前可用容量不足以执行接力的首段。"}
     if not result.get("admitted"):
         from model_supply_diagnostics import explain_supply_capacity
-        diagnostic = explain_supply_capacity(
-            result, grouped_descriptor=grouped, projected_nodes=projected,
-            alignment=alignment, total_layers=total, safety_margin=safety_margin,
-            prefer_all_workers=prefer_all_workers,
-        )
+        try:
+            diagnostic = explain_supply_capacity(
+                result, grouped_descriptor=grouped, projected_nodes=projected,
+                alignment=alignment, total_layers=total, safety_margin=safety_margin,
+                prefer_all_workers=prefer_all_workers,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 诊断绝不该改变控制流
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**诊断只解释原因，不该让供给失败**。
+            #
+            #   同机多执行器（本机 CPU 段与主段共用 `node_id`）会让诊断内部的
+            #   `{node["node_id"]: ...}` 索引互相覆盖 —— 拿一个执行器的层区间去比另一个
+            #   执行器的投影 ⇒ 抛 `HostCapacityProjectionError`。
+            #
+            #   而它发生在 `plan_segment_supply_reuse` **第一次尝试失败**时的诊断路径上
+            #   ⇒ **已经解出来的并存计划会被这条诊断异常杀掉**。实测（2026-10-26 03:46）：
+            #     supply_capacity_result admitted=True
+            #       [('master','',0,2), ('master','cpu',2,4), ('android','',4,6), ('TABLET','',6,8)]
+            #     model_supply_failed SUPPLY_RUNTIME_HOST_CAPACITY_INVALID
+            #   —— 计划是对的，"失败"完全来自解释失败。
+            #
+            #   诊断失败时退化为最小可用的诊断，保留原始 reason_code。
+            logger.warning(
+                "event=supply_diagnostic_failed err=%s: %s", type(exc).__name__, exc,
+            )
+            diagnostic = {
+                "reason_code": str(result.get("reason_code") or "SUPPLY_CAPACITY_INVALID"),
+                "reason": "容量求解未通过（诊断不可用）",
+                "nodes": [],
+            }
         return {**result, "total_layers": total, "loaded_ready": False, "supply_only": True,
                 "capacity_diagnostic": diagnostic}
     assignments = []
@@ -140,7 +350,11 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
                 "layer_range": [item["start_layer"], item["end_layer"]]}
         if "layer_ranges" in item:
             item["layer_ranges"] = [[start * alignment, end * alignment] for start, end in item["layer_ranges"]]
-        selected_node = by_id[item["node_id"]]
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：`by_id` 的键已改为 `(node_id, executor_id)`
+        #   —— 同一物理机的多个执行器（主段 + 本机 CPU 段）各持有不同工件、能承载的区间
+        #   不同，必须分别查表；按 `node_id` 查会取到同机**另一个**执行器的载荷规格。
+        identity = (item["node_id"], str(item.get("executor_id") or ""))
+        selected_node = by_id[identity]
         item["engine"] = selected_node["engine"]
         if selected_node.get("materialization") == "safetensors_layer_offload":
             from model_supply_runtime_capacity import runtime_range_capacity
@@ -161,7 +375,7 @@ def plan_segment_supply(descriptors: dict[str, dict], nodes: list[dict], *,
         if item["engine"] == "llama_cpp":
             # Native cut artifacts retain all non-block tensors on every node.
             # Keep this header-derived quote for the later prepare admission.
-            item["retained_component_bytes"] = by_id[item["node_id"]]["overhead_bytes"]
+            item["retained_component_bytes"] = by_id[identity]["overhead_bytes"]
         item["segment_mode"] = ("head" if item["start_layer"] == 0 else
                                 "tail" if item["end_layer"] == total else "middle")
         assignments.append(item)
@@ -329,6 +543,15 @@ class ModelSupplyCoordinator:
             if self._events[op_id].is_set() and values.get("status") not in {"cancelled", "failed"}:
                 return
             operation.update(values, updated_at=time.time())
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：状态每次变化都留痕。供给的状态机在
+            #   `waiting_nodes` / `inventory` / `building` 之间来回，而「谁把它设成
+            #   waiting_nodes」此前完全不可见 —— 排查只能靠读代码猜调用点。
+            #   这是低频事件（每次状态变化一条），不会刷屏。
+            if "status" in values:
+                logger.info(
+                    "event=supply_status op=%s status=%s reason=%s",
+                    op_id, values.get("status"), values.get("reason_code"),
+                )
             self._persist(self._operations[op_id])
             self._condition.notify_all()
 
@@ -694,6 +917,7 @@ class ModelSupplyCoordinator:
         from relay_segment_info import read_gguf_layer_info
         from model_supply_assets import _hash_file_cached
         model_id = intent["model_id"]
+        started = time.monotonic()
         from model_supply_sources import ensure_registered_sources
         source_result = ensure_registered_sources(
             model_id, operation_dir=self.root / op_id / "source",
@@ -707,7 +931,8 @@ class ModelSupplyCoordinator:
         descriptors = {}
         if hf and (hf / "config.json").is_file():
             descriptor = inspect_pipeline_model(hf, model_id=model_id, digest=_hash_file_cached)
-            descriptor.setdefault("model_sha256", compute_model_sha256(str(hf), digest=_hash_file_cached))
+            if "model_sha256" not in descriptor:
+                descriptor["model_sha256"] = compute_model_sha256(str(hf), digest=_hash_file_cached)
             descriptors["pytorch"] = descriptor
         if gguf and gguf.is_file():
             info = read_gguf_layer_info(gguf) or {}
@@ -742,6 +967,8 @@ class ModelSupplyCoordinator:
             descriptor = descriptors[master_engine]
             identity = descriptor.get("source_model_sha256", descriptor["model_sha256"])
             tokenizer = descriptor["tokenizer_sha256"]
+        logger.info("event=supply_sources_done operation=%s elapsed_ms=%d engines=%s",
+                    op_id, int((time.monotonic() - started) * 1000), sorted(descriptors))
         return {"hf": hf, "gguf": gguf, "descriptors": descriptors,
                 "master_engine": master_engine, "alignment": alignment,
                 "source_model_id": model_id, "source_model_sha256": identity,
@@ -827,14 +1054,190 @@ class ModelSupplyCoordinator:
                          capacity_diagnostic=None if cancelled else getattr(exc, "diagnostic", None))
             self._cancel_receivers(op_id, list(self.get(op_id)["nodes"]))
         finally:
-            # ★ 2026-10-24（#125）：**无论成败都回收历史操作目录**。此前每次供给都会在
-            #   `operations/<op_id>/` 留下 3~15 GB 的段工件且从不回收（实测积压
-            #   146 个 / 453.78 GB）。保留当前这次与设置指定的最近若干次。
             try:
-                self.collect_operation_directories(keep_operation_ids=(op_id,))
+                if self.get(op_id).get("status") != "available":
+                    self.collect_operation_directories(keep_operation_ids=(op_id,))
             except Exception:
                 logger.exception("event=supply_operations_reclaim_failed operation_id=%s", op_id)
 
+
+    def _local_resident_view(self, op_id, sources, plan, assignment, deadline):
+        from model_supply_digest_cache import (
+            DigestCacheError, cached_metadata, cached_sha256, file_stamp,
+        )
+        from relay_segment_info import read_artifact_manifest, read_gguf_layer_info
+
+        def check():
+            self._check(op_id)
+            if time.monotonic() >= deadline:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_TIMEOUT", "Resident verification exceeded the operation deadline")
+
+        def mismatch():
+            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_MISMATCH", "Bound resident artifact disagrees with the selected supply identity")
+
+        check()
+        selected = assignment.get("layer_artifact")
+        alignment = sources["alignment"]
+        span = [assignment["start_layer"], assignment["end_layer"]]
+        if (assignment.get("engine") != "llama_cpp" or not isinstance(selected, dict)
+                or type(alignment) is not int or alignment < 1
+                or plan.get("cut_alignment", alignment) != alignment
+                or any(type(value) is not int for value in span)
+                or not 0 <= span[0] < span[1] <= plan["total_layers"]):
+            mismatch()
+        selected_span = selected.get("layer_range")
+        if (not isinstance(selected_span, (list, tuple)) or len(selected_span) != 2
+                or any(type(value) is not int for value in selected_span)
+                or [value * alignment for value in selected_span] != span):
+            mismatch()
+        mode = "head" if span[0] == 0 else "tail" if span[1] == plan["total_layers"] else "middle"
+        if selected.get("segment_mode") != mode:
+            mismatch()
+        for field in ("source_model_sha256", "tokenizer_sha256"):
+            if not isinstance(sources.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", sources[field]) is None:
+                mismatch()
+        artifact_sha = selected.get("artifact_sha256")
+        if (not isinstance(artifact_sha, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None
+                or selected.get("source_model_sha256") != sources["source_model_sha256"]
+                or not isinstance(sources.get("source_model_id"), str) or not sources["source_model_id"]
+                or not isinstance(selected.get("model_id"), str) or not selected["model_id"]):
+            mismatch()
+        for field, expected in (("model_id", sources["source_model_id"]),
+                                ("model_sha256", sources["source_model_sha256"]),
+                                ("source_model_sha256", sources["source_model_sha256"])):
+            if field in plan and plan[field] != expected:
+                mismatch()
+        configured_path = (os.environ.get("QLH_LAYER_GGUF") or "").strip()
+        if not configured_path:
+            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "QLH_LAYER_GGUF is not configured")
+        artifact = Path(configured_path)
+        if not artifact.is_absolute():
+            artifact = Path(__file__).resolve().parents[1] / artifact
+        markers = (artifact.with_suffix(".manifest.json"), Path(str(artifact) + ".manifest.json"))
+
+        def version():
+            check()
+            if (os.environ.get("QLH_LAYER_GGUF") or "").strip() != configured_path:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_CHANGED", "Resident artifact binding changed")
+            try:
+                return (str(artifact.resolve(strict=True)), file_stamp(artifact), tuple(
+                    file_stamp(marker) if marker.exists() else None for marker in markers))
+            except OSError as exc:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "Bound resident artifact is unavailable") from exc
+
+        before = version()
+
+        def unchanged():
+            if version() != before:
+                raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_CHANGED", "Resident artifact or sidecar changed")
+
+        def cancelled():
+            check()
+            return False
+
+        def read_manifest(path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_span = payload.get("source_layer_range") if isinstance(payload, dict) else None
+            if (not isinstance(raw_span, list) or len(raw_span) != 2
+                    or any(type(value) is not int for value in raw_span)):
+                return {}
+            return read_artifact_manifest(path) or {}
+
+        try:
+            manifests = []
+            for marker, stamp in zip(markers, before[2]):
+                if stamp is None:
+                    continue
+                manifest = cached_metadata(marker, "supply-local-resident-v1", read_manifest, cancelled)
+                if (manifest.get("source_layer_range") != span
+                        or manifest.get("artifact_sha256") != artifact_sha
+                        or any(manifest.get(field) != sources[field] for field in (
+                            "source_model_id", "source_model_sha256", "tokenizer_sha256"))
+                        or ("n_layer" in manifest and manifest["n_layer"] != plan["total_layers"])):
+                    mismatch()
+                manifests.append(marker)
+            if not manifests:
+                mismatch()
+            info = read_gguf_layer_info(artifact) or {}
+            if info.get("n_layer") != span[1] - span[0]:
+                mismatch()
+            if cached_sha256(artifact, cancelled) != artifact_sha:
+                mismatch()
+        except (OSError, DigestCacheError, json.JSONDecodeError) as exc:
+            check()
+            raise ModelSupplyError("SUPPLY_LOCAL_RESIDENT_UNAVAILABLE", "Resident file verification failed") from exc
+        unchanged()
+        total_bytes = before[1][0]
+        return ({"status": "available", "strategy": "local_resident", "layer_range": span,
+                 "segment_mode": mode, "total_bytes": total_bytes, "artifact_sha256": artifact_sha,
+                 "source_model_id": sources["source_model_id"],
+                 "source_model_sha256": sources["source_model_sha256"],
+                 "tokenizer_sha256": sources["tokenizer_sha256"], "model_id": selected["model_id"],
+                 "model_path": before[0], "resident_manifest_path": str(manifests[0].resolve()),
+                 "transfer_granularity": "local_file", "engine": assignment["engine"],
+                 "executor_id": assignment["executor_id"], "node_id": assignment["node_id"],
+                 "actual_downloaded_bytes": 0, "reused_bytes": total_bytes}, unchanged)
+
+    @contextmanager
+    def _segment_builds(self, op_id, sources, plan, deadline):
+        from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
+        stopped = threading.Event()
+        jobs = []
+        reserve = 0
+        for assignment in plan["assignments"]:
+            self._check(op_id)
+            node_id = assignment["node_id"]
+            if node_id == "master" and assignment.get("executor_id"):
+                continue
+            directory = self.root / op_id / node_id
+            directory.mkdir(parents=True, exist_ok=True)
+            engine = assignment["engine"]
+            source = sources["gguf"] if engine == "llama_cpp" else sources["hf"]
+            estimated = _segment_disk_weight_bytes(sources["descriptors"][engine], assignment, source)
+            identity = {"node_id": node_id, "source_model_id": sources["source_model_id"],
+                        "source_model_sha256": sources["source_model_sha256"],
+                        "tokenizer_sha256": sources["tokenizer_sha256"], "total_layers": plan["total_layers"],
+                        "layer_range": [assignment["start_layer"], assignment["end_layer"]],
+                        "segment_mode": "head" if assignment["start_layer"] == 0 else
+                                        "tail" if assignment["end_layer"] == plan["total_layers"] else "middle",
+                        "format": "gguf" if engine == "llama_cpp" else "safetensors",
+                        "conversion_proof": sources["conversion_proof"]}
+            if not segment_cache_hint(self.root, identity):
+                reserve += estimated + _segment_disk_overhead_bytes(engine, source)
+            jobs.append((assignment, directory, source))
+        if shutil.disk_usage(self.root / op_id).free < reserve:
+            raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
+
+        def build(assignment, directory, source):
+            self._check(op_id)
+            started = time.monotonic()
+            builder = build_gguf_segment if assignment["engine"] == "llama_cpp" else build_safetensors_segment
+            options = {"cancelled": lambda: stopped.is_set() or self._events[op_id].is_set(),
+                       "deadline": deadline}
+            manifest = builder(source, directory, source_model_id=sources["source_model_id"],
+                               source_model_sha256=sources["source_model_sha256"],
+                               tokenizer_sha256=sources["tokenizer_sha256"],
+                               start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
+                               total_layers=plan["total_layers"], operation_id=op_id, node_id=assignment["node_id"],
+                               conversion_proof=sources["conversion_proof"], reuse_root=self.root, **options)
+            self._check(op_id)
+            logger.info("event=supply_segment_build_done operation=%s node=%s executor=%s elapsed_ms=%d reused_bytes=%d",
+                        op_id, assignment["node_id"], assignment.get("executor_id", ""),
+                        int((time.monotonic() - started) * 1000), manifest.get("_reused_bytes", 0))
+            return manifest
+
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="supply-build")
+        futures = []
+        try:
+            futures = [(assignment, directory, executor.submit(build, assignment, directory, source))
+                       for assignment, directory, source in jobs]
+            by_future = {future: (assignment, directory) for assignment, directory, future in futures}
+            yield ((by_future[future][0], by_future[future][1], future) for future in as_completed(by_future))
+        finally:
+            stopped.set()
+            for _, _, future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _execute(self, op_id):
         # ★ 2026-10-24（#117）：清点等待上限在此统一取一次，供本函数内所有
@@ -934,12 +1337,23 @@ class ModelSupplyCoordinator:
                          tokenizer_sha256=sources["tokenizer_sha256"], reason_code="", reason="",
                          capacity_diagnostic=None)
             capacity = self.scheduler._get_pipeline_capacity_nodes(set(worker_ids) | {"master"})
-            capacity_by_id = {record["node_id"]: record for record in capacity}
+            # ★ 2026-10-25（LOCAL-EXECUTORS-01）：索引按 `(node_id, executor_id)`。
+            #   本机附加执行器（CPU 段）与主段**共用 `node_id`**，用
+            #   `{record["node_id"]: record}` 建索引会让它**静默覆盖**主段。实测后果：
+            #   供给 plan 里 master 的 assignment 被标成 `executor_id='cpu'`，层区间却
+            #   是主段的 `[0,8)`。这个被污染的 plan 一路传到
+            #   `SupplyCapacityEvidence.project()`，于是 CPU 段拿到主段的切点
+            #   `candidate_layer_ranges=[[0,8]]`，与自身声明的 `[8,24)` 冲突 ⇒ 求解器
+            #   永远不选它（"同机两段"名存实亡）。
+            capacity_by_id = {
+                (record["node_id"], str(record.get("executor_id") or "")): record
+                for record in capacity
+            }
             records = []
             runtime_descriptors = {}
             runtime_host_descriptors = {}
             for node_id, inventory in inventories.items():
-                base = dict(capacity_by_id.get(node_id) or {})
+                base = dict(capacity_by_id.get((node_id, "")) or {})
                 if not base:
                     from config import PIPELINE_CAPACITY_RESERVE_MB
                     base = {"node_id": node_id, "role": "client", "score": 0.0,
@@ -950,6 +1364,17 @@ class ModelSupplyCoordinator:
                     "pytorch" if "pytorch" in engines and "pytorch" in sources["descriptors"] else "")
                 if not engine:
                     raise ModelSupplyError("SUPPLY_ENGINE_SOURCE_MISSING", f"No compatible source for {node_id}")
+                source_layer_budget = (
+                    inventory_local_cut_budget(inventory, sources)
+                    if engine == "llama_cpp" else None
+                )
+                advertised_budget = base.get("layer_budget")
+                if source_layer_budget is not None:
+                    base["layer_budget"] = source_layer_budget
+                elif isinstance(advertised_budget, dict) and advertised_budget.get("local_cut") is True:
+                    # A generic HELLO budget may describe another installed GGUF.
+                    # Only this operation's inventory proves the selected source.
+                    base.pop("layer_budget", None)
                 if engine == "llama_cpp":
                     # ★ 2026-10-23（#117）：**自裁节点按原生量化宽度物化**。GGUF 段是
                     #   从整模按原生 Q4_K_M 直接切出来的，worker 侧没有 fp16→fp32 的
@@ -976,7 +1401,7 @@ class ModelSupplyCoordinator:
                         # Selective loaders read Safetensors on CPU and transfer one
                         # tensor at a time. Charge target weights to VRAM, source
                         # staging separately to RAM, never RAM bytes to VRAM.
-                        runtime_host_descriptors[node_id] = projection
+                        runtime_host_descriptors[(node_id, "")] = projection
                         projection = {**projection,
                             "weight_bytes": projection["runtime_weight_bytes"],
                             "layer_weight_bytes": projection["runtime_layer_weight_bytes"],
@@ -1026,29 +1451,143 @@ class ModelSupplyCoordinator:
                         HOST_RAM_MAX_FRACTION, base["host_capacity_bytes"] / 1024**3,
                     )
                 records.append(base)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机附加执行器必须参与切点求解**。
+            #
+            #   上面的循环按 `inventories`（worker 上报）构建记录，而本机附加执行器
+            #   （CPU 段）**没有 inventory** —— 它不做工件传输，所以在"谁上报了什么"
+            #   这个视角下它不存在。但它**有容量、有裁好的工件、有可切范围**
+            #   （`layer_ranges` + `layer_budget` 的 `min_layer`/`max_layer`）。
+            #
+            #   漏掉它的后果不是"少一个候选"，而是**它没有发言人**：远端会先把
+            #   `[8,24)` 这些它本该承担的区间算进自己的切点、进而锁成
+            #   `candidate_layer_ranges`（那是"我手上确实有这个段"的事实，**本就该是
+            #   硬约束**）。之后的轮次里 CPU 段只能在自己工件覆盖的区间里挑，而那里
+            #   已经被占死 ⇒ 永远挤不进来（真机实测：`android [[8,20]]` +
+            #   `TABLET [[20,32]]` 占满 `[8,32)`，CPU 段在候选里却从未被选）。
+            #
+            #   注意它**只进容量规划、不进部署**：`scheduler_pipeline` 把带
+            #   `executor_id` 的 assignment 归入 `deployment["local_executors"]`，
+            #   不走工件传输与回执 —— 那些是**物理节点之间**的义务，本机执行器没有。
+            #   ★ 2026-10-27：**每台机器目前只支持一个附加执行器，且这是显式约束**。
+            #
+            #   此前这里是隐式的"按 `node_id` 去重"（变量名 `local_executor_seen`
+            #   装的是 `node_id`），效果是**静默丢弃**第二台附加执行器。静默丢弃在
+            #   诊断上很坏：将来若加 `cpu2` / `npu`，它不会报错、只是永远不参与规划，
+            #   现场只会看到"某台设备明明配了却没被用上"。
+            #
+            #   产品口径已确认：**当前设计就是每机一个附加执行器**（主段 `""` + 一个
+            #   附加段）。所以把隐式去重换成**显式断言** —— 真出现第二个时立刻带名字
+            #   报错，而不是悄悄少一条记录。放开这件事需要同时改部署侧
+            #   （`deployment["local_executors"]`、控制面白名单、就绪视图），
+            #   不是这里的局部改动。
+            local_executor_by_node: dict[str, str] = {}
+            for record in capacity:
+                executor_id = str(record.get("executor_id") or "")
+                if not executor_id:
+                    # 主执行器由上面的 inventories 循环负责，这里只收附加执行器
+                    continue
+                node_id = record["node_id"]
+                previous = local_executor_by_node.get(node_id)
+                if previous is not None:
+                    raise ModelSupplyError(
+                        "SUPPLY_MULTIPLE_LOCAL_EXECUTORS",
+                        f"node {node_id} declares more than one local executor "
+                        f"({previous!r} and {executor_id!r}); only one additional "
+                        f"local executor per node is supported",
+                        diagnostic={
+                            "reason_code": "SUPPLY_MULTIPLE_LOCAL_EXECUTORS",
+                            "node_id": node_id,
+                            "executors": sorted({previous, executor_id}),
+                        },
+                    )
+                if node_id not in inventories:
+                    continue
+                local_executor_by_node[node_id] = executor_id
+                records.append(dict(record))
+                logger.info(
+                    "event=local_executor_entered_supply_plan operation=%s node=%s "
+                    "executor=%s layer_ranges=%s bounds=(%s,%s)",
+                    op_id, node_id, executor_id,
+                    record.get("layer_ranges"),
+                    (record.get("layer_budget") or {}).get("min_layer"),
+                    (record.get("layer_budget") or {}).get("max_layer"),
+                )
             from config import PIPELINE_CAPACITY_SAFETY_MARGIN, API_PORT
             from model_supply_host_capacity import allowed_host_layer_ranges
             runtime_host_ranges = {}
-            for node_id, projection in runtime_host_descriptors.items():
+            for (node_id, _host_executor), projection in runtime_host_descriptors.items():
+                _avail = int(inventories[node_id].get("memory_available_bytes", 0))
+                _reserve = int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0))
                 runtime_host_ranges[node_id] = allowed_host_layer_ranges(
                     projection, node_id=node_id,
-                    available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                    reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
+                    available_bytes=_avail,
+                    reserve_bytes=_reserve,
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                )
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：host 区间为空时，上面的错误信息只说
+                #   "layer_range must be an aligned proper source segment"（来自诊断函数），
+                #   完全看不出是"预算不够"还是"投影层数不对"。把输入一起打出来。
+                logger.info(
+                    "event=host_layer_ranges node=%s total_layers=%s layer_bytes=%s "
+                    "available=%s reserve=%s alignment=%s ranges=%s max_end=%s",
+                    node_id, projection.get("total_layers"),
+                    len(projection.get("source_layer_weight_bytes") or []),
+                    _avail, _reserve, sources["alignment"],
+                    len(runtime_host_ranges[node_id]),
+                    max((end for _, end in runtime_host_ranges[node_id]), default=None),
                 )
                 if not runtime_host_ranges[node_id]:
                     from model_supply_diagnostics import explain_host_capacity
-                    diagnostic = explain_host_capacity(
-                        projection, node_id=node_id,
-                        available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                        reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
-                        safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
-                    )
+                    try:
+                        diagnostic = explain_host_capacity(
+                            projection, node_id=node_id,
+                            available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                            reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
+                            safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                        )
+                    except Exception as exc:  # noqa: BLE001 —— 诊断失败不该掩盖真正原因
+                        logger.warning("event=host_diagnostic_failed node=%s err=%s: %s",
+                                       node_id, type(exc).__name__, exc)
+                        diagnostic = {
+                            "reason_code": "SUPPLY_RUNTIME_HOST_CAPACITY_INVALID",
+                            "reason": "主机 RAM 无法暂存该节点候选计划的源权重（诊断不可用）",
+                            "nodes": [],
+                        }
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
             from model_supply_plan_reuse import plan_segment_supply_reuse
-            def capacity_plan(*, preferred_ranges, constrain_host=True, plan_records=None):
-                return plan_segment_supply(sources["descriptors"], plan_records or records,
+            def capacity_plan(*, preferred_ranges, constrain_host=True, plan_records=None,
+                              release_candidates=False):
+                chosen = list(plan_records or records)
+                if release_candidates:
+                    before = [bool(record.get("candidate_layer_ranges")) for record in chosen]
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**放开上一轮的切点锁**。
+                    #
+                    #   `candidate_layer_ranges` 由上一轮供给写入（见
+                    #   `model_supply_capacity.SupplyCapacityEvidence.project`），目的是
+                    #   锁定布局、避免 prepare 重新求解时切点漂移（#117）。但**拓扑变化**
+                    #   时它会变成死锁：旧切点把区间占满，新执行器（本机 CPU 段）或换过段
+                    #   的设备（surface 取代 ROG）挤不进自己工件覆盖的区间 ⇒ 连无偏好的
+                    #   baseline 都无解 ⇒ 供给直接失败，而设备手上还拿着**过期工件**。
+                    #
+                    #   scheduler 侧的同名机制（`get_pipeline_capacity_plan` 里
+                    #   "锁定的切点不再满足容量，放开候选约束重排"）早已这样做，**供给侧
+                    #   此前缺这一步**。放开后由求解器给出新布局，供给流程据此重推工件 ——
+                    #   这正是"拓扑变了要重裁"应有的机制路径，而不是要求人工去清设备文件。
+                    chosen = [
+                        {k: v for k, v in record.items() if k != "candidate_layer_ranges"}
+                        for record in chosen
+                    ]
+                    logger.info(
+                        "event=supply_release_candidates_supplied had=%s "
+                        "after=%s nodes=%s",
+                        before,
+                        [bool(record.get("candidate_layer_ranges")) for record in chosen],
+                        [(r.get("node_id"), r.get("executor_id", ""),
+                          r.get("layer_ranges"), r.get("candidate_layer_ranges"))
+                         for r in chosen],
+                    )
+                return plan_segment_supply(sources["descriptors"], chosen,
                     master_engine=sources["master_engine"], alignment=sources["alignment"],
                     safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                     runtime_descriptors=runtime_descriptors, preferred_ranges=preferred_ranges,
@@ -1056,7 +1595,16 @@ class ModelSupplyCoordinator:
             plan = plan_segment_supply_reuse(sources["descriptors"], capacity, records,
                 planner=capacity_plan, source_model_id=sources["source_model_id"],
                 source_model_sha256=sources["source_model_sha256"], tokenizer_sha256=sources["tokenizer_sha256"],
-                engine_by_node={record["node_id"]:record["engine"] for record in records},
+                # ★ 2026-10-27（LOCAL-EXECUTORS-01 / A8 问题 3）：**必须按 `(node_id, executor_id)` 建映射**。
+                #
+                #   同机 GPU 段（`("master", "")`，pytorch）与 CPU 段（`("master", "cpu")`，
+                #   llama_cpp）**共用 `node_id`**。此前这里是
+                #   `{record["node_id"]: record["engine"]}` ⇒ 后写的 CPU 段覆盖主段
+                #   ⇒ `engine_by_node["master"] == "llama_cpp"`。即使 `_preserves`/`_candidates`
+                #   已修好身份，主段的 assignment（engine=pytorch）仍会因"引擎不等"被判
+                #   False ⇒ 复用偏好继续退回 `unrestricted`，已裁好的段每轮重新规划。
+                engine_by_node={(record["node_id"], str(record.get("executor_id") or "")):
+                                record["engine"] for record in records},
                 alignment=sources["alignment"])
             # ★ 2026-10-23（#117）：**本机 RAM 是一等承载资源，不是失败兜底**。
             #   此前只在 resident 规划**失败之后**才尝试 `safetensors_layer_offload`
@@ -1080,28 +1628,74 @@ class ModelSupplyCoordinator:
                     and local_projection.get("model_type") in {"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"}):
                 resident_plan = plan
                 resident_diagnostic = copy.deepcopy(plan.get("capacity_diagnostic"))
+                # ★ 2026-10-27（LOCAL-EXECUTORS-01）：**必须同时要求主执行器**。
+                #
+                #   `safetensors_layer_offload` 是"PyTorch 主段把部分层放到主机 RAM"
+                #   的物化形态。同机的 CPU 段（`executor_id="cpu"`）engine 是
+                #   `llama_cpp`、工件是裁层 GGUF —— 它已经**本来就在主机内存里**，
+                #   没有"offload"这回事。
+                #
+                #   此前条件只有 `record["node_id"] == "master"` ⇒ CPU 段也被标成
+                #   `safetensors_layer_offload` ⇒ 进 `model_supply_runtime_capacity`
+                #   的 `if engine != "pytorch": fail("SUPPLY_RUNTIME_LOAD_SPEC_INVALID")`
+                #   ⇒ 该异常从这里无 try 地冒泡 ⇒ **整次供给失败**。
+                #
+                #   触发条件是 `host_ram_offload_enabled()`，即
+                #   `QLH_CAPACITY_PLANNING_MODE=balanced`（**缺省值**）或显式
+                #   `QLH_HOST_RAM_OFFLOAD_ENABLED=1`。所以这不是边缘情况：
+                #   本机之所以一直没事，是因为 `.env` 显式钉了 `fastest`。
                 offload_records = [
                     {**record, "materialization": "safetensors_layer_offload"}
-                    if record["node_id"] == "master" else record
+                    if record["node_id"] == "master"
+                    and not record.get("executor_id") else record
                     for record in records
                 ]
                 offload_plan = plan_segment_supply_reuse(
                     sources["descriptors"], capacity, offload_records,
-                    planner=lambda *, preferred_ranges, constrain_host=True: capacity_plan(
+                    # ★ 2026-10-27（LOCAL-EXECUTORS-01 / B1）：**必须转发 `release_candidates`**。
+                    #   此前这个 lambda 只声明 `preferred_ranges/constrain_host` ⇒
+                    #   `plan_segment_supply_reuse` 里两种"放开切点锁"的调用都会
+                    #   `TypeError` 被吞掉（代码里 catch 后 `released = baseline`）⇒
+                    #   offload 物化的路径上释放机制**从未生效**：无解时直接失败、
+                    #   "可行但缺少 CPU 段"时也不会重切。保持与 resident 路径同口径。
+                    planner=lambda *, preferred_ranges, constrain_host=True,
+                            release_candidates=False: capacity_plan(
                         preferred_ranges=preferred_ranges, constrain_host=constrain_host,
-                        plan_records=offload_records),
+                        plan_records=offload_records, release_candidates=release_candidates),
                     source_model_id=sources["source_model_id"],
                     source_model_sha256=sources["source_model_sha256"],
                     tokenizer_sha256=sources["tokenizer_sha256"],
-                    engine_by_node={record["node_id"]: record["engine"] for record in offload_records},
+                    engine_by_node={(record["node_id"], str(record.get("executor_id") or "")):
+                                    record["engine"] for record in offload_records},
                     alignment=sources["alignment"])
 
                 def _local_layers(candidate):
-                    """本机承担的层数；越大越优（本机算力最强）。"""
-                    total = 0
+                    """本机承担的**等效**层数；越大越优。
+
+                    ★ 2026-10-25（#117 收尾）：**必须按每层成本折算，不能只数层数**。
+                    `safetensors_layer_offload` 每层都要把权重从主机内存搬过 PCIe 再算，
+                    单层代价远高于 resident（原地计算）。实测（本机 RTX 4060 Laptop，
+                    链路 Gen2 x8 ≈ 4 GB/s）：
+                        resident  8 层 ⇒ 101 ms/步  ⇒ 12.6 ms/层
+                        offload  20 层 ⇒ 1535 ms/步 ⇒ 76.8 ms/层   ⇒ 约 6.1 倍
+                    而原准则只数"本机层数多"，于是**主动选中每步慢一个数量级的方案**
+                    （offload 20 层 > resident 8 层），把 `host_ram_offload_enabled()`
+                    打开的这条路变成了自伤。这里给 offload 的层数除以每层成本比
+                    `OFFLOAD_LAYER_COST_RATIO`，使比较反映**端到端步时**而非账面容量：
+                    20/6.0 ≈ 3.3 < 8 ⇒ resident 胜出。比值经 `QLH_OFFLOAD_LAYER_COST_RATIO`
+                    配置（默认 6.0，硬件相关量）；置 1.0 即恢复旧的纯层数比较。
+                    """
+                    from config import OFFLOAD_LAYER_COST_RATIO
+                    total = 0.0
                     for item in candidate.get("assignments", []) or []:
-                        if item.get("node_id") == "master":
-                            total += max(0, int(item.get("end_layer", 0)) - int(item.get("start_layer", 0)))
+                        if item.get("node_id") != "master":
+                            continue
+                        layers = max(0, int(item.get("end_layer", 0))
+                                     - int(item.get("start_layer", 0)))
+                        if (item.get("runtime_materialization")
+                                == "safetensors_layer_offload"):
+                            layers = layers / OFFLOAD_LAYER_COST_RATIO
+                        total += layers
                     return total
 
                 if offload_plan.get("admitted") and (
@@ -1135,15 +1729,20 @@ class ModelSupplyCoordinator:
                         shortages = []
                         for assignment in unconstrained["assignments"]:
                             node_id = assignment["node_id"]
-                            if node_id not in runtime_host_descriptors:
+                            if (node_id, "") not in runtime_host_descriptors:
                                 continue
-                            explanation = explain_host_capacity(
-                                runtime_host_descriptors[node_id], node_id=node_id,
-                                available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                                reserve_bytes=int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0)),
-                                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
-                                layer_range=[assignment["start_layer"], assignment["end_layer"]],
-                            )
+                            try:
+                                explanation = explain_host_capacity(
+                                    runtime_host_descriptors[(node_id, "")], node_id=node_id,
+                                    available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                    reserve_bytes=int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0)),
+                                    safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN, alignment=sources["alignment"],
+                                    layer_range=[assignment["start_layer"], assignment["end_layer"]],
+                                )
+                            except Exception as exc:  # noqa: BLE001 —— 诊断失败不该改变控制流
+                                logger.warning("event=host_diagnostic_failed node=%s err=%s: %s",
+                                               node_id, type(exc).__name__, exc)
+                                continue
                             shortages.extend(item for item in explanation["nodes"] if item.get("deficit_bytes", 0) > 0)
                         if shortages:
                             diagnostic = {**explanation, "nodes": shortages,
@@ -1156,36 +1755,129 @@ class ModelSupplyCoordinator:
                         wait_for_new=True, capacity_diagnostic=diagnostic)):
                     continue
                 raise ModelSupplyError(code, diagnostic["reason"], diagnostic=diagnostic)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**规划成功后必须清掉"等待新节点"的残留状态**。
+            #
+            #   诊断路径（上方 `wait_for_new=True` + `capacity_diagnostic=diagnostic`）会把
+            #   status 设为 `waiting_nodes` 并带上**诊断的** reason_code。而规划是**每轮重跑**
+            #   的、且结果会**波动**：
+            #     * `plan_segment_supply_reuse` 会先试 `preferred_ranges={}`（可能失败 ⇒ 触发
+            #       上面的诊断路径、把 status 写成 `waiting_nodes`），再靠 `release_candidates`
+            #       成功 ⇒ **最终 plan 是好的，但中途已经把状态写脏**；
+            #     * 候选又来自上一轮 plan ⇒ 下一轮重复同样的波动。
+            #   于是**成功轮不清状态，对外就永远显示 `waiting_nodes`**，客户端一直等下去，
+            #   而 `pending_node_ids` 是空的（根本没有节点可等）。
+            #
+            #   实测（2026-10-26 05:04，`event=supply_status`）：
+            #     planning → waiting_nodes(pipeline_candidate_layer_range_unsatisfied)
+            #              → waiting_nodes(同) → planning → … 每 5 秒循环，从不恢复。
+            #
+            #   ⚠️ 位置很关键：必须放在下面 `auto_pool` 那个 `continue` **之前** ——
+            #   `_extend_auto_inventory` 在此期间只要发现任何变化就会 `continue`，
+            #   放在它之后等于永远不执行（第一版就是这么写错的）。
+            self._update(op_id, status="building", reason_code="", reason="",
+                         capacity_diagnostic=None)
             if auto_pool and self._extend_auto_inventory(op_id, intent, worker_ids, nodes, inventories, deadline):
                 continue
             # CUDA still needs host source mappings. Gate the selected segment's
             # complete source bytes against real RAM plus the configured reserve.
             for assignment in plan["assignments"]:
                 node_id = assignment["node_id"]
-                projection = runtime_host_descriptors.get(node_id)
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**按 `(node_id, executor_id)` 取宿主投影**。
+                #
+                #   这一段算的是"把源权重暂存到主机内存要多少 RAM"——它只适用于**需要跨
+                #   PCIe 暂存**的物化（CUDA 上的 safetensors）。本机 CPU 段（llama.cpp）
+                #   的权重**本来就常驻主机内存、就地计算**，不存在"暂存"这回事。
+                #
+                #   此前按 `node_id` 取投影 ⇒ 本机 CPU 段（`node_id` 同样是 `master`）拿到
+                #   **主段的 PyTorch 投影** ⇒ 拿它去算 `safetensors_key_filtered` 的暂存需求
+                #   ⇒ `runtime_range_capacity` 抛 `HostCapacityProjectionError`
+                #   ⇒ 整次供给以 `SUPPLY_RUNTIME_HOST_CAPACITY_INVALID` 失败。
+                #   实测（03:37）：求解**已经**给出了正确的并存计划
+                #     [('master','',0,2), ('master','cpu',2,4), ('android','',4,6), ('TABLET','',6,8)]
+                #   却在随后这一步被误杀 —— 失败发生在求解**之后**，与规划无关。
+                #
+                #   按身份查表后，非主执行器天然取不到投影（那本就是个按物理机上报的量）
+                #   ⇒ `continue` ⇒ 正确地跳过与它无关的校验。
+                projection = runtime_host_descriptors.get(
+                    (node_id, str(assignment.get("executor_id") or ""))
+                )
                 if projection is None:
                     continue
                 from model_supply_runtime_capacity import runtime_range_capacity
                 from qlh_core.planning.load_spec import assignment_load_spec
                 materialization = assignment.get("runtime_materialization", "safetensors_key_filtered")
-                quote = runtime_range_capacity(
-                    projection, assignment["start_layer"], assignment["end_layer"],
-                    has_embedding=assignment["has_embedding"], has_lm_head=assignment["has_lm_head"],
-                    materialization=materialization,
-                )
+                try:
+                    quote = runtime_range_capacity(
+                        projection, assignment["start_layer"], assignment["end_layer"],
+                        has_embedding=assignment["has_embedding"], has_lm_head=assignment["has_lm_head"],
+                        materialization=materialization,
+                    )
+                except Exception as exc:  # noqa: BLE001 —— 只为把真实原因打出来，随后原样抛
+                    logger.error(
+                        "event=runtime_range_quote_failed node=%s executor=%s range=%s "
+                        "materialization=%s embedding=%s lm_head=%s projection_total=%s "
+                        "projection_layers=%s err=%s: %s",
+                        node_id, str(assignment.get("executor_id") or ""),
+                        [assignment["start_layer"], assignment["end_layer"]],
+                        materialization, assignment["has_embedding"], assignment["has_lm_head"],
+                        projection.get("total_layers"),
+                        len(projection.get("source_layer_weight_bytes") or []),
+                        type(exc).__name__, exc,
+                    )
+                    raise
                 source_bytes = quote["host_source_bytes"]
                 conversion_bytes = quote["host_conversion_bytes"]
-                reserve = int(capacity_by_id.get(node_id, {}).get("reserve_bytes", 0))
+                reserve = int(capacity_by_id.get((node_id, ""), {}).get("reserve_bytes", 0))
                 required = math.ceil((source_bytes + conversion_bytes) * PIPELINE_CAPACITY_SAFETY_MARGIN) + reserve
-                if required > int(inventories[node_id].get("memory_available_bytes", 0)):
+                # ★ 2026-10-25（#117 收尾）：这一段检查的是**主机内存**（上方注释原文即
+                #   "complete source bytes against real RAM"），却取了
+                #   `memory_available_bytes` —— 对 `pytorch` + `cuda` 的 master，该字段是
+                #   **显存可用量**（实测 7451181056 = 7.45 GB）。
+                #   后果：任何需要把权重放在主机内存的物化（`safetensors_layer_offload`）
+                #   都必然被拒 —— 用 14 GB 的主机需求去比 7.45 GB 的显存，于是 master
+                #   永远只能拿显存装得下的那几层（实测 `[0,8)`），主机那 ~32 GB 全程闲置。
+                #   主机内存额度是 `host_capacity_bytes`
+                #   （= min(当前可用内存, 物理总量 × HOST_RAM_MAX_FRACTION)，见上方
+                #   `host_ram_budget` 的写入点），这里改用它。远端 CPU 节点该字段同样由
+                #   该分支之外的路径落到"可用内存"，语义一致。
+                #   字段缺失时（旧回执 / 非 host-projection 节点）回退到
+                #   `memory_available_bytes`，保持旧行为不更差。
+                host_budget = inventories[node_id].get("host_capacity_bytes")
+                if host_budget is None:
+                    host_budget = inventories[node_id].get("memory_available_bytes", 0)
+                host_budget = int(host_budget)
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：打印每个 assignment 的实际 host 账。
+                #   `projection` 按 `node_id` 取（`runtime_host_descriptors` 只有主执行器有），
+                #   而 assignment 可能属于**同机的另一个执行器** ⇒ 用错了投影或用错了账本
+                #   时，只有在数字上才看得出来。
+                logger.info(
+                    "event=assignment_host_budget node=%s executor=%s range=%s "
+                    "source=%s conversion=%s required=%s budget=%s projection_total=%s "
+                    "materialization=%s has_embedding=%s has_lm_head=%s",
+                    node_id, str(assignment.get("executor_id") or ""),
+                    [assignment["start_layer"], assignment["end_layer"]],
+                    source_bytes, conversion_bytes, required, host_budget,
+                    projection.get("total_layers"), materialization,
+                    assignment["has_embedding"], assignment["has_lm_head"],
+                )
+                if required > host_budget:
                     from model_supply_diagnostics import explain_host_capacity
-                    diagnostic = explain_host_capacity(
-                        projection, node_id=node_id,
-                        available_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
-                        reserve_bytes=reserve, safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
-                        alignment=sources["alignment"],
-                        layer_range=[assignment["start_layer"], assignment["end_layer"]],
-                    )
+                    try:
+                        diagnostic = explain_host_capacity(
+                            projection, node_id=node_id,
+                            available_bytes=host_budget,
+                            reserve_bytes=reserve, safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                            alignment=sources["alignment"],
+                            layer_range=[assignment["start_layer"], assignment["end_layer"]],
+                        )
+                    except Exception as exc:  # noqa: BLE001 —— 诊断失败不该掩盖真正原因
+                        logger.warning("event=host_diagnostic_failed node=%s err=%s: %s",
+                                       node_id, type(exc).__name__, exc)
+                        diagnostic = {
+                            "reason_code": "SUPPLY_RUNTIME_HOST_CAPACITY_INVALID",
+                            "reason": "主机 RAM 不足以暂存该段源权重（诊断不可用）",
+                            "nodes": [],
+                        }
                     raise ModelSupplyError(diagnostic["reason_code"], diagnostic["reason"],
                                            diagnostic=diagnostic)
                 # Freeze the exact runtime quote as well as the source identity.
@@ -1194,7 +1886,7 @@ class ModelSupplyCoordinator:
                 assignment.update(quote, host_source_bytes=source_bytes,
                                   host_conversion_bytes=conversion_bytes,
                                   host_required_bytes=required,
-                                  host_capacity_bytes=int(inventories[node_id].get("memory_available_bytes", 0)),
+                                  host_capacity_bytes=host_budget,
                                   runtime_materialization=materialization,
                                   runtime_target_element_size=projection["runtime_target_element_size"],
                                   runtime_target_dtype=projection["runtime_target_dtype"])
@@ -1209,9 +1901,24 @@ class ModelSupplyCoordinator:
         with self._condition:
             self._check(op_id)
             self._check_receivers(op_id)
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**传输身份与视图身份是两回事**。
+            #
+            #   * 连接/回执按**物理机**去重 —— 同机两段（主段 + 本机 CPU 段）共用**一个**
+            #     TCP 连接与一条回执通道，所以这里用裸 `node_id` 是对的。
+            #   * 部署视图按**执行器**分开 —— 同机两段各自成条，否则下面那行过滤会把
+            #     `master#cpu` 整个丢掉。实测（2026-10-26 07:40）：`plan` 里四段齐全、
+            #     磁盘上 `master/` 也确实有两个 segment 目录，但 intent 的 `nodes` 只有
+            #     三条 ⇒ 并存无法从对外视图确认。
+            #
+            #   此前一个 `assigned` 同时干这两件事，于是视图被按物理机过滤。
             assigned = {item["node_id"] for item in plan["assignments"]}
+            assigned_view_keys = {
+                item["node_id"] if not item.get("executor_id")
+                else f"{item['node_id']}#{item['executor_id']}"
+                for item in plan["assignments"]
+            }
             candidate_node_ids = sorted(nodes)
-            nodes = {node_id: value for node_id, value in nodes.items() if node_id in assigned}
+            nodes = {key: value for key, value in nodes.items() if key in assigned_view_keys}
             # Inventory candidates are observations. Once placement is published,
             # only its executors own connection/receipt obligations.
             for key in list(self._connections):
@@ -1219,150 +1926,165 @@ class ModelSupplyCoordinator:
                     self._connections.pop(key)
             self._update(op_id, status="building", plan=plan, nodes=nodes,
                          candidate_node_ids=candidate_node_ids)
-        from model_supply_assets import build_gguf_segment, build_safetensors_segment, segment_cache_hint
         pending_receipts = []
+        pending_local = []
+        resident_checks = []
         for assignment in plan["assignments"]:
-            self._check(op_id)
-            node_id = assignment["node_id"]
-            directory = self.root / op_id / node_id
-            directory.mkdir(parents=True, exist_ok=True)
-            builder = build_gguf_segment if assignment["engine"] == "llama_cpp" else build_safetensors_segment
-            src = sources["gguf"] if assignment["engine"] == "llama_cpp" else sources["hf"]
-            # Disk budget covers the temporary segment + final publish. Source
-            # is already on disk; a missing source is never assumed free.
-            disk_descriptor = sources["descriptors"][assignment["engine"]]
-            estimated = _segment_disk_weight_bytes(disk_descriptor, assignment, src)
-            free = shutil.disk_usage(directory).free
-            identity = {"node_id": node_id, "source_model_id": sources["source_model_id"],
-                "source_model_sha256": sources["source_model_sha256"],
-                "tokenizer_sha256": sources["tokenizer_sha256"], "total_layers": plan["total_layers"],
-                "layer_range": [assignment["start_layer"], assignment["end_layer"]],
-                "segment_mode": "head" if assignment["start_layer"] == 0 else
-                                "tail" if assignment["end_layer"] == plan["total_layers"] else "middle",
-                "format": "gguf" if assignment["engine"] == "llama_cpp" else "safetensors",
-                "conversion_proof": sources["conversion_proof"]}
-            if free < max(estimated * 2, 64 * 1024**2) and not segment_cache_hint(self.root, identity):
-                raise ModelSupplyError("SUPPLY_MASTER_DISK_INSUFFICIENT", "Master staging disk is insufficient")
-            build_options = ({"cancelled": lambda: self._events[op_id].is_set(), "deadline": deadline}
-                             if assignment["engine"] == "llama_cpp" else {})
-            manifest = builder(src, directory, source_model_id=sources["source_model_id"],
-                               source_model_sha256=sources["source_model_sha256"],
-                               tokenizer_sha256=sources["tokenizer_sha256"],
-                               start_layer=assignment["start_layer"], end_layer=assignment["end_layer"],
-                               total_layers=plan["total_layers"], operation_id=op_id, node_id=node_id,
-                               conversion_proof=sources["conversion_proof"], reuse_root=self.root, **build_options)
-            self._check(op_id)
-            reused_bytes = manifest.pop("_reused_bytes", 0)
-            files = manifest.pop("local_files")
-            total_bytes = sum(int(item["size_bytes"]) for item in manifest["files"])
-            with self._condition:
-                nodes[node_id] = {"status": "supplying", "layer_range": manifest["layer_range"],
-                                  "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
-                                  "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
-                                  "transfer_granularity": "segment_tensors", "engine": assignment["engine"]}
-                self._update(op_id, nodes=nodes, status="supplying")
-            if node_id == "master":
-                self._check(op_id)
-                result = self.scheduler._model_supply_worker.activate_local(
-                    manifest, directory, cancelled=lambda: self._events[op_id].is_set(),
-                )
-                if result.get("status") != "available":
-                    raise ModelSupplyError(str(result.get("reason_code") or "SUPPLY_LOCAL_REGISTRATION_FAILED"), "Master could not register its segment")
-                with self._condition:
-                    nodes[node_id].update(status="available", strategy="reuse" if reused_bytes else "local_build",
-                                          actual_downloaded_bytes=0, reused_bytes=reused_bytes)
-                    self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
+            if assignment["node_id"] != "master" or not assignment.get("executor_id"):
                 continue
-            available_sources = inventories[node_id].get("sources") or []
-            # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
-            #   源身份的核心是权重摘要 `source_model_sha256`，tokenizer 摘要是附加
-            #   校验。此前用 `entry.get("tokenizer_sha256", default)` 判等，当 worker
-            #   上报的键**存在但值为 None/""**（实测安卓那份整模 GGUF：
-            #   `read_gguf_tokenizer_sha256` 读不到元数据 ⇒ tokenizer_sha256=None）
-            #   时不会回退到默认值 ⇒ 被判"无匹配本地源" ⇒ 明明握着整模却只能从网络
-            #   以 ~0.67 MB/s 拉 4 层（实测卡 `bytes=0` 超过 10 分钟）。
-            #   现在：源没给出 tokenizer 就不据此否决它。
-            matching_source = any(
-                entry.get("source_model_sha256") == sources["source_model_sha256"]
-                and (not entry.get("tokenizer_sha256")
-                     or entry.get("tokenizer_sha256") == sources["tokenizer_sha256"])
-                for entry in available_sources)
-            can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
-            requested = intent.get("strategy", "auto")
-            if requested == "local_cut" and not can_cut:
-                raise ModelSupplyError("SUPPLY_LOCAL_CUT_UNAVAILABLE", f"Worker {node_id} lacks the verified source or cutter")
-            strategy = "local_cut" if can_cut and requested != "distribute" else "distribute"
-            reason = ("SUPPLY_LOCAL_CUT_PREFERRED" if strategy == "local_cut" else
-                      "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
-                      "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
-                      "SUPPLY_NODE_CUTTER_UNAVAILABLE")
-            # ★ 2026-10-24（#124）：**复用显式参与决策**。此前 master 只在
-            #   local_cut / distribute 间二选一，从不告知节点"复用你已有的段"：
-            #   Python worker 好在收到 local_cut 时会先试 `reuse_segment`，而 Kotlin
-            #   worker（android）的 local_cut 路径**没有任何复用检查** ⇒ 每轮白裁约
-            #   3 GB（实测 ~105 s），即使它磁盘上已有身份完全一致的同段缓存
-            #   （已用两轮 marker 逐字段 diff 证明仅 manifest_sha256/operation_id 两个
-            #   收据字段不同，而这两者不在接收端 `sameContentIdentity` 判据内）。
-            #
-            #   接收端的复用能力挂在 distribute 路径上（`ModelSupplyReceiver.receive()`
-            #   在下载前会先按 `sameContentIdentity` 扫已发布段并 hardlink），所以这里
-            #   把命中的节点改判为 distribute ⇒ 零网络传输地复用已有段。
-            #
-            #   只在此处**确认**层段与三项摘要全等时才切换：若复用意外未命中，
-            #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
-            cached_hit = False
-            if strategy == "local_cut" and requested == "auto":
-                try:
-                    control = getattr(self.scheduler, "_task_worker_control", None)
-                    snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
-                    # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
-                    caps = snapshot.get("capabilities") or snapshot
-                except (AttributeError, KeyError, TypeError, ValueError):
+            view, unchanged = self._local_resident_view(op_id, sources, plan, assignment, deadline)
+            with self._condition:
+                unchanged()
+                self._check_receivers(op_id)
+                nodes[f"master#{assignment['executor_id']}"] = view
+                self._update(op_id, nodes=nodes)
+            resident_checks.append(unchanged)
+        with self._segment_builds(op_id, sources, plan, deadline) as builds:
+            for assignment, directory, future in builds:
+                self._check(op_id)
+                manifest = future.result()
+                node_id = assignment["node_id"]
+                reused_bytes = manifest.pop("_reused_bytes", 0)
+                files = manifest.pop("local_files")
+                total_bytes = sum(int(item["size_bytes"]) for item in manifest["files"])
+                # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**部署视图必须按执行器身份区分**。
+                #
+                #   同机 CPU 段与主段共用 `node_id="master"` ⇒ `nodes[node_id] = ...` 让它们
+                #   **互相覆盖**，对外只剩后写的那个。实测（2026-10-26 05:38）：
+                #     master [8,16)  ← 这是 **CPU 段**的区间（组 [2,4)×4）
+                #   而主段的 `[0,8)` **整个消失** —— capacity plan 里两段并存是有的（日志可证），
+                #   但对外视图只剩一段，肉眼根本无法确认"并存"这一验收判据。
+                #
+                #   视图键取 `node_id`（主执行器，保持既有客户端契约）或
+                #   `node_id#executor_id`（附加执行器）。
+                executor_id = str(assignment.get("executor_id") or "")
+                view_key = node_id if not executor_id else f"{node_id}#{executor_id}"
+                with self._condition:
+                    nodes[view_key] = {"status": "supplying", "layer_range": manifest["layer_range"],
+                                       "segment_mode": manifest["segment_mode"], "total_bytes": total_bytes,
+                                       "manifest_sha256": manifest["manifest_sha256"], "artifact_sha256": manifest["artifact_sha256"],
+                                       "transfer_granularity": "segment_tensors", "engine": assignment["engine"],
+                                       "executor_id": executor_id, "node_id": node_id}
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：留痕「视图里到底有哪些键」。
+                    #   同机两段的并存只有在**对外视图**里也能看到时才算可验证；此前
+                    #   `plan` 四段齐全、磁盘上 `master/` 也确实有两个 segment 目录，
+                    #   但 intent 的 `nodes` 只有三条，无从确认。这一行把每次发布的键集合
+                    #   打出来，才能分清是"没写进去"还是"写进去又被覆盖"。
+                    logger.info(
+                        "event=supply_view_publish op=%s view_key=%s keys=%s",
+                        op_id, view_key, sorted(nodes),
+                    )
+                    self._update(op_id, nodes=nodes, status="supplying")
+                # ★ 同上：**"本机"是主执行器的性质，不是 `node_id` 的性质**。本机 CPU 段
+                #   （llama.cpp）虽然也在 master 上，但它的权重**就地常驻**、由它自己的
+                #   执行器注册，不走 `activate_local` 的 PyTorch 段注册路径。
+                if node_id == "master" and not executor_id:
+                    pending_local.append((view_key, manifest, directory, reused_bytes))
+                    continue
+                available_sources = inventories[node_id].get("sources") or []
+                # ★ 2026-10-23（#117）：**"未声明 tokenizer" ≠ "tokenizer 不匹配"**。
+                #   源身份的核心是权重摘要 `source_model_sha256`，tokenizer 摘要是附加
+                #   校验。此前用 `entry.get("tokenizer_sha256", default)` 判等，当 worker
+                #   上报的键**存在但值为 None/""**（实测安卓那份整模 GGUF：
+                #   `read_gguf_tokenizer_sha256` 读不到元数据 ⇒ tokenizer_sha256=None）
+                #   时不会回退到默认值 ⇒ 被判"无匹配本地源" ⇒ 明明握着整模却只能从网络
+                #   以 ~0.67 MB/s 拉 4 层（实测卡 `bytes=0` 超过 10 分钟）。
+                #   现在：源没给出 tokenizer 就不据此否决它。
+                matching_source = any(
+                    entry.get("source_model_sha256") == sources["source_model_sha256"]
+                    and (not entry.get("tokenizer_sha256")
+                         or entry.get("tokenizer_sha256") == sources["tokenizer_sha256"])
+                    for entry in available_sources)
+                can_cut = assignment["engine"] == "llama_cpp" and inventories[node_id].get("local_cut") and matching_source
+                requested = intent.get("strategy", "auto")
+                if requested == "local_cut" and not can_cut:
+                    raise ModelSupplyError("SUPPLY_LOCAL_CUT_UNAVAILABLE", f"Worker {node_id} lacks the verified source or cutter")
+                strategy = "local_cut" if can_cut and requested != "distribute" else "distribute"
+                reason = ("SUPPLY_LOCAL_CUT_PREFERRED" if strategy == "local_cut" else
+                          "SUPPLY_DISTRIBUTE_REQUESTED" if requested == "distribute" else
+                          "SUPPLY_LOCAL_SOURCE_UNAVAILABLE" if not matching_source else
+                          "SUPPLY_NODE_CUTTER_UNAVAILABLE")
+                # ★ 2026-10-24（#124）：**复用显式参与决策**。此前 master 只在
+                #   local_cut / distribute 间二选一，从不告知节点"复用你已有的段"：
+                #   Python worker 好在收到 local_cut 时会先试 `reuse_segment`，而 Kotlin
+                #   worker（android）的 local_cut 路径**没有任何复用检查** ⇒ 每轮白裁约
+                #   3 GB（实测 ~105 s），即使它磁盘上已有身份完全一致的同段缓存
+                #   （已用两轮 marker 逐字段 diff 证明仅 manifest_sha256/operation_id 两个
+                #   收据字段不同，而这两者不在接收端 `sameContentIdentity` 判据内）。
+                #
+                #   接收端的复用能力挂在 distribute 路径上（`ModelSupplyReceiver.receive()`
+                #   在下载前会先按 `sameContentIdentity` 扫已发布段并 hardlink），所以这里
+                #   把命中的节点改判为 distribute ⇒ 零网络传输地复用已有段。
+                #
+                #   只在此处**确认**层段与三项摘要全等时才切换：若复用意外未命中，
+                #   distribute 会退化为真下载 3 GB（比裁切更慢），故判据从严。
+                cached_hit = False
+                if strategy == "local_cut" and requested == "auto":
+                    # ★ 2026-10-27（#135）：**以本次清点报出的段为准，不以 capabilities 快照为准。**
+                    #   判据与理由见模块级 `reuse_candidates()`。
+                    want_range = list(manifest.get("layer_range") or [])
                     caps = {}
-                want_range = list(manifest.get("layer_range") or [])
-                for artifact in caps.get("layer_artifacts") or []:
-                    if (isinstance(artifact, dict)
-                            and list(artifact.get("layer_range") or []) == want_range
-                            and artifact.get("artifact_sha256") == manifest.get("artifact_sha256")
-                            and artifact.get("source_model_id") == manifest.get("source_model_id")
-                            and artifact.get("source_model_sha256") == manifest.get("source_model_sha256")
-                            and artifact.get("tokenizer_sha256") == manifest.get("tokenizer_sha256")):
-                        cached_hit = True
-                        break
-            if cached_hit:
-                strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
-                logger.info(
-                    "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
-                    "reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
-                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12], reason,
-                )
-            elif strategy == "local_cut" and requested == "auto":
-                # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
-                logger.info(
-                    "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
-                    "advertised=%d artifact_shas=%s ranges=%s",
-                    node_id, want_range, str(manifest.get("artifact_sha256"))[:12],
-                    len(caps.get("layer_artifacts") or []),
-                    [str(item.get("artifact_sha256"))[:12]
-                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
-                    [item.get("layer_range")
-                     for item in (caps.get("layer_artifacts") or []) if isinstance(item, dict)],
-                )
-            # Do not attempt a new local cut when its staging reserve is already
-            # known infeasible; the receiver can still reuse its cached files.
-            if (strategy == "local_cut" and requested == "auto" and
-                    int(inventories[node_id].get("disk_free_bytes", 0)) < total_bytes + 64 * 1024**2):
-                strategy, reason = "distribute", "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT"
-            token = secrets.token_urlsafe(32)
+                    if not isinstance(inventories[node_id].get("artifacts"), list):
+                        # 只有旧 worker 缺该键时才需要快照；新 worker 一律用清点结果。
+                        try:
+                            control = getattr(self.scheduler, "_task_worker_control", None)
+                            snapshot = (control.worker_snapshot(node_id) or {}) if control else {}
+                            # 快照可能把 capabilities 嵌在 `capabilities` 下，也可能就是它本身。
+                            caps = snapshot.get("capabilities") or snapshot
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            caps = {}
+                    candidates, evidence = reuse_candidates(inventories[node_id], caps)
+                    cached_hit = any(
+                        reuse_artifact_matches(item, manifest) for item in candidates
+                    )
+                if cached_hit:
+                    strategy, reason = "distribute", "SUPPLY_CACHE_REUSED"
+                    logger.info(
+                        "event=supply_cache_reuse node=%s layer_range=%s artifact=%s "
+                        "evidence=%s reason=%s（改走接收端复用路径，避免 local_cut 重裁）",
+                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12], evidence, reason,
+                    )
+                elif strategy == "local_cut" and requested == "auto":
+                    # 未命中时把两侧事实打出来，避免"看起来该复用却没复用"无处定位。
+                    logger.info(
+                        "event=supply_cache_miss node=%s layer_range=%s artifact=%s "
+                        "evidence=%s advertised=%d artifact_shas=%s ranges=%s",
+                        node_id, want_range, str(manifest.get("artifact_sha256"))[:12], evidence,
+                        len(candidates),
+                        [str(item.get("artifact_sha256"))[:12]
+                         for item in candidates if isinstance(item, dict)],
+                        [item.get("layer_range")
+                         for item in candidates if isinstance(item, dict)],
+                    )
+                # Do not attempt a new local cut when its staging reserve is already
+                # known infeasible; the receiver can still reuse its cached files.
+                if (strategy == "local_cut" and requested == "auto" and
+                        int(inventories[node_id].get("disk_free_bytes", 0)) < total_bytes + 64 * 1024**2):
+                    strategy, reason = "distribute", "SUPPLY_LOCAL_CUT_DISK_INSUFFICIENT"
+                token = secrets.token_urlsafe(32)
+                with self._condition:
+                    self._leases[(op_id, node_id)] = {"token": token, "files": files}
+                with self._condition:
+                    nodes[node_id].update(strategy=strategy, strategy_reason_code=reason)
+                self._send(op_id, node_id, {"action": "ensure", "node_id": node_id, "strategy": strategy,
+                                         "manifest": manifest, "api_port": int(API_PORT), "token": token,
+                                         "allow_fallback": requested == "auto", "strategy_reason_code": reason,
+                                         "local_cut_timeout_seconds": max(1, min(300, int((deadline - time.monotonic()) / 3)))})
+                pending_receipts.append((node_id, manifest, total_bytes, strategy, time.monotonic()))
+        for view_key, manifest, directory, reused_bytes in pending_local:
+            self._check(op_id)
+            started = time.monotonic()
+            result = self.scheduler._model_supply_worker.activate_local(
+                manifest, directory, cancelled=lambda: self._events[op_id].is_set(),
+            )
+            if result.get("status") != "available":
+                raise ModelSupplyError(str(result.get("reason_code") or "SUPPLY_LOCAL_REGISTRATION_FAILED"), "Master could not register its segment")
+            logger.info("event=supply_local_activation_done operation=%s elapsed_ms=%d",
+                        op_id, int((time.monotonic() - started) * 1000))
             with self._condition:
-                self._leases[(op_id, node_id)] = {"token": token, "files": files}
-            with self._condition:
-                nodes[node_id].update(strategy=strategy, strategy_reason_code=reason)
-            self._send(op_id, node_id, {"action": "ensure", "node_id": node_id, "strategy": strategy,
-                                     "manifest": manifest, "api_port": int(API_PORT), "token": token,
-                                     "allow_fallback": requested == "auto", "strategy_reason_code": reason,
-                                     "local_cut_timeout_seconds": max(1, min(300, int((deadline - time.monotonic()) / 3)))})
-            pending_receipts.append((node_id, manifest, total_bytes, strategy, time.monotonic()))
+                nodes[view_key].update(status="available", strategy="reuse" if reused_bytes else "local_build",
+                                       actual_downloaded_bytes=0, reused_bytes=reused_bytes)
+                self._update(op_id, nodes=nodes, master_model_path=str(result["model_path"]))
         # All receivers pull from the master concurrently. File availability
         # is published only after every assignment returns its exact identity.
         for node_id, manifest, total_bytes, strategy, dispatched_at in pending_receipts:
@@ -1384,13 +2106,24 @@ class ModelSupplyCoordinator:
                         nodes[node_id][counter] = result[counter]
                 self._leases.pop((op_id, node_id), None)
                 self._update(op_id, nodes=nodes)
-        self._check(op_id)
-        self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
-                     loaded_ready=False, requires_prepare=True)
+        started = time.monotonic()
+        try:
+            report = self.collect_operation_directories(keep_operation_ids=(op_id,))
+            logger.info("event=supply_operations_maintenance_done operation=%s elapsed_ms=%d "
+                        "examined=%s removed=%s reclaimed_bytes=%s",
+                        op_id, int((time.monotonic() - started) * 1000), report.get("examined"),
+                        report.get("removed"), report.get("reclaimed_bytes"))
+        except Exception:
+            logger.exception("event=supply_operations_reclaim_failed operation=%s", op_id)
         try:
             self._collect_garbage(op_id)
         except Exception:
             logger.exception("event=supply_cache_collection_failed operation=%s", op_id)
+        for unchanged in resident_checks:
+            unchanged()
+        self._check(op_id)
+        self._update(op_id, status="available", nodes=nodes, reason_code="SUPPLY_ASSETS_AVAILABLE",
+                     loaded_ready=False, requires_prepare=True)
 
     def _collect_garbage(self, op_id):
         collector = getattr(self.scheduler._model_supply_worker, "collect_garbage", None)
@@ -1420,7 +2153,12 @@ class ModelSupplyCoordinator:
                         or any(path not in leased for lease in self._leases.values()
                                for path in lease["files"].values()))
 
+        started = time.monotonic()
         report = collector(root=self.root, protected_paths=protected, cancelled=invalidated)
+        logger.info("event=supply_cache_collection_done operation=%s elapsed_ms=%d "
+                    "examined=%s retained=%s removed=%s skipped=%s",
+                    op_id, int((time.monotonic() - started) * 1000), report.get("examined"),
+                    report.get("retained"), report.get("removed"), report.get("skipped"))
         self._update(op_id, retention=report)
 
     @contextmanager

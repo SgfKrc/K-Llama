@@ -314,6 +314,7 @@ class TestNotLoaded:
     def test_layer_artifact_selection_rejects_multiple_valid_matches(
         self, monkeypatch, tmp_path,
     ):
+        import model_supply_assets as assets
         from llama_engine import LlamaCppEngine
 
         source = tmp_path / "whole.gguf"
@@ -335,8 +336,19 @@ class TestNotLoaded:
         }
         monkeypatch.setenv("QLH_LAYER_ARTIFACT_DIR", str(tmp_path))
 
+        hashed = []
+        original_hash = assets._hash_file
+        def record_hash(path, *args, **kwargs):
+            hashed.append(Path(path))
+            return original_hash(path, *args, **kwargs)
+        monkeypatch.setattr(assets, "_hash_file", record_hash)
+
         with pytest.raises(RuntimeError, match="多个同源"):
             eng._find_layer_artifact(0, 8)
+        assert len(hashed) == 2
+        with pytest.raises(RuntimeError, match="多个同源"):
+            eng._find_layer_artifact(0, 8)
+        assert len(hashed) == 2
 
 
 @pytest.mark.real_model

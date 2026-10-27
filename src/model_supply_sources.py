@@ -298,16 +298,30 @@ def _model_tools(name: str):
     return importlib.import_module("scripts.model_tools." + name)
 
 def _gguf_metadata(path: Path) -> dict:
-    verify_gguf = _model_tools("gguf").verify_gguf
+    tools = _model_tools("gguf")
+    from model_supply_digest_cache import cached_metadata, file_stamp
     from relay_segment_info import read_gguf_tokenizer_sha256
-    mrv.validate_model_artifact("gguf", gguf_path=str(path))
-    report = verify_gguf(path, full_hash=True, digest=_content_digest)
-    if not report.get("valid") or not report.get("structure_valid"):
-        raise ValueError("GGUF structure or SHA256 validation failed")
-    tokenizer = read_gguf_tokenizer_sha256(path)
-    if not tokenizer:
-        raise ValueError("GGUF tokenizer metadata is missing")
-    return {"artifact_sha256": report["sha256"], "tokenizer_sha256": tokenizer}
+    sidecars = []
+    for candidate in tools._sidecar_candidates(path):
+        try:
+            stamp = file_stamp(candidate)
+        except FileNotFoundError:
+            stamp = None
+        sidecars.append([str(candidate), stamp])
+    namespace = "supply-source-gguf-v1-" + hashlib.sha256(
+        json.dumps(sidecars, sort_keys=True).encode()).hexdigest()
+
+    def inspect(source):
+        mrv.validate_model_artifact("gguf", gguf_path=str(source))
+        report = tools.verify_gguf(source, full_hash=True, digest=_content_digest)
+        if not report.get("valid") or not report.get("structure_valid"):
+            raise ValueError("GGUF structure or SHA256 validation failed")
+        tokenizer = read_gguf_tokenizer_sha256(source)
+        if not tokenizer:
+            raise ValueError("GGUF tokenizer metadata is missing")
+        return {"artifact_sha256": report["sha256"], "tokenizer_sha256": tokenizer}
+
+    return cached_metadata(path, namespace, inspect)
 
 
 def _registered_external_files(cfg: ModelConfig, row: dict) -> dict[str, Path]:

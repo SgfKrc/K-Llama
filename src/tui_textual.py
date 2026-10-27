@@ -1273,6 +1273,27 @@ class ChatPane(Vertical):
             elif isinstance(payload.get("thinking"), str) and payload["thinking"]:
                 if options["show_thinking"]:
                     self.append_chunk(f"[dim italic]{payload['thinking']}[/]")
+            elif payload.get("heartbeat"):
+                # ★ 2026-10-27（#126）：**静默期心跳要重绘状态行**。
+                #
+                #   三机线性路径在 `enable_thinking=True` 且未要求展示思考时，
+                #   会进入 `suppress_thinking`（`emit` 把整个思考期压成零字节）。
+                #   此前这里没有任何分支认领心跳帧 ⇒ 用户在整段思考期看到的是
+                #   **界面完全不动**（"停刷"），无法区分"在思考"和"卡死"，而思考
+                #   又比正文长得多，于是很容易被判成超时（实测真机 10.5 s 干等）。
+                #
+                #   现在据心跳更新状态行：不含任何思考文本，
+                #   只用 `suppressed_tokens` 让用户看出**仍在推进**。
+                #   注意这里必须直接 `set_status` —— `status` 变量要等 `finish`
+                #   才落盘，只赋值不重绘的话界面仍然不动。
+                suppressed = payload.get("suppressed_tokens")
+                hint = (
+                    f"思考中…（已生成 {suppressed} token，内容按设置隐藏）"
+                    if isinstance(suppressed, int) and suppressed > 0
+                    else "思考中…（内容按设置隐藏）"
+                )
+                status = hint
+                self.set_status(f"[dim]{hint}[/]")
             elif payload.get("done"):
                 if payload.get("error"):
                     error_text = str(payload["error"])

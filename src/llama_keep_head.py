@@ -39,6 +39,12 @@ GGML_ASSERT（fail-closed，不会静默给出错值）。
 `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll` 与 MSYS 的
 `api-ms-win-crt-*` 副本。本模块会依次把「shim 所在目录」与
 `QLH_KEEP_HEAD_DLL_DIRS`（`os.pathsep` 分隔）加入 DLL 搜索路径。
+
+★ 2026-10-26（PERF-SKIP-LOGITS-01）：`QLH_LAYER_SKIP_LOGITS=1` 时，**只要 hidden 的入口**
+（`forward_tokens_to_hidden` / `forward_hidden_to_hidden`）不再请求 logits ⇒ shim 把
+`batch.logits` 全置 0，llama.cpp 的 `n_outputs` 变 0，`lm_head`（`output.weight`）的矩阵乘
+不再执行。**缺省关闭**（不设该变量即与改动前完全一致）；**末段 argmax 入口恒开 logits**，
+不受影响。详见 `SKIP_HIDDEN_LOGITS_ENV` 的说明。
 """
 
 from __future__ import annotations
@@ -57,6 +63,22 @@ from typing import Sequence
 #: 允许额外 DLL 搜索目录（例如 `C:\msys64\ucrt64\bin`），`os.pathsep` 分隔。
 EXTRA_DLL_DIRS_ENV = "QLH_KEEP_HEAD_DLL_DIRS"
 
+#: ★ 2026-10-26（PERF-SKIP-LOGITS-01）：让**只要 hidden 的段**不再请求 logits。
+#:
+#: 背景：`qlh_keep_head.c` 过去对每个 token 都标 `batch.logits[i] = 1`，而
+#: 上游/中间段（`forward_tokens_to_hidden` / `forward_hidden_to_hidden`）**从不读 logits**
+#: ⇒ llama.cpp 每步仍要跑 `output.weight` 的矩阵乘。9B 中间段工件上这是每步几百 MB 的
+#: 权重读取，而本项目瓶颈正是内存带宽（`docs/本机跨框架层段成本与干扰实测-2026-10-25.md` §2）。
+#:
+#: 开着它（`1/true/yes/on`）时，shim 把"输出 hidden"入口的 `batch.logits` 全部置 0，
+#: llama.cpp 的 `n_outputs` 变 0，`lm_head` 不再产生有效计算；hidden 输出不变
+#: （`layer_inp` 通道与 logits 掩码无关）。**末段 argmax 入口恒开 logits**，不受影响。
+#:
+#: **缺省关闭** ⇒ 不设这个变量时行为与改动前完全一致（不悄悄改语义）。
+#: 要求 shim 带 `qlh_kh_set_skip_hidden_logits`；旧 shim 缺该符号时 **fail-loud**，
+#: 绝不静默退回"仍然算 logits"。
+SKIP_HIDDEN_LOGITS_ENV = "QLH_LAYER_SKIP_LOGITS"
+
 #: shim 必须导出的符号（缺任何一个都说明编译产物不对）。
 SHIM_SYMBOLS = ("qlh_kh_load", "qlh_kh_forward", "qlh_kh_forward_embd",
                 "qlh_kh_forward_embd_seq", "qlh_kh_reset", "qlh_kh_n_embd",
@@ -74,6 +96,13 @@ FORWARD_ERRORS = {
 }
 
 MODE_CODES = {"nextn": 0, "layer_inp": 1}
+
+
+def skip_hidden_logits_requested(environment=None) -> bool:
+    """`QLH_LAYER_SKIP_LOGITS` 是否为真（缺省 False ⇒ 既有行为）。"""
+    raw = str((os.environ if environment is None else environment)
+              .get(SKIP_HIDDEN_LOGITS_ENV, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def ctx_per_seq_for(n_ctx: int, n_seq_max: int) -> int:
@@ -222,6 +251,11 @@ class KeepHeadUpstream:
         environment=None,
     ) -> None:
         self._environment = dict(os.environ if environment is None else environment)
+        # ★ PERF-SKIP-LOGITS-01：配置**请求**（是否要跳过 logits）与**落实**（native 侧
+        #   确实已设置）分开记 —— worker 隔离模式下 native handle 在子进程里，主进程只能
+        #   靠初始化回执确认，不能凭"我设置了环境变量"就宣称已生效。
+        self._skip_hidden_logits_requested = skip_hidden_logits_requested(self._environment)
+        self._skip_hidden_logits_applied = False
         if mode not in MODE_CODES:
             raise KeepHeadUnavailable(f"mode 必须是 {sorted(MODE_CODES)}，实得 {mode!r}")
         if mode == "layer_inp" and cut_layer is None:
@@ -283,6 +317,17 @@ class KeepHeadUpstream:
         missing = [name for name in SHIM_SYMBOLS if not hasattr(self._lib, name)]
         if missing:
             raise KeepHeadUnavailable(f"{self.shim_path} 缺符号 {missing}")
+
+        # ★ PERF-SKIP-LOGITS-01：**先**验能力、再加载模型。旧 shim 缺这个符号时没必要先白读
+        #   几 GB 权重才发现；而且"已经省掉 logits"必须可证，绝不允许静默退回旧行为。
+        if (self._skip_hidden_logits_requested
+                and not hasattr(self._lib, "qlh_kh_set_skip_hidden_logits")):
+            message = (
+                f"{self.shim_path} 缺 qlh_kh_set_skip_hidden_logits，无法按 "
+                f"{SKIP_HIDDEN_LOGITS_ENV} 跳过 hidden 段 logits；请用 "
+                "scripts/model_tools/build_keep_head_shim.ps1 重新编译 shim")
+            self._close_failed_initialization(KeepHeadUnavailable(message))
+            raise KeepHeadUnavailable(message)
 
         lib = self._lib
         lib.qlh_kh_load.argtypes = [
@@ -382,9 +427,32 @@ class KeepHeadUpstream:
             and self._n_vocab > 0
             and lib.qlh_kh_finite_logits_guard() == 1)
 
+        # ★ 2026-10-26（PERF-SKIP-LOGITS-01）：按 `QLH_LAYER_SKIP_LOGITS` 关掉"只要 hidden
+        #   的入口"的 logits 请求（`output.weight` 的矩阵乘随之消失）。
+        #   缺省不设该变量 ⇒ 这段完全不执行 ⇒ 语义与改动前一致。
+        #   符号存在性已在 `qlh_kh_load` 之前验过（fail-fast）。
+        if self._skip_hidden_logits_requested:
+            setting = lib.qlh_kh_set_skip_hidden_logits
+            setting.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+            setting.restype = ctypes.c_int32
+            if setting(handle, 1) != 0:
+                message = f"{self.shim_path} 拒绝了 qlh_kh_set_skip_hidden_logits(1)"
+                self._close_failed_initialization(KeepHeadUnavailable(message))
+                raise KeepHeadUnavailable(message)
+            self._skip_hidden_logits_applied = True
+
     @property
     def supports_multi_position_argmax(self) -> bool:
         return getattr(self, "_supports_multi_position_argmax", False)
+
+    @property
+    def skip_hidden_logits_applied(self) -> bool:
+        """native 侧是否**确实**已让"只要 hidden 的入口"不再请求 logits。
+
+        `QLH_LAYER_SKIP_LOGITS` 未设时为 False（既有行为）；worker 隔离模式下该值来自
+        子进程的初始化回执，不是主进程的臆测。
+        """
+        return getattr(self, "_skip_hidden_logits_applied", False)
 
     @property
     def n_vocab(self) -> int:
@@ -459,6 +527,19 @@ class KeepHeadUpstream:
                 raise KeepHeadUnavailable("keep-head worker returned invalid capability receipt")
             self._n_vocab = vocabulary
             self._supports_multi_position_argmax = capability
+            # ★ PERF-SKIP-LOGITS-01：native handle 在子进程里 ⇒ 只能靠回执确认。
+            #   宽松读取：旧 worker 回执没有这个字段，未请求跳过时不该因此失败。
+            applied = response.get("skip_hidden_logits", False)
+            if type(applied) is not bool:
+                raise KeepHeadUnavailable("keep-head worker returned invalid skip-logits receipt")
+            self._skip_hidden_logits_applied = applied
+            # `getattr` 而非直接取属性：`_init_isolated_worker` 也会被
+            # `object.__new__(KeepHeadUpstream)` 这样的"绕过 __init__"的调用方用到
+            # （既有测试就是这么构造替身的），不该因为新增的可选开关而炸。
+            if getattr(self, "_skip_hidden_logits_requested", False) and not applied:
+                raise KeepHeadUnavailable(
+                    f"keep-head worker 未落实 {SKIP_HIDDEN_LOGITS_ENV}"
+                    f"（worker stderr: {log_path}）")
         except Exception as init_error:
             self._close_failed_initialization(init_error)
             raise

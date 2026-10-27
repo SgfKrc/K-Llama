@@ -22,7 +22,9 @@ class DeploymentService:
         self._operation_fences = {}
 
     def snapshot(self):
-        state = self.repository.read()
+        return self._with_operation_fences(self.repository.read())
+
+    def _with_operation_fences(self, state):
         if state["boot_id"] == self.boot_id:
             for operation_id, value in self._operation_fences.items():
                 old = state["operations"].get(operation_id)
@@ -30,6 +32,22 @@ class DeploymentService:
                     state["operations"][operation_id] = {**deepcopy(value), "durable": False,
                                                          "commit_scope": "volatile_failure"}
         return state
+
+    @property
+    def query_reads_enabled(self):
+        return getattr(self.repository, "query_reads_enabled", False)
+
+    def execution_snapshot(self):
+        read = getattr(self.repository, "read_execution", self.repository.read)
+        return read()
+
+    def query_snapshot(self, operation_id=None):
+        read = getattr(self.repository, "read_query", None)
+        return self._with_operation_fences(read(operation_id) if read else self.repository.read())
+
+    def query_stamp(self):
+        read = getattr(self.repository, "read_stamp", self.repository.read)
+        return read()
 
     def fence_operation_failure(self, value):
         # A failed disk cannot accept a durable terminal. Keep the admission
@@ -203,7 +221,7 @@ class DeploymentService:
                             and all(prior.get(key) == lifecycle.get(key) for key in (
                                 "model_id", "model_type", "model_sha256", "total_layers",
                                 "tokenizer_sha256", "quant_type", "plan_id", "assignments",
-                                "local_assignment"))):
+                                "local_assignment", "local_executors"))):
                         terminal_observation = True
                     if (not terminal_observation
                             or any(prior.get(key) != lifecycle.get(key)
@@ -266,6 +284,18 @@ class DeploymentService:
                     deployment["local_assignment"] = deepcopy(local)
                     if phase in {"committing", "committing_global", "ready"} and not recovery_input:
                         require_runtime_receipt(local, lifecycle.get("local_receipt"))
+                # ★ 2026-10-25（LOCAL-EXECUTORS-01）：同机**附加执行器**与主段同源同步。
+                #   两者都来自 lifecycle：若主段变了而附加执行器没变（或反之），说明这次
+                #   提交与当前生命周期不是同一份配置 ⇒ 与 `local_assignment` 同样拒。
+                #   旧记录里没有这个键 ⇒ `"local_executors" in deployment` 为假 ⇒ 不报错，
+                #   既有部署的校验路径逐位不变。附加执行器由本进程自己执行（无 TCP 连接），
+                #   所以**没有** `require_runtime_receipt` 那一档。
+                local_executors = lifecycle.get("local_executors")
+                if ("local_executors" in deployment
+                        and deployment.get("local_executors") != local_executors):
+                    raise ModelControlError("deployment_assignment_changed")
+                if local_executors is not None:
+                    deployment["local_executors"] = deepcopy(local_executors)
                 if phase == "ready":
                     if not expected or any(
                             (acknowledgements.get(node, {}).get("loaded") is not True
@@ -382,7 +412,7 @@ class DeploymentService:
         return self.repository.transact(settle)
 
     def runnable(self, config_id, *, authority, connections, input_revisions=None):
-        state = self.snapshot()
+        state = self.execution_snapshot()
         value = state["deployments"].get(config_id)
         return bool(state["boot_id"] == self.boot_id and state["active_deployment"] == config_id
                     and value and value["boot_id"] == self.boot_id and value["status"] == "active"

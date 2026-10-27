@@ -77,7 +77,14 @@ def test_real_scheduler_uses_fresh_operation_budget_without_mutating_profiles(fr
     assert [(a["node_id"], a["start_layer"], a["end_layer"]) for a in result["assignments"]] == [
         ("master", 0, 6), ("worker", 6, 8)]
     worker = next(a for a in result["assignments"] if a["node_id"] == "worker")
-    assert worker["required_bytes"] == 1300 and worker["capacity_bytes"] == 1500
+    # ★ 2026-10-25（#125 收尾，`5d85614b`）：GGUF 段（`llama_cpp`）按**原生量化
+    #   宽度**物化，`runtime_multiplier` 只适用于**未投影**描述符（PyTorch CPU 的
+    #   fp16→fp32）—— 见 `docs/已知问题记录.md` 的「×2 倍率误用」。故证据投影给出的
+    #   倍率恒为 1.0：账 = (2 层 × 100 + lm_head 400) × 1.0 + reserve 100 = 700。
+    #   本 fixture 在 cached 记录上写的 `runtime_multiplier=2.0` 是**陈旧 profile 的
+    #   输入**，不是契约：它正是"缓存 profile 不得覆盖新鲜判定"要挡住的东西，
+    #   若它生效这里会是 1300。
+    assert worker["required_bytes"] == 700 and worker["capacity_bytes"] == 1500
     assert all(n["engine"] == "llama_cpp" and not n["cross_engine"]
                for n in result["pipeline_layout"]["nodes"])
     assert {e["node_id"]: e["capacity_bytes"] for e in result["capacity_evidence"]} == case.ram
@@ -87,14 +94,16 @@ def test_real_scheduler_uses_fresh_operation_budget_without_mutating_profiles(fr
 
 def test_fresh_shortage_remains_rejected_even_when_cached_profile_has_room(fresh_case):
     case = fresh_case
+    # 陈旧 profile 说 worker 有 20000 B（远超所求），它不得覆盖新鲜样本。
     case.cached[1]["capacity_bytes"] = 20000
-    case.ram["worker"] = 1200
+    # 新鲜样本比**所需**（700 B，见上一个测试的账）少 1 字节 ⇒ 必须拒绝。
+    case.ram["worker"] = 699
     assert plan(case)["admitted"], plan(case)
     with case.c.prepare_guard(case.op):
         result = plan(case, case.c.prepare_capacity_evidence(case.op))
     assert not result["admitted"]
     assert result["reason_code"] == "pipeline_capacity_single_node_insufficient"
-    assert next(e for e in result["capacity_evidence"] if e["node_id"] == "worker")["capacity_bytes"] == 1200
+    assert next(e for e in result["capacity_evidence"] if e["node_id"] == "worker")["capacity_bytes"] == 699
 
 
 def test_evidence_is_checked_at_solve_after_metadata_preparation(fresh_case, monkeypatch):

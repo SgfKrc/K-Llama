@@ -303,8 +303,34 @@ class WorkerPrepareCoordinatorMixin:
                     except ModelControlError as exc:
                         ack.update(status="error", error=exc.code)
                 else:
-                    budget = expected.get("required_bytes", expected.get("capacity_bytes", 0))
+                    # ★ 2026-10-26（LOCAL-EXECUTORS-01）：预算口径**统一到
+                    #   `qlh_core.contracts.deployment.materialization_budget`**。
+                    #
+                    #   这条判据此前有两份独立实现（这里与 `require_runtime_receipt`
+                    #   的 else 分支）。我上一轮只改了这里，结果 `require_runtime_receipt`
+                    #   仍按 `required_bytes` 拒掉回执 ⇒ 生命周期持久化失败
+                    #   （`deployment_materialization_budget_exceeded`）⇒ 事务卡死到超时
+                    #   （实测 10:41:18 起完全静默，master/TABLET 永远停在 `loading`）。
+                    #   现在两处共用同一个函数，改一处不会再漏另一处。
+                    from qlh_core.contracts.deployment import materialization_budget
+                    materialization = expected.get("load_spec", {}).get("materialization")
+                    budget = materialization_budget(expected, str(materialization or ""))
                     if budget and receipt["materialized_bytes"] + receipt["load_spec"]["kv_cache_bytes"] > budget:
+                        # ★ 把**两边各自的口径**打出来：预算来自求解器按源描述符的估算，
+                        #   而 `materialized_bytes` 是 worker 按它自己那份工件实际加载的量，
+                        #   量化段与源差异很大时两者基准不同 —— 只看 "exceeded" 无法区分
+                        #   是预算算小了还是 worker 多加载了。
+                        logger.warning(
+                            "event=prepare_budget_exceeded node=%s materialized=%s "
+                            "kv_cache=%s total=%s budget=%s required=%s "
+                            "capacity=%s reserve=%s materialization=%s",
+                            node_id, receipt["materialized_bytes"],
+                            receipt["load_spec"]["kv_cache_bytes"],
+                            receipt["materialized_bytes"] + receipt["load_spec"]["kv_cache_bytes"],
+                            budget, expected.get("required_bytes"),
+                            expected.get("capacity_bytes"), expected.get("reserve_bytes"),
+                            expected.get("load_spec", {}).get("materialization"),
+                        )
                         ack.update(status="error", error="prepare_materialization_budget_exceeded")
             if ack["status"] == "error":
                 if phase == expected.get("phase") and transaction.get("phase") in {"preparing", "committing", "committing_global", "ready"}:
@@ -375,6 +401,18 @@ class WorkerPrepareCoordinatorMixin:
         threading.Thread(target=advance, name=f"pipeline-{phase}-{config_id}", daemon=True).start()
 
     def _worker_prepare_assignment_loaded(self, node_id, assignment):
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**本机附加执行器不走 prepare/commit 回执**。
+        #
+        #   同机 CPU 段没有 TCP 连接，因此本方法后面的每一道检查都不适用于它：
+        #     * `worker_prepare_identity` —— 本机写的是 `identity`；
+        #     * `_worker_assignments.state(node_id)` —— 根本没有它的 worker 状态；
+        #     * `ack["phase"] == "commit"` / `ack["loaded"]` —— 没有远端回执。
+        #   它的"就绪"由 `freeze_pipeline_candidate_assignment` 成功即代表：工件已在
+        #   本机、load_spec 已冻结。此前落到硬取 `worker_prepare_identity` 那条
+        #   ⇒ `worker_native_prepare_required` ⇒ 引擎设置阶段直接失败
+        #   （实测 11:51:17：CPU 段第一次真正 stage 就被挡）。
+        if str(assignment.get("executor_id") or ""):
+            return True, "local_executor"
         identity = assignment.get("worker_prepare_identity")
         if not isinstance(identity, dict):
             return False, "worker_native_prepare_required"

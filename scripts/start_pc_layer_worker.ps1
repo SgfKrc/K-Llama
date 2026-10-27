@@ -136,6 +136,13 @@ $env:QLH_TASK_WORKER_EXPERIMENTAL_ENABLED = '1'
 $env:QLH_TASK_GRAPH_ENABLED = '1'
 $env:QLH_LAYER_GGUF = $LayerGguf
 $env:QLH_KEEP_HEAD_SHIM = $KeepHeadShim
+# Optional, default OFF (PERF-SKIP-LOGITS-01): a middle layer segment only forwards hidden
+# states, so it does not need logits at all. Exporting QLH_LAYER_SKIP_LOGITS=1 makes the
+# keep-head shim leave batch.logits at 0 for the hidden-only entry points, so llama.cpp
+# skips the output.weight matmul (measured 122.6 -> 102.6 ms/step on the 9B [4,24) segment;
+# hidden output bit-identical, tail argmax unchanged). It is inherited by this process as-is.
+# NOTE: -Detach starts a Scheduled Task, which does NOT inherit this shell's environment;
+# set the variable inside that task if the detached worker should skip logits too.
 
 Set-Location -LiteralPath $RepoRoot
 

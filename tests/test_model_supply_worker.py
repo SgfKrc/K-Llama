@@ -205,6 +205,20 @@ def receiving(monkeypatch, source, *, progress_events=None, result_counts=None, 
     return calls
 
 
+def test_supply_available_does_not_run_retention_before_prepare(setup, tmp_path, monkeypatch):
+    worker, scheduler, client = setup
+    source = tmp_path / "source"
+    manifest = segment(source)
+    receiving(monkeypatch, source)
+    calls = []
+    monkeypatch.setattr(worker, "collect_garbage", lambda **kwargs: calls.append(kwargs))
+    worker.handle(command(manifest), client)
+    assert client.wait()["status"] == "available"
+    finish(worker)
+    assert calls == []
+    assert get_selected_model(worker.root)["artifact_sha256"] == manifest["artifact_sha256"]
+
+
 def test_receive_register_and_cached_selection(setup, tmp_path, monkeypatch):
     worker, scheduler, client = setup
     source = tmp_path / "master-segment"
@@ -798,6 +812,8 @@ def test_worker_reuses_verified_segment_before_transfer_or_local_cut(setup, tmp_
     manifest["operation_id"] = "op-two"
     manifest.pop("manifest_sha256")
     manifest["manifest_sha256"] = digest(manifest)
+    for entry in manifest["files"]:
+        assets._hash_file_cached(worker.root / ("segment-" + "a" * 64) / entry["path"])
     monkeypatch.setattr(assets, "receive_segment", lambda *args, **kwargs: pytest.fail("verified cache started HTTP transfer"))
     monkeypatch.setattr(worker, "_local_cut", lambda *args, **kwargs: pytest.fail("verified cache started local cutting"))
     original = assets._hash_file
@@ -1737,3 +1753,60 @@ def test_registration_rejects_replace_success_without_pointer_visibility(tmp_pat
     assert reply["status"] == "failed" and reply["reason_code"] == "registration_pointer_visibility_failed"
     assert (worker.root / "current.json").read_bytes() == previous
     assert get_selected_model(worker.root) is None and scheduler.refreshed == 1
+
+
+def test_inventory_reports_present_segment_artifact_with_matchable_identity(tmp_path, monkeypatch):
+    """#135：清点必须报出「此刻磁盘上真实存在」的段，且身份能直接与待供段比对。
+
+    master 侧据此决定是否把 `local_cut` 改判成 `distribute`（复用而非重裁）。若这里报
+    不出、或摘要与 supply manifest 对不上，复用判定就永远落空。
+    """
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    scheduler.worker = worker
+    # 清点只关心段工件，与本地整模源无关；不扫真实 models 目录。
+    monkeypatch.setattr(worker, "_source_candidates", lambda: iter(()))
+    directory = worker.root.parent / "built"
+    manifest = segment(directory, operation="op-inv", node="master")
+    assert worker.activate_local(manifest, directory)["status"] == "available"
+
+    artifacts = worker.inventory()["artifacts"]
+
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    assert item["layer_range"] == [1, 3]
+    # 与 supply manifest 逐字段对齐 —— 这正是 master 侧 `reuse_artifact_matches` 的输入。
+    assert item["artifact_sha256"] == manifest["artifact_sha256"]
+    assert item["source_model_id"] == manifest["source_model_id"]
+    assert item["source_model_sha256"] == manifest["source_model_sha256"]
+    assert item["tokenizer_sha256"] == manifest["tokenizer_sha256"]
+
+
+def test_inventory_drops_artifact_once_segment_file_is_gone(tmp_path, monkeypatch):
+    """#135 的核心回归：段文件被删后，清点不得再报它。
+
+    这是「运维清缓存 ⇒ master 误判可复用 ⇒ 改判 distribute ⇒ 退化成真下载」的源头。
+    """
+    monkeypatch.setattr(config, "RUN_MODE", "distributed")
+    scheduler = Scheduler("master")
+    worker = ModelSupplyWorker(scheduler, tmp_path / "supply" / "received")
+    scheduler.worker = worker
+    # 清点只关心段工件，与本地整模源无关；不扫真实 models 目录。
+    monkeypatch.setattr(worker, "_source_candidates", lambda: iter(()))
+    directory = worker.root.parent / "built"
+    manifest = segment(directory, operation="op-gone", node="master")
+    assert worker.activate_local(manifest, directory)["status"] == "available"
+    assert len(worker.inventory()["artifacts"]) == 1
+
+    # 模拟运维清理：删掉段权重文件，指针与 manifest 原样留着。
+    # `activate_local` 只发布指针、不复制权重，权重仍在注册目录里。
+    weights = directory / "segment.gguf"
+    assert weights.is_file(), "fixture should have persisted the segment weights"
+    weights.unlink()
+
+    inventory = worker.inventory()
+
+    assert inventory["artifacts"] == []
+    # 能力判据本身不受影响：能裁不等于手上有段。
+    assert inventory["local_cut"] is True

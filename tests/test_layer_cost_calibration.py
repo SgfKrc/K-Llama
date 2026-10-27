@@ -1,0 +1,722 @@
+"""切点求解的**成本标定**：`QLH_LAYER_COST_MS` 的解析与加权效果。
+
+背景：求解器原先按解码器**字节**份额均衡（`capacity.py` 的
+`placement_work_fraction`），把最慢的设备当成和最快的设备一样贵。实测三机每层成本
+差 2.3 倍（master 12.6 / rog-5060 8.7 / android-542cd254 20.1 ms，见
+`docs/本机跨框架层段成本与干扰实测-2026-10-25.md`），典型后果是 rog 扛 24 层成为
+瓶颈，而最慢的 android 却只扛 8 层。
+
+标定值由**调用方**（`scheduler._get_pipeline_capacity_nodes`）填进节点记录，因为
+`qlh_core.planning.capacity` 是纯求解器、契约禁止它访问 ambient state
+（由 `tests/test_refactor_capacity_load_spec.py` 断言）。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+# 复用既有 fixture：它构造了"陈旧 profile + 新鲜短缺"的完整求解场景，
+# 本文件的 makespan 报告测试直接跑真实求解器，而不是伪造求解结果。
+from tests.test_pipeline_capacity_freshness import fresh_case  # noqa: F401
+
+ROOT = Path(__file__).resolve().parents[1]
+for _directory in (ROOT, ROOT / "src"):
+    if str(_directory) not in sys.path:
+        sys.path.insert(0, str(_directory))
+
+
+def _config():
+    import config
+    return config
+
+
+def test_unset_env_yields_no_calibration(monkeypatch):
+    """未配置 ⇒ 空表 + default 0.0 ⇒ 求解器按 1.0 ⇒ 与旧行为逐字节等价。"""
+    monkeypatch.delenv("QLH_LAYER_COST_MS", raising=False)
+    cfg = _config()
+    assert cfg.layer_cost_ms_by_node() == {}
+    assert cfg.LAYER_COST_MS_DEFAULT == 0.0
+
+
+def test_well_formed_calibration_parses(monkeypatch):
+    monkeypatch.setenv("QLH_LAYER_COST_MS",
+                       "master=12.6,rog-5060=8.7,android-542cd254=20.1")
+    assert _config().layer_cost_ms_by_node() == {
+        "master": 12.6, "rog-5060": 8.7, "android-542cd254": 20.1,
+    }
+
+
+@pytest.mark.parametrize("raw,expected", [
+    # 缺 `=`、空 node、空值、非数、非正数、非有限 —— 全部忽略而不是抛错：
+    # 标定值是运行期调优参数，一个手误不该让整次供给失败。
+    ("a=1, broken, =, b=xyz, c=-5, d=2.5", {"a": 1.0, "d": 2.5}),
+    ("  spaced = 3.5  ", {"spaced": 3.5}),
+    ("inf=inf, nan=nan", {}),
+    ("", {}),
+    ("no_equals_at_all", {}),
+])
+def test_malformed_entries_are_ignored(monkeypatch, raw, expected):
+    monkeypatch.setenv("QLH_LAYER_COST_MS", raw)
+    assert _config().layer_cost_ms_by_node() == expected
+
+
+def test_solver_needs_a_calibrated_field_to_change_behaviour():
+    """求解器侧的核心契约：**没有 `layer_cost_ms` 字段就完全不变**。
+
+    这里只断言归一化/缺省逻辑的语义（不构造完整求解），因为求解器本身是纯函数、
+    不读环境；把标定值塞进节点记录的是调用方。
+    """
+    import math
+
+    # 与 `capacity._normalize_nodes` 相同的白名单校验语义
+    def normalize(raw):
+        if "layer_cost_ms" in raw:
+            cost = raw["layer_cost_ms"]
+            if type(cost) not in (int, float) or not math.isfinite(cost) or cost <= 0:
+                raise ValueError("layer_cost_ms must be a positive number")
+            return float(cost)
+        return None
+
+    assert normalize({}) is None
+    assert normalize({"layer_cost_ms": 8.7}) == 8.7
+    for bad in (0, -1, float("inf"), float("nan"), "8.7", None):
+        with pytest.raises(ValueError):
+            normalize({"layer_cost_ms": bad})
+
+
+def test_reference_and_multiplier_semantics():
+    """倍数语义：最快者为 1.0；未标定者按**已标定中最慢**计（安全方向）。
+
+    未标定若按 1.0 处理，会因为没有数据反而被当成最快而**过度分配**。
+    """
+    def multipliers(costs_by_node):
+        calibrated = [v for v in costs_by_node.values() if v]
+        reference = min(calibrated) if calibrated else 1.0
+        out = {}
+        for node, cost in costs_by_node.items():
+            out[node] = (float(cost) / reference) if cost else (
+                (max(calibrated) / reference) if calibrated else 1.0)
+        return out
+
+    # 实测值：rog 最快 ⇒ 1.0；android 最慢 ⇒ 2.31
+    got = multipliers({"master": 12.6, "rog-5060": 8.7, "android-542cd254": 20.1})
+    assert got["rog-5060"] == pytest.approx(1.0)
+    assert got["master"] == pytest.approx(12.6 / 8.7)
+    assert got["android-542cd254"] == pytest.approx(20.1 / 8.7)
+    # 全部未标定 ⇒ 一律 1.0 ⇒ 旧行为
+    assert multipliers({"a": 0.0, "b": 0.0}) == {"a": 1.0, "b": 1.0}
+    # 部分未标定 ⇒ 未标定者按最慢的已标定值，不会被当成最快
+    partial = multipliers({"calibrated": 8.7, "uncalibrated": 0.0})
+    assert partial["uncalibrated"] == pytest.approx(1.0)
+    partial2 = multipliers({"fast": 5.0, "slow": 20.0, "uncalibrated": 0.0})
+    assert partial2["uncalibrated"] == pytest.approx(20.0 / 5.0)
+
+
+# --------------------------------------------------------------------------
+# makespan 报告：让"切点好不好"可测，但**不参与选择**
+# --------------------------------------------------------------------------
+
+def _admitted_plan(case, calibrate=None):
+    """用**新鲜 evidence** 求解。
+
+    fixture 的陈旧 profile 本身不足以准入（`test_pipeline_capacity_freshness` 自己就断言
+    `not plan(case)["admitted"]`）—— 必须走 `prepare_guard` + `prepare_capacity_evidence`
+    拿新鲜容量样本，这也是 `test_refactor_product_gate` 采用同一模式的原因。
+    """
+    from tests.test_pipeline_capacity_freshness import plan
+
+    if calibrate is not None:
+        calibrate(case)
+    with case.c.prepare_guard(case.op):
+        evidence = case.c.prepare_capacity_evidence(case.op)
+        return plan(case, evidence)
+
+
+def test_step_time_estimate_reports_bottleneck_without_changing_the_choice(fresh_case):
+    """标定后求解器给出步时估计与瓶颈节点；**选择必须与未标定时完全一致**。
+
+    这是本报告的核心契约：求解目标是"能力加权工作平方"的**均衡近似**，而端到端由
+    最长段（makespan）决定，两者会背离（实测 `fastest` 下按成本均衡反而慢 7%）。
+    因此报告必须只读——一旦它影响了选择，就会把"均衡"悄悄换成"另一个东西"。
+    """
+    case = fresh_case
+    baseline = _admitted_plan(case)
+    assert baseline["admitted"], baseline.get("reason_code")
+    assert "step_time_estimate" not in baseline          # 未标定 ⇒ 不产出报告
+
+    def calibrate(case):
+        for record in case.cached:
+            record["layer_cost_ms"] = 20.0 if record["node_id"] == "worker" else 10.0
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    segments = lambda r: [(a["node_id"], a["start_layer"], a["end_layer"])
+                          for a in r["assignments"]]
+    assert segments(result) == segments(baseline), "报告不得改变选择"
+
+    est = result["step_time_estimate"]
+    assert est["basis"] == "layers_count_x_calibrated_layer_ms"
+    assert est["uncalibrated_segments"] == []
+    assert all(seg["layers_count"] == seg["layer_range"][1] - seg["layer_range"][0]
+               for seg in est["segments"])
+    assert all(seg["estimated_ms"] == pytest.approx(
+        seg["layers_count"] * seg["layer_cost_ms"]) for seg in est["segments"])
+    # 瓶颈 = 估计步时最大的那一段
+    assert est["estimated_step_ms"] == max(seg["estimated_ms"] for seg in est["segments"])
+    assert est["bottleneck_node_id"] == next(
+        seg["node_id"] for seg in est["segments"]
+        if seg["estimated_ms"] == est["estimated_step_ms"])
+
+
+def test_uncalibrated_segments_are_declared_not_guessed(fresh_case):
+    """半标定：未标定段的 `estimated_ms` 必须是 None 并被单列 —— 不猜。
+
+    半真半假的步时估计比没有更危险：它会让人以为瓶颈已经确定。
+    """
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            if record["node_id"] == "worker":
+                record["layer_cost_ms"] = 20.0
+            else:
+                record.pop("layer_cost_ms", None)        # master 不标定
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    est = result.get("step_time_estimate")
+    assert est is not None, "有任一参与节点带标定就应产出报告"
+    uncalibrated = [seg for seg in est["segments"]
+                    if seg["node_id"] in est["uncalibrated_segments"]]
+    assert uncalibrated, est
+    assert all(seg["estimated_ms"] is None and seg["layer_cost_ms"] is None
+               for seg in uncalibrated)
+    # 瓶颈只能取自**已标定**段
+    assert est["bottleneck_node_id"] not in est["uncalibrated_segments"]
+
+
+# --------------------------------------------------------------------------
+# 同机容量去重（LOCAL-EXECUTORS-01 的交付条件："容量无重复计数"）
+# --------------------------------------------------------------------------
+
+def test_no_domain_declaration_keeps_todays_accounting(fresh_case):
+    """**不声明共享域** ⇒ 结果里不出现 `capacity_domains`。
+
+    这是回归门：域机制必须对既有拓扑零影响（`capacity_domain_id` 缺省 = 每节点自成一域）。
+    """
+    result = _admitted_plan(fresh_case)
+    assert result["admitted"], result.get("reason_code")
+    assert "capacity_domains" not in result
+
+
+def test_capacity_domain_rejects_overclaimed_shared_budget(fresh_case):
+    """同域内执行器申报之和 > 域总账 ⇒ fail closed，并给出可审计的域报告。
+
+    这锁住的正是实测缺口：一台物理机上的两个执行器各自按整机可用内存申报，求解器把
+    它们当成两台独立机器，于是给出**物理上装不下**的计划却 `admitted=True`
+    （实测两节点各 200、合计需求 242，每段还显示 headroom=79）。
+    """
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            record["capacity_domain_id"] = "host-alpha"
+            record["domain_total_bytes"] = 250          # 远小于 10000 + 1500
+
+    result = _admitted_plan(case, calibrate)
+    assert not result["admitted"]
+    assert result["reason_code"] == "pipeline_capacity_domain_exceeded"
+    report = result["capacity_domains"]["host-alpha"]
+    assert report["domain_total_bytes"] == 250
+    assert report["claimed_allocatable_bytes"] > 250
+    assert report["excess_bytes"] == report["claimed_allocatable_bytes"] - 250
+    assert len(report["executors"]) == 2
+    assert {item["node_id"] for item in report["executors"]} == {"master", "worker"}
+    assert result["assignments"] == []
+
+
+def test_capacity_domain_admits_when_within_total(fresh_case):
+    """总账足够 ⇒ 照常准入，且域报告仍可审计（写明总账与申报额）。"""
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            record["capacity_domain_id"] = "host-alpha"
+            record["domain_total_bytes"] = 10 ** 9
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    report = result["capacity_domains"]["host-alpha"]
+    assert report["domain_total_bytes"] == 10 ** 9
+    assert report["excess_bytes"] == 0
+    assert report["claimed_allocatable_bytes"] <= 10 ** 9
+
+
+def test_conflicting_domain_totals_are_rejected_loudly():
+    """同域内两个执行器声明了**不同**的总账 ⇒ 直接报错，不静默取其一。
+
+    静默取 min/max 会让"这台机器到底有多少内存"变成一个随节点顺序变化的值。
+    """
+    from qlh_core.planning.capacity import (
+        PipelineCapacityError, validate_capacity_domains,
+    )
+
+    nodes = [
+        {"node_id": "a", "capacity_bytes": 100, "reserve_bytes": 0,
+         "capacity_domain_id": "host-x", "domain_total_bytes": 1000},
+        {"node_id": "b", "capacity_bytes": 100, "reserve_bytes": 0,
+         "capacity_domain_id": "host-x", "domain_total_bytes": 2000},
+    ]
+    with pytest.raises(PipelineCapacityError):
+        validate_capacity_domains(nodes)
+
+
+# --------------------------------------------------------------------------
+# 执行器身份进契约（LOCAL-EXECUTORS-01 交付条件前半："同物理节点两段可规划"）
+# --------------------------------------------------------------------------
+
+def _segment(node_id, executor_id, start, end):
+    from qlh_core.contracts.execution import Segment
+
+    return Segment(node_id, f"assign-{node_id}-{executor_id or 'main'}", "inc-1", 1,
+                   start, end, start == 0, end == 8, "{}", executor_id)
+
+
+def test_execution_plan_admits_two_executors_on_one_physical_node():
+    """**同一 node_id、不同 executor_id** ⇒ 可规划（本票的目标形态）。
+
+    物理上就是一台机器：GPU 段跑 PyTorch 首段、CPU 段跑 llama.cpp 中间段。两者共享
+    同一份 RAM 与同一个传输身份，所以 `node_id` 必须相同；靠 `executor_id` 区分。
+    """
+    from qlh_core.contracts.execution import ExecutionPlan
+
+    plan = ExecutionPlan("deploy-1", "boot-1", "auth", 8, (
+        _segment("master", "", 0, 4),        # 主执行器 = GPU 段
+        _segment("master", "cpu", 4, 8),     # 附加执行器 = 同机 CPU 段
+    ))
+    assert [s.executor_id for s in plan.segments] == ["", "cpu"]
+    assert [s.identity_key for s in plan.segments] == [
+        ("master", ""), ("master", "cpu")]
+
+
+def test_execution_plan_still_rejects_duplicate_executor_identity():
+    """**同一 (node_id, executor_id) 出现两次** ⇒ 仍然拒绝。
+
+    放宽的是"一台机器只能有一个段"，不是"允许重复声明同一个执行器"。
+    """
+    from qlh_core.contracts.execution import ExecutionError, ExecutionPlan
+
+    with pytest.raises(ExecutionError, match="execution_requires_two_nodes"):
+        ExecutionPlan("deploy-1", "boot-1", "auth", 8, (
+            _segment("master", "", 0, 4),
+            _segment("master", "", 4, 8),
+        ))
+
+
+def test_executor_id_defaults_to_the_primary_executor():
+    """缺省 `executor_id` ⇒ 与改动前**逐位等价**（旧的"node_id 唯一"语义）。
+
+    这是整个阶段 2 的回归保证：既有 topology 从不传 `executor_id`，所以它们的
+    `identity_key` 退化为 `(node_id, "")`，唯一性判据与旧的 `node_id` 集合相同。
+    """
+    from qlh_core.contracts.execution import ExecutionPlan
+
+    plan = ExecutionPlan("deploy-1", "boot-1", "auth", 8, (
+        _segment("master", "", 0, 4),
+        _segment("worker", "", 4, 8),
+    ))
+    assert all(s.executor_id == "" for s in plan.segments)
+    assert {s.identity_key for s in plan.segments} == {("master", ""), ("worker", "")}
+
+
+def test_pipeline_node_executor_id_is_omitted_when_default():
+    """`to_dict()` 只在**非空**时输出 `executor_id`。
+
+    缺省即主执行器 ⇒ 既有 layout 的 `to_dict()` 形态与 `contract_sha256` 逐位不变，
+    frozen 契约与只读消费者不受影响。
+    """
+    from pipeline_node_contract import (
+        PipelineArtifactRef, PipelineNode, PipelineNodeCapacity,
+    )
+
+    common = dict(
+        kind="layer", layer_range=(0, 4), engine="pytorch", location="local",
+        capacity=PipelineNodeCapacity(capacity_bytes=1000, required_bytes=200,
+                                      reserve_bytes=50, execution_device="cpu"),
+        artifact=PipelineArtifactRef(model_sha256="a" * 64,
+                                     artifact_kind="safetensors_assignment",
+                                     architecture="qwen3",
+                                     source_layer_range=(0, 4)),
+    )
+    primary = PipelineNode(node_id="master", **common)
+    assert "executor_id" not in primary.to_dict()
+    assert primary.identity_key == ("master", "")
+
+    secondary = PipelineNode(node_id="master", executor_id="cpu", **common)
+    assert secondary.to_dict()["executor_id"] == "cpu"
+    assert secondary.identity_key == ("master", "cpu")
+
+
+# --------------------------------------------------------------------------
+# KV 生命周期：同 node 两段的 stage 标识必须可区分
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("executor_id,expected", [
+    ("", "master"),              # 主执行器（缺省）⇒ 与改动前逐字相同
+    ("cpu", "master#cpu"),       # 同机 CPU 段
+])
+def test_stage_identity_includes_the_executor(executor_id, expected):
+    """`stage_identity` 是 `stage()` 与 `_reset_pipeline_kv()` **共用**的规则。
+
+    同 node 两段的 `node_id` 相同，只用 node_id 组 stage 标识会让两段撞车 —— 而它同时
+    是请求追踪与**清理回执关联**的键。撞车的后果是 `_reset_pipeline_kv` 把清理命令
+    关联到错误的 stage（实测中该函数按 `segment.node_id` 定位 owner）。
+    """
+    from types import SimpleNamespace
+
+    from qlh_core.bootstrap.execution import stage_identity
+
+    assert stage_identity(SimpleNamespace(node_id="master", executor_id=executor_id)) == expected
+
+
+def test_stage_identity_tolerates_segments_without_the_field():
+    """没有 `executor_id` 属性的对象（旧形态）⇒ 退化为 `node_id`，不抛错。"""
+    from types import SimpleNamespace
+
+    from qlh_core.bootstrap.execution import stage_identity
+
+    assert stage_identity(SimpleNamespace(node_id="worker")) == "worker"
+
+
+def test_same_node_segments_get_distinct_stage_identities():
+    """同 node 两段的 stage 标识**必须**互不相同（本测试锁住那个不变量本身）。"""
+    from qlh_core.bootstrap.execution import stage_identity
+
+    primary, secondary = _segment("master", "", 0, 4), _segment("master", "cpu", 4, 8)
+    assert stage_identity(primary) != stage_identity(secondary)
+    assert primary.node_id == secondary.node_id      # 同一台物理机
+    assert primary.identity_key != secondary.identity_key
+
+
+# --------------------------------------------------------------------------
+# 本机执行器 provider：复用 LocalFullModelProvider 容器，且**懒建**
+# --------------------------------------------------------------------------
+
+class _BareScheduler:
+    """只挂 provider 相关状态的裸壳，避免为一个契约测试构造整个 Scheduler。"""
+
+    def __init__(self):
+        import threading
+
+        from scheduler_task_worker import SchedulerTaskWorkerMixin
+
+        self._remote_task_worker_providers = {}
+        self._local_task_worker_providers = {}
+        self._local_engine_host = None
+        self._task_worker_stage_lock = threading.RLock()
+        # 裸壳只挂本次要验证的两个方法，避免构造整个 Scheduler
+        self._local_executor_key = SchedulerTaskWorkerMixin._local_executor_key
+        self._local_stage_executor = (
+            SchedulerTaskWorkerMixin._local_stage_executor.__get__(self)
+        )
+        self._lazy_stage_executor = (
+            SchedulerTaskWorkerMixin._lazy_stage_executor.__get__(self)
+        )
+
+
+def test_local_executor_key_rule():
+    """键规则：缺省 `executor_id` ⇒ 就是 `node_id`（与旧行为逐字相同）。"""
+    from scheduler_task_worker import SchedulerTaskWorkerMixin
+
+    key = SchedulerTaskWorkerMixin._local_executor_key
+    assert key("master") == "master"
+    assert key("master", "") == "master"
+    assert key("master", "cpu") == "master#cpu"
+
+
+def test_local_provider_is_lazy_and_reuses_the_generic_container():
+    """本机 provider 必须**懒建**，且复用 `LocalFullModelProvider` 而不是新类。
+
+    "懒"是可观察的安全性质：`EngineHost` 的 keep-head 上游（`QLH_LAYER_GGUF`）是首次
+    执行才加载，所以**不执行就不加载任何 GGUF** ⇒ 既有三机拓扑即使带着本机执行器声明
+    也零影响。这里断言 provider 构造后 `_local_engine_host` **仍然是 None**。
+    """
+    from unittest.mock import patch
+
+    from execution_provider import LocalFullModelProvider
+    from scheduler_task_worker import SchedulerTaskWorkerMixin
+
+    shell = _BareScheduler()
+    ensure = SchedulerTaskWorkerMixin._ensure_local_task_worker_provider.__get__(shell)
+
+    with patch("inference_service.engine_host.EngineHost") as host_cls:
+        first = ensure("master", "cpu")
+        # ★ 懒：构造 provider 不该构造 EngineHost
+        host_cls.assert_not_called()
+        assert shell._local_engine_host is None
+
+        assert isinstance(first, LocalFullModelProvider)
+        assert first.inspect().supported_stage_types == ("layer_forward",)
+        assert first.inspect().node_id == "master"
+        # 缓存：同一 (node, executor) 复用同一对象（否则每步都会新建 provider）
+        assert ensure("master", "cpu") is first
+        # 不同 executor ⇒ 不同 provider（同机两段互不干扰）
+        other = ensure("master", "")
+        assert other is not first
+        assert other.provider_id != first.provider_id
+        host_cls.assert_not_called()  # 仍未触碰 EngineHost
+
+
+def test_local_provider_executor_is_the_engine_host_stage_entry():
+    """执行体必须是 `EngineHost.execute_task_worker_stage` —— 签名与 ProviderExecutor 匹配。
+
+    这是整个接入的关键事实：不需要新类、不需要适配层。`ProviderExecutor` 定义为
+    `Callable[[StageRequest, threading.Event], dict]`，而该方法的签名逐字相同，且返回体
+    与远端 offer 同形（`hidden_out_f32` / `hidden_out_sha256` / `token_argmax`）。
+    """
+    import inspect
+
+    from execution_provider import ProviderExecutor
+    from inference_service.engine_host import EngineHost
+
+    signature = inspect.signature(EngineHost.execute_task_worker_stage)
+    parameters = list(signature.parameters)
+    # (self, stage_request, provider_cancel_event) —— 去掉 self 后正是协议要求的两个
+    assert parameters[:3] == ["self", "stage_request", "provider_cancel_event"]
+    assert ProviderExecutor is not None
+    assert "layer_forward" in inspect.getsource(EngineHost.execute_task_worker_stage)
+
+
+# --------------------------------------------------------------------------
+# producer：执行器身份必须随 assignment 流到部署侧
+# --------------------------------------------------------------------------
+
+def test_assignment_carries_executor_id_only_when_present(fresh_case):
+    """`assignment` 带 `executor_id`/`capacity_domain_id`，但**仅非空时**。
+
+    这是 producer 链的第一环：容量规划把"同机第二个执行器"的身份交给部署侧，否则
+    `scheduler_pipeline` 无法把本机 CPU 段认出来 —— 执行通路接好了却没人用它。
+
+    既有计划（每节点单执行器）不声明这两个字段 ⇒ assignment 形态与逐位内容不变。
+    """
+    case = fresh_case
+    baseline = _admitted_plan(case)
+    assert baseline["admitted"], baseline.get("reason_code")
+    for item in baseline["assignments"]:
+        assert "executor_id" not in item
+        assert "capacity_domain_id" not in item
+
+
+def test_assignment_exposes_executor_identity_when_declared(fresh_case):
+    """声明了共享域的节点 ⇒ 该域进入它自己的 assignment。
+
+    这里只声明 `capacity_domain_id`、**不声明** `executor_id`。原因是一个真实约束：
+    供给链路按 `(node_id, "")` 定位主执行器，而**远端 worker 的 assignment 本就不带
+    `executor_id`** —— 只有本机附加执行器有，且它**不进供给 plan**（本机执行器没有
+    工件传输流程，见 `model_supply.py` 的 `capacity_by_id` 修复）。给远端节点设非空
+    `executor_id` 会让它找不到记录（`Selected node ... is no longer eligible`），
+    那是测试设计错误，不是产品缺陷。
+    """
+    case = fresh_case
+
+    def calibrate(case):
+        for record in case.cached:
+            record["capacity_domain_id"] = "host-alpha"
+            record["domain_total_bytes"] = 10 ** 9
+            record.pop("executor_id", None)
+
+    result = _admitted_plan(case, calibrate)
+    assert result["admitted"], result.get("reason_code")
+    assert result["assignments"], result
+    for item in result["assignments"]:
+        assert item["capacity_domain_id"] == "host-alpha"
+        # 主执行器不输出该字段（缺省语义保持不变）
+        assert "executor_id" not in item
+    # 域账仍可见（阶段 1 的交付条件没被破坏）
+    assert result["capacity_domains"]["host-alpha"]["excess_bytes"] == 0
+
+
+def _primary_record():
+    return {
+        "node_id": "master", "role": "master", "capacity_bytes": 10000,
+        "host_capacity_bytes": 8000, "reserve_bytes": 100,
+        "runtime_multiplier": 2.0, "score": 50.0,
+    }
+
+
+def test_local_cpu_executor_record_shares_the_physical_node(monkeypatch):
+    """本机 CPU 执行器记录的三条不变量 —— 这是本票的核心形态。
+
+    1. `node_id` 与主执行器**相同**：它就是**同一台物理机**（同一传输身份、同一份 RAM、
+       同一断线归属）。刻意**不做**成"重复注册虚拟物理节点"—— 那样 RAM 共享、断线、
+       设备竞争都会被两套独立记账掩盖。
+    2. 与主执行器**同容量域**、总账 = 本机 host 容量 ⇒ 求解器不能因两段各自申报而放过
+       物理上装不下的计划。
+    3. `segment_mode="middle"`：keep-head 上游的挂点在 `output_norm` **之后**，
+       **不能当首段**（首段必须有 embedding）。
+
+    ★ 2026-10-27（审计 §9.4 #6）：**必须显式声明工件边界**。
+    未设 `QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE` 时 `_local_cpu_executor_record` 现在
+    **返回 `None`**（fail-closed）—— 一条没有 `layer_ranges`、也没有
+    `layer_budget.min_layer/max_layer` 的记录，会让求解器把工件覆盖不到的层派给它，
+    失败拖到执行期（层号越界／权重缺失）。这里钉一个区间，测"配全了之后的记录形态"；
+    "没配全就不申报"由 `test_local_cpu_executor_requires_layer_range` 单独覆盖。
+    """
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", "8,24")
+    from config import LOCAL_CPU_EXECUTOR_ID, LOCAL_CPU_EXECUTOR_LAYER_COST_MS
+    from scheduler import Scheduler
+
+    base = _primary_record()
+    cpu = Scheduler._local_cpu_executor_record(base)
+
+    assert cpu is not None, "配了工件边界就应该产出记录"
+    assert cpu["node_id"] == base["node_id"]              # ★ 同一台物理机
+    assert cpu["executor_id"] == LOCAL_CPU_EXECUTOR_ID
+    assert cpu["capacity_domain_id"] == base["node_id"]   # ★ 同一份 RAM 总账
+    assert cpu["domain_total_bytes"] == 8000              # host 容量，而非 capacity_bytes
+    assert cpu["capacity_bytes"] == 4000                  # 默认划走一半
+    assert cpu["capacity_bytes"] < cpu["domain_total_bytes"]
+    assert cpu["segment_mode"] == "middle"                # ★ 不能当首段
+    assert cpu["engine"] == "llama_cpp"
+    assert cpu["execution_device"] == "cpu"
+    assert cpu["layer_cost_ms"] == LOCAL_CPU_EXECUTOR_LAYER_COST_MS
+    # 工件边界进了记录（`layer_ranges` 是精确匹配语义的基线，budget 再解锁切分粒度）
+    assert cpu["layer_ranges"] == [[8, 24]]
+    # 主执行器记录本身不被改动
+    assert base == _primary_record()
+
+
+def test_local_cpu_executor_requires_layer_range(monkeypatch):
+    """没声明工件边界 ⇒ **不申报**这一执行器（fail-closed）。
+
+    ★ 2026-10-27（审计 §9.4 #6）：B1（切点释放）现在会主动重解以**争取**让附加执行器
+    参与，因此"没有边界"的记录更容易被推去算工件没覆盖的层。与其在执行期炸，不如在
+    规划期就表现为"这台机器的 CPU 段不参与"。
+    """
+    monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", raising=False)
+    from scheduler import Scheduler
+
+    assert Scheduler._local_cpu_executor_record(_primary_record()) is None
+
+
+def test_local_cpu_executor_shares_one_host_budget(monkeypatch):
+    """同机两段共用一份总账 ⇒ 域校验看得到两者，且不因总账冲突而报错。
+
+    这正是"容量无重复计数"在**同机第二执行器**上的体现：若两段各自按整机可用内存申报
+    而不声明共享域，求解器会把它们当成两台独立机器，给出物理上装不下的计划。
+
+    ★ 2026-10-27（审计 §9.4 #6）：同上，需要显式声明工件边界才能拿到记录。
+    """
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR_LAYER_RANGE", "8,24")
+    from qlh_core.planning.capacity import validate_capacity_domains
+    from scheduler import Scheduler
+
+    base = _primary_record()
+    cpu = Scheduler._local_cpu_executor_record(base)
+    assert cpu is not None, "配了工件边界就应该产出记录"
+    nodes = [
+        {**base, "executor_id": ""},
+        {**cpu},
+        # 与主执行器同域、总账一致（真实路径下两条记录的总账同源）
+        {**base, "executor_id": "", "capacity_domain_id": None},
+    ]
+    nodes[2].pop("capacity_domain_id")
+
+    _ok, report = validate_capacity_domains(nodes)
+    domain_id = cpu["capacity_domain_id"]
+    assert domain_id in report
+    assert report[domain_id]["domain_total_bytes"] == cpu["domain_total_bytes"]
+    # 同域里能看到两个执行器（主 + CPU）
+    assert len(report[domain_id]["executors"]) >= 2
+    assert {item["executor_id"] for item in report[domain_id]["executors"]} >= {
+        "", cpu["executor_id"]}
+
+
+def test_local_cpu_executor_defaults_to_off(monkeypatch):
+    """默认**关闭** ⇒ 既有三机拓扑逐位不变（回归门）。
+
+    这一档必须是**显式开启**的：它改变的是"哪些层由哪台机器算"，属于部署决策，
+    不该因为一次升级就悄悄生效。
+    """
+    import importlib
+
+    import config
+
+    monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR", raising=False)
+    reloaded = importlib.reload(config)
+    assert reloaded.LOCAL_CPU_EXECUTOR_ENABLED is False
+    # 成本缺省用**实测值**（docs 里那一份），不是拍脑袋的数
+    assert reloaded.LOCAL_CPU_EXECUTOR_LAYER_COST_MS == pytest.approx(6.84)
+    monkeypatch.setenv("QLH_LOCAL_CPU_EXECUTOR", "1")
+    assert importlib.reload(config).LOCAL_CPU_EXECUTOR_ENABLED is True
+    monkeypatch.delenv("QLH_LOCAL_CPU_EXECUTOR", raising=False)
+    importlib.reload(config)
+
+
+# --------------------------------------------------------------------------
+# 同机附加执行器的四道登记（闭集白名单，"写了要能读回来"）
+# --------------------------------------------------------------------------
+
+def test_local_executors_is_allowlisted_for_control_read_and_retention():
+    """`local_executors` 必须在保留策略字段表里登记。
+
+    这类表是**闭集白名单**：写了却没登记 ⇒ 提交后读不回来（或在校验时被判未知字段），
+    现象是"部署成功了但控制面看不到同机第二执行器"—— 与"功能根本没生效"极难区分。
+    所以把它当契约单独钉住。
+    """
+    from qlh_core.adapters.model_control_retention import _FIELDS
+
+    deployments = _FIELDS["deployments"]
+    assert "local_executors" in deployments
+    # 与主段字段成对出现，避免只登记一半（写进去了、读不回来）
+    assert "local_assignment" in deployments
+
+
+def test_execution_view_projects_local_executors():
+    """`_execution_view` 的 lifecycle 投影必须带上 `local_executors`，且容忍旧记录。"""
+    from qlh_core.adapters.model_control_repository import SqliteModelControlRepository
+
+    state = {
+        "schema_version": 1, "revision": 1, "boot_id": "b", "selected_operation": "op",
+        "active_deployment": "d", "commit_scope": "durable",
+        "deployments": {"d": {"deployment_id": "d"}},
+        "lifecycle": {
+            "total_layers": 32,
+            "local_assignment": {"start_layer": 0},
+            "local_executors": {"cpu": {"start_layer": 8}},
+        },
+    }
+    view = SqliteModelControlRepository._execution_view(state)
+    assert view["lifecycle"]["local_executors"] == {"cpu": {"start_layer": 8}}
+    assert view["lifecycle"]["local_assignment"] == {"start_layer": 0}
+
+    # 旧记录没有这个键 ⇒ 投影里也不出现（不炸、不臆造空值）
+    state["lifecycle"].pop("local_executors")
+    assert "local_executors" not in SqliteModelControlRepository._execution_view(
+        state)["lifecycle"]
+
+
+def test_local_assignment_extraction_skips_secondary_executors():
+    """主段提取**必须**跳过附加执行器 —— 它们与主段同 `node_id`。
+
+    这是最容易静默出错的一处：本机 CPU 段与 GPU 段同 node_id，若只按 node_id 用
+    `next()` 取"本地主段"，可能取到 CPU 段 ⇒ `local_assignment` 语义被污染、
+    真正的 GPU 首段丢失，而**不会有任何报错**。
+    """
+    plan_assignments = [
+        {"node_id": "master", "executor_id": "cpu", "start_layer": 8, "end_layer": 16},
+        {"node_id": "master", "start_layer": 0, "end_layer": 8},
+        {"node_id": "worker", "start_layer": 16, "end_layer": 32},
+    ]
+    master_ids = {"master"}
+    chosen = next((item for item in plan_assignments
+                   if item.get("node_id") in master_ids
+                   and not item.get("executor_id")), None)
+    assert chosen is not None
+    assert chosen["start_layer"] == 0 and chosen["end_layer"] == 8
+
+    secondary = [item for item in plan_assignments
+                 if item.get("executor_id") and item.get("node_id") in master_ids]
+    assert [item["executor_id"] for item in secondary] == ["cpu"]

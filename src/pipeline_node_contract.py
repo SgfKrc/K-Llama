@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 try:
@@ -235,6 +235,10 @@ class PipelineNode:
     federated: bool = False
     cross_engine: bool = False
     handoff_at: int | None = None
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：**节点内执行器**。同一物理节点（同一 node_id）
+    #   上的 GPU 段与 CPU 段靠它区分；缺省 "" = 该节点的默认/主执行器 = 今天的行为。
+    #   必须留在**末尾且带默认值**（既有调用方按关键字/位置构造）。
+    executor_id: str = ""
 
     def __post_init__(self) -> None:
         node_id = str(self.node_id or "").strip()
@@ -263,9 +267,15 @@ class PipelineNode:
         object.__setattr__(self, "federated", bool(self.federated))
         object.__setattr__(self, "cross_engine", bool(self.cross_engine))
         object.__setattr__(self, "handoff_at", handoff_at)
+        object.__setattr__(self, "executor_id", str(self.executor_id or "").strip())
+
+    @property
+    def identity_key(self) -> tuple[str, str]:
+        """唯一性判据用的键：同一 node 上的不同执行器互不冲突。"""
+        return (self.node_id, self.executor_id)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "node_id": self.node_id,
             "kind": self.kind,
             "layer_range": list(self.layer_range),
@@ -279,6 +289,11 @@ class PipelineNode:
             "cross_engine": self.cross_engine,
             "handoff_at": self.handoff_at,
         }
+        # ★ 仅**非空**时输出：缺省即主执行器 ⇒ 既有 layout 的 `to_dict()` 形态与
+        #   `contract_sha256` 逐位不变（frozen 契约与只读消费者不受影响）。
+        if self.executor_id:
+            payload["executor_id"] = self.executor_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -358,7 +373,12 @@ def validate_pipeline_nodes(
         raise PipelineNodeContractError("pipeline requires at least one node")
     if any(not isinstance(node, PipelineNode) for node in values):
         raise PipelineNodeContractError("every layout entry must be a PipelineNode")
-    if len({node.node_id for node in values}) != len(values):
+    # ★ 2026-10-25（LOCAL-EXECUTORS-01）：唯一性判据由 `node_id` 放宽到
+    #   `(node_id, executor_id)` —— 同一物理节点上的 GPU 段与 CPU 段必须能共存
+    #   （本票的目标形态）。`executor_id` 缺省 "" ⇒ 键退化为 `(node_id, "")`，
+    #   与旧的"node_id 唯一"**逐位等价** ⇒ 既有 layout 零回归。
+    #   错误文本保持原样（既有断言依赖它），但它现在指的是"节点身份"而非 node_id。
+    if len({node.identity_key for node in values}) != len(values):
         raise PipelineNodeContractError("pipeline node_id values must be unique")
 
     ordered = tuple(sorted(values, key=lambda node: node.layer_range))
@@ -441,10 +461,42 @@ def validate_pipeline_nodes(
     )
 
 
+def _layout_metadata_for(
+    metadata: Mapping[Any, Mapping[str, Any]] | None,
+    node_id: str,
+    executor_id: str,
+) -> Mapping[str, Any]:
+    """按**完整执行器身份** `(node_id, executor_id)` 取布局元数据。
+
+    ★ 2026-10-27（审计 §9.4 #4）：同机主执行器与附加执行器共用 `node_id`，旧写法
+    `metadata.get(node_id)` 让**附加执行器静默读到主执行器的属性**。实测（2026-10-27
+    纯计算复现，布局 `master#"" + master#cpu + worker`）：候选里 `master#cpu` 的
+    `artifact_kind` 被判成 `safetensors_assignment`（应为 `gguf_segment`），
+    `kind`/`engine`/`federated`/`handoff_at` 同样按主段填 —— 这是 A1
+    （`scheduler._attach_pipeline_node_contract` 用裸 `node_id` 建 engines 表 ⇒
+    主段被盖上 CPU 段引擎）在 reshard 路径的**镜像**：同一个键，反方向的串味。
+
+    **回退只允许主执行器**：旧调用方（`scheduler._pipeline_node_metadata()`、既有
+    测试夹具）传的映射以裸 `node_id` 为键，它描述的本来就只是该物理节点的
+    **主**执行器。附加执行器若回退到裸键，等于又把主段的属性借给 CPU 段 ——
+    正是要消灭的串味。附加执行器宁可拿空 meta（下游按其 assignment 的
+    `engine`/`role` 推导），也不要拿错的那份。
+    """
+    values = metadata if isinstance(metadata, Mapping) else {}
+    entry = values.get((node_id, str(executor_id or "")))
+    if isinstance(entry, Mapping):
+        return entry
+    if not executor_id:
+        legacy = values.get(node_id)
+        if isinstance(legacy, Mapping):
+            return legacy
+    return {}
+
+
 def pipeline_layout_from_capacity_plan(
     plan: Mapping[str, Any],
     *,
-    node_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+    node_metadata: Mapping[Any, Mapping[str, Any]] | None = None,
     default_engine: str = "pytorch",
 ) -> PipelineLayout:
     """Map an admitted ``solve_pipeline_capacity`` result into this contract."""
@@ -457,12 +509,55 @@ def pipeline_layout_from_capacity_plan(
     model_sha256 = str(plan.get("model_sha256", "") or "").strip()
     architecture = str(plan.get("model_type", "") or "")
     metadata = node_metadata or {}
+    frozen_layout = None
+    snapshot = plan.get("pipeline_layout")
+    if snapshot is not None:
+        try:
+            if not isinstance(snapshot, Mapping):
+                raise PipelineNodeContractError("pipeline_layout must be an object")
+            if snapshot.get("schema_version") != PIPELINE_NODE_SCHEMA_VERSION:
+                raise PipelineNodeContractError("pipeline_layout schema is unsupported")
+            frozen_layout = validate_pipeline_nodes([
+                PipelineNode(**{
+                    field.name: item[field.name]
+                    for field in fields(PipelineNode) if field.name in item
+                })
+                for item in snapshot["nodes"]
+            ], total_layers=snapshot["total_layers"])
+        except (KeyError, TypeError) as exc:
+            raise PipelineNodeContractError("pipeline_layout snapshot is invalid") from exc
+        if snapshot.get("contract_sha256") != frozen_layout.contract_sha256:
+            raise PipelineNodeContractError("pipeline_layout snapshot hash mismatch")
+        if (
+            frozen_layout.total_layers != total_layers
+            or frozen_layout.model_sha256 != model_sha256
+            or frozen_layout.architecture != architecture
+        ):
+            raise PipelineNodeContractError("pipeline_layout snapshot model mismatch")
+        metadata = {
+            node.identity_key: {
+                "is_local": not node.federated and node.location == "local",
+                "location": node.location, "kind": node.kind, "engine": node.engine,
+                "federated": node.federated, "cross_engine": node.cross_engine,
+                "handoff_at": node.handoff_at, "artifact": node.artifact,
+                "artifact_kind": node.artifact.artifact_kind,
+                "architecture": node.artifact.architecture,
+            }
+            for node in frozen_layout.nodes
+        }
     nodes: list[PipelineNode] = []
     for assignment in assignments:
         if not isinstance(assignment, Mapping):
             raise PipelineNodeContractError("capacity assignment must be an object")
-        node_id = str(assignment.get("node_id", "") or "")
-        meta = dict(metadata.get(node_id, {}))
+        node_id = str(assignment.get("node_id", "") or "").strip()
+        # ★ 2026-10-27（审计 §9.4 #4）：身份是 `(node_id, executor_id)` —— 同机两段
+        #   共用一个 `node_id`，裸键会让附加执行器读到主段的 `kind`/`engine`/
+        #   `artifact_kind`。回退语义（旧裸键只对主执行器生效）见
+        #   `_layout_metadata_for()`。
+        executor_id = str(assignment.get("executor_id") or "").strip()
+        meta = dict(_layout_metadata_for(metadata, node_id, executor_id))
+        if frozen_layout is not None and not meta:
+            raise PipelineNodeContractError("pipeline_layout snapshot executor mismatch")
         start = _non_negative_int(assignment.get("start_layer", 0), "start_layer")
         end = _non_negative_int(assignment.get("end_layer", 0), "end_layer")
         is_local = bool(meta.get(
@@ -522,6 +617,17 @@ def pipeline_layout_from_capacity_plan(
             federated=bool(meta.get("federated", not is_local)),
             cross_engine=bool(meta.get("cross_engine", False)),
             handoff_at=meta.get("handoff_at"),
+            # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**执行器身份必须传下去**。
+            #   同机 GPU 段与 CPU 段共用 `node_id="master"`，靠 `executor_id` 区分；
+            #   `identity_key` 已经是 `(node_id, executor_id)`，但这里没填 ⇒ 两个
+            #   `PipelineNode` 的键都是 `("master", "")` ⇒ `validate_pipeline_nodes`
+            #   报 `pipeline node_id values must be unique` ⇒
+            #   `pipeline_node_contract_invalid` ⇒ prepare 失败。
+            #   实测（2026-10-26 10:05）：容量求解已经给出
+            #     [('master','',0,8), ('master','cpu',8,24), ('android',...), ('TABLET',...)]
+            #   却死在布局契约上。缺省 "" ⇒ 与旧的"node_id 唯一"逐位等价。
+            #   复用上面的局部变量，避免与 `meta` 查找的身份来源再次分叉。
+            executor_id=executor_id,
         ))
     annotated: list[PipelineNode] = []
     previous_engine = ""
@@ -533,9 +639,28 @@ def pipeline_layout_from_capacity_plan(
                 cross_engine=True,
                 handoff_at=node.layer_range[0],
             )
+        elif node.kind == "cross_framework" or node.cross_engine:
+            # ★ 2026-10-27（审计 §9.4 #4 的必然联动）：meta 里的 `kind`/`cross_engine`
+            #   描述的是**旧布局**。同机 CPU 段原本接在主段（PyTorch）之后 ⇒ 是
+            #   跨框架接力；主执行器退场后它成了**首段**，前面没有任何段 ⇒ 接力和
+            #   交接点都不存在了。若不跟着降级，就会留下"kind=cross_framework 但
+            #   handoff_at 已被重算掉"的自相矛盾节点，被契约直接拒绝 ——
+            #   实测（2026-10-27，`failed={("master","")}`，CPU 段成为首段）：
+            #   `pipeline_reshard_input_invalid: cross_framework node requires an
+            #   explicit handoff_at` / `handoff_at must be a pipeline node boundary`。
+            #   kind / cross_engine / handoff_at 三者必须与"引擎序列"同源。
+            node = replace(
+                node,
+                kind="local" if node.location == "local" else "remote_pipeline",
+                cross_engine=False,
+                handoff_at=None,
+            )
         annotated.append(node)
         previous_engine = node.engine
-    return validate_pipeline_nodes(annotated, total_layers=total_layers)
+    layout = validate_pipeline_nodes(annotated, total_layers=total_layers)
+    if frozen_layout is not None and layout.contract_sha256 != frozen_layout.contract_sha256:
+        raise PipelineNodeContractError("capacity assignments do not match pipeline_layout snapshot")
+    return layout
 
 
 def pipeline_layout_from_relay_handoff(

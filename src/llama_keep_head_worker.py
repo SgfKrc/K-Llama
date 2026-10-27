@@ -77,7 +77,10 @@ def main() -> int:
 
     _response(ok=True, n_embd=upstream.n_embd, n_layer=upstream.n_layer,
               n_vocab=upstream.n_vocab,
-              supports_multi_position_argmax=upstream.supports_multi_position_argmax)
+              supports_multi_position_argmax=upstream.supports_multi_position_argmax,
+              # ★ PERF-SKIP-LOGITS-01：native handle 只在本进程里，父进程必须靠这个回执
+              #   确认 `QLH_LAYER_SKIP_LOGITS` 真的落实了（而不是"我设了环境变量"）。
+              skip_hidden_logits=upstream.skip_hidden_logits_applied)
     try:
         for raw in sys.stdin:
             if not raw.strip():

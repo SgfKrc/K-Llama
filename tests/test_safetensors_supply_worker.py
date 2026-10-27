@@ -234,8 +234,8 @@ def test_metadata_only_architecture_does_not_advertise_layer_forward(tiny_supply
     #   GGUF）⇒ 会把 fixture 节点误判成自裁节点。该用例关心的是"架构元数据不足以
     #   广告层段"，显式关闭自裁探测以保持与真实文件系统隔离。
     monkeypatch.setattr(
-        tiny_supply.scheduler, "_task_worker_local_full_source_available",
-        lambda: False,
+        tiny_supply.scheduler, "_task_worker_local_full_source",
+        lambda: None,
     )
     full_identity = ModelIdentity(model_id="full-model", engine="pytorch", format="safetensors",
                                   revision="1", sha256="a" * 64)

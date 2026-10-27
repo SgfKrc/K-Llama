@@ -9,6 +9,7 @@ import atexit
 from copy import deepcopy
 import json
 import os
+import sqlite3
 import threading
 import time
 from qlh_core.contracts.deployment import MODEL_CONTROL_DOMAIN, canonical, ModelControlError
@@ -18,18 +19,6 @@ from qlh_core.adapters.model_control_retention import (
 )
 
 
-# ★ 2026-10-25（实验探针，默认关闭）：PERF-CONTROL-READ-01 要测「#132 的完整读放大」
-#   —— 每个普通 decode 步究竟读了几次完整控制面快照、每次多少字节。生产代码里没有
-#   计数器，而票要的正是这两个数，所以在这里放一个**受环境变量控制、默认零开销**的探针：
-#       QLH_PROFILE_CONTROL_READS=<输出文件路径>
-#   设置后，每次 `read()`（新建连接 + sqlite_master 探测）与 `_read()`（读整行 payload
-#   并 json.loads）各记一条 `monotonic 时间戳 / 类别 / payload 字节 / 线程名`；按 decode
-#   step 的时间窗口聚合可得「每步 N 次、合计 M 字节」，按**线程名**聚合则直接分出
-#   「查询读取」（`qlh-tui-backend`：TUI 轮询投影）与「执行读取」（`linear-request-executor`
-#   / 请求线程：逐步校验）各自的份额 —— 这正是票要求「分开测试执行读取、查询读取及
-#   两者组合」的那两个量，且无需重启进程或做外部 A/B。
-#   不设置时 `_profile_control_read` 立即返回，判定代价只是一个字符串真值测试。
-#   记录先在内存攒批（阈值取小，保证长会话也能连续落盘），或进程退出时写盘。
 _PROFILE_PATH = os.environ.get("QLH_PROFILE_CONTROL_READS", "")
 _PROFILE_RECORDS: list[tuple[float, str, int, str]] = []
 _PROFILE_LOCK = threading.Lock()
@@ -61,6 +50,18 @@ def _profile_control_read(kind: str, size: int) -> None:
 atexit.register(_flush_profile_control_reads)
 
 
+_READ_TRIGGERS = {
+    f"model_control_read_{action.lower()}": (
+        f"CREATE TRIGGER model_control_read_{action.lower()} AFTER {action} ON model_control_state "
+        "BEGIN UPDATE model_control_read_revision SET generation=generation+1 WHERE id=1; END"
+    ) for action in ("INSERT", "UPDATE", "DELETE")
+}
+_SUPPLY_QUERY_FIELDS = (
+    "operation_id", "intent", "status", "reason_code", "reason", "created_at", "updated_at",
+    "nodes", "plan", "source_progress", "capacity_diagnostic",
+)
+
+
 def empty_state():
     return {"schema_version": 1, "revision": 0, "boot_id": "", "selected_operation": "",
             "active_deployment": "", "operations": {}, "supplies": {}, "deployments": {},
@@ -68,9 +69,19 @@ def empty_state():
 
 
 class SqliteModelControlRepository:
-    def __init__(self, *, connect, transaction, max_events=64, max_event_bytes=8 * 1024 * 1024):
+    def __init__(self, *, connect, transaction, max_events=64, max_event_bytes=8 * 1024 * 1024,
+                 read_mode=None):
         self._connect = connect
         self._transaction = transaction
+        mode = read_mode if read_mode is not None else os.environ.get("QLH_CONTROL_READ_MODE", "combined")
+        if mode not in {"legacy", "execution", "query", "combined"}:
+            raise ValueError("model_control_read_mode_invalid")
+        self.execution_reads_enabled = mode in {"execution", "combined"}
+        self.query_reads_enabled = mode in {"query", "combined"}
+        self._read_lock = threading.RLock()
+        self._read_token = None
+        self._read_state = None
+        self._read_schema = None
         self._journal = SnapshotJournal("model_control_events", domain=MODEL_CONTROL_DOMAIN,
             error=lambda: ModelControlError("model_control_journal_corrupt"),
             max_events=max_events, max_bytes=max_event_bytes)
@@ -79,6 +90,10 @@ class SqliteModelControlRepository:
     def _initialize(connection):
         connection.execute("CREATE TABLE IF NOT EXISTS model_control_state (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)")
         connection.execute("CREATE TABLE IF NOT EXISTS model_control_events (sequence INTEGER PRIMARY KEY, domain_id TEXT NOT NULL, previous_digest TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS model_control_read_revision (id INTEGER PRIMARY KEY CHECK(id=1), incarnation TEXT NOT NULL, generation INTEGER NOT NULL)")
+        connection.execute("INSERT OR IGNORE INTO model_control_read_revision VALUES (1,hex(randomblob(16)),0)")
+        for definition in _READ_TRIGGERS.values():
+            connection.execute(definition.replace("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1))
 
     @staticmethod
     def _read(connection):
@@ -99,6 +114,84 @@ class SqliteModelControlRepository:
             return self._read(connection) if present else empty_state()
         finally:
             connection.close()
+
+    def _committed_read_token(self, connection):
+        database = next(row for row in connection.execute("PRAGMA database_list") if row["name"] == "main")
+        if not database["file"]:
+            return None
+        filename = os.path.normcase(os.path.realpath(database["file"]))
+        info = os.stat(filename)
+        database_identity = (filename, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+        schema = connection.execute("PRAGMA schema_version").fetchone()[0]
+        try:
+            row = connection.execute("SELECT incarnation,generation FROM model_control_read_revision WHERE id=1").fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table: model_control_read_revision" not in str(error):
+                raise
+            return None
+        if row is None:
+            return None
+        schema_key = (*database_identity, schema, row["incarnation"])
+        if schema_key != self._read_schema:
+            definitions = {item["name"]: item["sql"] for item in connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='model_control_state'")}
+            if any(" ".join(definitions.get(name, "").split()) != " ".join(definition.split())
+                   for name, definition in _READ_TRIGGERS.items()):
+                return None
+            self._read_schema = schema_key
+        return (*schema_key, row["generation"])
+
+    @staticmethod
+    def _execution_view(state):
+        key = state["active_deployment"]
+        lifecycle = state.get("lifecycle")
+        return {**{field: state[field] for field in (
+                    "schema_version", "revision", "boot_id", "selected_operation", "active_deployment", "commit_scope")},
+                "deployments": {key: state["deployments"][key]} if key in state["deployments"] else {},
+                "lifecycle": {field: lifecycle[field] for field in (
+                                  "total_layers", "local_assignment", "local_executors")
+                              if field in lifecycle} if lifecycle else None}
+
+    def _read_view(self, kind, operation_id=None):
+        _profile_control_read("connect", 0)
+        with self._read_lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN")
+                token = self._committed_read_token(connection)
+                if token is None:
+                    self._read_token, self._read_state = None, None
+                if token is not None and token == self._read_token:
+                    state = self._read_state
+                else:
+                    present = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_control_state'").fetchone()
+                    state = self._read(connection) if present else empty_state()
+                    if token is not None:
+                        self._read_state, self._read_token = state, token
+                if kind == "stamp":
+                    value = {field: state[field] for field in ("revision", "boot_id")}
+                else:
+                    value = self._execution_view(state)
+                    if kind == "query":
+                        selected = operation_id if operation_id is not None else state["selected_operation"]
+                        value["operations"] = {selected: state["operations"][selected]} if selected in state["operations"] else {}
+                        supply = state["supplies"].get(selected)
+                        value["supplies"] = {selected: {field: supply[field] for field in _SUPPLY_QUERY_FIELDS
+                                                       if field in supply}} if supply is not None else {}
+                _profile_control_read("view:" + kind, 0)
+                return deepcopy(value)
+            finally:
+                connection.rollback()
+                connection.close()
+
+    def read_execution(self):
+        return self._read_view("execution") if self.execution_reads_enabled else self.read()
+
+    def read_query(self, operation_id=None):
+        return self._read_view("query", operation_id) if self.query_reads_enabled else self.read()
+
+    def read_stamp(self):
+        return self._read_view("stamp") if self.query_reads_enabled else self.read()
 
     def transact(self, mutation, *, domain=MODEL_CONTROL_DOMAIN):
         with self._transaction() as connection:

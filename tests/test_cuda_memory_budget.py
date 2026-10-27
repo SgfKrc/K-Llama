@@ -270,6 +270,48 @@ def test_llama_cpp_segment_multiplier_matches_the_supply_stage():
     assert node["runtime_multiplier"] == 1.0
 
 
+def test_stale_profile_multiplier_cannot_inflate_fresh_gguf_supply_capacity():
+    """陈旧 profile 上的 ×2 不是权威：GGUF 段的新鲜账恒按**原生量化宽度**算。
+
+    回归现场（2026-10-25，`5d85614b` 之后）：`tests/test_pipeline_capacity_freshness`
+    的 fixture 在缓存节点上写 `runtime_multiplier=2.0`，而准备阶段的证据投影按
+    `engine == "llama_cpp"` 给出 1.0（见上一条）。两者的分界必须由**准入结论**守住，
+    而不只是一个字段：这里把可用容量卡在两种账之间 —— 4 层 × 2 MiB 原生权重
+    + 1 MiB 预约 = 9 MiB（准入）；若陈旧倍率 2.0 生效则是 17 MiB（拒绝）。
+    """
+    from model_supply_capacity import project_inventory_capacity
+    from pipeline_capacity import solve_pipeline_capacity
+    from tests.test_pc_supply_layer_budget import descriptor
+
+    source = descriptor(sizes=(2 * MIB,) * 4)
+    stale = {"node_id": "rog-5060", "role": "master", "reserve_bytes": MIB,
+             "runtime_multiplier": 2.0}
+
+    gguf = project_inventory_capacity(
+        {**stale, "capacity_bytes": 9 * MIB},
+        {"distributed": True, "engines": ["llama_cpp"], "memory_available_bytes": 10 * MIB},
+        "llama_cpp")
+    assert gguf["runtime_multiplier"] == 1.0 and gguf["capacity_bytes"] == 10 * MIB
+    admitted = solve_pipeline_capacity(source, [gguf], safety_margin=1.0,
+                                       required_node_id="rog-5060")
+    assert admitted["admitted"], admitted
+    assert admitted["assignments"][0]["raw_weight_bytes"] == 8 * MIB
+    assert admitted["assignments"][0]["required_bytes"] == 9 * MIB
+
+    # 反面：**未投影**的 PyTorch CPU 描述符仍必须 ×2（fp16 → fp32），
+    # 同一个容量下必须拒绝 —— 证明 1.0 只对已投影/原生宽度生效。
+    cpu = project_inventory_capacity(
+        {**stale, "capacity_bytes": 9 * MIB},
+        {"distributed": True, "engines": ["pytorch"], "memory_available_bytes": 10 * MIB,
+         "pytorch_runtime": {"execution_device": "cpu", "available_bytes": 9 * MIB,
+                             "target_element_size": 2}},
+        "pytorch")
+    assert cpu["runtime_multiplier"] == 2.0
+    rejected = solve_pipeline_capacity(source, [cpu], safety_margin=1.0,
+                                       required_node_id="rog-5060")
+    assert not rejected["admitted"], rejected
+
+
 def test_global_budget_reaches_fresh_solver_with_reserve_and_safety_unchanged(inventory_worker, monkeypatch):
     from model_supply_capacity import project_inventory_capacity
     from pipeline_capacity import solve_pipeline_capacity

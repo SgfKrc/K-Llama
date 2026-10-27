@@ -56,8 +56,6 @@ from task_worker_capabilities import build_engine_capabilities
 
 logger = logging.getLogger("scheduler")
 
-_LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
-_LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
 _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
 _TASK_WORKER_RESPONSE_CONTEXT = threading.local()
 from qlh_core.contracts.deadline import REQUEST_DEADLINE_EXCEEDED as _REQUEST_DEADLINE_EXCEEDED
@@ -170,34 +168,16 @@ def keep_head_shim_available() -> bool:
 
 
 def _verified_layer_artifact_sha256(path) -> str:
-    """Hash one configured GGUF once per stable filesystem identity."""
+    """Reuse the shared digest for the same complete live file version."""
+    from model_supply_digest_cache import DigestCacheError, cached_sha256
+
     try:
         resolved = path.resolve(strict=True)
-        stat = resolved.stat()
         if not resolved.is_file():
             return ""
-        fingerprint = (
-            int(stat.st_size),
-            int(getattr(stat, "st_mtime_ns", 0)),
-            int(getattr(stat, "st_ctime_ns", 0)),
-        )
-    except OSError:
+        return cached_sha256(resolved)
+    except (OSError, DigestCacheError):
         return ""
-    cache_key = str(resolved)
-    with _LAYER_ARTIFACT_DIGEST_LOCK:
-        cached = _LAYER_ARTIFACT_DIGEST_CACHE.get(cache_key)
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1]
-        digest = hashlib.sha256()
-        try:
-            with resolved.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            return ""
-        value = digest.hexdigest()
-        _LAYER_ARTIFACT_DIGEST_CACHE[cache_key] = (fingerprint, value)
-        return value
 
 
 def _layer_weight_bytes_of(artifact_path, local_layers: int) -> list[int]:
@@ -649,54 +629,37 @@ class SchedulerTaskWorkerMixin:
         except (ImportError, OSError, ValueError):
             return False
 
-    def _task_worker_local_full_layers(self) -> int | None:
-        """Layer count of the installed *complete* local GGUF source, if any.
-
-        A node holding a whole GGUF can host any contiguous range, so it may join
-        the layer pool without a pre-cut segment. Only cheap header reads are
-        used (`verify_hashes=False`); nothing is hashed on this path.
-        """
+    def _task_worker_local_full_source(self) -> dict | None:
+        """Return metadata and size for one inventory-visible complete GGUF."""
         try:
-            from pathlib import Path
-            from local_model_assets import discover_local_model_assets, _app_root
+            from model_supply_worker import local_gguf_source_candidates
             from relay_segment_info import read_gguf_layer_info
-            root = Path(_app_root())
-            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
-                relative = asset.get("gguf_path")
-                if not isinstance(relative, str) or not relative:
-                    continue
-                path = (root / relative).resolve()
-                if not path.is_file():
-                    continue
+            worker = getattr(self, "_model_supply_worker", None)
+            candidates = worker._source_candidates() if worker is not None else local_gguf_source_candidates()
+            for _source_id, path in candidates:
                 info = read_gguf_layer_info(path) or {}
                 total = info.get("n_layer")
                 if isinstance(total, int) and total > 0:
-                    return total
+                    return {"source_model_id": _source_id, "path": path,
+                            "total_layers": total, "size_bytes": int(path.stat().st_size)}
         except Exception:
             logger.debug("local full GGUF source probe failed", exc_info=True)
         return None
+
+    def _task_worker_local_full_layers(self) -> int | None:
+        """Layer count of the installed complete local GGUF source, if any."""
+        source = self._task_worker_local_full_source()
+        return source["total_layers"] if source is not None else None
 
     def _task_worker_local_full_source_available(self) -> bool:
         return self._task_worker_local_full_layers() is not None
 
     def _task_worker_local_full_source_bytes(self) -> int:
         """Size of the installed complete local GGUF source, 0 when absent."""
-        try:
-            from pathlib import Path
-            from local_model_assets import discover_local_model_assets, _app_root
-            root = Path(_app_root())
-            for asset in discover_local_model_assets(verify_hashes=False).get("assets", []):
-                relative = asset.get("gguf_path")
-                if not isinstance(relative, str) or not relative:
-                    continue
-                path = (root / relative).resolve()
-                if path.is_file():
-                    return int(path.stat().st_size)
-        except Exception:
-            logger.debug("local full GGUF size probe failed", exc_info=True)
-        return 0
+        source = self._task_worker_local_full_source()
+        return source["size_bytes"] if source is not None else 0
 
-    def _task_worker_local_cut_layer_budget(self) -> dict | None:
+    def _task_worker_local_cut_layer_budget(self, source: dict | None = None) -> dict | None:
         """Device-advertised layer budget, mirroring Android's computeLayerBudget.
 
         `layer_ranges=[[0, total]]` says "I can take any range" but **not** how many
@@ -705,10 +668,11 @@ class SchedulerTaskWorkerMixin:
         11.4GB、缺口 5.65GB，`waiting_nodes` 因此每 20~30 秒重算一次（白烧 4 分钟），
         而空闲 9.6GB 的 android 反而一个层段都拿不到。
         """
-        total = self._task_worker_local_full_layers()
-        size = self._task_worker_local_full_source_bytes()
-        if not total or not size:
+        if source is None:
+            source = self._task_worker_local_full_source()
+        if source is None:
             return None
+        total, size = source["total_layers"], source["size_bytes"]
         try:
             import psutil
 
@@ -762,14 +726,15 @@ class SchedulerTaskWorkerMixin:
         # `QLH_LOCAL_CUT_SELF=0` 可显式关闭自裁广告（测试默认关闭：该判据要探测
         # 本地完整 GGUF 源，而开发机 `models/` 里就有整模，否则每个用例都会被
         # 误判成自裁节点）。生产侧默认开启，无需配置。
-        local_cut_only = bool(
+        can_probe_local_cut = bool(
             not host_has_model
             and not os.environ.get("QLH_LAYER_GGUF", "").strip()
             and os.environ.get("QLH_LOCAL_CUT_SELF", "1").strip().lower()
             not in {"0", "false", "no", "off"}
             and self._task_worker_local_cut_available()
-            and self._task_worker_local_full_source_available()
         )
+        local_full_source = self._task_worker_local_full_source() if can_probe_local_cut else None
+        local_cut_only = can_probe_local_cut and local_full_source is not None
         layer_worker = bool(
             active_layer_config
             or getattr(self._host, "layer_range", None)
@@ -795,7 +760,7 @@ class SchedulerTaskWorkerMixin:
             # ★ 持整模 + 能自裁 ⇒ 声明整域 [0, total)，让容量求解按能力自由分配，
             #   而不是被某个历史段绑死。已注册的段仍作为可复用工件存在，但**分发
             #   契约**以"能承担任意连续层段"为准（否则早期乱切的段会永久固化布局）。
-            total = self._task_worker_local_full_layers()
+            total = local_full_source["total_layers"]
             if total:
                 layer_ranges.append([0, int(total)])
             layer_worker = True
@@ -864,7 +829,7 @@ class SchedulerTaskWorkerMixin:
         if not stage_types:
             stage_types = ["aggregate"]
         local_cut_budget = (
-            self._task_worker_local_cut_layer_budget() if local_cut_only else None
+            self._task_worker_local_cut_layer_budget(local_full_source) if local_cut_only else None
         )
         capabilities = {
             "engine_capabilities": engine_schema,
@@ -1527,6 +1492,85 @@ class SchedulerTaskWorkerMixin:
             return [
                 self._remote_task_worker_providers[node_id]
                 for node_id in sorted(self._remote_task_worker_providers)
+            ]
+
+    @staticmethod
+    def _local_executor_key(node_id: str, executor_id: str = "") -> str:
+        """本机执行器的 provider 缓存键。缺省 `executor_id` ⇒ 就是 `node_id`。"""
+        executor_id = str(executor_id or "")
+        return f"{node_id}#{executor_id}" if executor_id else str(node_id)
+
+    def _local_stage_executor(self):
+        """进程内层段执行体：懒建 `EngineHost`，返回它的 `execute_task_worker_stage`。
+
+        它的签名与 `ProviderExecutor` 协议
+        （`Callable[[StageRequest, threading.Event], dict]`，见 `execution_provider.py`）
+        **逐字匹配**，且自带 `_worker_layer_lock()` 串行保护；返回体也与远端 offer
+        同形（`hidden_out_f32` / `hidden_out_sha256` / `token_argmax`）。
+
+        `EngineHost` 只在本机执行器**首次被调度**时才构造：它的 keep-head 上游
+        （`QLH_LAYER_GGUF` + `QLH_KEEP_HEAD_SHIM`）是首次执行才加载 ⇒ 不执行就不加载
+        任何 GGUF，对既有拓扑零影响。
+        """
+        host = self._local_engine_host
+        if host is None:
+            from inference_service.engine_host import EngineHost
+            host = EngineHost()
+            self._local_engine_host = host
+        return host.execute_task_worker_stage
+
+    def _lazy_stage_executor(self):
+        """把 `EngineHost` 的构造推迟到**首次真正执行**时（`ProviderExecutor` 闭包）。
+
+        ⚠️ 这是必需的，不是优化：`LocalFullModelProvider(executor, ...)` 的 `executor`
+        参数**立即求值**。直接传 `self._local_stage_executor()` 会让"构造 provider"
+        等同于"构造 `EngineHost`"（连带 `ModelHost`），而 provider 在**装配期**就会被
+        建出来 —— 于是"不执行就不加载"不成立。实测由
+        `test_local_provider_is_lazy_and_reuses_the_generic_container` 抓到
+        （`AssertionError: Expected 'EngineHost' to not have been called. Called 1 times.`）。
+        签名与 `ProviderExecutor` 一致：`Callable[[StageRequest, threading.Event], dict]`。
+        """
+        def execute(stage_request, cancel_event):
+            return self._local_stage_executor()(stage_request, cancel_event)
+        return execute
+
+    def _ensure_local_task_worker_provider(self, node_id: str, executor_id: str = ""):
+        """本机执行器的 provider（复用 `LocalFullModelProvider` 容器，**不发帧**）。
+
+        ★ 2026-10-25（LOCAL-EXECUTORS-01）：与 `_ensure_remote_task_worker_provider`
+        并列，但语义完全不同 —— 本机执行器（例如 master 上的 CPU 段）与远端 worker
+        **共用同一套 `StageRequest`/`ProviderExecutor` 契约**，却没有 TCP 连接：
+          * 不能走 `RemoteFullWorkerProvider`（它按 node_id 发帧，并把故障归属绑到连接
+            世代上）；
+          * 也不需要新的 provider 类 —— `LocalFullModelProvider` 的
+            `supported_stage_types` 本就是构造参数。
+        为什么独立构造 `EngineHost` 而不复用 `self._host`：`self._host` 是 PyTorch 的
+        `ModelHost`（负责 master 首段），没有层段执行入口；本机 CPU 段的 keep-head 上游
+        只存在于 `EngineHost` 里。两者在**同一进程内并存**（shim 的进程隔离由
+        `KeepHeadUpstream` 自理）—— 这正是"同机 GPU 段 + CPU 段"的形态，而不是两台
+        假装无关的物理机。
+        """
+        key = self._local_executor_key(node_id, executor_id)
+        with self._task_worker_stage_lock:
+            provider = self._local_task_worker_providers.get(key)
+            if provider is None:
+                from execution_provider import LocalFullModelProvider
+                provider = LocalFullModelProvider(
+                    self._lazy_stage_executor(),
+                    provider_id="local-" + key.replace("#", "-"),
+                    node_id=str(node_id),
+                    supported_stage_types=("layer_forward",),
+                    provider_kind="local_layer_executor",
+                )
+                self._local_task_worker_providers[key] = provider
+            return provider
+
+    def local_task_worker_providers(self) -> list:
+        """本机执行器的稳定 Provider 列表（供显式 TaskGraph 注册，与远端并列）。"""
+        with self._task_worker_stage_lock:
+            return [
+                self._local_task_worker_providers[key]
+                for key in sorted(self._local_task_worker_providers)
             ]
 
 

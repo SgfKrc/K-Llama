@@ -20,7 +20,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
+import threading
+import weakref
+from collections import OrderedDict
+from contextlib import contextmanager
+from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -75,11 +82,164 @@ _GGUF_SCALAR_TYPES: dict[int, tuple[str, int]] = {
 }
 _GGUF_TYPE_STRING = 8
 _GGUF_TYPE_ARRAY = 9
+_MAX_ARRAY_ITEMS = 2_000_000
+_MAX_GGUF_STRING_BYTES = 64 * 1024 * 1024
+
+_GGUF_HEADER_CACHE = OrderedDict()
+_GGUF_HEADER_LOCK = threading.RLock()
+_GGUF_READER_LOCKS = weakref.WeakValueDictionary()
+
+
+def _gguf_version(path):
+    from model_supply_digest_cache import file_stamp
+    return file_stamp(path)
+
+
+def _cached_gguf_reader(reader):
+    @wraps(reader)
+    def read(path):
+        try:
+            version = _gguf_version(path)
+            key = (reader.__name__, version)
+            with _GGUF_HEADER_LOCK:
+                if key in _GGUF_HEADER_CACHE:
+                    _GGUF_HEADER_CACHE.move_to_end(key)
+                    return deepcopy(_GGUF_HEADER_CACHE[key])
+                lock = _GGUF_READER_LOCKS.get(key)
+                if lock is None:
+                    lock = threading.RLock()
+                    _GGUF_READER_LOCKS[key] = lock
+            with lock:
+                with _GGUF_HEADER_LOCK:
+                    if key in _GGUF_HEADER_CACHE:
+                        _GGUF_HEADER_CACHE.move_to_end(key)
+                        return deepcopy(_GGUF_HEADER_CACHE[key])
+                if reader.__name__ in {"read_gguf_layer_info", "read_gguf_tokenizer_sha256"}:
+                    from model_supply_digest_cache import cached_metadata
+
+                    namespace = "relay-gguf-reader-v2-" + reader.__name__
+                    result = cached_metadata(
+                        path, namespace,
+                        lambda source: {"value": reader(source)},
+                    )["value"]
+                else:
+                    result = reader(path)
+                    if version != _gguf_version(path):
+                        return None
+                if result is not None:
+                    with _GGUF_HEADER_LOCK:
+                        _GGUF_HEADER_CACHE[key] = deepcopy(result)
+                        while len(_GGUF_HEADER_CACHE) > 128:
+                            _GGUF_HEADER_CACHE.popitem(last=False)
+                return deepcopy(result)
+        except (OSError, ValueError):
+            return None
+    return read
+
+
+class _HeaderStream:
+    """GGUF header 的**只进不退**读视图：委托给文件对象，额外提供 `len()`。
+
+    为什么需要它：解析器用 `len(handle)` 判断"读到这里是否会越过文件末尾"
+    （`_gguf_skip_value` 的截断检查）。此前 `handle` 是 `mmap`，天然支持 `len()`
+    与下标；换回顺序读之后 `BufferedReader` 没有 `__len__`，于是
+    `TypeError: object of type '_io.BufferedReader' has no len()`（实测 2026-10-26 14:58）。
+
+    `__len__` 取 `fstat().st_size` —— **只查元数据、不读内容**，因此不会破坏
+    "preflight 不得触碰权重载荷"的契约（`tests/test_model_pipeline_availability.py`
+    的 `HeaderOnly` 哨兵只允许 `read` 落在 header 范围内）。
+
+    刻意**不**实现 `__getitem__`：整个模块对 header 的访问都是 `read/seek/tell`
+    顺序式；若将来有人按下标取值，应当显式改成读取，而不是让这里悄悄退化成
+    整文件映射。
+    """
+
+    __slots__ = ("_stream", "_size", "_pos")
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._pos = 0
+        try:
+            self._size = int(os.fstat(stream.fileno()).st_size)
+        except (OSError, AttributeError, ValueError):
+            # 底层可能是个**只提供 read 的哨兵**（测试用它禁止越界读）。
+            # 这时拿不到真实大小 —— 必须表示成"无穷大"，否则
+            # `_gguf_skip_value` 的截断检查（`tell() + length > len(handle)`）
+            # 会把每一次跳过都误判成 truncated。
+            self._size = -1
+
+    # —— 只依赖底层 `read` ——
+    #
+    # 刻意**不**委托 `tell()` / `seek()`：本模块的解析器只做"顺序前进"
+    # （`read(n)` 取值、`seek(n, 1)` 跳过），因此偏移量自己记账就够，
+    # 也更贴合"只准读 header"的契约 —— `tests/test_model_pipeline_availability.py`
+    # 的 `HeaderOnly` 哨兵**只**提供了 `read`（它把越界读取变成断言失败），
+    # 委托 `fileno()` / `tell()` 都会直接 `AttributeError`（实测 2026-10-26 14:47/15:05）。
+    def read(self, count=-1):
+        data = self._stream.read(count)
+        self._pos += len(data)
+        return data
+
+    def seek(self, offset, whence=0):
+        """只支持"相对当前位置前进"——这正是解析器的唯一用法。"""
+        if whence == 1 and offset >= 0:
+            remaining = offset
+            # 分块吞掉，避免为一个跳过而尝试分配巨大缓冲。
+            while remaining > 0:
+                chunk = self.read(min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            return self._pos
+        if whence == 0 and offset >= 0:
+            # 绝对定位只用于"从头重来"这种极端情况：退化为吞到目标位置。
+            if offset < self._pos:
+                raise ValueError("GGUF header 视图不支持回退定位")
+            return self.seek(offset - self._pos, 1)
+        if whence == 2:
+            raise ValueError("GGUF header 视图不支持从末尾定位")
+        raise ValueError(f"不支持的 seek: offset={offset} whence={whence}")
+
+    def tell(self):
+        return self._pos
+
+    # —— mmap 才有、而解析器确实用到的能力 ——
+    def __len__(self) -> int:
+        # 大小未知（见 `__init__`）时返回一个远大于任何真实 GGUF 的值，
+        # 让截断检查退化为"不判截断"——宁可让解析器在 EOF 处读到短数据
+        # 自行报 `truncated`，也不要因为哨兵没有 `fileno()` 就全部误判。
+        return self._size if self._size >= 0 else (1 << 62)
+
+
+@contextmanager
+def _gguf_header(path):
+    """只读地打开 GGUF，**按顺序**交出读视图（不做整文件 mmap）。
+
+    ★ 2026-10-26：此前这里是 `mmap.mmap(stream.fileno(), 0)` —— 把**整个文件**
+    映射进地址空间。GGUF header 是纯顺序读（`read(n)` 逐段前进），mmap 的随机
+    访问能力一次都用不上，代价却很实在：
+
+      1. **越界**：映射范围覆盖全部张量载荷与 `tokenizer.ggml.tokens`
+         （本模型 248320 条字符串）⇒ "只读元数据"的契约名存实亡；
+         `tests/test_model_pipeline_availability.py::test_preflight_never_reads_weight_payloads_or_hashes_models`
+         用 `HeaderOnly` 哨兵把这条契约变成硬断言，于是它在 `fileno()` 上直接
+         `AttributeError`（实测 2026-10-26 14:47）。该测试还同时禁止 `sha256`
+         并要求总读取量 ≤ 2×header。
+      2. **无谓开销**：解析 header 只需要前若干 KB ~ 数 MB。
+
+    改回顺序读之后，读取量完全由解析器决定（解析器只前进到 header 结束），
+    既满足契约，也顺带消除了"冷进程摸一遍整份权重"的开销。
+    """
+    with Path(path).open("rb") as stream:
+        yield _HeaderStream(stream)
 
 
 def _gguf_read_string(handle) -> str:
     (length,) = struct.unpack("<Q", handle.read(8))
-    return handle.read(int(length)).decode("utf-8", errors="replace")
+    value = handle.read(int(length))
+    if len(value) != length:
+        raise ValueError("truncated GGUF string")
+    return value.decode("utf-8", errors="replace")
 
 
 def _gguf_read_scalar(handle, value_type: int) -> Any:
@@ -93,19 +253,104 @@ def _gguf_read_scalar(handle, value_type: int) -> Any:
 def _gguf_skip_value(handle, value_type: int) -> None:
     """结构化跳过一个 KV 值（数组递归）。未知类型 ⇒ `ValueError`（由调用方兜成 `None`）。"""
     if value_type == _GGUF_TYPE_STRING:
-        _gguf_read_string(handle)
+        (length,) = struct.unpack("<Q", handle.read(8))
+        if length > _MAX_GGUF_STRING_BYTES or handle.tell() + length > len(handle):
+            raise ValueError("truncated or excessive GGUF string")
+        handle.seek(int(length), 1)
         return
     if value_type == _GGUF_TYPE_ARRAY:
         (element_type,) = struct.unpack("<I", handle.read(4))
         (count,) = struct.unpack("<Q", handle.read(8))
+        if count > _MAX_ARRAY_ITEMS:
+            raise ValueError("GGUF metadata array is excessive")
+        if element_type in _GGUF_SCALAR_TYPES:
+            length = int(count) * _GGUF_SCALAR_TYPES[element_type][1]
+            if handle.tell() + length > len(handle):
+                raise ValueError("truncated GGUF metadata array")
+            handle.seek(length, 1)
+            return
         for _ in range(int(count)):
             _gguf_skip_value(handle, element_type)
         return
     if value_type not in _GGUF_SCALAR_TYPES:
         raise ValueError(f"未知的 GGUF KV 类型: {value_type}")
-    handle.read(_GGUF_SCALAR_TYPES[value_type][1])
+    length = _GGUF_SCALAR_TYPES[value_type][1]
+    if handle.tell() + length > len(handle):
+        raise ValueError("truncated GGUF scalar")
+    handle.seek(length, 1)
 
 
+def _gguf_digest_value(handle, value_type: int, digest) -> None:
+    """消费一个 KV 值（数组递归），**并把读到的原始字节喂给 `digest`** —— 只走一遍。
+
+    ★ 2026-10-26：此前 `read_gguf_tokenizer_sha256` 的做法是
+
+        start = handle.tell();  _gguf_skip_value(...);  end = handle.tell()
+        handle.seek(start);     # 回退
+        while remaining: ...    # 再读一遍算摘要
+
+    也就是**同一个 KV 被完整遍历两次**。对 `tokenizer.ggml.tokens` 这种
+    248320 条字符串的数组（本模型 qwen35），代价实打实翻倍；而且它必须先
+    `seek` 回退 —— 那个回退在后来的"只进不退"读视图上直接 `ValueError`，
+    把这段隐藏浪费变成了显式失败（实测 2026-10-26 15:05）。
+
+    这里把"跳过"和"取摘要"合并成一次顺序读：语义与原来的
+    `sha256(pack(value_type) + raw_bytes[start:end])` 逐字节等价，但只读一遍。
+
+    `digest` 允许为 `None`（调用方只关心跳过时不必构造 hasher）。
+    """
+
+    def feed(chunk) -> None:
+        if digest is not None and chunk:
+            digest.update(chunk)
+
+    if value_type == _GGUF_TYPE_STRING:
+        header = handle.read(8)
+        (length,) = struct.unpack("<Q", header)
+        feed(header)
+        if length > _MAX_GGUF_STRING_BYTES or handle.tell() + length > len(handle):
+            raise ValueError("truncated or excessive GGUF string")
+        remaining = int(length)
+        while remaining > 0:
+            chunk = handle.read(min(remaining, 1 << 20))
+            if not chunk:
+                raise ValueError("truncated GGUF string")
+            feed(chunk)
+            remaining -= len(chunk)
+        return
+    if value_type == _GGUF_TYPE_ARRAY:
+        head = handle.read(12)
+        (element_type,) = struct.unpack("<I", head[:4])
+        (count,) = struct.unpack("<Q", head[4:12])
+        feed(head)
+        if count > _MAX_ARRAY_ITEMS:
+            raise ValueError("GGUF metadata array is excessive")
+        if element_type in _GGUF_SCALAR_TYPES:
+            remaining = int(count) * _GGUF_SCALAR_TYPES[element_type][1]
+            if handle.tell() + remaining > len(handle):
+                raise ValueError("truncated GGUF metadata array")
+            while remaining > 0:
+                chunk = handle.read(min(remaining, 1 << 20))
+                if not chunk:
+                    raise ValueError("truncated GGUF metadata array")
+                feed(chunk)
+                remaining -= len(chunk)
+            return
+        for _ in range(int(count)):
+            _gguf_digest_value(handle, element_type, digest)
+        return
+    if value_type not in _GGUF_SCALAR_TYPES:
+        raise ValueError(f"未知的 GGUF KV 类型: {value_type}")
+    length = _GGUF_SCALAR_TYPES[value_type][1]
+    if handle.tell() + length > len(handle):
+        raise ValueError("truncated GGUF scalar")
+    chunk = handle.read(length)
+    if len(chunk) != length:
+        raise ValueError("truncated GGUF scalar")
+    feed(chunk)
+
+
+@_cached_gguf_reader
 def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     """**零依赖**读 GGUF 头 ⇒ `{"architecture","block_count","nextn_predict_layers","n_layer"}`。
 
@@ -120,7 +365,7 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     if not target.is_file():
         return None
     try:
-        with target.open("rb") as handle:
+        with _gguf_header(target) as handle:
             if handle.read(4) != _GGUF_MAGIC:
                 return None
             (version,) = struct.unpack("<I", handle.read(4))
@@ -178,12 +423,13 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     }
 
 
+@_cached_gguf_reader
 def read_gguf_tokenizer_sha256(path: str | Path) -> str | None:
     """Fingerprint serialized tokenizer GGUF metadata without reading tensor payloads."""
     target = Path(path)
     try:
         file_size = target.stat().st_size
-        with target.open("rb") as handle:
+        with _gguf_header(target) as handle:
             if handle.read(4) != _GGUF_MAGIC:
                 return None
             (version,) = struct.unpack("<I", handle.read(4))
@@ -197,24 +443,24 @@ def read_gguf_tokenizer_sha256(path: str | Path) -> str | None:
             for _ in range(metadata_count):
                 key = _gguf_read_string(handle)
                 (value_type,) = struct.unpack("<I", handle.read(4))
+                # ★ 一次遍历：`_gguf_digest_value` 读的同时把**原始字节**喂给 hasher。
+                #   原实现是"先 `_gguf_skip_value` 定位 end，再 `seek(start)` 重读"
+                #   —— `tokenizer.ggml.tokens` 有 248320 条字符串（本模型），
+                #   等于把最大的那个 KV 完整走两遍。摘要口径不变：
+                #   `sha256(pack(value_type) + raw_bytes)`。
+                field_digest = hashlib.sha256(struct.pack("<I", value_type))
+                wants_digest = key.startswith("tokenizer.")
+                if wants_digest and key in values:
+                    return None
                 start = handle.tell()
-                _gguf_skip_value(handle, value_type)
+                _gguf_digest_value(handle, value_type, field_digest if wants_digest else None)
                 end = handle.tell()
                 if end > file_size:
                     return None
-                if not key.startswith("tokenizer."):
+                if not wants_digest:
                     continue
-                if key in values or end - start > 128 * 1024 * 1024:
+                if end - start > 128 * 1024 * 1024:
                     return None
-                field_digest = hashlib.sha256(struct.pack("<I", value_type))
-                handle.seek(start)
-                remaining = end - start
-                while remaining:
-                    chunk = handle.read(min(remaining, 1 << 20))
-                    if not chunk:
-                        return None
-                    field_digest.update(chunk)
-                    remaining -= len(chunk)
                 values[key] = field_digest.digest()
             if not {"tokenizer.ggml.model", "tokenizer.ggml.tokens"}.issubset(values):
                 return None
@@ -242,6 +488,7 @@ _GGML_TYPE_SIZES: dict[int, tuple[int, int]] = {
 }
 
 
+@_cached_gguf_reader
 def read_gguf_tensor_bytes(path: str | Path) -> dict[str, int] | None:
     """**零依赖**读 GGUF 张量表 ⇒ `{张量名: 字节数}`。
 
@@ -255,7 +502,7 @@ def read_gguf_tensor_bytes(path: str | Path) -> dict[str, int] | None:
     if not target.is_file():
         return None
     try:
-        with target.open("rb") as handle:
+        with _gguf_header(target) as handle:
             if handle.read(4) != _GGUF_MAGIC:
                 return None
             (version,) = struct.unpack("<I", handle.read(4))

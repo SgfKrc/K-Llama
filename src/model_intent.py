@@ -21,6 +21,12 @@ TERMINAL = {"ready", "failed", "cancelled", "superseded"}
 logger = logging.getLogger(__name__)
 
 
+def _query_reads_enabled(owner):
+    return (getattr(owner, "query_reads_enabled", False) is True
+            and callable(getattr(owner, "query_snapshot", None))
+            and callable(getattr(owner, "query_stamp", None)))
+
+
 class ModelIntentCoordinator:
     def __init__(self, scheduler, prepare, *, retire=None, retire_timeout=300, root=None, poll_interval=0.25):
         self.scheduler = scheduler
@@ -60,7 +66,12 @@ class ModelIntentCoordinator:
         return deepcopy(saved)
 
     def current(self):
-        selected = self.scheduler._model_control.snapshot()["selected_operation"]
+        owner = self.scheduler._model_control
+        if _query_reads_enabled(owner):
+            snapshot = owner.query_snapshot()
+            selected = snapshot["selected_operation"]
+            return self.get(selected, snapshot=snapshot) if selected else None
+        selected = owner.snapshot()["selected_operation"]
         return self.get(selected) if selected else None
 
     def _transaction(self, operation_id, candidate_id):
@@ -81,13 +92,19 @@ class ModelIntentCoordinator:
                 value["_native_ready"], value["_native_reason_code"], value["_native_reason"] = self._native_readiness(transaction)
             return value, active
 
-    def get(self, operation_id):
+    def get(self, operation_id, *, snapshot=None):
         from qlh_core.contracts.snapshots import envelope, reason
         owner = getattr(self.scheduler, "_model_control", None)
-        for _ in range(3):
-            before = owner.snapshot() if owner is not None else None
-            result = self._project(operation_id)
-            after = owner.snapshot() if owner is not None else None
+        query_reads = _query_reads_enabled(owner)
+        for attempt in range(3):
+            if query_reads:
+                before = snapshot if attempt == 0 and snapshot is not None else owner.query_snapshot(operation_id=operation_id)
+                result = self._project(operation_id, snapshot=before)
+                after = owner.query_stamp()
+            else:
+                before = owner.snapshot() if owner is not None else None
+                result = self._project(operation_id)
+                after = owner.snapshot() if owner is not None else None
             if before is not None and (before["revision"] != after["revision"] or before["boot_id"] != after["boot_id"]):
                 continue
             code = result.get("reason_code") or result.get("deployment_reason_code", "")
@@ -99,9 +116,10 @@ class ModelIntentCoordinator:
                         revision=None, identity={"operation_id": operation_id}, observed_at=time.time(), validity="pending",
                         reason=reason("snapshot", "snapshot_revision_changed", "model_control", retryability="retry"))
 
-    def _project(self, operation_id):
+    def _project(self, operation_id, *, snapshot=None):
         owner = getattr(self.scheduler, "_model_control", None)
-        snapshot = owner.snapshot() if owner is not None else None
+        if snapshot is None:
+            snapshot = owner.snapshot() if owner is not None else None
         if snapshot is not None and operation_id in snapshot["operations"] and operation_id in snapshot["supplies"]:
             record = snapshot["operations"][operation_id]
             supply = snapshot["supplies"][operation_id]
@@ -123,9 +141,25 @@ class ModelIntentCoordinator:
         # Inventory candidates are not necessarily participants in the admitted
         # plan. Project only assigned nodes once the supply owner publishes it;
         # a global ready phase must never promote an unused candidate to ready.
+        # ★ 2026-10-26（LOCAL-EXECUTORS-01）：**视图键要包含执行器身份**。
+        #
+        #   供给侧的部署视图按执行器分条目：主执行器是裸 `node_id`，附加执行器是
+        #   `node_id#executor_id`（同机 CPU 段就是 `master#cpu`）。这里此前只按裸
+        #   `node_id` 过滤 ⇒ 附加执行器被整条丢掉。实测（2026-10-26 08:03，
+        #   `event=supply_view_publish`）：
+        #     view_key=master#cpu  keys=['TABLET','android','master','master#cpu']  ← 写入成功
+        #   而 `intent.nodes` 只有三条 ⇒ 过滤发生在本层，不是写入失败。
+        #   两种键都接受，保持既有客户端契约不变。
         plan = supply.get("plan") or {}
-        assigned = {item.get("node_id") for item in plan.get("assignments", [])
-                    if isinstance(item, dict) and isinstance(item.get("node_id"), str)}
+        assigned: set[str] = set()
+        for item in plan.get("assignments", []):
+            if not isinstance(item, dict) or not isinstance(item.get("node_id"), str):
+                continue
+            node_key = item["node_id"]
+            assigned.add(node_key)
+            executor_id = item.get("executor_id")
+            if isinstance(executor_id, str) and executor_id:
+                assigned.add(f"{node_key}#{executor_id}")
         if plan.get("admitted") is True and assigned:
             result["nodes"] = {node_id: node for node_id, node in result.get("nodes", {}).items()
                                if node_id in assigned}
@@ -163,13 +197,33 @@ class ModelIntentCoordinator:
             else:
                 result.update(status="preparing", reason_code="", reason="")
             for node_id, node in result.get("nodes", {}).items():
-                ack = (transaction.get("acks") or {}).get(node_id, {})
+                # ★ 2026-10-27（LOCAL-EXECUTORS-01）：视图键可能是 `"master#cpu"`。
+                #
+                #   上面构造 `assigned` 时，附加执行器的键写成 `f"{node_key}#{executor_id}"`
+                #   （本函数约 :162），而 `transaction["acks"]` / `transaction["expected"]`
+                #   的键**都是裸 `node_id`**（回执链是按物理节点建的那一套）。
+                #
+                #   此前直接用 `node_id` 去取 ⇒ `"master#cpu"` 既取不到 ack、
+                #   也不在 `expected` 里 ⇒ 落到最后那个分支之外 ⇒ 它**永远停在初始
+                #   status**（通常 `available`）。实测现象就是"CPU 段在视图里
+                #   长期不亮"。
+                #
+                #   修法：取 ack 前剥掉 `#executor` 后缀；但**带后缀的键不要**
+                #   套用远端那套 `prepared` 判据 —— 本机执行器没有 prepare/commit
+                #   回执链（那些是物理节点之间的义务），硬套只会永远 `loading`。
+                base_node_id, _, view_executor = node_id.partition("#")
+                ack = (transaction.get("acks") or {}).get(base_node_id, {})
+                expected_acks = transaction.get("expected") or {}
                 if result["status"] == "ready":
                     node["status"] = "ready"
                 elif ack.get("status") == "error":
                     node.update(status="failed", reason_code=ack.get("error_code", "WORKER_PREPARE_FAILED"),
                                 reason=ack.get("error", "Worker failed to load its segment"))
-                elif node_id == "master" or node_id in (transaction.get("expected") or {}):
+                elif view_executor:
+                    # 本机附加执行器：它和主段同属一台机器，`result["status"]`
+                    # 已是整次部署的汇总口径；这里只需保证不把它**卡在初始态**。
+                    node["status"] = "ready" if result["status"] == "ready" else "loading"
+                elif base_node_id == "master" or base_node_id in expected_acks:
                     node["status"] = "prepared" if ack.get("phase") == "prepare" and ack.get("loaded") is True else "loading"
         elif record["status"] == "ready" or record.get("config_id"):
             result.update(status="superseded", reason_code="INTENT_PLAN_RETIRED", reason="The selected inference plan has been retired")
