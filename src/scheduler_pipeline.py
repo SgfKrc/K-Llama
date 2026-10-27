@@ -2975,12 +2975,21 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
         )
         if execution_attempts is not None:
             execution_attempts.append((provider, attempt.attempt_id))
+        # ★ 2026-10-27：**stage 执行耗时必须可观测**。
+        #
+        #   此前这条收据只记 `completed_at`，于是"每次请求多出十几秒"这类问题
+        #   只能靠抓日志时间戳反推（实测 prefill 三段 5.8/10.4/11.7 s、decode
+        #   0.2-0.4 s，差 12~38 倍，方向指向权重加载而非计算，但要靠猜）。
+        #   这里记 `provider.execute` 的墙钟耗时：它包含 worker 侧加载 + 前向，
+        #   是区分"算得慢"与"每次重新加载"的唯一直接证据。
+        _stage_started = time.monotonic()
         try:
             result = provider.execute(
                 attempt,
                 reservation,
                 cancel_event or threading.Event(),
             )
+            _stage_elapsed_ms = int((time.monotonic() - _stage_started) * 1000)
             if execution_attempts is not None:
                 # A returned StageResult already proves physical execution
                 # stopped. Its provider cache expires after release; retain
@@ -3007,6 +3016,7 @@ class SchedulerPipelineMixin(WorkerPrepareCoordinatorMixin):
                     "tokens": n_tokens,
                     "hidden_sha256": stage_fields["hidden_sha256"],
                     "result_kind": value["kind"],
+                    "elapsed_ms": _stage_elapsed_ms,
                     "completed_at": time.time(),
                 }, sort_keys=True, separators=(",", ":")),
             )
