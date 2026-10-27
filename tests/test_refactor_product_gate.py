@@ -1,6 +1,7 @@
 """R6 regressions: real shared control schemas and rejection of misleading evidence."""
 from copy import deepcopy
 import sqlite3
+import time
 import pytest
 from qlh_core.adapters.state_migration import migrate, MigrationError
 from qlh_core.contracts.snapshots import envelope
@@ -330,9 +331,30 @@ def test_additional_native_freeze_fallback_shares_scheduler_digest(tmp_path, mon
     monkeypatch.setattr(digests, "_hash_file", observed_hash)
     assert scheduler._local_cpu_artifact_sha256() == hashlib.sha256(original).hexdigest()
     if changed:
+        # ★ 2026-10-27：`original` 与 `replacement` **都是 15 字节**，且下面把
+        #   mtime 拨回原值 ⇒ size 与 mtime 都不体现差异，只有 ChangeTime 能。
+        #   而紧随其后的 write 很容易落在**同一个时间戳 tick** 里（Windows
+        #   ChangeTime 是 FILETIME，实际分辨率取决于卷），于是
+        #   `file_stamp` 完全相等 ⇒ 缓存层认为"文件没变" ⇒ 冻结出来的
+        #   `artifact_sha256` 还是旧摘要 ⇒ 与 `expected` 不等。
+        #
+        #   症状是随机失败（Heisenbug：加一行 print 就过）。这里先跨 tick 再写，
+        #   并校验 stamp 真的变了；不变就重试，2 秒仍不变则显式失败说明前置条件
+        #   不成立，而不是让 `artifact_sha256` 的断言去背这个锅。
         before = artifact.stat()
-        artifact.write_bytes(replacement)
-        os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+        deadline = time.monotonic() + 2.0
+        while True:
+            original_stamp = digests.file_stamp(artifact)
+            time.sleep(0.005)
+            artifact.write_bytes(replacement)
+            os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+            if digests.file_stamp(artifact) != original_stamp:
+                break
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    "ChangeTime 在改写后没有推进（重试 2 秒）：这次改写对 "
+                    "file_stamp 不可见，测试的前置条件不成立"
+                )
     host = SimpleNamespace(_require_pipeline_candidate=lambda key: SimpleNamespace(
         manager=SimpleNamespace(engine_type="pytorch"), model_sha256="a" * 64, descriptor={}))
     assignment = {"engine": "llama_cpp", "executor_id": "cpu", "start_layer": 8, "end_layer": 24}

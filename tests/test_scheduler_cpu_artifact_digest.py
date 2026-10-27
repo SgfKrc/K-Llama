@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -103,8 +104,24 @@ def test_cpu_digest_invalidates_same_size_restored_mtime(
         os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
         os.replace(replacement, artifact)
     else:
-        artifact.write_bytes(b"bad middle 8-24")
-        os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+        # ★ 2026-10-27：原地覆盖分支。`b"bad middle 8-24"` 与原内容**同为 15 字节**，
+        #   mtime 又被拨回去 ⇒ 只有 ChangeTime 能体现差异，而紧随读取之后的写入很容易
+        #   落在**同一个时间戳 tick** 里 ⇒ `file_stamp` 不变 ⇒ 下面那条断言随机失败
+        #   （Heisenbug：加 print 就过）。`replace` 分支换 inode，天然不同，不需要等。
+        #   这里"跨 tick + 校验"，2 秒仍不变则显式失败说明前置条件不成立。
+        deadline = time.monotonic() + 2.0
+        while True:
+            current_stamp = digests.file_stamp(artifact)
+            time.sleep(0.005)
+            artifact.write_bytes(b"bad middle 8-24")
+            os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+            if digests.file_stamp(artifact) != current_stamp:
+                break
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    "ChangeTime 在改写后没有推进（重试 2 秒）：这次改写对 "
+                    "file_stamp 不可见，测试的前置条件不成立"
+                )
     assert artifact.stat().st_size == before.st_size
     assert artifact.stat().st_mtime_ns == before.st_mtime_ns
     assert digests.file_stamp(artifact) != stamp
@@ -133,8 +150,28 @@ def test_cpu_digest_rejects_change_during_hash(artifact, monkeypatch):
 
     def changing_hash(path, cancelled=None):
         digest = original(path, cancelled)
-        path.write_bytes(b"bad middle 8-24")
-        return digest
+        # ★ 2026-10-27：**必须先跨出当前时间戳 tick 再写，并确认 stamp 真的变了。**
+        #
+        #   fixture 的原文是 `b"cpu middle 8-24"`，这里写 `b"bad middle 8-24"`
+        #   —— **两者都是 15 字节**，size 完全相同，所以"文件变了"只能由时间戳
+        #   体现。而读 15 字节几乎瞬时，写紧随其后 ⇒ 很容易落在**同一个时间戳
+        #   tick** 里，mtime 与 ChangeTime 都不推进 ⇒ `file_stamp` 相等 ⇒
+        #   被测的"hash 期间发生了变更"检测不到。
+        #
+        #   症状是随机失败（Heisenbug：加一行 print 就过）。只 sleep 一次仍会偶发
+        #   失败（实测 8 次里 2 次），所以换成"重试到 stamp 真的变"。
+        deadline = time.monotonic() + 2.0
+        while True:
+            before_stamp = digests.file_stamp(path)
+            time.sleep(0.005)
+            path.write_bytes(b"bad middle 8-24")
+            if digests.file_stamp(path) != before_stamp:
+                return digest
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    "ChangeTime 在改写后没有推进（重试 2 秒）：这次改写对 "
+                    "file_stamp 不可见，测试的前置条件不成立"
+                )
 
     monkeypatch.setattr(digests, "_hash_file", changing_hash)
     assert scheduler._local_cpu_artifact_sha256() == ""

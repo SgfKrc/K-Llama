@@ -109,12 +109,30 @@ class NativeTool {
 
 
 def retry_fixture_sharing(operation):
-    """Only retry Windows sharing violations while preparing fake tools."""
-    for attempt in range(12):
+    """Only retry Windows sharing violations while preparing fake tools.
+
+    ★ 2026-10-27：上限从 12 次提到 20 次。
+
+    原来 12 次 × (0.5, 1.0, …, 6.0 s) ≈ 39 秒。并发跑（`-n 6`）时杀软与
+    SearchIndexer 会把这个刚由 `Add-Type` 生成的 `fake.exe` 持有得更久，实测 44 个
+    用例在 `-n 6` 下偶发 1–2 个 `WinError 32`，而同一个文件单跑 **44 passed**
+    （10 分钟）—— 说明不是被测契约的问题，是环境占用。20 次累计约 105 秒，
+    仍在 pytest 的 300 秒单测超时内。
+
+    **刻意用次数、不用墙钟预算**：`FakeToolReadinessTests` 会 patch
+    `time.sleep`（并让操作立即失败），按 `time.monotonic()` 设 deadline 在那里
+    就是死循环 —— 实测放开成墙钟控制后，该用例跑了 **5,854,332 次**才被测试框架
+    打断。次数上限对 mock 是安全的。
+
+    退避形状保持 `0.5 × (attempt + 1)` 的**线性**递增：`FakeToolReadinessTests`
+    用它固化"只重试共享冲突、且退避确实递增"的契约。
+    """
+    attempts = 20
+    for attempt in range(attempts):
         try:
             return operation()
         except OSError as error:
-            if getattr(error, "winerror", None) != 32 or attempt == 11:
+            if getattr(error, "winerror", None) != 32 or attempt == attempts - 1:
                 raise
             time.sleep(0.5 * (attempt + 1))
 
@@ -843,9 +861,11 @@ class FakeToolReadinessTests(unittest.TestCase):
 
         self.assertIs(caught.exception, error)
         self.process.assert_called_once()
-        self.assertEqual(self.exclusive.call_count, 12)
+        # ★ 2026-10-27：上限从 12 提到 20（并发下杀软持有更久；见
+        #   `retry_fixture_sharing` 的 docstring）。退避仍是线性递增。
+        self.assertEqual(self.exclusive.call_count, 20)
         self.assertEqual([call.args for call in self.sleep.call_args_list],
-                         [(0.5 * attempt,) for attempt in range(1, 12)])
+                         [(0.5 * attempt,) for attempt in range(1, 20)])
 
     def test_builder_failures_are_never_replayed_or_replaced(self):
         outputs = (

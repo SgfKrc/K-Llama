@@ -7,6 +7,34 @@ import pytest
 import qlh
 
 
+@pytest.fixture(autouse=True)
+def _isolate_dotenv(monkeypatch):
+    """让 `--auto-start` 路径**读不到仓库根的 `.env`**。
+
+    ★ 2026-10-27：这是本文件在开发机上必红、在 CI 上却绿的原因。
+
+    `qlh._shell_options` 在 `--auto-start` 时调
+    `SettingsStore(...).load_listener()`，而它按
+    ``[get_app_root()/".env", src/".env", cwd/".env"]`` **直接扫磁盘**
+    （见 `qlh_core/adapters/settings.py:_read_inputs`）—— `monkeypatch.delenv`
+    对它**完全无效**。
+
+    开发机的 `.env` 里有 `QLH_BACKEND_HOST=0.0.0.0`（为了局域网多机联调），于是
+    "环境里没配就该 loopback" 这条断言在本机恒挂。把它隔离掉，让这些用例只反映
+    **进程环境 + CLI 参数**这两层优先级，不被工作区的 `.env` 内容绑定。
+
+    只覆盖 `load_listener`：它唯一的生产消费者就是这里的 shell 启动路径。
+    返回**显式环境快照**（`dict(self._environment)`）而不是 `{}` —— 因为真实实现
+    在读完 `.env` 后有一句 `environment.update(self._environment)`，**显式环境永远
+    压过 `.env`**。这里等价于"只有显式环境这一层"，于是
+    `monkeypatch.setenv("QLH_BACKEND_HOST", "0.0.0.0")` 的用例仍然成立。
+    """
+    from qlh_core.adapters.settings import SettingsStore
+
+    monkeypatch.setattr(
+        SettingsStore, "load_listener", lambda self: dict(self._environment))
+
+
 def test_help_is_local_and_does_not_spawn(monkeypatch, capsys):
     called = []
     monkeypatch.setattr(qlh.subprocess, "run", lambda *args, **kwargs: called.append(args))

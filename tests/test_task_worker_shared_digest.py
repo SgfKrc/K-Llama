@@ -178,10 +178,31 @@ def test_worker_digest_invalidates_same_size_restored_mtime(
     before = artifact.stat()
     stamp = digests.file_stamp(artifact)
     changed = artifact.with_suffix(".new") if change == "replace" else artifact
-    changed.write_bytes(b"modified payload")
-    os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
+    # ★ 2026-10-27：`rewrite` 分支是原地覆盖，而 `b"modified payload"` 与原内容
+    #   **同为 16 字节**、mtime 又被拨回去 ⇒ 只有 ChangeTime 能体现差异。紧接原
+    #   读取之后的写入很容易落在**同一个时间戳 tick** 里 ⇒ `file_stamp` 不变 ⇒
+    #   下面那条 `!= stamp` 随机失败（Heisenbug：加 print 就过）。
+    #
+    #   `replace` 分支写的是全新文件（`.new`，此时还不存在）并 `os.replace` 换
+    #   inode，天然不同，不需要等 —— 所以两条分支必须分开。
     if change == "replace":
+        changed.write_bytes(b"modified payload")
+        os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
         os.replace(changed, artifact)
+    else:
+        deadline = time.monotonic() + 2.0
+        while True:
+            current_stamp = digests.file_stamp(artifact)
+            time.sleep(0.005)
+            artifact.write_bytes(b"modified payload")
+            os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+            if digests.file_stamp(artifact) != current_stamp:
+                break
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    "ChangeTime 在改写后没有推进（重试 2 秒）：这次改写对 "
+                    "file_stamp 不可见，测试的前置条件不成立"
+                )
     assert artifact.stat().st_size == before.st_size
     assert artifact.stat().st_mtime_ns == before.st_mtime_ns
     assert digests.file_stamp(artifact) != stamp
@@ -233,7 +254,7 @@ def test_worker_digest_rejects_change_during_hash(artifact, monkeypatch):
 
     def changing_hash(path, cancelled=None):
         digest = original(path, cancelled)
-        # ★ 2026-10-27：**必须先跨出当前时间戳 tick 再写。**
+        # ★ 2026-10-27：**必须先跨出当前时间戳 tick 再写，并确认 stamp 真的变了。**
         #
         #   这个 fixture 的文件只有 16 字节（`b"original payload"`，改后
         #   `b"modified payload"` 也是 16 字节 ⇒ **size 完全相同**），所以"文件
@@ -242,10 +263,20 @@ def test_worker_digest_rejects_change_during_hash(artifact, monkeypatch):
         #   完全相等 ⇒ 被测的"hash 期间发生了变更"永远检测不到。
         #
         #   症状是随机失败（Heisenbug）：加一行 print 就过，因为打印把两次系统调用
-        #   推到了不同 tick。
-        time.sleep(0.005)
-        path.write_bytes(b"modified payload")
-        return digest
+        #   推到了不同 tick。只 sleep 一次仍会偶发（姊妹用例实测 8 次里 2 次失败），
+        #   所以换成"重试到 stamp 真的变"。
+        deadline = time.monotonic() + 2.0
+        while True:
+            before_stamp = digests.file_stamp(path)
+            time.sleep(0.005)
+            path.write_bytes(b"modified payload")
+            if digests.file_stamp(path) != before_stamp:
+                return digest
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    "ChangeTime 在改写后没有推进（重试 2 秒）：这次改写对 "
+                    "file_stamp 不可见，测试的前置条件不成立"
+                )
 
     monkeypatch.setattr(digests, "_hash_file", changing_hash)
     assert task_worker._verified_layer_artifact_sha256(artifact) == ""
