@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -32,11 +33,43 @@ def no_read(*args, **kwargs):
 
 
 def mutate(path):
+    """翻掉最后一个字节、再把 mtime 拨回去 —— 制造"内容变了、版本看着没变"。
+
+    ★ 2026-10-27：**必须确认这次写入真的推进了 ChangeTime 才返回。**
+
+    踩到的真因（实测，不是猜）：Windows 的 ChangeTime 是 FILETIME，但**紧随文件
+    创建/上一次写入之后的 write 很可能落在同一个时间戳 tick 内** ⇒ ChangeTime 不
+    推进 ⇒ 对 `file_stamp` 完全不可见（size/mtime/ctime/ino 本来就被刻意造得相等）。
+    实测证据：
+
+        gguf() 刚写完立刻改写 → stamp 变 = False
+        同一个文件隔了 50 ms 再改写 → stamp 变 = True
+
+    后果是依赖"篡改可被发现"的断言**随机失败**，而且是典型 Heisenbug —— 加一行
+    `print` 就通过，因为打印把两次系统调用推到了不同 tick。实测
+    `test_metadata_items_keeps_final_fences[file_digest_mismatch-reuse]` 正是如此。
+
+    所以这里：先 sleep 跨过当前 tick → 写入 → 恢复 mtime → **验 stamp 真的变了**；
+    没变就重试（换一个字节再写），超过 2 秒直接失败并说明原因，不让被测断言背
+    "缓存没失效"的锅。
+    """
     before = path.stat()
-    with path.open("r+b") as handle:
-        handle.seek(-1, 2)
-        handle.write(b"x")
-    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    deadline = time.monotonic() + 2.0
+    while True:
+        original = digests.file_stamp(path)
+        time.sleep(0.005)                       # 跨出当前时间戳 tick
+        replacement = b"y" if path.read_bytes()[-1:] == b"x" else b"x"
+        with path.open("r+b") as handle:
+            handle.seek(-1, 2)
+            handle.write(replacement)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        if digests.file_stamp(path) != original:
+            return
+        if time.monotonic() > deadline:
+            pytest.fail(
+                "ChangeTime 在篡改后没有推进（重试 2 秒）：这次篡改对 file_stamp "
+                "不可见，测试的前置条件不成立 —— 不要就此断言缓存行为"
+            )
 
 
 def test_shared_digest_survives_a_fresh_process(tmp_path):

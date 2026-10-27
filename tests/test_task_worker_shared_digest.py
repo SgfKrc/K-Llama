@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -232,6 +233,17 @@ def test_worker_digest_rejects_change_during_hash(artifact, monkeypatch):
 
     def changing_hash(path, cancelled=None):
         digest = original(path, cancelled)
+        # ★ 2026-10-27：**必须先跨出当前时间戳 tick 再写。**
+        #
+        #   这个 fixture 的文件只有 16 字节（`b"original payload"`，改后
+        #   `b"modified payload"` 也是 16 字节 ⇒ **size 完全相同**），所以"文件
+        #   变了"只能由时间戳体现。而读 16 字节几乎瞬时，写紧随其后 ⇒ 很容易落在
+        #   **同一个时间戳 tick** 里，mtime 与 ChangeTime 都不推进 ⇒ `file_stamp`
+        #   完全相等 ⇒ 被测的"hash 期间发生了变更"永远检测不到。
+        #
+        #   症状是随机失败（Heisenbug）：加一行 print 就过，因为打印把两次系统调用
+        #   推到了不同 tick。
+        time.sleep(0.005)
         path.write_bytes(b"modified payload")
         return digest
 
