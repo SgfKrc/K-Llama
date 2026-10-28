@@ -600,6 +600,32 @@ class ModelSupplyWorker:
                 self._runner = threading.Thread(target=self._run, name="model-supply-worker", daemon=True)
                 self._runner.start()
 
+    def _local_cut_budget_for_target(self, model_id: str | None) -> dict | None:
+        """Layer budget computed from the GGUF that this operation targets (#143).
+
+        Delegates to the scheduler's `_task_worker_local_cut_layer_budget`, which
+        sizes the budget from the complete local GGUF and the node's free memory.
+        The scheduler resolves *which* GGUF by `_last_supply_model_id`, so that
+        value has to be set first (it is, at the top of `_inventory_reply`).
+
+        Returns `None` when the node is not a local-cut worker or the probe fails,
+        so a non-cutting node's reply keeps its exact previous shape.
+        """
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            return None
+        probe = getattr(scheduler, "_task_worker_local_cut_layer_budget", None)
+        if not callable(probe):
+            return None
+        try:
+            budget = probe()
+        except Exception:  # noqa: BLE001 — budget discovery must not break inventory
+            _LOG.debug("local-cut budget probe failed", exc_info=True)
+            return None
+        if not isinstance(budget, dict) or not budget.get("local_cut"):
+            return None
+        return budget
+
     def _inventory_reply(self, op: _Operation, model_id: str | None = None) -> None:
         try:
             # ★ 2026-10-28（#139）：记住本次供给的目标模型。
@@ -630,6 +656,23 @@ class ModelSupplyWorker:
             # Keep legacy callers (including zero-argument inventory hooks) valid.
             result = self.inventory() if model_id is None else self.inventory(model_id=model_id)
             result.update(action="inventory_result", operation_id=op.operation_id, node_id=op.node_id)
+            # ★ 2026-10-28（#143）：**把按本次目标算好的 layer_budget 直接带回**。
+            #
+            #   原先预算只能由 hello capabilities 携带，而 hello 在 worker 启动时
+            #   就发出、早于任何 inventory ⇒ 那时不知道目标模型 ⇒ 只能盲取第一个
+            #   整模源。Surface 上 `qwen3-0.6b` 排在 9B 之前 ⇒ 按 21.8 MiB/层申报
+            #   （= 609.8/28），主节点把 max_layers 判成 282、`ranges=[[0,28]]`
+            #   （28 是 0.6B 的层数）⇒ prepare 裁决
+            #   `pipeline_distributed_capacity_insufficient`。
+            #
+            #   曾尝试"目标变化时重发 hello 让 master 重新拉取"，但那条路径依赖
+            #   `refresh_task_worker_capabilities` 是否真的重发、以及 master 对重发
+            #   hello 的世代去重 —— 实测（11:13）重发后容量投影里仍是 21.8 MiB。
+            #   inventory 是**本次供给特有的**往返，目标模型就随它一起传到，
+            #   所以在这里把预算算准并回传，不需要任何时序假设。
+            budget = self._local_cut_budget_for_target(model_id)
+            if budget is not None:
+                result["layer_budget"] = budget
             self._send(op, result, inventory=True)
         except Exception:
             self._send(op, {"action": "inventory_result", "operation_id": op.operation_id,
