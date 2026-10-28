@@ -168,6 +168,48 @@ def keep_head_shim_available() -> bool:
     return bool(path) and Path(path).is_file()
 
 
+def _segment_layer_bytes(source: dict) -> int:
+    """Mean per-layer weight bytes of a complete GGUF, *excluding* components.
+
+    The solver charges `embedding` to the first segment and `lm_head` to the last
+    one (`capacity.py`: `has_embedding = not started`, `has_lm_head = end ==
+    layer_budget`). Averaging the whole file over the layer count therefore counts
+    those two components twice — measured on 9B Q4_K that inflates each layer from
+    125.5 MiB to 172.3 MiB (+27%), which alone made every `[0, N)` candidate on a
+    6 GiB device look unaffordable.
+
+    Falls back to the plain average when the tensor table cannot be read, so a
+    node without the gguf package keeps its previous advertisement byte for byte.
+    """
+    total = source.get("total_layers")
+    size = source.get("size_bytes")
+    path = source.get("path")
+    fallback = int(size) // int(total) if total and size else 0
+    if path is None or not total or not size:
+        return fallback
+    try:
+        from model_supply_assets import _gguf_table
+        from relay_segment_info import read_gguf_layer_info
+        import gguf_tensor_selection as selection
+
+        info = read_gguf_layer_info(path) or {}
+        _metadata, ranges = _gguf_table(Path(path))
+        table = {name: int(value[1]) for name, value in ranges.items()}
+        block = info.get("block_count") or int(total)
+        nextn = int(info.get("nextn_predict_layers") or 0)
+        picked = selection.select_gguf_tensors(
+            table, block_count=int(block), start_layer=0, end_layer=int(total),
+            architecture=info.get("architecture"), nextn_predict_layers=nextn,
+        )
+        layer_bytes = [int(value) for value in picked.layer_weight_bytes]
+        positive = [value for value in layer_bytes if value > 0]
+        if positive:
+            return sum(positive) // len(positive)
+    except (ImportError, OSError, ValueError, TypeError):
+        logger.debug("segment layer byte probe failed", exc_info=True)
+    return fallback
+
+
 def _remote_accept_timeout_seconds() -> float:
     """Accept-wait ceiling for remote layer stages (`QLH_REMOTE_ACCEPT_TIMEOUT_SECONDS`).
 
@@ -747,7 +789,21 @@ class SchedulerTaskWorkerMixin:
             return None
         if available <= 0:
             return None
-        per_layer = int(size) // int(total)
+        # ★ 2026-10-28（#143）：**每层字节要扣掉 embedding / lm_head**。
+        #
+        #   `size_bytes` 是整模总字节（含 `token_embd` 与 `output.weight`），此前
+        #   直接 `// total_layers` 平均摊到每层。而求解器对**首段**额外加
+        #   `embedding`、对**末段**额外加 `lm_head`（`capacity.py:1511-1512`）
+        #   ⇒ 两者被算了两遍。
+        #
+        #   实测（9B Q4_K，`gguf_tensor_selection` 逐张量求和）：
+        #     embedding 545.6 MiB、lm_head 795.7 MiB、真实每层 125.5 MiB
+        #     `// total_layers` 得 172.3 MiB，**每层多算 46.8 MiB（27%）**
+        #   后果：整域 `[0,32)` 按旧口径需 32×172.3 + 545.6 + 795.7 = 6855 MiB，
+        #   超过 Surface 的 6028 MiB 可用 ⇒ 所有 `[0,N)` 候选被判
+        #   `node_capacity_insufficient`（实测 N=6…29 共 20 条）；按真实口径
+        #   只需 32×125.5 + 545.6 + 795.7 = 5358 MiB ⇒ 放得下。
+        per_layer = _segment_layer_bytes(source)
         if per_layer <= 0:
             return None
         # 与 Android 同系数：留 40% 给 KV 缓存与运行时。
