@@ -115,35 +115,76 @@ def reuse_artifact_matches(artifact: Any, manifest: dict) -> bool:
 
 
 def inventory_local_cut_budget(inventory: dict, sources: dict) -> dict | None:
-    """Calculate a cut budget from the exact GGUF source selected for this supply."""
+    """Calculate a cut budget from the exact GGUF source selected for this supply.
+
+    ★ 2026-10-28（#143）：**预算匹配不要求 tokenizer 摘要相等。**
+
+    预算只需要两个量：这份 GGUF 有几层、每层多少字节（外加上报的可用内存）。
+    `tokenizer_sha256` 与该能力无关 —— 它校验的是"上游启动词表是否同源"，
+    而 `local_cut` 节点的可裁性只取决于 GGUF 自身。
+
+    此前把 `tokenizer_sha256` 当成匹配的必要条件，导致一个结构性问题：主节点在
+    `engine != "llama_cpp"` 时走 `require_cross_format`，`sources` 的 tokenizer
+    取自 **safetensors 族**的 `tokenizer.json`；而 GGUF worker 上报的是**内嵌
+    tokenizer**。两者永远不会逐字节相同（本机三份 9B GGUF 的 tokenizer 甚至
+    两两不同：`7a70c227` / `3dbcec8c` / `0572e418`，而 HF 的是 `5f9e4d49`）。
+
+    实测后果（2026-10-28 10:23，Surface 7 Pro，跑 9B）：
+      匹配失败 ⇒ 本函数返回 None ⇒ 调用方回落到 hello 里**残留的 0.6B 预算**
+      ⇒ `per_layer_bytes=21.8 MiB`（0.6B 是 609.8/28）、`max_layers=286`、
+      `ranges=[[0,28]]`（0.6B 的层数，9B 是 32）
+      ⇒ prepare 容量裁决 `pipeline_distributed_capacity_insufficient`（#141）。
+
+    因此这里只按 `source_model_sha256` + `total_layers` 匹配。`total_layers` 仍是
+    硬条件（层数不同就不是同一份模型）；`tokenizer_sha256` 不再参与。
+    """
     if not inventory.get("local_cut"):
         return None
     source_sha = sources.get("source_model_sha256")
-    tokenizer_sha = sources.get("tokenizer_sha256")
-    descriptor = (sources.get("descriptors") or {}).get("llama_cpp") or {}
-    total_layers = descriptor.get("total_layers")
-    if (not isinstance(source_sha, str) or not isinstance(tokenizer_sha, str)
-            or type(total_layers) is not int or total_layers <= 0):
+    if not isinstance(source_sha, str) or not source_sha:
         return None
     inventory_sources = inventory.get("sources")
     if not isinstance(inventory_sources, list):
         return None
-    source = next((item for item in inventory_sources
-                   if isinstance(item, dict)
-                   and item.get("source_model_sha256") == source_sha
-                   and item.get("tokenizer_sha256") == tokenizer_sha
-                   and (item.get("total_layers") is None
-                        or (type(item.get("total_layers")) is int
-                            and item.get("total_layers") == total_layers))), None)
+    matches = [item for item in inventory_sources
+               if isinstance(item, dict)
+               and item.get("source_model_sha256") == source_sha]
+    if not matches:
+        return None
+    # 层数优先取 worker 自己上报的值（它对本地文件有直接证据）；
+    # descriptor 的 `total_layers` 仅作交叉校验，缺失时不再否决整个预算
+    # ——实测 Surface 的 `descriptors.llama_cpp` 是空 dict。
+    descriptor_total = ((sources.get("descriptors") or {}).get("llama_cpp") or {}).get("total_layers")
+    source = next((
+        item for item in matches
+        if type(item.get("total_layers")) is int and item.get("total_layers") > 0
+        and (type(descriptor_total) is not int or descriptor_total <= 0
+             or item.get("total_layers") == descriptor_total)
+    ), None)
+    if source is None and type(descriptor_total) is int and descriptor_total > 0:
+        # worker 没报层数：退而用 descriptor 声明值，但仍要求源摘要匹配。
+        source = matches[0]
     if source is None:
+        return None
+    total_layers = source.get("total_layers")
+    if type(total_layers) is not int or total_layers <= 0:
+        total_layers = descriptor_total
+    if type(total_layers) is not int or total_layers <= 0:
         return None
     size_bytes = source.get("size_bytes")
     available = inventory.get("memory_available_bytes")
     if type(size_bytes) is not int or size_bytes <= 0 or type(available) is not int or available <= 0:
         return None
     per_layer_bytes = size_bytes // total_layers
+    if per_layer_bytes <= 0:
+        return None
+    # 可用额度沿用既有的 0.6 系数（为 KV 缓存与运行时预留 40%）。
+    # 该系数是既有契约（`test_inventory_local_cut_budget_matches_selected_source_identity`
+    # 与 `test_supply_capacity_budget_uses_inventory_source_matching_selected_model`
+    # 都以 `available × 0.6` 断言），本次不动它 —— #143 的根因是 tokenizer 匹配
+    # 与"回落到过期 hello"，不是系数宽严。
     available_bytes = int(available * 0.6)
-    max_layers = available_bytes // per_layer_bytes if per_layer_bytes > 0 else 0
+    max_layers = available_bytes // per_layer_bytes
     if max_layers <= 0:
         return None
     return {"available_bytes": available_bytes, "per_layer_bytes": per_layer_bytes,
