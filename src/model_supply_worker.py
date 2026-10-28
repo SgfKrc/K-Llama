@@ -27,6 +27,29 @@ from model_supply_digest_cache import file_stamp as _file_stamp
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,256}")
+
+
+def _resend_capabilities(scheduler) -> None:
+    """Refresh the coordinator's view of this worker's capabilities (#143).
+
+    The capability snapshot is built by `SchedulerTaskWorkerMixin`, not by the
+    supply worker, so the call has to go through the scheduler. Both entry points
+    are tried because `refresh_task_worker_capabilities` exists on some builds
+    while the hello sender is the one that actually re-advertises `layer_budget`.
+    Best effort: a failure here must never break an inventory reply.
+    """
+    if scheduler is None:
+        return
+    for attribute in ("refresh_task_worker_capabilities", "_send_task_worker_hello"):
+        method = getattr(scheduler, attribute, None)
+        if not callable(method):
+            continue
+        try:
+            method()
+        except Exception:  # noqa: BLE001 — capability refresh is best effort
+            continue
+
+
 _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_CANCELLED_OPERATIONS = 256
 _TRANSFER_COUNTERS = ("downloaded_bytes", "actual_downloaded_bytes", "reused_bytes", "resumed_bytes")
@@ -586,19 +609,24 @@ class ModelSupplyWorker:
             if isinstance(model_id, str) and model_id:
                 previous = str(getattr(self, "_last_supply_model_id", "") or "")
                 self._last_supply_model_id = model_id
-                # ★ 2026-10-28（#139）：**目标模型一变就重发 hello**。
-                #   hello 在 worker 启动时先于第一次 inventory 发出，那时还没有目标
-                #   ⇒ `_task_worker_local_full_source()` 只能盲取第一个整模源
-                #   （Surface 上是 `qwen3-0.6b`），合成出错误的模型身份
-                #   ⇒ 容量求解永不选中它。实测 04:56 仍是 `qwen3-0.6b`。
-                #   拿到目标后重发一次，让 `models` 反映真正要跑的模型。
+                # ★ 2026-10-28（#143）：**目标模型一变就让调度器重算能力并重发 hello**。
+                #
+                #   hello 在 worker 启动时先于第一次 inventory 发出，那一刻还没有
+                #   目标 ⇒ `_task_worker_local_full_source()` 只能盲取候选列表第一个。
+                #   Surface 上 `models/` 下同时有 `qwen3-0.6b` 与 9B，0.6b 排在前
+                #   ⇒ `_task_worker_local_cut_layer_budget()` 按 21.8 MiB/层申报
+                #   （= 609.8/28），而 9B 是 172.3 MiB/层。实测（10:56，Surface）：
+                #     _last_supply_model_id = ''
+                #     _task_worker_local_full_source() => 'qwen3-0.6b' total=28
+                #     _task_worker_local_cut_layer_budget() => 21.8 MiB, max_layers=279
+                #   主节点据此把 max_layers 判成 283、`ranges=[[0,28]]`（28 是 0.6B
+                #   的层数），prepare 裁决因此失败。
+                #
+                #   注意 `_send_task_worker_hello` 定义在 **scheduler** 上
+                #   （`SchedulerTaskWorkerMixin`），不在 supply worker 自身 ——
+                #   此前 `getattr(self, ...)` 恒取不到，重发从未发生过。
                 if model_id != previous:
-                    resend = getattr(self, "_send_task_worker_hello", None)
-                    if callable(resend):
-                        try:
-                            resend()
-                        except Exception:  # noqa: BLE001 — capability refresh is best effort
-                            pass
+                    _resend_capabilities(getattr(self, "scheduler", None))
             # Keep legacy callers (including zero-argument inventory hooks) valid.
             result = self.inventory() if model_id is None else self.inventory(model_id=model_id)
             result.update(action="inventory_result", operation_id=op.operation_id, node_id=op.node_id)
