@@ -1,11 +1,14 @@
 # OpenAI Responses 协议接入计划
 
-> 状态：未实现
+> 状态：已实现，`tools/verify_responses.py` 全部通过
 > 更新日期：2026-10-29
 
-`server.py` 现在只实现 `/v1/chat/completions`。Responses 是 OpenAI 目前主推的接口形态，
+`server.py` 原本只实现 `/v1/chat/completions`。Responses 是 OpenAI 目前主推的接口形态，
 两者的请求与响应形状差别不小，不能靠改几个字段糊过去。本文件定下要做什么、不做什么、
 以及验收判据。
+
+实现落在 `server.py`（路由）+ `proto_responses.py`（纯翻译层，无 socket / 无 chain /
+无状态，因此可脱离模型单测）。**§5 起是实现后才确认的事实，与最初的计划有出入，以那里为准。**
 
 ---
 
@@ -232,3 +235,79 @@ assert "".join(got)
 ⚠️ `developers.openai.com` 的页面直连返回 403，抓不到内容。上面 Parallel 的文档是
 可访问的第三方实现说明，字段与事件名与官方一致，可作为实现依据。若需核对官方原文，
 用浏览器打开官方链接，不要依赖脚本抓取。
+
+---
+
+## 9. 实现后修正的事实
+
+计划里有几条写错了。以下以实测为准。
+
+### 9.1 `seed` 不在 SDK 的 responses.create 签名里
+
+计划 §3 说采样参数"直接转发"。实际上 openai 3.41.0 的
+`client.responses.create()` 不接受 `seed`：
+
+```
+TypeError: unexpected keyword argument 'seed'
+```
+
+只能走 `extra_body={"seed": N}`。服务端照常接收并转发到最后一段，但真实客户端
+拿不到这个参数——写文档时把它当成一等参数是错的。
+
+### 9.2 `logprobs` 是流事件的必填字段
+
+`ResponseTextDeltaEvent.logprobs` 在 SDK 里声明为 `List[Logprob]`，不是 Optional。
+计划 §2 的事件示例里没有它。每条 delta 和 `output_text.done` 都必须带
+`logprobs: []`。
+
+### 9.3 SDK 是惰性构造，不校验字段
+
+计划 §7.1 说"少了字段 SDK 会拒绝"。这句过强：SDK 用 `construct()` 而不是
+`validate_type`，缺字段不会在解析时抛错，而是属性访问拿到 `None`——**静默错误，
+比抛错更难查**。所以验收不能只看"SDK 没报错"，要真的读属性。
+
+实际补全的必填项包括 `parallel_tool_calls`、`tool_choice`、`tools`、
+`annotations`、`usage` 的三个子对象。
+
+### 9.4 同一响应在流式与非流式下可能给出矛盾的状态
+
+初版流式的 `output_item.done` 硬编码 `status: "completed"`，而非流式在截断时输出
+`incomplete`。同一个响应两条路径互相矛盾。现在两处共用一个纯函数
+`responses_status(tokens, max_tokens)`。
+
+### 9.5 截断是正常结果，不是错误
+
+`status: "incomplete"` + `incomplete_details.reason: "max_output_tokens"` + HTTP 200。
+生成到上限不是请求错误，OpenAI 也这么返回。
+
+但要留意：**当前 2B 拓扑下模型贪心解码从不发 EOG**（换 6 个 prompt 探过，全部跑满
+上限），所以只要 `max_output_tokens` 不够大，几乎每个响应都是 `incomplete`。
+客户端若断言 `status == "completed"` 会失败。这是模型本身的既有事实，不是协议问题。
+
+### 9.6 文档里的行号会过期
+
+计划 §6 写 `server.py` 有 362 行、`_full_response` 在 L289。实际改动前已是 414 行。
+行号不要写进文档，写结构关系。
+
+---
+
+## 10. 验收怎么跑
+
+```powershell
+# 起服务（2B 两段，1.44 GB，不需要远端机器）
+$env:SA_SHIM = "H:\slimarc-proto\shim\bin\qlh_keep_head.dll"
+python server.py --topology topology-2b.toml --port 8080 --max-tokens 64
+
+# 另一个终端
+python tools/verify_responses.py
+```
+
+`verify_responses.py` 覆盖：官方 SDK 解析（流式与非流式）、与 chat completions
+逐字一致、中文零替换字符、不支持字段报错、空值接受。
+
+### 一个自己踩过的判据错误
+
+第一版验收里我拿"`temperature=0.7 top_p=0.9` 时两个端点文本相同"当判据，结果稳定
+失败。原因不是协议问题，是**没传 seed 时采样本就随机**：两次调用产生不同序列是正确
+行为，断言相等等于在测随机数。改成"argmax 下相同"和"固定 seed 下相同"，并且额外
+验证同 seed 两次能复现——否则前一条没有意义。

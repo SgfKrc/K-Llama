@@ -182,6 +182,12 @@ def flatten_messages(messages: list[dict]) -> str:
     return "\n".join(parts)
 
 
+# Responses request/response translation. Kept in its own module because the two
+# protocol shapes differ more than the code that carries them.
+from proto_responses import (  # noqa: E402 - after the sys.path insert above
+    flatten_input, rejected_responses_field, responses_message, responses_object,
+    responses_status, responses_usage,
+)
 class Handler(BaseHTTPRequestHandler):
     server_version = "slimarc/0.1"
     protocol_version = "HTTP/1.1"
@@ -243,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
-        if path not in ("/v1/chat/completions", "/chat/completions"):
+        if path not in ("/v1/chat/completions", "/chat/completions", "/v1/responses"):
             self._json(404, {"error": {"message": f"no route {path}", "type": "not_found"}})
             return
         try:
@@ -252,6 +258,13 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError) as exc:
             self._json(400, {"error": {"message": f"bad request body: {exc}",
                                         "type": "invalid_request_error"}})
+            return
+        if not isinstance(body, dict):
+            self._json(400, {"error": {"message": "request body must be an object",
+                                        "type": "invalid_request_error"}})
+            return
+        if path == "/v1/responses":
+            self._responses(body)
             return
 
         messages = body.get("messages")
@@ -359,6 +372,146 @@ class Handler(BaseHTTPRequestHandler):
                                 "finish_reason": "length" if tokens >= max_tokens else "stop"}],
                    "usage": {"completion_tokens": tokens},
                    "slimarc": {"sampling": self.chain.sampling_state()}})
+        self._sse("[DONE]")
+
+    # -- /v1/responses ---------------------------------------------------------
+
+    def _responses(self, body: dict) -> None:
+        bad = rejected_responses_field(body)
+        if bad is not None:
+            self._json(400, {"error": bad})
+            return
+        try:
+            messages = flatten_input(body.get("input"), body.get("instructions"))
+        except ValueError as exc:
+            self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error",
+                                        "param": "input"}})
+            return
+
+        prompt = flatten_messages(messages)
+        # Same fallback and the same cast as the chat route, so an identical request
+        # produces an identical `max_tokens` and therefore identical text.
+        max_tokens = int(body.get("max_output_tokens") or self.default_max_tokens)
+        sampling = sampling_request(body) or None
+        model = str(body.get("model") or "slimarc")
+        rid = f"resp_{uuid.uuid4().hex[:24]}"
+        mid = f"msg_{uuid.uuid4().hex[:24]}"
+        created = time.time()
+
+        if not self.chain.ready:
+            self._json(503, {"error": {"message": "stages not ready",
+                                        "type": "service_unavailable"}})
+            return
+
+        meta = {"max_output_tokens": max_tokens,
+                "temperature": body.get("temperature"),
+                "top_p": body.get("top_p"),
+                "metadata": body.get("metadata")}
+        if body.get("stream"):
+            self._responses_stream(rid, mid, created, model, prompt, max_tokens, meta,
+                                   sampling)
+        else:
+            self._responses_full(rid, mid, created, model, prompt, max_tokens, meta,
+                                 sampling)
+
+    def _responses_full(self, rid: str, mid: str, created: float, model: str,
+                        prompt: str, max_tokens: int, meta: dict,
+                        sampling: dict | None) -> None:
+        text_parts: list[str] = []
+        tokens = 0
+        try:
+            for chunk in self.chain.generate(prompt, max_tokens, sampling):
+                text_parts.append(chunk.text)
+                tokens += 1
+        except Exception as exc:  # noqa: BLE001 - report, do not kill the server
+            self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}",
+                                        "type": "internal_error"}})
+            return
+
+        status, reason, item_status = responses_status(tokens, max_tokens)
+        payload = responses_object(
+            rid, created, model, status,
+            [responses_message(mid, "".join(text_parts), item_status)],
+            responses_usage(len(prompt), tokens), incomplete_reason=reason,
+            **{k: v for k, v in meta.items() if v is not None})
+        self._json(200, payload)
+
+    def _responses_stream(self, rid: str, mid: str, created: float, model: str,
+                          prompt: str, max_tokens: int, meta: dict,
+                          sampling: dict | None) -> None:
+        self._sse_head()
+        seq = 0
+        deltas: list[str] = []
+        tokens = 0
+        # Events are addressed by (response, item, index), so the same ids are repeated
+        # in every event rather than being re-generated per event: the SDK groups
+        # deltas by item_id, and a fresh id per event would split one answer into many.
+        addr = {"item_id": mid, "output_index": 0, "content_index": 0}
+
+        def emit(kind: str, **fields) -> None:
+            nonlocal seq
+            self._sse({"type": kind, "sequence_number": seq, **addr, **fields})
+            seq += 1
+
+        in_progress = responses_object(
+            rid, created, model, "in_progress",
+            [responses_message(mid, "", "in_progress")], None, **meta)
+        self._sse({"type": "response.created", "sequence_number": seq,
+                   "response": in_progress})
+        seq += 1
+        self._sse({"type": "response.in_progress", "sequence_number": seq,
+                   "response": in_progress})
+        seq += 1
+        self._sse({"type": "response.output_item.added", "sequence_number": seq,
+                   "output_index": 0,
+                   "item": responses_message(mid, "", "in_progress")})
+        seq += 1
+        self._sse({"type": "response.content_part.added", "sequence_number": seq,
+                   "output_index": 0, "content_index": 0, "item_id": mid,
+                   "part": {"type": "output_text", "text": "",
+                            "annotations": [], "logprobs": []}})
+        seq += 1
+
+        try:
+            for chunk in self.chain.generate(prompt, max_tokens, sampling):
+                if not chunk.text:
+                    continue    # a partial UTF-8 byte group; the assembler is holding it
+                tokens += 1
+                deltas.append(chunk.text)
+                # `logprobs` is part of the schema, not an option here: the SDK's
+                # typed model declares it required, so it is always sent, empty.
+                emit("response.output_text.delta", delta=chunk.text, logprobs=[])
+        except (BrokenPipeError, ConnectionResetError):
+            return              # client hung up; the chain lock is released by the generator
+        except Exception as exc:  # noqa: BLE001
+            self._sse({"type": "response.failed", "sequence_number": seq,
+                       "response": responses_object(
+                           rid, created, model, "failed", [], None,
+                           error={"code": "server_error",
+                                  "message": f"{type(exc).__name__}: {exc}"})})
+            self._sse("[DONE]")
+            return
+
+        full = "".join(deltas)
+        emit("response.output_text.done", text=full, logprobs=[])
+        self._sse({"type": "response.content_part.done", "sequence_number": seq,
+                   "output_index": 0, "content_index": 0, "item_id": mid,
+                   "part": {"type": "output_text", "text": full,
+                            "annotations": [], "logprobs": []}})
+        seq += 1
+        # Now that the loop is over it is known whether the cap was hit, so the item
+        # can carry the same status the Response object is about to report.
+        status, reason, item_status = responses_status(tokens, max_tokens)
+        self._sse({"type": "response.output_item.done", "sequence_number": seq,
+                   "output_index": 0,
+                   "item": responses_message(mid, full, item_status)})
+        seq += 1
+        final = responses_object(
+            rid, created, model, status,
+            [responses_message(mid, full, item_status)],
+            responses_usage(len(prompt), tokens), incomplete_reason=reason, **meta)
+        self._sse({"type": "response.completed", "sequence_number": seq,
+                   "response": final})
         self._sse("[DONE]")
 
 
