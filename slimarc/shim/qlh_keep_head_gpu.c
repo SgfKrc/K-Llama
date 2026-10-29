@@ -43,6 +43,14 @@
 #include <string.h>
 #include <windows.h>
 
+/* The two layer_inp entry points are a QLH-local extension, not upstream llama.cpp,
+ * so no published llama.h declares them. The DLL exports them (verified with
+ * dumpbin), and the prototype builds against a stock llama.h, so declare them here.
+ * Signatures are read off the call sites below: the setter takes a layer index and a
+ * flag, the getter returns that layer's input embedding for the last decode. */
+extern void         llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool enable);
+extern const float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
 /* PROTO: load whatever ggml backends sit next to this DLL (ggml-cuda.dll in the
  * prototype build). Upstream QLH never needed this because the shim only ever ran
  * on CPU; llama.cpp's own tools call it once at startup. With GGML_BACKEND_DL=ON the
@@ -749,4 +757,56 @@ uint32_t qlh_kh_context_size(void * ptr) {
 uint32_t qlh_kh_batch_size(void * ptr) {
     qlh_keep_head * h = (qlh_keep_head *) ptr;
     return h && h->ctx ? llama_n_batch(h->ctx) : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Text I/O for the OpenAI-compatible endpoint and the TUI.
+ *
+ * Everything above deals in token ids, which is enough to measure throughput but
+ * not to show a human what the model produced. These three entry points close that
+ * gap without touching the forward path.
+ *
+ * `token_to_piece` writes into a caller-owned buffer instead of returning a heap
+ * pointer, so the binding does not have to agree with this DLL on an allocator.
+ * It returns the number of bytes written, or the required size when `buf` is NULL
+ * or too small -- the usual two-call pattern.
+ * ------------------------------------------------------------------------- */
+
+int32_t qlh_kh_token_to_piece(void * handle_void, int32_t token, char * buf, int32_t buf_len) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->model == NULL) return -1;
+    const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
+    if (vocab == NULL) return -1;
+
+    /* A single token is at most a few bytes, but a lenient upper bound avoids
+     * growing the buffer in a loop; llama_token_to_piece reports the real size. */
+    char local[256];
+    const int32_t written = llama_token_to_piece(vocab, token, local, (int32_t) sizeof(local), 0, false);
+    if (written < 0) return written;
+    if (buf == NULL || buf_len < written) return written;
+    memcpy(buf, local, (size_t) written);
+    return written;
+}
+
+/* Returns the token count, or a negative llama error code. Same two-call pattern:
+ * pass tokens == NULL to learn the required length. */
+int32_t qlh_kh_tokenize(void * handle_void, const char * text, int32_t text_len,
+                        int32_t * tokens, int32_t max_tokens) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->model == NULL || text == NULL) return -1;
+    const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
+    if (vocab == NULL) return -1;
+
+    /* add_special = true so the caller can pass raw chat text; parse_special stays
+     * false because the template markers are literal text here, not control input. */
+    const int32_t n = llama_tokenize(vocab, text, text_len, tokens, max_tokens, true, false);
+    return n;
+}
+
+/* True when this token ends the generation (EOS or an equivalent stop token). */
+int32_t qlh_kh_is_eog(void * handle_void, int32_t token) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->model == NULL) return 0;
+    const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
+    return vocab != NULL && llama_vocab_is_eog(vocab, token) ? 1 : 0;
 }

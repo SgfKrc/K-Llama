@@ -81,6 +81,16 @@ class StageEngine:
         """Block count the shim found in this artifact, i.e. the layers it runs."""
         return int(self._up.n_layer)
 
+    def tokenize(self, text: str) -> list[int]:
+        """Text -> ids. Any stage can do this; all of them load the same vocab."""
+        return self._up.tokenize(text)
+
+    def piece(self, token: int) -> bytes:
+        return self._up.piece(token)
+
+    def is_eog(self, token: int) -> bool:
+        return self._up.is_eog(token)
+
     def forward_tokens(self, tokens: list[int], *, n_past: int) -> np.ndarray:
         """token in, hidden out. Used by the first stage."""
         out = self._up.forward_tokens_to_hidden(tokens, n_past=n_past)

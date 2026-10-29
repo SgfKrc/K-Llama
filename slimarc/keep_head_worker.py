@@ -104,6 +104,20 @@ class Binding:
         if hasattr(lib, "qlh_kh_last_error"):
             lib.qlh_kh_last_error.argtypes = [ctypes.c_void_p]
             lib.qlh_kh_last_error.restype = ctypes.c_int32
+        # Text I/O. Declared defensively: an older shim without these still works for
+        # the numeric path, and the methods below raise a clear error if used.
+        if hasattr(lib, "qlh_kh_token_to_piece"):
+            lib.qlh_kh_token_to_piece.argtypes = [
+                ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32]
+            lib.qlh_kh_token_to_piece.restype = ctypes.c_int32
+        if hasattr(lib, "qlh_kh_tokenize"):
+            lib.qlh_kh_tokenize.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
+            lib.qlh_kh_tokenize.restype = ctypes.c_int32
+        if hasattr(lib, "qlh_kh_is_eog"):
+            lib.qlh_kh_is_eog.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+            lib.qlh_kh_is_eog.restype = ctypes.c_int32
 
         n_embd, n_layer = ctypes.c_int32(0), ctypes.c_int32(0)
         err = ctypes.create_string_buffer(512)
@@ -151,6 +165,44 @@ class Binding:
             self._handle, _f32(arr), int(arr.shape[0]), int(n_past), None, None, None,
             ctypes.byref(token))
         return self._checked(rc, int(token.value), "tail forward")
+
+    def tokenize(self, text: bytes) -> list[int]:
+        """Text -> token ids.
+
+        llama_tokenize signals "buffer too small" by returning the negated required
+        size, not by failing, so the probe call always comes back negative and the
+        absolute value is the length to allocate.
+        """
+        if not hasattr(self._lib, "qlh_kh_tokenize"):
+            raise RuntimeError("shim has no qlh_kh_tokenize (rebuild it from slimarc/shim)")
+        probe = self._lib.qlh_kh_tokenize(self._handle, text, len(text), None, 0)
+        need = -probe if probe < 0 else probe
+        if need == 0:
+            return []
+        buf = (ctypes.c_int32 * need)()
+        got = self._lib.qlh_kh_tokenize(self._handle, text, len(text), buf, need)
+        if got < 0:
+            # Second call should fit now; a negative result means the tokenizer is
+            # non-deterministic in size, which would be a real bug.
+            raise RuntimeError(f"tokenize still short after sizing: {got}")
+        return list(buf[:got])
+
+    def piece(self, token: int) -> bytes:
+        """Token id -> UTF-8 bytes. May be a partial character; the caller has to
+        reassemble across tokens (see the SSE/TUI consumers)."""
+        if not hasattr(self._lib, "qlh_kh_token_to_piece"):
+            raise RuntimeError("shim has no qlh_kh_token_to_piece (rebuild it)")
+        need = self._lib.qlh_kh_token_to_piece(self._handle, int(token), None, 0)
+        if need <= 0:
+            return b""
+        buf = ctypes.create_string_buffer(need)
+        got = self._lib.qlh_kh_token_to_piece(self._handle, int(token), buf, need)
+        return buf.raw[:got] if got > 0 else b""
+
+    def is_eog(self, token: int) -> bool:
+        if not hasattr(self._lib, "qlh_kh_is_eog"):
+            return False
+        return bool(self._lib.qlh_kh_is_eog(self._handle, int(token)))
 
     def reset(self) -> None:
         self._lib.qlh_kh_reset(self._handle)
@@ -224,6 +276,14 @@ def main() -> int:
                 _array_response(binding.hidden(_decode_hidden(request), n_past))
             elif operation == "hidden_token":
                 _response(ok=True, token=binding.token(_decode_hidden(request), n_past))
+            elif operation == "tokenize":
+                # Text crosses the worker boundary as UTF-8 bytes, not str: the shim
+                # wants raw bytes plus an explicit length so it never has to guess.
+                _response(ok=True, tokens=binding.tokenize(request.get("text", "").encode("utf-8")))
+            elif operation == "piece":
+                _response(ok=True, piece=binding.piece(int(request["token"])).decode("latin-1"))
+            elif operation == "is_eog":
+                _response(ok=True, eog=binding.is_eog(int(request["token"])))
             else:
                 raise ValueError(f"unknown operation: {operation!r}")
     except Exception as exc:  # noqa: BLE001 - serialize the failure instead of dying

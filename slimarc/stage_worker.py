@@ -65,6 +65,30 @@ class StageWorker:
 
             n_tokens = int(msg.meta.get("n_tokens", 0))
             n_past = int(msg.meta.get("n_past", 0))
+            # Text helpers ride on FORWARD's meta instead of new message types, so the
+            # frame format stays at six messages and `op` is just another key.
+            op = msg.meta.get("op", "")
+            if op:
+                try:
+                    if op == "tokenize":
+                        tokens = self._engine.tokenize(str(msg.meta.get("text", "")))
+                        protocol.send(conn, protocol.RESULT, {"tokens": tokens})
+                    elif op == "piece":
+                        piece = self._engine.piece(int(msg.meta["token"]))
+                        # latin-1 keeps arbitrary bytes intact through the JSON hop.
+                        protocol.send(conn, protocol.RESULT,
+                                      {"piece": piece.decode("latin-1")})
+                    elif op == "is_eog":
+                        protocol.send(conn, protocol.RESULT,
+                                      {"eog": self._engine.is_eog(int(msg.meta["token"]))})
+                    else:
+                        protocol.send(conn, protocol.ERROR,
+                                      {"code": "unknown_op", "op": op})
+                except Exception as exc:  # noqa: BLE001
+                    protocol.send(conn, protocol.ERROR,
+                                  {"code": "op_failed", "op": op, "detail": str(exc)[:300]})
+                continue
+
             try:
                 if self._role == "gpu":
                     tokens = list(msg.meta["tokens"])

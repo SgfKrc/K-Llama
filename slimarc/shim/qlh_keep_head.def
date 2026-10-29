@@ -14,3 +14,6 @@ EXPORTS
     qlh_kh_set_skip_hidden_logits
     qlh_kh_reset
     qlh_kh_close
+    qlh_kh_token_to_piece
+    qlh_kh_tokenize
+    qlh_kh_is_eog

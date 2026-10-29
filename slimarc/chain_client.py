@@ -33,9 +33,7 @@ import topology  # noqa: E402
 from topology import Stage  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-# Resolve the shim relative to the repo so a checkout runs anywhere; SA_SHIM
-# overrides it for a machine whose DLLs live outside the tree.
-DEFAULT_SHIM = Path(os.environ.get("SA_SHIM") or (HERE / "shim" / "bin" / "qlh_keep_head.dll"))
+DEFAULT_SHIM = Path("H:/slimarc-proto/shim/bin/qlh_keep_head.dll")
 LOG_DIR = HERE / "build" / "relay-records"
 
 # Weights are not the only cost of a loaded stage: each one also builds a KV cache
@@ -130,6 +128,19 @@ class StageClient:
         blob = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
         msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past}, blob)
         return int(msg.meta["token"])
+
+    def tokenize(self, text: str) -> list[int]:
+        """Text -> ids via the stage's own vocabulary (every stage loads the same one)."""
+        msg = self._forward({"op": "tokenize", "text": text})
+        return [int(t) for t in msg.meta.get("tokens", [])]
+
+    def piece(self, token: int) -> bytes:
+        """Token id -> UTF-8 bytes, possibly a partial character."""
+        msg = self._forward({"op": "piece", "token": int(token)})
+        return str(msg.meta.get("piece", "")).encode("latin-1")
+
+    def is_eog(self, token: int) -> bool:
+        return bool(self._forward({"op": "is_eog", "token": int(token)}).meta.get("eog"))
 
     def reset(self) -> None:
         protocol.send(self.sock, protocol.RESET)

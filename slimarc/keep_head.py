@@ -218,6 +218,26 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(f"keep-head worker returned an invalid token id: {token}")
         return token
 
+    def tokenize(self, text: str) -> list[int]:
+        """Text -> token ids, for callers that start from a prompt instead of ids."""
+        reply = self._request({"op": "tokenize", "text": text})
+        return [int(t) for t in reply.get("tokens", [])]
+
+    def piece(self, token: int) -> bytes:
+        """Token id -> UTF-8 bytes.
+
+        A piece can be a partial UTF-8 character: byte-level BPE splits multi-byte
+        characters across tokens. Callers must buffer until the bytes decode, which
+        is what ``stream_text`` does.
+        """
+        reply = self._request({"op": "piece", "token": int(token)})
+        # latin-1 is a byte-preserving round trip for the JSON hop; the real encoding
+        # is recovered here.
+        return reply.get("piece", "").encode("latin-1")
+
+    def is_eog(self, token: int) -> bool:
+        return bool(self._request({"op": "is_eog", "token": int(token)}).get("eog", False))
+
     def reset(self) -> None:
         """Clear KV / recurrent memory so the next sequence may start at position 0."""
         if self.is_available:

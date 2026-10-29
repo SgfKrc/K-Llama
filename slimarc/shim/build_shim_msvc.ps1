@@ -17,14 +17,10 @@ $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Compon
 Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64' | Out-Null
 
-$llamaSrc = 'G:\C\PYT\qlh\android\app\src\main\cpp\llama.cpp'
-$includeDirs = @(
-    (Join-Path $llamaSrc 'include'),
-    (Join-Path $llamaSrc 'ggml\include'),
-    (Join-Path $llamaSrc 'ggml\src'),
-    (Join-Path $llamaSrc 'src')
-)
-$incFlags = $includeDirs | ForEach-Object { "/I$_" }
+# Headers come from a llama-cpp-python wheel rather than a llama.cpp checkout: the
+# upstream tree is gone from this machine, and only the two QLH-local layer_inp
+# symbols are missing from the published llama.h (declared by hand in the shim).
+$llamaSrc = 'H:\slimarc-proto\build-headers'
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
@@ -34,12 +30,14 @@ Write-Host '=== compiling shim (MSVC) ==='
 $defFile = 'H:\slimarc-proto\shim\qlh_keep_head.def'
 $args = @(
     '/nologo', '/LD', '/O2', '/W3',
+    # The bundled llama.h comes from a newer experimental branch than the DLL. The
+    # guard drops the three fields that branch added before n_threads, which is what
+    # makes the struct layout match the DLL again.
+    '/DQLH_LLAMA_ABI_NO_EXPERIMENTAL_TAIL',
     $Source,
     "/Fe:$OutDir\qlh_keep_head.dll",
     "/Fo:$OutDir\qlh_keep_head.obj",
-    "/I$llamaSrc\include",
-    "/I$llamaSrc\ggml\include",
-    "/I$llamaSrc\ggml\src",
+    "/I$llamaSrc",
     "/link",
     "/DEF:$defFile",
     "/LIBPATH:$BuildDir\src",
