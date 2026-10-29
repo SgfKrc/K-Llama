@@ -12,6 +12,8 @@ EXPORTS
     qlh_kh_n_layer
     qlh_kh_last_error
     qlh_kh_set_skip_hidden_logits
+    qlh_kh_set_sampling
+    qlh_kh_get_sampling
     qlh_kh_reset
     qlh_kh_close
     qlh_kh_token_to_piece

@@ -84,6 +84,28 @@ class StageWorker:
                     elif op == "is_eog":
                         protocol.send(conn, protocol.RESULT,
                                       {"eog": self._engine.is_eog(int(msg.meta["token"]))})
+                    elif op == "set_sampling":
+                        # Sampling lives on the tail stage only (it is the one that
+                        # turns logits into an id). Every field is optional; the
+                        # reply is the shim's own view of what took effect, because
+                        # the clamping rules live there and not here.
+                        effective = self._engine.set_sampling(
+                            temperature=float(msg.meta.get("temperature", 0.0)),
+                            top_p=float(msg.meta.get("top_p", 1.0)),
+                            top_k=int(msg.meta.get("top_k", 0)),
+                            repeat_penalty=float(msg.meta.get("repeat_penalty", 1.0)),
+                            repeat_last_n=int(msg.meta.get("repeat_last_n", 0)),
+                            frequency_penalty=float(msg.meta.get("frequency_penalty", 0.0)),
+                            presence_penalty=float(msg.meta.get("presence_penalty", 0.0)),
+                            seed=int(msg.meta.get("seed", 0xFFFFFFFF)),
+                        )
+                        protocol.send(conn, protocol.RESULT, {"sampling": effective})
+                    elif op == "get_sampling":
+                        protocol.send(conn, protocol.RESULT,
+                                      {"sampling": self._engine.sampling()})
+                    elif op == "clear_sampling":
+                        protocol.send(conn, protocol.RESULT,
+                                      {"sampling": self._engine.clear_sampling()})
                     else:
                         protocol.send(conn, protocol.ERROR,
                                       {"code": "unknown_op", "op": op})

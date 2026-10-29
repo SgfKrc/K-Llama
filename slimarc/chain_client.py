@@ -39,14 +39,51 @@ LOG_DIR = HERE / "build" / "relay-records"
 # Weights are not the only cost of a loaded stage: each one also builds a KV cache
 # and compute buffers, and the CUDA stage takes VRAM rather than RAM. Staying well
 # under available RAM is the point — Windows does not refuse an overshoot, it pages
-# and the machine stops responding. 75% of available leaves room for that overhead.
+# and the machine stops responding.
+#
+# What the budget actually counts was calibrated by measuring, because the naive
+# "sum of file sizes" reading is off by a factor of two on this workload:
+#
+#   stage 0-8   4.53 GB file, all layers on GPU   -> 4.84 GB RAM gone
+#   stage 8-24  8.36 GB file, pure CPU, after warm -> 1.80 GB RAM gone
+#   both loaded together                          -> 6.67 GB total (sums to 6.64)
+#
+# Pure-CPU stages mmap their weights and only the resident pages that the graph
+# actually touches stay committed -- 8.36 GB of file became 1.80 GB of RAM. The GPU
+# stage is different: its weights go to VRAM, but `token_embd` is forced onto the CPU
+# ("cannot be used with preferred buffer type CUDA_Host"), and the CUDA context plus
+# compute buffer add up, so it costs roughly its file size in RAM.
+#
+# Hence two coefficients rather than one, both deliberately generous:
 MEM_SAFETY = 0.75
+# Fraction of a CPU stage's file size that stays resident. Measured 0.215; 0.30 leaves
+# a margin for a longer context than the 4096 the measurement used.
+CPU_RESIDENT_RATIO = 0.30
+# GPU stages are charged their full file size: VRAM is not counted here, and the RAM
+# they do hold (token_embd + context) scales with the artifact.
+GPU_RAM_RATIO = 1.00
 
 
 def mem_budget_bytes() -> int:
     import psutil
 
     return int(psutil.virtual_memory().available * MEM_SAFETY)
+
+
+def estimate_ram_bytes(stages) -> int:
+    """What loading these stages is expected to cost in system RAM.
+
+    Replaces summing file sizes, which assumed every byte of every artifact becomes
+    resident. Only local stages count: a remote one is loaded on its own machine.
+    """
+    total = 0.0
+    for stage in stages:
+        if not stage.is_local:
+            continue
+        size = stage.model.stat().st_size
+        ratio = GPU_RAM_RATIO if stage.gpu_layers else CPU_RESIDENT_RATIO
+        total += size * ratio
+    return int(total)
 
 # A worker finishes loading its artifact tens of seconds after spawn, and serve()
 # only starts listening afterwards, so connect has to retry rather than fail fast.
@@ -154,6 +191,29 @@ class StageClient:
 
     def is_eog(self, token: int) -> bool:
         return bool(self._forward({"op": "is_eog", "token": int(token)}).meta.get("eog"))
+
+    def set_sampling(self, **params) -> dict:
+        """Install the tail stage's sampler; returns the parameters in effect.
+
+        Rides on FORWARD's meta like the other ops, so the six-message protocol is
+        untouched. The tail stage is the only one that produces tokens, so this is
+        a no-op for every other kind.
+        """
+        if self.stage.kind != "tail":
+            return {}
+        return dict(self._forward({"op": "set_sampling", **params}).meta.get("sampling") or {})
+
+    def sampling(self) -> dict:
+        """Effective sampler configuration as the tail stage reports it."""
+        if self.stage.kind != "tail":
+            return {}
+        return dict(self._forward({"op": "get_sampling"}).meta.get("sampling") or {})
+
+    def clear_sampling(self) -> dict:
+        """Return the tail stage to the untouched argmax default."""
+        if self.stage.kind != "tail":
+            return {}
+        return dict(self._forward({"op": "clear_sampling"}).meta.get("sampling") or {})
 
     def reset(self) -> None:
         protocol.send(self.sock, protocol.RESET)
@@ -329,15 +389,21 @@ def main() -> int:
     # Loading every local stage at once is the whole memory cost of the run, and
     # Windows answers an overshoot by thrashing swap rather than failing — on this
     # machine that hard-locked the desktop twice. Refuse up front instead.
+    #
+    # The estimate is not the sum of file sizes: see CPU_RESIDENT_RATIO for the
+    # measurement showing a pure-CPU stage keeps only ~21% of its artifact resident.
     local_bytes = sum(s.model.stat().st_size for s in stages if s.is_local)
     local_count = sum(1 for s in stages if s.is_local)
+    estimate = estimate_ram_bytes(stages)
     budget = mem_budget_bytes()
     print(f"\nlocal stages: {local_count}  weights {local_bytes / 2**30:.2f} GiB  "
+          f"expected resident {estimate / 2**30:.2f} GiB  "
           f"budget {budget / 2**30:.2f} GiB")
-    if local_bytes > budget:
+    if estimate > budget:
         raise SystemExit(
-            f"refusing to start: local artifacts total {local_bytes / 2**30:.2f} GiB "
-            f"but only {budget / 2**30:.2f} GiB is safe (available x {MEM_SAFETY:.0%}). "
+            f"refusing to start: local stages need an estimated "
+            f"{estimate / 2**30:.2f} GiB resident but only "
+            f"{budget / 2**30:.2f} GiB is safe (available x {MEM_SAFETY:.0%}). "
             f"Move a stage to another host or lower the count.")
 
     if args.dry_run:

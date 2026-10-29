@@ -6,13 +6,17 @@ without a translation layer, not to reimplement the API surface.
 
 Two honesty constraints shape this file:
 
-  * Decoding is argmax only -- the shim returns one token per step and never samples.
-    `temperature`/`top_p`/`seed` are accepted so clients do not error, recorded in the
-    response as ignored, and NOT silently pretended to work. A caller who asks for
-    temperature 0.9 and gets deterministic output should be told why.
+  * Sampling happens inside the shim, on the tail stage, using llama.cpp's own
+    sampler chain. Every parameter that reaches the tail is echoed back in the
+    response as the value that actually took effect -- read out of the native handle,
+    not out of the request, because the clamping rules ("top_k >= n_vocab means off",
+    "repeat_last_n 0 means the default") live there. Parameters this server cannot
+    honour are reported in `ignored_parameters` rather than dropped.
   * There is no multi-turn memory. Every request replays its own prompt from
     position 0; the KV cache is reset between requests. Sending a long `messages`
     list works because it is all re-prefilled, not because context is retained.
+    The sampler is reset on the same boundary, so penalties do not leak from one
+    conversation into the next.
 """
 from __future__ import annotations
 
@@ -36,10 +40,48 @@ from stream import generate_stream  # noqa: E402
 DEFAULT_SHIM = Path(os.environ.get("SA_SHIM") or
                     (Path(__file__).resolve().parent / "shim" / "bin" / "qlh_keep_head.dll"))
 
-# Parameters this server cannot honour. Reported per response instead of dropped, so
-# a client can see why its output does not vary.
-UNSUPPORTED = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty",
-               "presence_penalty", "frequency_penalty", "seed", "logit_bias")
+# Parameters this server still cannot honour. Reported per response instead of
+# dropped, so a client can see why its output did not change. Everything else in the
+# OpenAI sampling surface now maps onto a real sampler in llama.dll.
+#
+#   logit_bias -- needs llama_sampler_init_logit_bias plus a per-token table, which
+#                 the shim does not expose yet.
+#   min_p      -- a first-class llama.cpp sampler, but the shim's setter signature
+#                 (SAMPLING.md §4.2) has no min_p argument, so it stays unsupported
+#                 rather than being silently approximated by top_p.
+UNSUPPORTED = ("logit_bias", "min_p")
+
+#: OpenAI request field -> shim setter keyword. `top_k` and `repetition_penalty` are
+#: not OpenAI parameters, but llama.cpp's own API takes both and clients of local
+#: servers routinely send them, so they are honoured instead of ignored.
+SAMPLING_FIELDS = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "seed": "seed",
+    "frequency_penalty": "frequency_penalty",
+    "presence_penalty": "presence_penalty",
+    "repetition_penalty": "repeat_penalty",
+}
+
+
+def sampling_request(body: dict) -> dict:
+    """Translate an OpenAI request body into shim setter arguments.
+
+    Only fields the client actually sent are forwarded: the shim treats every
+    argument's low end as "off", so inventing a temperature the client never asked
+    for would silently change its output.
+    """
+    params: dict = {}
+    for field, keyword in SAMPLING_FIELDS.items():
+        if field not in body or body[field] is None:
+            continue
+        value = body[field]
+        try:
+            params[keyword] = int(value) if keyword in ("top_k", "seed") else float(value)
+        except (TypeError, ValueError):
+            continue        # a malformed value is not worth a 400; the default applies
+    return params
 
 
 class Chain:
@@ -68,12 +110,40 @@ class Chain:
             client.connect()
         self.ready = True
 
-    def generate(self, prompt: str, max_tokens: int):
-        """Yield Chunk, serialised under the chain lock."""
+    def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None):
+        """Yield Chunk, serialised under the chain lock.
+
+        The tail's sampler is configured inside the same lock, right after the reset,
+        so a request can never sample with another request's penalties history.
+
+        ``sampling`` is either a non-empty parameter dict, or ``None`` meaning "this
+        request asked for nothing". The two are NOT the same: an empty dict would be
+        passed straight to the setter, whose defaults install a greedy chain, and the
+        handle would stay in that state for every later request. ``None`` therefore
+        clears the chain instead.
+        """
         with self._lock:
             for client in self._clients:
                 client.reset()
+            if self._clients:
+                tail = self._clients[-1]
+                if sampling:
+                    # The tail is the only stage that turns logits into an id; every
+                    # other kind ignores this and returns {}.
+                    tail.set_sampling(**sampling)
+                else:
+                    # Restore the pristine argmax path, not a greedy chain.
+                    tail.clear_sampling()
             yield from generate_stream(self._clients, prompt, max_tokens=max_tokens)
+
+    def sampling_state(self) -> dict:
+        """What the tail stage currently has in effect, for the response body."""
+        if not self._clients:
+            return {}
+        try:
+            return self._clients[-1].sampling()
+        except Exception:  # noqa: BLE001 - an echo must never fail a completion
+            return {}
 
     def stop(self) -> None:
         for client in self._clients:
@@ -195,6 +265,10 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         model = str(body.get("model") or "slimarc")
         ignored = [k for k in UNSUPPORTED if k in body]
+        # `None` (not `{}`) when the client asked for nothing: the chain then *clears*
+        # the sampler instead of installing a greedy one, which keeps the pristine
+        # argmax path and stops one request's configuration leaking into the next.
+        sampling = sampling_request(body) or None
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
@@ -204,19 +278,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if stream:
-            self._stream_response(completion_id, created, model, prompt, max_tokens, ignored)
+            self._stream_response(completion_id, created, model, prompt, max_tokens,
+                                  ignored, sampling)
         else:
-            self._full_response(completion_id, created, model, prompt, max_tokens, ignored)
+            self._full_response(completion_id, created, model, prompt, max_tokens,
+                                ignored, sampling)
 
     # -- response shapes -------------------------------------------------------
 
     def _full_response(self, cid: str, created: int, model: str, prompt: str,
-                       max_tokens: int, ignored: list[str]) -> None:
+                       max_tokens: int, ignored: list[str],
+                       sampling: dict | None = None) -> None:
         text_parts: list[str] = []
         tokens = 0
         started = time.perf_counter()
         try:
-            for chunk in self.chain.generate(prompt, max_tokens):
+            for chunk in self.chain.generate(prompt, max_tokens, sampling):
                 text_parts.append(chunk.text)
                 tokens += 1
         except Exception as exc:  # noqa: BLE001 - report, do not kill the server
@@ -224,6 +301,9 @@ class Handler(BaseHTTPRequestHandler):
                                        "type": "internal_error"}})
             return
         elapsed = time.perf_counter() - started
+        # Read back from the native handle while the lock is free: this is what the
+        # client actually got, not what it asked for (clamping happens in C).
+        effective = self.chain.sampling_state()
         payload = {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "choices": [{
@@ -237,27 +317,29 @@ class Handler(BaseHTTPRequestHandler):
                 "tokens_per_second": round(tokens / elapsed, 2) if elapsed > 0 else 0,
                 "elapsed_seconds": round(elapsed, 3),
                 "ignored_parameters": ignored,
-                "note": "decoding is argmax; sampling parameters have no effect"
-                        if ignored else "",
+                "sampling": effective,
             },
         }
         self._json(200, payload)
 
     def _stream_response(self, cid: str, created: int, model: str, prompt: str,
-                         max_tokens: int, ignored: list[str]) -> None:
+                         max_tokens: int, ignored: list[str],
+                         sampling: dict | None = None) -> None:
         self._sse_head()
         first = {"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": model,
                  "choices": [{"index": 0, "delta": {"role": "assistant"},
                               "finish_reason": None}]}
-        if ignored:
-            first["slimarc"] = {"ignored_parameters": ignored,
-                                "note": "decoding is argmax; sampling parameters "
-                                        "have no effect"}
+        # The stream announces the requested configuration; the closing chunk carries
+        # the effective one, because the shim can only be asked after the first
+        # generate() has configured it.
+        announced = {"ignored_parameters": ignored} if ignored else {}
+        announced["requested_sampling"] = dict(sampling or {})
+        first["slimarc"] = announced
         self._sse(first)
         tokens = 0
         try:
-            for chunk in self.chain.generate(prompt, max_tokens):
+            for chunk in self.chain.generate(prompt, max_tokens, sampling):
                 if not chunk.text:
                     continue        # a partial UTF-8 byte pair; wait for the rest
                 tokens += 1
@@ -275,7 +357,8 @@ class Handler(BaseHTTPRequestHandler):
                    "model": model,
                    "choices": [{"index": 0, "delta": {},
                                 "finish_reason": "length" if tokens >= max_tokens else "stop"}],
-                   "usage": {"completion_tokens": tokens}})
+                   "usage": {"completion_tokens": tokens},
+                   "slimarc": {"sampling": self.chain.sampling_state()}})
         self._sse("[DONE]")
 
 
@@ -297,21 +380,22 @@ def main() -> int:
 
     # Same guard as chain_client: loading every local artifact at once is the whole
     # memory cost, and Windows answers an overshoot by thrashing swap rather than
-    # failing.
-    from chain_client import mem_budget_bytes
-    local_bytes = sum(s.model.stat().st_size for s in stages if s.is_local)
+    # failing. The estimate accounts for mmap residency, not file size sum.
+    from chain_client import estimate_ram_bytes, mem_budget_bytes
+    estimate = estimate_ram_bytes(stages)
     budget = mem_budget_bytes()
-    if local_bytes > budget:
+    if estimate > budget:
         raise SystemExit(
-            f"refusing to start: local artifacts total {local_bytes / 2**30:.2f} GiB "
-            f"but only {budget / 2**30:.2f} GiB is safe (available x 0.75). "
-            f"Move a stage to another host.")
+            f"refusing to start: local stages need an estimated "
+            f"{estimate / 2**30:.2f} GiB resident but only "
+            f"{budget / 2**30:.2f} GiB is safe. Move a stage to another host.")
 
     chain = Chain(stages, shim, config.ctx())
     print(f"loading {len(stages)} stage(s)…", flush=True)
     chain.start()
     print(f"ready on http://{args.host}:{args.port}  "
-          f"(stages={len(stages)}, argmax decoding)", flush=True)
+          f"(stages={len(stages)}, sampling on the tail stage; argmax by default)",
+          flush=True)
 
     Handler.chain = chain
     Handler.default_max_tokens = args.max_tokens

@@ -123,12 +123,47 @@ typedef struct qlh_keep_head {
      * 此前 decode 失败一律折成 -2，把 llama.cpp 的具体错误码丢了 ⇒ 长时 decode 的 ctx 边界
      * 问题无法定位。每次 forward 入口清零（读到的就是本次错误），`qlh_kh_reset` 也清零。 */
     int32_t last_error;
+    /* ★ 2026-10-29（SAMPLING-01）：**采样链**。NULL = argmax（默认，行为与旧版完全一致）。
+     *
+     * 非 NULL 时 `qlh_kh_forward_embd_token` 改用上游 `llama_sampler_sample` 选 token，
+     * 而不是自己遍历 logits 取最大值。链由 `qlh_kh_set_sampling` 建立，顺序遵循
+     * llama.cpp 惯例：penalties → top_k → top_p → temp → dist（dist 必须最后）。
+     *
+     * 为什么把采样放在 shim 里而不是 Python 侧：段间只传 hidden（8 KB/token），
+     * 传完整 logits 是 944 KB/token（241,664 × f32），会毁掉链路的带宽特性；
+     * 采样在末段本地做完，跨机协议一个字都不用改。
+     *
+     * 生命周期：`qlh_kh_reset` 调 `llama_sampler_reset`（否则 penalties 的历史会跨序列污染），
+     * `qlh_kh_close` 调 `llama_sampler_free`，重复调 setter 先 free 旧的再建（不泄漏）。 */
+    struct llama_sampler * sampler;
+    /* 实际生效的采样参数（回显用；`sampler == NULL` 时全为零/缺省）。 */
+    float    sampling_temperature;
+    float    sampling_top_p;
+    int32_t  sampling_top_k;
+    float    sampling_repeat_penalty;
+    int32_t  sampling_repeat_last_n;
+    float    sampling_penalty_freq;
+    float    sampling_penalty_present;
+    uint32_t sampling_seed;
 } qlh_keep_head;
 
 static void qlh_set_err(char *err, size_t errlen, const char *msg) {
     if (err != NULL && errlen > 0) {
         snprintf(err, errlen, "%s", msg);
     }
+}
+
+/* Vocabulary width of a loaded handle, 0 when unavailable. Hoisted to a static
+ * helper because the sampling setter needs it as a *size* (upper bound for
+ * repeat_last_n and for detecting "top_k disables everything"), while the exported
+ * `qlh_kh_n_vocab` lives further down the file. Relying on an implicit declaration
+ * there would have compiled and linked while silently returning the wrong value. */
+static int32_t qlh_vocab_size(const qlh_keep_head * handle) {
+    if (handle == NULL || handle->model == NULL) {
+        return 0;
+    }
+    const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
+    return vocab == NULL ? 0 : llama_vocab_n_tokens(vocab);
 }
 
 /* 返回值：句柄；失败返回 NULL 并把原因写进 err。
@@ -285,6 +320,20 @@ void * qlh_kh_load(const char * model_path,
     handle->n_layer   = n_layer;
     handle->mode      = mode;
     handle->cut_layer = cut_layer;
+    /* ★ 2026-10-29（SAMPLING-01）：**中性**默认值，不是 calloc 的零。
+     * `calloc` 会把 top_p / repeat_penalty 留成 0.0，而 0.0 在这套接口里的含义是
+     * "极端截断"和"非法惩罚"，与"未启用"正好相反。回显函数会把这些字段原样交给
+     * 客户端，所以必须在加载时就写成各自的关闭值，否则 argmax 模式会对外声称
+     * top_p=0.0（听起来像最贪婪的采样）而不是"不适用"。 */
+    handle->sampler                 = NULL;   /* argmax，见 last_error 上方的说明 */
+    handle->sampling_temperature    = 0.0f;   /* <= 0 = greedy */
+    handle->sampling_top_p          = 1.0f;   /* >= 1 = 关闭 */
+    handle->sampling_top_k          = 0;      /* <= 0 = 关闭 */
+    handle->sampling_repeat_penalty = 1.0f;   /* 1.0 = 关闭 */
+    handle->sampling_repeat_last_n  = 0;      /* 0 = 关闭 */
+    handle->sampling_penalty_freq   = 0.0f;
+    handle->sampling_penalty_present= 0.0f;
+    handle->sampling_seed           = LLAMA_DEFAULT_SEED;
     /* ★ M-RoPE（Qwen3.5 等）：每个 token 有 4 个位置分量，**embd 通道**下必须按 planar 提供
      * （见 `qlh_fill_pos_planar`）。按模型实际 rope 类型判定，不对架构硬编码。 */
     {
@@ -564,11 +613,37 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
                         row, i);
                 return -7;
             }
-            if (row == n_tokens - 1 && (i == 0 || value > best_logit)) {
+            if (handle->sampler == NULL && row == n_tokens - 1 && (i == 0 || value > best_logit)) {
                 best_logit = value;
                 best = i;
             }
         }
+    }
+    /* ★ 2026-10-29（SAMPLING-01）：末段分叉 —— 有采样链就交给上游，否则走上面的 argmax。
+     *
+     * `idx = n_tokens - 1`：本入口给**每一行**都标了 `batch.logits = 1`（见上面的
+     * `qlh_fill_explicit(..., 1)`），因此 output 序号与行号一一对应，最后一行的 output
+     * index 就是 n_tokens - 1。这与 llama.h 的 "Equivalent to
+     * llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab" 一致 —— 也意味着上面那个
+     * 逐行循环读到的 `llama_get_logits_ith(ctx, n_tokens-1)` 正是采样器将要读的那一块，
+     * 所以非有限门检查的正是采样输入。（实测见 docs/SAMPLING.md §6.1 的记录。）
+     *
+     * ⚠️ **这里刻意不调 `llama_sampler_accept()`**。`llama_sampler_sample` 自己就
+     * 先 `iface->apply` 再 `iface->accept`（llama-sampling.cpp 的实现，且已用
+     * dumpbin 反汇编在本机 llama.dll 上确认：函数体内两次间接调用，先 apply 后 accept），
+     * 再 accept 一次会让 penalties 把同一个 token 记两遍。实测（shim/_test/probe_sampler.c）：
+     * 同一个 token accept 两次，该 token 的 logit 从 -2.4999 变成 -4.4999 —— 不是无害的空操作，
+     * 而是把重复惩罚翻倍。SAMPLING.md §3 的那一行是错的，以本处实现为准。 */
+    if (handle->sampler != NULL) {
+        const llama_token sampled = llama_sampler_sample(handle->sampler, handle->ctx,
+                                                         n_tokens - 1);
+        if (sampled == LLAMA_TOKEN_NULL || sampled < 0 || sampled >= n_vocab) {
+            fprintf(stderr, "[qlh_keep_head] sampler returned an invalid token id: %d\n",
+                    (int) sampled);
+            return -6;
+        }
+        *out_token = (int32_t) sampled;
+        return 0;
     }
     *out_token = best;
     return 0;
@@ -677,12 +752,7 @@ int32_t qlh_kh_finite_logits_guard(void) {
 }
 
 int32_t qlh_kh_n_vocab(void * handle_void) {
-    const qlh_keep_head * handle = (const qlh_keep_head *) handle_void;
-    if (handle == NULL || handle->model == NULL) {
-        return 0;
-    }
-    const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
-    return vocab == NULL ? 0 : llama_vocab_n_tokens(vocab);
+    return qlh_vocab_size((const qlh_keep_head *) handle_void);
 }
 
 int32_t qlh_kh_n_embd(void * handle_void) {    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
@@ -730,15 +800,231 @@ int32_t qlh_kh_set_skip_hidden_logits(void * handle_void, int32_t skip) {
     return 0;
 }
 
+/* ★ 2026-10-29（SAMPLING-01）：建立/替换本句柄的采样链。
+ *
+ * 语义（"关闭"取值与调用方的直觉一致，越界值一律按关闭处理，而不是报错，
+ * 因为 OpenAI 客户端会传 0 / 1.0 这类"关掉它"的值）：
+ *   temperature    <= 0     ⇒ greedy（确定性；与 argmax 逐位等价，见下）
+ *   top_p          >= 1.0   ⇒ 关闭
+ *   top_k          <= 0     ⇒ 关闭
+ *   repeat_penalty == 1.0   ⇒ 关闭，除非 freq/present 非零（那两个也需要历史）
+ *   repeat_last_n  <= 0     ⇒ 用 QLH_PENALTY_LAST_N_DEFAULT（llama.cpp CLI 的默认 64）
+ *   seed                    ⇒ 直接交给 dist 采样器
+ *   temperature    == QLH_SAMPLING_DISABLE (-1.0f)
+ *                           ⇒ **拆掉采样链，回到 argmax 缺省**（见下方"为什么需要它"）
+ *
+ * 为什么 temperature <= 0 建 greedy 链、而不是把 `handle->sampler` 置回 NULL：
+ *   1. 二者输出**逐位相同** —— 实测 2000 轮随机 logits（含 500 轮强制并列）零分歧
+ *      （shim/_test/probe_sampler.c Q2）。所以"确定性"不受影响。
+ *   2. `sampler == NULL` 在本文件里的含义是"**从未开过采样**"，那是缺省路径，
+ *      也是既有吞吐数据的基线。让显式要求 temperature=0 的调用方也真正走一遍
+ *      采样路径，才能验证 llama_sampler_sample 的 idx、accept 状态机与 greedy 链
+ *      本身是对的 —— 否则 §6.1 的回归测试根本碰不到新代码。
+ *   代价是 greedy 要为一次 sample 分配 n_vocab 大小的候选数组；实测约 0.15 ms
+ *   （n_vocab=248320），相对约 50 ms 的 step 是 0.3%。
+ *
+ * ⚠️ 为什么还需要那个显式的 -1 关闭值：长驻服务在同一句柄上服务多个请求，而
+ *    "temperature <= 0 ⇒ greedy" 会把"客户端没传任何采样参数"变成"建了一条 greedy 链"。
+ *    greedy 与 argmax 逐位等价，所以数值上无害 —— 但 sampler != NULL 会让回显报告
+ *    mode=greedy 而不是 argmax，客户端无法区分"我没要求采样"和"我要求了 temperature=0"。
+ *    更实际的问题是状态残留：会改采样配置的请求之后，下一个什么都不传的请求若只靠
+ *    "不调用 setter"，就会**静默沿用**上一个请求的参数（penalties 尤其明显）。
+ *    所以"回到缺省"必须是能主动表达的动作，而不是"省略"。
+ *
+ * 链的添加顺序按 llama.cpp 惯例：penalties → top_k → top_p → temp → dist。
+ * `dist` 必须最后（它是唯一"选出一个 token"的采样器，前面几个只改分布）。
+ *
+ * 返回 0 成功；-1 参数非法（NULL 句柄 / NaN / Inf）；-2 采样器分配失败
+ * （此时 handle 回到 argmax，不会半残）。重复调用先 free 旧链，不泄漏。 */
+#define QLH_PENALTY_LAST_N_DEFAULT 64
+#define QLH_SAMPLING_DISABLE (-1.0f)
+
+int32_t qlh_kh_set_sampling(void * handle_void,
+                            float    temperature,
+                            float    top_p,
+                            int32_t  top_k,
+                            float    repeat_penalty,
+                            int32_t  repeat_last_n,
+                            float    penalty_freq,
+                            float    penalty_present,
+                            uint32_t seed) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL) {
+        return -1;
+    }
+    /* NaN 会让 temp / top_p 的比较全部为假，静默退化成"看起来设了、其实没设"。
+     * Inf 在 top_p 上等于"全关"，但遇到就报错更能暴露调用方的 bug。 */
+    if (!isfinite(temperature) || !isfinite(top_p) ||
+        !isfinite(repeat_penalty) || !isfinite(penalty_freq) || !isfinite(penalty_present)) {
+        return -1;
+    }
+    if (top_k < 0) {
+        top_k = 0;
+    }
+
+    /* 显式"回到 argmax"：拆掉旧链（无论是否真的有一条），并把回显字段恢复成加载时的
+     * 中性值。幂等 —— 本来就是缺省时再关一次也算成功。 */
+    if (temperature == QLH_SAMPLING_DISABLE) {
+        if (handle->sampler != NULL) {
+            llama_sampler_free(handle->sampler);
+            handle->sampler = NULL;
+        }
+        handle->sampling_temperature    = 0.0f;
+        handle->sampling_top_p          = 1.0f;
+        handle->sampling_top_k          = 0;
+        handle->sampling_repeat_penalty = 1.0f;
+        handle->sampling_repeat_last_n  = 0;
+        handle->sampling_penalty_freq   = 0.0f;
+        handle->sampling_penalty_present= 0.0f;
+        handle->sampling_seed           = LLAMA_DEFAULT_SEED;
+        return 0;
+    }
+
+    /* 先拆旧链：无论下面成不成功，句柄都不能同时指向两条链。 */
+    if (handle->sampler != NULL) {
+        llama_sampler_free(handle->sampler);
+        handle->sampler = NULL;
+    }
+
+    /* n_vocab 有三个用途：penalties 的窗口上限、判断 top_k 是否"等于全开"
+     * （top_k >= n_vocab 就是不截断）、以及如实回显。取不到就失败，不猜值。 */
+    const int32_t n_vocab = qlh_vocab_size(handle);
+    if (n_vocab <= 0) {
+        return -1;
+    }
+
+    const int greedy = temperature <= 0.0f;
+    const int want_penalties = (repeat_penalty != 1.0f && repeat_last_n > 0) ||
+                               penalty_freq != 0.0f || penalty_present != 0.0f;
+    int32_t last_n = repeat_last_n;
+    if (want_penalties && last_n <= 0) {
+        last_n = QLH_PENALTY_LAST_N_DEFAULT;
+    }
+    if (want_penalties && last_n > n_vocab) {
+        last_n = n_vocab;      /* llama.cpp 自己也会 clamp，这里同步以便如实回显 */
+    }
+    const int want_top_k = !greedy && top_k > 0 && top_k < n_vocab;
+    const int want_top_p = !greedy && top_p > 0.0f && top_p < 1.0f;
+
+    struct llama_sampler * chain = NULL;
+    if (!want_penalties && greedy) {
+        /* 最常见也最轻的一条：纯 greedy，不需要链，也不需要候选数组排序。 */
+        chain = llama_sampler_init_greedy();
+    } else {
+        struct llama_sampler * built = llama_sampler_chain_init(
+            llama_sampler_chain_default_params());
+        if (built == NULL) {
+            return -2;
+        }
+        /* chain_add 接管所有权，失败时只需 free 链本身。 */
+        if (want_penalties) {
+            struct llama_sampler * pen = llama_sampler_init_penalties(
+                n_vocab, last_n,
+                repeat_penalty,
+                penalty_freq,
+                penalty_present);
+            if (pen == NULL) {
+                llama_sampler_free(built);
+                return -2;
+            }
+            llama_sampler_chain_add(built, pen);
+        }
+        if (want_top_k) {
+            struct llama_sampler * s = llama_sampler_init_top_k(top_k);
+            if (s == NULL) { llama_sampler_free(built); return -2; }
+            llama_sampler_chain_add(built, s);
+        }
+        if (want_top_p) {
+            /* min_keep = 1：与 llama.cpp 的 common 默认一致，保证 top_p 不会把所有候选砍光。 */
+            struct llama_sampler * s = llama_sampler_init_top_p(top_p, 1);
+            if (s == NULL) { llama_sampler_free(built); return -2; }
+            llama_sampler_chain_add(built, s);
+        }
+        if (greedy) {
+            struct llama_sampler * s = llama_sampler_init_greedy();
+            if (s == NULL) { llama_sampler_free(built); return -2; }
+            llama_sampler_chain_add(built, s);
+        } else {
+            struct llama_sampler * s = llama_sampler_init_temp(temperature);
+            if (s == NULL) { llama_sampler_free(built); return -2; }
+            llama_sampler_chain_add(built, s);
+            s = llama_sampler_init_dist(seed);      /* 必须最后 */
+            if (s == NULL) { llama_sampler_free(built); return -2; }
+            llama_sampler_chain_add(built, s);
+        }
+        chain = built;
+    }
+    if (chain == NULL) {
+        return -2;
+    }
+
+    handle->sampler = chain;
+    /* 记录**实际生效**的值（而不是调用方传来的原始值），供 Python 侧如实回显。 */
+    handle->sampling_temperature    = greedy ? 0.0f : temperature;
+    handle->sampling_top_p          = want_top_p ? top_p : 1.0f;
+    handle->sampling_top_k          = want_top_k ? top_k : 0;
+    handle->sampling_repeat_penalty = want_penalties ? repeat_penalty : 1.0f;
+    handle->sampling_repeat_last_n  = want_penalties ? last_n : 0;
+    handle->sampling_penalty_freq   = want_penalties ? penalty_freq : 0.0f;
+    handle->sampling_penalty_present= want_penalties ? penalty_present : 0.0f;
+    /* ⚠️ 实测（shim/_test/probe_sampler.c Q4，2026-10-29）：把 LLAMA_DEFAULT_SEED
+     * （0xFFFFFFFF）交给 `llama_sampler_init_dist` **不是**"用 4294967295 当种子"，
+     * 而是"随机抽一个"：两条链分别拿到 0xBEEE9BDC / 0x2ECD8F8F，序列也不同。
+     * 所以这里必须回读 `llama_sampler_get_seed()` 的**实际**种子 —— 原样回显
+     * 0xFFFFFFFF 等于对客户端撒谎，说了一个它并没有用的种子。greedy 链没有 dist，
+     * get_seed 会返回 LLAMA_DEFAULT_SEED，那种情况下种子无意义，原值即可。 */
+    handle->sampling_seed           = greedy
+        ? seed
+        : llama_sampler_get_seed(chain);
+    return 0;
+}
+
+/* 回显**实际生效**的采样配置。返回 1 = 采样链在（含 greedy），0 = argmax 缺省。
+ * 为什么要有它：server.py 必须告诉客户端"你的参数真的被采纳了多少"，而 clamp 与
+ * "关闭"判定都发生在本函数里（top_k >= n_vocab 会被关掉、repeat_last_n 会被补成
+ * 默认值……）。让 Python 自己复算一遍这些规则，等于把同一份语义抄成两份，
+ * 一旦漂移，回显就是对客户端撒谎。任何 out 指针都可以是 NULL。
+ *
+ * 这是**可选符号**：旧 shim 没有它 ⇒ Python 侧按 optional 处理。 */
+int32_t qlh_kh_get_sampling(void * handle_void,
+                            float * temperature, float * top_p, int32_t * top_k,
+                            float * repeat_penalty, int32_t * repeat_last_n,
+                            float * penalty_freq, float * penalty_present,
+                            uint32_t * seed) {
+    const qlh_keep_head * handle = (const qlh_keep_head *) handle_void;
+    if (handle == NULL) {
+        return 0;
+    }
+    const int on = handle->sampler != NULL ? 1 : 0;
+    if (temperature     != NULL) { *temperature     = handle->sampling_temperature; }
+    if (top_p           != NULL) { *top_p           = handle->sampling_top_p; }
+    if (top_k           != NULL) { *top_k           = handle->sampling_top_k; }
+    if (repeat_penalty  != NULL) { *repeat_penalty  = handle->sampling_repeat_penalty; }
+    if (repeat_last_n   != NULL) { *repeat_last_n   = handle->sampling_repeat_last_n; }
+    if (penalty_freq    != NULL) { *penalty_freq    = handle->sampling_penalty_freq; }
+    if (penalty_present != NULL) { *penalty_present = handle->sampling_penalty_present; }
+    if (seed            != NULL) { *seed            = handle->sampling_seed; }
+    return on;
+}
+
 /* ★ P3：清空 KV / recurrent 记忆。跨机服务在**同一进程**里服务多条连接时必须调用 ——
  * 否则新连接从位置 0 开始会与上一条连接留下的位置冲突（llama.cpp 报
- * "tokens ... have inconsistent sequence positions"，实测表现为远端 runner_failed）。 */
+ * "tokens ... have inconsistent sequence positions"，实测表现为远端 runner_failed）。
+ *
+ * ★ 2026-10-29（SAMPLING-01）：同时 reset 采样链。penalties 采样器保留最近
+ * `repeat_last_n` 个 token，不清就会让**上一条序列的结尾**去惩罚**下一条序列的开头**；
+ * dist 的 RNG 状态同理。注意不能改成"重建链"：重建会把 seed 重置回初始状态，
+ * 那样每条请求从同一种子起步是合理的，但也会丢掉我们刻意要保留的链配置。
+ * `llama_sampler_reset` 正是上游为此提供的接口。 */
 void qlh_kh_reset(void * handle_void) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     if (handle == NULL || handle->ctx == NULL) {
         return;
     }
     handle->last_error = 0;
+    if (handle->sampler != NULL) {
+        llama_sampler_reset(handle->sampler);
+    }
     llama_memory_t mem = llama_get_memory(handle->ctx);
     if (mem != NULL) {
         llama_memory_clear(mem, true);
@@ -749,6 +1035,13 @@ void qlh_kh_close(void * handle_void) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     if (handle == NULL) {
         return;
+    }
+    /* ★ 2026-10-29（SAMPLING-01）：先free采样链。它不持有 ctx/model 的引用
+     * （greedy 与 penalties 只自带计数器），所以放在 free(ctx) 之前或之后都安全，
+     * 但放在之前更明确：句柄里所有堆对象都按"后建先拆"的顺序释放。 */
+    if (handle->sampler != NULL) {
+        llama_sampler_free(handle->sampler);
+        handle->sampler = NULL;
     }
     if (handle->ctx != NULL) {
         llama_free(handle->ctx);

@@ -238,6 +238,55 @@ class KeepHeadUpstream:
     def is_eog(self, token: int) -> bool:
         return bool(self._request({"op": "is_eog", "token": int(token)}).get("eog", False))
 
+    # ----------------------------------------------------------------- sampling
+    def set_sampling(
+        self,
+        *,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repeat_penalty: float = 1.0,
+        repeat_last_n: int = 0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        seed: int = 0xFFFFFFFF,
+    ) -> dict:
+        """Install this stage's sampler chain; return the values actually in effect.
+
+        Only meaningful on a stage that emits token ids -- the tail. A hidden-out
+        stage has no logits to sample from, so nothing there reads this.
+
+        Defaults are the "off" end of every knob (temperature 0 = greedy,
+        top_p 1 = disabled, top_k 0 = disabled, penalties disabled), which is why a
+        caller that says nothing keeps the argmax-equivalent deterministic path.
+        """
+        reply = self._request({
+            "op": "set_sampling",
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "repeat_penalty": float(repeat_penalty),
+            "repeat_last_n": int(repeat_last_n),
+            "frequency_penalty": float(frequency_penalty),
+            "presence_penalty": float(presence_penalty),
+            "seed": int(seed) & 0xFFFFFFFF,
+        })
+        return dict(reply.get("sampling") or {})
+
+    def sampling(self) -> dict:
+        """What the native side says is in effect (no request parameters involved)."""
+        return dict(self._request({"op": "get_sampling"}).get("sampling") or {})
+
+    def clear_sampling(self) -> dict:
+        """Return this stage to the pristine argmax default.
+
+        Call this when a request carries no sampling parameters: ``set_sampling`` with
+        the defaults would install a greedy chain, which scales the same tokens but
+        reports a different mode and would let one client's configuration leak into
+        the next client's request.
+        """
+        return dict(self._request({"op": "clear_sampling"}).get("sampling") or {})
+
     def reset(self) -> None:
         """Clear KV / recurrent memory so the next sequence may start at position 0."""
         if self.is_available:

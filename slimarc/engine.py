@@ -105,6 +105,31 @@ class StageEngine:
         """hidden in, next token out. Used by the tail stage."""
         return int(self._up.forward_hidden_to_token(hidden, n_past=n_past))
 
+    def set_sampling(self, **params) -> dict:
+        """Configure the tail stage's sampler; returns the effective parameters.
+
+        Wraps nothing: the shim decides what "off" means for every field, and the
+        reply it sends back is the authority on what the caller actually got.
+        A 'gpu'/'cpu' stage accepts the call and ignores it in every way that
+        matters -- it never produces tokens, so `set_sampling` there is a no-op that
+        still succeeds, which keeps the caller from having to special-case roles.
+        """
+        if self.role != "tail":
+            return {}
+        return self._up.set_sampling(**params)
+
+    def sampling(self) -> dict:
+        """Effective sampler configuration (empty for stages that never sample)."""
+        if self.role != "tail":
+            return {}
+        return self._up.sampling()
+
+    def clear_sampling(self) -> dict:
+        """Back to the argmax default (see KeepHeadUpstream.clear_sampling)."""
+        if self.role != "tail":
+            return {}
+        return self._up.clear_sampling()
+
     def reset(self) -> None:
         self._up.reset()
 
