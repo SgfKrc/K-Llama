@@ -58,6 +58,11 @@ class StageEngine:
         # The shim loads ggml backends by directory; without this it only sees the
         # executable and CWD search paths, which do not contain our DLLs.
         env["SA_BACKEND_DIR"] = str(Path(shim_path).resolve().parent)
+        # Only the tail stage chooses a token, so only it needs the output projection.
+        # A stage that returns hidden states was making the shim run output.weight for
+        # the whole 248,320-row vocabulary on every step and discard it: stage0 measured
+        # 32.0 ms/step that way against 6.4 ms with logits skipped.
+        env["SA_NEEDS_LOGITS"] = "1" if role == "tail" else "0"
         # mode 0 (nextn) takes the model's own last-layer output and pairs with a
         # head-cut artifact (blk.0..K-1), so a K-layer file only runs K layers.
         # That is what the first stage needs. mode 1 (layer_inp) reads layer

@@ -101,6 +101,9 @@ class Binding:
         lib.qlh_kh_reset.restype = None
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_close.restype = None
+        if hasattr(lib, "qlh_kh_set_skip_hidden_logits"):
+            lib.qlh_kh_set_skip_hidden_logits.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+            lib.qlh_kh_set_skip_hidden_logits.restype = ctypes.c_int32
         if hasattr(lib, "qlh_kh_last_error"):
             lib.qlh_kh_last_error.argtypes = [ctypes.c_void_p]
             lib.qlh_kh_last_error.restype = ctypes.c_int32
@@ -155,6 +158,26 @@ class Binding:
         if self.n_embd <= 0:
             self.close()
             raise KeepHeadUnavailable("shim reported n_embd <= 0")
+        # Stages whose job is to hand back hidden states have no use for logits: the
+        # shim would otherwise run output.weight for all 248,320 vocabulary rows on
+        # every single decode step and throw the result away. Measured on stage0
+        # (8 layers, all on GPU): 32.0 ms/step with logits, 6.4 ms without.
+        # Only the tail stage needs them, because that is where a token is chosen.
+        #
+        # SA_NEEDS_LOGITS arrives through the environment because that is how engine.py
+        # already conveys per-stage load settings (the shim reads its own copy at load
+        # time, so anything set later would be invisible to it).
+        if os.environ.get("SA_NEEDS_LOGITS", "0") != "1":
+            self.set_skip_hidden_logits(True)
+
+    def set_skip_hidden_logits(self, skip: bool) -> None:
+        """Tell the shim whether this stage needs logits."""
+        fn = getattr(self._lib, "qlh_kh_set_skip_hidden_logits", None)
+        if fn is None:
+            return          # older shim: keep the default, just slower
+        rc = fn(self._handle, 1 if skip else 0)
+        if rc:
+            raise KeepHeadUnavailable(f"set_skip_hidden_logits({skip}) failed: {rc}")
 
     def _checked(self, rc: int, result, what: str):
         """Raise on a native error code, else hand back ``result``."""

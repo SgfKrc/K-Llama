@@ -257,8 +257,14 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     ]
     if stage.cpus:
         cmd.extend(["--cpus", stage.cpus])
+    # Only the tail stage needs the output projection. Without this the shim computes
+    # logits for all 248,320 vocabulary rows on every step of every stage and discards
+    # all but the tail's -- measured 32.0 vs 3.6 ms/step on stage0.
+    env = dict(os.environ)
+    env["SA_NEEDS_LOGITS"] = "1" if stage.kind == "tail" else "0"
     try:
-        proc = subprocess.Popen(cmd, cwd=str(HERE), stdout=handle, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, cwd=str(HERE), stdout=handle,
+                                stderr=subprocess.STDOUT, env=env)
     finally:
         handle.close()
     return proc, log

@@ -202,6 +202,36 @@ void * qlh_kh_load(const char * model_path,
         }
     }
 
+    /* PROTO: keep a pure-CPU stage off the GPU entirely.
+     *
+     * n_gpu_layers = 0 does not mean "do not touch the GPU". Measured on the three-stage
+     * chain: the middle stage runs 16 layers on the CPU, yet llama.cpp still picked
+     * CUDA0 as its device and reserved a 1012 MiB compute buffer there. Two processes
+     * holding CUDA contexts on one card made the GPU stage's decoder step go from
+     * 5.9 ms standalone to 61.9 ms inside the chain -- a 10x regression caused purely
+     * by a stage that was supposed to be CPU-only.
+     *
+     * `devices` is a NULL-terminated list of the devices a model may use. Passing only
+     * the CPU device keeps that stage out of VRAM and out of the CUDA context, which is
+     * what n_gpu_layers = 0 was always meant to imply here.
+     */
+    static ggml_backend_dev_t s_cpu_only[2];
+    if (mparams.n_gpu_layers == 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev != NULL) {
+            s_cpu_only[0] = cpu_dev;
+            s_cpu_only[1] = NULL;
+            mparams.devices = s_cpu_only;
+            fprintf(stderr, "[qlh_keep_head] cpu-only: pinned devices to CPU (%s)\n",
+                    ggml_backend_dev_name(cpu_dev));
+        } else {
+            /* Should not happen: the CPU backend is always registered. Say so rather
+             * than silently keeping every device, which is the bug this exists to fix. */
+            fprintf(stderr, "[qlh_keep_head] cpu-only: no CPU device found, "
+                            "falling back to all devices\n");
+        }
+    }
+
     /* PROTO: mirror llama-bench's --n-cpu-moe. Expert tensors are the bulk of the
      * weights (88% for Qwen3.6-35B-A3B) but only 8 of 256 are touched per token, so
      * leaving them on the host while everything else sits in VRAM is what makes the
