@@ -1,0 +1,17 @@
+# slimarc 是独立起点，只需要忽略自己产生的文件；
+# 原 K-Llama 的 .gitignore 已随历史剥离。
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行时输出：日志与临时工件
+slimarc/build/
+*.log
+
+# 模型与二进制不进 git
+*.gguf
+slimarc/shim/bin/
+
+# 本地拓扑覆盖
+slimarc/topology-local*.toml
