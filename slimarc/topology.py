@@ -43,7 +43,12 @@ class Stage:
 
     @property
     def is_local(self) -> bool:
-        return self.host in LOCAL_HOSTS
+        return is_loopback(self.host)
+
+
+def is_loopback(host: str) -> bool:
+    """True when this host runs the stage itself, i.e. the master spawns it."""
+    return host in LOCAL_HOSTS
 
 
 def _int(raw: dict, key: str, index: int, lo: int, hi: int | None = None,
@@ -78,13 +83,17 @@ def _stage(index: int, raw: dict) -> Stage:
     if not isinstance(raw, dict):
         raise TopologyError(f"stage[{index}] must be a [[stage]] table, got {raw!r}")
     model = Path(_str(raw, "model", index)).expanduser()
-    if not model.is_file():
+    host = _str(raw, "host", index)
+    # Only local artifacts are checked for existence. A remote stage's path refers to
+    # that machine's filesystem, so requiring it here would make every cross-host
+    # topology invalid on the master -- and the master never opens it anyway.
+    if is_loopback(host) and not model.is_file():
         raise TopologyError(f"stage[{index}].model does not point to a file: {model}")
     kind = _str(raw, "kind", index)
     if kind not in KINDS:
         raise TopologyError(f"stage[{index}].kind must be one of {KINDS}, got {kind!r}")
     return Stage(
-        index, model, _str(raw, "host", index),
+        index, model, host,
         _int(raw, "port", index, 1024, 65535),
         _int(raw, "layers", index, 1, TOTAL_LAYERS),
         kind,
@@ -209,8 +218,13 @@ def verify_artifacts(stages: tuple[Stage, ...]) -> None:
 
     Catches the failure mode where someone edits the topology and reuses an artifact
     cut for a different range: the chain would still run, on the wrong layers.
+
+    Remote stages are skipped: their path is on another machine, so the file cannot be
+    opened here. The remote worker does its own check when it loads.
     """
     for s in stages:
+        if not s.is_local:
+            continue
         actual = layers_from_gguf(s.model)
         if actual != s.layers:
             raise TopologyError(
