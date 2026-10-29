@@ -79,7 +79,7 @@ torch）。放在 `slimarc/koakuma.cmd`，同时给一个 `koakuma.ps1` 供 Powe
 
 命令要做的事，按顺序：
 
-1. 找拓扑：`SA_TOPOLOGY` 环境变量 → 否则 `topology.toml` → 否则列出可选文件让用户选
+1. 找拓扑：`SA_TOPOLOGY` 环境变量 → 否则 `topology.toml` → 否则列出目录下的候选文件并提示用 `--topology` 指定
 2. 找 shim：`SA_SHIM` → 否则 `shim/bin/qlh_keep_head.dll`
 3. 跑内存预检，不够就明确说差多少、建议怎么改
 4. 起 worker（本机段），连远端段
