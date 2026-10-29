@@ -232,6 +232,27 @@ void * qlh_kh_load(const char * model_path,
         }
     }
 
+    /* NOTE 2026-10-29: an SA_NO_EXTRA_BUFTYPES switch lived here and was removed.
+     *
+     * It set mparams.use_extra_bufts = false to skip ggml's 4.6 GB repack buffer, on
+     * the theory that the buffer was starving page cache on a 15.2 GB host and making
+     * the mmap'd 9.17 GB of weights re-read from disk every step. Two measurements
+     * killed that:
+     *
+     *   1. The switch changed nothing here. The log printed "repack disabled" and the
+     *      loader still reported `CPU_REPACK model buffer size = 4608.00 MiB`; this
+     *      DLL build does not honour use_extra_bufts, so the knob was decorative.
+     *   2. With the flag on, resident cost went UP, not down: 10.51 GB peak versus
+     *      9.18 GB with repack left alone. Much of that is confounded by the GPU
+     *      engine loaded in the same process during the comparison, so the honest
+     *      reading is "no measurable benefit", not "actively harmful".
+     *
+     * Repack is a pure-CPU decode optimisation; its cost only shows up when the GPU
+     * and CPU stages share a machine. It is not the lever for a memory-tight tail
+     * host, so nothing here tries to disable it until a real switch exists upstream
+     * (a `--no-repack` equivalent in llama_model_params).
+     */
+
     /* PROTO: mirror llama-bench's --n-cpu-moe. Expert tensors are the bulk of the
      * weights (88% for Qwen3.6-35B-A3B) but only 8 of 256 are touched per token, so
      * leaving them on the host while everything else sits in VRAM is what makes the
