@@ -12,6 +12,16 @@ slimarc/build/
 # 模型与二进制不进 git
 *.gguf
 slimarc/shim/bin/
-
 # 本地拓扑覆盖
 slimarc/topology-local*.toml
+
+#环境变量
+.env
+
+.agents/
+.venv-*/
+.vscode/
+local_docs/
+_archive/
+tools/
+video-remotion/
