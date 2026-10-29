@@ -23,5 +23,5 @@ slimarc/topology-local*.toml
 .vscode/
 local_docs/
 _archive/
-tools/
+/tools/
 video-remotion/
