@@ -1,0 +1,108 @@
+warning: in the working copy of 'a/qlh_keep_head.c', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'b/qlh_keep_head.c', LF will be replaced by CRLF the next time Git touches it
+diff --git a/qlh_keep_head.c b/qlh_keep_head.c
+index ae5d169..25b02fd 100644
+--- a/qlh_keep_head.c
++++ b/qlh_keep_head.c
+@@ -34,12 +34,44 @@
+  */
+ 
+ #include "llama.h"
++#include "ggml-backend.h"
+ 
+ #include <math.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <windows.h>
++
++/* PROTO: load whatever ggml backends sit next to this DLL (ggml-cuda.dll in the
++ * prototype build). Upstream QLH never needed this because the shim only ever ran
++ * on CPU; llama.cpp's own tools call it once at startup. With GGML_BACKEND_DL=ON the
++ * backends are separate DLLs and the loader searches the executable directory and
++ * the CWD, neither of which is guaranteed to be our directory when the shim runs
++ * inside a detached worker process. Pass our own directory explicitly, falling back
++ * to the default search when the path cannot be resolved. */
++static void qlh_ensure_backends_loaded(void) {
++    static int loaded = 0;
++    if (loaded) return;
++    /* PROTO: prefer an explicit directory (the worker knows where the shim lives),
++     * fall back to this DLL's own directory, then to the default search paths. */
++    const char * dir = getenv("SA_BACKEND_DIR");
++    if (dir != NULL && dir[0] != '\0') {
++        ggml_backend_load_all_from_path(dir);
++    }
++    char self[MAX_PATH];
++    DWORD n = GetModuleFileNameA((HMODULE) &qlh_ensure_backends_loaded, self, (DWORD) sizeof(self));
++    if (n > 0 && n < (DWORD) sizeof(self)) {
++        char * slash = strrchr(self, '\\');
++        if (slash != NULL) {
++            *slash = '\0';
++            ggml_backend_load_all_from_path(self);
++        }
++    }
++    ggml_backend_load_all();
++    loaded = 1;
++    fprintf(stderr, "[qlh_keep_head] backends loaded: count=%zu\n", ggml_backend_reg_count());
++}
+ 
+ typedef struct qlh_keep_head {
+     struct llama_model   *model;
+@@ -97,8 +129,55 @@ void * qlh_kh_load(const char * model_path,
+         return NULL;
+     }
+ 
++    qlh_ensure_backends_loaded();
++
+     struct llama_model_params mparams = llama_model_default_params();
+-    mparams.n_gpu_layers = 0;
++    /* PROTO: n_gpu_layers is configurable here. Upstream QLH hardcodes 0 because its
++     * GPU stage runs on PyTorch and the shim only ever serves CPU stages. This
++     * prototype puts the first-stage expert weights on the GPU, so the shim must be
++     * able to offload. SA_N_GPU_LAYERS=0 keeps the original behaviour. */
++    {
++        const char * gpu_layers_raw = getenv("SA_N_GPU_LAYERS");
++        if (gpu_layers_raw != NULL && gpu_layers_raw[0] != '\0') {
++            char * gpu_layers_end = NULL;
++            const long parsed = strtol(gpu_layers_raw, &gpu_layers_end, 10);
++            mparams.n_gpu_layers = (gpu_layers_end != gpu_layers_raw && *gpu_layers_end == '\0')
++                ? (int32_t) parsed : 0;
++        } else {
++            mparams.n_gpu_layers = 0;
++        }
++    }
++
++    /* PROTO: mirror llama-bench's --n-cpu-moe. Expert tensors are the bulk of the
++     * weights (88% for Qwen3.6-35B-A3B) but only 8 of 256 are touched per token, so
++     * leaving them on the host while everything else sits in VRAM is what makes the
++     * split worth doing. Implemented the same way llama-bench does it: pin the
++     * first N layers' expert tensors to the CPU buffer type via tensor overrides.
++     * SA_N_CPU_MOE unset or 0 leaves every expert on the GPU. */
++    static char * s_moe_patterns[512];
++    static struct llama_model_tensor_buft_override s_moe_overrides[513];
++    {
++        const char * cpu_moe_raw = getenv("SA_N_CPU_MOE");
++        long cpu_moe = 0;
++        if (cpu_moe_raw != NULL && cpu_moe_raw[0] != '\0') {
++            char * end = NULL;
++            const long parsed = strtol(cpu_moe_raw, &end, 10);
++            if (end != cpu_moe_raw && *end == '\0' && parsed > 0) cpu_moe = parsed;
++        }
++        if (cpu_moe > 0 && cpu_moe <= 512) {
++            for (long i = 0; i < cpu_moe; ++i) {
++                const size_t need = strlen("blk\\.\\.ffn_(up|down|gate|gate_up)_(ch|)exps") + 16;
++                s_moe_patterns[i] = (char *) malloc(need);
++                if (s_moe_patterns[i] == NULL) break;
++                snprintf(s_moe_patterns[i], need, "blk\\.%ld\\.ffn_(up|down|gate|gate_up)_(ch|)exps", i);
++                s_moe_overrides[i].pattern = s_moe_patterns[i];
++                s_moe_overrides[i].buft = ggml_backend_cpu_buffer_type();
++            }
++            s_moe_overrides[cpu_moe].pattern = NULL;
++            s_moe_overrides[cpu_moe].buft = NULL;
++            mparams.tensor_buft_overrides = s_moe_overrides;
++        }
++    }
+ 
+     struct llama_model * model = llama_model_load_from_file(model_path, mparams);
+     if (model == NULL) {

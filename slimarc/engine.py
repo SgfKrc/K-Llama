@@ -1,0 +1,107 @@
+"""Thin wrapper over the keep-head shim.
+
+The shim (qlh_keep_head.c) provides the hidden-in/hidden-out and
+hidden-in/token-out primitives; keep_head.py binds it. This module only adds the
+per-stage policy: which layers live on which device, and role-specific naming.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import numpy as np
+
+from keep_head import KeepHeadUpstream
+
+
+ROLES = ("gpu", "cpu", "tail")
+
+
+class EngineError(RuntimeError):
+    pass
+
+
+class StageEngine:
+    """One pipeline stage backed by a cut GGUF and the keep-head shim.
+
+    role='gpu'  consumes token ids and emits hidden (first stage).
+    role='cpu'  consumes hidden and emits hidden (middle stage).
+    role='tail' consumes hidden and emits the next token id (last stage).
+
+    'tail' runs exactly like 'cpu' -- same embd-injection decode path, same hidden
+    width -- only the export the worker asks for differs. The role is validated
+    here rather than silently coerced so a typo in topology.toml fails at load.
+    """
+
+    def __init__(
+        self,
+        *,
+        shim_path: Path,
+        model_path: Path,
+        role: str,
+        ctx: int,
+        n_threads: int,
+        cut_layer: int | None,
+        n_gpu_layers: int,
+        n_cpu_moe: int = 0,
+        n_batch: int = 512,
+    ) -> None:
+        if role not in ROLES:
+            raise EngineError(f"role must be one of {ROLES}, got {role!r}")
+        self.role = role
+        # Per-stage device policy rides on an explicit environment mapping, because
+        # each stage needs a different value (the CPU stage keeps every layer on the
+        # host) and the shim reads these with getenv() at load time.
+        env = dict(os.environ)
+        env["SA_N_GPU_LAYERS"] = str(int(n_gpu_layers))
+        env["SA_N_CPU_MOE"] = str(int(n_cpu_moe))
+        # The shim loads ggml backends by directory; without this it only sees the
+        # executable and CWD search paths, which do not contain our DLLs.
+        env["SA_BACKEND_DIR"] = str(Path(shim_path).resolve().parent)
+        # mode 0 (nextn) takes the model's own last-layer output and pairs with a
+        # head-cut artifact (blk.0..K-1), so a K-layer file only runs K layers.
+        # That is what the first stage needs. mode 1 (layer_inp) reads layer
+        # `cut_layer`'s input but runs every layer in the file.
+        self._up = KeepHeadUpstream(
+            shim_path=str(shim_path),
+            model_path=str(model_path),
+            mode="nextn",
+            n_ctx=ctx,
+            n_threads=n_threads,
+            n_batch=n_batch,
+            environment=env,
+        )
+
+    @property
+    def n_embd(self) -> int:
+        return int(self._up.n_embd)
+
+    @property
+    def n_layer(self) -> int:
+        """Block count the shim found in this artifact, i.e. the layers it runs."""
+        return int(self._up.n_layer)
+
+    def forward_tokens(self, tokens: list[int], *, n_past: int) -> np.ndarray:
+        """token in, hidden out. Used by the first stage."""
+        out = self._up.forward_tokens_to_hidden(tokens, n_past=n_past)
+        return np.asarray(out, dtype=np.float32)
+
+    def forward_hidden(self, hidden: np.ndarray, *, n_past: int) -> np.ndarray:
+        """hidden in, hidden out. Used by middle (cpu) stages."""
+        out = self._up.forward_hidden_to_hidden(hidden, n_past=n_past)
+        return np.asarray(out, dtype=np.float32)
+
+    def forward_token(self, hidden: np.ndarray, *, n_past: int) -> int:
+        """hidden in, next token out. Used by the tail stage."""
+        return int(self._up.forward_hidden_to_token(hidden, n_past=n_past))
+
+    def reset(self) -> None:
+        self._up.reset()
+
+    def close(self) -> None:
+        try:
+            self._up.close()
+        except Exception:  # noqa: BLE001 - closing must not mask the original failure
+            pass
+
+

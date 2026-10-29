@@ -1,0 +1,57 @@
+# 三段链式推理：8 + 16 + 16 = 40 层。
+#
+# 每段一个 [[stage]] 表，顺序即链序：
+#   kind = "gpu"  第一段，吃 token、吐 hidden，必须 1 个且在最前
+#   kind = "cpu"  中间段，吃 hidden、吐 hidden，0 个或多个
+#   kind = "tail" 最后一段，吃 hidden、吐 token，必须 1 个且在最后
+#
+# host 是 127.0.0.1 / localhost / ::1 时本进程负责拉起 stage_worker；
+# 其它地址只连接、不拉起（那一端要自己先启动 worker）。
+#
+# ⚠️ 本机三段同载不可行（21.85 GiB 权重 / 0.75 = 需 29.1 GiB 可用，本机常态 20-26）。
+#    chain_client 的内存预检会拒绝启动。三段实验必须把 tail 段的 host 改成远端 IP。
+#
+# ⚠️ cpus 别给太少。实测：一个 3 核的 worker 跑 32 层要 1692 ms，放宽到 6 核只要 70 ms
+#    （24 倍差）。原因是每个 worker 有 5+ 活动线程（主线程 + keep_head 主线程 +
+#    llama 计算线程），3 个逻辑核装不下，且相邻逻辑核可能是同一物理 P-core 的超线程对。
+#    给每段 6 个逻辑核；宁可留空也不要挤。
+
+[[stage]]
+model      = "F:/qlh-models/stage-split-3/stage-0-8.gguf"
+host       = "127.0.0.1"
+port       = 9101
+layers     = 8
+kind       = "gpu"
+gpu_layers = 99          # 整段上卡；显存不够就降到 0，别让它悄悄换成系统内存
+cpu_moe    = 0
+cpus       = "0,1"       # GPU 段算得少（8 层 6-10 ms），2 核够
+threads    = 3
+
+[[stage]]
+model      = "F:/qlh-models/stage-split-3/stage-8-24.gguf"
+host       = "127.0.0.1"
+port       = 9102
+layers     = 16
+kind       = "cpu"
+gpu_layers = 0
+cpu_moe    = 0
+cpus       = "2,3,4,5,6,7"
+threads    = 3
+
+[[stage]]
+# 第三段必须放远端。把 host 改成 ROG 的局域网 IP（例如 192.168.1.20），
+# 并在那台机器上先启动（路径按 ROG 上的实际位置改）：
+#   python stage_worker.py --role tail --model <stage-24-40.gguf> \
+#       --shim <shim 路径> --host 0.0.0.0 --port 9103 --ctx 4096 \
+#       --threads 6 --layers 16
+# ROG 是 6 核 / 12 线程，threads 给 6 即可；不必绑核（它没有 P/E 异构）。
+# 改了 host 之后本进程就不再拉起这一段（见 is_local 判断）。
+model      = "F:/qlh-models/stage-split-3/stage-24-40.gguf"
+host       = "127.0.0.1"
+port       = 9103
+layers     = 16
+kind       = "tail"
+gpu_layers = 0
+cpu_moe    = 0
+cpus       = "8,9,10,11,12,13"
+threads    = 6

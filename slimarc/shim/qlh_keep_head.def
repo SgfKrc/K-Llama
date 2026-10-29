@@ -1,0 +1,16 @@
+LIBRARY qlh_keep_head
+EXPORTS
+    qlh_kh_load
+    qlh_kh_forward
+    qlh_kh_forward_embd
+    qlh_kh_forward_embd_seq
+    qlh_kh_forward_embd_token
+    qlh_kh_forward_embd_tokens
+    qlh_kh_finite_logits_guard
+    qlh_kh_n_vocab
+    qlh_kh_n_embd
+    qlh_kh_n_layer
+    qlh_kh_last_error
+    qlh_kh_set_skip_hidden_logits
+    qlh_kh_reset
+    qlh_kh_close
