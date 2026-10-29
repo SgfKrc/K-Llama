@@ -72,7 +72,10 @@ class StageWorker:
                 try:
                     if op == "tokenize":
                         tokens = self._engine.tokenize(str(msg.meta.get("text", "")))
-                        protocol.send(conn, protocol.RESULT, {"tokens": tokens})
+                        # n_embd rides along so a client can learn the width without
+                        # running a forward first (single-stage topologies never do).
+                        protocol.send(conn, protocol.RESULT,
+                                      {"tokens": tokens, "n_embd": self._engine.n_embd})
                     elif op == "piece":
                         piece = self._engine.piece(int(msg.meta["token"]))
                         # latin-1 keeps arbitrary bytes intact through the JSON hop.

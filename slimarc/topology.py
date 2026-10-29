@@ -95,7 +95,7 @@ def _stage(index: int, raw: dict) -> Stage:
     )
 
 
-def _validate(stages: tuple[Stage, ...]) -> None:
+def _validate(stages: tuple[Stage, ...], declared_source_layers: int = 0) -> None:
     if len(stages) < 2:
         raise TopologyError(f"a topology needs at least 2 stages, got {len(stages)}")
     kinds = [s.kind for s in stages]
@@ -123,12 +123,18 @@ def _validate(stages: tuple[Stage, ...]) -> None:
     total = total_layers(stages)
     # A gap is not a lesser mistake than an overlap: the chain would silently skip
     # layers and produce plausible-but-wrong logits, whereas excess layers fail loudly
-    # at load. Require an exact cover.
-    if total != TOTAL_LAYERS:
+    # at load. Require an exact cover of the source model's decoder layers.
+    #
+    # The expected count comes from `source_layers` when the file declares it, because
+    # no single stage artifact knows the source total (each reports only what it kept).
+    # TOTAL_LAYERS stays as the default so a 35B topology without the key still works.
+    expected = declared_source_layers if declared_source_layers else TOTAL_LAYERS
+    if total != expected:
         raise TopologyError(
-            f"stages sum to {total} layers but the model has {TOTAL_LAYERS}; "
+            f"stages sum to {total} layers but the model has {expected}; "
             f"the topology must cover every layer exactly (got "
-            f"{[s.layers for s in stages]})")
+            f"{[s.layers for s in stages]}). Set `source_layers` at the top of the "
+            f"file if the model is not the default {TOTAL_LAYERS}-layer one.")
     ports = [s.port for s in stages]
     dupes = sorted({p for p in ports if ports.count(p) > 1})
     if dupes:
@@ -150,8 +156,14 @@ def load(path: str | Path) -> tuple[Stage, ...]:
     raw_stages = doc.get("stage")
     if not isinstance(raw_stages, list) or not raw_stages:
         raise TopologyError(f"topology file needs a non-empty [[stage]] array: {p}")
+    # Optional top-level key: how many decoder layers the source model has. Needed
+    # because a cut artifact only knows what it kept, so the exact-cover check has no
+    # other way to learn the total for a non-default model.
+    declared = doc.get("source_layers", 0)
+    if declared and (not isinstance(declared, int) or declared <= 0):
+        raise TopologyError(f"source_layers must be a positive integer, got {declared!r}")
     stages = tuple(_stage(i, raw) for i, raw in enumerate(raw_stages))
-    _validate(stages)
+    _validate(stages, declared or 0)
     return stages
 
 
@@ -174,16 +186,22 @@ def layers_from_gguf(path: str | Path) -> int:
     """Read a stage artifact's own block count.
 
     A cut artifact reports the layers it kept, not the source model's total, so this
-    is useful for checking that a stage's declared `layers` matches the file it points
-    at. The topology's TOTAL_LAYERS refers to the *source* model and cannot be derived
-    from any single artifact.
+    checks that a stage's declared `layers` matches the file it points at.
     """
     from gguf import GGUFReader
 
     with open(path, "rb") as fh:
         reader = GGUFReader(fh)
-        field = reader.get_field("qwen35moe.block_count")
+        arch = _arch_of(reader)
+        field = reader.get_field(f"{arch}.block_count") if arch else None
+    if field is None:
+        raise ValueError(f"{path}: no {arch}.block_count")
     return int(field.contents())
+
+
+def _arch_of(reader) -> str:
+    field = reader.get_field("general.architecture")
+    return str(field.contents()) if field is not None else ""
 
 
 def verify_artifacts(stages: tuple[Stage, ...]) -> None:

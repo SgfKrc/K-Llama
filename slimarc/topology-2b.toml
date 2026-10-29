@@ -1,0 +1,31 @@
+# 2B 模型的两段，用于 SSE 协议验证。1.44 GB，内存开销可忽略。
+# 20 层覆盖（16 + 4），均为 4 的倍数，符合 full_attention_interval 约束。
+# 真实端到端见 topology.toml（35B 三段，需 ROG）。
+#
+# 不绑核：实测绑 "0,1" 时同一个 step 从 50 ms 涨到秒级。i9-13900H 的相邻逻辑核
+# 可能是同一物理 P-core 的超线程对，3 个 llama 计算线程挤在 1 个物理核上互相抢占。
+# 真机调优时按物理核编号绑（见 docs/MEMORY-LIMITS.md §3.4）。
+
+source_layers = 20
+
+[[stage]]
+model      = "F:/qlh-models/archive-q35-2b/q35-2b-head16.gguf"
+host       = "127.0.0.1"
+port       = 9401
+layers     = 16
+kind       = "gpu"
+gpu_layers = 0
+cpu_moe    = 0
+cpus       = ""
+threads    = 3
+
+[[stage]]
+model      = "F:/qlh-models/archive-q35-2b/q35-2b-cut-16-20.gguf"
+host       = "127.0.0.1"
+port       = 9402
+layers     = 4
+kind       = "tail"
+gpu_layers = 0
+cpu_moe    = 0
+cpus       = ""
+threads    = 4

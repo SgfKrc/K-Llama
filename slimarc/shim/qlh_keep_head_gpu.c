@@ -233,6 +233,22 @@ void * qlh_kh_load(const char * model_path,
     cparams.n_threads       = (n_threads > 0 ? n_threads : 4);
     cparams.n_threads_batch = (n_threads > 0 ? n_threads : 4);
     cparams.n_seq_max       = (uint32_t) (n_seq_max > 0 ? n_seq_max : 1);
+    /* Zero the DLL's own n_outputs_max slot. The newer llama.h declares it at a
+     * different offset than this build uses, so the guard in llama.h removes the
+     * field and we write it by raw offset instead.
+     *
+     * Measured on the real DLL (build-headers/probe_slots.py): n_ctx 0, n_batch 4,
+     * n_ubatch 8, n_seq_max 12, slot16, slot20, n_threads 24, n_threads_batch 28.
+     * n_threads at 24 means exactly two extra slots, and the second (offset 20) is
+     * n_outputs_max. The DLL asserts `n_outputs_max <= cparams.n_outputs_max` on
+     * decode; leaving whatever default_params() put there makes the bound garbage and
+     * the assert fires at the first forward. 0 means "derive it". */
+    {
+        unsigned char * base = (unsigned char *) &cparams;
+        uint32_t zero = 0;
+        memcpy(base + 16, &zero, sizeof(zero));   /* n_rs_seq slot on this build */
+        memcpy(base + 20, &zero, sizeof(zero));   /* n_outputs_max */
+    }
 
     struct llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {

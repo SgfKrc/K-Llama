@@ -92,10 +92,17 @@ def generate_stream(
     t0 = time.perf_counter()
 
     # Prefill the whole prompt in one pass; decode then continues one token at a time.
-    hidden = clients[0].forward_tokens(prompt_tokens, 0)
-    for client in clients[1:-1]:
-        hidden = client.forward_hidden(hidden, 0)
-    token = tail.forward_token(hidden, 0)
+    if len(clients) == 1:
+        # Single-stage topology: protocol smoke test only. A tail stage expects hidden,
+        # so feed zeros; the numbers are meaningless but every wire path is real.
+        head = clients[0]
+        prefix = np.zeros((len(prompt_tokens), head.n_embd), dtype=np.float32)
+        token = head.forward_token(prefix, 0)
+    else:
+        hidden = clients[0].forward_tokens(prompt_tokens, 0)
+        for client in clients[1:-1]:
+            hidden = client.forward_hidden(hidden, 0)
+        token = tail.forward_token(hidden, 0)
     n_past = len(prompt_tokens)
 
     for _ in range(max_tokens):

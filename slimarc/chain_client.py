@@ -104,6 +104,17 @@ class StageClient:
             raise RuntimeError(f"stage {self.stage.index} is not connected")
         return self._sock
 
+    @property
+    def n_embd(self) -> int:
+        """Hidden width, known after the first forward.
+
+        A single-stage topology never runs `forward_tokens`, so ask the worker for it
+        via a tokenize round trip, which is cheap and always available.
+        """
+        if not self._n_embd:
+            self._forward({"op": "tokenize", "text": ""})
+        return self._n_embd
+
     def _forward(self, meta: dict, blob: bytes = b"") -> protocol.Message:
         protocol.send(self.sock, protocol.FORWARD, meta, blob)
         msg = protocol.read(self.sock)
@@ -132,6 +143,8 @@ class StageClient:
     def tokenize(self, text: str) -> list[int]:
         """Text -> ids via the stage's own vocabulary (every stage loads the same one)."""
         msg = self._forward({"op": "tokenize", "text": text})
+        if "n_embd" in msg.meta:
+            self._n_embd = int(msg.meta["n_embd"])
         return [int(t) for t in msg.meta.get("tokens", [])]
 
     def piece(self, token: int) -> bytes:
