@@ -159,16 +159,20 @@ class KeepHeadUpstream:
 
     @staticmethod
     def _hidden_payload(op: str, arr: np.ndarray, n_past: int) -> dict:
-        # base64 keeps the pipe line-oriented JSON instead of raw binary.
+        # base64 keeps the pipe line-oriented JSON instead of raw binary, and it can read
+        # the array's buffer directly: .tobytes() first would add an 8 KB copy per step.
         return {"op": op, "shape": list(arr.shape), "n_past": int(n_past),
-                "data": base64.b64encode(arr.tobytes()).decode("ascii")}
+                "data": base64.b64encode(arr).decode("ascii")}
 
     @staticmethod
     def _array(response: dict) -> np.ndarray:
         try:
             shape = tuple(int(v) for v in response["shape"])
             raw = base64.b64decode(str(response["data"]))
-            return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
+            # No .copy(): b64decode already produced a fresh bytes object owned by this
+            # view, so the copy was pure overhead on an 8 KB payload. The array is
+            # read-only, which the numeric path only ever reads.
+            return np.frombuffer(raw, dtype=np.float32).reshape(shape)
         except (KeyError, TypeError, ValueError) as exc:
             raise KeepHeadUnavailable("keep-head worker returned malformed hidden") from exc
 

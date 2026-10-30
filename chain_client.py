@@ -6,9 +6,12 @@ them (local and remote alike), and walks the chain left to right.
 
 Payload shape follows the stage kind, not its position:
 
-  gpu   tokens  (JSON list)   -> hidden (raw float32)
-  cpu   hidden  (raw float32) -> hidden (raw float32)
-  tail  hidden  (raw float32) -> token  (JSON int)
+  gpu   tokens  (JSON list)   -> hidden (raw bytes, wire dtype)
+  cpu   hidden  (wire dtype)  -> hidden (raw bytes, wire dtype)
+  tail  hidden  (wire dtype)  -> token  (JSON int)
+
+The wire dtype is float32 unless SA_WIRE_DTYPE asks for float16 (see wire.py); the
+client declares it on every FORWARD and reads back whatever the worker declares.
 
 Only the first stage is spawned without an input; it is the one that owns the
 token embedding. Only the last one owns the output projection.
@@ -30,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 import protocol  # noqa: E402
 import topology  # noqa: E402
+import wire  # noqa: E402
 from topology import Stage  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -272,22 +276,40 @@ class StageClient:
         return msg
 
     def forward_tokens(self, tokens: list[int], n_past: int) -> np.ndarray:
-        msg = self._forward({"tokens": tokens, "n_tokens": len(tokens), "n_past": n_past})
-        self._n_embd = int(msg.meta["n_embd"])
-        return np.frombuffer(msg.blob, dtype=np.float32).reshape(
-            int(msg.meta["n_tokens"]), self._n_embd)
+        msg = self._forward({"tokens": tokens, "n_tokens": len(tokens),
+                             "n_past": n_past, "dtype": wire.current_dtype()})
+        return self._decode_hidden(msg)
 
     def forward_hidden(self, hidden: np.ndarray, n_past: int) -> np.ndarray:
-        blob = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past}, blob)
-        n_embd = int(msg.meta["n_embd"])
-        return np.frombuffer(msg.blob, dtype=np.float32).reshape(
-            int(msg.meta["n_tokens"]), n_embd)
+        dtype = wire.current_dtype()
+        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past,
+                             "dtype": dtype}, wire.encode(hidden, dtype))
+        return self._decode_hidden(msg)
 
     def forward_token(self, hidden: np.ndarray, n_past: int) -> int:
-        blob = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past}, blob)
+        dtype = wire.current_dtype()
+        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past,
+                             "dtype": dtype}, wire.encode(hidden, dtype))
         return int(msg.meta["token"])
+
+    def _decode_hidden(self, msg: protocol.Message) -> np.ndarray:
+        """Decode the reply's hidden in whatever dtype the worker declared.
+
+        The answer's dtype is not assumed to match this side's setting: a worker that
+        ignored `dtype` (an older build) still answers float32, and the declared value
+        is what decides how the bytes are read. Reading it wrong would be silent garbage,
+        so the byte count is checked against it.
+        """
+        n_embd = int(msg.meta["n_embd"])
+        n_tokens = int(msg.meta["n_tokens"])
+        dtype = msg.meta.get("dtype", wire.DEFAULT)
+        self._n_embd = n_embd
+        expected = wire.payload_size((n_tokens, n_embd), dtype)
+        if len(msg.blob) != expected:
+            raise RuntimeError(
+                f"stage {self.stage.index} ({self.stage.kind}) sent {len(msg.blob)} bytes "
+                f"for {n_tokens}x{n_embd} {dtype} hidden (expected {expected})")
+        return wire.decode(msg.blob, dtype, (n_tokens, n_embd))
 
     def tokenize(self, text: str) -> list[int]:
         """Text -> ids via the stage's own vocabulary (every stage loads the same one)."""

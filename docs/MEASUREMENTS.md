@@ -205,3 +205,75 @@ python chain_client.py --gen 128 --repeat 3 --threads 3
 
 跨机时两段的资源是相加而非共享，理论上 CPU 段能拿到完整的 14.4 GB 专家 + 2.4 GB
 非专家，比单机拆分宽松。这是下一阶段要验证的核心假设。
+
+---
+
+## 9. 段间 hidden 的传输 dtype（2026-10-30，2B）
+
+背景：跨机每步约 157 ms，其中约 24 ms 是 Tailscale 传 8 KB hidden（MTU 1280，
+约 6 个包，每包 ~5 ms）。换成 4 KB 就能少一半包。代价是精度——这一节回答
+"值不值得"。
+
+测量条件：`topology-2b.toml`（2B 两段，20+4 层，纯 CPU），`checks/verify_wire.py`，
+贪心采样，5 个 prompt × 48 token；重复运行用于确认链本身是确定性的。
+
+### 9.1 float16 让输出变了，int16 定点也一样
+
+| 传输 dtype | 单跳量化 max\|diff\| | 相对 max\|a\| | 贪心 token 一致 |
+| --- | ---: | ---: | ---: |
+| float32 | 0 | 0 | 5/5（基线） |
+| float16 | 3.9e-3 | 3.0e-4 | **4/5**，p2 在第 22 步分叉 |
+| int16 定点 | 2.2e-4 | 1.5e-5 | **4/5**，p0 在第 16 步分叉 |
+
+hidden 的真实范数 34–100（与 35B 的 9–89 同量级）；int16 是 per-tensor 对称定点，
+scale 随 payload 前 4 字节传，量化步长比 float16 的 ULP 细约 20 倍。
+
+float32 与 int16 各重跑一次，两次逐位一致——分叉是量化引起的确定性变化，不是随机
+抖动。两个 4 KB 方案各在一个 prompt 上翻转 token，且都发生在输出接近平局的位置。
+所以不能用"大多数 prompt 一致"代替"一致"。
+
+**结论：不用 float16，也不用 int16。** 默认 float32；`SA_WIRE_DTYPE` 只是实验开关
+（默认 float32），worker 按请求 meta 里的 dtype 解码并用同一 dtype 回复。
+
+### 9.2 拷贝从 5 份降到 1 份，耗时没变
+
+每步 hidden 单向的 8 KB payload 拷贝：
+
+| 位置 | 改前 | 改后 |
+| --- | ---: | ---: |
+| client `tobytes` | 1 | 0（memoryview 直接进帧） |
+| `protocol.encode` 拼接 | 2（+blob、+header） | 1（一次 join） |
+| worker `read` | 2（chunks join、payload 切片） | 0（recv_into + memoryview） |
+| **合计（单向）** | **5** | **1** |
+
+微基准（`checks/bench_wire.py protocol`）：整帧构造 2.195 → 2.257 µs（噪声内）。
+8 KB memcpy 0.15 µs，省 4 次拷贝约 0.6 µs。**这一项不改变延迟。**
+
+loopback worker 往返（2B tail 段，300 次中位）：`StageEngine` 直调 17.45 ms，
+worker 往返 17.76 ms，差 0.31 ms。2B 上整个 worker 协议成本不到 1 ms，不是标题里的
+11 ms。那 11 ms 出在 ROG 的 35B 段（计算 32 ms），本轮按约束不碰 ROG，本机无法复现；
+但它与 8 KB 拷贝的量级不符（5 份 ≈ 0.75 µs），所以拷贝优化注定救不了它。
+
+### 9.3 跨网模拟：4 KB 确实少 3 个包
+
+`checks/bench_wire.py proxy` 在本机 worker 前插一个中继：每方向最多转发 1240 B
+（1280 MTU − 40）后 sleep 5 ms，与实测的"每包一个 RTT"同构。这是链路模型，不是
+Tailscale 本身；中继会打印转发块数，假设可见。
+
+| dtype | 上行字节/步 | 块数/步 | 中继后每步 | 相对 loopback |
+| --- | ---: | ---: | ---: | ---: |
+| float32 | 8246 | 7.0 | 51.85 ms | +35.15 |
+| float16 | 4150 | 4.0 | 33.83 ms | +17.13 |
+| int16 | 4152 | 4.0 | 33.79 ms | +17.09 |
+
+4 KB 比 8 KB 每步少 3 个包 ≈ 15 ms（模拟里 18 ms，含中继固定开销）。按用户实测
+口径（8 KB = 6 包、4 KB = 3 包、5 ms/包），157 ms 的每步可到约 142 ms。
+
+**但这 15 ms 买不到**：两个 4 KB 方案都会改 token。实际每步仍是 157 ms。
+
+### 9.4 试过但不做
+
+- **无损压缩**：真实 hidden 的 zlib 压缩率只有 0.93（8 KB → 7.3 KB），包数不变，
+  单次压缩还要约 0.3 ms（8 KB）。没有收益。
+- **35B / ROG 上的 dtype 验证**：2B 已是 1/5 分叉，结论方向明确，没有必要为此去碰
+  ROG；若将来要试别的 dtype，`checks/verify_wire.py --record/--compare` 是现成的判据。

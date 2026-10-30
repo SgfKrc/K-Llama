@@ -349,9 +349,11 @@ def _response(**payload: object) -> None:
 
 
 def _array_response(array: np.ndarray) -> None:
+    # b64encode reads the array's buffer directly; the old .tobytes() built an 8 KB
+    # intermediate per step that base64 then copied again.
     contiguous = np.ascontiguousarray(array, dtype=np.float32)
     _response(ok=True, shape=list(contiguous.shape),
-              data=base64.b64encode(contiguous.tobytes()).decode("ascii"))
+              data=base64.b64encode(contiguous).decode("ascii"))
 
 
 def _decode_hidden(request: dict) -> np.ndarray:

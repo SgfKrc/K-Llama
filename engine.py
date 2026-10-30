@@ -21,6 +21,16 @@ class EngineError(RuntimeError):
     pass
 
 
+def _f32_input(hidden: np.ndarray) -> np.ndarray:
+    """A contiguous float32 view of a hidden that may be float32 or wire-float16.
+
+    No copy on the float32 path (ascontiguousarray returns the input itself); one
+    conversion when the transport dtype was float16, which is the whole point of keeping
+    the switch at the socket boundary instead of inside the shim.
+    """
+    return np.ascontiguousarray(hidden, dtype=np.float32)
+
+
 class StageEngine:
     """One pipeline stage backed by a cut GGUF and the keep-head shim.
 
@@ -102,13 +112,19 @@ class StageEngine:
         return np.asarray(out, dtype=np.float32)
 
     def forward_hidden(self, hidden: np.ndarray, *, n_past: int) -> np.ndarray:
-        """hidden in, hidden out. Used by middle (cpu) stages."""
-        out = self._up.forward_hidden_to_hidden(hidden, n_past=n_past)
+        """hidden in, hidden out. Used by middle (cpu) stages.
+
+        The input may arrive in the wire dtype (float16 -- see wire.py), but the shim's
+        ABI is float32 and stays float32: this is where the one conversion happens, and
+        it disappears entirely on the float32 path because ascontiguousarray returns the
+        same array when it is already contiguous float32.
+        """
+        out = self._up.forward_hidden_to_hidden(_f32_input(hidden), n_past=n_past)
         return np.asarray(out, dtype=np.float32)
 
     def forward_token(self, hidden: np.ndarray, *, n_past: int) -> int:
         """hidden in, next token out. Used by the tail stage."""
-        return int(self._up.forward_hidden_to_token(hidden, n_past=n_past))
+        return int(self._up.forward_hidden_to_token(_f32_input(hidden), n_past=n_past))
 
     def set_sampling(self, **params) -> dict:
         """Configure the tail stage's sampler; returns the effective parameters.

@@ -6,9 +6,12 @@ hello / forward / result / error / reset / bye.
 
 Three roles, three payload shapes:
 
-  gpu   tokens  (JSON list)  -> hidden (raw float32)
-  cpu   hidden  (raw float32)-> hidden (raw float32)
-  tail  hidden  (raw float32)-> token  (JSON int)
+  gpu   tokens  (JSON list)  -> hidden (raw bytes, wire dtype)
+  cpu   hidden  (wire dtype) -> hidden (raw bytes, wire dtype)
+  tail  hidden  (wire dtype) -> token  (JSON int)
+
+The wire dtype is float32 by default and float16 when SA_WIRE_DTYPE says so; see
+wire.py for why it is a switch. Inside the stage everything stays float32.
 """
 from __future__ import annotations
 
@@ -17,11 +20,10 @@ import socket
 import sys
 from pathlib import Path
 
-import numpy as np
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import protocol  # noqa: E402
+import wire  # noqa: E402
 from engine import ROLES, StageEngine  # noqa: E402
 
 
@@ -133,24 +135,33 @@ class StageWorker:
                 continue
 
             try:
+                # The client declares the transport dtype per request; a frame without
+                # one is float32, which is what an older client sends. The answer is
+                # sent back in the same dtype, so one side can switch without the other.
+                dtype = wire.resolve(msg.meta.get("dtype"))
                 if self._role == "gpu":
                     tokens = list(msg.meta["tokens"])
                     hidden = self._engine.forward_tokens(tokens, n_past=n_past)
                     protocol.send(
                         conn, protocol.RESULT,
-                        {"n_tokens": hidden.shape[0], "n_embd": hidden.shape[1], "n_past": n_past},
-                        hidden.astype(np.float32).tobytes(),
+                        {"n_tokens": hidden.shape[0], "n_embd": hidden.shape[1],
+                         "n_past": n_past, "dtype": dtype},
+                        wire.encode(hidden, dtype),
                     )
                 else:
                     n_embd = self._engine.n_embd
-                    if len(msg.blob) != n_tokens * n_embd * 4:
+                    expected = wire.payload_size((n_tokens, n_embd), dtype)
+                    if len(msg.blob) != expected:
                         protocol.send(conn, protocol.ERROR, {
                             "code": "hidden_size_mismatch",
-                            "expected": n_tokens * n_embd * 4,
+                            "expected": expected,
                             "got": len(msg.blob),
+                            "dtype": dtype,
                         })
                         continue
-                    hidden = np.frombuffer(msg.blob, dtype=np.float32).reshape(n_tokens, n_embd)
+                    # A view, not a copy: the engine converts to float32 exactly once,
+                    # at the point where the shim's ABI requires it.
+                    hidden = wire.decode(msg.blob, dtype, (n_tokens, n_embd))
                     if self._role == "tail":
                         token = self._engine.forward_token(hidden, n_past=n_past)
                         protocol.send(conn, protocol.RESULT, {"token": token, "n_past": n_past})
@@ -158,8 +169,9 @@ class StageWorker:
                         out = self._engine.forward_hidden(hidden, n_past=n_past)
                         protocol.send(
                             conn, protocol.RESULT,
-                            {"n_tokens": out.shape[0], "n_embd": out.shape[1], "n_past": n_past},
-                            out.astype(np.float32).tobytes(),
+                            {"n_tokens": out.shape[0], "n_embd": out.shape[1],
+                             "n_past": n_past, "dtype": dtype},
+                            wire.encode(out, dtype),
                         )
             except Exception as exc:  # noqa: BLE001 - the peer must see the failure
                 protocol.send(conn, protocol.ERROR, {"code": "forward_failed", "detail": str(exc)[:400]})
