@@ -198,6 +198,9 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 | `docs/RESPONSES-API.md` | Responses 协议，含与计划不符的实测 |
 | `docs/SAMPLING.md` | 采样参数如何映射到 llama.cpp |
 | `docs/TUI.md` | TUI 布局与启动画面 |
+| `docs/PATCHES.md` | 两代补丁的差异，以及和原生 RPC 的分界 |
+| `docs/SPECULATION.md` | 投机解码四个方向的判定（MTP 首选、DFlash 次之、PLD 按负载） |
+| `docs/SLIM-ARC-接入计划.md` | 缺页优化在什么条件下才启用 |
 | `docs/DECISIONS.md` | 为什么是这样 |
 
 验收：`python checks/verify_*.py`（区间、显存、多序列、TUI、协议），
@@ -214,3 +217,5 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 - 裁段工具的退场**已完成**。整模 + `layer_range` 与裁段工件逐位一致（`max|diff|=0`），
   跨机也验证过了。`cut.py` 留着只用于离线比对。
 - 多序列 token 共享（需要 `kv_unified`；当前对这类请求明确报错）。
+- 投机解码。四个方向已实测判定，见 `docs/SPECULATION.md`：MTP 首选（预期 2.0–2.3×）、
+  DFlash 次之、PLD 按负载开关；前置条件是 recurrent state 回滚，shim 现在把它关着。
