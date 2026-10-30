@@ -19,8 +19,8 @@ sys.path.insert(0, r"G:\C\PYT\qlh")
 import topology  # noqa: E402
 from topology import Stage  # noqa: E402
 
-HEAD = Path(r"H:\slimarc-proto\exp\prov-head.gguf")
-TAIL = Path(r"H:\slimarc-proto\exp\prov-tail.gguf")
+HEAD = Path(r"F:\qlh-models\archive-q35-2b\q35-2b-head20.gguf")
+TAIL = Path(r"F:\qlh-models\archive-q35-2b\q35-2b-tail20-24.gguf")
 
 ok = True
 
@@ -55,7 +55,7 @@ def main() -> int:
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            got = topology.load(r"H:\slimarc-proto\exp\topo-bad-20.toml")
+            got = topology.load(r"F:\qlh-models\archive-q35-2b\topo-bad-20.toml")
         msgs = [str(x.message) for x in caught]
         gap = [m for m in msgs if "belong to no stage" in m or "20" in m]
         check("gap reported", bool(gap), gap[0] if gap else f"got {msgs}")
@@ -80,11 +80,14 @@ def main() -> int:
 
     print()
     print("  D. an artifact with no sidecar is reported, not trusted")
-    noprov = (Stage(0, Path(r"F:\qlh-models\stage-split-3\stage-0-8.gguf"), "127.0.0.1",
-                    9805, 8, "gpu", 99, 0, "", 3),
-              Stage(1, Path(r"F:\qlh-models\stage-split-3\stage-24-40.gguf"), "127.0.0.1",
-                    9806, 32, "tail", 0, 0, "", 6))
-    w = topology.verify_artifacts(noprov)
+    # Every artifact on disk now has a sidecar, so simulate the pre-provenance case by
+    # hiding the sidecar lookup rather than keeping a stale duplicate around.
+    real = topology.provenance
+    topology.provenance = lambda _p: None
+    try:
+        w = topology.verify_artifacts(stages(20, 4))
+    finally:
+        topology.provenance = real
     check("absence reported", any("no artifacts carry provenance" in m for m in w),
           "; ".join(w)[:100])
 

@@ -295,7 +295,10 @@ def verify_ranges(stages: tuple[Stage, ...]) -> list[str]:
                             f"starting at {lo2}: layers [{hi1}, {lo2}) belong to no stage")
 
     total = have[0][1].get("n_layer")
-    if isinstance(total, int) and spans:
+    # Only when every stage is local can completeness be judged: a stage on another
+    # machine keeps its range here, so a local-only view of a chain with a remote tail
+    # would always look like it stops early. Overlap is still checked either way.
+    if isinstance(total, int) and spans and not any(not s.is_local for s in stages):
         if spans[0][0] != 0:
             warnings.append(f"layer 0..{spans[0][0]} belong to no stage")
         if spans[-1][1] != total:
