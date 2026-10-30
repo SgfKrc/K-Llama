@@ -138,8 +138,13 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 **③ 不要绑核。** 每个 worker 有 5+ 活动线程，绑到相邻逻辑核（同一物理核的超线程对）
 会互相抢占：实测把 step 从 50 ms 拖到秒级。所有拓扑现在都是 `cpus = ""`。
 
-**④ 切点必须是 `full_attention_interval` 的整数倍。** qwen35moe 是 4，否则层类型
-错位、加载报 `missing tensor`。`cut.py` 会 fail-closed 拒绝。
+**④ 边界必须是 `full_attention_interval` 的整数倍。** qwen35moe 是 4，类型序列是 `LLL F`
+重复，full attention 落在 3 / 7 / 11 / … / 39。`src/models/qwen35moe.cpp:24` 用**本地层号**
+推算类型，而本地层号被映射回源层号 `lo + i`，所以 `lo` 是 4 的倍数时两者模 4 同余、类型对齐。
+
+配合「tail 段的 `hi` 必须等于模型总层数 40」，末段层数只能取 4 的倍数。`32:38` 这种 6 层的
+划分会在解析阶段被 `topology.py` 拒绝（`layers=6 is not a multiple of 4`）。`cut.py` 切工件时
+判据更严：`lo`、`hi`、`hi-lo` 三者都要合格。
 
 **⑤ 不要用 float16 传 hidden。** 4 KB 的负载能把跨网每步少 3 个包（约 15 ms），
 但 2B 上 5 个贪心 prompt 有 1 个在第 22 步换了 token；更精细的 int16 定点同样 1/5
