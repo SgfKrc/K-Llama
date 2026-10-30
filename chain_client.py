@@ -59,9 +59,23 @@ MEM_SAFETY = 0.75
 # Fraction of a CPU stage's file size that stays resident. Measured 0.215; 0.30 leaves
 # a margin for a longer context than the 4096 the measurement used.
 CPU_RESIDENT_RATIO = 0.30
-# GPU stages are charged their full file size: VRAM is not counted here, and the RAM
-# they do hold (token_embd + context) scales with the artifact.
+# Fraction of a file charged to RAM for the layers that are copied to VRAM. Reading them
+# for upload walks the whole tensor through the page cache, and those pages stay counted
+# until something evicts them, so a fully-offloaded artifact costs about its file size.
 GPU_RAM_RATIO = 1.00
+
+# A stage whose `gpu_layers` is between 0 and its layer count is a MIX, and charging such
+# a stage its full file size is what made 35B look like it could not fit on one machine.
+# Measured on the 40-layer 35B (20.82 GiB file) with 14 layers on the GPU:
+#
+#   estimate under the old rule   20.82 GiB   -> refused, since budget was ~11-17 GiB
+#   actual RAM used                9.10 GiB   -> 0.44x, and it ran at 12.64 t/s
+#
+# The two populations behave differently: uploaded layers cost their pages once and those
+# pages are reclaimable, while CPU layers keep re-reading the ~21.5% they touch. So the
+# ratio is a weighted average over the split, not a step function of "any GPU layers at
+# all". 14/40 predicts 0.35*1.00 + 0.65*0.30 = 0.545 against a measured 0.44 -- still
+# generous, which is the right side to err on, but no longer 2.3x pessimistic.
 
 # VRAM is a separate budget from RAM and it does not fail loudly. On Windows the display
 # driver (WDDM) lets an allocation exceed dedicated video memory and backs the excess with
@@ -129,6 +143,26 @@ def estimate_vram_bytes(stages) -> int:
     return int(total)
 
 
+def ram_ratio(stage) -> float:
+    """What fraction of one artifact's size to charge to system RAM.
+
+    A stage that offloads *some* layers is a mix, and it must be charged as one. The old
+    rule was a step: any `gpu_layers` at all meant the full file size in RAM. For 35B that
+    turned a 9.10 GiB load into a 20.82 GiB estimate, so the budget refused a configuration
+    that actually runs at 12.64 t/s -- and the workaround became splitting the model across
+    machines, which is slower (3.40 t/s) than not splitting it at all.
+
+    Layers go to VRAM but their pages still pass through the page cache on the way, and
+    they are reclaimable afterwards; CPU layers keep re-reading the ~21.5% they touch.
+    Weighting the two by the split predicts 0.545 where 0.44 was measured: still on the
+    cautious side, which is the direction that keeps the machine alive.
+    """
+    layers = max(stage.layers, 1)
+    on_gpu = min(max(stage.gpu_layers, 0), layers)
+    frac_gpu = on_gpu / layers
+    return frac_gpu * GPU_RAM_RATIO + (1.0 - frac_gpu) * CPU_RESIDENT_RATIO
+
+
 def estimate_ram_bytes(stages) -> int:
     """What loading these stages is expected to cost in system RAM.
 
@@ -139,9 +173,7 @@ def estimate_ram_bytes(stages) -> int:
     for stage in stages:
         if not stage.is_local:
             continue
-        size = stage.model.stat().st_size
-        ratio = GPU_RAM_RATIO if stage.gpu_layers else CPU_RESIDENT_RATIO
-        total += size * ratio
+        total += stage.model.stat().st_size * ram_ratio(stage)
     return int(total)
 
 # A worker finishes loading its artifact tens of seconds after spawn, and serve()

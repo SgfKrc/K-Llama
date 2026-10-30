@@ -26,9 +26,9 @@ from textual.widgets import Input, Static
 
 import config
 import topology
-from chain_client import (CPU_RESIDENT_RATIO, GPU_RAM_RATIO, GPU_VRAM_OVERHEAD,
-                          VRAM_PER_BYTE, StageClient, _terminate, estimate_ram_bytes,
-                          estimate_vram_bytes, mem_budget_bytes, spawn_worker, vram_info)
+from chain_client import (GPU_VRAM_OVERHEAD, VRAM_PER_BYTE, StageClient, _terminate,
+                          estimate_ram_bytes, estimate_vram_bytes, mem_budget_bytes,
+                          ram_ratio, spawn_worker, vram_info)
 from stream import generate_stream
 
 HERE = Path(__file__).resolve().parent
@@ -67,8 +67,10 @@ def precheck(stages) -> dict:
     显存单独算，因为它的超额是静默的：WDDM 用系统内存兜住超出部分，llama.cpp 照样报
     offloaded N/N，只是每步慢到比纯 CPU 还差。见 chain_client.VRAM_PER_BYTE 的实测。"""
     need, budget = estimate_ram_bytes(stages), mem_budget_bytes()
-    rows = [(s.index, s.kind, s.layers, int(s.model.stat().st_size *
-             (GPU_RAM_RATIO if s.gpu_layers else CPU_RESIDENT_RATIO)))
+    # Per-stage figures use the same weighted model as the total; computing them with the
+    # old step function would make the rows disagree with the number they are explaining.
+    rows = [(s.index, s.kind, s.layers,
+             int(s.model.stat().st_size * ram_ratio(s)))
             for s in stages if s.is_local]
     out = {"need": need, "budget": budget, "short": max(0, need - budget), "rows": rows,
            "vram_need": 0, "vram_free": None, "vram_short": 0}
