@@ -99,6 +99,15 @@ typedef struct qlh_keep_head {
     int n_layer;
     int mode;        /* 0 = nextn, 1 = layer_inp */
     int cut_layer;
+    /* ★ 2026-10-30：context 的并行序列上限，从 qlh_kh_load 的入参归一化后存下。
+     * 批次分配的 `n_seq_max` 必须与它一致 —— 详见 qlh_fill_explicit 上方的说明。 */
+    int32_t n_seq_max;
+    /* 是否启用统一 KV。= 0 时 llama.cpp 要求每个 token 恰好属于一个序列
+     * （`llama-kv-cache.cpp` 在 `n_stream > 1` 时断言 `n_seq_id == 1`，而
+     * `llama-context.cpp` 用 `n_stream = kv_unified ? 1 : n_seq_max`）。
+     * 这里保持 llama.cpp 的默认（分开 KV），因此"一个 token 属于多条序列"会被
+     * `qlh_fill_explicit` 明确拒绝，而不是走到 decode 深处才报 KV 槽位找不到。 */
+    int kv_unified;
     int n_pos_per_embd;  /* ★ M-RoPE 模型 = 4（每个 token 的位置分量数），否则 1 */
     /* ★ 2026-10-26（PERF-SKIP-LOGITS-01）：**输出 hidden 的入口**是否连 logits 一起要。
      *
@@ -371,6 +380,21 @@ void * qlh_kh_load(const char * model_path,
     handle->n_layer   = n_layer;
     handle->mode      = mode;
     handle->cut_layer = cut_layer;
+    /* ★ P3 (2026-10-30)：把 `n_seq_max` 记进 handle。
+     *
+     * 之前它只写进了 `cparams`（context 层），批次分配处却硬编码 1：
+     *
+     *     llama_batch_init(n_tokens, embd, 1)
+     *
+     * 于是 `seq_id[i]` 只拿到 1 个槽位。而 `qlh_fill_explicit` 允许调用方传
+     * `n_seq_id[i] > 1`（一个 token 同时属于多条序列 —— 多序列交错推进的正常用法），
+     * 它会写 `batch->n_seq_id[i] = 2`，却只填 `seq_id[i][0]`：llama.cpp 随后读
+     * `seq_id[i][1]` 是**未初始化内存**，`llama_batch_free` 遍历时也按这个数字走。
+     * 崩溃点在 free 而不是 decode，所以现场看起来与模型无关。
+     *
+     * 现在 batch 按 handle 记录的上限分配，填充处越界时直接拒绝，见 qlh_fill_explicit。 */
+    handle->n_seq_max = (int32_t) cparams.n_seq_max;
+    handle->kv_unified = 0;   /* llama.cpp 默认 false；见结构体注释 */
     /* ★ 2026-10-29（SAMPLING-01）：**中性**默认值，不是 calloc 的零。
      * `calloc` 会把 top_p / repeat_penalty 留成 0.0，而 0.0 在这套接口里的含义是
      * "极端截断"和"非法惩罚"，与"未启用"正好相反。回显函数会把这些字段原样交给
@@ -459,18 +483,39 @@ static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_
  * 多序列交错推进时，位置由调用方决定（每序列可各自递增）。
  * ⚠️ `positions == NULL` 时回落到 `n_past + i`（单序列增量语义）—— 少了这一项，
  *    单序列 decode 的第二步会从位置 0 重放，直接触发
- *    "tokens ... have inconsistent sequence positions" 而 decode 失败（实测踩过）。 */
-static void qlh_fill_explicit(struct llama_batch * batch, int32_t n_tokens, int32_t n_past,
-                              const int32_t * n_seq_id, const int32_t * seq_ids,
-                              const int32_t * positions, int32_t want_logits) {
+ *    "tokens ... have inconsistent sequence positions" 而 decode 失败（实测踩过）。
+ *
+ * ★ 2026-10-30：`seq_ids` 是**扁平**数组，按 `sum(n_seq_id[0..i-1])` 偏移取第 i 个 token
+ *   的各个序列号 —— 这正是 llama_batch 的语义（`LLAMA_API` 头文件里
+ *   `seq_id[i][j]` 的二维视角在内存里就是连续的）。旧实现只写 `seq_id[i][0]`，
+ *   于是 `n_seq_id[i] > 1` 时后面的槽位保持未初始化，llama.cpp 读它、`llama_batch_free`
+ *   也按它遍历。`cap_seq` 是 batch 实际分配到的槽位数，超出即拒绝，不再越界。 */
+static int32_t qlh_fill_explicit(struct llama_batch * batch, int32_t n_tokens, int32_t n_past,
+                                 const int32_t * n_seq_id, const int32_t * seq_ids,
+                                 const int32_t * positions, int32_t want_logits,
+                                 int32_t cap_seq, int kv_unified) {
+    int32_t off = 0;
     for (int32_t i = 0; i < n_tokens; ++i) {
         const int32_t per_token = (n_seq_id == NULL) ? 1 : n_seq_id[i];
-        batch->n_seq_id[i]  = per_token > 0 ? per_token : 1;
-        batch->seq_id[i][0] = (seq_ids == NULL) ? 0 : seq_ids[i];
-        batch->pos[i]       = (positions == NULL) ? (n_past + i) : positions[i];
-        batch->logits[i]    = want_logits ? 1 : 0;
+        if (per_token <= 0 || per_token > cap_seq) {
+            return -5;   /* 调用方要的序列数超过批次能容纳的槽位 */
+        }
+        if (per_token > 1 && !kv_unified) {
+            /* 不是越界，是不支持：kv_unified = false 时 llama.cpp 的 KV 为每个序列
+             * 保留独立池，一个 token 只能归属一个序列。放行会让它走到 decode 深处才
+             * 报 "failed to find a memory slot"，那句话指不到真正的原因。 */
+            return -5;
+        }
+        batch->n_seq_id[i] = per_token;
+        for (int32_t j = 0; j < per_token; ++j) {
+            batch->seq_id[i][j] = (seq_ids == NULL) ? 0 : seq_ids[off + j];
+        }
+        off += per_token;
+        batch->pos[i]    = (positions == NULL) ? (n_past + i) : positions[i];
+        batch->logits[i] = want_logits ? 1 : 0;
     }
     batch->n_tokens = n_tokens;
+    return 0;
 }
 
 /* ★ M-RoPE 的 **embd 通道**位置布局（真 bug 修复，2026-09-23）：
@@ -527,7 +572,7 @@ int32_t qlh_kh_forward(void * handle_void,
     }
     handle->last_error = 0;   /* ★ 本次 forward 的错误从这里重新计 */
 
-    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    struct llama_batch batch = llama_batch_init(n_tokens, 0, handle->n_seq_max);
     for (int32_t i = 0; i < n_tokens; ++i) {
         batch.token[i] = tokens[i];
     }
@@ -584,9 +629,13 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
     }
     handle->last_error = 0;
 
-    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
-    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions,
-                      handle->skip_hidden_logits ? 0 : 1);
+    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, handle->n_seq_max);
+    if (qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions,
+                          handle->skip_hidden_logits ? 0 : 1,
+                          handle->n_seq_max, handle->kv_unified) != 0) {
+        llama_batch_free(batch);
+        return -5;
+    }
     if (qlh_fill_pos_planar(&batch, n_tokens, n_past, positions,
                             handle->n_pos_per_embd) != 0) {
         llama_batch_free(batch);
@@ -621,10 +670,14 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
     }
     handle->last_error = 0;
 
-    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
+    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, handle->n_seq_max);
     /* ★ PERF-SKIP-LOGITS-01：本入口要**末位 argmax** ⇒ logits 恒开，**不跟随**
      *   `skip_hidden_logits`（末段是数值门的终点，缺了 logits 就直接失败）。 */
-    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions, 1);
+    if (qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions, 1,
+                          handle->n_seq_max, handle->kv_unified) != 0) {
+        llama_batch_free(batch);
+        return -5;
+    }
     if (qlh_fill_pos_planar(&batch, n_tokens, n_past, positions,
                             handle->n_pos_per_embd) != 0) {
         llama_batch_free(batch);
@@ -745,9 +798,13 @@ int32_t qlh_kh_forward_embd_tokens(void * handle_void,
     if (result == NULL) {
         return -5;
     }
-    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
+    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, handle->n_seq_max);
     /* ★ PERF-SKIP-LOGITS-01：多位置 argmax 同样**恒开** logits（原因同上）。 */
-    qlh_fill_explicit(&batch, n_tokens, pos_start, n_seq_id, seq_ids, positions, 1);
+    if (qlh_fill_explicit(&batch, n_tokens, pos_start, n_seq_id, seq_ids, positions, 1,
+                          handle->n_seq_max, handle->kv_unified) != 0) {
+        llama_batch_free(batch);
+        return -5;
+    }
     if (qlh_fill_pos_planar(&batch, n_tokens, pos_start, positions,
                             handle->n_pos_per_embd) != 0) {
         llama_batch_free(batch);
