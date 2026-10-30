@@ -34,17 +34,35 @@ class StageWorker:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
-        server.listen(1)
-        print(f"[{self._role}] listening on {host}:{port}", flush=True)
+        server.listen(4)
+        print(f"[{self._role}] listening on {host}:{port} (serving repeatedly)", flush=True)
 
-        conn, addr = server.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        print(f"[{self._role}] client {addr}", flush=True)
-        try:
-            self._session(conn)
-        finally:
-            conn.close()
-            server.close()
+        # Serve connections in a loop rather than handling exactly one.
+        #
+        # The old behaviour made every chain run require restarting the remote worker --
+        # on ROG that meant an schtasks call plus 30 s of model loading before each
+        # measurement, and a stale worker silently refusing the next connection. The model
+        # stays loaded across sessions; only the KV cache is reset (`reset` op), which is
+        # what a fresh chain wants anyway.
+        while True:
+            try:
+                conn, addr = server.accept()
+            except OSError:
+                break
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print(f"[{self._role}] client {addr}", flush=True)
+            try:
+                self._session(conn)
+            except Exception as exc:  # noqa: BLE001 - one bad session must not kill the worker
+                print(f"[{self._role}] session error: {type(exc).__name__}: {exc}", flush=True)
+                self._engine.reset()
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                print(f"[{self._role}] client {addr} closed, ready for next", flush=True)
+        server.close()
 
     def _session(self, conn: socket.socket) -> None:
         while True:
