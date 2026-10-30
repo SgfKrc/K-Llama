@@ -187,6 +187,19 @@ def _write(gguf, r, d, dst, keep, ov):
                 raise ValueError(f"无法确定 KV {name} 的类型")
             w.add_key_value(name, ov.get(name, field.contents()), kinds[0],
                             kinds[-1] if kinds[0] == gguf.GGUFValueType.ARRAY else None)
+        # Keys that exist only in `ov` are new, not overrides -- provenance goes here.
+        # llama.cpp ignores unknown keys (verified: a 5-key artifact loads and runs), and
+        # keeping it in the file means the artifact describes itself when it is copied to
+        # another machine, with no sidecar to lose.
+        for name, val in ov.items():
+            if name in r.fields:
+                continue
+            if isinstance(val, str):
+                w.add_string(name, val)
+            elif isinstance(val, int):
+                w.add_uint32(name, val)
+            else:
+                raise ValueError(f"新增 KV {name} 的类型不支持: {type(val).__name__}")
         for t, new in keep:
             w.add_tensor(new, _Stream(t.data), raw_dtype=t.tensor_type,
                          tensor_endianess=r.endianess)
@@ -271,6 +284,17 @@ def main() -> int:
         print(f"[kv] MTP 层（blk.{mtp}）不在保留区间 ⇒ nextn_predict_layers: "
               f"{d['nextn']} -> 0")
 
+    # ★ 溯源（qlh.*）：写进工件本体而不是只写 manifest JSON。manifest 是可选参数，
+    # 传到别的机器常被落下；而"这段覆盖源的哪几层"是唯一能查出分段缺层/重叠的信息
+    # ——少了它，20 层 + 4 层在 24 层的模型上会一路跑通，只是输出全乱。
+    # 用源文件名而非完整路径：路径在别的机器上无意义。
+    ov["qlh.generator"] = "cut.py/1"
+    ov["qlh.source_model"] = Path(d["source"]).name
+    ov["qlh.source_layers"] = int(d["n_layer"])
+    ov["qlh.range_lo"] = int(lo)
+    ov["qlh.range_hi"] = int(hi if hi <= d["n_layer"] else d["n_layer"])
+    ov["qlh.role"] = mode
+
     if _write(gguf, r, d, dst, keep, ov):
         return 2
     # ★ 根因三（manifest 双口径）：顶层 block_count / n_layer / nextn_predict_layers 描述
@@ -284,6 +308,10 @@ def main() -> int:
          "artifact": str(dst), "hidden_size": d["n_embd"], "architecture": d["arch"],
          "block_count": d["blocks"], "n_layer": d["n_layer"],
          "nextn_predict_layers": d["nextn"], "kept_block_count": hi - lo,
+         # Size lets the validator notice that an artifact was swapped for a different one
+         # while the sidecar stayed behind. Without it a stale sidecar would validate a
+         # file it does not describe.
+         "artifact_size": dst.stat().st_size,
          "first_local_layer_maps_to": lo, "tensors_kept": len(keep),
          "tensors_dropped": len(drop), "trim_layers": 0 if mode == "head" else lo,
          "source_layer_range": [lo, d["n_layer"] if mode == "tail" else hi],
@@ -292,10 +320,14 @@ def main() -> int:
          "artifact_contains": {
              "token_embd": tok, "output_norm": norm, "output_weight": out,
              "can_serve_tail": bool(norm and (out or (tok and not d["has_out"])))}, }
-    if a.manifest:
-        Path(a.manifest).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Sidecar is what the validator reads; the qlh.* keys in the artifact are the fallback
+    # for when the sidecar gets lost in transit. Reason for two copies: reading the keys
+    # back costs ~7 s per artifact, because GGUF puts tokenizer.ggml.tokens (248k strings)
+    # in the header and any reader must scan past it. A sidecar is milliseconds.
+    sidecar = Path(a.manifest) if a.manifest else dst.with_suffix(dst.suffix + ".qlh.json")
+    sidecar.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {dst}：保留 {len(keep)} 张量、丢弃 {len(drop)}；kept_block_count={hi - lo}"
-          f"{f'；manifest {a.manifest}' if a.manifest else ''}")
+          f"；溯源 {sidecar.name}")
     return 0
 
 

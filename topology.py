@@ -7,6 +7,8 @@ starts.
 """
 from __future__ import annotations
 
+import json
+
 import tomllib
 import warnings
 from dataclasses import dataclass
@@ -26,6 +28,17 @@ _REQUIRED = object()
 
 class TopologyError(ValueError):
     pass
+
+
+class ProvenanceWarning(UserWarning):
+    """An artifact's provenance is missing or the coverage is incomplete.
+
+    Kept separate from TopologyError: the topology itself is valid, it just cannot be
+    checked. That distinction matters because the failure this reports is quiet -- a
+    segment set covering 20 of 24 layers runs to completion and produces fluent garbage --
+    while artifacts predating cut.py's sidecar have no provenance at all and must still
+    run.
+    """
 
 
 @dataclass(frozen=True)
@@ -173,6 +186,11 @@ def load(path: str | Path) -> tuple[Stage, ...]:
         raise TopologyError(f"source_layers must be a positive integer, got {declared!r}")
     stages = tuple(_stage(i, raw) for i, raw in enumerate(raw_stages))
     _validate(stages, declared or 0)
+    # Definitely verify artifacts here rather than exposing a flag: this check existed for
+    # months without a single caller, which is exactly how a 20-of-24-layer segment set ran
+    # to completion producing garbage. Cheap enough for the local stages.
+    for msg in verify_artifacts(stages):
+        warnings.warn(msg, ProvenanceWarning, stacklevel=2)
     return stages
 
 
@@ -213,20 +231,106 @@ def _arch_of(reader) -> str:
     return str(field.contents()) if field is not None else ""
 
 
-def verify_artifacts(stages: tuple[Stage, ...]) -> None:
-    """Check每段 declared layer count against the file it points at.
+def provenance(path: str | Path) -> dict | None:
+    """Read the `cut.py` sidecar next to an artifact, or None when there is none.
 
-    Catches the failure mode where someone edits the topology and reuses an artifact
-    cut for a different range: the chain would still run, on the wrong layers.
-
-    Remote stages are skipped: their path is on another machine, so the file cannot be
-    opened here. The remote worker does its own check when it loads.
+    The same facts are also stored as qlh.* keys inside the GGUF, which is what makes an
+    artifact self-describing on another machine. The sidecar is preferred for validation
+    only because reading those keys back costs seconds per file: GGUF put
+    tokenizer.ggml.tokens (a 248k-element string array) in the header, so every reader has
+    to walk it before reaching anything written later.
     """
+    p = Path(path)
+    side = p.with_suffix(p.suffix + ".qlh.json")
+    try:
+        return json.loads(side.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def verify_ranges(stages: tuple[Stage, ...]) -> list[str]:
+    """Check that the local stages' source-layer ranges tile the source model.
+
+    Returns warnings rather than raising, because artifacts predating the sidecar cannot
+    be checked and refusing to run them would be a regression. What this catches is the
+    failure the layer-count check cannot see: `source_layers` was also typed by hand, so a
+    topology declaring 20 for a 24-layer source passes every other check while the chain
+    quietly runs on five sixths of the model. That produced fluent-looking garbage.
+    """
+    local = [s for s in stages if s.is_local]
+    provs = [(s, provenance(s.model)) for s in local]
+    have = [(s, p) for s, p in provs if p and "source_layer_range" in p]
+    if not have:
+        return ["no artifacts carry provenance (cut.py sidecar); layer coverage is "
+                "unverified -- re-cut them to enable the check"]
+
+    warnings: list[str] = []
+    sources = {p.get("source") for _s, p in have if p.get("source")}
+    if len(sources) > 1:
+        warnings.append(f"stages come from different source models: {sorted(sources)}")
+
+    spans = []
+    for s, p in have:
+        lo, hi = p["source_layer_range"]
+        if not 0 <= lo < hi:
+            warnings.append(f"stage[{s.index}] has an invalid range [{lo}, {hi})")
+            continue
+        if hi - lo != s.layers:
+            warnings.append(f"stage[{s.index}] declares {s.layers} layers but its "
+                            f"provenance covers [{lo}, {hi}) = {hi - lo}")
+        spans.append((lo, hi, s.index))
+
+    if len(have) < len(local):
+        warnings.append(f"{len(local) - len(have)} of {len(local)} local artifacts have no "
+                        f"provenance; coverage only partially checked")
+
+    spans.sort()
+    for (lo1, hi1, i1), (lo2, hi2, i2) in zip(spans, spans[1:]):
+        if lo2 < hi1:
+            warnings.append(f"stage[{i1}] covers [{lo1}, {hi1}) and stage[{i2}] "
+                            f"covers [{lo2}, {hi2}) -- they overlap on "
+                            f"[{lo2}, {min(hi1, hi2)})")
+        elif lo2 > hi1:
+            warnings.append(f"gap between stage[{i1}] ending at {hi1} and stage[{i2}] "
+                            f"starting at {lo2}: layers [{hi1}, {lo2}) belong to no stage")
+
+    total = have[0][1].get("n_layer")
+    if isinstance(total, int) and spans:
+        if spans[0][0] != 0:
+            warnings.append(f"layer 0..{spans[0][0]} belong to no stage")
+        if spans[-1][1] != total:
+            warnings.append(f"layers [{spans[-1][1]}, {total}) belong to no stage")
+    return warnings
+
+
+def verify_artifacts(stages: tuple[Stage, ...]) -> list[str]:
+    """Check each local stage's declared layer count against its provenance, and that the
+    stages tile the source model.
+
+    Deliberately reads only the sidecar, never the GGUF: opening a 35B artifact to read its
+    header costs ~7 s (the 248k-element tokenizer string array lives there), which would add
+    half a minute to every start-up. The cost of that trade is that an artifact with no
+    sidecar cannot be verified -- so it gets reported rather than silently trusted.
+    """
+    extra: list[str] = []
     for s in stages:
         if not s.is_local:
             continue
-        actual = layers_from_gguf(s.model)
-        if actual != s.layers:
+        p = provenance(s.model)
+        if not p:
+            continue  # reported in bulk by verify_ranges
+        # Compare against the range width, not kept_block_count: a tail artifact also
+        # carries the source model's MTP block, so its block count is one more than the
+        # decoder layers the topology declares.
+        span = p.get("source_layer_range")
+        if isinstance(span, list) and len(span) == 2 and span[1] - span[0] != s.layers:
             raise TopologyError(
                 f"stage[{s.index}] declares {s.layers} layers but {s.model.name} "
-                f"contains {actual}")
+                f"was cut for [{span[0]}, {span[1]}) = {span[1] - span[0]}")
+        size = p.get("artifact_size")
+        if isinstance(size, int) and size != s.model.stat().st_size:
+            extra.append(
+                f"stage[{s.index}] {s.model.name} is {s.model.stat().st_size} bytes but "
+                f"its sidecar describes {size}; the artifact was replaced, re-cut it")
+    return verify_ranges(stages) + extra
+    return verify_ranges(stages)

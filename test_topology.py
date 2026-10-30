@@ -258,6 +258,11 @@ class TopologyTest(unittest.TestCase):
             warnings.simplefilter("always")
             stages = topology.load(path)
         self.assertEqual(len(stages), 3)
+        # The placeholder artifacts here carry no provenance, so load() also emits a
+        # ProvenanceWarning. That is a separate concern from the tail/gpu_layers rule this
+        # test is about, so filter it out rather than changing what is asserted.
+        caught = [w for w in caught
+                  if not issubclass(w.category, topology.ProvenanceWarning)]
         self.assertEqual(len(caught), 1)
         self.assertIs(caught[0].category, UserWarning)
         self.assertIn("tail", str(caught[0].message))
