@@ -26,8 +26,9 @@ from textual.widgets import Input, Static
 
 import config
 import topology
-from chain_client import (CPU_RESIDENT_RATIO, GPU_RAM_RATIO, StageClient, _terminate,
-                          estimate_ram_bytes, mem_budget_bytes, spawn_worker)
+from chain_client import (CPU_RESIDENT_RATIO, GPU_RAM_RATIO, GPU_VRAM_OVERHEAD,
+                          VRAM_PER_BYTE, StageClient, _terminate, estimate_ram_bytes,
+                          estimate_vram_bytes, mem_budget_bytes, spawn_worker, vram_info)
 from stream import generate_stream
 
 HERE = Path(__file__).resolve().parent
@@ -60,13 +61,26 @@ def find_shim(explicit: str) -> Path:
 
 
 def precheck(stages) -> dict:
-    """内存账目。chain_client 的结论以 "Move a stage to another host" 结尾，既不说差多少
-    也不说哪段最贵；这里两个都算出来，缺口就是启动画面直接打印的那个数。"""
+    """内存与显存账目。chain_client 的结论以 "Move a stage to another host" 结尾，既不说
+    差多少也不说哪段最贵；这里两个都算出来，缺口就是启动画面直接打印的那个数。
+
+    显存单独算，因为它的超额是静默的：WDDM 用系统内存兜住超出部分，llama.cpp 照样报
+    offloaded N/N，只是每步慢到比纯 CPU 还差。见 chain_client.VRAM_PER_BYTE 的实测。"""
     need, budget = estimate_ram_bytes(stages), mem_budget_bytes()
     rows = [(s.index, s.kind, s.layers, int(s.model.stat().st_size *
              (GPU_RAM_RATIO if s.gpu_layers else CPU_RESIDENT_RATIO)))
             for s in stages if s.is_local]
-    return {"need": need, "budget": budget, "short": max(0, need - budget), "rows": rows}
+    out = {"need": need, "budget": budget, "short": max(0, need - budget), "rows": rows,
+           "vram_need": 0, "vram_free": None, "vram_short": 0}
+    if any(s.is_local and s.gpu_layers for s in stages):
+        out["vram_need"] = estimate_vram_bytes(stages)
+        info = vram_info()
+        # A None here means nvidia-smi is unavailable, not that the card has no room;
+        # leaving vram_free as None keeps the splash from claiming a check it never ran.
+        if info is not None:
+            out["vram_free"] = info[0] - info[1]
+            out["vram_short"] = max(0, out["vram_need"] - out["vram_free"])
+    return out
 
 
 _TENSORS = re.compile(r"and (\d+) tensors from")
@@ -271,6 +285,29 @@ def splash_text(b: Boot) -> Text:
                  f"把它的 host 改成远端 IP，或减少本机段数\n", style="#e3a04a")
         t.append("\n  没有启动任何 worker。按 q 退出。\n", style="#7b8194")
         return t
+
+    # Video memory gets its own row: an overflow there does not fail, it spills, and the
+    # run merely crawls. Show it only when some local stage actually offloads.
+    if m["vram_need"]:
+        if m["vram_free"] is None:
+            step("vram", False, "nvidia-smi 不可用，无法预算（溢出不报错）", bad=True)
+        elif not m["vram_short"]:
+            step("vram", True, f"预计 {m['vram_need'] / GIB:.2f} / 空闲 "
+                              f"{m['vram_free'] / GIB:.2f} GiB")
+        else:
+            step("vram", False, f"差 {m['vram_short'] / GIB:.2f} GiB（需 "
+                               f"{m['vram_need'] / GIB:.2f} / 空闲 "
+                               f"{m['vram_free'] / GIB:.2f} GiB）", bad=True)
+            gpu = max(((s, s.model.stat().st_size * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD)
+                       for s in b.stages if s.is_local and s.gpu_layers),
+                      key=lambda p: p[1], default=None)
+            if gpu:
+                t.append(f"     最贵的是 stage {gpu[0].index}（{gpu[0].model.name}，约 "
+                         f"{gpu[1] / GIB:.2f} GiB）：把它的 gpu_layers 降到 0 走 CPU。\n"
+                         f"     Windows 不会拒绝这次分配，它会溢出到系统内存，"
+                         f"然后比纯 CPU 还慢。\n", style="#e3a04a")
+            t.append("\n  没有启动任何 worker。按 q 退出。\n", style="#7b8194")
+            return t
 
     for stage in b.stages:
         i, status = stage.index, b.status.get(stage.index, "waiting")

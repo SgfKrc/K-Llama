@@ -63,11 +63,70 @@ CPU_RESIDENT_RATIO = 0.30
 # they do hold (token_embd + context) scales with the artifact.
 GPU_RAM_RATIO = 1.00
 
+# VRAM is a separate budget from RAM and it does not fail loudly. On Windows the display
+# driver (WDDM) lets an allocation exceed dedicated video memory and backs the excess with
+# system RAM, so llama.cpp reports "offloaded N/N layers" and everything looks fine while
+# every step copies weights over PCIe. Measured on a 8188 MiB RTX 4060 Laptop:
+#
+#   stage 0-8    4640 MiB file -> 5237 MiB VRAM delta   1.13x   5.6 ms/step
+#   stage 24-32  4542 MiB file -> 5139 MiB VRAM delta   1.13x   6.9 ms/step
+#   stage 8-24   8559 MiB file -> 7660 MiB VRAM delta   0.89x  42.1 ms/step  <- spilled
+#
+# The two that fit both cost exactly 597 MiB on top of the file size, so the model is
+# linear: file size times a fixed factor plus a fixed per-stage overhead. The one that did
+# not fit is the tell -- its delta is *smaller* than its file, and it ran 7.5x slower than
+# the same artifact on CPU. That is the silent spill.
+#
+# Both constants are rounded up from the measurements; a stage that trips this check has
+# never turned out to fit.
+VRAM_PER_BYTE = 1.13
+GPU_VRAM_OVERHEAD = 640 << 20   # measured 597 MiB of context + compute buffer, rounded up
+
 
 def mem_budget_bytes() -> int:
     import psutil
 
     return int(psutil.virtual_memory().available * MEM_SAFETY)
+
+
+def vram_info() -> tuple[int, int] | None:
+    """(total, used) video memory in bytes, or None when no NVIDIA card is queryable.
+
+    nvidia-smi is the only source that reflects *dedicated* usage the driver has already
+    committed, which is exactly what decides whether the next allocation spills. Returning
+    None (rather than raising) keeps CPU-only machines working.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    line = (out.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    try:
+        total, used = (int(x) for x in line[0].split(",")[:2])
+    except ValueError:
+        return None
+    mib = 1 << 20
+    return total * mib, used * mib
+
+
+def estimate_vram_bytes(stages) -> int:
+    """Video memory the GPU-offloaded stages need, per the measured model above.
+
+    Only local GPU stages count: a remote one runs on its own card.
+    """
+    total = 0.0
+    for stage in stages:
+        if not stage.is_local or not stage.gpu_layers:
+            continue
+        total += stage.model.stat().st_size * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD
+    return int(total)
 
 
 def estimate_ram_bytes(stages) -> int:
@@ -412,12 +471,44 @@ def main() -> int:
             f"{budget / 2**30:.2f} GiB is safe (available x {MEM_SAFETY:.0%}). "
             f"Move a stage to another host or lower the count.")
 
+    # VRAM gets its own check because an overshoot there is silent: WDDM backs the excess
+    # with system RAM, llama.cpp still reports every layer offloaded, and the run simply
+    # crawls. See VRAM_PER_BYTE for the measurement.
+    if any(s.is_local and s.gpu_layers for s in stages):
+        vram = vram_info()
+        want = estimate_vram_bytes(stages)
+        if vram is None:
+            print("\nVRAM: nvidia-smi unavailable, skipping the check. An overflow would "
+                  "be silent -- verify with nvidia-smi while it runs.")
+        else:
+            total, used = vram
+            free = total - used
+            print(f"VRAM: need ~{want / 2**30:.2f} GiB  free {free / 2**30:.2f} GiB  "
+                  f"of {total / 2**30:.2f} GiB")
+            if want > free:
+                gpu = [(s, s.model.stat().st_size * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD)
+                       for s in stages if s.is_local and s.gpu_layers]
+                gpu.sort(key=lambda pair: pair[1], reverse=True)
+                worst, cost = gpu[0]
+                raise SystemExit(
+                    f"refusing to start: GPU stages need ~{want / 2**30:.2f} GiB of video "
+                    f"memory but only {free / 2**30:.2f} GiB is free "
+                    f"(short by {(want - free) / 2**30:.2f} GiB).\n"
+                    f"  Largest: stage {worst.index} ({worst.model.name}) needs "
+                    f"~{cost / 2**30:.2f} GiB.\n"
+                    f"  Lower its gpu_layers, or set gpu_layers = 0 to run it on CPU. "
+                    f"Windows does not refuse the allocation -- it spills to system RAM "
+                    f"and runs slower than pure CPU.")
+
     if args.dry_run:
         print("\ndry run: topology and budget look fine, no model loaded")
         return 0
 
     procs: list[tuple[subprocess.Popen, Path, Stage]] = []
     clients: list[StageClient] = []
+    # Sample VRAM before any worker starts, so the delta after loading is attributable to
+    # this run rather than to whatever else shares the card.
+    vram_before = vram_info() if any(s.is_local and s.gpu_layers for s in stages) else None
     try:
         # Spawn everything first, then connect: the stages load in parallel, so the
         # chain is ready in the time of the slowest artifact, not the sum of them.
@@ -430,6 +521,31 @@ def main() -> int:
         for c in clients:
             c.connect(proc=local_procs.get(c.stage.index))
         print(f"workers ready in {time.perf_counter() - spawn_start:.1f}s")
+
+        # Verify the up-front VRAM estimate against what actually landed. The estimate is
+        # deliberately generous, so it can only catch a gross miss; this catches the case
+        # the estimate got wrong. The tell is simple and does not depend on the constants:
+        # a stage that fits always occupies MORE video memory than its file size, because
+        # the compute buffer and context come on top. A stage that spills occupies LESS --
+        # the driver quietly backed the remainder with system RAM, and llama.cpp still
+        # printed "offloaded N/N layers".
+        if vram_before is not None:
+            vram_after = vram_info()
+            if vram_after is not None:
+                landed = vram_after[1] - vram_before[1]
+                want_disk = sum(s.model.stat().st_size for s in stages
+                                if s.is_local and s.gpu_layers)
+                if want_disk and landed < want_disk:
+                    gpu_stages = [s for s in stages if s.is_local and s.gpu_layers]
+                    print(f"\n!! VRAM spill detected after load: {landed / 2**30:.2f} GiB "
+                          f"resident for {want_disk / 2**30:.2f} GiB of GPU weights.\n"
+                          f"   Stage(s) {[s.index for s in gpu_stages]} did not fully fit. "
+                          f"Windows spilled the rest to system RAM; decode will be slower "
+                          f"than pure CPU.\n"
+                          f"   Set gpu_layers = 0 for the largest stage, or lower it.")
+                else:
+                    print(f"VRAM verified: {landed / 2**30:.2f} GiB resident for "
+                          f"{want_disk / 2**30:.2f} GiB of GPU weights")
 
         prompt = list(range(100, 100 + args.prompt_tokens * 100, 100))[: args.prompt_tokens]
         for run in range(1, args.repeat + 1):
