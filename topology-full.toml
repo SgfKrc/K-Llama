@@ -1,0 +1,59 @@
+# 四段跨机，但**不切段**：每段直接指向整模，用 layer_range 在加载时选层。
+#
+# 与 topology-rog4.toml 的差别只有两点：model 指向整模，多一个 layer_range。
+# 效果应当与切段版本完全一致（已验证 hidden 与 logits 逐位相同），但磁盘上只需要
+# 一份整模，换分段只改这里的数字，不用重切、不用传工件。
+#
+# 需要带 C-scheme 补丁的 llama.cpp 与 shim（见 H:\slimarc-proto\exp-c\）。
+# 未打补丁的 llama.cpp 会忽略 LLAMA_LAYER_RANGE，于是每段都跑完整 40 层 —— 不会报错，
+# 只会慢 5 倍，所以认准 build 版本。
+
+source_layers = 40
+
+[[stage]]
+model       = "F:/qlh-models/qwen3-6-35b-a3b-gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+host        = "127.0.0.1"
+port        = 9101
+layers      = 8
+layer_range = "0:8"
+kind        = "gpu"
+gpu_layers  = 99
+cpu_moe     = 0
+cpus        = ""
+threads     = 3
+
+[[stage]]
+model       = "F:/qlh-models/qwen3-6-35b-a3b-gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+host        = "127.0.0.1"
+port        = 9102
+layers      = 16
+layer_range = "8:24"
+kind        = "cpu"
+gpu_layers  = 0
+cpu_moe     = 0
+cpus        = ""
+threads     = 6
+
+[[stage]]
+model       = "F:/qlh-models/qwen3-6-35b-a3b-gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+host        = "127.0.0.1"
+port        = 9104
+layers      = 8
+layer_range = "24:32"
+kind        = "cpu"
+gpu_layers  = 0
+cpu_moe     = 0
+cpus        = ""
+threads     = 6
+
+[[stage]]
+model       = "F:/qlh-models/qwen3-6-35b-a3b-gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+host        = "100.116.17.12"
+port        = 9103
+layers      = 8
+layer_range = "32:40"
+kind        = "tail"
+gpu_layers  = 0
+cpu_moe     = 0
+cpus        = ""
+threads     = 6

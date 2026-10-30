@@ -28,7 +28,7 @@ import config
 import topology
 from chain_client import (GPU_VRAM_OVERHEAD, VRAM_PER_BYTE, StageClient, _terminate,
                           estimate_ram_bytes, estimate_vram_bytes, mem_budget_bytes,
-                          ram_ratio, spawn_worker, vram_info)
+                          ram_ratio, spawn_worker, stage_bytes, vram_info)
 from stream import generate_stream
 
 HERE = Path(__file__).resolve().parent
@@ -69,8 +69,9 @@ def precheck(stages) -> dict:
     need, budget = estimate_ram_bytes(stages), mem_budget_bytes()
     # Per-stage figures use the same weighted model as the total; computing them with the
     # old step function would make the rows disagree with the number they are explaining.
+    source_total = sum(s.layers for s in stages)
     rows = [(s.index, s.kind, s.layers,
-             int(s.model.stat().st_size * ram_ratio(s)))
+             int(stage_bytes(s, source_total) * ram_ratio(s)))
             for s in stages if s.is_local]
     out = {"need": need, "budget": budget, "short": max(0, need - budget), "rows": rows,
            "vram_need": 0, "vram_free": None, "vram_short": 0}

@@ -53,6 +53,10 @@ class Stage:
     cpu_moe: int
     cpus: str
     threads: int
+    # Optional [lo, hi) source-layer range when `model` is the FULL checkpoint and the
+    # layers are selected at load time instead of pre-cut into an artifact. None keeps the
+    # original behaviour (model points at a cut segment). See docs/DEPLOYMENT.md.
+    layer_range: tuple[int, int] | None = None
 
     @property
     def is_local(self) -> bool:
@@ -92,6 +96,38 @@ def _str(raw: dict, key: str, index: int, default: object = _REQUIRED,
     return value
 
 
+def _layer_range(raw: dict, index: int, layers: int) -> tuple[int, int] | None:
+    """Optional source-layer range: `layer_range = "8:24"` or `[8, 24]`.
+
+    When present, `model` is the full checkpoint and llama.cpp selects the layers at load
+    time (the C scheme) instead of reading a pre-cut artifact. Accepting both spellings
+    because TOML has no tuple type and an array reads better in a config file.
+    """
+    value = raw.get("layer_range")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = value.split(":")
+        try:
+            lo, hi = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            raise TopologyError(
+                f"stage[{index}].layer_range must look like \"lo:hi\", got {value!r}") from None
+    elif isinstance(value, list) and len(value) == 2 and all(type(v) is int for v in value):
+        lo, hi = value
+    else:
+        raise TopologyError(
+            f"stage[{index}].layer_range must be \"lo:hi\" or [lo, hi], got {value!r}")
+    if not 0 <= lo < hi <= TOTAL_LAYERS:
+        raise TopologyError(
+            f"stage[{index}].layer_range [{lo}, {hi}) is out of bounds")
+    if hi - lo != layers:
+        raise TopologyError(
+            f"stage[{index}] declares {layers} layers but layer_range [{lo}, {hi}) covers "
+            f"{hi - lo}; they must agree or the chain runs on the wrong layers")
+    return (lo, hi)
+
+
 def _stage(index: int, raw: dict) -> Stage:
     if not isinstance(raw, dict):
         raise TopologyError(f"stage[{index}] must be a [[stage]] table, got {raw!r}")
@@ -105,15 +141,17 @@ def _stage(index: int, raw: dict) -> Stage:
     kind = _str(raw, "kind", index)
     if kind not in KINDS:
         raise TopologyError(f"stage[{index}].kind must be one of {KINDS}, got {kind!r}")
+    layers = _int(raw, "layers", index, 1, TOTAL_LAYERS)
     return Stage(
         index, model, host,
         _int(raw, "port", index, 1024, 65535),
-        _int(raw, "layers", index, 1, TOTAL_LAYERS),
+        layers,
         kind,
         _int(raw, "gpu_layers", index, 0, default=0),
         _int(raw, "cpu_moe", index, 0, default=0),
         _str(raw, "cpus", index, default="", blank=True),
         _int(raw, "threads", index, 1, 64, 3),
+        _layer_range(raw, index, layers),
     )
 
 
@@ -258,11 +296,21 @@ def verify_ranges(stages: tuple[Stage, ...]) -> list[str]:
     quietly runs on five sixths of the model. That produced fluent-looking garbage.
     """
     local = [s for s in stages if s.is_local]
-    provs = [(s, provenance(s.model)) for s in local]
-    have = [(s, p) for s, p in provs if p and "source_layer_range" in p]
+    # Two sources of truth for "which layers is this stage": the topology itself when it
+    # declares layer_range (C scheme, whole checkpoint + load-time selection), otherwise
+    # the provenance sidecar written by cut.py. The former needs no artifact metadata at
+    # all -- the range is right there in the config.
+    have: list[tuple] = []
+    for s in local:
+        if s.layer_range:
+            have.append((s, {"source_layer_range": list(s.layer_range)}))
+        else:
+            p = provenance(s.model)
+            if p and "source_layer_range" in p:
+                have.append((s, p))
     if not have:
-        return ["no artifacts carry provenance (cut.py sidecar); layer coverage is "
-                "unverified -- re-cut them to enable the check"]
+        return ["no artifacts carry provenance (cut.py sidecar) and no stage declares "
+                "layer_range; layer coverage is unverified"]
 
     warnings: list[str] = []
     sources = {p.get("source") for _s, p in have if p.get("source")}
@@ -281,8 +329,8 @@ def verify_ranges(stages: tuple[Stage, ...]) -> list[str]:
         spans.append((lo, hi, s.index))
 
     if len(have) < len(local):
-        warnings.append(f"{len(local) - len(have)} of {len(local)} local artifacts have no "
-                        f"provenance; coverage only partially checked")
+        warnings.append(f"{len(local) - len(have)} of {len(local)} local stages have neither "
+                        f"layer_range nor provenance; coverage only partially checked")
 
     spans.sort()
     for (lo1, hi1, i1), (lo2, hi2, i2) in zip(spans, spans[1:]):
@@ -294,10 +342,15 @@ def verify_ranges(stages: tuple[Stage, ...]) -> list[str]:
             warnings.append(f"gap between stage[{i1}] ending at {hi1} and stage[{i2}] "
                             f"starting at {lo2}: layers [{hi1}, {lo2}) belong to no stage")
 
+    # Completeness can only be judged when every stage is local: a remote stage keeps its
+    # range here, so a local-only view of a chain with a remote tail would always look like
+    # it stops early. Overlap is checked either way.
+    #
+    # The expected total comes from the sidecar's n_layer when there is one, otherwise from
+    # the ranges themselves (the C scheme has no artifact metadata to read).
     total = have[0][1].get("n_layer")
-    # Only when every stage is local can completeness be judged: a stage on another
-    # machine keeps its range here, so a local-only view of a chain with a remote tail
-    # would always look like it stops early. Overlap is still checked either way.
+    if not isinstance(total, int) and spans and all(s.layer_range for s in local):
+        total = max(hi for _lo, hi, _i in spans)
     if isinstance(total, int) and spans and not any(not s.is_local for s in stages):
         if spans[0][0] != 0:
             warnings.append(f"layer 0..{spans[0][0]} belong to no stage")
@@ -321,7 +374,9 @@ def verify_artifacts(stages: tuple[Stage, ...]) -> list[str]:
             continue
         p = provenance(s.model)
         if not p:
-            continue  # reported in bulk by verify_ranges
+            # A C-scheme stage points at the full checkpoint, which has no cut.py sidecar
+            # by design; its range lives in the topology and is validated while parsing.
+            continue
         # Compare against the range width, not kept_block_count: a tail artifact also
         # carries the source model's MTP block, so its block count is one more than the
         # decoder layers the topology declares.

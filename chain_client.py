@@ -135,12 +135,27 @@ def estimate_vram_bytes(stages) -> int:
 
     Only local GPU stages count: a remote one runs on its own card.
     """
+    source_total = sum(s.layers for s in stages)
     total = 0.0
     for stage in stages:
         if not stage.is_local or not stage.gpu_layers:
             continue
-        total += stage.model.stat().st_size * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD
+        total += stage_bytes(stage, source_total) * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD
     return int(total)
+
+
+def stage_bytes(stage, source_total: int) -> float:
+    """Bytes of the artifact this stage actually touches.
+
+    For a pre-cut segment that is the file size. For a C-scheme stage the file is the full
+    checkpoint, so charging its size would claim 20.82 GiB of RAM for a stage that loads
+    8 of 40 layers -- which is exactly the pessimism that made 35B look unable to fit on
+    one machine. Scale by the layer fraction instead.
+    """
+    size = stage.model.stat().st_size
+    if stage.layer_range and source_total > 0:
+        return size * (stage.layers / source_total)
+    return float(size)
 
 
 def ram_ratio(stage) -> float:
@@ -169,11 +184,12 @@ def estimate_ram_bytes(stages) -> int:
     Replaces summing file sizes, which assumed every byte of every artifact becomes
     resident. Only local stages count: a remote one is loaded on its own machine.
     """
+    source_total = sum(s.layers for s in stages)
     total = 0.0
     for stage in stages:
         if not stage.is_local:
             continue
-        total += stage.model.stat().st_size * ram_ratio(stage)
+        total += stage_bytes(stage, source_total) * ram_ratio(stage)
     return int(total)
 
 # A worker finishes loading its artifact tens of seconds after spawn, and serve()
@@ -353,6 +369,11 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     # all but the tail's -- measured 32.0 vs 3.6 ms/step on stage0.
     env = dict(os.environ)
     env["SA_NEEDS_LOGITS"] = "1" if stage.kind == "tail" else "0"
+    # Layer selection at load time: with a range, `model` is the full checkpoint and
+    # llama.cpp (with the C-scheme patch) exposes only these layers. Unset for the
+    # pre-cut-artifact path, which needs no help.
+    if stage.layer_range:
+        env["LLAMA_LAYER_RANGE"] = f"{stage.layer_range[0]}:{stage.layer_range[1]}"
     try:
         proc = subprocess.Popen(cmd, cwd=str(HERE), stdout=handle,
                                 stderr=subprocess.STDOUT, env=env)
@@ -565,7 +586,10 @@ def main() -> int:
             vram_after = vram_info()
             if vram_after is not None:
                 landed = vram_after[1] - vram_before[1]
-                want_disk = sum(s.model.stat().st_size for s in stages
+                # Same scaling as the estimate: with a layer range the file is the whole
+                # checkpoint, and only this stage's share of it is copied to the card.
+                source_total = sum(x.layers for x in stages)
+                want_disk = sum(stage_bytes(s, source_total) for s in stages
                                 if s.is_local and s.gpu_layers)
                 if want_disk and landed < want_disk:
                     gpu_stages = [s for s in stages if s.is_local and s.gpu_layers]

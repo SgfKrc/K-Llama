@@ -51,6 +51,26 @@
 extern void         llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool enable);
 extern const float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+/* [C-scheme] "relay hidden" = the output of layer K-1, before the model's final
+ * output_norm. Two ways to get it depending on which llama.cpp the shim links:
+ *
+ *   QLH DLL  : llama_set_embeddings_layer_inp(ctx, K, true) -> a dedicated channel.
+ *   upstream : cparams.embeddings + cparams.embeddings_pre_norm, then the ordinary
+ *              llama_get_embeddings_ith() returns the pre-norm hidden of the last layer.
+ *
+ * With upstream the slot number is implicit: the context only ever holds the layers it was
+ * told to load (LLAMA_LAYER_RANGE), so "layer K" is just the last layer. The lid argument is
+ * therefore unused on that path -- it is kept so both builds share the call sites.
+ */
+#if defined(QLH_ABI_UPSTREAM_HEADER)
+#  define LLAMA_SET_RELAY_HIDDEN(ctx, lid) ((void) (lid))
+#  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) (llama_get_embeddings_ith((ctx), -1))
+#else
+#  define LLAMA_SET_RELAY_HIDDEN(ctx, lid) llama_set_embeddings_layer_inp((ctx), (lid), true)
+#  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) llama_get_embeddings_layer_inp((ctx), (lid))
+#endif
+
+
 /* PROTO: load whatever ggml backends sit next to this DLL (ggml-cuda.dll in the
  * prototype build). Upstream QLH never needed this because the shim only ever ran
  * on CPU; llama.cpp's own tools call it once at startup. With GGML_BACKEND_DL=ON the
@@ -338,12 +358,37 @@ void * qlh_kh_load(const char * model_path,
      * n_outputs_max. The DLL asserts `n_outputs_max <= cparams.n_outputs_max` on
      * decode; leaving whatever default_params() put there makes the bound garbage and
      * the assert fires at the first forward. 0 means "derive it". */
+#if defined(QLH_ABI_UPSTREAM_HEADER)
+    /* Compiled against a llama.cpp checkout rather than the pip wheel: the struct has the
+     * fields by name, three of them before n_threads (n_threads sits at 28, not 24). Writing
+     * through the names is the whole point of switching headers -- the raw-offset version
+     * below is what has to be kept in sync with a layout measured from a binary. */
+    cparams.n_rs_seq               = 0;   /* no recurrent-state rollback */
+    cparams.n_outputs_max          = 0;   /* derive from n_batch */
+    cparams.n_outputs_max_per_seq  = 0;   /* derive from n_outputs_max */
+#else
     {
         unsigned char * base = (unsigned char *) &cparams;
         uint32_t zero = 0;
         memcpy(base + 16, &zero, sizeof(zero));   /* n_rs_seq slot on this build */
         memcpy(base + 20, &zero, sizeof(zero));   /* n_outputs_max */
     }
+#endif
+
+#if defined(QLH_ABI_UPSTREAM_HEADER)
+    /* The relay channel must be requested at context creation on upstream llama.cpp:
+     * `embeddings` makes the graph expose a hidden state at all, and
+     * `embeddings_pre_norm` moves that tap before the final output_norm (see llama.h).
+     * The QLH DLL instead has llama_set_embeddings_layer_inp(), called after creation. */
+    /* A relay segment returns the hidden state and skips the LM head; the tail returns
+     * logits and must NOT skip it. The role arrives as SA_NEEDS_LOGITS (set by
+     * spawn_worker) because context creation happens at load time, before any forward
+     * call could pass want_logits. Absent means "needs logits", i.e. the old behaviour. */
+    const char * needs_logits_env = getenv("SA_NEEDS_LOGITS");
+    const bool needs_logits = (needs_logits_env == NULL) || (atoi(needs_logits_env) != 0);
+    cparams.embeddings          = !needs_logits;
+    cparams.embeddings_pre_norm = !needs_logits;
+#endif
 
     struct llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
@@ -428,9 +473,9 @@ void * qlh_kh_load(const char * model_path,
      * 与架构无关（槽位由 llama-context.cpp 多分配一个，由各架构 graph 在 `output_norm`
      * 之前登记）。 */
     if (mode == 0) {
-        llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, true);
+        LLAMA_SET_RELAY_HIDDEN(ctx, (uint32_t) n_layer);
     } else {
-        llama_set_embeddings_layer_inp(ctx, (uint32_t) cut_layer, true);
+        LLAMA_SET_RELAY_HIDDEN(ctx, (uint32_t) cut_layer);
     }
 
     if (out_n_embd  != NULL) { *out_n_embd  = handle->n_embd;  }
@@ -447,7 +492,7 @@ void * qlh_kh_load(const char * model_path,
  * （旧实现按 token 逐个取 `llama_get_embeddings_nextn_ith`）。 */
 static int32_t qlh_extract_hidden(qlh_keep_head * handle, int32_t n_tokens, float * out) {
     const uint32_t lid = (uint32_t) ((handle->mode == 0) ? handle->n_layer : handle->cut_layer);
-    const float * ptr = llama_get_embeddings_layer_inp(handle->ctx, lid);
+    const float * ptr = LLAMA_GET_RELAY_HIDDEN(handle->ctx, lid);
     if (ptr == NULL) {
         return -3;
     }
@@ -473,7 +518,15 @@ static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_
         batch->pos[i]       = n_past + i;
         batch->n_seq_id[i]  = 1;
         batch->seq_id[i][0] = 0;
-        batch->logits[i]    = want_logits ? 1 : 0;
+    #if defined(QLH_ABI_UPSTREAM_HEADER)
+    /* Upstream derives the embedding rows from batch.logits, so marking nothing makes
+     * llama_get_embeddings_ith() index past the end of an empty tensor (access violation,
+     * measured). The LM head is skipped inside the graph instead, by the C-scheme patch,
+     * which costs nothing -- so marking every row is cheap here. */
+    batch->logits[i]    = 1;
+#else
+    batch->logits[i]    = want_logits ? 1 : 0;
+#endif
     }
     batch->n_tokens = n_tokens;
 }
@@ -512,7 +565,11 @@ static int32_t qlh_fill_explicit(struct llama_batch * batch, int32_t n_tokens, i
         }
         off += per_token;
         batch->pos[i]    = (positions == NULL) ? (n_past + i) : positions[i];
-        batch->logits[i] = want_logits ? 1 : 0;
+    #if defined(QLH_ABI_UPSTREAM_HEADER)
+    batch->logits[i] = 1;   /* see the note above: embeddings follow batch.logits */
+#else
+    batch->logits[i] = want_logits ? 1 : 0;
+#endif
     }
     batch->n_tokens = n_tokens;
     return 0;
