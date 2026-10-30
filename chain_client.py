@@ -140,7 +140,12 @@ def estimate_vram_bytes(stages) -> int:
     for stage in stages:
         if not stage.is_local or not stage.gpu_layers:
             continue
-        total += stage_bytes(stage, source_total) * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD
+        # Only `gpu_layers` of the stage's layers reach the card. Charging the whole stage
+        # made a 32-layer segment with 12 on the GPU look like it needed 19.45 GiB of VRAM
+        # and get refused, when it actually uses 6.7 GiB.
+        on_gpu = min(stage.gpu_layers, stage.layers)
+        per_layer = stage_bytes(stage, source_total) / max(stage.layers, 1)
+        total += per_layer * on_gpu * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD
     return int(total)
 
 
@@ -539,7 +544,13 @@ def main() -> int:
             print(f"VRAM: need ~{want / 2**30:.2f} GiB  free {free / 2**30:.2f} GiB  "
                   f"of {total / 2**30:.2f} GiB")
             if want > free:
-                gpu = [(s, s.model.stat().st_size * VRAM_PER_BYTE + GPU_VRAM_OVERHEAD)
+                # Per-stage VRAM cost, scaled to the layers that actually go to the card.
+                # Using the file size here charged a whole 20.82 GiB checkpoint to a stage
+                # that offloads 12 of its 32 layers, so it was refused as a 24 GiB stage.
+                src_total = sum(x.layers for x in stages)
+                gpu = [(s, stage_bytes(s, src_total) / max(s.layers, 1)
+                           * min(s.gpu_layers, s.layers) * VRAM_PER_BYTE
+                           + GPU_VRAM_OVERHEAD)
                        for s in stages if s.is_local and s.gpu_layers]
                 gpu.sort(key=lambda pair: pair[1], reverse=True)
                 worst, cost = gpu[0]
@@ -589,8 +600,13 @@ def main() -> int:
                 # Same scaling as the estimate: with a layer range the file is the whole
                 # checkpoint, and only this stage's share of it is copied to the card.
                 source_total = sum(x.layers for x in stages)
-                want_disk = sum(stage_bytes(s, source_total) for s in stages
-                                if s.is_local and s.gpu_layers)
+                # Same scaling as the estimate: only `gpu_layers` of each stage reach the
+                # card, so a 32-layer segment with 12 offloaded must be compared against
+                # 12 layers' worth of bytes, or every such load looks like a spill.
+                want_disk = sum(
+                    stage_bytes(s, source_total) / max(s.layers, 1)
+                    * min(s.gpu_layers, s.layers)
+                    for s in stages if s.is_local and s.gpu_layers)
                 if want_disk and landed < want_disk:
                     gpu_stages = [s for s in stages if s.is_local and s.gpu_layers]
                     print(f"\n!! VRAM spill detected after load: {landed / 2**30:.2f} GiB "
