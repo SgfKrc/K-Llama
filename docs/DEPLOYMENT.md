@@ -63,6 +63,9 @@ python cut.py --src <整模> --dst <段> --k 24                  # 尾段
 
 每次都写 `<段>.gguf.qlh.json`。它记录源模型、覆盖区间、层数、文件大小。
 
+如果用的是整模 + `layer_range`（见 §6），这一步整个不存在：改 topology 里的数字就是
+换分段，不需要磁盘操作，也没有工件要回收。
+
 ## 3. 溯源与校验
 
 `cut.py` 把同样的信息写两处：
@@ -128,7 +131,7 @@ scp / rsync 够用。自己实现传输就要自己实现断点续传、校验�
 草稿只快 3 倍，加上验证成本后是亏的。只有四段含远程机器（297 ms/token）时才回本，
 而那时的瓶颈恰恰是远程那台机器本身——把它修好，这条路的收益就消失了。
 
-## 6. 另一条路：改 llama.cpp 不裁段（评估过，暂不做）
+## 6. 另一条路：改 llama.cpp 不裁段（已实现）
 
 `llama-model-loader.cpp` 的 `get_weight()` 是唯一的张量查找入口：
 
@@ -139,14 +142,35 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
 }
 ```
 
-配合覆盖 GGUF 的 `block_count`，可以让架构代码只用段内编号访问整模，
-从而**完全不需要裁段工件**：每台只存整模，换分段只改 topology 里的数字。
+配合覆盖 GGUF 的 `block_count`，架构代码就只用段内编号访问整模，**完全不需要裁段工件**：
 
-不做的理由：
+```toml
+[[stage]]
+model       = "F:/qlh-models/.../Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+layers      = 16
+layer_range = "8:24"
+```
 
-- 要改上游源码 + 重新编译整份 llama.cpp（CUDA 部分 20-30 分钟）
-- 覆盖 `block_count` 比改 `get_weight` 难——它要在 hparams 解析前生效
-- 要验证输出与裁段逐位一致
-- 而裁切只要 11 秒，收益不足
+实测与裁段工件**逐位相同**（35B logits / hidden、2B logits），端到端 token 也完全相同。
+链路性能与裁段方案相当（291 vs 254 ms，差在噪声内）。
 
-什么时候值得回头：分段需要频繁变动（例如做自动实验），或者磁盘比时间贵。
+真正做起来比预估多三件事，都不是"改 get_weight"能覆盖的：
+
+1. **`create_tensor` 必须用本地名命名张量**。用源名会让 `load_all_data` 按名字二次
+   重映射，落到别的层，症状是 `GGML_ASSERT(buf_mmap || cur->data)` abort——不是报错，
+   是崩溃，且堆栈指不到这里。
+2. **接力需要 norm 之前的 hidden**。上游 `t_embd` 是 `build_norm` 之后的值，直接传
+   给下一段等于做两次 RMSNorm，第一个 token 就分叉。为此加了
+   `llama_context_params.embeddings_pre_norm`，顺带跳过 lm_head。
+3. **预读只能"全读"或"不读"**。整模 20.82 GiB 不能全读，但完全不读会让每步重新缺页
+   （实测 stage0 从 5 ms 涨到 403 ms）。改用 `llama_prefetch(ranges)` 只触达本段页。
+
+代价是自维护 `llama.dll`：每次升级 llama.cpp 要 rebase 这 5 处改动（集中在 3 个文件，
+约 90 行）。收益是切段工件、11 秒重切、以及"工件与整模不同步"这一类故障同时消失。
+
+一个前提：**相关 KV 必须全是标量**。按层数组的模型在缩小 `block_count` 后会因长度校验
+抛 "wrong array length"。本项目两个模型都核对过——35B 21 个、2B 19 个，零数组。
+
+MTP 层（2B 的 `nextn_predict_layers=1`）由补丁强制归零，所以范围不能包含它。实测
+`range 0:24` 与整模 25 层（含 MTP）逐位一致——MTP 是独立分支，不进主输出。
+
