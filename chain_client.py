@@ -484,8 +484,25 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shim", default=str(DEFAULT_SHIM))
     ap.add_argument("--topology", default="", help="override SA_TOPOLOGY for this run")
-    ap.add_argument("--prompt-tokens", type=int, default=32)
+    ap.add_argument("--prompt-tokens", type=int, default=32,
+                    help="synthetic prompt length; ignored with --prompt-text")
+    # The synthetic default is a sequence of unrelated token ids. It is fine for timing
+    # (fixed shape, no tokenizer cost) but it makes every model look degenerate, so it is
+    # not evidence about output quality either way.
+    ap.add_argument("--prompt-text", default=None,
+                    help="natural-language prompt instead of synthetic token ids")
     ap.add_argument("--gen", type=int, default=64)
+    # The checkpoint recommends temp 1.00 / top_k 20 / top_p 0.95. Greedy (the shim default)
+    # degenerates into repetition on this model, so sampling is the default here and
+    # --greedy opts back into it for reproducible comparisons.
+    ap.add_argument("--greedy", action="store_true",
+                    help="temperature 0; deterministic but prone to repetition on 35B")
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--chat", action="store_true",
+                    help="render --prompt-text as ChatML and parse special tokens")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--dry-run", action="store_true",
                     help="validate the topology and the memory budget, load no model")
@@ -576,6 +593,10 @@ def main() -> int:
     try:
         # Spawn everything first, then connect: the stages load in parallel, so the
         # chain is ready in the time of the slowest artifact, not the sum of them.
+        # Must be set BEFORE the workers spawn: they inherit the environment at start-up,
+        # and a later assignment would not reach the shim that tokenizes.
+        if args.chat:
+            os.environ["SA_PARSE_SPECIAL"] = "1"
         spawn_start = time.perf_counter()
         for s in stages:
             if s.is_local:
@@ -619,7 +640,28 @@ def main() -> int:
                     print(f"VRAM verified: {landed / 2**30:.2f} GiB resident for "
                           f"{want_disk / 2**30:.2f} GiB of GPU weights")
 
-        prompt = list(range(100, 100 + args.prompt_tokens * 100, 100))[: args.prompt_tokens]
+        if args.chat and args.prompt_text:
+            from chat import apply_chatml
+            args.prompt_text = apply_chatml([{"role": "user", "content": args.prompt_text}])
+        _sampling = (dict(temperature=0.0) if args.greedy else
+                     dict(temperature=args.temperature, top_k=args.top_k,
+                          top_p=args.top_p, seed=args.seed))
+        # Every stage holds its own sampler; all of them must agree or the tail samples with
+        # a different distribution than the chain was tuned for.
+        for c in clients:
+            c.set_sampling(**_sampling)
+        print(f"  sampling: {clients[-1].sampling()}")
+
+        if args.prompt_text:
+            prompt = clients[0].tokenize(args.prompt_text)
+            if not prompt:
+                raise SystemExit("--prompt-text tokenized to nothing")
+        else:
+            # N unrelated ids. Keeps the shape fixed for timing; says nothing about
+            # whether the model writes sensible text.
+            prompt = list(range(100, 100 + args.prompt_tokens * 100, 100))[: args.prompt_tokens]
+        origin = repr(args.prompt_text) if args.prompt_text else "(synthetic token ids)"
+        print(f"  prompt: {len(prompt)} tokens  {origin}")
         for run in range(1, args.repeat + 1):
             # Fresh KV per run: a timing number only means something from a fixed start.
             for c in clients:
@@ -658,6 +700,13 @@ def main() -> int:
                       f"{ms:.1f} ms")
             print(f"    tokens: {out_tokens[:8]}  unique={len(set(out_tokens))}"
                   f"{' (stuck on one token)' if len(set(out_tokens)) == 1 else ''}")
+            # Decode the generated ids, otherwise a degenerate run and a healthy one
+            # look the same except for a "unique" count.
+            try:
+                _text = b"".join(clients[-1].piece(t) for t in out_tokens)
+                print(f"    text:   {_text.decode('utf-8', 'replace')!r}")
+            except Exception:  # noqa: BLE001 - a decode failure must not kill a timing run
+                pass
     finally:
         # One bad session must not leave the rest of the stages running: that is how
         # the next run ends up loading models on top of still-resident ones.

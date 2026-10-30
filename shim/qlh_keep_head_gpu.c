@@ -56,15 +56,20 @@ extern const float * llama_get_embeddings_layer_inp(struct llama_context * ctx, 
  *
  *   QLH DLL  : llama_set_embeddings_layer_inp(ctx, K, true) -> a dedicated channel.
  *   upstream : cparams.embeddings + cparams.embeddings_pre_norm, then the ordinary
- *              llama_get_embeddings_ith() returns the pre-norm hidden of the last layer.
+ *              llama_get_embeddings() returns the pre-norm hidden of the last layer.
  *
  * With upstream the slot number is implicit: the context only ever holds the layers it was
  * told to load (LLAMA_LAYER_RANGE), so "layer K" is just the last layer. The lid argument is
  * therefore unused on that path -- it is kept so both builds share the call sites.
+ *
+ * It must be llama_get_embeddings() and NOT llama_get_embeddings_ith(-1): the latter returns
+ * one row, while qlh_extract_hidden copies n_tokens * n_embd floats out of it. That mismatch
+ * read past the buffer and every token after the first was garbage -- which looked like the
+ * model being broken, not like a bug in the plumbing.
  */
 #if defined(QLH_ABI_UPSTREAM_HEADER)
 #  define LLAMA_SET_RELAY_HIDDEN(ctx, lid) ((void) (lid))
-#  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) (llama_get_embeddings_ith((ctx), -1))
+#  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) (llama_get_embeddings((ctx)))
 #else
 #  define LLAMA_SET_RELAY_HIDDEN(ctx, lid) llama_set_embeddings_layer_inp((ctx), (lid), true)
 #  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) llama_get_embeddings_layer_inp((ctx), (lid))
@@ -1271,9 +1276,16 @@ int32_t qlh_kh_tokenize(void * handle_void, const char * text, int32_t text_len,
     const struct llama_vocab * vocab = llama_model_get_vocab(handle->model);
     if (vocab == NULL) return -1;
 
-    /* add_special = true so the caller can pass raw chat text; parse_special stays
-     * false because the template markers are literal text here, not control input. */
-    const int32_t n = llama_tokenize(vocab, text, text_len, tokens, max_tokens, true, false);
+    /* add_special = true so the caller can pass raw chat text.
+     *
+     * parse_special used to be false, reasoning that template markers are literal text.
+     * That was wrong for chat prompts: with parse_special=false the tokenizer splits
+     * "<|im_start|>" into ordinary fragments, so the model never sees a chat structure and
+     * answers everything with degenerate repetition ("是 是 是 ..."). It is an environment
+     * switch now so plain-text callers keep the old behaviour. */
+    const char * parse_special_env = getenv("SA_PARSE_SPECIAL");
+    const bool parse_special = (parse_special_env != NULL) && (atoi(parse_special_env) != 0);
+    const int32_t n = llama_tokenize(vocab, text, text_len, tokens, max_tokens, true, parse_special);
     return n;
 }
 
