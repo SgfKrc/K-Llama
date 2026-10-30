@@ -220,7 +220,7 @@ class Binding:
         absolute value is the length to allocate.
         """
         if not hasattr(self._lib, "qlh_kh_tokenize"):
-            raise RuntimeError("shim has no qlh_kh_tokenize (rebuild it from slimarc/shim)")
+            raise RuntimeError("shim has no qlh_kh_tokenize (rebuild it from shim/)")
         probe = self._lib.qlh_kh_tokenize(self._handle, text, len(text), None, 0)
         need = -probe if probe < 0 else probe
         if need == 0:
@@ -266,7 +266,7 @@ class Binding:
         """
         if not hasattr(self._lib, "qlh_kh_set_sampling"):
             raise RuntimeError(
-                "shim has no qlh_kh_set_sampling (rebuild it from slimarc/shim)")
+                "shim has no qlh_kh_set_sampling (rebuild it from shim/)")
         rc = self._lib.qlh_kh_set_sampling(
             self._handle, float(temperature), float(top_p), int(top_k),
             float(repeat_penalty), int(repeat_last_n),

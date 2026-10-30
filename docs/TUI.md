@@ -75,7 +75,7 @@ koakuma
 ```
 
 命令名沿用前身仓库的引擎层命名（`Koakuma` = 统一引擎入口，上层不区分 llama.cpp /
-torch）。放在 `slimarc/koakuma.cmd`，同时给一个 `koakuma.ps1` 供 PowerShell 直接调。
+torch）。放在 `koakuma.cmd`，同时给一个 `koakuma.ps1` 供 PowerShell 直接调。
 
 命令要做的事，按顺序：
 

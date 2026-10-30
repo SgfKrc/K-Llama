@@ -1,27 +1,34 @@
-# slimarc 是独立起点，只需要忽略自己产生的文件；
-# 原 K-Llama 的 .gitignore 已随历史剥离。
+# 本项目是独立起点分支，仓库根就是项目根，不套子目录。
+# 从 K-Llama 剥离历史时，原 .gitignore 一并丢弃，这里只留现在真正需要的规则。
 
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 运行时输出：日志与临时工件
-slimarc/build/
+# 运行时输出：worker 日志、临时工件。
+# build/relay-records 是 spawn_worker 重定向的 stage 日志，随运行重新生成。
+build/
 *.log
 
 # 模型与二进制不进 git
 *.gguf
-slimarc/shim/bin/
-# 本地拓扑覆盖
-slimarc/topology-local*.toml
+shim/bin/
 
-#环境变量
+# 本地拓扑覆盖
+topology-local*.toml
+
+# 环境变量
 .env
 
+# 工作区里与本项目无关的本地目录（原仓库遗留的开发与素材目录）
 .agents/
+.claude/
+.codex/
+.reasonix/
 .venv-*/
 .vscode/
 local_docs/
 _archive/
 /tools/
 video-remotion/
+torchinductor_Koakuma/

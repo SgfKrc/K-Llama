@@ -7,7 +7,7 @@
 
 ## 一、首期已完成
 
-### 1.1 代码（`slimarc/`，1406 行 + 裁切工具 269 行）
+### 1.1 代码（仓库根，1406 行 + 裁切工具 269 行）
 
 | 模块 | 行数 | 职责 | 验证状态 |
 | --- | ---: | --- | --- |
@@ -56,19 +56,26 @@
 
 ### 2.1 应提交
 
+仓库根就是项目根（本分支是独立起点，不套子目录）：
+
 ```
-slimarc/                    # 1406 行核心 + 269 行裁切 + 测试
-  *.py
-  topology.toml
-  README.md
-docs/slimarc/               # 文档（建议放这个前缀下）
+*.py                        # 协议 / 链路 / 引擎 / 服务端 / TUI
+*.toml                      # 拓扑
+README.md
+docs/                       # 文档
   *.md
+checks/                     # 验收脚本，可独立运行
+  verify_responses.py
+  verify_tui.py
+  verify_tui_text.py
 shim/
   qlh_keep_head_gpu.c       # 改版 shim 源码（+80 行）
   qlh_keep_head.def         # MSVC 导出清单
   qlh_keep_head-gpu.patch   # 可应用补丁
-tools/                      # 可选：build_cuda_shim.ps1 / build_shim_msvc.ps1
+  build_cuda_shim.ps1       # 构建脚本
+  build_shim_msvc.ps1
 ```
+
 
 ### 2.2 不应提交
 
@@ -84,8 +91,8 @@ tools/                      # 可选：build_cuda_shim.ps1 / build_shim_msvc.ps1
 ### 2.3 建议的 `.gitignore`
 
 ```gitignore
-slimarc/build/
-slimarc/__pycache__/
+build/
+__pycache__/
 shim/bin/
 shim/_gen/
 shim/_test/
@@ -105,7 +112,7 @@ slimarc-trial/
 | # | 内容 | 大小 | 说明 |
 | --- | --- | ---: | --- |
 | 1 | **CPU 版 shim**（9 个 DLL） | **9.9 MB** | 从 `G:\C\PYT\qlh\build\keephead\build-cpu-skiplogits\bin\` 整个目录 |
-| 2 | **`slimarc/` 目录** | 约 250 KB | Python 代码 |
+| 2 | **仓库根（Python 代码）** | 约 250 KB | Python 代码 |
 | 3 | **`stage-24-40.gguf`** | **8.96 GB** | tail 段工件 |
 
 **不需要**：CUDA 版 shim（553 MB）、整模（20.8 GB）、其他两段。

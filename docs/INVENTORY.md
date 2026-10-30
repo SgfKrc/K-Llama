@@ -2,7 +2,7 @@
 
 > 盘点对象：`G:\C\PYT\qlh\src\`，**232 个 .py 文件 / 129,337 行非空行**（含空行 142,827）。
 > 只读盘点，未修改仓库任何文件。
-> 对照基准：`DESIGN.md` / `ARCHITECTURE.md` / `PROGRESS.md` / `slimarc/`（已有 1,276 行非空原型）。
+> 对照基准：`DESIGN.md` / `ARCHITECTURE.md` / `PROGRESS.md` / 仓库根（已有 1,276 行非空原型）。
 > 新定位：**只保留「llama 工件裁切」+「层段接力」**，首期 1000 行左右。
 
 ---
@@ -54,7 +54,7 @@
 （`scripts/model_tools/patches/llama-cpp-layer-forward-api.patch`，248 行）导出
 `llama_set_embeddings_layer_inp` / `llama_get_embeddings_layer_inp`，shim 建立在它之上。
 
-**这是新原型的硬依赖，不是可选件**：`slimarc/engine.py:19-24` 目前直接
+**这是新原型的硬依赖，不是可选件**：`engine.py:19-24` 目前直接
 `sys.path.insert(0, "G:/C/PYT/qlh/src")` 再 `from llama_keep_head import KeepHeadUpstream`。
 原型 P1 的「逐位相同」结论（`PROGRESS.md` §1，`max abs diff = 0.0`）就建立在这个通道上。
 
@@ -106,7 +106,7 @@
 | F11 TUI | 4,789 | Rust 侧重写。`tui_shared.py` 的 `API_PATHS` 常量表随 API 一起消失。 |
 | F12 多模态/跨框架 | 27,825 | 用户明确不接跨框架、不引入 PyTorch。这是整仓最大单块（21.5%）。 |
 | F13 持久化/journal | 3,449 | 用户明确不要 SQLite。`local_store.py` / `recovery_journal.py` / `journal_replication*.py` 全部去掉。 |
-| F14 启动配置 | 3,285 | `app_bootstrap.py` 1,567 行是安装包启动器。`config.py` 975 行读 **94 个 QLH_* 变量**（全 src 共 **180 个**），原型只需 9 个（`slimarc/config.py:70`）。 |
+| F14 启动配置 | 3,285 | `app_bootstrap.py` 1,567 行是安装包启动器。`config.py` 975 行读 **94 个 QLH_* 变量**（全 src 共 **180 个**），原型只需 9 个（`config.py:70`）。 |
 
 ---
 
@@ -199,14 +199,14 @@ SQLite 出现在 4 处：`local_store.py`、`recovery_journal.py`、`journal_rep
 1. **C shim**（`qlh_keep_head_gpu.c` 741 行）+ `llama-cpp-layer-forward-api.patch` 248 行 —— 这是既有资产，直接沿用；CUDA 版构建脚本 `build_cuda_shim.ps1` 已在原型目录。
 2. **不预留 Rust 控制面 / TUI 行数** —— 那是另一个语言栈，不占这 1000 行 Python 预算。
 
-**与现有 1,276 行原型的差额处理**：现有原型多出的 276 行主要来自 `topology.py`（200 行，支持 N 段 + TOML 校验）、`test_topology.py`（291 行测试）、`bench.py`/`breakdown.py`/`probe_hops.py`/`smoke.py`（共 302 行工具）。建议：**拓扑校验砍到 60 行、固定两段**；工具脚本移出 `slimarc/`，不进交付行数。
+**与现有 1,276 行原型的差额处理**：现有原型多出的 276 行主要来自 `topology.py`（200 行，支持 N 段 + TOML 校验）、`test_topology.py`（291 行测试）、`bench.py`/`breakdown.py`/`probe_hops.py`/`smoke.py`（共 302 行工具）。建议：**拓扑校验砍到 60 行、固定两段**；工具脚本移出核心包，不进交付行数。
 
 ---
 
 ## §6 与预期不符的五点（供决策）
 
 1. **`relay_transport.py` 不能复用**。它硬性拒绝非 loopback 端点（`relay_transport.py:535`），跨机靠外部 SSH 隧道。新原型要真跨机，传输层必须重写——但只抄它的 6 帧形状，不抄 1,247 行实现。
-2. **keep-head 是硬依赖，不是可选加速件**。裸 llama.cpp 拿不到 `output_norm` 之前的 hidden，必须走补丁 + shim。原型 `engine.py:19` 已经在 `sys.path` 注入旧仓库——这个耦合必须在合并时显式化（把 `llama_keep_head.py` 精简后收进 `slimarc/`，C shim 进 `slimarc/shim/`）。
+2. **keep-head 是硬依赖，不是可选加速件**。裸 llama.cpp 拿不到 `output_norm` 之前的 hidden，必须走补丁 + shim。原型 `engine.py:19` 已经在 `sys.path` 注入旧仓库——这个耦合必须在合并时显式化（把 `llama_keep_head.py` 精简后收进仓库根，C shim 进 `shim/`）。
 3. **裁切真身不在 `src/`**。如果只盘 `src/`，会得出「裁切功能只有 200 行」的错误结论——实际 690 行在 `scripts/cut_layers.py`，且是全仓唯一被原型依赖的旧代码（`DESIGN.md:174,196`）。
 4. **`scheduler_pipeline.py` 的重点不是接力**。接力循环本体在 `qlh_core/execution/linear.py`，只有 62 行；8,691 行的主体是 A3 供给编排（准备/提交/就绪/清理/重试/恢复）。真正纯接力路径（A1）已被降级为探针（`config.py:741-748`）。这解释了「旧仓库功能多」的具体形态：**不是功能多，是把一条 62 行的循环包在 29,752 行控制面里**。
 5. **`tcp_comm.py` 的价值被高估**。2,834 行里可直接迁移的只有约 280 行帧编解码；余下 2,000+ 行是心跳/重连/epoch/注册重放，全部属于「首期不做」。

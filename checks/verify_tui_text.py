@@ -19,7 +19,8 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r"G:\C\PYT\qlh\slimarc")
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 import koakuma  # noqa: E402
 
@@ -46,7 +47,7 @@ REPEAT = re.compile(r"(.{2,6}?)\1{3,}")
 
 
 async def main() -> int:
-    args = Args(r"G:\C\PYT\qlh\slimarc\topology-2b.toml",
+    args = Args(str(ROOT / "topology-2b.toml"),
                 os.environ.get("SA_SHIM",
                                       r"H:\slimarc-proto\shim\bin\qlh_keep_head.dll"),
                 1024, "中国的首都是", 24)

@@ -1,4 +1,4 @@
-"""Tests for topology.py. Run from slimarc/:
+"""Tests for topology.py. Run from the repository root:
 
     python -m unittest test_topology -v
 
