@@ -32,3 +32,6 @@ _archive/
 /tools/
 video-remotion/
 torchinductor_Koakuma/
+
+# 实验 shim（含 66 MB DLL，可由 checks/build 脚本重建）
+checks/_exp_shim/
