@@ -101,6 +101,27 @@ class StageWorker:
                         # latin-1 keeps arbitrary bytes intact through the JSON hop.
                         protocol.send(conn, protocol.RESULT,
                                       {"piece": piece.decode("latin-1")})
+                    elif op == "last_hidden":
+                        h = self._engine.last_hidden()
+                        if h is None:
+                            protocol.send(conn, protocol.ERROR,
+                                          {"code": "no_nextn_head"})
+                        else:
+                            # `dtype` is only resolved further down (the forward path needs it
+                            # after decoding the blob); this op sends bytes without one, so it
+                            # has to resolve its own or the NameError gets swallowed by the
+                            # handler's except and the caller silently sees "no hidden".
+                            d = wire.resolve(msg.meta.get("dtype"))
+                            protocol.send(conn, protocol.RESULT,
+                                          {"n_embd": int(h.shape[0]), "n_tokens": 1,
+                                           "dtype": d},
+                                          wire.encode(h.reshape(1, -1), d))
+                    elif op == "seq_rm":
+                        self._engine.seq_rm(n_past)
+                        protocol.send(conn, protocol.RESULT, {})
+                    elif op == "mtp_reset":
+                        self._engine.mtp_reset()
+                        protocol.send(conn, protocol.RESULT, {})
                     elif op == "is_eog":
                         protocol.send(conn, protocol.RESULT,
                                       {"eog": self._engine.is_eog(int(msg.meta["token"]))})
@@ -163,7 +184,12 @@ class StageWorker:
                     # at the point where the shim's ABI requires it.
                     hidden = wire.decode(msg.blob, dtype, (n_tokens, n_embd))
                     if self._role == "tail":
-                        if n_tokens > 1:
+                        if "token" in msg.meta:
+                            token = self._engine.mtp_draft(hidden, int(msg.meta["token"]),
+                                                           n_past=n_past)
+                            protocol.send(conn, protocol.RESULT,
+                                          {"token": token, "n_past": n_past})
+                        elif n_tokens > 1:
                             # Speculative verification: one argmax per submitted position.
                             toks = self._engine.forward_tokens_out(hidden, n_past=n_past)
                             protocol.send(conn, protocol.RESULT,

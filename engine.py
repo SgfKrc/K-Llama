@@ -130,6 +130,23 @@ class StageEngine:
         """k rows of hidden in, k token ids out. The speculative verification primitive."""
         return self._up.forward_hidden_to_tokens(_f32_input(hidden), n_past=n_past)
 
+    def last_hidden(self) -> np.ndarray | None:
+        """Final hidden of the most recent decode, for the MTP head (needs SA_MTP=1)."""
+        try:
+            return np.asarray(self._up.last_hidden(), dtype=np.float32).reshape(-1)
+        except Exception:  # noqa: BLE001 - the caller treats "no draft head" as a normal state
+            return None
+
+    def mtp_draft(self, hidden: np.ndarray, token: int, *, n_past: int) -> int:
+        return int(self._up.mtp_draft(_f32_input(hidden), int(token), n_past=n_past))
+
+    def mtp_reset(self) -> None:
+        self._up.mtp_reset()
+
+    def seq_rm(self, n_past: int) -> None:
+        """Roll back positions >= n_past (needs SA_N_RS_SEQ > 0 on hybrid models)."""
+        self._up.seq_rm(int(n_past))
+
     def set_sampling(self, **params) -> dict:
         """Configure the tail stage's sampler; returns the effective parameters.
 

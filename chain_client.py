@@ -37,7 +37,7 @@ import wire  # noqa: E402
 from topology import Stage  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_SHIM = Path("H:/slimarc-proto/shim/bin/qlh_keep_head.dll")
+DEFAULT_SHIM = Path("H:/slimarc-proto/exp-c/shim/qlh_keep_head.dll")
 LOG_DIR = HERE / "build" / "relay-records"
 
 # Weights are not the only cost of a loaded stage: each one also builds a KV cache
@@ -59,7 +59,11 @@ LOG_DIR = HERE / "build" / "relay-records"
 # compute buffer add up, so it costs roughly its file size in RAM.
 #
 # Hence two coefficients rather than one, both deliberately generous:
-MEM_SAFETY = 0.75
+# Fraction of *currently available* RAM a local set of stages may claim. 0.75 leaves a margin for
+# page cache that the OS will not hand back on demand. Override with SA_MEM_SAFETY when a run
+# genuinely needs to sit closer to the limit (e.g. a 35B two-segment split on one box, which needs
+# 17.96 GiB against a 17.71 GiB budget at 0.75).
+MEM_SAFETY = float(os.environ.get("SA_MEM_SAFETY", "0.75"))
 # Fraction of a CPU stage's file size that stays resident. Measured 0.215; 0.30 leaves
 # a margin for a longer context than the 4096 the measurement used.
 CPU_RESIDENT_RATIO = 0.30
@@ -303,6 +307,35 @@ class StageClient:
                 f"stage {self.stage.index}: {len(toks)} tokens for {hidden.shape[0]} rows")
         return toks
 
+    def last_hidden(self) -> np.ndarray | None:
+        """Final hidden of the most recent decode (MTP input). None when unavailable."""
+        try:
+            msg = self._forward({"op": "last_hidden", "n_tokens": 1, "n_past": 0})
+        except Exception:  # noqa: BLE001 - "no draft head" is a normal state
+            return None
+        return self._decode_hidden(msg).reshape(-1)
+
+    def mtp_draft(self, hidden: np.ndarray, token: int, n_past: int) -> int:
+        """One draft token from the MTP head held by this stage."""
+        # last_hidden() hands back a flat (n_embd,) row; the wire wants one row of that width.
+        # Reading shape[0] without this gave a 2048-row request and the worker rejected it.
+        arr = hidden.reshape(1, -1) if hidden.ndim == 1 else hidden
+        dtype = wire.current_dtype()
+        # No "op": this rides on FORWARD like a normal hidden-in call, with `token` marking it
+        # as a draft request. An op would be intercepted by the text-helper dispatch before the
+        # blob is decoded, and mtp_draft needs the hidden.
+        msg = self._forward({"n_tokens": int(arr.shape[0]),
+                             "n_past": n_past, "dtype": dtype, "token": int(token)},
+                            wire.encode(arr, dtype))
+        return int(msg.meta["token"])
+
+    def mtp_reset(self) -> None:
+        self._forward({"op": "mtp_reset", "n_tokens": 0, "n_past": 0})
+
+    def seq_rm(self, n_past: int) -> None:
+        """Drop everything at and after ``n_past``. Undoes a rejected draft."""
+        self._forward({"op": "seq_rm", "n_tokens": 0, "n_past": n_past})
+
     def _decode_hidden(self, msg: protocol.Message) -> np.ndarray:
         """Decode the reply's hidden in whatever dtype the worker declared.
 
@@ -407,6 +440,12 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     # all but the tail's -- measured 32.0 vs 3.6 ms/step on stage0.
     env = dict(os.environ)
     env["SA_NEEDS_LOGITS"] = "1" if stage.kind == "tail" else "0"
+    # Speculative decode needs two things the plain path does not: the draft head (only the
+    # tail holds it) and recurrent snapshots to roll a rejected draft back. Both are opt-in
+    # because they cost memory and graph nodes that a non-speculative run should not pay.
+    if stage.kind == "tail":
+        env.setdefault("SA_MTP", "1" if os.environ.get("SA_SPEC", "1") != "0" else "0")
+    env.setdefault("SA_N_RS_SEQ", os.environ.get("SA_SPEC_K", "2"))
     # Layer selection at load time: with a range, `model` is the full checkpoint and
     # llama.cpp (with the C-scheme patch) exposes only these layers. Unset for the
     # pre-cut-artifact path, which needs no help.
@@ -446,9 +485,114 @@ def forward(clients: list[StageClient], tokens: list[int], n_past: int,
         else:  # tail
             if hidden is None:
                 raise RuntimeError(f"stage {i} (tail) has no hidden to consume")
-            token = client.forward_token(hidden, n_past)
+            if hidden.shape[0] > 1:
+                # A prefill pass hands the tail several rows at once. The worker answers with
+                # one argmax per position, and the token this step should return is the last
+                # one -- the same token a single-row call on the final position would give.
+                token = client.forward_tokens_out(hidden, n_past)[-1]
+            else:
+                token = client.forward_token(hidden, n_past)
         stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
     return token
+
+
+def forward_batch(clients: list[StageClient], tokens: list[int], n_past: int,
+                  stage_ms: list[list[float]]) -> list[int]:
+    """Walk the chain once with a *block* of tokens and return one token per position.
+
+    This is the verification primitive: the whole candidate block goes through the chain in one
+    round trip, and the tail answers with an argmax per position. Verified bit-identical to
+    running the same positions one at a time (see checks/probe_perfect_draft.py).
+    """
+    if not clients or clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
+        raise RuntimeError("chain must start with a gpu stage and end with a tail stage")
+
+    hidden: np.ndarray | None = None
+    for i, client in enumerate(clients):
+        kind = client.stage.kind
+        t0 = time.perf_counter()
+        if kind == "gpu":
+            hidden = client.forward_tokens(tokens, n_past)
+        elif kind == "cpu":
+            if hidden is None:
+                raise RuntimeError(f"stage {i} (cpu) has no hidden to consume")
+            hidden = client.forward_hidden(hidden, n_past)
+        else:  # tail
+            if hidden is None:
+                raise RuntimeError(f"stage {i} (tail) has no hidden to consume")
+            out = client.forward_tokens_out(hidden, n_past)
+            stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
+            return out
+        stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
+    raise RuntimeError("chain has no tail stage")
+
+
+def speculate(clients: list[StageClient], token: int, n_past: int,
+              stage_ms: list[list[float]], k: int,
+              stats: dict) -> list[int]:
+    """One speculative step: trunk token + up to k recursive MTP drafts, verified in one block.
+
+    Returns the accepted tokens for this step (1 + accepted drafts), always starting with the
+    token the trunk itself produced. The trailing token of the verified block is free -- the
+    block already computed it -- so it is returned as well and the caller must not recompute it.
+
+    Correctness contract: the returned list is what plain greedy would have produced. The
+    verification compares the drafts against the trunk's own argmax at each position, and any
+    position after the first mismatch is rolled back on *every* stage.
+    """
+    tail = clients[-1]
+
+    # 1. trunk step: one token, and the final hidden the draft head needs
+    t1 = forward(clients, [token], n_past, stage_ms)
+    h = tail.last_hidden()
+    if h is None:                      # no NextN head (or SA_MTP off): plain decode
+        stats["no_draft"] = stats.get("no_draft", 0) + 1
+        return [t1]
+
+    # 2. recursive drafts. Each one feeds the previous guess back in with the same hidden.
+    drafts: list[int] = []
+    tail.mtp_reset()
+    cur = t1
+    try:
+        for j in range(k):
+            d = tail.mtp_draft(h, cur, n_past + 1 + j)
+            drafts.append(d)
+            cur = d
+    except Exception:                  # noqa: BLE001 - a broken draft head must not break decode
+        stats["draft_error"] = stats.get("draft_error", 0) + 1
+        return [t1]
+
+    # 3. verify the whole block [t1, d0, d1, ...] in one pass
+    block = [t1] + drafts
+    try:
+        tb = forward_batch(clients, block, n_past + 1, stage_ms)
+    except Exception:                  # noqa: BLE001
+        stats["verify_error"] = stats.get("verify_error", 0) + 1
+        return [t1]
+
+    # 4. accept the longest prefix where the draft equals the trunk
+    accepted = 0
+    for j in range(len(drafts)):
+        if drafts[j] == tb[j]:
+            accepted += 1
+        else:
+            break
+
+    keep = 1 + accepted                # positions the block legitimately wrote
+    if keep < len(block):
+        # roll back everything past the accepted prefix, on both ends of the chain
+        for c in clients:
+            try:
+                c.seq_rm(n_past + 1 + keep)
+            except Exception:          # noqa: BLE001 - keep decoding even if rollback fails
+                stats["rollback_error"] = stats.get("rollback_error", 0) + 1
+
+    stats["drafts"] = stats.get("drafts", 0) + len(drafts)
+    stats["accepted"] = stats.get("accepted", 0) + accepted
+    out = block[:keep]
+    # tb[accepted] is the trunk's token at the next position -- already paid for
+    out.append(tb[accepted])
+    return out
 
 
 def _children(pid: int) -> list:
@@ -525,6 +669,8 @@ def main() -> int:
     ap.add_argument("--prompt-text", default=None,
                     help="natural-language prompt instead of synthetic token ids")
     ap.add_argument("--gen", type=int, default=64)
+    ap.add_argument("--spec-k", type=int, default=0,
+                    help="MTP 递归草稿数；0 = 不投机。代码场景 k=2 实测 1.19x，k>2 只会更慢")
     # The checkpoint recommends temp 1.00 / top_k 20 / top_p 0.95. Greedy (the shim default)
     # degenerates into repetition on this model, so sampling is the default here and
     # --greedy opts back into it for reproducible comparisons.
@@ -711,12 +857,26 @@ def main() -> int:
             step_ms: list[float] = []
             out_tokens = [token]
             n_past = len(prompt)
-            for _ in range(args.gen - 1):
+            spec_stats: dict = {}
+            k = args.spec_k
+            while len(out_tokens) < args.gen:
                 start = time.perf_counter()
-                token = forward(clients, [token], n_past, stage_ms)
+                if k > 0:
+                    produced = speculate(clients, token, n_past, stage_ms, k, spec_stats)
+                else:
+                    produced = [forward(clients, [token], n_past, stage_ms)]
                 step_ms.append((time.perf_counter() - start) * 1000.0)
+                # produced[0] is the token this step committed first; the rest are the extra
+                # tokens the block settled. A step that yields m tokens advances n_past by m.
+                token = produced[0]
                 out_tokens.append(token)
                 n_past += 1
+                for extra in produced[1:]:
+                    if len(out_tokens) >= args.gen:
+                        break
+                    token = extra
+                    out_tokens.append(token)
+                    n_past += 1
 
             arr = np.asarray(step_ms)
             pp = len(prompt) / prefill_s if prefill_s > 0 else 0.0
@@ -731,6 +891,14 @@ def main() -> int:
                 where = "local" if s.is_local else s.host
                 print(f"    stage {i} ({s.kind + ',':<5}{s.layers:>3} layers, {where}): "
                       f"{ms:.1f} ms")
+            if spec_stats.get("drafts"):
+                acc = spec_stats.get("accepted", 0)
+                drf = spec_stats["drafts"]
+                steps = max(spec_stats.get("steps", 1), 1)
+                print(f"    spec:   k={k} 接受 {acc}/{drf} = {100.0*acc/max(drf,1):.1f}%"
+                      f"  平均每轮 {len(out_tokens)/max(len(step_ms),1):.2f} token"
+                      + (f"  回滚失败 {spec_stats['rollback_error']}"
+                         if spec_stats.get("rollback_error") else ""))
             print(f"    tokens: {out_tokens[:8]}  unique={len(set(out_tokens))}"
                   f"{' (stuck on one token)' if len(set(out_tokens)) == 1 else ''}")
             # Decode the generated ids, otherwise a degenerate run and a healthy one

@@ -103,6 +103,15 @@ class Binding:
             ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
             ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
         lib.qlh_kh_forward_embd_tokens.restype = ctypes.c_int32
+        lib.qlh_kh_last_hidden.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32]
+        lib.qlh_kh_last_hidden.restype = ctypes.c_int32
+        lib.qlh_kh_mtp_draft.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)]
+        lib.qlh_kh_mtp_draft.restype = ctypes.c_int32
+        lib.qlh_kh_mtp_reset.argtypes = [ctypes.c_void_p]
+        lib.qlh_kh_mtp_reset.restype = ctypes.c_int32
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_reset.restype = None
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
@@ -233,6 +242,36 @@ class Binding:
             self._handle, _f32(arr), k, int(n_past), None, None, None, out, k)
         self._checked(rc, None, "tail forward (batch)")
         return list(out)
+
+    def last_hidden(self) -> np.ndarray | None:
+        """The trunk's final hidden of the most recent decode (needs SA_MTP=1).
+
+        This is what the MTP head was trained against -- the tail's t_h_nextn, not the 32-layer
+        head output. Returns None when the model carries no NextN head.
+        """
+        buf = np.zeros(self.n_embd, dtype=np.float32)
+        rc = self._lib.qlh_kh_last_hidden(self._handle, _f32(buf), self.n_embd)
+        if rc != 0:
+            return None
+        return buf
+
+    def mtp_draft(self, hidden: np.ndarray, token: int, n_past: int) -> int:
+        """One draft token from the MTP head, given (hidden, token)."""
+        out = ctypes.c_int32(-1)
+        rc = self._lib.qlh_kh_mtp_draft(self._handle, _f32(hidden), int(hidden.shape[-1]),
+                                        int(token), int(n_past), ctypes.byref(out))
+        return self._checked(rc, int(out.value), "mtp draft")
+
+    def mtp_reset(self) -> None:
+        """Clear the draft context's memory. Positions accumulate in mtp_ctx, so recursive
+        drafting has to start each candidate chain from a clean slate."""
+        self._lib.qlh_kh_mtp_reset(self._handle)
+
+    def seq_rm(self, n_past: int) -> None:
+        """Drop positions >= n_past for sequence 0. Undoes a rejected draft block."""
+        rc = self._lib.qlh_kh_seq_rm(self._handle, 0, int(n_past))
+        if rc != 0:
+            raise RuntimeError(f"seq_rm({n_past}) rc={rc} (SA_N_RS_SEQ>0 required)")
 
     def tokenize(self, text: bytes) -> list[int]:
         """Text -> token ids.
@@ -427,6 +466,21 @@ def main() -> int:
                 _response(ok=True, token=binding.token(_decode_hidden(request), n_past))
             elif operation == "hidden_tokens":
                 _response(ok=True, tokens=binding.tokens_of(_decode_hidden(request), n_past))
+            elif operation == "last_hidden":
+                arr = binding.last_hidden()
+                if arr is None:
+                    _response(ok=False, error="no nextn hidden (needs SA_MTP=1 and a NextN head)")
+                else:
+                    _array_response(arr.reshape(1, -1))
+            elif operation == "mtp_draft":
+                _response(ok=True, token=binding.mtp_draft(
+                    _decode_hidden(request), int(request["token"]), n_past))
+            elif operation == "mtp_reset":
+                binding.mtp_reset()
+                _response(ok=True)
+            elif operation == "seq_rm":
+                binding.seq_rm(n_past)
+                _response(ok=True)
             elif operation == "tokenize":
                 # Text crosses the worker boundary as UTF-8 bytes, not str: the shim
                 # wants raw bytes plus an explicit length so it never has to guess.

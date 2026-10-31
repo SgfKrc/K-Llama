@@ -158,11 +158,13 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(f"keep-head worker communication failed: {exc}") from exc
 
     @staticmethod
-    def _hidden_payload(op: str, arr: np.ndarray, n_past: int) -> dict:
+    def _hidden_payload(op: str, arr: np.ndarray, n_past: int, **extra) -> dict:
         # base64 keeps the pipe line-oriented JSON instead of raw binary, and it can read
         # the array's buffer directly: .tobytes() first would add an 8 KB copy per step.
-        return {"op": op, "shape": list(arr.shape), "n_past": int(n_past),
-                "data": base64.b64encode(arr).decode("ascii")}
+        payload = {"op": op, "shape": list(arr.shape), "n_past": int(n_past),
+                   "data": base64.b64encode(arr).decode("ascii")}
+        payload.update(extra)
+        return payload
 
     @staticmethod
     def _array(response: dict) -> np.ndarray:
@@ -236,6 +238,23 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(
                 f"keep-head worker returned {len(toks)} tokens for {arr.shape[0]} rows")
         return toks
+
+    def last_hidden(self) -> np.ndarray:
+        """The trunk's final hidden of the most recent decode; raises when unavailable."""
+        reply = self._request({"op": "last_hidden"})
+        return self._array(reply)
+
+    def mtp_draft(self, hidden, token: int, *, n_past: int) -> int:
+        """One draft token from the MTP head."""
+        arr = self._checked_hidden(hidden, n_past)
+        return int(self._request(
+            self._hidden_payload("mtp_draft", arr, n_past, token=int(token)))["token"])
+
+    def mtp_reset(self) -> None:
+        self._request({"op": "mtp_reset"})
+
+    def seq_rm(self, n_past: int) -> None:
+        self._request({"op": "seq_rm", "n_past": int(n_past)})
 
     def tokenize(self, text: str) -> list[int]:
         """Text -> token ids, for callers that start from a prompt instead of ids."""
