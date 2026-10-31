@@ -214,8 +214,7 @@ layer dropout。
 
 1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻**。hidden 差 2.5e-2~3.8e-2 但不翻转 argmax：
    用「完美草稿」跑 30 个 token，2B 与 35B 都逐位一致，块的第 1 行（验货）与第 2 行（免费
-   token）都对。之前两次「批量出错」是实验设计问题（`checks/probe_perfect_draft.py` 是干净版）。
-
+   token）都对（`checks/probe_perfect_draft.py`）。
 2. ~~`qlh_kh_seq_rm` 不是干净回滚~~ —— **已修复**，详见
    [`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md)。根因是
    `n_rs_seq` 快照**只有「单 ubatch 内」语义、跨 ubatch 不滚动**：单 token decode 每步只写
@@ -237,8 +236,16 @@ layer dropout。
 **且 k=2 约半数运行会在第一次 `forward` 前让 gpu 段 worker 退出**，同配置 baseline 4/4 稳定，
 根因未定位；`回滚失败 2` 稳定复现、长跑（gen=32）会崩。
 
-**所以投机暂不进主链路**，`--spec-k` 默认 0。要继续先解决三件事：崩溃根因、回滚失败来源、
-以及换到不 spill 的机器测真实收益（本机 head 段 WDDM 溢出，baseline 本身已经掉了一半性能）。
+**崩溃与回滚都已修**（`qlh_kh_seq_rm` 漏声明 ctypes 签名 → 64 位句柄溢出打死 worker；
+`n_rs_seq` 从 k-1 改成 k）。修完 6/6 + 1/1 通过，token 与 baseline 逐字节相同。
+
+**速度仍未测出**：本机 head 段 WDDM 溢出（baseline 就掉了一半性能），跨机又卡在传输——
+局域网 SSH 通了（48 MB/s），但本机走 **WLAN**，22 GiB 连续传输跑几块就停；且 `copy /b`
+合并出的文件**大小对、内容错**（256 MiB 切片哈希：head 相同，mid/tail 不同）。ROG 上那份
+损坏的模型会让 tail 段恒定输出 token 0（本机同配置正常）。
+
+**所以投机仍不进主链路**，`--spec-k` 默认 0。缺的是一个**有线网络 + 单机装得下 22 GiB** 的
+运行环境，不是代码。
 
 ## 11. 已知限制
 
