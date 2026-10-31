@@ -1536,9 +1536,14 @@ int32_t qlh_kh_seq_rm(void * handle_void, int32_t seq_id, int32_t p0) {
     if (mem == NULL) {
         return -5;
     }
+    /* 埋点：回滚前后都量一次真实位置。removed=0 时这两行能立刻区分
+     * "KV 里本来就没有 >= p0 的位置" 和 "有但删不掉"（后者才是 bug）。 */
+    const llama_pos before = llama_memory_seq_pos_max(mem, (llama_seq_id) seq_id);
     const bool removed = llama_memory_seq_rm(mem, (llama_seq_id) seq_id, (llama_pos) p0, -1);
+    const llama_pos after = llama_memory_seq_pos_max(mem, (llama_seq_id) seq_id);
     if (getenv("SA_DEBUG_KV") != NULL) {
-        fprintf(stderr, "[kv] seq_rm p0=%d removed=%d\n", p0, removed ? 1 : 0);
+        fprintf(stderr, "[kv] seq_rm p0=%d removed=%d pos_max %d -> %d\n",
+                p0, removed ? 1 : 0, before, after);
     }
     return removed ? 0 : -6;
 }
