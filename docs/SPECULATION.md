@@ -237,5 +237,5 @@ layer dropout。
 
 ## 10. 已知限制
 
-只对 temp=0 无损（shim 暴露 argmax 而非 logits，做不了 rejection sampling）。ROG 只有 0.82 GiB，
-`n_rs_seq` 占 100 MiB。DFlash 接受率与 k≥2 端到端收益未实测。
+只对 temp=0 无损（只暴露 argmax，做不了 rejection sampling）；ROG 只有 0.82 GiB，`n_rs_seq` 占
+100 MiB；DFlash 接受率与 k≥2 端到端收益未实测。
