@@ -132,33 +132,23 @@ loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP �
 ## 5. DFlash：可行，但第二步
 
 权重可用：[z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash)
-（Q4_K_M 的 GGUF 仅 0.24 GB），llama.cpp 已支持该架构（`src/models/dflash.cpp`、
-`LLM_ARCH_DFLASH`）。
+（Q4_K_M 仅 0.24 GB），llama.cpp 已支持（`src/models/dflash.cpp`）。GGUF 关键参数：
+`block_count=6`、**`block_size=16`（一次出 16 个候选）**、`target_layers=[2,7,12,17,23,28,33,38]`。
 
-从 GGUF 读到的关键参数：
+两个硬障碍：① **8 路中间层 hidden 横跨两段**（33/38 在 ROG 段），要么回传要么改 shim 支持多层
+输出（第一代 `layer_inp` 能做，第二代简化掉了）；② llama.cpp 的 `draft-dflash` 要求 target 与
+draft 在**同一个 `llama_context`**，它直接读 target 的中间层和 KV，没有跨进程分段 target 的概念。
 
-```
-dflash.block_count    = 6
-dflash.block_size     = 16                              ← 一次出 16 个候选
-dflash.target_layers  = [2, 7, 12, 17, 23, 28, 33, 38]  ← 需要目标模型的 8 个中间层
-```
-
-两个硬障碍：
-
-1. **8 路中间层 hidden 横跨两段**。33 和 38 在 ROG 段，本机拿不到。要么让 ROG 回传，
-   要么改 shim 支持多层输出（第一代 K-Llama 的 `layer_inp` 能做，第二代简化掉了）。
-2. **llama.cpp 的 `draft-dflash` 要求 target 与 draft 在同一个 `llama_context`**。它直接读
-   target 的中间层和 KV，没有"跨进程分段 target"的概念。这条路要自己在 Python 侧重写编排。
-
-按 §0 的模型，k=8 且每草稿接受 16% 即回本。社区线索的接受率是 0.30–0.50：
+按 §0，k=8 且每草稿接受 16% 即回本。社区接受率 0.30–0.50：
 
 ```
-接受 4/8 (50%)  → 1.30 单位/token，快 1.54×
+接受 4/8 (50%)   → 1.30 单位/token，快 1.54×
 接受 6.8/8 (85%) → 0.83 单位/token，快 2.40×
-**这才是本项目的真机会**：MTP 单头的 k=1 结构上赚不了，DFlash 的 `block_size=16` 天生在
-盈利区间。代价是工程量高一个量级（8 路中间层横跨两段、需要自己编排 target/draft）。
+```
 
----
+**这才是本项目的真机会**：MTP 单头的 k=1 结构上赚不了，DFlash 的 `block_size=16` 天生在盈利
+区间。代价是工程量高一个量级。
+
 
 ## 6. PLD / n-gram：按负载开关
 
@@ -201,52 +191,52 @@ layer dropout。
 
 1. **`n_rs_seq` 可配 + 按序回滚**。已完成：`SA_N_RS_SEQ`、`qlh_kh_seq_rm`。
 2. **批量验证链路**。已完成：`hidden_tokens` op 贯通到 `StageClient.forward_tokens_out`。
-3. **MTP 递归 k=2**。部件已完成；代码场景实测 1.19×，按负载开关接入（§4）。
+3. **MTP 递归 k=2**。已接入并跨机实测 **1.13×**（70% 接受，§10）；按负载开关用。
 4. **回滚已修**（§9）。剩下的跨形状 kernel 差异不影响 argmax。
 5. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
 6. **DFlash**：k=8 天生在盈利区间，是唯一值得投入完整工程的方向。
 
 ## 9. 数值验证结论
 
-位置账在 `checks/probe_spec_wip.py`（先验证后写入模式下 2 个 prompt 逐位一致、接受率 83-92%）。
-两个曾经的障碍都已澄清或修掉：
+位置账在 `checks/probe_spec_wip.py`。两个曾经的障碍都已澄清或修掉：
 
 1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻**。hidden 差 2.5e-2~3.8e-2 但不翻转 argmax：
    用「完美草稿」跑 30 个 token，2B 与 35B 都逐位一致，块的第 1 行（验货）与第 2 行（免费
    token）都对（`checks/probe_perfect_draft.py`）。
 2. ~~`qlh_kh_seq_rm` 不是干净回滚~~ —— **已修复**，详见
    [`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md)。根因是
-   `n_rs_seq` 快照**只有「单 ubatch 内」语义、跨 ubatch 不滚动**：单 token decode 每步只写
-   slot 0，`seq_rm` 后重写就读到陈旧的 slot 1。修法是在 `build_rs` 里插移位节点让快照跨
-   ubatch 连续。实测同形状回滚 **0.000e+00**。跨形状仍有 ~1e-2，是 GDN 两套 kernel
-   （CH/AR）的算术差异，与回滚无关、不影响 argmax。
-
-   **官方从不跨 ubatch 回滚**（verify batch 一次写 `n_draft+1` 个 token，回滚量总落在刚写的
-   槽里；draft 端 `n_rs_seq=0`、整段重跑），所以这个缺陷只有「分段 + 单 token draft」才暴露。
-
+   `n_rs_seq` 快照**只有单 ubatch 内语义、跨 ubatch 不滚动**，修法是在 `build_rs` 里插移位
+   节点。同形状回滚实测 **0.000e+00**；跨形状仍有 ~1e-2，是 GDN 两套 kernel（CH/AR）的算术
+   差异，不影响 argmax。官方从不跨 ubatch 回滚（verify batch 一次写 `n_draft+1` 个 token），
+   所以这个缺陷只有「分段 + 单 token draft」才暴露。
 3. **tail 段 8 层里 6 层是 linear**（32/33/34/36/37/38，只有 35/39 是 full attention），
    recurrent state 没有位置索引——这是上面那条缺陷只在本项目暴露的根本原因。
 
-## 10. 接入状态（未完成）
 
-已接进 `chain_client.py`（`--spec-k N`），`forward_batch` 一次绕链验证整个候选块。本机两段
-（`topology-local-32-8.toml`）实测：**正确性通过**（k=2 与 k=0 的 token 序列逐位相同），接受率
-83.3%，全接受时一轮前进 4 个。**但速度没优势**（baseline 119-125 ms/token，投机持平或更慢），
-**且 k=2 约半数运行会在第一次 `forward` 前让 gpu 段 worker 退出**，同配置 baseline 4/4 稳定，
-根因未定位；`回滚失败 2` 稳定复现、长跑（gen=32）会崩。
+## 10. 接入与实测
 
-**崩溃与回滚都已修**（`qlh_kh_seq_rm` 漏声明 ctypes 签名 → 64 位句柄溢出打死 worker；
-`n_rs_seq` 从 k-1 改成 k）。修完 6/6 + 1/1 通过，token 与 baseline 逐字节相同。
+已接进 `chain_client.py`（`--spec-k N`），`forward_batch` 一次绕链验证整个候选块。
+**正确性**：token 序列与 `--spec-k 0` 逐位相同（本机、跨机都验过）。
 
-**速度仍未测出**：本机 head 段 WDDM 溢出（baseline 就掉了一半性能），跨机又卡在传输——
-局域网 SSH 通了（48 MB/s），但本机走 **WLAN**，22 GiB 连续传输跑几块就停；且 `copy /b`
-合并出的文件**大小对、内容错**（256 MiB 切片哈希：head 相同，mid/tail 不同）。ROG 上那份
-损坏的模型会让 tail 段恒定输出 token 0（本机同配置正常）。
+**跨机实测**（`topology-cross-mtp.toml`：本机 0:32 + ROG 32:40，U 盘传模型后 SHA256 一致）：
 
-**所以投机仍不进主链路**，`--spec-k` 默认 0。缺的是一个**有线网络 + 单机装得下 22 GiB** 的
-运行环境，不是代码。
+| | 中位 | 平均 | 范围 |
+|---|---:|---:|---|
+| baseline | **205.8 ms/token** | 200.2 | 174-226 |
+| spec k=2 | **182.2 ms/token** | 180.1 | 165-187 |
+
+**1.11-1.13×**，接受率 70.0%（14/20），每轮前进 3.20 token。比 §4 预测的 1.19× 略低，因为那个
+数是按 85% 接受率算的。**波动也变小**：baseline 174-226、投机 165-187 —— 批量验证把每步一次的
+不稳定开销摊到 3.2 个 token 上。
+
+本机两段（`topology-local-32-8.toml`）测不出收益：head 段 WDDM 溢出，baseline 就掉了一半。
+
+排查中修掉三个真 bug：`qlh_kh_seq_rm` 漏声明 ctypes 签名（64 位句柄溢出打死 worker）、
+`n_rs_seq` 该是 k 不是 k-1、`n_embd` 属性丢弃响应恒返回 0。两个坑：`copy /b` 合并 22 GiB 会
+产出**大小对、内容错**的文件（模型能加载却恒定输出 token 0）；本机是 WLAN，连续大文件传输跑
+几块就停，最终靠 U 盘 + SHA256 校验解决。
+
 
 ## 11. 已知限制
 
-只对 temp=0 无损（只暴露 argmax，做不了 rejection sampling）；ROG 只有 0.82 GiB，`n_rs_seq` 占
-100 MiB；DFlash 接受率与 k≥2 端到端收益未实测。
+只对 temp=0 无损（只暴露 argmax，做不了 rejection sampling）；DFlash 端到端收益未实测。

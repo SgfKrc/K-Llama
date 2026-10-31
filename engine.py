@@ -7,6 +7,7 @@ per-stage policy: which layers live on which device, and role-specific naming.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -134,7 +135,12 @@ class StageEngine:
         """Final hidden of the most recent decode, for the MTP head (needs SA_MTP=1)."""
         try:
             return np.asarray(self._up.last_hidden(), dtype=np.float32).reshape(-1)
-        except Exception:  # noqa: BLE001 - the caller treats "no draft head" as a normal state
+        except Exception as exc:  # noqa: BLE001 - the caller treats "no draft head" as normal
+            # Silent by design (a model without a head is normal), but it also hid a real
+            # failure: the chain reported no_nextn_head while the shim answered rc=0 when
+            # called directly. Leave the reason in the stage log.
+            print(f"[engine.last_hidden] {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
             return None
 
     def mtp_draft(self, hidden: np.ndarray, token: int, *, n_past: int) -> int:

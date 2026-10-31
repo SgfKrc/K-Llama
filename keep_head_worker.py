@@ -261,6 +261,9 @@ class Binding:
         buf = np.zeros(self.n_embd, dtype=np.float32)
         rc = self._lib.qlh_kh_last_hidden(self._handle, _f32(buf), self.n_embd)
         if rc != 0:
+            # -5 bad handle/ctx/capacity, -6 llama_get_embeddings_nextn() == NULL.
+            # Returning a bare None erased that distinction and cost a long detour.
+            print(f"[kh.last_hidden] rc={rc} n_embd={self.n_embd}", file=sys.stderr, flush=True)
             return None
         return buf
 

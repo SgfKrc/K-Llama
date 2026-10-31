@@ -269,7 +269,10 @@ class StageClient:
         via a tokenize round trip, which is cheap and always available.
         """
         if not self._n_embd:
-            self._forward({"op": "tokenize", "text": ""})
+            # Must go through tokenize(): it is what stores n_embd from the reply. Calling
+            # _forward directly sent the same request and threw the answer away, so this
+            # property returned 0 forever and every caller built zero-width payloads.
+            self.tokenize("")
         return self._n_embd
 
     def _forward(self, meta: dict, blob: bytes = b"") -> protocol.Message:
@@ -311,7 +314,11 @@ class StageClient:
         """Final hidden of the most recent decode (MTP input). None when unavailable."""
         try:
             msg = self._forward({"op": "last_hidden", "n_tokens": 1, "n_past": 0})
-        except Exception:  # noqa: BLE001 - "no draft head" is a normal state
+        except Exception as exc:  # noqa: BLE001 - "no draft head" is a normal state
+            # Swallowing this silently made a broken MTP path look like "this model has no head",
+            # which is exactly how the cross-machine run looked healthy but barely sped up.
+            print(f"    [last_hidden] stage {self.stage.index}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
             return None
         return self._decode_hidden(msg).reshape(-1)
 
@@ -895,7 +902,19 @@ def main() -> int:
             arr = np.asarray(step_ms)
             pp = len(prompt) / prefill_s if prefill_s > 0 else 0.0
             # --gen 1 leaves no decode step to time; an empty median is nan, not a number.
-            tg = f"{1000.0 / np.median(arr):.1f} t/s" if arr.size else "n/a (--gen 1)"
+            # `arr` holds one sample per DECODE STEP, and a speculative step advances several
+            # tokens. Two corrections matter:
+            #   1. divide by tokens per step, or speculation looks 3x slower than it is;
+            #   2. use the TOTAL over steps, not the median step -- steps advance a variable
+            #      number of tokens under speculation, so a median of step latencies does not
+            #      divide cleanly. Total tokens over total time is the only like-for-like
+            #      number between plain and speculative decoding.
+            # out_tokens includes the prefill token, which no step produced.
+            n_decoded = max(len(out_tokens) - 1, 1)
+            total_ms = float(np.sum(arr)) if arr.size else 0.0
+            tg = (f"{1000.0 * n_decoded / total_ms:.1f} t/s"
+                  f" ({total_ms / n_decoded:.1f} ms/token)"
+                  if total_ms > 0 else "n/a (--gen 1)")
             print(f"  run {run}: pp{len(prompt)}={pp:.1f} t/s  "
                   f"tg{args.gen}={tg}" +
                   (f"  (median {np.median(arr):.1f} ms, p90 {np.percentile(arr, 90):.1f} ms)"
@@ -905,12 +924,18 @@ def main() -> int:
                 where = "local" if s.is_local else s.host
                 print(f"    stage {i} ({s.kind + ',':<5}{s.layers:>3} layers, {where}): "
                       f"{ms:.1f} ms")
-            if spec_stats.get("drafts"):
+            # Print whenever speculative decode ran at all, including the paths where it
+            # bailed out: "no MTP head" and "draft raised" used to leave no trace, so a
+            # silently-degraded run looked identical to a working one in the summary.
+            if spec_stats.get("drafts") or spec_stats.get("no_draft") or spec_stats.get("draft_error"):
                 acc = spec_stats.get("accepted", 0)
-                drf = spec_stats["drafts"]
-                steps = max(spec_stats.get("steps", 1), 1)
+                drf = spec_stats.get("drafts", 0)
+                no_draft = spec_stats.get("no_draft", 0)
+                draft_err = spec_stats.get("draft_error", 0)
                 print(f"    spec:   k={k} 接受 {acc}/{drf} = {100.0*acc/max(drf,1):.1f}%"
                       f"  平均每轮 {len(out_tokens)/max(len(step_ms),1):.2f} token"
+                      + (f"  无 MTP 头 {no_draft}" if no_draft else "")
+                      + (f"  草稿异常 {draft_err}" if draft_err else "")
                       + (f"  回滚失败 {spec_stats['rollback_error']}"
                          if spec_stats.get("rollback_error") else ""))
             print(f"    tokens: {out_tokens[:8]}  unique={len(set(out_tokens))}"
