@@ -67,13 +67,55 @@ extern const float * llama_get_embeddings_layer_inp(struct llama_context * ctx, 
  * read past the buffer and every token after the first was garbage -- which looked like the
  * model being broken, not like a bug in the plumbing.
  */
-#if defined(QLH_ABI_UPSTREAM_HEADER)
-#  define LLAMA_SET_RELAY_HIDDEN(ctx, lid) ((void) (lid))
-#  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) (llama_get_embeddings((ctx)))
-#else
-#  define LLAMA_SET_RELAY_HIDDEN(ctx, lid) llama_set_embeddings_layer_inp((ctx), (lid), true)
-#  define LLAMA_GET_RELAY_HIDDEN(ctx, lid) llama_get_embeddings_layer_inp((ctx), (lid))
-#endif
+/* plot twist（2026-10-31，DFLASH-01）：这两个入口在 llama.dll 里导出的是 **C++ mangled
+ * 名**，不是 C 名：
+ *   ?llama_set_embeddings_layer_inp@@YAXPEAUllama_context@@I_N@Z
+ *   ?llama_get_embeddings_layer_inp@@YAPEAMPEAUllama_context@@I@Z
+ * （dumpbin /exports 实测）。本文件是 C，`extern` 声明得到的是 C 链接名，链接期直接
+ * LNK1120。两个选择：把整个 shim 改成 C++，或者运行时按 mangled 名解析。选后者 ——
+ * 代价是一次 GetProcAddress，改动面只有一个函数。
+ *
+ * 为什么之前没人踩到：原代码在 QLH_ABI_UPSTREAM_HEADER 分支里把 SET 做成空操作、GET
+ * 退化成 llama_get_embeddings()（那是 C 导出的），所以从来没有引用过这两个符号。 */
+typedef void          (*qlh_set_layer_inp_fn)(struct llama_context *, uint32_t, bool);
+typedef const float * (*qlh_get_layer_inp_fn)(struct llama_context *, uint32_t);
+
+static qlh_set_layer_inp_fn qlh_p_set_layer_inp;
+static qlh_get_layer_inp_fn qlh_p_get_layer_inp;
+
+static void qlh_resolve_layer_inp(void) {
+    static int done = 0;
+    if (done) {
+        return;
+    }
+    done = 1;
+    HMODULE m = GetModuleHandleA("llama.dll");
+    if (m == NULL) {
+        return;
+    }
+    qlh_p_set_layer_inp = (qlh_set_layer_inp_fn) (void *) GetProcAddress(
+        m, "?llama_set_embeddings_layer_inp@@YAXPEAUllama_context@@I_N@Z");
+    qlh_p_get_layer_inp = (qlh_get_layer_inp_fn) (void *) GetProcAddress(
+        m, "?llama_get_embeddings_layer_inp@@YAPEAMPEAUllama_context@@I@Z");
+    if (qlh_p_set_layer_inp == NULL || qlh_p_get_layer_inp == NULL) {
+        fprintf(stderr, "[qlh_keep_head] WARNING: layer_inp symbols not resolved "
+                        "(set=%p get=%p) -- multi-slot hidden output unavailable\n",
+                (void *) qlh_p_set_layer_inp, (void *) qlh_p_get_layer_inp);
+    }
+}
+
+/* 两个分支用同一套：上游 DLL 也导出了这两个符号，退化成 llama_get_embeddings() 只会
+ * 让多槽能力静默失效（加槽成功、取数 NULL），见 DFLASH-01 的说明。 */
+#define LLAMA_SET_RELAY_HIDDEN(ctx, lid) do {                      \
+    qlh_resolve_layer_inp();                                       \
+    if (qlh_p_set_layer_inp != NULL) {                             \
+        qlh_p_set_layer_inp((ctx), (lid), true);                   \
+    }                                                              \
+} while (0)
+
+#define LLAMA_GET_RELAY_HIDDEN(ctx, lid)                           \
+    (qlh_resolve_layer_inp(),                                      \
+     qlh_p_get_layer_inp != NULL ? qlh_p_get_layer_inp((ctx), (lid)) : NULL)
 
 
 /* PROTO: load whatever ggml backends sit next to this DLL (ggml-cuda.dll in the
@@ -134,6 +176,21 @@ typedef struct qlh_keep_head {
     int n_layer;
     int mode;        /* 0 = nextn, 1 = layer_inp */
     int cut_layer;
+    /* ★ 2026-10-31（DFLASH-01）：**多槽** layer_inp。
+     *
+     * 原来只有一个槽（mode 0 用 `n_layer`、mode 1 用 `cut_layer`），够接力用；但 DFlash 的
+     * draft 一次要 8 路中间层的输入 hidden（GGUF 的 `target_layers`，每个 id 一个槽位）。
+     * 上游 `llama_set_embeddings_layer_inp(ctx, lid, true)` 本来就是按 lid 独立开的
+     * （`llama-cparams.h::embeddings_layer_inp` 是 per-layer 的 vector），所以这里**只需记住
+     * 开了哪些**，一行 llama.cpp 都不用改。
+     *
+     * `lids[]` 只记录通过 `qlh_kh_add_layer_inp()` 显式开的槽；mode 0/1 那一个仍走
+     * `cut_layer`/`n_layer`，因此既有行为完全不变。
+     * `last_n_tokens` 是 getter 需要的行数 —— getter 不接收 n_tokens，因为它取的是"最近一次
+     * forward"的 buffered 结果，行数由那个 forward 决定。 */
+    uint32_t lids[16];
+    int32_t  n_lids;
+    int32_t  last_n_tokens;
     /* ★ 2026-10-30：context 的并行序列上限，从 qlh_kh_load 的入参归一化后存下。
      * 批次分配的 `n_seq_max` 必须与它一致 —— 详见 qlh_fill_explicit 上方的说明。 */
     int32_t n_seq_max;
@@ -566,6 +623,83 @@ static int32_t qlh_extract_hidden(qlh_keep_head * handle, int32_t n_tokens, floa
     return 0;
 }
 
+/* ★ 2026-10-31（DFLASH-01）：额外开一个 layer_inp 槽位。
+ *
+ * 为什么需要：DFlash 的 draft 一次吃 target 的 8 路中间层输入 hidden（GGUF 的
+ * `target_layers`），而 shim 原来只有一个槽（mode 0 用 n_layer、mode 1 用 cut_layer）。
+ * 上游 `llama_set_embeddings_layer_inp()` 本来就是 per-lid 独立开关的，所以叠加即可。
+ *
+ * 返回 0；-1 参数无效、-2 槽位已满（上限 16）、-3 llama.cpp 拒绝该 lid
+ * （常见原因：lid 超出本地层数，或该架构没有为它登记 t_layer_inp）。
+ * 幂等：重复开同一个 lid 直接返回 0 —— 调用方每轮重建 driver 时会重复调用。 */
+int32_t qlh_kh_add_layer_inp(void * handle_void, uint32_t lid) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->ctx == NULL) {
+        return -1;
+    }
+    const int32_t cap = (int32_t) (sizeof(handle->lids) / sizeof(handle->lids[0]));
+    for (int32_t i = 0; i < handle->n_lids; ++i) {
+        if (handle->lids[i] == lid) {
+            return 0;
+        }
+    }
+    if (handle->n_lids >= cap) {
+        return -2;
+    }
+    LLAMA_SET_RELAY_HIDDEN(handle->ctx, lid);
+    /* 这里**不能**用 getter 验证：`embd_layer_inp` 要到 `extract_layer_inputs()`（即
+     * decode 内）才被填，forward 之前 getter 恒为 NULL —— 早先在这里检查导致每次
+     * add 都返回 -3（实测）。lid 是否真有效，由 get_layer_inp 在 forward 后报 -3。 */
+    handle->lids[handle->n_lids++] = lid;
+    return 0;
+}
+
+/* 取某个已开槽位、**最近一次 forward** 的 hidden（`last_n_tokens` 行）。
+ *
+ * 为什么行数从 handle 读而不让调用方传：它必须与产生这次数据的那次 forward 严格一致，
+ * 传错就是整段拷到陈旧数据且不会报错。放在 handle 里就传不错。
+ * 返回 0；-1 参数无效或 capacity 不足、-3 该槽本次没有数据、-4 槽位没开。 */
+int32_t qlh_kh_get_layer_inp(void * handle_void, uint32_t lid, float * out, int32_t capacity) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->ctx == NULL || out == NULL || handle->n_embd <= 0) {
+        return -1;
+    }
+    int32_t open = 0;
+    for (int32_t i = 0; i < handle->n_lids; ++i) {
+        if (handle->lids[i] == lid) {
+            open = 1;
+            break;
+        }
+    }
+    /* mode 0/1 的默认槽不是经 add_layer_inp 开的，但它同样有效（接力一直在用它）——
+     * 漏掉这一条会让 lid=n_layer 报 -4「槽位没开」，而它其实是最老的那个槽。 */
+    if (!open && handle->mode == 0 && lid == (uint32_t) handle->n_layer) {
+        open = 1;
+    }
+    if (!open && handle->mode == 1 && lid == (uint32_t) handle->cut_layer) {
+        open = 1;
+    }
+    if (!open) {
+        return -4;
+    }
+    if (handle->last_n_tokens <= 0 ||
+        capacity < handle->last_n_tokens * handle->n_embd) {
+        return -1;
+    }
+    const float * ptr = LLAMA_GET_RELAY_HIDDEN(handle->ctx, lid);
+    if (ptr == NULL) {
+        return -3;
+    }
+    memcpy(out, ptr, (size_t) handle->last_n_tokens * (size_t) handle->n_embd * sizeof(float));
+    return 0;
+}
+
+/* 最近一次 forward 的行数（getter 用它决定拷贝多少行）。0 = 还没跑过。 */
+int32_t qlh_kh_last_n_tokens(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    return handle == NULL ? 0 : handle->last_n_tokens;
+}
+
 /* 统一标注：默认**每个 token 都要标输出**。
  * 历史原因：旧的 nextn 通道只对「有输出的行」计算末层 hidden，若只标最后一行，取 n_tokens 行
  * 就会踩到 GGML_ASSERT "tensor read out of bounds"（实测踩过）。现在两个模式都走 layer_inp
@@ -694,6 +828,7 @@ int32_t qlh_kh_forward(void * handle_void,
         return -1;
     }
     handle->last_error = 0;   /* ★ 本次 forward 的错误从这里重新计 */
+    handle->last_n_tokens = n_tokens; /* ★ DFLASH-01: getter 的行数来源 */
 
     struct llama_batch batch = llama_batch_init(n_tokens, 0, handle->n_seq_max);
     for (int32_t i = 0; i < n_tokens; ++i) {
@@ -751,6 +886,7 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
         return -5;
     }
     handle->last_error = 0;
+    handle->last_n_tokens = n_tokens; /* ★ DFLASH-01: getter 的行数来源 */
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, handle->n_seq_max);
     if (qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions,
@@ -792,6 +928,7 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
         return -5;
     }
     handle->last_error = 0;
+    handle->last_n_tokens = n_tokens; /* ★ DFLASH-01: getter 的行数来源 */
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, handle->n_seq_max);
     /* ★ PERF-SKIP-LOGITS-01：本入口要**末位 argmax** ⇒ logits 恒开，**不跟随**
@@ -893,6 +1030,7 @@ int32_t qlh_kh_forward_embd_tokens(void * handle_void,
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     if (handle != NULL) {
         handle->last_error = 0;
+        handle->last_n_tokens = n_tokens; /* ★ DFLASH-01: getter 的行数来源 */
     }
     if (handle == NULL || handle->ctx == NULL || handle->n_embd <= 0 ||
         embd == NULL || out_tokens == NULL || n_tokens <= 0 ||
