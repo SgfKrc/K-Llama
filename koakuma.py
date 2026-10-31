@@ -452,9 +452,17 @@ class KLlamaApp(App):
                 f"[#e6e8f0]{stage.index}[/] {stage.kind:<4} {stage.layers:>2}L "
                 f"[{colour}]{'█' * n}[/][#3a3f4d]{'░' * (BAR - n)}[/] [#cfd2dc]{v:7,.1f} ms[/]  "
                 f"[#7b8194]{'local' if stage.is_local else stage.host}[/]")
+        greedy = self.args.temperature <= 0.0
+        mode = "贪心" if greedy else f"采样 temp={self.args.temperature:g}"
+        drafts: list[str] = []
+        if greedy and self.args.dflash:
+            drafts.append(f"DFlash k={self.args.dflash_block - 1}")
+        if greedy and self.args.spec_k:
+            drafts.append(f"MTP k={self.args.spec_k}")
+        draft_txt = (" · " + " + ".join(drafts)) if drafts else ""
         self.query_one("#params", Static).update(
             f"[#8f96a8]ctx {boot.ctx}  max_tokens {self.args.max_tokens}  "
-            f"贪心（未装采样器）  每问重置 KV[/]  [#7b8194]· "
+            f"{mode}{draft_txt}  每问重置 KV[/]  [#7b8194]· "
             f"{boot.topology.name if boot.topology else ''}[/]")
 
     def ask(self, prompt: str) -> None:
@@ -470,8 +478,25 @@ class KLlamaApp(App):
         try:
             for client in self.boot.clients:  # 每问独立：KV 与位置都从一开始
                 client.reset()
-            # 到达时间必须在 worker 线程里取，那才是 token 真正到达的时刻。
-            for chunk in generate_stream(self.boot.clients, prompt, max_tokens=self.args.max_tokens):
+            args = self.args
+            greedy = args.temperature <= 0.0
+            tail = self.boot.clients[-1]
+            # Sampler state lives in the shim and survives a KV reset, so it is set on
+            # every request rather than once at boot: a run that switched modes must not
+            # leave the tail sampling for the next question.
+            if greedy:
+                tail.clear_sampling()
+            else:
+                tail.set_sampling(temperature=args.temperature, top_k=args.top_k,
+                                  top_p=args.top_p, seed=args.seed)
+            # Drafting is only sound at temperature 0; a sampling tail would make the
+            # verifier accept tokens the sampler never produced.
+            for chunk in generate_stream(
+                    self.boot.clients, prompt,
+                    max_tokens=args.max_tokens,
+                    spec_k=args.spec_k if greedy else 0,
+                    dflash_path=args.dflash if greedy else "",
+                    dflash_block=args.dflash_block):
                 self.call_from_thread(self.on_chunk, chunk, time.perf_counter())
         except Exception as exc:  # noqa: BLE001 - 错误要显示在对话区
             self.call_from_thread(self.on_error, f"{type(exc).__name__}: {exc}")
@@ -506,7 +531,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ctx", type=int, default=0, help="覆盖 SA_CTX")
     ap.add_argument("--prompt", default="", help="进 TUI 后自动发送的问题")
     ap.add_argument("--max-tokens", type=int, default=256)
+    # The shim's sampler starts NULL, which is argmax -- so temperature 0 is both the
+    # default and the only mode where drafting is valid. The flag exists to make that
+    # explicit and to turn speculation on without also passing --dflash.
+    ap.add_argument("--greedy", action="store_true",
+                    help="temperature 0（默认即如此；显式给出便于与 --temperature 对照）")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="采样温度；>0 时关闭投机（验证器只暴露 argmax）")
+    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--spec-k", type=int, default=0,
+                    help="MTP 递归草稿数；只在 temperature 0 下生效")
+    ap.add_argument("--dflash", default="",
+                    help="DFlash 草稿 GGUF；只在 temperature 0 下生效")
+    ap.add_argument("--dflash-block", type=int, default=6,
+                    help="DFlash 每轮草稿数 = block-1（默认 6 = k=5）")
     args = ap.parse_args(argv)
+    if args.greedy:
+        args.temperature = 0.0
     if args.ctx:
         os.environ[config.CTX_ENV] = str(args.ctx)
     app = KLlamaApp(args)

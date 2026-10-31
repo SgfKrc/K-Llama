@@ -183,31 +183,29 @@ remains a net loss. Per-segment time is U-shaped in `n_past`; see
 
 ## Not done (ordered by what this machine can verify)
 
-**1. A greedy switch for the TUI.** `stream.py` now shares `chain_client`'s decode engine, so the
-server can run speculation; koakuma still has no sampling flags and takes the default sampling
-path, where drafting does not hold. A `--greedy` passthrough is all it needs.
-
-**2. Speculation with sampling.** The verifier only exposes argmax; sampling needs rejection
+**1. Speculation with sampling.** The verifier only exposes argmax; sampling needs rejection
 sampling plus per-position logits from the shim. The chain uses quantised weights across
 machines, so "the two distributions agree" is a weaker premise here than on one box.
 
-**3. SLIM-ARC's on-demand loader.** Only prefetch is integrated. Verifying the loader means
+**2. SLIM-ARC's on-demand loader.** Only prefetch is integrated. Verifying the loader means
 manufacturing a segment that does not fit — the whole checkpoint is in the page cache here, so
 `issued` stays at 0. Either wait for the weak device or squeeze available memory artificially.
 It optimises the degraded mode, which is not today's bottleneck.
 
-**4. Multi-sequence token sharing.** Needs `kv_unified`, and every segment has to track
+**3. Multi-sequence token sharing.** Needs `kv_unified`, and every segment has to track
 per-sequence positions. The server serialises requests behind one global lock, so concurrency
 demand is low for a single user. Doing it properly starts with how the 30 linear layers' recurrent
 state would be isolated per sequence.
 
 **Done**: cutting tool retired, both draft sources integrated, DFlash k sweep, SLIM-ARC prefetch
-with its win32 port, and **speculation wired into the serving path** — `stream.py` used to carry
-its own plain decode loop, which is why the server and TUI never saw DFlash. It now keeps only
-UTF-8 reassembly, timing and stop conditions, and delegates decoding to `chain_client`'s
-`forward` / `speculate` / `DFlashDriver`. The server gained `--spec-k` / `--dflash` /
-`--dflash-block`, honoured only for `temperature=0` requests. Measured: the same greedy request
-produces byte-identical output with drafting on and off. Details in [`PROGRESS.md`](PROGRESS.md).
+with its win32 port, speculation wired into the serving path, and a sampling switch for the TUI.
+
+On that serving-path work: `stream.py` used to carry its own plain decode loop, which is why the
+server and TUI never saw DFlash. It now keeps only UTF-8 reassembly, timing and stop conditions,
+and delegates decoding to `chain_client`'s `forward` / `speculate` / `DFlashDriver`. Both the
+server and the TUI gained drafting flags, honoured only at `temperature=0` — measured: the same
+greedy request produces byte-identical output with drafting on and off. Details in
+[`PROGRESS.md`](PROGRESS.md).
 
 ---
 

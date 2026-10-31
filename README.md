@@ -168,27 +168,25 @@ Qwen3.6-35B-A3B（MoE，40 层，14.79 GiB 权重），单序列，greedy：
 
 ## 未做（按本机可验证性排序）
 
-**1. TUI 的 greedy 开关。** `stream.py` 已经改成共用 `chain_client` 的解码引擎，server 因此
-能跑投机；koakuma 还没有采样参数入口，走的是默认采样路径，而投机只在 temperature 0 下成立。
-补一个 `--greedy` 透传即可。
-
-**2. 非贪心下的投机。** 验证器只暴露 argmax；采样需要 rejection sampling，要 shim 回传
+**1. 非贪心下的投机。** 验证器只暴露 argmax；采样需要 rejection sampling，要 shim 回传
 每个位置的 logits。链路是量化权重 + 跨机分段，"两个分布一致"这个前提比单机更弱。
 
-**3. SLIM-ARC 的 on-demand 加载器。** 现在只接 prefetch。要验证它得先造出"段装不下"
+**2. SLIM-ARC 的 on-demand 加载器。** 现在只接 prefetch。要验证它得先造出"段装不下"
 的场景——本机整模在页缓存里，`issued` 恒为 0。要么等弱设备，要么人为把可用内存压下去。
 它是降级档的优化，不是当前瓶颈。
 
-**4. 多序列 token 共享。** 需要 `kv_unified`，且每段要维护多序列位置。当前 server 用一把
+**3. 多序列 token 共享。** 需要 `kv_unified`，且每段要维护多序列位置。当前 server 用一把
 全局锁串行处理请求，单用户场景下并发需求弱。真要做，先想清楚 hybrid 模型那 30 层 linear 的
 recurrent state 怎么按序列隔离。
 
-**已完成**：裁段工具退场、两个草稿源接入、DFlash 的 k 扫描、SLIM-ARC prefetch 与 win32 移植，
-以及**把投机接进服务路径**——`stream.py` 原本自己写了一遍朴素解码循环，导致 server 与 TUI
-拿不到 DFlash；现在它只保留 UTF-8 重组、计时与停止条件，解码交给 `chain_client` 的
-`forward` / `speculate` / `DFlashDriver`。server 新增 `--spec-k` / `--dflash` /
-`--dflash-block`，只对 `temperature=0` 的请求生效。实测同一 greedy 请求开启与关闭 DFlash，
-输出逐字相同。细节见 [`docs/PROGRESS.md`](docs/PROGRESS.md)。
+**已完成**：裁段工具退场、两个草稿源接入、DFlash 的 k 扫描、SLIM-ARC prefetch 与 win32 移植、
+把投机接进服务路径、TUI 的采样开关。
+
+服务路径那次：`stream.py` 原本自己写了一遍朴素解码循环，导致 server 与 TUI 拿不到 DFlash；
+现在它只保留 UTF-8 重组、计时与停止条件，解码交给 `chain_client` 的
+`forward` / `speculate` / `DFlashDriver`。server 与 TUI 都新增了投机参数，只对
+`temperature=0` 生效——实测同一 greedy 请求开启与关闭 DFlash，输出逐字相同。
+细节见 [`docs/PROGRESS.md`](docs/PROGRESS.md)。
 
 ---
 
