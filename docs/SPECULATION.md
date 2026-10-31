@@ -105,9 +105,8 @@ blk.40.nextn.{eh_proj,enorm,hnorm,shared_head_norm}
 | 文档（Markdown 表头） | 62.2% | 65.2% | 1.03 | 2.15 | 慢 7% |
 | 对话（`中国的首都是`） | 60.0% | 73.3% | 1.24（k=4） | >2.0 | 慢 |
 
-k=2 的盈亏线是 **1.18 个草稿**，只有代码场景达标。第 3 层掉到 36%、第 4 层 17%——
-**递归深度上限就是 2**，再加 k 只多付成本。**MTP 定位是「代码续写场景的 1.19×」，不是通用
-加速**，收益随文本可预测性走，必须按负载开关（§6）。
+k=2 盈亏线是 **1.18 个草稿**，只有代码场景达标。第 3 层掉到 36%、第 4 层 17%——**递归上限
+就是 2**。MTP 的定位是「代码续写 1.19×」，不是通用加速，必须按负载开关（§6）。
 
 **接受率已实测**（head 0:32 + tail 32:40 + MTP，贪心，三个 prompt）：
 
@@ -215,11 +214,9 @@ layer dropout。
 位置账在 `checks/probe_spec_wip.py`（先验证后写入模式下 2 个 prompt 逐位一致、接受率 83-92%）。
 两个曾经的障碍都已澄清或修掉：
 
-1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻，批量验证是干净的**。hidden 差
-   2.5e-2~3.8e-2（相对 4e-3）但不翻转 argmax：用「完美草稿」跑 30 个 token，2B 与 35B 都
-   逐位一致，块的第 1 行（验货用）与第 2 行（免费 token）**都对**。之前的两次「批量出错」
-   都是实验设计问题（filler 污染 KV、`rebuild()` 重放不一致），`checks/probe_perfect_draft.py`
-   是干净的端到端版本。
+1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻**。hidden 差 2.5e-2~3.8e-2 但不翻转 argmax：
+   用「完美草稿」跑 30 个 token，2B 与 35B 都逐位一致，块的第 1 行（验货）与第 2 行（免费
+   token）都对。之前两次「批量出错」是实验设计问题（`checks/probe_perfect_draft.py` 是干净版）。
 
 2. ~~`qlh_kh_seq_rm` 不是干净回滚~~ —— **已修复**，详见
    [`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md)。根因是
@@ -234,7 +231,18 @@ layer dropout。
 3. **tail 段 8 层里 6 层是 linear**（32/33/34/36/37/38，只有 35/39 是 full attention），
    recurrent state 没有位置索引——这是上面那条缺陷只在本项目暴露的根本原因。
 
-## 10. 已知限制
+## 10. 接入状态（未完成）
+
+已接进 `chain_client.py`（`--spec-k N`），`forward_batch` 一次绕链验证整个候选块。本机两段
+（`topology-local-32-8.toml`）实测：**正确性通过**（k=2 与 k=0 的 token 序列逐位相同），接受率
+83.3%，全接受时一轮前进 4 个。**但速度没优势**（baseline 119-125 ms/token，投机持平或更慢），
+**且 k=2 约半数运行会在第一次 `forward` 前让 gpu 段 worker 退出**，同配置 baseline 4/4 稳定，
+根因未定位；`回滚失败 2` 稳定复现、长跑（gen=32）会崩。
+
+**所以投机暂不进主链路**，`--spec-k` 默认 0。要继续先解决三件事：崩溃根因、回滚失败来源、
+以及换到不 spill 的机器测真实收益（本机 head 段 WDDM 溢出，baseline 本身已经掉了一半性能）。
+
+## 11. 已知限制
 
 只对 temp=0 无损（只暴露 argmax，做不了 rejection sampling）；ROG 只有 0.82 GiB，`n_rs_seq` 占
 100 MiB；DFlash 接受率与 k≥2 端到端收益未实测。

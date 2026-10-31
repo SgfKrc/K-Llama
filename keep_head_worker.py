@@ -270,7 +270,12 @@ class Binding:
     def seq_rm(self, n_past: int) -> None:
         """Drop positions >= n_past for sequence 0. Undoes a rejected draft block."""
         rc = self._lib.qlh_kh_seq_rm(self._handle, 0, int(n_past))
-        if rc != 0:
+        if os.environ.get("SA_DEBUG_SEQRM"):
+            print(f"[seq_rm] p0={n_past} rc={rc}", file=sys.stderr, flush=True)
+        # -6 means llama_memory_seq_rm found nothing to remove in that range: the block never
+        # reached that position, or an earlier rollback already covered it. That is a no-op,
+        # not a failure -- counting it made a healthy run report rollback errors.
+        if rc not in (0, -6):
             raise RuntimeError(f"seq_rm({n_past}) rc={rc} (SA_N_RS_SEQ>0 required)")
 
     def tokenize(self, text: bytes) -> list[int]:

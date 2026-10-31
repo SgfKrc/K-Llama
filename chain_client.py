@@ -445,7 +445,19 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     # because they cost memory and graph nodes that a non-speculative run should not pay.
     if stage.kind == "tail":
         env.setdefault("SA_MTP", "1" if os.environ.get("SA_SPEC", "1") != "0" else "0")
-    env.setdefault("SA_N_RS_SEQ", os.environ.get("SA_SPEC_K", "2"))
+    # Recurrent snapshots: the tail drafts k tokens and may need to drop all k, while the
+    # head only has to drop the tail of one verification block (one position). Giving the head
+    # the same k is not just wasteful -- with k=2 on 32 layers the graph grows past what the
+    # CUDA scheduler reserves and the worker dies on the first decode. Measured: k=1 fine,
+    # k=2 dead, same topology.
+    #
+    # A rejected block can be up to k tokens long, so k-1 snapshots is the exact requirement
+    # (k=2 needs 1). Going higher is not just wasteful: k=2 on the 32-layer head made the CUDA
+    # graph reservation fail and the worker died on the first decode -- measured k=1 fine,
+    # k=2 dead, same topology. Both stages get the same value because the chain only needs
+    # them to agree on the depth.
+    _k = int(os.environ.get("SA_SPEC_K", "2"))
+    env.setdefault("SA_N_RS_SEQ", str(max(1, _k - 1)))
     # Layer selection at load time: with a range, `model` is the full checkpoint and
     # llama.cpp (with the C-scheme patch) exposes only these layers. Unset for the
     # pre-cut-artifact path, which needs no help.
