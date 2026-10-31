@@ -445,19 +445,21 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     # because they cost memory and graph nodes that a non-speculative run should not pay.
     if stage.kind == "tail":
         env.setdefault("SA_MTP", "1" if os.environ.get("SA_SPEC", "1") != "0" else "0")
-    # Recurrent snapshots: the tail drafts k tokens and may need to drop all k, while the
-    # head only has to drop the tail of one verification block (one position). Giving the head
-    # the same k is not just wasteful -- with k=2 on 32 layers the graph grows past what the
-    # CUDA scheduler reserves and the worker dies on the first decode. Measured: k=1 fine,
-    # k=2 dead, same topology.
+    # Recurrent snapshots. A speculative step submits a verification block of k+1
+    # positions (the trunk token plus k drafts) and keeps only the accepted prefix, so the
+    # worst case -- every draft rejected -- retracts k positions, not k-1. The snapshot
+    # depth therefore has to be k. With k-1 (what this used to be) the reject-all step
+    # makes llama_memory_seq_rm refuse the rollback (rc=-6, which seq_rm treats as a no-op),
+    # the stage's recurrent state then stays ahead of the position the chain believes in,
+    # and the next decode dies with "llama_decode failed rc=-1" -- measured at k=2 gen=40:
+    # [seq_rm] p0=25 rc=-6 immediately followed by a -2 on the head stage.
     #
-    # A rejected block can be up to k tokens long, so k-1 snapshots is the exact requirement
-    # (k=2 needs 1). Going higher is not just wasteful: k=2 on the 32-layer head made the CUDA
-    # graph reservation fail and the worker died on the first decode -- measured k=1 fine,
-    # k=2 dead, same topology. Both stages get the same value because the chain only needs
-    # them to agree on the depth.
+    # The old comment here claimed k on the 32-layer head made the CUDA graph reservation
+    # fail ("k=1 fine, k=2 dead"). That was the seq_rm ctypes bug in keep_head_worker.py
+    # (missing argtypes), not the graph: with that fixed, k=2 on the same topology loads and
+    # runs (head CUDA compute buffer unchanged at 291.13 MiB, CUDA_Host 44.21 -> 60.30 MiB).
     _k = int(os.environ.get("SA_SPEC_K", "2"))
-    env.setdefault("SA_N_RS_SEQ", str(max(1, _k - 1)))
+    env.setdefault("SA_N_RS_SEQ", str(max(1, _k)))
     # Layer selection at load time: with a range, `model` is the full checkpoint and
     # llama.cpp (with the C-scheme patch) exposes only these layers. Unset for the
     # pre-cut-artifact path, which needs no help.

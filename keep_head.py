@@ -53,6 +53,17 @@ FORWARD_ERRORS = {
 WORKER_SCRIPT = "keep_head_worker.py"
 
 
+def _trace(message: str) -> None:
+    """Parent-side breadcrumb, off unless SA_KH_TRACE is set.
+
+    Both sides of the pipe log into the stage log (see keep_head_worker._trace), so a
+    request the parent wrote but the worker never answered is visible as the last
+    ``->`` line with no matching ``req`` line in the child.
+    """
+    if os.environ.get("SA_KH_TRACE"):
+        print(f"[kh-parent {os.getpid()}] {message}", file=sys.stderr, flush=True)
+
+
 class KeepHeadUnavailable(RuntimeError):
     """Shim or symbol missing, load failed, or a forward returned an error."""
 
@@ -137,6 +148,7 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable("keep-head worker is not running")
         line = worker.stdout.readline()
         if not line:
+            _trace(f"EOF on worker stdout, returncode={worker.poll()}")
             raise KeepHeadUnavailable("keep-head worker exited before responding")
         try:
             response = json.loads(line)
@@ -150,6 +162,7 @@ class KeepHeadUpstream:
         worker = self._worker
         if worker is None or worker.poll() is not None or worker.stdin is None:
             raise KeepHeadUnavailable("keep-head worker is not running")
+        _trace(f"-> {payload.get('op')} n_past={payload.get('n_past')}")
         try:
             worker.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
             worker.stdin.flush()
@@ -334,6 +347,7 @@ class KeepHeadUpstream:
         worker, self._worker = getattr(self, "_worker", None), None
         if worker is None:
             return
+        _trace(f"close() called, worker poll={worker.poll()}")
         try:
             if worker.poll() is None and worker.stdin is not None and not worker.stdin.closed:
                 worker.stdin.write('{"op":"close"}\n')

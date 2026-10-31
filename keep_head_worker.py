@@ -114,6 +114,15 @@ class Binding:
         lib.qlh_kh_mtp_reset.restype = ctypes.c_int32
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_reset.restype = None
+        # Rollback. Declaring this is not optional: without argtypes ctypes assumes every
+        # parameter is a 32-bit C int, so the 64-bit model handle is converted through
+        # c_int and raises "ArgumentError: argument 1: OverflowError: int too long to
+        # convert" whenever the pointer does not fit in 31 bits -- which is the normal
+        # case. That exception escaped the request loop, killed the worker, and surfaced
+        # higher up as "keep-head worker exited before responding" on the *next* forward,
+        # which is why the crash looked like a bad forward call rather than a bad seq_rm.
+        lib.qlh_kh_seq_rm.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
+        lib.qlh_kh_seq_rm.restype = ctypes.c_int32
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_close.restype = None
         if hasattr(lib, "qlh_kh_set_skip_hidden_logits"):
@@ -410,6 +419,18 @@ class Binding:
             self._dll_dir = None
 
 
+def _trace(message: str) -> None:
+    """Diagnostic breadcrumb on stderr, off unless SA_KH_TRACE is set.
+
+    stderr is inherited by the stage worker, so these lines land in the stage log next
+    to llama.cpp's own output and survive a worker that dies without a response. That is
+    the only way to tell "the parent closed my stdin" apart from "a native call killed
+    the process": both leave the parent reading EOF.
+    """
+    if os.environ.get("SA_KH_TRACE"):
+        print(f"[kh {os.getpid()}] {message}", file=sys.stderr, flush=True)
+
+
 def _response(**payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), flush=True)
 
@@ -450,6 +471,7 @@ def main() -> int:
         return 1
 
     _response(ok=True, n_embd=binding.n_embd, n_layer=binding.n_layer)
+    _trace(f"ready n_embd={binding.n_embd} n_layer={binding.n_layer}")
     try:
         for raw in sys.stdin:
             if not raw.strip():
@@ -457,8 +479,11 @@ def main() -> int:
             request = json.loads(raw)
             operation = request.get("op")
             n_past = int(request.get("n_past", 0))
+            _trace(f"req op={operation} n_past={n_past} "
+                   f"n_tokens={len(request.get('tokens') or []) or request.get('shape')}")
             if operation == "close":
                 _response(ok=True)
+                _trace("close requested by parent")
                 return 0
             if operation == "reset":
                 binding.reset()
@@ -514,9 +539,16 @@ def main() -> int:
                 raise ValueError(f"unknown operation: {operation!r}")
     except Exception as exc:  # noqa: BLE001 - serialize the failure instead of dying
         _response(ok=False, error=f"{type(exc).__name__}: {exc}")
+        _trace(f"handler error, exiting: {type(exc).__name__}: {exc}")
         return 1
+    except BaseException as exc:  # noqa: BLE001 - KeyboardInterrupt / SystemExit reach here
+        _trace(f"non-Exception escape: {type(exc).__name__}: {exc}")
+        raise
+    else:
+        _trace("stdin EOF, exiting")
     finally:
         binding.close()
+        _trace("binding closed")
     return 0
 
 

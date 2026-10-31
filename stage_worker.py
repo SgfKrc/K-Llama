@@ -16,6 +16,7 @@ wire.py for why it is a switch. Inside the stage everything stays float32.
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 from pathlib import Path
@@ -25,6 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import protocol  # noqa: E402
 import wire  # noqa: E402
 from engine import ROLES, StageEngine  # noqa: E402
+
+
+def _trace(message: str) -> None:
+    """Per-request breadcrumb on stderr, off unless SA_STAGE_TRACE is set."""
+    if os.environ.get("SA_STAGE_TRACE"):
+        print(f"[trace {os.getpid()}] {message}", file=sys.stderr, flush=True)
 
 
 class StageWorker:
@@ -50,6 +57,7 @@ class StageWorker:
             try:
                 conn, addr = server.accept()
             except OSError:
+                _trace("accept raised OSError, leaving serve loop")
                 break
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"[{self._role}] client {addr}", flush=True)
@@ -57,7 +65,9 @@ class StageWorker:
                 self._session(conn)
             except Exception as exc:  # noqa: BLE001 - one bad session must not kill the worker
                 print(f"[{self._role}] session error: {type(exc).__name__}: {exc}", flush=True)
+                _trace("session error handler: engine.reset()")
                 self._engine.reset()
+                _trace("session error handler: reset done")
             finally:
                 try:
                     conn.close()
@@ -85,6 +95,7 @@ class StageWorker:
 
             n_tokens = int(msg.meta.get("n_tokens", 0))
             n_past = int(msg.meta.get("n_past", 0))
+            _trace(f"forward op={msg.meta.get('op') or '-'} n_tokens={n_tokens} n_past={n_past}")
             # Text helpers ride on FORWARD's meta instead of new message types, so the
             # frame format stays at six messages and `op` is just another key.
             op = msg.meta.get("op", "")
@@ -207,6 +218,7 @@ class StageWorker:
                             wire.encode(out, dtype),
                         )
             except Exception as exc:  # noqa: BLE001 - the peer must see the failure
+                _trace(f"forward raised: {type(exc).__name__}: {exc}")
                 protocol.send(conn, protocol.ERROR, {"code": "forward_failed", "detail": str(exc)[:400]})
 
 
@@ -257,7 +269,9 @@ def main() -> int:
               flush=True)
         StageWorker(engine, args.role).serve(args.host, args.port)
     finally:
+        _trace("main finally: engine.close()")
         engine.close()
+        _trace("main finally: engine closed")
     return 0
 
 
