@@ -466,7 +466,11 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     # (missing argtypes), not the graph: with that fixed, k=2 on the same topology loads and
     # runs (head CUDA compute buffer unchanged at 291.13 MiB, CUDA_Host 44.21 -> 60.30 MiB).
     _k = int(os.environ.get("SA_SPEC_K", "2"))
-    env.setdefault("SA_N_RS_SEQ", str(max(1, _k)))
+    # SA_NRS_FORCE decouples snapshot depth from draft depth: it lets k=3/4 be measured at
+    # n_rs_seq=2, which separates "the extra drafts are useless" from "the extra snapshots are
+    # expensive". Only for experiments -- depth k needs k-1 snapshots to roll back correctly.
+    _force = os.environ.get("SA_NRS_FORCE")
+    env.setdefault("SA_N_RS_SEQ", _force if _force else str(max(1, _k)))
     # Layer selection at load time: with a range, `model` is the full checkpoint and
     # llama.cpp (with the C-scheme patch) exposes only these layers. Unset for the
     # pre-cut-artifact path, which needs no help.

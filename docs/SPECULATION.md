@@ -131,23 +131,30 @@ loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP �
 ## 5. DFlash：可行，但第二步
 
 权重可用：[z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash)
-（Q4_K_M 仅 0.24 GB），llama.cpp 已支持（`src/models/dflash.cpp`）。GGUF 关键参数：
-`block_count=6`、**`block_size=16`（一次出 16 个候选）**、`target_layers=[2,7,12,17,23,28,33,38]`。
+（Q4_K_M 仅 0.24 GB，本机 `H:\qlh_models\dflash\`），llama.cpp 已支持。GGUF 关键参数：
+`block_count=6`、**`block_size=16`（一次出 16 个位置）**、`target_layers=[2,7,12,17,23,28,33,38]`
+——后两个落在 ROG 段，两段各交一部分 hidden 即可（顺序天然是「前 6 本地 + 后 2 远程」）。
 
-两个硬障碍：① **8 路中间层 hidden 横跨两段**（33/38 在 ROG 段），要么回传要么改 shim 支持多层
-输出（第一代 `layer_inp` 能做，第二代简化掉了）；② llama.cpp 的 `draft-dflash` 要求 target 与
-draft 在**同一个 `llama_context`**，它直接读 target 的中间层和 KV，没有跨进程分段 target 的概念。
+**实测接受率**（2026-10-31，`llama-speculative-simple` + 完整 40 层 target + 本模型，
+CPU 版；`n_max` 是草稿深度，实际 1 anchor + n_max 草稿）：
 
-按 §0，k=8 且每草稿接受 16% 即回本。社区接受率 0.30–0.50：
+| n_max | 场景 | 草稿/接受 | α | 前进/轮 | 预估加速 |
+|---:|---|---:|---:|---:|---:|
+| 3 | 代码 | 40/38 | **95.0%** | 3.85 | **1.52×** |
+| 3 | 对话 | 54/33 | 61.1% | 2.83 | 1.12× |
+| 15 | 代码 | 131/55 | **42.0%** | 7.30 | **1.56×** |
+| 15 | 对话 | 192/39 | 20.3% | 4.05 | **0.87×（亏）** |
 
-```
-接受 4/8 (50%)   → 1.30 单位/token，快 1.54×
-接受 6.8/8 (85%) → 0.83 单位/token，快 2.40×
-```
+**盈亏线 24.5%**（成本 9.34 单位/轮、1+15α 前进）。**代码场景远超，对话在深 draft 下亏**——
+所以 DFlash 也要按负载选 `n_max`：代码 15、对话 3。
 
-**这才是本项目的真机会**：MTP 单头的 k=1 结构上赚不了，DFlash 的 `block_size=16` 天生在盈利
-区间。代价是工程量高一个量级。
+**对比 MTP k=2 跨机实测 1.13×，DFlash 代码场景 1.5×** —— 这才是本项目的大增量。
 
+三个已确认的事实（推翻旧判断）：
+1. **llama.cpp 零改动**：`embeddings_layer_inp` 本来就是 per-layer vector，可同时开 8 个槽。
+2. **真正的障碍是词表**：DFlash GGUF 无 `tok_embd`/`output.weight`，靠 `ctx_other` 借 target 的；
+   跨段后没有任何一段同时持有两者，跑 draft 的机器要多背 1.03 GiB。
+3. **k=16 是 1 anchor + 15 草稿**（`speculative.cpp` 把 `n_max` clamp 到 `block_size-1`）。
 
 ## 6. PLD / n-gram：按负载开关
 
@@ -196,7 +203,6 @@ early-exit loss 加 layer dropout。
 3. **tail 段 8 层里 6 层是 linear**（32/33/34/36/37/38，只有 35/39 是 full attention），
    recurrent state 没有位置索引——这是上面那条缺陷只在本项目暴露的根本原因。
 
-
 ## 10. 接入与实测
 
 已接进 `chain_client.py`（`--spec-k N`），`forward_batch` 一次绕链验证整个候选块。
@@ -230,7 +236,6 @@ early-exit loss 加 layer dropout。
 低于 35% 自动关闭。`--spec-k N` 仍可强制。
 
 本机两段（`topology-local-32-8.toml`）测不出收益：head 段 WDDM 溢出。
-
 
 排查中修掉三个真 bug：`qlh_kh_seq_rm` 漏声明 ctypes 签名（64 位句柄溢出打死 worker）、
 `n_rs_seq` 该是 k 不是 k-1、`n_embd` 属性恒返回 0。传输坑：`copy /b` 合并大文件会产出**大小对、
