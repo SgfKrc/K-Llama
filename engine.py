@@ -22,16 +22,6 @@ class EngineError(RuntimeError):
     pass
 
 
-def _f32_input(hidden: np.ndarray) -> np.ndarray:
-    """A contiguous float32 view of a hidden that may be float32 or wire-float16.
-
-    No copy on the float32 path (ascontiguousarray returns the input itself); one
-    conversion when the transport dtype was float16, which is the whole point of keeping
-    the switch at the socket boundary instead of inside the shim.
-    """
-    return np.ascontiguousarray(hidden, dtype=np.float32)
-
-
 class StageEngine:
     """One pipeline stage backed by a cut GGUF and the keep-head shim.
 
@@ -120,18 +110,18 @@ class StageEngine:
         it disappears entirely on the float32 path because ascontiguousarray returns the
         same array when it is already contiguous float32.
         """
-        out = self._up.forward_hidden_to_hidden_or_none(_f32_input(hidden), n_past=n_past)
+        out = self._up.forward_hidden_to_hidden_or_none(hidden, n_past=n_past)
         if out is None:
             return None            # 前向发生了，只是这一段不提供 dense hidden
         return np.asarray(out, dtype=np.float32)
 
     def forward_token(self, hidden: np.ndarray, *, n_past: int) -> int:
         """hidden in, next token out. Used by the tail stage."""
-        return int(self._up.forward_hidden_to_token(_f32_input(hidden), n_past=n_past))
+        return int(self._up.forward_hidden_to_token(hidden, n_past=n_past))
 
     def forward_tokens_out(self, hidden: np.ndarray, *, n_past: int) -> list[int]:
         """k rows of hidden in, k token ids out. The speculative verification primitive."""
-        return self._up.forward_hidden_to_tokens(_f32_input(hidden), n_past=n_past)
+        return self._up.forward_hidden_to_tokens(hidden, n_past=n_past)
 
     def draft_open(self, path: str, n_ctx: int = 256, n_batch: int = 32,
                    n_gpu_layers: int = 0) -> int:
@@ -184,7 +174,7 @@ class StageEngine:
             return None
 
     def mtp_draft(self, hidden: np.ndarray, token: int, *, n_past: int) -> int:
-        return int(self._up.mtp_draft(_f32_input(hidden), int(token), n_past=n_past))
+        return int(self._up.mtp_draft(hidden, int(token), n_past=n_past))
 
     def mtp_reset(self) -> None:
         self._up.mtp_reset()

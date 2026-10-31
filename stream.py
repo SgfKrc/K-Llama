@@ -15,6 +15,7 @@ render incrementally instead of waiting for the whole sentence.
 """
 from __future__ import annotations
 
+import codecs
 import time
 from dataclasses import dataclass, field
 from typing import Iterator, Sequence
@@ -35,35 +36,22 @@ class Chunk:
 class Utf8Assembler:
     """Turn a stream of arbitrary byte fragments into a stream of valid str.
 
-    A partial trailing sequence is held back until the next fragment completes it.
-    Without this, a Chinese character split across two tokens shows up as two
-    replacement characters.
+    A byte-level BPE tokenizer splits multi-byte characters across tokens, so a single
+    piece is often not decodable on its own. The stdlib already does exactly this job:
+    an incremental decoder buffers the incomplete tail and releases it once the next
+    fragment completes the sequence. The hand-written version that used to live here
+    retried `bytes.decode` from the longest cut down, which is O(n²) in the pending size.
     """
 
     def __init__(self) -> None:
-        self._pending = b""
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def feed(self, data: bytes) -> str:
-        self._pending += data
-        # Decode the longest well-formed prefix and keep the incomplete tail. Trying
-        # cuts from long to short matters: a 3-byte character split as 2+1 must not be
-        # decoded as one valid byte plus a stray continuation byte.
-        for cut in range(len(self._pending), -1, -1):
-            try:
-                text = self._pending[:cut].decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            self._pending = self._pending[cut:]
-            return text
-        # Unreachable in practice: cut=0 always decodes (to the empty string), so the
-        # loop returns above. Kept so the branch cannot silently swallow bytes if the
-        # range ever changes.
-        return ""
+        return self._decoder.decode(data, final=False)
 
     def flush(self) -> str:
         """Emit whatever is left, replacing any truly invalid tail."""
-        rest, self._pending = self._pending, b""
-        return rest.decode("utf-8", errors="replace")
+        return self._decoder.decode(b"", final=True)
 
 
 def generate_stream(
@@ -74,6 +62,7 @@ def generate_stream(
     spec_k: int = 0,
     dflash_path: str = "",
     dflash_block: int = 6,
+    stats: dict | None = None,
 ) -> Iterator[Chunk]:
     """Tokenize ``prompt``, drive the chain, yield text as it becomes readable.
 
@@ -93,6 +82,10 @@ def generate_stream(
     prompt_tokens = clients[0].tokenize(prompt)
     if not prompt_tokens:
         return
+    if stats is not None:
+        # Callers used to report `len(prompt)` -- a character count -- as the prompt's
+        # token usage. The real number is right here and was being thrown away.
+        stats["prompt_tokens"] = len(prompt_tokens)
 
     assembler = Utf8Assembler()
     single_stage = len(clients) == 1

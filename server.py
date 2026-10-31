@@ -114,7 +114,8 @@ class Chain:
             client.connect()
         self.ready = True
 
-    def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None):
+    def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None,
+                 stats: dict | None = None):
         """Yield Chunk, serialised under the chain lock.
 
         The tail's sampler is configured inside the same lock, right after the reset,
@@ -125,6 +126,9 @@ class Chain:
         passed straight to the setter, whose defaults install a greedy chain, and the
         handle would stay in that state for every later request. ``None`` therefore
         clears the chain instead.
+
+        ``stats`` (optional) receives the tokenized prompt length; the caller cannot
+        count it itself because tokenization happens inside the generator.
         """
         with self._lock:
             for client in self._clients:
@@ -147,7 +151,34 @@ class Chain:
                 spec_k=self._spec_k if greedy else 0,
                 dflash_path=self._dflash if greedy else "",
                 dflash_block=self._dflash_block,
+                stats=stats,
             )
+
+    def drain(self, prompt: str, max_tokens: int, sampling: dict | None,
+              sink=None):
+        """One generation pass, shared by all four response shapes.
+
+        Returns ``(text, completion_tokens, prompt_tokens, elapsed)``. The four shapes
+        used to carry their own loops, and the counting differed between them: the
+        streaming variants skipped chunks whose text was empty (a partial UTF-8 byte
+        group the assembler is still holding) before counting, the full variants counted
+        them -- so the same answer reported a different ``completion_tokens`` depending
+        on ``stream``. Counting tokens rather than chunks also stops the final flush
+        chunk (``token == -1``) from being counted as one.
+        """
+        parts: list[str] = []
+        tokens = 0
+        stats: dict = {}
+        started = time.perf_counter()
+        for chunk in self.generate(prompt, max_tokens, sampling, stats=stats):
+            if chunk.text:
+                parts.append(chunk.text)
+                if sink is not None:
+                    sink(chunk.text)
+            if chunk.token >= 0:
+                tokens += 1
+        return ("".join(parts), tokens, int(stats.get("prompt_tokens", 0)),
+                time.perf_counter() - started)
 
     def sampling_state(self) -> dict:
         """What the tail stage currently has in effect, for the response body."""
@@ -170,29 +201,32 @@ class Chain:
 
 
 def flatten_messages(messages: list[dict]) -> str:
-    """Collapse a chat into one prompt.
+    """Collapse a chat into ChatML -- the format these checkpoints were trained on.
 
-    There is no chat template here: the split model may not be a chat model at all,
-    and inventing `<|im_start|>` markers for it would produce confidently wrong
-    output. Role prefixes are kept as plain text so multi-turn content survives.
+    This used to emit plain text with Chinese role prefixes ("用户：", "助手：") on the
+    reasoning that a split model might not be a chat model. That held for numerics but not
+    for usefulness: Qwen answered every question with degenerate repetition because it
+    never saw `<|im_start|>`. `chat.py` carries the two facts that settled it, and the
+    same renderer the CLI uses is used here so the two paths cannot drift again.
+
+    A missing system turn gets Qwen's default; `apply_chatml` decides that, not this
+    function, because it also has to know whether system came first.
     """
-    parts: list[str] = []
+    from chat import apply_chatml
+
+    system: str | None = None
+    turns: list[dict] = []
     for msg in messages:
-        role = str(msg.get("role", "user"))
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # OpenAI's multimodal shape; keep only the text parts.
-            content = "".join(p.get("text", "") for p in content
-                              if isinstance(p, dict) and p.get("type") == "text")
-        content = str(content)
-        if role == "system":
-            parts.append(f"系统：{content}")
-        elif role == "assistant":
-            parts.append(f"助手：{content}")
+        if str(msg.get("role", "user")) == "system":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "".join(p.get("text", "") for p in content
+                                  if isinstance(p, dict) and p.get("type") == "text")
+            text = str(content)
+            system = text if system is None else f"{system}\n{text}"
         else:
-            parts.append(f"用户：{content}")
-    parts.append("助手：")
-    return "\n".join(parts)
+            turns.append(msg)
+    return apply_chatml(turns, system=system)
 
 
 # Responses request/response translation. Kept in its own module because the two
@@ -315,18 +349,13 @@ class Handler(BaseHTTPRequestHandler):
     def _full_response(self, cid: str, created: int, model: str, prompt: str,
                        max_tokens: int, ignored: list[str],
                        sampling: dict | None = None) -> None:
-        text_parts: list[str] = []
-        tokens = 0
-        started = time.perf_counter()
         try:
-            for chunk in self.chain.generate(prompt, max_tokens, sampling):
-                text_parts.append(chunk.text)
-                tokens += 1
+            text, tokens, prompt_tokens, elapsed = self.chain.drain(
+                prompt, max_tokens, sampling)
         except Exception as exc:  # noqa: BLE001 - report, do not kill the server
             self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}",
                                        "type": "internal_error"}})
             return
-        elapsed = time.perf_counter() - started
         # Read back from the native handle while the lock is free: this is what the
         # client actually got, not what it asked for (clamping happens in C).
         effective = self.chain.sampling_state()
@@ -334,11 +363,11 @@ class Handler(BaseHTTPRequestHandler):
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "".join(text_parts)},
+                "message": {"role": "assistant", "content": text},
                 "finish_reason": "length" if tokens >= max_tokens else "stop",
             }],
-            "usage": {"prompt_tokens": len(prompt), "completion_tokens": tokens,
-                      "total_tokens": len(prompt) + tokens},
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens,
+                      "total_tokens": prompt_tokens + tokens},
             "slimarc": {
                 "tokens_per_second": round(tokens / elapsed, 2) if elapsed > 0 else 0,
                 "elapsed_seconds": round(elapsed, 3),
@@ -363,16 +392,16 @@ class Handler(BaseHTTPRequestHandler):
         announced["requested_sampling"] = dict(sampling or {})
         first["slimarc"] = announced
         self._sse(first)
-        tokens = 0
+
+        def emit_text(text: str) -> None:
+            self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": model,
+                       "choices": [{"index": 0, "delta": {"content": text},
+                                    "finish_reason": None}]})
+
         try:
-            for chunk in self.chain.generate(prompt, max_tokens, sampling):
-                if not chunk.text:
-                    continue        # a partial UTF-8 byte pair; wait for the rest
-                tokens += 1
-                self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
-                           "model": model,
-                           "choices": [{"index": 0, "delta": {"content": chunk.text},
-                                        "finish_reason": None}]})
+            _text, tokens, prompt_tokens, _elapsed = self.chain.drain(
+                prompt, max_tokens, sampling, sink=emit_text)
         except (BrokenPipeError, ConnectionResetError):
             return              # client hung up; the chain lock is released by the generator
         except Exception as exc:  # noqa: BLE001
@@ -383,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
                    "model": model,
                    "choices": [{"index": 0, "delta": {},
                                 "finish_reason": "length" if tokens >= max_tokens else "stop"}],
-                   "usage": {"completion_tokens": tokens},
+                   "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens},
                    "slimarc": {"sampling": self.chain.sampling_state()}})
         self._sse("[DONE]")
 
@@ -430,12 +459,9 @@ class Handler(BaseHTTPRequestHandler):
     def _responses_full(self, rid: str, mid: str, created: float, model: str,
                         prompt: str, max_tokens: int, meta: dict,
                         sampling: dict | None) -> None:
-        text_parts: list[str] = []
-        tokens = 0
         try:
-            for chunk in self.chain.generate(prompt, max_tokens, sampling):
-                text_parts.append(chunk.text)
-                tokens += 1
+            text, tokens, prompt_tokens, _elapsed = self.chain.drain(
+                prompt, max_tokens, sampling)
         except Exception as exc:  # noqa: BLE001 - report, do not kill the server
             self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}",
                                         "type": "internal_error"}})
@@ -444,8 +470,8 @@ class Handler(BaseHTTPRequestHandler):
         status, reason, item_status = responses_status(tokens, max_tokens)
         payload = responses_object(
             rid, created, model, status,
-            [responses_message(mid, "".join(text_parts), item_status)],
-            responses_usage(len(prompt), tokens), incomplete_reason=reason,
+            [responses_message(mid, text, item_status)],
+            responses_usage(prompt_tokens, tokens), incomplete_reason=reason,
             **{k: v for k, v in meta.items() if v is not None})
         self._json(200, payload)
 
@@ -454,8 +480,6 @@ class Handler(BaseHTTPRequestHandler):
                           sampling: dict | None) -> None:
         self._sse_head()
         seq = 0
-        deltas: list[str] = []
-        tokens = 0
         # Events are addressed by (response, item, index), so the same ids are repeated
         # in every event rather than being re-generated per event: the SDK groups
         # deltas by item_id, and a fresh id per event would split one answer into many.
@@ -486,14 +510,11 @@ class Handler(BaseHTTPRequestHandler):
         seq += 1
 
         try:
-            for chunk in self.chain.generate(prompt, max_tokens, sampling):
-                if not chunk.text:
-                    continue    # a partial UTF-8 byte group; the assembler is holding it
-                tokens += 1
-                deltas.append(chunk.text)
-                # `logprobs` is part of the schema, not an option here: the SDK's
-                # typed model declares it required, so it is always sent, empty.
-                emit("response.output_text.delta", delta=chunk.text, logprobs=[])
+            full, tokens, prompt_tokens, _elapsed = self.chain.drain(
+                prompt, max_tokens, sampling, sink=lambda text: emit(
+                    # `logprobs` is part of the schema, not an option here: the SDK's
+                    # typed model declares it required, so it is always sent, empty.
+                    "response.output_text.delta", delta=text, logprobs=[]))
         except (BrokenPipeError, ConnectionResetError):
             return              # client hung up; the chain lock is released by the generator
         except Exception as exc:  # noqa: BLE001
@@ -505,7 +526,6 @@ class Handler(BaseHTTPRequestHandler):
             self._sse("[DONE]")
             return
 
-        full = "".join(deltas)
         emit("response.output_text.done", text=full, logprobs=[])
         self._sse({"type": "response.content_part.done", "sequence_number": seq,
                    "output_index": 0, "content_index": 0, "item_id": mid,
@@ -522,7 +542,7 @@ class Handler(BaseHTTPRequestHandler):
         final = responses_object(
             rid, created, model, status,
             [responses_message(mid, full, item_status)],
-            responses_usage(len(prompt), tokens), incomplete_reason=reason, **meta)
+            responses_usage(prompt_tokens, tokens), incomplete_reason=reason, **meta)
         self._sse({"type": "response.completed", "sequence_number": seq,
                    "response": final})
         self._sse("[DONE]")
@@ -564,6 +584,12 @@ def main() -> int:
 
     chain = Chain(stages, shim, config.ctx(),
                   spec_k=args.spec_k, dflash=args.dflash, dflash_block=args.dflash_block)
+    # Must be set BEFORE the workers spawn: they inherit the environment at start-up, and a
+    # later assignment would not reach the shim that tokenizes. Without it the ChatML
+    # markers flattened by flatten_messages are split into ordinary fragments, which is
+    # worse than sending plain text -- the model then sees broken control tokens.
+    from chat import chat_token_env
+    os.environ.update(chat_token_env())
     print(f"loading {len(stages)} stage(s)…", flush=True)
     chain.start()
     spec_note = []
