@@ -228,11 +228,10 @@ layer dropout。
    重写同一位置，hidden 差 0.13~0.62（相对 2~10%），token 偶发翻转（8 个位置里 3 次）。
    残余误差会污染后续所有 hidden，把接受率从 88% 打到 50%。
 
-   机制已梳理：`llama_memory_recurrent::seq_rm` 只放行 `rollback ≤ n_rs_seq` 且要求
-   `rs_idx == 0`（快照索引 single-use，`s_copy` 读完即清零）；快照本身由 graph 在每次
-   decode 时把当前状态拷进 `rs_idx * size` 起始的槽位。hybrid 的分发是正确的（先 recurrent、
-   失败即中止，再 attention）。**所以问题不在"要不要回滚"，而在快照恢复出来的状态是否与
-   当初逐位相同**——这正是要查的。
+   机制已梳理：`seq_rm` 只放行 `rollback ≤ n_rs_seq` 且要求 `rs_idx == 0`（快照索引
+   single-use，`s_copy` 读完清零）；快照由 graph 在每次 decode 时把当前状态拷进
+   `rs_idx * size` 起始的槽位；hybrid 分发正确（先 recurrent、失败即中止，再 attention）。
+   **所以问题不在"要不要回滚"，而在快照恢复出的状态是否与当初逐位相同。**
 
 3. **官方投机的假设在这里不成立**。`common/speculative.cpp:2726` 把 `n_rs_seq` 设为 **0**，
    因为它的 target 是纯 transformer（KV 按位置删就够）。而 `qwen35moe` 的 tail 段 8 层里
@@ -241,6 +240,5 @@ layer dropout。
 
 ## 10. 已知限制
 
-- **只对 temp=0 无损**。shim 暴露 argmax 而非 logits 分布，无法做标准 rejection sampling。
-- **ROG 内存余量**：0.82 GiB 可用，`n_rs_seq` 占 100 MiB（§2）。
-- **未实测**：DFlash 真实接受率、k≥2 端到端收益。
+只对 temp=0 无损（shim 暴露 argmax 而非 logits 分布，做不了标准 rejection sampling）。ROG 只有
+0.82 GiB 可用，`n_rs_seq` 要占 100 MiB。DFlash 的真实接受率与 k≥2 端到端收益都还没实测。
