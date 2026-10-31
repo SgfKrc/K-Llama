@@ -553,72 +553,64 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     return proc, log
 
 
-def forward(clients: list[StageClient], tokens: list[int], n_past: int,
-            stage_ms: list[list[float]]) -> int:
-    """Walk the chain once and return the next token.
+def _walk(clients: list[StageClient], tokens: list[int], n_past: int,
+          stage_ms: list[list[float]], want_all: bool):
+    """Push `tokens` into the head, relay hidden through cpu stages, stop at the tail.
 
-    The payload is chosen by each stage's kind, not by its position: a gpu stage
-    takes tokens, any number of cpu stages pass hidden through, and the tail returns
-    one token. Position is asserted once up front because a mis-ordered topology
-    would otherwise feed tokens into a hidden-in endpoint and fail inside the shim.
+    The payload is chosen by each stage's kind, not by its position: a gpu stage takes
+    tokens, any number of cpu stages pass hidden through, and the tail turns hidden into
+    ids. Position is asserted once up front because a mis-ordered topology would
+    otherwise feed tokens into a hidden-in endpoint and fail inside the shim.
+
+    ``want_all=False`` returns the single next token, ``True`` returns one id per input
+    row (the verification primitive). The two used to be separate loops with the same
+    body; keeping one is what makes a fix to the relay apply to both.
     """
     if not clients or clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
         raise RuntimeError("chain must start with a gpu stage and end with a tail stage")
 
     hidden: np.ndarray | None = None
-    token = -1
     for i, client in enumerate(clients):
         kind = client.stage.kind
         t0 = time.perf_counter()
-        if kind == "gpu":
-            hidden = client.forward_tokens(tokens, n_past)
-        elif kind == "cpu":
-            if hidden is None:
-                raise RuntimeError(f"stage {i} (cpu) has no hidden to consume")
-            hidden = client.forward_hidden(hidden, n_past)
-        else:  # tail
-            if hidden is None:
-                raise RuntimeError(f"stage {i} (tail) has no hidden to consume")
-            if hidden.shape[0] > 1:
-                # A prefill pass hands the tail several rows at once. The worker answers with
-                # one argmax per position, and the token this step should return is the last
-                # one -- the same token a single-row call on the final position would give.
-                token = client.forward_tokens_out(hidden, n_past)[-1]
-            else:
-                token = client.forward_token(hidden, n_past)
-        stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
-    return token
+        try:
+            if kind == "gpu":
+                hidden = client.forward_tokens(tokens, n_past)
+            elif kind == "cpu":
+                if hidden is None:
+                    raise RuntimeError(f"stage {i} (cpu) has no hidden to consume")
+                hidden = client.forward_hidden(hidden, n_past)
+            else:  # tail
+                if hidden is None:
+                    raise RuntimeError(f"stage {i} (tail) has no hidden to consume")
+                if want_all:
+                    return client.forward_tokens_out(hidden, n_past)
+                if hidden.shape[0] > 1:
+                    # A prefill pass hands the tail several rows at once. The worker answers
+                    # with one argmax per position, and the token this step should return is
+                    # the last one -- the same token a single-row call would give.
+                    return client.forward_tokens_out(hidden, n_past)[-1]
+                return client.forward_token(hidden, n_past)
+        finally:
+            stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
+    raise RuntimeError("chain has no tail stage")
+
+
+def forward(clients: list[StageClient], tokens: list[int], n_past: int,
+            stage_ms: list[list[float]]) -> int:
+    """Walk the chain once and return the next token."""
+    return _walk(clients, tokens, n_past, stage_ms, want_all=False)
 
 
 def forward_batch(clients: list[StageClient], tokens: list[int], n_past: int,
                   stage_ms: list[list[float]]) -> list[int]:
     """Walk the chain once with a *block* of tokens and return one token per position.
 
-    This is the verification primitive: the whole candidate block goes through the chain in one
-    round trip, and the tail answers with an argmax per position. Verified bit-identical to
-    running the same positions one at a time (see checks/probe_perfect_draft.py).
+    The verification primitive: the whole candidate block goes through in one round trip and
+    the tail answers with an argmax per position. Verified bit-identical to running the same
+    positions one at a time (see checks/probe_perfect_draft.py).
     """
-    if not clients or clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
-        raise RuntimeError("chain must start with a gpu stage and end with a tail stage")
-
-    hidden: np.ndarray | None = None
-    for i, client in enumerate(clients):
-        kind = client.stage.kind
-        t0 = time.perf_counter()
-        if kind == "gpu":
-            hidden = client.forward_tokens(tokens, n_past)
-        elif kind == "cpu":
-            if hidden is None:
-                raise RuntimeError(f"stage {i} (cpu) has no hidden to consume")
-            hidden = client.forward_hidden(hidden, n_past)
-        else:  # tail
-            if hidden is None:
-                raise RuntimeError(f"stage {i} (tail) has no hidden to consume")
-            out = client.forward_tokens_out(hidden, n_past)
-            stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
-            return out
-        stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
-    raise RuntimeError("chain has no tail stage")
+    return _walk(clients, tokens, n_past, stage_ms, want_all=True)
 
 
 # Speculation pays off only where the text is predictable. Measured on this chain (§10):
