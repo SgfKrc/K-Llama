@@ -203,6 +203,14 @@ typedef struct qlh_keep_head {
     uint32_t lids[16];
     int32_t  n_lids;
     int32_t  last_n_tokens;
+    /* ★ 2026-10-31（DFLASH-01）：DFlash draft 是**独立模型文件**，不是 MTP 那种同模型第二
+     * context，所以它自带一份 model/ctx。三者都只在 qlh_kh_draft_open 成功后非空。 */
+    struct llama_model   *draft_model;
+    struct llama_context *draft_ctx;
+    int32_t draft_n_embd_enc;   /* = n_embd_inp_enc，注入行的宽度（16384） */
+    int32_t draft_block_size;   /* GGUF 的 dflash.block_size（16） */
+    int32_t draft_mask_token;   /* GGUF 的 mask token id（248077） */
+    int32_t draft_n_past;       /* draft KV 里已经写进多少行 */
     /* ★ 2026-10-30：context 的并行序列上限，从 qlh_kh_load 的入参归一化后存下。
      * 批次分配的 `n_seq_max` 必须与它一致 —— 详见 qlh_fill_explicit 上方的说明。 */
     int32_t n_seq_max;
@@ -711,6 +719,217 @@ int32_t qlh_kh_last_n_tokens(void * handle_void) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     return handle == NULL ? 0 : handle->last_n_tokens;
 }
+
+/* ★ 2026-10-31（DFLASH-01）：DFlash draft 三件套。
+ *
+ * 为什么不能复用 MTP 的路径：MTP 是"同一模型的第二个 context"（LLM_CONTEXT_TYPE_MTP），
+ * 而 DFlash 的 draft 是**另一个 GGUF**（6 层 block-diffusion 头），两者没有共同点。差异正好
+ * 三条，也是这三个函数存在的理由：
+ *   1. 独立 model + context，且 non-causal（llama_set_causal_attn(ctx, false)）；
+ *   2. 输入行宽 n_embd_inp_enc（target_layers × n_embd = 16384），llama_decode 对
+ *      LLM_ARCH_DFLASH 会自动按这个宽度读（llama-batch.cpp），所以这里只要把批分配成
+ *      16384 宽即可，llama.cpp 一行都不用改；
+ *   3. 词表来自 draft GGUF 自己（已把 target 的 tok_embd/output 合并进去），所以
+ *      cparams.ctx_other 分支不会触发。
+ */
+
+/* 打开 draft 模型并建 context。返回 0 或负错误码。
+ * `gguf_path` 必须是把 target 词表合并进去的那份，否则 llama_init_from_model 会报
+ * "dflash requires ctx_other to be set"（-6）。 */
+int32_t qlh_kh_draft_open(void * handle_void, const char * gguf_path,
+                          int32_t n_ctx, int32_t n_batch, int32_t n_gpu_layers,
+                          char * err, size_t errlen) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || gguf_path == NULL) {
+        qlh_set_err(err, errlen, "bad argument");
+        return -1;
+    }
+    if (handle->draft_ctx != NULL) {
+        return 0;                       /* already open, keep it */
+    }
+
+    struct llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = n_gpu_layers;
+    struct llama_model * dmodel = llama_model_load_from_file(gguf_path, mparams);
+    if (dmodel == NULL) {
+        qlh_set_err(err, errlen, "draft model load failed (merged vocab missing?)");
+        return -2;
+    }
+
+    struct llama_context_params dparams = llama_context_default_params();
+    dparams.n_ctx     = (uint32_t) (n_ctx   > 0 ? n_ctx   : 256);
+    dparams.n_batch   = (uint32_t) (n_batch > 0 ? n_batch : 32);
+    dparams.n_ubatch  = dparams.n_batch;
+    dparams.n_seq_max = 1;
+    dparams.n_threads = 8;
+    dparams.n_threads_batch = 8;
+    dparams.embeddings = false;
+    struct llama_context * dctx = llama_init_from_model(dmodel, dparams);
+    if (dctx == NULL) {
+        llama_model_free(dmodel);
+        qlh_set_err(err, errlen, "draft context creation failed (ctx_other required?)");
+        return -3;
+    }
+    /* DFlash 的 decoder 是 block diffusion：同块内 16 个位置互相可见。默认的因果掩码会
+     * 把它们隔开，草稿质量直接崩掉。 */
+    llama_set_causal_attn(dctx, false);
+
+    handle->draft_model      = dmodel;
+    handle->draft_ctx        = dctx;
+    handle->draft_n_embd_enc = llama_model_n_embd_inp_enc(dmodel);
+    handle->draft_n_past     = 0;
+    /* 从模型 metadata 读块大小与 mask id：这两者在 GGUF 里，不该由调用方猜。 */
+    handle->draft_block_size = 16;
+    handle->draft_mask_token = -1;
+    {
+        char buf[16];
+        int32_t n = llama_model_meta_val_str(dmodel, "dflash.block_size", buf, sizeof(buf));
+        if (n > 0) {
+            handle->draft_block_size = atoi(buf);
+        }
+        n = llama_model_meta_val_str(dmodel, "tokenizer.ggml.mask_token_id", buf, sizeof(buf));
+        if (n > 0) {
+            handle->draft_mask_token = atoi(buf);
+        }
+    }
+    fprintf(stderr, "[qlh_keep_head] draft ready: n_embd_enc=%d block_size=%d mask=%d\n",
+            handle->draft_n_embd_enc, handle->draft_block_size, handle->draft_mask_token);
+    return 0;
+}
+
+/* 把 target 的 8 路中间层（已按 target_layers 顺序拼成 16384 宽的行）注入 draft 的 KV。
+ * `n_rows` 行、`positions` 每个位置一个。增量写入，`draft_n_past` 跟着前进。 */
+int32_t qlh_kh_draft_inject(void * handle_void, const float * embd, int32_t n_rows,
+                            const int32_t * positions) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->draft_ctx == NULL || embd == NULL || n_rows <= 0) {
+        return -1;
+    }
+    if (handle->draft_n_embd_enc <= 0) {
+        return -2;
+    }
+    struct llama_batch batch = llama_batch_init(n_rows, handle->draft_n_embd_enc, 1);
+    /* llama_batch_init 里 token 与 embd 是**二选一**：传了 embd 宽度就只分配 embd，token
+     * 保持 nullptr。早先要求两者都非空，于是每次注入都误判失败（-3）。 */
+    if (batch.embd == NULL) {
+        llama_batch_free(batch);
+        return -3;
+    }
+    for (int32_t i = 0; i < n_rows; ++i) {
+        batch.n_tokens   = i + 1;
+        batch.pos[i]     = positions != NULL ? positions[i] : handle->draft_n_past + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]  = 0;          /* 只要 K/V，不要 logits */
+    }
+    batch.n_tokens = n_rows;
+    memcpy(batch.embd, embd,
+           (size_t) n_rows * (size_t) handle->draft_n_embd_enc * sizeof(float));
+
+    const int32_t rc = llama_decode(handle->draft_ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        return -4;
+    }
+    handle->draft_n_past += n_rows;
+    return 0;
+}
+
+/* 出一块草稿：位置 0 是 anchor（真实 token），1..n_block-1 是 mask。
+ * 返回实际写进 out_ids 的草稿数（不含 anchor），负值表示错误。
+ *
+ * 语义与 llama.cpp 的 examples/speculative 一致：anchor 的 argmax 就是普通的下一 token，
+ * 后面 n_block-1 个位置是并行去噪出来的草稿。 */
+int32_t qlh_kh_draft_block(void * handle_void, int32_t anchor_id, int32_t n_block,
+                           const int32_t * positions, int32_t * out_ids, int32_t out_capacity) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->draft_ctx == NULL || out_ids == NULL) {
+        return -1;
+    }
+    if (handle->draft_mask_token < 0) {
+        return -2;
+    }
+    const int32_t block = n_block > 0 ? n_block : handle->draft_block_size;
+    if (block < 2 || block > out_capacity + 1) {
+        return -3;
+    }
+
+    struct llama_batch batch = llama_batch_init(block, 0, 1);
+    if (batch.token == NULL) {
+        llama_batch_free(batch);
+        return -4;
+    }
+    for (int32_t i = 0; i < block; ++i) {
+        batch.token[i]    = (i == 0) ? anchor_id : handle->draft_mask_token;
+        batch.pos[i]      = positions != NULL ? positions[i] : handle->draft_n_past + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]   = 1;          /* 每个位置都要 logits 才能取样 */
+    }
+    batch.n_tokens = block;
+
+    const int32_t rc = llama_decode(handle->draft_ctx, batch);
+    if (rc != 0) {
+        llama_batch_free(batch);
+        return -5;
+    }
+
+    const int32_t n_vocab = qlh_vocab_size(handle);
+    int32_t n_out = 0;
+    for (int32_t i = 1; i < block && n_out < out_capacity; ++i) {
+        const float * logits = llama_get_logits_ith(handle->draft_ctx, i);
+        if (logits == NULL) {
+            continue;
+        }
+        int32_t best = 0;
+        float bestv = logits[0];
+        for (int32_t v = 1; v < n_vocab; ++v) {
+            if (logits[v] > bestv) {
+                bestv = logits[v];
+                best = v;
+            }
+        }
+        out_ids[n_out++] = best;
+    }
+    llama_batch_free(batch);
+    return n_out;
+}
+
+/* draft 的 KV 前进/回滚。`n_keep` = 保留多少行；之后的全部丢弃（验证失败时用）。 */
+int32_t qlh_kh_draft_rollback(void * handle_void, int32_t n_keep) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->draft_ctx == NULL || n_keep < 0) {
+        return -1;
+    }
+    if (n_keep >= handle->draft_n_past) {
+        return 0;
+    }
+    llama_memory_t mem = llama_get_memory(handle->draft_ctx);
+    if (mem == NULL) {
+        return -2;
+    }
+    llama_memory_seq_rm(mem, 0, n_keep, -1);
+    handle->draft_n_past = n_keep;
+    return 0;
+}
+
+int32_t qlh_kh_draft_close(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL) {
+        return -1;
+    }
+    if (handle->draft_ctx != NULL) {
+        llama_free(handle->draft_ctx);
+        handle->draft_ctx = NULL;
+    }
+    if (handle->draft_model != NULL) {
+        llama_model_free(handle->draft_model);
+        handle->draft_model = NULL;
+    }
+    handle->draft_n_past = 0;
+    return 0;
+}
+
 
 /* 统一标注：默认**每个 token 都要标输出**。
  * 历史原因：旧的 nextn 通道只对「有输出的行」计算末层 hidden，若只标最后一行，取 n_tokens 行
