@@ -18,12 +18,18 @@
 ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
 ```
 
-- **17.0 tok/s**，接受率 98.0%，每轮前进 3.94 token（`topology-cross-mtp.toml`，2026-10-31）
+- **20.9 tok/s**（64-token 生成口径；写满 128 token 时 13.4 —— 代码后段不可预测，
+  接受率从 96% 掉到 70%），接受率 96.4%，每轮前进 5.82 token
+  （`topology-cross-mtp.toml`，2026-10-31）
 - 输出与不做投机的贪心解码**逐位一致**
 - 对外是 OpenAI 兼容的 SSE 流式接口；TUI 与控制面在 Python 侧
 
 作为对照：同一个模型在本机单卡整模 `-ngl 6` 只有 **10.5 tok/s**，
 纯 CPU 是 7.1。跨机两段是这台机器上唯一超过单机的形态。
+
+> 上面两个吞吐都是**解码阶段**口径（`scripts/check_p4_cross.py` 的 `t_gen`，
+> 不含 prefill 与协议开销），prompt 是 `def quicksort(arr):`。
+> 跨 prompt 比较要重测——接受率由文本可预测性决定，不由模型规模决定。
 
 ---
 
@@ -52,6 +58,7 @@ ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
 | 释放远端内存 | 关掉 ROG 上的常驻浏览器 | `tail_fwd` 226 → 76 ms |
 | tail 线程数 | ROG 侧 10 线程 | 并入上面那档 |
 | 切点实验 | 32:40 → 36:40 | 17.0 → 17.7（+4%），**未采纳**，负载会压到笔记本 |
+| DFlash 草稿深度 | k=3 → **k=5** | 17.0 → 20.9 tok/s（64 token）；12.2 → 13.4（128 token）。k=8 起崩塌 |
 | 投机按负载开关 | 代码类 k=2，其余 k=0；6 步后接受率 <35% 自动关 | 见 `docs/SPECULATION.md` §10 |
 | n-gram 草稿 | 上游原生，优先级在 DFlash 之前 | 代码 prompt 10.4 vs 无投机 7.4 tok/s；对话自动落空 |
 

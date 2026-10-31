@@ -15,12 +15,19 @@ harness then only connects.
     python scripts/check_p4_cross.py topology-cross-mtp.toml
 
 Environment (all optional):
-    SA_P4_BLOCK      drafts per round, default 4 (=> k=3)
-    SA_N_RS_SEQ      recurrent snapshot depth for the head, default k
+    SA_P4_BLOCK      drafts per round, default 6 (=> k=5, the measured optimum)
+    SA_N_RS_SEQ      recurrent snapshot depth for the head, default SA_P4_BLOCK
     SA_HEAD_GPU      head GPU layers override
     SA_HEAD_CMOE     head layers whose experts stay on CPU, default 24
     SA_DRAFT_GPU     GPU layers for the draft model, default 99
     SA_CTX           context size, default 1024
+
+Why the default is k=5 and not k=3: measured 2026-10-31 on the 32:40 chain, one prompt
+(`def quicksort`), decode phase only, 64-token runs: k=3 gives 3.94 tokens/round at
+17.0 tok/s and 98.0% acceptance, k=5 gives 5.82 tokens/round at 20.1 tok/s and 96.4%.
+Longer runs (128 tokens, where the text leaves the predictable region) keep the same
+ordering: k=3 12.2, k=5 13.4. Past that the acceptance collapses -- k=8 lands 31.1% and
+k=15 11.1%, both slower than k=3. The extra drafts stop paying for themselves at k=6.
 """
 from __future__ import annotations
 
@@ -55,8 +62,13 @@ def split_target_layers(head_range, tail_range):
     head_ids = [l - head_lo for l in TARGET_LAYERS if head_lo <= l < head_hi]
     tail_ids = [l - tail_lo for l in TARGET_LAYERS if tail_lo <= l < tail_hi]
     return head_ids, tail_ids
-N_BLOCK = int(os.environ.get("SA_P4_BLOCK", "4"))
+N_BLOCK = int(os.environ.get("SA_P4_BLOCK", "6"))
 CTX = int(os.environ.get("SA_CTX", "1024"))
+# The head needs one recurrent snapshot per position a reject-all round retracts, which is
+# N_BLOCK-1. chain_client's spawn_worker derives it from SA_SPEC_K instead (that knob drives
+# the MTP path), so without this the default k=5 block would try to roll back 5 positions on
+# a 2-deep snapshot ring and silently lose the state.
+os.environ.setdefault("SA_N_RS_SEQ", str(N_BLOCK))
 
 
 def eight_layers(hc, tc, enc_w: int, head_ids, tail_ids) -> np.ndarray:
@@ -135,6 +147,10 @@ def main() -> int:
         tc = cc.StageClient(tail)
         tc.connect()
         tc.tokenize("x")
+        # An externally started worker serves repeatedly: the previous run leaves its KV
+        # populated, and the next run writes position 0..n on top of it, which llama_decode
+        # rejects (rc=-1). Clearing costs one round trip and makes repeated runs possible.
+        tc.seq_rm(0)
         print("  prompt tokens = %d" % len(toks))
 
         head_ids, tail_ids = split_target_layers(head.layer_range, tail.layer_range)
