@@ -234,8 +234,8 @@ early-exit loss 加 layer dropout。
 
 排查中修掉三个真 bug：`qlh_kh_seq_rm` 漏声明 ctypes 签名（64 位句柄溢出打死 worker）、
 `n_rs_seq` 该是 k 不是 k-1、`n_embd` 属性丢弃响应恒返回 0。两个坑：`copy /b` 合并 22 GiB 会
-产出**大小对、内容错**的文件（模型能加载却恒定输出 token 0）；本机是 WLAN，连续大文件传输跑
-几块就停，最终靠 U 盘 + SHA256 校验解决。
+产出**大小对、内容错**的文件（能加载却恒定输出 token 0）；本机是 WLAN，大文件传输跑几块就停，
+最终靠 U 盘 + SHA256 校验解决。
 
 **已知限制**：只对 temp=0 无损（只暴露 argmax，做不了 rejection sampling）；DFlash 端到端收益
 未实测；自动切换的阈值（35% / 6 步）是按 k=2 的成本模型定的，换 k 要重算。
