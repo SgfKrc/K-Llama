@@ -87,17 +87,31 @@ blk.40.nextn.{eh_proj,enorm,hnorm,shared_head_norm}
 ```
 
 **qwen35moe 是单 head，一次只能预投 1 个 token。** 但这恰好是最划算的形态——
-验证只需 batch=2：
+验证只需 batch=2。
+
+**接受率已实测**（head 0:32 + tail 32:40 + MTP，贪心，三个 prompt）：
+
+| prompt | 接受 |
+| --- | ---: |
+| 中国的首都是 | 12/19 = 63.2% |
+| 用一句话解释什么是层段推理 | 13/15 = 86.7% |
+| `def quicksort(arr):` | 14/15 = 93.3% |
+| **合计** | **39/49 = 79.6%** |
+
+代码类最高（可预测），对话居中偏上，与 Qwen 官方的 60-80% 一致。
+
+按 batch=2 的边际成本（本机 72 → 81.8 ms，即 +13.6%）推算：
 
 ```
-验证成本 = 本机 batch=2 (81.8 ms) + ROG (约 28 ms) ≈ 110 ms
-接受率 60% → 前进 1.6 个 → 69 ms/token (2.0×)
-接受率 80% → 前进 1.8 个 → 61 ms/token (2.3×)
+验证 2 个 = 81.8(本机) + 76(ROG, 按同比例) ≈ 158 ms
+接受率 79.6% → 前进 1.796 个 → 88 ms/token (1.6×)
+接受率 63%   → 前进 1.63 个  → 97 ms/token (1.44×)
 ```
 
-**技术障碍**：`LLAMA_LAYER_RANGE` 目前强制把 `nextn` 覆盖成 0（loader 日志可见），
-即 C 方案把 MTP 层关掉了。要让 tail 段保留 MTP，需要改 `llama-model-loader.cpp` 的
-range 解析：当 `hi == n_layer_all` 时不覆盖 `nextn`。
+**已接通**：`qlh_kh_load` 在 `SA_MTP=1` 且模型带 NextN 时创建第二个 context
+（`ctx_type = LLAMA_CONTEXT_TYPE_MTP`），配套 `qlh_kh_last_hidden` 取主图
+`t_h_nextn`、`qlh_kh_mtp_draft` 用 `llama_batch_ext` 提交 `(token, hidden)` 并 argmax。
+loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP 层）。
 
 ---
 
