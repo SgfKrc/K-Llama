@@ -778,6 +778,10 @@ int32_t qlh_kh_draft_open(void * handle_void, const char * gguf_path,
     dparams.n_threads = 8;
     dparams.n_threads_batch = 8;
     dparams.embeddings = false;
+    /* DFlash 每轮要回滚最多 block_size-1 个位置，而 hybrid recurrent 只能按 n_rs_seq
+     * 范围内的快照部分回滚（llama-memory-recurrent.cpp:197-217），n_rs_seq=0 会让
+     * seq_rm 直接返回 false。这里给满一个 block。 */
+    dparams.n_rs_seq = 16;
     struct llama_context * dctx = llama_init_from_model(dmodel, dparams);
     if (dctx == NULL) {
         llama_model_free(dmodel);
@@ -922,9 +926,13 @@ int32_t qlh_kh_draft_rollback(void * handle_void, int32_t n_keep) {
     if (mem == NULL) {
         return -2;
     }
-    llama_memory_seq_rm(mem, 0, n_keep, -1);
+    const bool removed = llama_memory_seq_rm(mem, 0, n_keep, -1);
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] draft_rollback n_keep=%d was=%d removed=%d\n",
+                n_keep, handle->draft_n_past, removed ? 1 : 0);
+    }
     handle->draft_n_past = n_keep;
-    return 0;
+    return removed ? 0 : -6;
 }
 
 /* draft 注入行的宽度（= n_embd_inp_enc）。调用方拿它校验自己拼的 8 路 concat。 */
@@ -1087,8 +1095,15 @@ int32_t qlh_kh_forward(void * handle_void,
     }
     qlh_fill_common(&batch, n_tokens, n_past, handle->skip_hidden_logits ? 0 : 1);
 
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] tokens n=%d n_past=%d pos0=%d\n",
+                n_tokens, n_past, batch.pos[0]);
+    }
     const int32_t rc = llama_decode(handle->ctx, batch);
     llama_batch_free(batch);
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] tokens decode rc=%d (n=%d n_past=%d)\n", rc, n_tokens, n_past);
+    }
     if (rc != 0) {
         /* ★ 2026-09-24：把原始 rc 透出给调用方（**返回码仍是 -2，不破坏既有契约**）。 */
         handle->last_error = rc;
@@ -1487,7 +1502,11 @@ int32_t qlh_kh_seq_rm(void * handle_void, int32_t seq_id, int32_t p0) {
     if (mem == NULL) {
         return -5;
     }
-    return llama_memory_seq_rm(mem, (llama_seq_id) seq_id, (llama_pos) p0, -1) ? 0 : -6;
+    const bool removed = llama_memory_seq_rm(mem, (llama_seq_id) seq_id, (llama_pos) p0, -1);
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] seq_rm p0=%d removed=%d\n", p0, removed ? 1 : 0);
+    }
+    return removed ? 0 : -6;
 }
 
 int32_t qlh_kh_n_vocab(void * handle_void) {
