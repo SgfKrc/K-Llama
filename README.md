@@ -94,6 +94,7 @@ int16 的量化步长比 float16 细 20 倍，照样翻转——分叉点都落�
 ```powershell
 koakuma                                    # 一条命令进 TUI
 koakuma --topology topology-cross.toml     # 跨机两段
+koakuma --dflash <dflash.gguf>             # TUI 也走投机（默认贪心，k=5）
 
 # 直接跑链路（--spec-k 默认 -1 = 按负载自动选）
 python chain_client.py --topology topology-cross.toml --prompt-text "中国的首都是" --chat --gen 32
