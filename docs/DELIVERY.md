@@ -242,5 +242,5 @@ threads    = 6
 1. ROG 配好 → master 改 `topology.toml` 的 host
 2. **先 `--dry-run`** 确认内存预算通过
 3. 跑 `--gen 32 --repeat 2`，看三段是否串通
-4. 若通了，跑 `check_correct.py` 验数值
+4. 若通了，跑 `scripts/check_correct.py` 验数值
 5. 记录 ROG 每层耗时与真实 RTT

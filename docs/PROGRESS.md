@@ -101,6 +101,9 @@ MTP 草稿、采样器、`seq_rm`。MSVC 导出的 C++ mangled 名用 `GetProcAd
 
 `check_p4_cross.py` 从拓扑读一切（含 `ssh_user` / `start_cmd`），target layer id 按切点动态算；
 `tail-worker.cmd` 是远端启动模板；`topology-example.toml` 是占位模板。
+另有 8 个实验期探针从根目录迁入此目录（`perstage.py` / `breakdown.py` / `probe_hops.py` /
+`smoke.py` / `check_correct.py` / `dflash_probe.py` / `dflash_probe2.py` / `dflash_warmup_probe.py`），
+仅作历史测量记录，不是正式验收入口。
 站点配置（IP、账号、路径）全部在 `.gitignore` 的 `topology-*.toml` 里，不进版本库。
 
 ---

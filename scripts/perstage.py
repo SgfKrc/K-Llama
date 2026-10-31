@@ -19,11 +19,13 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+sys.path.insert(0, str(REPO))
 
 from engine import StageEngine  # noqa: E402
 
-SHIM = Path(os.environ.get("SA_SHIM") or (Path(__file__).resolve().parent / "shim" / "bin" / "qlh_keep_head.dll"))
+SHIM = Path(os.environ.get("SA_SHIM") or (REPO / "shim" / "bin" / "qlh_keep_head.dll"))
 
 
 def measure(name: str, engine, feed: np.ndarray, *, gen: int, n_past0: int) -> dict:

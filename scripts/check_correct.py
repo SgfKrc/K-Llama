@@ -20,12 +20,14 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+sys.path.insert(0, str(REPO))
 
 import config  # noqa: E402
 from keep_head import KeepHeadUpstream  # noqa: E402
 
-SHIM = Path(os.environ.get("SA_SHIM") or (Path(__file__).resolve().parent / "shim" / "bin" / "qlh_keep_head.dll"))
+SHIM = Path(os.environ.get("SA_SHIM") or (REPO / "shim" / "bin" / "qlh_keep_head.dll"))
 # Reference model for the layer_inp baseline. Required, not defaulted: the value is
 # machine-specific and a wrong guess would produce a confident PASS against the
 # wrong file.

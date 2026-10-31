@@ -129,6 +129,7 @@ proto_responses.py    /v1/responses 的纯翻译层
 koakuma.py            TUI 与启动画面
 cut.py                离线裁段（现在只用于比对）
 checks/               20 份验收脚本
+scripts/              实验探针与跨机驱动（perstage / breakdown / probe_hops / smoke / check_correct / dflash_probe*）
 ```
 
 不写行数：这类数字每次重构都会过期，而职责不会。

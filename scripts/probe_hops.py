@@ -15,7 +15,9 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+sys.path.insert(0, str(REPO))
 
 import protocol  # noqa: E402
 from chain_client import StageClient, spawn_worker  # noqa: E402
@@ -24,7 +26,7 @@ from config import load  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shim", default=str(Path(__file__).resolve().parent / "shim" / "bin" / "qlh_keep_head.dll"))
+    ap.add_argument("--shim", default=str(REPO / "shim" / "bin" / "qlh_keep_head.dll"))
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--threads", type=int, default=3)
     args = ap.parse_args()

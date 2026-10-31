@@ -174,7 +174,7 @@ python scripts/cut_layers.py --src <full.gguf> --dst gpu-0-8.gguf --keep-head 8
 python scripts/cut_layers.py --src <full.gguf> --dst cpu-8-40.gguf --k 8
 
 # 数值正确性
-python check_correct.py --prompt-tokens 16
+python scripts/check_correct.py --prompt-tokens 16
 
 # 两进程吞吐
 python chain_client.py --gen 128 --repeat 3 --threads 3
