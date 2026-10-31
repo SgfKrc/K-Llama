@@ -9,12 +9,37 @@
 
 ---
 
+## 0. 成本模型：k 决定一切
+
+一轮投机的位置操作账（两段链，每段各算一次）：
+
+```
+一轮 = tail 单步(1) + head 批量(k) + tail 批量(k) + head 预写(1)
+一个 k 行 batch 的实测成本 = 1 + 0.178 × (k-1) 个单行
+  （0:32 段 72 / 81.8 / 105 / 161.3 / 269.3 ms 于 k=1/2/4/8/16）
+plain 生成 2 个 token = 4.00 个单位
+```
+
+| k | 成本 | 每草稿需接受的盈亏线 | 接受率 85% 时 |
+| ---: | ---: | ---: | ---: |
+| 1 | 4.00 | **1.00（即 100%）** | 2.19 单位/token，**慢 9%** |
+| 2 | 4.36 | 0.09 | 1.61，快 1.24× |
+| 4 | 5.07 | 0.13 | 1.15，快 1.74× |
+| 8 | 6.49 | 0.16 | 0.83，快 2.40× |
+| 16 | 9.34 | 0.17 | 0.64，快 3.13× |
+
+**k=1 是结构性亏损**：成本 4.00 与 plain 生成 2 个 token 完全相同，却只多前进 `r ≤ 1` 个，
+只有草稿 100% 正确才持平。实测 83% ⇒ 必然慢 9%。
+
+**k ≥ 2 才有意义**，门槛很低（每草稿接受 9-17% 即回本）。这是 MTP 与 DFlash 的分水岭，
+也是早期把 MTP 排在 DFlash 前面时漏掉的一笔账。
+
 ## 1. 判定汇总
 
 | 方向 | 判定 | 依据 |
 | --- | --- | --- |
-| MTP（模型自带） | **首选** | 单 head，验证只需 batch=2，均摊 61–69 ms（2.0–2.3×） |
-| DFlash（外挂 0.24 GB） | 可行，第二步 | block 16 个候选，验证 444 ms，接受率 ≥20% 即回本 |
+| MTP（模型自带） | **部件已通，不接主链路** | 单 head ⇒ k=1，§0 结构性亏损；实测慢 13-14% |
+| DFlash（外挂 0.24 GB） | **唯一值得投入** | k=8/16 在盈利区间，每草稿接受 16% 即回本 |
 | PLD / n-gram | 按负载开关 | 中文对话 m=1.05（无效），代码续写 m=2.56–3.37 |
 | 浅层投机（前 k 层） | 不做 | 实测 α=0.00–0.08，E[accept]≈1.0 |
 | dSpark | 不做 | 开源权重只有 DeepSeek-V4 系，无 Qwen 版 |
@@ -35,39 +60,23 @@ llama_memory_recurrent: size = 50.25 MiB (1 cells, 32 layers, 1 seqs 0 rs_seq)
 
 **这一条不解决，任何投机方案都无法实现。**
 
-内存代价已实测（`SA_N_RS_SEQ=4`，35B）：
+内存代价已实测（`SA_N_RS_SEQ=4`，35B）：head 0:32 → **251.25 MiB**（R 11.25 + S 240）；
+tail 32:40 → **62.81 MiB**（R 2.81 + S 60）。S 随 `n_rs_seq` 线性增长。本机 22 GiB 毫无压力；
+tail 那 63 MiB 塞进 ROG 的 0.82 GiB 可行，但吃掉七分之一余量。
 
-```
-head 0:32 (32 layers): 251.25 MiB   —— R 11.25 MiB + S 240.00 MiB
-tail 32:40 ( 8 layers):  62.81 MiB   —— R  2.81 MiB + S  60.00 MiB
-```
-
-S 是快照本身，随 `n_rs_seq` 线性增长；R 是单个状态。本机 22 GiB 毫无压力；tail 那 63 MiB
-塞进 ROG 的 0.82 GiB 可行，但吃掉七分之一余量。
-
-回滚行为也已验证：不开快照时 `qlh_kh_seq_rm` 返回 **-6**（`llama_memory_seq_rm` 拒绝），
-开到 4 之后退回"上一个 ubatch 内"返回 0。与 llama.cpp 的 #31368 一致——它只放行最近一批
-快照内的回退。shim 侧只需 `SA_N_RS_SEQ ≥ k`，无需改 llama.cpp。
+回滚也已验证：不开快照时 `qlh_kh_seq_rm` 返回 **-6**，开到 4 后返回 0。与 llama.cpp #31368
+一致——只放行最近一批快照内的回退。shim 侧 `SA_N_RS_SEQ ≥ k` 即可，无需改 llama.cpp。
 
 ---
 
 ## 3. 验证成本：k 个候选只需一次绕链
 
-`shim/qlh_keep_head_gpu.c` 的 `qlh_kh_forward_embd_tokens` 接受 k 行 hidden、返回 k 个
-位置的 argmax，实测与逐位置调用逐位一致。所以验证 k 个候选走**一次**本机→ROG→回的往返。
+`qlh_kh_forward_embd_tokens` 接受 k 行 hidden、返回 k 个位置的 argmax，所以验证 k 个候选只走
+**一次**本机→ROG→回的往返。但摊薄不均匀：**lm_head（248320×2048）按行线性增长**（35B tail 段
+实测 23.5 / 27.9 / 34.7 / 58.3 / 90.3 ms 于 k=1/2/4/8/16，边际 4.4-5.0 ms/行），层计算却能
+被 batch 摊薄（MoE 专家共享）。**这是所有投机方案在本项目的成本上限。**
 
-但成本的摊薄并不均匀。**lm_head（248320×2048）按行线性增长**，这是 35B tail 段实测：
-
-```
-k=1    23.5 ms
-k=2    27.9 ms   (+18.7%)
-k=4    34.7 ms   (+47.6%)
-k=8    58.3 ms   (+147.5%)
-k=16   90.3 ms   (+283.8%)     边际 4.4-5.0 ms/行
-```
-
-层计算能被 batch 摊薄（MoE 专家共享），lm_head 每行都要过一次完整词表投影，因此保持线性。
-**这是所有投机方案在本项目的成本上限。**
+注意：tail 的批量与逐位置**逐位一致**已实测；head 的不一致（见 §9）是另一回事。
 
 ---
 
@@ -89,8 +98,9 @@ blk.40.nextn.{eh_proj,enorm,hnorm,shared_head_norm}
 //   neither (qwen35 / qwen35moe): a single trained MTP head.
 ```
 
-**qwen35moe 是单 head，一次只能预投 1 个 token。** 但这恰好是最划算的形态——
-验证只需 batch=2。
+**qwen35moe 是单 head，一次只能预投 1 个 token，即 k=1。** 按 §0 的成本模型，k=1 是结构性
+亏损（成本等于 plain 生成 2 个 token，却只多前进 r ≤ 1 个）。**所以 MTP 单头不值得接**——
+这与早期判断相反，早期那笔账漏算了轮内的四次位置操作。
 
 **接受率已实测**（head 0:32 + tail 32:40 + MTP，贪心，三个 prompt）：
 
@@ -103,15 +113,10 @@ blk.40.nextn.{eh_proj,enorm,hnorm,shared_head_norm}
 
 代码类最高（可预测），对话居中偏上，与 Qwen 官方的 60-80% 一致。
 
-按 batch=2 的边际成本（本机 72 → 81.8 ms，即 +13.6%）推算：
+**subagent 实跑确认**：位置账修好后（先验证后写入、不回滚），两个 prompt 逐位一致、接受率
+83.3% / 91.7%，但稳定**慢 13-14%**——正是 §0 预测的方向。
 
-```
-验证 2 个 = 81.8(本机) + 76(ROG, 按同比例) ≈ 158 ms
-接受率 79.6% → 前进 1.796 个 → 88 ms/token (1.6×)
-接受率 63%   → 前进 1.63 个  → 97 ms/token (1.44×)
-```
-
-**已接通**：`qlh_kh_load` 在 `SA_MTP=1` 且模型带 NextN 时创建第二个 context
+**部件已接通**：`qlh_kh_load` 在 `SA_MTP=1` 且模型带 NextN 时创建第二个 context
 （`ctx_type = LLAMA_CONTEXT_TYPE_MTP`），配套 `qlh_kh_last_hidden` 取主图
 `t_h_nextn`、`qlh_kh_mtp_draft` 用 `llama_batch_ext` 提交 `(token, hidden)` 并 argmax。
 loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP 层）。
@@ -148,8 +153,15 @@ dflash.target_layers  = [2, 7, 12, 17, 23, 28, 33, 38]  ← 需要目标模型�
 接受率 40% → 6.4 个 → 69 ms/token（2.0×）
 ```
 
-社区线索的接受率是 0.30–0.50，即 **1.5–2×**。收益与 MTP 相当，但工程量高一个量级。
-**先做 MTP，跑通基础设施后，DFlash 只需替换草稿器这一层。**
+社区线索的接受率是 0.30–0.50。按 §0 的模型，k=8 且每草稿接受 16% 即回本：
+
+```
+接受 4/8 (50%)  → 1.30 单位/token，快 1.54×
+接受 6.8/8 (85%) → 0.83 单位/token，快 2.40×
+```
+
+**这才是本项目的真机会**：MTP 单头的 k=1 结构上赚不了，DFlash 的 `block_size=16` 天生在
+盈利区间。代价是工程量高一个量级（8 路中间层横跨两段、需要自己编排 target/draft）。
 
 ---
 
@@ -181,15 +193,10 @@ llama.cpp 内置 5 种（`ngram-simple` / `ngram-map-k` / `ngram-map-k4v` / `ngr
 **浅层投机（取前 k 层当草稿）**：用 2B 切出 head4/8/12，把 `token_embd` 单行反量化后经
 embd 注入，逐位置 teacher forcing 与完整链的 gold 比较：
 
-| 草稿 | 中文对话 α | 代码 α | E[accept] |
-| --- | ---: | ---: | ---: |
-| head4 | 0.083 | 0.000 | 1.00 |
-| head8 | 0.042 | 0.000 | 1.00 |
-| head12 | 0.062 | 0.000 | 1.00 |
-| 完整 24 层（对照） | 0.969 | 0.906 | — |
-
-对照组 0.97 证明注入路径本身没问题。未训练的截断层接上最终的 `output_norm` + `lm_head`，
-分布是错位的。LayerSkip 那类效果来自训练时的 early-exit loss 加 layer dropout。
+head4/8/12 的 α 分别 0.083 / 0.042 / 0.062，代码生成全为 0.000，E[accept]=1.00（等于没有
+草稿）；对照组完整 24 层是 0.969 / 0.906，证明注入路径本身没问题。未训练的截断层接上最终的
+`output_norm` + `lm_head`，分布是错位的。LayerSkip 那类效果来自训练时的 early-exit loss 加
+layer dropout。
 
 **dSpark**：机制是外挂草稿（DFlash 骨干）+ Markov 头 + 置信度调度，llama.cpp 用
 `markov_w1.weight` 张量识别。开源权重只有 DeepSeek-V4-Pro/Flash 系，没有 Qwen 版本，
@@ -199,26 +206,29 @@ embd 注入，逐位置 teacher forcing 与完整链的 gold 比较：
 
 ## 8. 落地顺序
 
-1. **开 `n_rs_seq` + 导出按序列回滚**。已完成：`SA_N_RS_SEQ` 可配、`qlh_kh_seq_rm` 已导出。
-2. **批量验证接口贯通**（shim 已有，Python 侧缺 `hidden_tokens` op 与 tail 段的 list 返回，
-   约 180 行）。
-3. **换带 MTP 的整模 + 改 loader 保留 nextn**，接 `draft-mtp`。预期 2.0–2.3×。
-4. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
-5. **DFlash** 作为最后一步，需要多层 hidden 输出与自定义编排。
+1. **`n_rs_seq` 可配 + 按序回滚**。已完成：`SA_N_RS_SEQ`、`qlh_kh_seq_rm`。
+2. **批量验证链路**。已完成：`hidden_tokens` op 贯通到 `StageClient.forward_tokens_out`。
+3. **MTP 部件**。已完成（loader 保留 nextn、独立 context、`qlh_kh_mtp_draft`）。**但不接主链路**：
+   k=1 结构性亏损。
+4. **修两个数值障碍**（见 §9）。不修则任何 k≥2 的投机都无法保证输出一致。
+5. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
+6. **DFlash**：k=8 天生在盈利区间，是唯一值得投入完整工程的方向。
 
-## 9. 拼装状态
+## 9. 两个数值障碍
 
-部件全部单独验证过（加载、独立 context、草稿、真实接受率、批量验证逐位一致、`n_rs_seq`、
-`seq_rm`），**主循环的位置推进尚未对齐**：草稿验收后的位置推进与拒稿回滚会让两个 context 的
-位置错开一格，表现为输出与普通贪心不一致。`checks/probe_spec_wip.py` 是当前草图，带
-`PROBE_DEBUG=1` 可打印每次写入的位置。
+位置账已修好（`checks/probe_spec_wip.py`，先验证后写入模式下 2 个 prompt 逐位一致、
+接受率 83-92%），但**真投机（批量验证 + 拒稿回滚）卡在两个底层行为上**：
 
-序列不一致之前不看性能数字——投机只该改变一步覆盖几个 token，不该改变 token 本身。
+1. **head 的多 token 批量 ≠ 逐位置**。每行 hidden 差 2.5e-2~3.8e-2（相对 4e-3），与批量长度
+   无关；MoE 放大后翻转 argmax（`token@6` 108820→95761）。实验 shim 证实 `n_ubatch=1` 时差
+   **0.00e+00**，即位置无误、是并行计算路径。但回滚要求 `n_rs_seq≥1` ⇒ llama.cpp 要求
+   `n_ubatch > n_rs_seq+1` ⇒ 2-token 批量无法退化成逐 token 路径。
+2. **`qlh_kh_seq_rm` 不是干净回滚**。单 token 写完 → rm → 同输入重写同一位置，hidden 差
+   0.13~0.62（相对 2~10%），token 偶发翻转（8 个位置里 3 次）。残余误差会污染后续所有
+   hidden，把接受率从 88% 打到 50%。
 
 ## 10. 已知限制
 
-- **只对 temp=0 无损**。shim 暴露的是 argmax 而非 logits 分布，无法做标准 rejection sampling。
-  项目默认贪心（`chat.py`），当前不构成问题。
-- **ROG 的内存余量**。0.82 GiB 可用，`n_rs_seq` 要占 100 MiB，会加剧已有的 22.7 ms 压力。
-- **未实测项**：ROG 的 batch 曲线（按本机外推）、DFlash 的真实接受率（只有社区线索）、
-  `n_rs_seq` 非零值在现 DLL 上能否正常初始化。
+- **只对 temp=0 无损**。shim 暴露 argmax 而非 logits 分布，无法做标准 rejection sampling。
+- **ROG 内存余量**。0.82 GiB 可用，`n_rs_seq` 占 100 MiB（见 §2 实测）。
+- **未实测**：DFlash 的真实接受率（只有社区线索）、k≥2 的端到端收益。
