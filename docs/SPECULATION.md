@@ -172,12 +172,10 @@ llama.cpp 内置 5 种 n-gram 草稿策略，核心是 `common/ngram-map.cpp:49`
 
 **浅层投机（取前 k 层当草稿）**：2B 切出 head4/8/12，`token_embd` 单行反量化后经 embd 注入，
 逐位置 teacher forcing 对比完整链：α 分别 0.083 / 0.042 / 0.062，代码生成全为 0.000，
-E[accept]=1.00（等于没有草稿）；对照组完整 24 层是 0.969 / 0.906，证明注入路径本身没问题。
-未训练的截断层接上 `output_norm` + `lm_head`，分布是错位的——LayerSkip 那类效果来自训练时的
-early-exit loss 加 layer dropout。
+E[accept]=1.00；对照组完整 24 层是 0.969 / 0.906（证明注入路径本身没问题）。未训练的截断层接上
+`output_norm` + `lm_head`，分布是错位的——LayerSkip 那类效果来自训练时的 early-exit loss。
 
-**dSpark**：外挂草稿（DFlash 骨干）+ Markov 头 + 置信度调度，llama.cpp 用 `markov_w1.weight`
-识别。开源权重只有 DeepSeek-V4-Pro/Flash 系，没有 Qwen 版本，自训成本远超收益。
+**dSpark**：外挂草稿 + Markov 头 + 置信度调度。开源权重只有 DeepSeek-V4 系，无 Qwen 版本。
 
 ---
 ## 8. 落地顺序
