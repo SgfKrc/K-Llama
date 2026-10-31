@@ -969,9 +969,25 @@ int32_t qlh_kh_draft_block(void * handle_void, int32_t anchor_id, int32_t n_bloc
         if (logits == NULL) {
             continue;
         }
+        /* 与另外三个 argmax 入口（forward_embd_token / forward_embd_tokens /
+         * mtp_draft）保持同一个失败码：-7 = logits 含 NaN/Inf。
+         *
+         * 这一处原先没有这个闸。缺了它的后果不是"输出错"，而是**投机静默归零**：
+         * 若 logits[0] 是 NaN，`logits[v] > bestv` 对每个 v 都恒假，函数稳稳返回
+         * token 0，草稿全是同一个 id，验证器全部拒掉 —— 接受率掉到 0%，看起来像
+         * DFlash 坏了，实际是 argmax 被 NaN 卡住。另外三处早就有这道闸，正是为了让
+         * 这种失败能被看见。 */
+        if (!isfinite(logits[0])) {
+            llama_batch_free(batch);
+            return -7;
+        }
         int32_t best = 0;
         float bestv = logits[0];
         for (int32_t v = 1; v < n_vocab; ++v) {
+            if (!isfinite(logits[v])) {
+                llama_batch_free(batch);
+                return -7;
+            }
             if (logits[v] > bestv) {
                 bestv = logits[v];
                 best = v;
