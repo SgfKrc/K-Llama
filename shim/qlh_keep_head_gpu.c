@@ -778,10 +778,9 @@ int32_t qlh_kh_draft_open(void * handle_void, const char * gguf_path,
     dparams.n_threads = 8;
     dparams.n_threads_batch = 8;
     dparams.embeddings = false;
-    /* DFlash 每轮要回滚最多 block_size-1 个位置，而 hybrid recurrent 只能按 n_rs_seq
-     * 范围内的快照部分回滚（llama-memory-recurrent.cpp:197-217），n_rs_seq=0 会让
-     * seq_rm 直接返回 false。这里给满一个 block。 */
-    dparams.n_rs_seq = 16;
+    /* n_rs_seq 对 DFlash 无效：它的 memory 是 llama_kv_cache_iswa（sliding window +
+     * full 两套 KV），不是 hybrid/recurrent，llama_context 还会把 n_rs_seq clamp 到 0
+     * （llm_arch_supports_rs_rollback 不含 DFLASH）。保留默认值即可。 */
     struct llama_context * dctx = llama_init_from_model(dmodel, dparams);
     if (dctx == NULL) {
         llama_model_free(dmodel);
@@ -917,6 +916,11 @@ int32_t qlh_kh_draft_block(void * handle_void, int32_t anchor_id, int32_t n_bloc
         out_ids[n_out++] = best;
     }
     llama_batch_free(batch);
+    /* ★ 关键：block 自己也会往 draft KV 写 block 行（anchor + 15 mask）。早先这里不更新
+     * draft_n_past，于是 rollback 里的 "n_keep >= draft_n_past" 短路永远成立，seq_rm
+     * 从未被调用过 —— KV 一直停在 36，下一轮 inject 位置 21 就撞上 llm_batch 的
+     * "last position is X = 36"。实测（子 agent 的最小复现）iswa 的 seq_rm 本身是好的。 */
+    handle->draft_n_past += block;
     return n_out;
 }
 
@@ -942,17 +946,24 @@ int32_t qlh_kh_draft_rollback(void * handle_void, int32_t n_keep) {
     if (handle == NULL || handle->draft_ctx == NULL || n_keep < 0) {
         return -1;
     }
-    if (n_keep >= handle->draft_n_past) {
-        return 0;
-    }
     llama_memory_t mem = llama_get_memory(handle->draft_ctx);
     if (mem == NULL) {
         return -2;
     }
+    /* 是否真的需要回滚，要看 KV 的真实位置，而不是我们自己的计数器 —— 计数器一旦
+     * 落后（block 写入没记），这个判断就会把真正的回滚短路掉。 */
+    const llama_pos kv_max = llama_memory_seq_pos_max(mem, 0);
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] draft_rollback n_keep=%d counter=%d kv_max=%d\n",
+                n_keep, handle->draft_n_past, kv_max);
+    }
+    if (kv_max < 0 || n_keep > kv_max) {
+        handle->draft_n_past = n_keep;
+        return 0;                       /* 已经不比目标更靠后，no-op */
+    }
     const bool removed = llama_memory_seq_rm(mem, 0, n_keep, -1);
     if (getenv("SA_DEBUG_KV") != NULL) {
-        fprintf(stderr, "[kv] draft_rollback n_keep=%d was=%d removed=%d\n",
-                n_keep, handle->draft_n_past, removed ? 1 : 0);
+        fprintf(stderr, "[kv] draft_rollback removed=%d\n", removed ? 1 : 0);
     }
     handle->draft_n_past = n_keep;
     return removed ? 0 : -6;
