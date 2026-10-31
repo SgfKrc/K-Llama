@@ -548,6 +548,35 @@ def forward_batch(clients: list[StageClient], tokens: list[int], n_past: int,
     raise RuntimeError("chain has no tail stage")
 
 
+# Speculation pays off only where the text is predictable. Measured on this chain (§10):
+# code continuation accepts 70-83% of drafts and lands ~1.13x faster, ordinary prose 60-73%
+# and the gain shrinks toward nothing. So the default is automatic: start from what the prompt
+# looks like, and switch off if the live acceptance rate says this request is not the kind.
+# Strong markers appear in code and essentially never in prose, so one is enough. Weak ones
+# ("return", "for") also occur in English, so those need corroboration. The split matters for
+# short prompts: "def quicksort(arr):" has exactly one marker and must still count as code.
+STRONG_MARKERS = ("def ", "class ", "import ", "from ", "self.", "print(", "```",
+                  "()", "):\n", "= [", "== ", "!=", ">>> ")
+WEAK_MARKERS = ("return ", "if ", "for ", "while ", " = ", "{\n", "};")
+
+
+def looks_like_code(text: str) -> bool:
+    """Rough code detector: strong marker wins alone, weak ones need two, indentation counts."""
+    if any(m in text for m in STRONG_MARKERS):
+        return True
+    hits = sum(1 for m in WEAK_MARKERS if m in text)
+    if "\n    " in text or "\n\t" in text:
+        hits += 1
+    return hits >= 2
+
+
+# Below this acceptance rate a speculative step costs more than it saves at k=2
+# (cost 4.36 units per round, so 0.35 accepted still breaks even). Checked after a warm-up
+# window, since the first steps draft from a nearly empty context and accept poorly.
+AUTO_MIN_ACCEPT = 0.35
+AUTO_WARMUP_STEPS = 6
+
+
 def speculate(clients: list[StageClient], token: int, n_past: int,
               stage_ms: list[list[float]], k: int,
               stats: dict) -> list[int]:
@@ -562,6 +591,7 @@ def speculate(clients: list[StageClient], token: int, n_past: int,
     position after the first mismatch is rolled back on *every* stage.
     """
     tail = clients[-1]
+    stats["steps"] = stats.get("steps", 0) + 1
 
     # 1. trunk step: one token, and the final hidden the draft head needs
     t1 = forward(clients, [token], n_past, stage_ms)
@@ -690,8 +720,9 @@ def main() -> int:
     ap.add_argument("--prompt-text", default=None,
                     help="natural-language prompt instead of synthetic token ids")
     ap.add_argument("--gen", type=int, default=64)
-    ap.add_argument("--spec-k", type=int, default=0,
-                    help="MTP 递归草稿数；0 = 不投机。代码场景 k=2 实测 1.19x，k>2 只会更慢")
+    ap.add_argument("--spec-k", type=int, default=-1,
+                    help="MTP 递归草稿数；-1 = 按 prompt 自动判断（默认），0 = 强制关闭，"
+                         ">0 = 强制该深度。跨机实测 k=2 代码场景 1.13x（70%% 接受）")
     # The checkpoint recommends temp 1.00 / top_k 20 / top_p 0.95. Greedy (the shim default)
     # degenerates into repetition on this model, so sampling is the default here and
     # --greedy opts back into it for reproducible comparisons.
@@ -879,8 +910,24 @@ def main() -> int:
             out_tokens = [token]
             n_past = len(prompt)
             spec_stats: dict = {}
-            k = args.spec_k
+            auto = args.spec_k < 0
+            if auto:
+                # Start from the prompt's shape; the live acceptance rate can veto it below.
+                k = 2 if (args.prompt_text and looks_like_code(args.prompt_text)) else 0
+            else:
+                k = args.spec_k
+            if os.environ.get("SA_DEBUG_AUTO"):
+                print(f"  [auto] spec_k={args.spec_k} auto={auto} k={k} "
+                      f"code={looks_like_code(args.prompt_text) if args.prompt_text else None}",
+                      file=sys.stderr, flush=True)
             while len(out_tokens) < args.gen:
+                if auto and k > 0 and spec_stats.get("steps", 0) >= AUTO_WARMUP_STEPS:
+                    rate = spec_stats.get("accepted", 0) / max(spec_stats.get("drafts", 0), 1)
+                    if rate < AUTO_MIN_ACCEPT:
+                        # This request is not predictable enough; fall back to plain decode for
+                        # the rest of it rather than paying draft cost for nothing.
+                        spec_stats["auto_off_at"] = spec_stats["steps"]
+                        k = 0
                 start = time.perf_counter()
                 if k > 0:
                     produced = speculate(clients, token, n_past, stage_ms, k, spec_stats)
@@ -932,8 +979,11 @@ def main() -> int:
                 drf = spec_stats.get("drafts", 0)
                 no_draft = spec_stats.get("no_draft", 0)
                 draft_err = spec_stats.get("draft_error", 0)
+                auto_note = (f"  第 {spec_stats['auto_off_at']} 步起自动关闭"
+                             if spec_stats.get("auto_off_at") else "")
                 print(f"    spec:   k={k} 接受 {acc}/{drf} = {100.0*acc/max(drf,1):.1f}%"
                       f"  平均每轮 {len(out_tokens)/max(len(step_ms),1):.2f} token"
+                      + auto_note
                       + (f"  无 MTP 头 {no_draft}" if no_draft else "")
                       + (f"  草稿异常 {draft_err}" if draft_err else "")
                       + (f"  回滚失败 {spec_stats['rollback_error']}"
