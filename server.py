@@ -92,10 +92,14 @@ class Chain:
     concurrent conversations would interleave positions and corrupt both.
     """
 
-    def __init__(self, stages: tuple, shim: Path, ctx: int) -> None:
+    def __init__(self, stages: tuple, shim: Path, ctx: int,
+                 spec_k: int = 0, dflash: str = "", dflash_block: int = 6) -> None:
         self._stages = stages
         self._shim = shim
         self._ctx = ctx
+        self._spec_k = spec_k
+        self._dflash = dflash
+        self._dflash_block = dflash_block
         self._lock = threading.Lock()
         self._clients: list[StageClient] = []
         self._procs: list[tuple] = []
@@ -125,6 +129,7 @@ class Chain:
         with self._lock:
             for client in self._clients:
                 client.reset()
+            greedy = not sampling or float(sampling.get("temperature", 1.0)) == 0.0
             if self._clients:
                 tail = self._clients[-1]
                 if sampling:
@@ -134,7 +139,15 @@ class Chain:
                 else:
                     # Restore the pristine argmax path, not a greedy chain.
                     tail.clear_sampling()
-            yield from generate_stream(self._clients, prompt, max_tokens=max_tokens)
+            # Drafting only holds at temperature 0: the verifier compares drafts against
+            # the chain's argmax, so a sampling tail would make it accept tokens the
+            # sampler never produced. A sampling request therefore runs plain decode.
+            yield from generate_stream(
+                self._clients, prompt, max_tokens=max_tokens,
+                spec_k=self._spec_k if greedy else 0,
+                dflash_path=self._dflash if greedy else "",
+                dflash_block=self._dflash_block,
+            )
 
     def sampling_state(self) -> dict:
         """What the tail stage currently has in effect, for the response body."""
@@ -522,6 +535,12 @@ def main() -> int:
     ap.add_argument("--shim", default=str(DEFAULT_SHIM))
     ap.add_argument("--topology", default="")
     ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--spec-k", type=int, default=0,
+                    help="MTP 递归草稿数；只对 temperature=0 的请求生效（默认 0 = 关闭）")
+    ap.add_argument("--dflash", default="",
+                    help="DFlash 草稿 GGUF；给了就走并行块草稿，同样只在 temperature=0 生效")
+    ap.add_argument("--dflash-block", type=int, default=6,
+                    help="DFlash 每轮草稿数 = block-1（默认 6 = k=5，实测拐点）")
     args = ap.parse_args()
 
     if args.topology:
@@ -543,11 +562,18 @@ def main() -> int:
             f"{estimate / 2**30:.2f} GiB resident but only "
             f"{budget / 2**30:.2f} GiB is safe. Move a stage to another host.")
 
-    chain = Chain(stages, shim, config.ctx())
+    chain = Chain(stages, shim, config.ctx(),
+                  spec_k=args.spec_k, dflash=args.dflash, dflash_block=args.dflash_block)
     print(f"loading {len(stages)} stage(s)…", flush=True)
     chain.start()
+    spec_note = []
+    if args.dflash:
+        spec_note.append(f"DFlash block={args.dflash_block}")
+    if args.spec_k:
+        spec_note.append(f"MTP k={args.spec_k}")
+    spec_txt = ("; speculation: " + ", ".join(spec_note) + " at temperature 0") if spec_note else ""
     print(f"ready on http://{args.host}:{args.port}  "
-          f"(stages={len(stages)}, sampling on the tail stage; argmax by default)",
+          f"(stages={len(stages)}, sampling on the tail stage; argmax by default{spec_txt})",
           flush=True)
 
     Handler.chain = chain

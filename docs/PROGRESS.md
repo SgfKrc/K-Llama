@@ -94,7 +94,7 @@ MTP 草稿、采样器、`seq_rm`。MSVC 导出的 C++ mangled 名用 `GetProcAd
 | `chain_client.py` | 绕链驱动、两个草稿源（MTP 递归 / DFlash 并行块）、按负载选 k、内存预检 |
 | `engine.py` / `keep_head.py` | shim 的 ctypes 绑定 |
 | `stage_worker.py` / `protocol.py` / `wire.py` | 段进程与帧协议 |
-| `server.py` / `stream.py` / `proto_responses.py` | OpenAI 兼容接口与 SSE |
+| `server.py` / `stream.py` / `proto_responses.py` | OpenAI 兼容接口与 SSE；`stream.py` 只做 UTF-8 重组、计时与停止条件，解码交给 `chain_client` 的引擎（server 因此能跑投机） |
 | `chat_tui.py` / `koakuma.py` | TUI 与控制面 |
 
 **通用跨机驱动（`scripts/`，设备无关，可入库）**

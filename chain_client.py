@@ -762,15 +762,15 @@ class DFlashDriver:
     temperature 0 -- sampling would need rejection sampling, which the shim does not expose.
     """
 
-    def __init__(self, clients, draft_path, n_block, ctx, stage_ms, stats):
+    def __init__(self, clients, draft_path, n_block, ctx=1024, stage_ms=None, stats=None):
         if clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
             raise RuntimeError("DFlash needs a gpu head and a tail")
         self.clients = clients
         self.head = clients[0]
         self.tail = clients[-1]
         self.n_block = int(n_block)
-        self.stage_ms = stage_ms
-        self.stats = stats
+        self.stage_ms = stage_ms if stage_ms is not None else [[] for _ in clients]
+        self.stats = stats if stats is not None else {}
         self.pending = []
         self.primed = False
         self.head_ids, self.tail_ids = dflash_split_layers(
