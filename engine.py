@@ -131,6 +131,25 @@ class StageEngine:
         """k rows of hidden in, k token ids out. The speculative verification primitive."""
         return self._up.forward_hidden_to_tokens(_f32_input(hidden), n_past=n_past)
 
+    def draft_open(self, path: str, n_ctx: int = 256, n_batch: int = 32,
+                   n_gpu_layers: int = 0) -> int:
+        return int(self._up.draft_open(path, n_ctx, n_batch, n_gpu_layers))
+
+    def draft_n_embd_enc(self) -> int:
+        return int(self._up.draft_n_embd_enc())
+
+    def draft_inject(self, rows) -> int:
+        return int(self._up.draft_inject(rows))
+
+    def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:
+        return list(self._up.draft_block(anchor, n_block))
+
+    def draft_rollback(self, n_keep: int) -> int:
+        return int(self._up.draft_rollback(n_keep))
+
+    def draft_close(self) -> None:
+        self._up.draft_close()
+
     def add_layer_inp(self, lid: int) -> None:
         """Open an intermediate-hidden slot; needed only by DFlash-style drafting."""
         self._up.add_layer_inp(int(lid))

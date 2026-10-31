@@ -750,7 +750,21 @@ int32_t qlh_kh_draft_open(void * handle_void, const char * gguf_path,
 
     struct llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
+    /* ★ LLAMA_LAYER_RANGE 是给 target 分段用的，draft 模型（DFlash 只有 6 层）绝不能用它：
+     * loader 会按 0:32 去找 blk.6 之类的层，直接报 "tensor 'blk.6.attn_norm.weight' not
+     * found"（实测）。这里在加载期间临时清空、加载完立刻恢复 —— 不能永久改，因为同一个
+     * 进程里的 target ctx 还要靠它保持语义。 */
+    char saved_range[64];
+    saved_range[0] = '\\0';
+    const char * range_env = getenv("LLAMA_LAYER_RANGE");
+    if (range_env != NULL && range_env[0] != '\\0') {
+        snprintf(saved_range, sizeof(saved_range), "%s", range_env);
+        _putenv_s("LLAMA_LAYER_RANGE", "");
+    }
     struct llama_model * dmodel = llama_model_load_from_file(gguf_path, mparams);
+    if (saved_range[0] != '\\0') {
+        _putenv_s("LLAMA_LAYER_RANGE", saved_range);
+    }
     if (dmodel == NULL) {
         qlh_set_err(err, errlen, "draft model load failed (merged vocab missing?)");
         return -2;
@@ -911,6 +925,12 @@ int32_t qlh_kh_draft_rollback(void * handle_void, int32_t n_keep) {
     llama_memory_seq_rm(mem, 0, n_keep, -1);
     handle->draft_n_past = n_keep;
     return 0;
+}
+
+/* draft 注入行的宽度（= n_embd_inp_enc）。调用方拿它校验自己拼的 8 路 concat。 */
+int32_t qlh_kh_draft_n_embd_enc(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    return handle == NULL ? 0 : handle->draft_n_embd_enc;
 }
 
 int32_t qlh_kh_draft_close(void * handle_void) {
@@ -1113,7 +1133,11 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
                                 const int32_t * n_seq_id, const int32_t * seq_ids,
                                 const int32_t * positions, float * out) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
-    if (handle == NULL || embd == NULL || out == NULL || n_tokens <= 0) {
+    /* out == NULL 合法：调用方只想要 layer_inp（DFlash 的 33/38 两路就来自 tail 段这一次
+     * 前向），不想要 dense hidden。tail 段为了出 token 必须开 logits，而 logits 与
+     * cparams.embeddings 互斥（qlh_kh_load: embeddings = !needs_logits），所以"顺带要
+     * 一份 dense hidden"在 tail 段根本不可能 —— 这个分支就是为那种情况准备的。 */
+    if (handle == NULL || embd == NULL || n_tokens <= 0) {
         return -5;
     }
     handle->last_error = 0;
@@ -1135,6 +1159,9 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
 
     const int32_t rc = llama_decode(handle->ctx, batch);
     llama_batch_free(batch);
+    if (rc == 0 && out == NULL) {
+        return 0;                    /* 只要 layer_inp，不取 dense hidden */
+    }
     if (rc != 0) {
         handle->last_error = rc;
         fprintf(stderr,

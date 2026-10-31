@@ -18,6 +18,7 @@ EXPORTS
     qlh_kh_draft_inject
     qlh_kh_draft_block
     qlh_kh_draft_rollback
+    qlh_kh_draft_n_embd_enc
     qlh_kh_draft_close
     qlh_kh_seq_rm
     qlh_kh_n_embd

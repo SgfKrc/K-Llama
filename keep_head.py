@@ -252,6 +252,32 @@ class KeepHeadUpstream:
                 f"keep-head worker returned {len(toks)} tokens for {arr.shape[0]} rows")
         return toks
 
+    def draft_open(self, path: str, n_ctx: int = 256, n_batch: int = 32,
+                   n_gpu_layers: int = 0) -> int:
+        reply = self._request({"op": "draft_open", "path": str(path), "n_ctx": int(n_ctx),
+                               "n_batch": int(n_batch), "n_gpu_layers": int(n_gpu_layers)})
+        return int(reply.get("draft_rc", 0))
+
+    def draft_n_embd_enc(self) -> int:
+        return int(self._request({"op": "draft_n_embd_enc"}).get("n_embd_enc", 0))
+
+    def draft_inject(self, rows) -> int:
+        arr = np.ascontiguousarray(rows, dtype=np.float32)
+        reply = self._request({"op": "draft_inject", "shape": list(arr.shape)}, arr)
+        return int(reply.get("draft_rc", 0))
+
+    def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:
+        reply = self._request({"op": "draft_block", "anchor": int(anchor),
+                               "n_block": int(n_block)})
+        return [int(v) for v in reply.get("drafts", [])]
+
+    def draft_rollback(self, n_keep: int) -> int:
+        reply = self._request({"op": "draft_rollback", "n_keep": int(n_keep)})
+        return int(reply.get("draft_rc", 0))
+
+    def draft_close(self) -> None:
+        self._request({"op": "draft_close"})
+
     def add_layer_inp(self, lid: int) -> None:
         """Open one more intermediate-hidden slot (DFlash needs 8 of them)."""
         self._request({"op": "add_layer_inp", "lid": int(lid)})

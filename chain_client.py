@@ -289,8 +289,15 @@ class StageClient:
 
     def forward_hidden(self, hidden: np.ndarray, n_past: int) -> np.ndarray:
         dtype = wire.current_dtype()
-        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past,
-                             "dtype": dtype}, wire.encode(hidden, dtype))
+        # 显式 op：tail 段的主路径只出 token，不带这个 op 的话它会走 forward_tokens_out
+        # 并回一个没有 n_embd 的响应（DFlash 需要 tail 真的前向一次好拿 layer_inp）。
+        msg = self._forward({"op": "forward_hidden", "n_tokens": int(hidden.shape[0]),
+                             "n_past": n_past, "dtype": dtype},
+                            wire.encode(hidden, dtype))
+        if msg.meta.get("no_hidden"):
+            # 前向发生了，但这一段的 logits/embeddings 开关不给 dense hidden。
+            # 调用方通常只为它的 layer_inp 而来，所以这里不是错误。
+            return None
         return self._decode_hidden(msg)
 
     def forward_token(self, hidden: np.ndarray, n_past: int) -> int:
@@ -321,6 +328,33 @@ class StageClient:
                   file=sys.stderr, flush=True)
             return None
         return self._decode_hidden(msg).reshape(-1)
+
+    def draft_open(self, path: str, n_ctx: int = 256, n_batch: int = 32,
+                   n_gpu_layers: int = 0) -> int:
+        msg = self._forward({"op": "draft_open", "path": str(path), "n_ctx": int(n_ctx),
+                             "n_batch": int(n_batch), "n_gpu_layers": int(n_gpu_layers)})
+        return int(msg.meta.get("draft_rc", 0))
+
+    def draft_n_embd_enc(self) -> int:
+        return int(self._forward({"op": "draft_n_embd_enc"}).meta.get("n_embd_enc", 0))
+
+    def draft_inject(self, rows) -> int:
+        arr = np.ascontiguousarray(rows, dtype=np.float32)
+        msg = self._forward({"op": "draft_inject", "n_tokens": int(arr.shape[0]),
+                             "shape": list(arr.shape)}, arr)
+        return int(msg.meta.get("draft_rc", 0))
+
+    def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:
+        msg = self._forward({"op": "draft_block", "anchor": int(anchor),
+                             "n_block": int(n_block)})
+        return [int(v) for v in msg.meta.get("drafts", [])]
+
+    def draft_rollback(self, n_keep: int) -> int:
+        msg = self._forward({"op": "draft_rollback", "n_keep": int(n_keep)})
+        return int(msg.meta.get("draft_rc", 0))
+
+    def draft_close(self) -> None:
+        self._forward({"op": "draft_close"})
 
     def add_layer_inp(self, lid: int) -> None:
         """Open an intermediate-hidden slot on this stage."""

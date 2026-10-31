@@ -127,6 +127,59 @@ class StageWorker:
                                           {"n_embd": int(h.shape[0]), "n_tokens": 1,
                                            "dtype": d},
                                           wire.encode(h.reshape(1, -1), d))
+                    elif op == "forward_hidden":
+                        # DFLASH-01: hidden -> hidden on ANY stage, including tail.
+                        # tail 的主路径只出 token（mtp_draft / forward_tokens_out /
+                        # forward_token），但 DFlash 需要 tail 真的前向一次来产生 33/38
+                        # 两路 layer_inp。这条 op 显式要求 hidden-in/hidden-out，绕开
+                        # 主分支的角色假设。
+                        dtype = wire.resolve(msg.meta.get("dtype"))
+                        n_tokens = int(msg.meta["n_tokens"])
+                        n_embd = self._engine.n_embd
+                        hidden = wire.decode(msg.blob, dtype, (n_tokens, n_embd))
+                        try:
+                            out = self._engine.forward_hidden(hidden, n_past=n_past)
+                        except Exception as exc:  # noqa: BLE001
+                            # tail 段为了出 token 必须开 logits，而 logits 与
+                            # cparams.embeddings 互斥 -> dense hidden 取不到。这不是错误：
+                            # 调用方要的往往是这次前向顺手产生的 layer_inp（DFlash 的
+                            # 33/38 两路）。前向已经发生，照实回"没有 hidden"。
+                            _trace(f"forward_hidden produced no dense hidden: {exc}")
+                            protocol.send(conn, protocol.RESULT,
+                                          {"n_past": n_past, "no_hidden": True})
+                            continue
+                        protocol.send(conn, protocol.RESULT,
+                                      {"n_tokens": int(out.shape[0]),
+                                       "n_embd": int(out.shape[1]),
+                                       "n_past": n_past, "dtype": dtype},
+                                      wire.encode(out, dtype))
+                    elif op == "draft_open":
+                        rc = self._engine.draft_open(str(msg.meta["path"]),
+                                                     int(msg.meta.get("n_ctx", 256)),
+                                                     int(msg.meta.get("n_batch", 32)),
+                                                     int(msg.meta.get("n_gpu_layers", 0)))
+                        protocol.send(conn, protocol.RESULT, {"draft_rc": int(rc)})
+                    elif op == "draft_n_embd_enc":
+                        protocol.send(conn, protocol.RESULT,
+                                      {"n_embd_enc": int(self._engine.draft_n_embd_enc())})
+                    elif op == "draft_inject":
+                        # 与 forward 分支同样的内联解码（本文件没有 _decode_hidden）
+                        n_rows = int(msg.meta["n_tokens"])
+                        n_embd = int(msg.meta["shape"][1])
+                        d = wire.resolve(msg.meta.get("dtype"))
+                        arr = wire.decode(msg.blob, d, (n_rows, n_embd))
+                        rc = self._engine.draft_inject(arr)
+                        protocol.send(conn, protocol.RESULT, {"draft_rc": int(rc)})
+                    elif op == "draft_block":
+                        ids = self._engine.draft_block(int(msg.meta["anchor"]),
+                                                       int(msg.meta.get("n_block", 16)))
+                        protocol.send(conn, protocol.RESULT, {"drafts": [int(v) for v in ids]})
+                    elif op == "draft_rollback":
+                        rc = self._engine.draft_rollback(int(msg.meta["n_keep"]))
+                        protocol.send(conn, protocol.RESULT, {"draft_rc": int(rc)})
+                    elif op == "draft_close":
+                        self._engine.draft_close()
+                        protocol.send(conn, protocol.RESULT, {})
                     elif op == "add_layer_inp":
                         # DFLASH-01: open one more intermediate-hidden slot. The shim keeps
                         # the list; this op is idempotent so a reconnecting driver can re-add.

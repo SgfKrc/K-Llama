@@ -116,6 +116,26 @@ class Binding:
         lib.qlh_kh_get_layer_inp.restype = ctypes.c_int32
         lib.qlh_kh_last_n_tokens.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_last_n_tokens.restype = ctypes.c_int32
+        # DFLASH-01: the draft trio. Same reason as above -- an undeclared function makes
+        # ctypes truncate the 64-bit handle to int and the worker dies without a traceback.
+        lib.qlh_kh_draft_open.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_char_p, ctypes.c_size_t]
+        lib.qlh_kh_draft_open.restype = ctypes.c_int32
+        lib.qlh_kh_draft_inject.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32)]
+        lib.qlh_kh_draft_inject.restype = ctypes.c_int32
+        lib.qlh_kh_draft_block.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
+        lib.qlh_kh_draft_block.restype = ctypes.c_int32
+        lib.qlh_kh_draft_rollback.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+        lib.qlh_kh_draft_rollback.restype = ctypes.c_int32
+        lib.qlh_kh_draft_close.argtypes = [ctypes.c_void_p]
+        lib.qlh_kh_draft_close.restype = ctypes.c_int32
+        lib.qlh_kh_draft_n_embd_enc.argtypes = [ctypes.c_void_p]
+        lib.qlh_kh_draft_n_embd_enc.restype = ctypes.c_int32
         lib.qlh_kh_mtp_draft.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
             ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)]
@@ -287,6 +307,39 @@ class Binding:
                 print(f"[kh.layer_inp] lid={lid} rc={rc}", file=sys.stderr, flush=True)
                 return None
         return out
+
+    def draft_open(self, path: str, n_ctx: int, n_batch: int, n_gpu_layers: int) -> int:
+        err = ctypes.create_string_buffer(512)
+        rc = int(self._lib.qlh_kh_draft_open(
+            self._handle, path.encode("utf-8"), int(n_ctx), int(n_batch),
+            int(n_gpu_layers), err, len(err)))
+        if rc != 0:
+            print(f"[kh.draft_open] rc={rc} {err.value.decode(errors='replace')}",
+                  file=sys.stderr, flush=True)
+        return rc
+
+    def draft_n_embd_enc(self) -> int:
+        return int(self._lib.qlh_kh_draft_n_embd_enc(self._handle))
+
+    def draft_inject(self, rows: np.ndarray) -> int:
+        arr = np.ascontiguousarray(rows, dtype=np.float32)
+        return int(self._lib.qlh_kh_draft_inject(
+            self._handle, _f32(arr), int(arr.shape[0]), None))
+
+    def draft_block(self, anchor: int, n_block: int) -> list[int]:
+        out = (ctypes.c_int32 * max(1, n_block))()
+        n = int(self._lib.qlh_kh_draft_block(
+            self._handle, int(anchor), int(n_block), None, out, n_block))
+        if n < 0:
+            print(f"[kh.draft_block] rc={n}", file=sys.stderr, flush=True)
+            return []
+        return [int(out[i]) for i in range(n)]
+
+    def draft_rollback(self, n_keep: int) -> int:
+        return int(self._lib.qlh_kh_draft_rollback(self._handle, int(n_keep)))
+
+    def draft_close(self) -> int:
+        return int(self._lib.qlh_kh_draft_close(self._handle))
 
     def last_hidden(self) -> np.ndarray | None:
         """The trunk's final hidden of the most recent decode (needs SA_MTP=1).
@@ -553,6 +606,25 @@ def main() -> int:
                     _response(ok=False, error="layer_inp unavailable (see stage log)")
                 else:
                     _array_response(arr.reshape(-1, arr.shape[-1]))
+            elif operation == "draft_open":
+                rc = binding.draft_open(str(request["path"]), int(request.get("n_ctx", 256)),
+                                        int(request.get("n_batch", 32)),
+                                        int(request.get("n_gpu_layers", 0)))
+                _response(ok=(rc == 0), draft_rc=rc)
+            elif operation == "draft_n_embd_enc":
+                _response(ok=True, n_embd_enc=binding.draft_n_embd_enc())
+            elif operation == "draft_inject":
+                rc = binding.draft_inject(_decode_hidden(request))
+                _response(ok=(rc == 0), draft_rc=rc)
+            elif operation == "draft_block":
+                ids = binding.draft_block(int(request["anchor"]), int(request.get("n_block", 16)))
+                _response(ok=True, drafts=ids)
+            elif operation == "draft_rollback":
+                rc = binding.draft_rollback(int(request["n_keep"]))
+                _response(ok=(rc == 0), draft_rc=rc)
+            elif operation == "draft_close":
+                binding.draft_close()
+                _response(ok=True)
             elif operation == "add_layer_inp":
                 rc = binding.add_layer_inp(int(request["lid"]))
                 if rc != 0:
