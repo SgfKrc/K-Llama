@@ -35,16 +35,19 @@ llama_memory_recurrent: size = 50.25 MiB (1 cells, 32 layers, 1 seqs 0 rs_seq)
 
 **这一条不解决，任何投机方案都无法实现。**
 
-内存代价已实测：单快照 50.25 MiB（本机 0:32 段的 24 层 linear），按层数线性缩放。
+内存代价已实测（`SA_N_RS_SEQ=4`，35B）：
 
-| 快照数 | 本机（24 层 linear） | ROG（6 层 linear） |
-| ---: | ---: | ---: |
-| 8 | 402 MiB | 100 MiB |
-| 16 | 804 MiB | 201 MiB |
+```
+head 0:32 (32 layers): 251.25 MiB   —— R 11.25 MiB + S 240.00 MiB
+tail 32:40 ( 8 layers):  62.81 MiB   —— R  2.81 MiB + S  60.00 MiB
+```
 
-本机 22 GiB 可用毫无压力；ROG 只剩 0.82 GiB，100 MiB 能承受但会加剧已有的内存压力
-（见 `docs/DEPLOYMENT.md` 的跨机实测）。llama.cpp 侧机制齐备（PR #26499/#28118/#31350/#31368），
-shim 只需开 `n_rs_seq ≥ k` 并导出按序列回滚。
+S 是快照本身，随 `n_rs_seq` 线性增长；R 是单个状态。本机 22 GiB 毫无压力；tail 那 63 MiB
+塞进 ROG 的 0.82 GiB 可行，但吃掉七分之一余量。
+
+回滚行为也已验证：不开快照时 `qlh_kh_seq_rm` 返回 **-6**（`llama_memory_seq_rm` 拒绝），
+开到 4 之后退回"上一个 ubatch 内"返回 0。与 llama.cpp 的 #31368 一致——它只放行最近一批
+快照内的回退。shim 侧只需 `SA_N_RS_SEQ ≥ k`，无需改 llama.cpp。
 
 ---
 
@@ -196,14 +199,23 @@ embd 注入，逐位置 teacher forcing 与完整链的 gold 比较：
 
 ## 8. 落地顺序
 
-1. **开 `n_rs_seq` + 导出按序列回滚**（约 30 行 C）。这是所有方案的前置条件。
+1. **开 `n_rs_seq` + 导出按序列回滚**。已完成：`SA_N_RS_SEQ` 可配、`qlh_kh_seq_rm` 已导出。
 2. **批量验证接口贯通**（shim 已有，Python 侧缺 `hidden_tokens` op 与 tail 段的 list 返回，
    约 180 行）。
 3. **换带 MTP 的整模 + 改 loader 保留 nextn**，接 `draft-mtp`。预期 2.0–2.3×。
 4. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
 5. **DFlash** 作为最后一步，需要多层 hidden 输出与自定义编排。
 
-## 9. 已知限制
+## 9. 拼装状态
+
+部件全部单独验证过（加载、独立 context、草稿、真实接受率、批量验证逐位一致、`n_rs_seq`、
+`seq_rm`），**主循环的位置推进尚未对齐**：草稿验收后的位置推进与拒稿回滚会让两个 context 的
+位置错开一格，表现为输出与普通贪心不一致。`checks/probe_spec_wip.py` 是当前草图，带
+`PROBE_DEBUG=1` 可打印每次写入的位置。
+
+序列不一致之前不看性能数字——投机只该改变一步覆盖几个 token，不该改变 token 本身。
+
+## 10. 已知限制
 
 - **只对 temp=0 无损**。shim 暴露的是 argmax 而非 logits 分布，无法做标准 rejection sampling。
   项目默认贪心（`chat.py`），当前不构成问题。
