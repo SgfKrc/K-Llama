@@ -1,13 +1,15 @@
 # K-Llama v2
 
-> 状态：两段跨机链路可用；TUI、OpenAI 兼容接口、采样、显存校验均已接入
-> 更新日期：2026-10-30
+> 状态：两段跨机链路可用，DFlash 并行草稿与 SLIM-ARC prefetch 已接入；
+> TUI、OpenAI 兼容接口、采样、显存校验均已接
+> 更新日期：2026-10-31
 
 面向**非整模加载**的定制 llama.cpp 引擎。整模文件留在原地，每个节点只把属于自己那几层
 读进内存，段间只传 hidden state（`n_embd` 个 float32，8 KB）。
 
-Qwen3.6-35B-A3B（MoE，40 层，20.8 GiB）在两台机器上分成 32 + 8 层，跑到 5.3 t/s。
-一台 8 GiB 显存的笔记本加一台 15 GiB 内存的机器就装下了它。
+Qwen3.6-35B-A3B（MoE，40 层，14.8 GiB）在两台机器上分成 32 + 8 层：本机背 32 层、
+注意力与 dense 全上卡，ROG 背 8 层纯 CPU。解码阶段 **20.9 tok/s**（DFlash k=5，
+接受 96.4%，64-token 生成口径），同一个模型在本机单卡整模只有 10.5 tok/s。
 
 与第一代 K-Llama 的差别见 `docs/PATCHES.md`：那代用"裁好的层段工件"，这代用"整模 + 层范围"。
 
@@ -27,6 +29,17 @@ Qwen3.6-35B-A3B（MoE，40 层，20.8 GiB）在两台机器上分成 32 + 8 层�
 **两进程比单进程慢**——同一块 8 GiB 显存要分摊给两段。拆分的价值出现在**单机装不下**时：
 那时资源是相加而非共享。35B 就是这种情况（20.8 GiB 权重 vs 15.2 GiB 可用内存），
 80B 以上更是如此。单机上拆分的吞吐低于整模。
+
+跨机之后，快的那部分是投机解码挣回来的，与拆分本身无关：
+
+| 环节 | 手段 | 解码阶段吞吐 |
+| --- | --- | ---: |
+| 无投机 | 每步 1 token、一次绕链 | 12.2 |
+| MTP 递归 | k=2，草稿在 tail 的 NextN 头 | 1.13× |
+| **DFlash 并行块** | k=5，一次出 6 个候选、一轮验证 | **20.9** |
+
+口径：32:40 链路、`def quicksort(arr):`、64-token 生成、只计解码阶段。
+写满 128 token 时接受率从 96% 掉到 70%，吞吐 13.4 —— 见 `docs/SPECULATION.md`。
 
 ---
 
@@ -93,6 +106,10 @@ shim\build_shim_msvc.ps1
 
 # 3. 跑：拓扑里的 layer_range 决定各段拿哪几层
 python chain_client.py --topology topology-cross.toml --prompt-text "中国的首都是" --chat --gen 32
+
+# 4. 加 DFlash 并行草稿（需要草稿 GGUF，k=5 是实测拐点）
+python chain_client.py --topology topology-cross.toml --greedy --dflash <dflash.gguf> \
+       --dflash-block 6 --prompt-text "def quicksort(arr):" --gen 64
 ```
 
 远端机器先起 worker（`python stage_worker.py --role tail ...`），把拓扑里该段的
@@ -200,7 +217,7 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 | `docs/ISSUE-recurrent-snapshot-rollback.md` | hybrid 模型跨 ubatch 回滚缺陷与修复 |
 | `docs/SAMPLING.md` | 采样参数如何映射到 llama.cpp |
 | `docs/TUI.md` | TUI 布局与启动画面 |
-| `docs/PATCHES.md` | 两代补丁的差异，以及和原生 RPC 的分界 |
+| `docs/PATCHES.md` | 三代补丁的差异，以及和原生 RPC 的分界 |
 | `docs/LILICORR-轻量头.md` | DFlash 草稿的块内一致性重排，以及训练成本 |
 | `docs/ANDROID-SURFACE-段接入评估.md` | 弱设备接入的条件、安卓侧硬约束、切点实测 |
 | `docs/SLIM-ARC-接入计划.md` | 缺页优化在什么条件下才启用 |
@@ -213,12 +230,15 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 
 ## 未做
 
-- 跨框架接力（llama.cpp ↔ torch）。SLIM-ARC 已评估：它的 `on-demand` 加载器是唯一
-  能救"装不下"的机制，但没接进任何补丁；`prefetch` 只是预热已有映射。
-- 投机解码。词表已验证一致，但词表匹配的最小草稿模型就是 2B（33 ms/token），
-  相对本机三段只快 3 倍，加验证成本后是亏的。
-- 裁段工具的退场**已完成**。整模 + `layer_range` 与裁段工件逐位一致（`max|diff|=0`），
-  跨机也验证过了。`cut.py` 留着只用于离线比对。
-- 多序列 token 共享（需要 `kv_unified`；当前对这类请求明确报错）。
-- 投机解码。四个方向已实测判定，见 `docs/SPECULATION.md`：MTP 首选（预期 2.0–2.3×）、
-  DFlash 次之、PLD 按负载开关；前置条件是 recurrent state 回滚，shim 现在把它关着。
+- **跨框架接力**（llama.cpp ↔ torch）。段内只能整段切给一个执行器，不能跨机器拆算子。
+- **SLIM-ARC 的 on-demand 加载器**。目前只接了 `prefetch` 一级；本机整模在页缓存里时
+  `issued` 为 0，它只在"段装不下、真的在读盘"时才有事可做。接入细节见 `docs/PATCHES.md`。
+- **多序列 token 共享**（需要 `kv_unified`；当前对这类请求明确报错）。
+- **非贪心下的投机**。验证器只暴露 argmax，采样需要 rejection sampling，shim 还没做。
+
+## 已完成，留在这里备查
+
+- 裁段工具的退场。整模 + `layer_range` 与裁段工件逐位一致（`max|diff|=0`），跨机也验过。
+  `cut.py` 留着只用于离线比对。
+- 两个草稿源的接入（MTP 递归 / DFlash 并行块）与 DFlash 的 k 扫描（k=5 是拐点）；
+  SLIM-ARC prefetch 一级的接入与 win32 移植。

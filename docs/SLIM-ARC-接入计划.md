@@ -1,10 +1,21 @@
 # SLIM-ARC 接入计划
 
-> 状态：未开始（等待触发条件成立）
+> 状态：**prefetch 一级已接入**（2026-10-31），默认关闭，`SLIM_ARC_PREFETCH=1` 开启；
+> on-demand 加载器仍未做
 > 更新日期：2026-10-31
 
 本文只回答两件事：SLIM-ARC 补丁在什么条件下接进来，以及接进来之后按什么顺序启用。
 它不描述 SLIM-ARC 本身能做什么——那部分见 `docs/PATCHES.md` 与上游仓库。
+
+接入形态：`slim-arc-prefetch.{h,cpp}` 与它依赖的 4 个模块编译进 `llama.dll`
+（`src/CMakeLists.txt` 里 `SKIP_UNITY_BUILD_INCLUSION`，不参与 unity 分批）。两个挂点在
+`llama-model-loader.cpp::init_mappings`（注册每个权重的 mmap 区间）与
+`llama-context.cpp::graph_compute`（每步通知当前层）。win32 侧把
+`madvise(WILLNEED)` / `madvise(DONTNEED)` / `mincore` / `sysconf` / `mlock` 换成
+`PrefetchVirtualMemory` / `DiscardVirtualMemory` / `GetSystemInfo` / `VirtualLock`。
+实测通路：`llama-cli -ngl 0` 跑 3 个 token 后打印
+`[SLIM-ARC-PREFETCH] calls=5 issued=0.0MB window=3` —— 通知链路工作，`issued` 为 0 是因为
+整模已在页缓存里，没有可补的页。
 
 ---
 

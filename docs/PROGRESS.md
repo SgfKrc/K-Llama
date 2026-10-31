@@ -78,6 +78,8 @@ ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
 | `[C-scheme]` | `qwen35` / `qwen35moe` 的 pre-norm tap；`extern "C"` 导出供 C 侧按名解析 |
 | `[TAG_RECURRENT_ROLLBACK_SPLITS]` | recurrent 快照按 ubatch 滚动，跨批回滚不再读到过期槽位 |
 | `[DFLASH-01]` | 末层输出挂 `t_layer_inp[n_layer]`、`llama_model_n_embd_inp_enc`、warmup 空跑越界修复 |
+| `[SLIM-ARC]` | prefetch 一级：`init_mappings` 注册 mmap 区间、`graph_compute` 通知当前层；win32 侧用 `PrefetchVirtualMemory` 等替代 madvise，默认关闭（`SLIM_ARC_PREFETCH=1`） |
+| `[DFLASH-01]` | 末层输出挂 `t_layer_inp[n_layer]`、`llama_model_n_embd_inp_enc`、warmup 空跑越界修复 |
 
 **shim（`shim/qlh_keep_head_gpu.c`，约 1650 行 C）**
 
@@ -89,7 +91,7 @@ MTP 草稿、采样器、`seq_rm`。MSVC 导出的 C++ mangled 名用 `GetProcAd
 | 文件 | 职责 |
 | --- | --- |
 | `topology.py` | TOML 拓扑解析，切分点按 `full_attention_interval` fail-closed |
-| `chain_client.py` | 绕链驱动、投机循环、按负载选 k、内存预检 |
+| `chain_client.py` | 绕链驱动、两个草稿源（MTP 递归 / DFlash 并行块）、按负载选 k、内存预检 |
 | `engine.py` / `keep_head.py` | shim 的 ctypes 绑定 |
 | `stage_worker.py` / `protocol.py` / `wire.py` | 段进程与帧协议 |
 | `server.py` / `stream.py` / `proto_responses.py` | OpenAI 兼容接口与 SSE |

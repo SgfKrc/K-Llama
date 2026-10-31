@@ -1,7 +1,7 @@
 # 两代补丁，以及与原生 RPC 的分界
 
 > 状态：已核对源码
-> 更新日期：2026-10-30
+> 更新日期：2026-10-31
 
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在**模型怎么装进显存和内存**：
 第一代靠"裁好的层段工件"，第二代靠"整模 + 层范围"。llama.cpp 侧的补丁因此完全不同。
@@ -53,6 +53,50 @@
 
 **为什么第二代反而更小**：第一代要 9 个架构各自登记挂点，第二代把"取哪一层的输出"变成
 "只加载哪几层"——后者是加载器的事，与架构无关。架构侧只剩 2 处 tap。
+
+---
+
+## 第三代：SLIM-ARC prefetch（2026-10-31）
+
+上游 SLIM-ARC 是给 Linux 写的，本机是 Windows，所以是**带回移植的接入**，只接它两级里的
+第一级（`prefetch`）。第二级（on-demand 加载器）仍未接，理由见
+[`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md)。
+
+新增 5 个源文件：`slim-arc-prefetch.{h,cpp}` 加它依赖的
+`page-range` / `expert-reclaim` / `expert-residency` / `expert-transition`。
+`src/CMakeLists.txt` 用 `SKIP_UNITY_BUILD_INCLUSION` 把它们挡在 unity 批次之外——这批文件带
+`WIN32_LEAN_AND_MEAN` 和 POSIX 名字，混进 unity 会污染同批的翻译单元。
+
+两个挂点：
+
+| 文件 | 位置 | 作用 |
+| --- | --- | --- |
+| `llama-model-loader.cpp` | `init_mappings()` 末尾 | 把每个权重的 `(mmap 基址 + 偏移, 大小, 层号)` 注册进调度器 |
+| `llama-context.cpp` | `graph_compute()` 调 `sched_graph_compute_async` 之前 | 通知"现在要算第 N 层"，调度器据此预取 N+1..N+window |
+
+**层号怎么来**：上游从图节点名里读 `blk.N`，在本树里取不到——GGML 的 scheduler 在计算前把
+每个节点重命名成 `node_%d`，真正的张量名留在**操作数**上，所以改成读 `src[0..]` 的名字。
+按上游写法接时 `calls` 恒为 0；改成读 src 后 `calls=5`（3 个 token 各一次通知加上 prefill），
+链路确认通了。
+
+win32 移植面（3 个函数 + 1 个锁包装）：
+
+| POSIX | Windows | 说明 |
+| --- | --- | --- |
+| `madvise(WILLNEED)` | `PrefetchVirtualMemory` | 语义相同：把这些页读成驻留 |
+| `madvise(DONTNEED)` | `DiscardVirtualMemory` | 内容作废、页丢弃，最接近的等价物 |
+| `madvise(NORMAL/RANDOM/SEQUENTIAL)` | 空操作 | 只影响内核预读启发式，Windows 没有这个接口 |
+| `mincore` | 不支持，返回"未知" | 唯一消费方是专家热锁 LRU，未知即跳过该区间 |
+| `sysconf(_SC_PAGESIZE)` | `GetSystemInfo().dwPageSize` | |
+| `mlock` / `munlock` | `VirtualLock` / `VirtualUnlock` | |
+
+另有两处 MSVC 兼容：`NOMINMAX`（否则 `windows.h` 的 `max` 宏会把 `std::max` 和
+`numeric_limits<T>::max()` 一起打掉），以及用 `_umul128` 拼出 64×64→128 的乘积替代
+`unsigned __int128`（MSVC 没有该类型，用在专家 LRU 的打分比较上）。
+
+**当前生效范围**：默认关闭，`SLIM_ARC_PREFETCH=1` 才装调度器。整模在页缓存里时
+`issued` 为 0——它只在"段装不下、真的在读盘"的降级形态里才有事可做，与
+`SLIM-ARC-接入计划.md` 的触发条件一致。
 
 ---
 

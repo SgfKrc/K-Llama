@@ -719,6 +719,151 @@ def speculate(clients: list[StageClient], token: int, n_past: int,
     return out
 
 
+# ---------------------------------------------------------------------------
+# DFlash parallel drafting
+# ---------------------------------------------------------------------------
+
+# Source layers whose *input* hidden the DFlash encoder consumes, in GGUF order. Fixed by the
+# published checkpoint (`dflash.target_layers`); a draft model trained against a different
+# target would carry its own list.
+DFLASH_TARGET_LAYERS = (2, 7, 12, 17, 23, 28, 33, 38)
+
+
+def dflash_split_layers(head_range, tail_range):
+    """Map the draft's source-layer list onto head-local and tail-local ids.
+
+    Which stage owns a given source layer follows from where the chain is cut, so this cannot
+    be a constant: asking a 4-layer tail for source layer 6 would address a layer it never
+    loaded, and the shim answers a missing slot with an error rather than a wrong vector.
+    """
+    head_lo, head_hi = head_range
+    tail_lo, tail_hi = tail_range
+    head_ids = [l - head_lo for l in DFLASH_TARGET_LAYERS if head_lo <= l < head_hi]
+    tail_ids = [l - tail_lo for l in DFLASH_TARGET_LAYERS if tail_lo <= l < tail_hi]
+    if len(head_ids) + len(tail_ids) != len(DFLASH_TARGET_LAYERS):
+        raise RuntimeError(
+            "the cut point drops a layer the draft consumes: it wants %s, "
+            "head covers %s of %s, tail covers %s of %s"
+            % (list(DFLASH_TARGET_LAYERS), head_ids, head_range, tail_ids, tail_range))
+    return head_ids, tail_ids
+
+
+class DFlashDriver:
+    """One DFlash drafting session over an already connected chain.
+
+    DFlash proposes a whole block of future tokens in a single forward pass, so a round is:
+    draft `n_block` candidates from the anchor, verify `[anchor] + drafts` through the chain in
+    one trip, keep the longest correct prefix. Its KV is fed the *target's* intermediate hidden
+    states, which is why the chain has to expose per-layer `layer_inp` slots and why the rows
+    arrive one round behind the verification pass.
+
+    Contract: the tokens it returns are what plain greedy decoding would have produced. The
+    verifier compares drafts against the chain's own argmax, so this only holds at
+    temperature 0 -- sampling would need rejection sampling, which the shim does not expose.
+    """
+
+    def __init__(self, clients, draft_path, n_block, ctx, stage_ms, stats):
+        if clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
+            raise RuntimeError("DFlash needs a gpu head and a tail")
+        self.clients = clients
+        self.head = clients[0]
+        self.tail = clients[-1]
+        self.n_block = int(n_block)
+        self.stage_ms = stage_ms
+        self.stats = stats
+        self.pending = []
+        self.primed = False
+        self.head_ids, self.tail_ids = dflash_split_layers(
+            self.head.stage.layer_range, self.tail.stage.layer_range)
+        for lid in self.head_ids:
+            self.head.add_layer_inp(lid)
+        for lid in self.tail_ids:
+            self.tail.add_layer_inp(lid)
+        if self.head.draft_open(draft_path, ctx, 512, 99) != 0:
+            raise RuntimeError("draft_open failed for %s" % draft_path)
+        self.enc_w = self.head.draft_n_embd_enc()
+
+    def _rows(self):
+        """The eight target-layer inputs of the most recent forward, in GGUF order."""
+        h = self.head.layer_inp(self.head_ids)
+        t = self.tail.layer_inp(self.tail_ids)
+        if h is None or t is None:
+            raise RuntimeError("layer_inp unavailable (head=%s tail=%s)"
+                               % (None if h is None else h.shape,
+                                  None if t is None else t.shape))
+        if h.shape[1] != t.shape[1]:
+            raise RuntimeError("row mismatch: head %d tail %d" % (h.shape[1], t.shape[1]))
+        n = h.shape[1]
+        rows = np.concatenate([h.transpose(1, 0, 2), t.transpose(1, 0, 2)],
+                              axis=1).reshape(n, -1)
+        if rows.shape[1] != self.enc_w:
+            raise RuntimeError("enc width %d != %d" % (rows.shape[1], self.enc_w))
+        return rows
+
+    def prime(self):
+        """Seed the draft KV with the prefill rows. Call once, after the prompt has run."""
+        self.head.draft_reset()
+        self.head.draft_inject(self._rows())
+        self.primed = True
+
+    def step(self, anchor: int, n_past: int):
+        """One round. Returns the tokens this round adds *beyond* `anchor`."""
+        self.stats["steps"] = self.stats.get("steps", 0) + 1
+        if not self.primed:
+            self.prime()
+        else:
+            # The previous round's accepted rows were never handed to the draft KV; its own
+            # history stopped at the verify pass, so rewind it to the chain's position first.
+            self.head.draft_rollback(n_past)
+            if self.pending:
+                self.head.draft_inject(np.concatenate(self.pending, axis=0))
+                self.pending = []
+
+        drafts = self.head.draft_block(anchor, self.n_block)
+        if not drafts:
+            self.stats["no_draft"] = self.stats.get("no_draft", 0) + 1
+            return [forward(self.clients, [anchor], n_past, self.stage_ms)]
+
+        t0 = time.perf_counter()
+        block_hidden = self.head.forward_tokens([anchor] + drafts, n_past)
+        if self.stage_ms and len(self.stage_ms) > 1:
+            self.stage_ms[0].append((time.perf_counter() - t0) * 1000.0)
+        t0 = time.perf_counter()
+        verified = self.tail.forward_tokens_out(block_hidden, n_past)
+        if self.stage_ms:
+            self.stage_ms[-1].append((time.perf_counter() - t0) * 1000.0)
+
+        accept = 0
+        for i, draft in enumerate(drafts):
+            if i < len(verified) and int(verified[i]) == int(draft):
+                accept += 1
+            else:
+                break
+
+        self.stats["drafts"] = self.stats.get("drafts", 0) + len(drafts)
+        self.stats["accepted"] = self.stats.get("accepted", 0) + accept
+
+        # Rows for the accepted prefix, to feed the draft KV next round. They must come from
+        # this forward, not the previous one: the verify pass just wrote those positions.
+        take = self._rows()[: 1 + accept]
+        self.pending.append(take)
+
+        if len(drafts) > accept:
+            # Both stages wrote the rejected rows. Leave them and the next block starts from a
+            # polluted position -- measured as a -1 from llama_decode on the following round.
+            keep = n_past + 1 + accept
+            for client in (self.tail, self.head):
+                try:
+                    client.seq_rm(keep)
+                except Exception:  # noqa: BLE001 - a failed rollback must not kill the run
+                    self.stats["rollback_error"] = self.stats.get("rollback_error", 0) + 1
+
+        # The row after the accepted prefix was computed by the verify pass but paid for by no
+        # draft, so it is free -- that is what makes a round advance accept+1 tokens.
+        free = int(verified[accept]) if accept < len(verified) else int(verified[-1])
+        return list(drafts[:accept]) + [free]
+
+
 def _children(pid: int) -> list:
     """Snapshot a worker's descendants, taken while its parent is still alive."""
     try:
@@ -801,6 +946,11 @@ def main() -> int:
     # --greedy opts back into it for reproducible comparisons.
     ap.add_argument("--greedy", action="store_true",
                     help="temperature 0; deterministic but prone to repetition on 35B")
+    ap.add_argument("--dflash", default="",
+                    help="DFlash 草稿模型 GGUF 路径。给了就走并行块草稿（需要 --greedy，"
+                         "验证器只暴露 argmax）。与 --spec-k 互斥：两者都是草稿源")
+    ap.add_argument("--dflash-block", type=int, default=6,
+                    help="每轮草稿数 = block-1；实测 6（k=5）最优，8 起接受率崩塌")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)
@@ -972,19 +1122,37 @@ def main() -> int:
                 c.reset()
 
             stage_ms: list[list[float]] = [[] for _ in stages]
+            # The draft driver has to be built before the prompt runs: it opens the draft
+            # model and switches on the per-layer `layer_inp` taps, and the prefill pass is
+            # what fills them. Priming the draft KV happens after, below.
+            dflash = None
+            spec_stats: dict = {}
+            if args.dflash:
+                if not args.greedy:
+                    raise SystemExit("--dflash 需要 --greedy：验证器只暴露 argmax，"
+                                     "采样下无法做 rejection sampling")
+                if args.spec_k > 0:
+                    raise SystemExit("--dflash 与 --spec-k 互斥：两者都是草稿源")
+                dflash = DFlashDriver(clients, args.dflash, args.dflash_block, ctx,
+                                      stage_ms, spec_stats)
             t0 = time.perf_counter()
             token = forward(clients, prompt, 0, stage_ms)
             prefill_s = time.perf_counter() - t0
             # Per-stage numbers below are decode steps only: a prefill pass is an order
             # of magnitude larger and would dominate the median of a short --gen run.
             stage_ms = [[] for _ in stages]
+            if dflash is not None:
+                dflash.stage_ms = stage_ms
+                # The first step primes the draft KV; doing it here would need the rows the
+                # prefill just produced, which step() reads anyway.
 
             step_ms: list[float] = []
             out_tokens = [token]
             n_past = len(prompt)
-            spec_stats: dict = {}
             auto = args.spec_k < 0
-            if auto:
+            if dflash is not None:
+                k = int(args.dflash_block) - 1
+            elif auto:
                 # Start from the prompt's shape; the live acceptance rate can veto it below.
                 k = 2 if (args.prompt_text and looks_like_code(args.prompt_text)) else 0
             else:
@@ -1002,7 +1170,9 @@ def main() -> int:
                         spec_stats["auto_off_at"] = spec_stats["steps"]
                         k = 0
                 start = time.perf_counter()
-                if k > 0:
+                if dflash is not None:
+                    produced = dflash.step(token, n_past)
+                elif k > 0:
                     produced = speculate(clients, token, n_past, stage_ms, k, spec_stats)
                 else:
                     produced = [forward(clients, [token], n_past, stage_ms)]
@@ -1070,6 +1240,14 @@ def main() -> int:
                 print(f"    text:   {_text.decode('utf-8', 'replace')!r}")
             except Exception:  # noqa: BLE001 - a decode failure must not kill a timing run
                 pass
+            if dflash is not None:
+                # The draft context holds its own KV and a second copy of the token table;
+                # dropping it here keeps a --repeat run from stacking them.
+                try:
+                    clients[0].draft_close()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  draft_close failed: {exc}", file=sys.stderr)
+                dflash = None
     finally:
         # One bad session must not leave the rest of the stages running: that is how
         # the next run ends up loading models on top of still-resident ones.
