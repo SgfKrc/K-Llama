@@ -17,45 +17,20 @@ import os
 
 import numpy as np
 
+from _shimlib import head_step, load as _shim_load, tail_batch, tail_one
+
 SHIM = r"H:\slimarc-proto\exp-c\shim\qlh_keep_head.dll"
 MODEL = (r"H:\qlh_models\qwen3-6-35b-a3b-opus47-distill-apex-mtp"
          r"\Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality.gguf")
 
 os.environ["SA_BACKEND_DIR"] = os.path.dirname(SHIM)
 os.environ["SA_N_CPU_MOE"] = "0"
-os.add_dll_directory(os.path.dirname(SHIM))
 
-lib = ctypes.CDLL(SHIM)
-P32 = ctypes.POINTER(ctypes.c_int32)
-PF = ctypes.POINTER(ctypes.c_float)
-
-for name, argt, rest in [
-    ("qlh_kh_load", [ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-                     ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, P32, P32,
-                     ctypes.c_char_p, ctypes.c_size_t], ctypes.c_void_p),
-    ("qlh_kh_forward", [ctypes.c_void_p, P32, ctypes.c_int32, ctypes.c_int32, PF], ctypes.c_int32),
-    ("qlh_kh_forward_embd_token", [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                   P32, P32, P32, P32], ctypes.c_int32),
-    ("qlh_kh_forward_embd_tokens", [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                    P32, P32, P32, P32, ctypes.c_int32], ctypes.c_int32),
-    ("qlh_kh_tokenize", [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, P32,
-                         ctypes.c_int32, ctypes.c_int32], ctypes.c_int32),
-    ("qlh_kh_n_embd", [ctypes.c_void_p], ctypes.c_int32),
-    ("qlh_kh_seq_rm", [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32], ctypes.c_int32),
-]:
-    fn = getattr(lib, name)
-    fn.argtypes = argt
-    fn.restype = rest
-lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
-lib.qlh_kh_reset.restype = None
+lib = _shim_load(SHIM)
 
 
 def load(rng, need_logits, mtp, gpu):
-    os.environ["LLAMA_LAYER_RANGE"] = rng
-    os.environ["SA_NEEDS_LOGITS"] = str(need_logits)
-    os.environ["SA_MTP"] = str(mtp)
-    os.environ["SA_N_GPU_LAYERS"] = str(gpu)
-    os.environ["SA_N_RS_SEQ"] = os.environ.get("PROBE_RS_SEQ", "4")
+    _shim_load(SHIM, range=rng, logits=need_logits, mtp=mtp, gpu=gpu)
     ne, nl = ctypes.c_int32(0), ctypes.c_int32(0)
     err = ctypes.create_string_buffer(512)
     h = lib.qlh_kh_load(MODEL.encode(), 1024, 8, 64, 1, 0, 0,
@@ -63,34 +38,6 @@ def load(rng, need_logits, mtp, gpu):
     if not h:
         raise SystemExit("load %s failed: %s" % (rng, err.value.decode()))
     return h
-
-
-def hw(head, tokens, at, W):
-    out = np.zeros((len(tokens), W), dtype=np.float32)
-    rc = lib.qlh_kh_forward(head, (ctypes.c_int32 * len(tokens))(*tokens), len(tokens), at,
-                            out.ctypes.data_as(PF))
-    if rc != 0:
-        raise RuntimeError("head rc=%d at %d" % (rc, at))
-    return out
-
-
-def t1(tail, hidden, at, W):
-    t = ctypes.c_int32(-1)
-    rc = lib.qlh_kh_forward_embd_token(tail, hidden.ctypes.data_as(PF), 1, at,
-                                       None, None, None, ctypes.byref(t))
-    if rc != 0:
-        raise RuntimeError("tail rc=%d at %d" % (rc, at))
-    return t.value
-
-
-def tn(tail, rows, at, W):
-    k = rows.shape[0]
-    out = (ctypes.c_int32 * k)()
-    rc = lib.qlh_kh_forward_embd_tokens(tail, rows.ctypes.data_as(PF), k, at,
-                                        None, None, None, out, k)
-    if rc != 0:
-        raise RuntimeError("tail rows rc=%d at %d" % (rc, at))
-    return list(out)
 
 
 def main() -> int:
@@ -108,14 +55,14 @@ def main() -> int:
     # plain chain: tokens at n.. and hidden at n..
     lib.qlh_kh_reset(head)
     lib.qlh_kh_reset(tail)
-    hp = hw(head, toks, 0, W)
-    tok = {n: t1(tail, hp[-1:], n - 1, W)}
+    hp = head_step(head, toks, 0, W)
+    tok = {n: tail_one(tail, hp[-1:], n - 1, W)}
     hid = {}
     p = n
-    hid[p] = hw(head, [tok[p]], p, W)
+    hid[p] = head_step(head, [tok[p]], p, W)
     while p < n + steps + 2:
-        tok[p + 1] = t1(tail, hid[p], p, W)
-        hid[p + 1] = hw(head, [tok[p + 1]], p + 1, W)
+        tok[p + 1] = tail_one(tail, hid[p], p, W)
+        hid[p + 1] = head_step(head, [tok[p + 1]], p + 1, W)
         p += 1
     print("plain tokens: %r" % [tok[i] for i in range(n, n + steps + 1)])
 
@@ -123,14 +70,14 @@ def main() -> int:
         """head holds 0..P, tail holds n-1..P-1 (the round invariant)."""
         lib.qlh_kh_reset(head)
         lib.qlh_kh_reset(tail)
-        hp_ = hw(head, toks, 0, W)
-        t1(tail, hp_[-1:], n - 1, W)
-        hh = hw(head, [tok[n]], n, W)
+        hp_ = head_step(head, toks, 0, W)
+        tail_one(tail, hp_[-1:], n - 1, W)
+        hh = head_step(head, [tok[n]], n, W)
         for q in range(n, P):
-            t1(tail, hh, q, W)
-            hh = hw(head, [tok[q + 1]], q + 1, W)
+            tail_one(tail, hh, q, W)
+            hh = head_step(head, [tok[q + 1]], q + 1, W)
         # head holds P, tail holds P-1
-        t1(tail, hh, P, W)                     # tail holds P
+        tail_one(tail, hh, P, W)                     # tail holds P
         return hh
 
     print("")
@@ -143,24 +90,24 @@ def main() -> int:
 
         # clean: head writes token_{P+1} at P+1, then nxt at P+2
         hP = build(P)
-        hA = hw(head, [tok[P + 1]], P + 1, W)
-        hclean = hw(head, [nxt], P + 2, W)
-        tclean = t1(tail, hclean, P + 2, W)
+        hA = head_step(head, [tok[P + 1]], P + 1, W)
+        hclean = head_step(head, [nxt], P + 2, W)
+        tclean = tail_one(tail, hclean, P + 2, W)
 
         # spec A: two SINGLE writes at P+1,P+2, rm to P+2, then nxt at P+2 (HEAD_BATCH=0 path)
         hP = build(P)
-        hw(head, [tok[P + 1]], P + 1, W)
-        hw(head, [wrong], P + 2, W)
+        head_step(head, [tok[P + 1]], P + 1, W)
+        head_step(head, [wrong], P + 2, W)
         rcA = lib.qlh_kh_seq_rm(head, 0, P + 2)
-        hspecA = hw(head, [nxt], P + 2, W)
-        tsA = t1(tail, hspecA, P + 2, W)
+        hspecA = head_step(head, [nxt], P + 2, W)
+        tsA = tail_one(tail, hspecA, P + 2, W)
 
         # spec B: one BATCHED write at P+1,P+2, rm to P+2, then nxt at P+2 (HEAD_BATCH=1 path)
         hP = build(P)
-        hw(head, [tok[P + 1], wrong], P + 1, W)
+        head_step(head, [tok[P + 1], wrong], P + 1, W)
         rcB = lib.qlh_kh_seq_rm(head, 0, P + 2)
-        hspecB = hw(head, [nxt], P + 2, W)
-        tsB = t1(tail, hspecB, P + 2, W)
+        hspecB = head_step(head, [nxt], P + 2, W)
+        tsB = tail_one(tail, hspecB, P + 2, W)
 
         dA = float(np.max(np.abs(hclean.astype(np.float64) - hspecA.astype(np.float64))))
         dB = float(np.max(np.abs(hclean.astype(np.float64) - hspecB.astype(np.float64))))
@@ -175,15 +122,15 @@ def main() -> int:
     # tail: batched 2-row write vs two single writes, at a mid history
     P = n + 3
     build(P)
-    hP = hw(head, [tok[P + 1]], P + 1, W)
-    a0 = t1(tail, hP, P + 1, W)
-    rows = hw(head, [tok[P + 1], tok[P + 2]], P + 1, W)
+    hP = head_step(head, [tok[P + 1]], P + 1, W)
+    a0 = tail_one(tail, hP, P + 1, W)
+    rows = head_step(head, [tok[P + 1], tok[P + 2]], P + 1, W)
     # same hidden rows into the tail, batched, but on a rebuilt state
     build(P)
-    hb = tn(tail, rows, P + 1, W)
+    hb = tail_batch(tail, rows, P + 1, W)
     build(P)
-    x0 = t1(tail, rows[0:1], P + 1, W)
-    x1 = t1(tail, rows[1:2], P + 2, W)
+    x0 = tail_one(tail, rows[0:1], P + 1, W)
+    x1 = tail_one(tail, rows[1:2], P + 2, W)
     print("")
     print("tail batched [%d,%d] vs single [%d,%d] -> %s"
           % (hb[0], hb[1], x0, x1, "SAME" if hb == [x0, x1] else "DIFF"))

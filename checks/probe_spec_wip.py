@@ -99,6 +99,8 @@ import time
 
 import numpy as np
 
+from _shimlib import PF, head_step, load as _shim_load, tail_batch, tail_one
+
 SHIM = r"H:\slimarc-proto\exp-c\shim\qlh_keep_head.dll"
 MODEL = (r"H:\qlh_models\qwen3-6-35b-a3b-opus47-distill-apex-mtp"
          r"\Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality.gguf")
@@ -107,54 +109,14 @@ os.environ["SA_BACKEND_DIR"] = os.path.dirname(SHIM)
 os.environ["SA_N_CPU_MOE"] = "0"
 DEBUG = os.environ.get("PROBE_DEBUG") == "1"
 SELFTEST = os.environ.get("PROBE_SELFTEST") == "1"
-os.add_dll_directory(os.path.dirname(SHIM))
 
-lib = ctypes.CDLL(SHIM)
-P32 = ctypes.POINTER(ctypes.c_int32)
-PF = ctypes.POINTER(ctypes.c_float)
-
-lib.qlh_kh_load.argtypes = [ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-                            ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-                            P32, P32, ctypes.c_char_p, ctypes.c_size_t]
-lib.qlh_kh_load.restype = ctypes.c_void_p
-lib.qlh_kh_forward.argtypes = [ctypes.c_void_p, P32, ctypes.c_int32, ctypes.c_int32, PF]
-lib.qlh_kh_forward.restype = ctypes.c_int32
-lib.qlh_kh_forward_embd_token.argtypes = [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                          P32, P32, P32, P32]
-lib.qlh_kh_forward_embd_token.restype = ctypes.c_int32
-lib.qlh_kh_forward_embd_tokens.argtypes = [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                           P32, P32, P32, P32, ctypes.c_int32]
-lib.qlh_kh_forward_embd_tokens.restype = ctypes.c_int32
-lib.qlh_kh_last_hidden.argtypes = [ctypes.c_void_p, PF, ctypes.c_int32]
-lib.qlh_kh_last_hidden.restype = ctypes.c_int32
-lib.qlh_kh_mtp_draft.argtypes = [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                 ctypes.c_int32, P32]
-lib.qlh_kh_mtp_draft.restype = ctypes.c_int32
-lib.qlh_kh_tokenize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, P32,
-                                ctypes.c_int32, ctypes.c_int32]
-lib.qlh_kh_tokenize.restype = ctypes.c_int32
-lib.qlh_kh_n_embd.argtypes = [ctypes.c_void_p]
-lib.qlh_kh_n_embd.restype = ctypes.c_int32
-lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
-lib.qlh_kh_reset.restype = None
-lib.qlh_kh_seq_rm.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
-lib.qlh_kh_seq_rm.restype = ctypes.c_int32
-lib.qlh_kh_token_to_piece.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p,
-                                      ctypes.c_int32]
-lib.qlh_kh_token_to_piece.restype = ctypes.c_int32
+lib = _shim_load(SHIM)
 
 
 # ---------------------------------------------------------------------------------- plumbing
 
 def load(rng: str, need_logits: int, mtp: int, gpu: int):
-    os.environ["LLAMA_LAYER_RANGE"] = rng
-    os.environ["SA_NEEDS_LOGITS"] = str(need_logits)
-    os.environ["SA_MTP"] = str(mtp)
-    os.environ["SA_N_GPU_LAYERS"] = str(gpu)
-    # Recurrent-state snapshots. Without them llama_memory_seq_rm refuses to roll back a hybrid
-    # model's linear-layer state and a rejected draft cannot be undone. llama.cpp also requires
-    # n_ubatch > n_rs_seq + 1, so this value bounds the micro-batch from below.
-    os.environ["SA_N_RS_SEQ"] = os.environ.get("PROBE_RS_SEQ", "4")
+    _shim_load(SHIM, range=rng, logits=need_logits, mtp=mtp, gpu=gpu)
     ne, nl = ctypes.c_int32(0), ctypes.c_int32(0)
     err = ctypes.create_string_buffer(512)
     h = lib.qlh_kh_load(MODEL.encode(), 1024, 8, 64, 1, 0, 0,
@@ -168,34 +130,6 @@ def piece(h, tok: int) -> str:
     buf = ctypes.create_string_buffer(64)
     n = lib.qlh_kh_token_to_piece(h, tok, buf, len(buf))
     return buf.raw[:n].decode("utf-8", "replace") if n > 0 else "?"
-
-
-def head_write(head, tokens, at, W):
-    out = np.zeros((len(tokens), W), dtype=np.float32)
-    rc = lib.qlh_kh_forward(head, (ctypes.c_int32 * len(tokens))(*tokens), len(tokens), at,
-                            out.ctypes.data_as(PF))
-    if rc != 0:
-        raise RuntimeError("head forward rc=%d at %d" % (rc, at))
-    return out
-
-
-def tail_one(tail, hidden, at, W):
-    t = ctypes.c_int32(-1)
-    rc = lib.qlh_kh_forward_embd_token(tail, hidden.ctypes.data_as(PF), 1, at,
-                                       None, None, None, ctypes.byref(t))
-    if rc != 0:
-        raise RuntimeError("tail token rc=%d at %d" % (rc, at))
-    return t.value
-
-
-def tail_rows(tail, rows, at, W):
-    k = rows.shape[0]
-    out = (ctypes.c_int32 * k)()
-    rc = lib.qlh_kh_forward_embd_tokens(tail, rows.ctypes.data_as(PF), k, at,
-                                        None, None, None, out, k)
-    if rc != 0:
-        raise RuntimeError("tail rows rc=%d at %d" % (rc, at))
-    return list(out)
 
 
 def last_hidden(tail, W):
@@ -229,12 +163,12 @@ def generate(head, tail, prompt_tokens, want, W, spec, head_batch, no_rollback=F
     lib.qlh_kh_reset(head)
     lib.qlh_kh_reset(tail)
 
-    hp = head_write(head, prompt_tokens, 0, W)       # head: 0 .. n-1
+    hp = head_step(head, prompt_tokens, 0, W)       # head: 0 .. n-1
     if hp.shape[0] != n:
         raise RuntimeError("head prefill returned %d rows for %d tokens" % (hp.shape[0], n))
 
     tok = tail_one(tail, hp[-1:], n - 1, W)          # tail: n-1  ->  token@n
-    hidden = head_write(head, [tok], n, W)           # head: n    ->  hidden@n
+    hidden = head_step(head, [tok], n, W)           # head: n    ->  hidden@n
 
     hn, tn, P = n + 1, n, n
     tokens = [tok]                                   # token@n
@@ -261,14 +195,14 @@ def generate(head, tail, prompt_tokens, want, W, spec, head_batch, no_rollback=F
             # token@(P+2) must be known before anything is written at P+2, so the block is
             # [t_next] then [t2]: two 1-token head writes, two 1-token tail writes, 2 tokens out.
             drafted += 1
-            h1 = head_write(head, [t_next], P + 1, W)
+            h1 = head_step(head, [t_next], P + 1, W)
             hn = P + 2
             t2 = tail_one(tail, h1, P + 1, W)
             tn = P + 2
             tokens.append(t2)                        # position P+2
             if t2 == d:
                 accepted += 1
-            hidden = head_write(head, [t2], P + 2, W)
+            hidden = head_step(head, [t2], P + 2, W)
             hn = P + 3
             P = P + 2
             if DEBUG:
@@ -281,7 +215,7 @@ def generate(head, tail, prompt_tokens, want, W, spec, head_batch, no_rollback=F
 
         if d is None:
             # No draft (or not asked): one position, one token.
-            hidden = head_write(head, [t_next], P + 1, W)
+            hidden = head_step(head, [t_next], P + 1, W)
             hn = P + 2
             P = P + 1
             if DEBUG:
@@ -293,17 +227,17 @@ def generate(head, tail, prompt_tokens, want, W, spec, head_batch, no_rollback=F
         drafted += 1
         # d. one verification block over [t_next, d] at P+1, P+2
         if head_batch:
-            rows = head_write(head, [t_next, d], P + 1, W)
+            rows = head_step(head, [t_next, d], P + 1, W)
             hn = P + 3
             drift = None
         else:
-            r0 = head_write(head, [t_next], P + 1, W)
-            r1 = head_write(head, [d], P + 2, W)
+            r0 = head_step(head, [t_next], P + 1, W)
+            r1 = head_step(head, [d], P + 2, W)
             rows = np.stack([r0[0], r1[0]])
             hn = P + 3
             drift = None
 
-        tb = tail_rows(tail, rows, P + 1, W)
+        tb = tail_batch(tail, rows, P + 1, W)
         tn = P + 3
         if not (hn == P + 3 and tn == P + 3):
             raise AssertionError("ledger after block: hn=%d tn=%d" % (hn, tn))
@@ -313,7 +247,7 @@ def generate(head, tail, prompt_tokens, want, W, spec, head_batch, no_rollback=F
             accepted += 1
             tokens.append(d)                         # position P+2
             nxt = tb[1]
-            hidden = head_write(head, [nxt], P + 3, W)
+            hidden = head_step(head, [nxt], P + 3, W)
             hn = P + 4
             tokens.append(nxt)                       # position P+3
             P = P + 3
@@ -326,7 +260,7 @@ def generate(head, tail, prompt_tokens, want, W, spec, head_batch, no_rollback=F
             seq_rm(head, tail, P + 2)
             hn = tn = P + 2
             nxt = tb[0]                              # token@(P+2), the trunk's own answer
-            hidden = head_write(head, [nxt], P + 2, W)
+            hidden = head_step(head, [nxt], P + 2, W)
             hn = P + 3
             tokens.append(nxt)                       # position P+2
             P = P + 2
@@ -346,25 +280,25 @@ def selftest(head, tail, prompt_tokens, W):
     n = len(prompt_tokens)
     lib.qlh_kh_reset(head)
     lib.qlh_kh_reset(tail)
-    hp = head_write(head, prompt_tokens, 0, W)
+    hp = head_step(head, prompt_tokens, 0, W)
     t = {n: tail_one(tail, hp[-1:], n - 1, W)}
     hid = {}
     p = n
-    hid[p] = head_write(head, [t[p]], p, W)
+    hid[p] = head_step(head, [t[p]], p, W)
     while p < n + 2:
         t[p + 1] = tail_one(tail, hid[p], p, W)
-        hid[p + 1] = head_write(head, [t[p + 1]], p + 1, W)
+        hid[p + 1] = head_step(head, [t[p + 1]], p + 1, W)
         p += 1
     print("plain chain: token@%d..%d = %r" % (n, n + 2, [t[i] for i in range(n, n + 3)]))
 
     words = [t[n + 1], t[n + 2]]
     lib.qlh_kh_reset(head)
-    head_write(head, prompt_tokens, 0, W)
-    singles = np.stack([head_write(head, [words[0]], n, W)[0],
-                        head_write(head, [words[1]], n + 1, W)[0]])
+    head_step(head, prompt_tokens, 0, W)
+    singles = np.stack([head_step(head, [words[0]], n, W)[0],
+                        head_step(head, [words[1]], n + 1, W)[0]])
     lib.qlh_kh_reset(head)
-    head_write(head, prompt_tokens, 0, W)
-    batch = head_write(head, words, n, W)
+    head_step(head, prompt_tokens, 0, W)
+    batch = head_step(head, words, n, W)
     for i in range(2):
         d = float(np.max(np.abs(batch[i].astype(np.float64) - singles[i].astype(np.float64))))
         print("  head row %d: max|batch-single| = %.3e   rel = %.2e"
@@ -385,7 +319,7 @@ def main() -> int:
 
     buf = (ctypes.c_int32 * 256)()
     raw = prompt.encode("utf-8")
-    n = lib.qlh_kh_tokenize(tail, raw, len(raw), buf, 256, 0)
+    n = lib.qlh_kh_tokenize(tail, raw, len(raw), buf, 256)
     if n <= 0:
         raise SystemExit("tokenize failed")
     toks = [buf[i] for i in range(n)]

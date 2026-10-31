@@ -14,45 +14,20 @@ import os
 
 import numpy as np
 
+from _shimlib import head_step, load as _shim_load, tail_batch, tail_one
+
 SHIM = r"H:\slimarc-proto\exp-c\shim\qlh_keep_head.dll"
 MODEL = (r"H:\qlh_models\qwen3-6-35b-a3b-opus47-distill-apex-mtp"
          r"\Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality.gguf")
 
 os.environ["SA_BACKEND_DIR"] = r"H:\slimarc-proto\exp-c\shim"
 os.environ["SA_N_CPU_MOE"] = "0"
-os.add_dll_directory(r"H:\slimarc-proto\exp-c\shim")
 
-lib = ctypes.CDLL(SHIM)
-P32 = ctypes.POINTER(ctypes.c_int32)
-PF = ctypes.POINTER(ctypes.c_float)
-
-for name, argt, rest in [
-    ("qlh_kh_load", [ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-                     ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, P32, P32,
-                     ctypes.c_char_p, ctypes.c_size_t], ctypes.c_void_p),
-    ("qlh_kh_forward", [ctypes.c_void_p, P32, ctypes.c_int32, ctypes.c_int32, PF], ctypes.c_int32),
-    ("qlh_kh_forward_embd_token", [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                   P32, P32, P32, P32], ctypes.c_int32),
-    ("qlh_kh_forward_embd_tokens", [ctypes.c_void_p, PF, ctypes.c_int32, ctypes.c_int32,
-                                    P32, P32, P32, P32, ctypes.c_int32], ctypes.c_int32),
-    ("qlh_kh_tokenize", [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, P32,
-                         ctypes.c_int32, ctypes.c_int32], ctypes.c_int32),
-    ("qlh_kh_n_embd", [ctypes.c_void_p], ctypes.c_int32),
-    ("qlh_kh_seq_rm", [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32], ctypes.c_int32),
-]:
-    fn = getattr(lib, name)
-    fn.argtypes = argt
-    fn.restype = rest
-lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
-lib.qlh_kh_reset.restype = None
+lib = _shim_load(SHIM)
 
 
 def load(rng, need_logits, mtp, gpu):
-    os.environ["LLAMA_LAYER_RANGE"] = rng
-    os.environ["SA_NEEDS_LOGITS"] = str(need_logits)
-    os.environ["SA_MTP"] = str(mtp)
-    os.environ["SA_N_GPU_LAYERS"] = str(gpu)
-    os.environ["SA_N_RS_SEQ"] = os.environ.get("PROBE_RS_SEQ", "4")
+    _shim_load(SHIM, range=rng, logits=need_logits, mtp=mtp, gpu=gpu)
     ne, nl = ctypes.c_int32(0), ctypes.c_int32(0)
     err = ctypes.create_string_buffer(512)
     h = lib.qlh_kh_load(MODEL.encode(), 1024, 8, 64, 1, 0, 0,
@@ -60,34 +35,6 @@ def load(rng, need_logits, mtp, gpu):
     if not h:
         raise SystemExit("load %s failed: %s" % (rng, err.value.decode()))
     return h
-
-
-def head_step(head, tokens, n_past, W):
-    out = np.zeros((len(tokens), W), dtype=np.float32)
-    rc = lib.qlh_kh_forward(head, (ctypes.c_int32 * len(tokens))(*tokens), len(tokens), n_past,
-                            out.ctypes.data_as(PF))
-    if rc != 0:
-        raise RuntimeError("head rc=%d" % rc)
-    return out
-
-
-def tail_one(tail, hidden, n_past, W):
-    t = ctypes.c_int32(-1)
-    rc = lib.qlh_kh_forward_embd_token(tail, hidden.ctypes.data_as(PF), 1, n_past,
-                                       None, None, None, ctypes.byref(t))
-    if rc != 0:
-        raise RuntimeError("tail rc=%d" % rc)
-    return t.value
-
-
-def tail_batch(tail, hidden, n_past, W):
-    k = hidden.shape[0]
-    out = (ctypes.c_int32 * k)()
-    rc = lib.qlh_kh_forward_embd_tokens(tail, hidden.ctypes.data_as(PF), k, n_past,
-                                        None, None, None, out, k)
-    if rc != 0:
-        raise RuntimeError("tail batch rc=%d" % rc)
-    return list(out)
 
 
 def main() -> int:
@@ -99,7 +46,7 @@ def main() -> int:
 
     buf = (ctypes.c_int32 * 256)()
     raw = "中国的首都是".encode("utf-8")
-    n = lib.qlh_kh_tokenize(tail, raw, len(raw), buf, 256, 0)
+    n = lib.qlh_kh_tokenize(tail, raw, len(raw), buf, 256)
     toks = [buf[i] for i in range(n)]
 
     # --- plain chain: token@p for p = n .. n+steps, plus hidden@n .. hidden@(n+steps) ---
