@@ -20,6 +20,9 @@ topology-local*.toml
 # 环境变量
 .env
 
+# 临时调试目录：一次性脚本与工件，不入库
+.qlh_tmp/
+
 # 工作区里与本项目无关的本地目录（原仓库遗留的开发与素材目录）
 .agents/
 .claude/
