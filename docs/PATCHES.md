@@ -1,10 +1,15 @@
-# 两代补丁，以及与原生 RPC 的分界
+# 三代补丁，以及与原生 RPC 的分界
 
 > 状态：已核对源码
 > 更新日期：2026-10-31
 
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在**模型怎么装进显存和内存**：
 第一代靠"裁好的层段工件"，第二代靠"整模 + 层范围"。llama.cpp 侧的补丁因此完全不同。
+
+**补丁全文**：`docs/llamacpp-qlh-slimarc.patch`（26 文件 / 183 KB / 4214 行）。
+生成方式：`git -C H:\llamacpp-c add -A && git diff --cached --binary HEAD > <patch> && git reset`。
+校验方式：`git apply --reverse --check <patch>` 在打过补丁的树上通过，说明它与工作区
+逐字节对应，可以正向重放。
 
 ---
 
