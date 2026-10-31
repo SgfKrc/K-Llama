@@ -844,8 +844,15 @@ int32_t qlh_kh_draft_inject(void * handle_void, const float * embd, int32_t n_ro
     memcpy(batch.embd, embd,
            (size_t) n_rows * (size_t) handle->draft_n_embd_enc * sizeof(float));
 
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] draft_inject n=%d pos0=%d draft_n_past=%d\n",
+                n_rows, batch.pos[0], handle->draft_n_past);
+    }
     const int32_t rc = llama_decode(handle->draft_ctx, batch);
     llama_batch_free(batch);
+    if (getenv("SA_DEBUG_KV") != NULL) {
+        fprintf(stderr, "[kv] draft_inject decode rc=%d\n", rc);
+    }
     if (rc != 0) {
         return -4;
     }

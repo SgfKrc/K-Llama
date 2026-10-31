@@ -336,7 +336,10 @@ class Binding:
         return [int(out[i]) for i in range(n)]
 
     def draft_rollback(self, n_keep: int) -> int:
-        return int(self._lib.qlh_kh_draft_rollback(self._handle, int(n_keep)))
+        rc = int(self._lib.qlh_kh_draft_rollback(self._handle, int(n_keep)))
+        print(f"[kh.draft_rollback] n_keep={n_keep} rc={rc} handle={bool(self._handle)}",
+              file=sys.stderr, flush=True)
+        return rc
 
     def draft_close(self) -> int:
         return int(self._lib.qlh_kh_draft_close(self._handle))
@@ -639,7 +642,9 @@ def main() -> int:
                 _response(ok=True, drafts=ids)
             elif operation == "draft_rollback":
                 rc = binding.draft_rollback(int(request["n_keep"]))
-                _response(ok=(rc == 0), draft_rc=rc)
+                # -6 表示"那段范围里没有可删的行"，是 no-op 不是失败 —— 与 seq_rm 同一条
+                # 约定（binding.seq_rm 也把 -6 当成功）。当成失败会让整轮在第二轮就断掉。
+                _response(ok=(rc in (0, -6)), draft_rc=rc)
             elif operation == "draft_close":
                 binding.draft_close()
                 _response(ok=True)

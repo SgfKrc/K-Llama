@@ -66,3 +66,50 @@ tail: [seq_rm] p0=21 rc=-6
 - `check_p4_generate.py`：多轮驱动，卡在第二轮
 - `check_p3_two_seg.py`：单轮，**PASS**（这是当前可信的基线）
 - 所有 Python 侧改动都已提交（`735eb7f4`），shim 侧 `89cb4253`
+
+
+## 2026-10-31 续：又前进两层，仍卡在 DFlash 自己的 KV
+
+### 已修复
+
+**1. 主链的 seq_rm 现在生效**（根因：`n_rs_seq` 不够）
+
+```
+llama-memory-hybrid.cpp:144   recurrent 删不掉 -> 整体 return false（attention 也不删）
+llama-memory-recurrent.cpp:211  部分回滚要求 rollback <= n_rs_seq
+chain_client.py:539            SA_N_RS_SEQ 默认 = max(1, spec_k) = 1，而 DFlash 要回滚 15
+```
+
+设 `SA_N_RS_SEQ=16` 后：`seq_rm p0=21 removed=1`（原 0），第二轮 KV 轨迹连续正确。
+
+**2. `draft_open` 里 `dparams.n_rs_seq = 16`**（DFlash 自己的 ctx 也要够）
+
+**3. `draft_rollback` 的 -6 视为 no-op**（与 `seq_rm` 同一约定）
+
+**4. `draft_kv` 记账**：draft 只接收**注入**的行（prompt + 每轮 anchor），草稿不入 KV；
+   回滚目标应与 tail 一致 = `n_past + accept`，而不是 `draft_kv - drop`（后者第二轮变成 -8）
+
+**5. `draft_rollback` 必须每轮都做**：`draft_block` 自己会往 draft KV 写 `block_size` 行
+   （anchor + 15 mask），不因"全接受"而跳过——跳过时 KV 停在 36，下轮 inject 撞 21
+
+### 当前卡点
+
+修完上面 5 条后：
+
+```
+[kh.draft_rollback] n_keep=21 rc=0 handle=True        ← 返回成功
+- the last position stored in the memory module ... is X = 36   ← 但 KV 仍在 36
+```
+
+`qlh_kh_draft_rollback` 返回 0（即 `llama_memory_seq_rm` 返回 true），但 attention 那半的
+KV 没有被截断。DFlash 的 memory 类型需要确认：如果它走 `llama_memory_hybrid`，那么
+`seq_rm` 里 `mem_recr->seq_rm` 返回 true 之后必须再调 `mem_attn->seq_rm`——目前的结果
+说明后者没生效，或者 draft 用的是别的 memory 实现。
+
+### 下一步
+
+1. 在 `qlh_kh_draft_rollback` 里分别打印 `mem_recr` / `mem_attn` 的 `seq_rm` 结果
+   （需要 `llama_memory_hybrid` 的 getter，或者直接看 `llama_get_memory` 的类型）
+2. 若 DFlash 的 attention 子缓存确认没被截断，考虑改用 `llama_memory_seq_rm` 之后
+   再显式 `llama_memory_clear` 或重建 draft ctx（代价可接受：draft ctx 只有 256 上下文）
+3. 备选：把 draft 的 KV 上下文压到一轮的量级（每轮重建），牺牲增量但保证正确
