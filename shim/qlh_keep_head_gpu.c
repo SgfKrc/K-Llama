@@ -117,9 +117,19 @@ static void qlh_ensure_backends_loaded(void) {
     fprintf(stderr, "[qlh_keep_head] backends loaded: count=%zu\n", ggml_backend_reg_count());
 }
 
+/* Declared in llama.cpp's src/llama-ext.h rather than the public header: both are exported
+ * from the DLL, but a pip wheel's llama.h has no trace of them. */
+extern void    llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+extern float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
 typedef struct qlh_keep_head {
     struct llama_model   *model;
     struct llama_context *ctx;
+    /* Second context on the same model, built with ctx_type = LLAMA_CONTEXT_TYPE_MTP.
+     * A hybrid model's draft head is a distinct graph (LLM_GRAPH_TYPE_DECODER_MTP), not a flag
+     * on the main graph, so it needs its own context. NULL when the model carries no NextN head.
+     * Its batch takes the target's last hidden via llama_batch_ext_set_embd_state(). */
+    struct llama_context *mtp_ctx;
     int n_embd;
     int n_layer;
     int mode;        /* 0 = nextn, 1 = layer_inp */
@@ -368,7 +378,16 @@ void * qlh_kh_load(const char * model_path,
      * fields by name, three of them before n_threads (n_threads sits at 28, not 24). Writing
      * through the names is the whole point of switching headers -- the raw-offset version
      * below is what has to be kept in sync with a layout measured from a binary. */
-    cparams.n_rs_seq               = 0;   /* no recurrent-state rollback */
+    /* Recurrent-state snapshots. A hybrid model (Qwen3.5's LLL F) keeps linear-attention
+     * state that has no position index, so a speculative decode cannot trim it by position the
+     * way plain KV can: it needs a snapshot per sequence to fall back to. 0 disables that, which
+     * is what every non-speculative chain wants (it is pure overhead otherwise). SA_N_RS_SEQ sets
+     * it; the value must be >= the number of tokens one verification batch covers. */
+    {
+        const char * rs_env = getenv("SA_N_RS_SEQ");
+        const long rs = (rs_env != NULL && rs_env[0] != '\0') ? strtol(rs_env, NULL, 10) : 0;
+        cparams.n_rs_seq = (rs > 0 && rs <= 64) ? (uint32_t) rs : 0;
+    }
     cparams.n_outputs_max          = 0;   /* derive from n_batch */
     cparams.n_outputs_max_per_seq  = 0;   /* derive from n_outputs_max */
 #else
@@ -430,6 +449,48 @@ void * qlh_kh_load(const char * model_path,
     handle->n_layer   = n_layer;
     handle->mode      = mode;
     handle->cut_layer = cut_layer;
+
+    /* Build the draft-head context when the file has one and the caller asks for it.
+     *
+     * The MTP head is a separate graph (LLM_GRAPH_TYPE_DECODER_MTP) selected by the context
+     * type, so it cannot be reached from the main context. Same model, second context, tiny
+     * KV: it only ever holds one verified position at a time.
+     * SA_MTP=1 opts in; absent keeps a single context, which is the non-speculative path. */
+    {
+        const char * mtp_env = getenv("SA_MTP");
+        const bool want_mtp = (mtp_env != NULL) && (atoi(mtp_env) != 0);
+        if (want_mtp) {
+            const int n_nextn = llama_model_n_layer_nextn(model);
+            if (n_nextn <= 0) {
+                fprintf(stderr, "[qlh_keep_head] SA_MTP=1 but the model has no NextN head "
+                                "(n_layer_nextn=%d); draft disabled\n", n_nextn);
+            } else {
+                struct llama_context_params mp = llama_context_default_params();
+                mp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
+                mp.n_ctx         = 64;
+                mp.n_batch       = 8;
+                mp.n_ubatch      = 8;
+                mp.n_seq_max     = 1;
+                mp.n_threads     = (uint32_t) (n_threads > 0 ? n_threads : 4);
+                mp.n_threads_batch = mp.n_threads;
+                mp.n_rs_seq      = 0;
+                mp.embeddings   = false;
+                mp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+                /* Device placement is decided when the model is loaded (mparams), so the
+                 * draft context inherits it; llama_context_params has no device list. */
+                handle->mtp_ctx = llama_init_from_model(model, mp);
+                if (handle->mtp_ctx == NULL) {
+                    fprintf(stderr, "[qlh_keep_head] MTP context creation failed; draft disabled\n");
+                } else {
+                    /* The draft needs the target's last hidden, which the trunk graph only
+                     * exports when this flag is set (t_h_nextn). masked=false keeps a row per
+                     * token rather than only for the rows flagged via batch.logits. */
+                    llama_set_embeddings_nextn(handle->ctx, true, false);
+                    fprintf(stderr, "[qlh_keep_head] MTP context ready: n_layer_nextn=%d\n", n_nextn);
+                }
+            }
+        }
+    }
     /* ★ P3 (2026-10-30)：把 `n_seq_max` 记进 handle。
      *
      * 之前它只写进了 `cparams`（context 层），批次分配处却硬编码 1：
@@ -921,6 +982,118 @@ int32_t qlh_kh_finite_logits_guard(void) {
     return 1;
 }
 
+
+
+/* Copy the trunk's last hidden state from the most recent decode.
+ *
+ * Only populated when the handle was loaded with SA_MTP=1 on a model that has a NextN head;
+ * otherwise returns -5. `capacity` is in floats and must be >= n_embd.
+ */
+int32_t qlh_kh_last_hidden(void * handle_void, float * out, int32_t capacity) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->ctx == NULL || out == NULL ||
+        handle->n_embd <= 0 || capacity < handle->n_embd) {
+        return -5;
+    }
+    const float * src = llama_get_embeddings_nextn(handle->ctx);
+    if (src == NULL) {
+        return -6;
+    }
+    memcpy(out, src, (size_t) handle->n_embd * sizeof(float));
+    return 0;
+}
+
+/* Draft one token from the MTP head.
+ *
+ * The draft graph takes two inputs per position: the token id (its embedding is looked up
+ * inside the graph) and the target model's last hidden state, handed over through the
+ * extended batch. Output is that graph's logits, argmaxed here because the port only ever
+ * exposes argmax (see the sampling note in qlh_kh_forward_embd_token).
+ *
+ * hidden must be the target's final hidden for the position that FOLLOWS `token` in the
+ * sequence -- the head predicts token n+1 from (h_n, x_{n+1}).
+ *
+ * Returns 0 on success, -5 for bad input, -2 when llama_process fails, -6 when no logits,
+ * -7 when the logits are not finite.
+ */
+int32_t qlh_kh_mtp_draft(void * handle_void,
+                         const float * hidden,
+                         int32_t n_embd,
+                         int32_t token,
+                         int32_t n_past,
+                         int32_t * out_token) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle != NULL) {
+        handle->last_error = 0;
+    }
+    if (handle == NULL || handle->mtp_ctx == NULL || hidden == NULL ||
+        out_token == NULL || n_embd != handle->n_embd || token < 0 || n_past < 0) {
+        if (handle != NULL) handle->last_error = -5;
+        return -5;
+    }
+
+    struct llama_batch_ext * batch = llama_batch_ext_init(handle->mtp_ctx);
+    if (batch == NULL) {
+        handle->last_error = -5;
+        return -5;
+    }
+
+    int32_t rc = 0;
+    do {
+        const int32_t idx = llama_batch_ext_add_token(batch, 0, (llama_token) token);
+        if (idx < 0) { rc = -5; break; }
+
+        struct llama_embd state;
+        state.data   = hidden;
+        state.n_rows = 1;
+        state.n_embd = (size_t) n_embd;
+        if (!llama_batch_ext_set_embd_state(batch, idx, state)) { rc = -5; break; }
+
+        const llama_pos pos = (llama_pos) n_past;
+        if (!llama_batch_ext_set_pos(batch, idx, &pos)) { rc = -5; break; }
+        if (!llama_batch_ext_set_output_logits(batch, idx, true)) { rc = -5; break; }
+
+        const int32_t drc = llama_process(handle->mtp_ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+        if (drc != 0) { rc = -2; break; }
+
+        const float * logits = llama_get_logits_ith(handle->mtp_ctx, 0);
+        if (logits == NULL) { rc = -6; break; }
+
+        const int n_vocab = qlh_vocab_size(handle);
+        int best = 0;
+        float best_v = logits[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            const float v = logits[i];
+            if (!isfinite(v)) { rc = -7; break; }
+            if (v > best_v) { best_v = v; best = i; }
+        }
+        if (rc == -7) break;
+        *out_token = best;
+    } while (0);
+
+    llama_batch_ext_free(batch);
+    handle->last_error = rc;
+    return rc;
+}
+
+/* Drop KV/state at and after `p0` for one sequence, keeping [0, p0).
+ *
+ * Speculative decode verifies k tokens, accepts j <= k, and has to retract the rest. Plain
+ * KV can be trimmed by position, but a hybrid model's linear layers keep recurrent state
+ * that has no position index; llama.cpp covers that with n_rs_seq snapshots (SA_N_RS_SEQ),
+ * and refuses a rollback that would land behind them. */
+int32_t qlh_kh_seq_rm(void * handle_void, int32_t seq_id, int32_t p0) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->ctx == NULL || seq_id < 0 || p0 < 0) {
+        return -5;
+    }
+    llama_memory_t mem = llama_get_memory(handle->ctx);
+    if (mem == NULL) {
+        return -5;
+    }
+    return llama_memory_seq_rm(mem, (llama_seq_id) seq_id, (llama_pos) p0, -1) ? 0 : -6;
+}
+
 int32_t qlh_kh_n_vocab(void * handle_void) {
     return qlh_vocab_size((const qlh_keep_head *) handle_void);
 }
@@ -1212,6 +1385,10 @@ void qlh_kh_close(void * handle_void) {
     if (handle->sampler != NULL) {
         llama_sampler_free(handle->sampler);
         handle->sampler = NULL;
+    }
+    if (handle->mtp_ctx != NULL) {
+        llama_free(handle->mtp_ctx);
+        handle->mtp_ctx = NULL;
     }
     if (handle->ctx != NULL) {
         llama_free(handle->ctx);
