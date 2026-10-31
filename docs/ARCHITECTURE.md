@@ -1,292 +1,158 @@
-# slimarc 架构（定稿）
+# 机制：非整模加载凭什么成立
 
-> 状态：**设计定稿**
-> 更新日期：2026-10-28
+> 状态：**现行**
+> 更新日期：2026-10-31
 >
-> 单机性能数据见 `MEASUREMENTS.md`，旧仓库盘点见 `INVENTORY.md` / `BASELINE.md`。
+> 本文回答三件事：不切模型怎么分段加载、段之间传什么、哪些约束是硬的。
+> 补丁的改动清单见 [`PATCHES.md`](PATCHES.md)，实测数字见 [`MEASUREMENTS.md`](MEASUREMENTS.md)，
+> 投机的判定见 [`SPECULATION.md`](SPECULATION.md)。
 
 ---
 
-## 1. 核心思想
+## 0. 一句话
 
-**每个节点加载自己那份层段工件，而 llama.cpp 把每份工件当作完整模型对待。**
-
-由此得到两条互不干扰的优化路径：
-
-```
-路径 A（段内）：每段独立 offload
-  GPU 节点：非专家上卡，专家按显存余量分配
-  CPU 节点：全留内存，或交给 SLIM-ARC 做页级优化
-
-路径 B（段间）：按层切分，跨机传 hidden
-  一台机器装不下时，把层分给多台
-```
-
-**两条路径正交。** 段内怎么 offload 不影响段间怎么切，反之亦然。这是本设计的全部复杂度来源，
-也是它唯一的抽象。
-
-### 1.1 为什么不"整模 + 分布式 offload"
-
-llama.cpp 的 `-ncmoe` 只能在**同一进程**内把张量分配到显存/内存。跨机没有对应机制
-（其 RPC 后端是另一套东西，且要求同构构建）。
-
-所以跨机只能按层切。一旦按层切，每段自然就是独立的 llama.cpp 实例，offload 自动可用。
-
-### 1.2 装得下时不该拆
-
-在 35B-A3B + 31.6 GB RAM 这个组合下：
-
-| 方案 | tg128 |
-| --- | ---: |
-| 单机单进程 `-ncmoe 32` | **28.02** |
-| 单机两进程 | ~17 |
-| 三机三段（预期） | ~17.5 |
-
-**拆分在本机是倒退。** 它的价值只在"单机装不下"时体现（如未来 80B-A3B 45 GB）。
-这一点必须写进设计，避免后人误以为拆分能提速。
+**每个节点都持有同一份整模文件，加载时只创建、只读取属于自己那几层的张量。**
+没有"切模型"这个动作，也没有"层段工件"这类中间产物。
 
 ---
 
-## 2. 设备与切分
+## 1. 为什么整模可以不整读
 
-| 节点 | 硬件 | 层段 | 引擎 | offload 配置 |
-| --- | --- | --- | --- | --- |
-| master | 14C/20T / 31.6 GB / RTX 4060 8GB | `[0,8)` | llama.cpp CUDA | `-ngl 99 -ncmoe 0`（全上卡） |
-| master | 同上 | `[8,24)` | llama.cpp CUDA | `-ngl 99 -ncmoe 13`（前 13 层专家留 CPU） |
-| ROG | 6C/12T / 15.15 GB / RTX 5060 | `[24,40)` | llama.cpp **纯 CPU** | `-ngl 0`，SLIM-ARC 可选 |
+GGUF 的内部布局是：一段元数据（键值对）+ 若干个 tensor，每个 tensor 的数据在文件里是
+**连续区间**，起始偏移写在元数据里。
 
-**ROG 的显卡不用**（Blackwell sm_120，现有构建是 sm_89，需重编；纯 CPU 足够验证机制）。
+llama.cpp 用 mmap 把整个文件映射进地址空间。**映射不等于读入**——操作系统只在页被访问时
+才从磁盘取。所以"持有整模"和"把整模读进内存"本来就是两件事。
 
-切点约束：`full_attention_interval=4`，所有切点必须是 4 的倍数。
-
----
-
-## 3. 三段工件
-
-| 段 | 文件 | 大小 | 张量 | 含全局张量 |
-| --- | --- | ---: | ---: | --- |
-| `[0,8)` | `stage-0-8.gguf` | 4.53 GB | 148 | `token_embd` ✓ |
-| `[8,24)` | `stage-8-24.gguf` | 8.36 GB | 294 | 无 |
-| `[24,40)` | `stage-24-40.gguf` | 8.96 GB | 295 | `output.weight` ✓ |
-
-合计 21.85 GB，整模 20.81 GB，**多出 1.04 GB**——中段和末段各自带的重复全局张量。
-这是拆分的固定代价。
+本项目把第二步也省掉：让 llama.cpp 在**加载阶段**就认为这个模型只有 `hi-lo` 层，
+于是它只为这几层创建 tensor，其余层的字节从头到尾没有被 touch。
 
 ---
 
-## 4. SLIM-ARC 的接入位置
+## 2. 三个机制
 
-SLIM-ARC 是 llama.cpp 的 patch set，**编译期接入**，运行时由环境变量控制。
+### 2.1 层数覆盖：`LLAMA_LAYER_RANGE=lo:hi`
 
-### 4.1 激活门槛
+`llama-model-loader.cpp` 在元数据解析之后、`load_hparams()` 之前改写 `block_count`
+（以及 `nextn_predict_layers`）。架构读到的 `n_layer` 就是 `hi-lo`，它所有的循环都只在这几层里转。
+元数据里同时保留原始层数，因为"这段是不是末段"要靠它判断（末段才保留 `output` 与 MTP 头）。
 
-`slim-arc-runtime.h:14`：
+### 2.2 名字重映射：本地 `blk.i` → 源文件 `blk.lo+i`
 
-```cpp
-use_mmap_buffer && mapping_count > 0 && size_data > (6ULL << 30) && enabled
-```
+`get_weight` 在校验名表**之前**先做重映射。这一步不能省：`lo > 0` 的段如果不重映射，
+会读到源文件的 `blk.0`——输出仍然通顺，只是错的。
 
-`size_data` 是**模型文件大小**。对照三段：
+### 2.3 全局张量按需 lazy
 
-| 段 | 大小 | 过 6 GiB 门槛 |
-| --- | ---: | --- |
-| `stage-0-8` | 4.53 GB | ❌ 不激活 |
-| `stage-8-24` | 8.36 GB | ✅ 激活 |
-| `stage-24-40` | 8.96 GB | ✅ 激活 |
+`token_embd`（515 MiB）只有首段要，`output`（515 MiB）只有末段要，中段两个都不要。
+不创建就不读：中段因此省 **1030.62 MiB**。
 
-### 4.2 预期行为
+判断依据是 `tn.tensor` 而不是名字——tied 模型会把 `output` 建成 `token_embd` 的副本，
+名字说是 embedding，实际承担投影。
 
-用户要求「装得下就让它自己退化回普通 llama.cpp」。按门槛设计，退化由两件事保证：
-
-1. **文件小于 6 GiB 直接跳过**（首段）
-2. **内存充足时不产生 page fault**，prefetch 无事可做（中段、末段在 15–31 GB 内存下）
-
-因此明天的 A/B 预期是**持平**。如果实测有明显差异（正或负），说明对退化条件的理解
-需要修正——这本身就是有价值的结论。
-
-### 4.3 接入代价
-
-`apply-slim-arc.py`（734 行，19 处 `replace_required` 锚点）做**文本级源码改写**，
-不是 `git apply`。这意味着：
-
-- 构建必须 fail-fast（锚点找不到就报错，不能静默跳过）
-- 构建脚本要记录 patch 版本与锚点校验结果
-- `slim-arc-integration.patch` 是**废弃的**（引用了不存在的符号），不要用
+三者合起来：任何一个节点都没有"整模加载"这一步，只有"我这几层"。
 
 ---
 
-## 5. 控制面：Rust
+## 3. 接力向量：必须在 `output_norm` 之前
 
-### 5.1 分工
+上游的 `t_embd` 是 `build_norm` **之后**的值（pooling 要归一化后的结果）。接力要的是原始输出：
+多过一次 RMSNorm，第一个 token 就分叉。
 
-```
-Rust 控制面
-  ├─ 读 topology.toml
-  ├─ 按 host 决定 spawn 本地 worker 还是连接远端
-  ├─ 驱动链式调用（token → 段0 → 段1 → 段2 → token）
-  ├─ 统计每段耗时、吞吐
-  └─ TUI 显示
-
-llama.cpp worker（独立进程，C++）
-  ├─ 加载一份段工件
-  ├─ 段内 offload（-ngl / -ncmoe）
-  └─ SLIM-ARC（如启用）
-```
-
-**llama.cpp 不嵌入 Rust 进程。** 理由：
-
-- 崩溃隔离：worker 段错误时控制面能报清楚是哪段、哪个工件
-- 复用现有 shim（`qlh_keep_head.c`，620 行 C），不必重写 FFI 绑定
-- SLIM-ARC 的 patch 在 llama.cpp 侧，与调用方语言无关
-
-### 5.2 与 Python 版的关系
-
-**协议字节级兼容**（6 种消息，长度前缀帧）。好处：
-
-- Rust 版可逐步替换：先换控制面，worker 仍是 Python
-- Python 版（872 行，已验证 25 项测试通过、数值逐位一致）作为参考实现
-- 跨机实验时，一端 Rust 一端 Python 也能跑
-
-### 5.3 Rust 版模块
-
-| 模块 | 职责 | 预算 |
-| --- | --- | ---: |
-| `main.rs` | CLI、模式选择（serve / run / tui） | 80 |
-| `topology.rs` | 读 TOML → `Vec<Stage>` | 120 |
-| `protocol.rs` | 6 种消息编解码 | 180 |
-| `worker.rs` | 子进程 spawn / 终止 / stderr 落盘 | 100 |
-| `chain.rs` | 链式调用、耗时统计 | 150 |
-| `tui.rs` | ratatui 界面 | 200 |
-| **合计** | | **830** |
-
-不引入 async runtime——链式调用严格串行，裸线程足够。
+`embeddings_pre_norm` 开关把 tap 点前移，顺带不建 lm_head——中段因此再省 515 MiB。
 
 ---
 
-## 6. 协议
+## 4. 段间传什么
 
-6 种消息，不变：
+一个 `n_embd` 宽的 float32 向量：2048 × 4 B = **8 KB**。
 
-| 消息 | 方向 | 载荷 |
+**为什么不用 fp16 / int16**：实测 5 个贪心 prompt，fp16 有 1 个在第 22 步换了 token，
+int16 定点同样 1/5（第 16 步）。int16 的量化步长比 fp16 细 20 倍，照样翻转——因为分叉点
+都落在输出接近平局的位置。判据是**逐位一致**，不是"误差足够小"。
+
+协议：4 字节大端长度 + 1 字节类型 + payload，hidden 走原始字节，不套 JSON。
+
+---
+
+## 5. 段内怎么 offload
+
+两条互不干扰的路径：
+
+| 参数 | 语义 | 什么时候用 |
 | --- | --- | --- |
-| `hello` | worker → client | `n_embd`、`layers` |
-| `forward` | client → worker | tokens 或 hidden，`n_past` |
-| `result` | worker → client | hidden 或 token，耗时 |
-| `error` | worker → client | `code`、`detail` |
-| `reset` | client → worker | 清 KV |
-| `bye` | client → worker | 下线 |
+| `-ngl N` | 前 N 层的**全部**张量上卡 | 层少、显存够 |
+| `-ncmoe N` | 前 N 层的**专家**留 CPU，其余专家上卡 | MoE |
 
-帧格式：`>IB`（4 字节长度 + 1 字节类型）+ payload。
-hidden 是**原始 float32**，不走 JSON。
+MoE 的权重分布是专家占 88%，而每个 token 只用到 8/256 个专家——**体积最大、访问最稀疏的
+部分进最快的设备**收益最大。实测同一台机器：整层 11 层 10.11 tok/s，专家 8 层 28.47 tok/s。
 
-按段类型分流：
+段内怎么 offload 与段间怎么切是正交的，这是本设计唯一的抽象。
 
-| 段类型 | 入 | 出 |
+---
+
+## 6. 切分的硬约束
+
+- 所有切点必须是 `full_attention_interval`（qwen35moe 是 4）的倍数
+- 末段的 `hi` 必须等于模型总层数
+- `topology.py` 在解析阶段就拒绝，不自动纠正
+
+原因：`src/models/qwen35moe.cpp:24` 用**本地层号**推算层类型，而本地层号被映射回源层号。
+只有 `lo` 是 4 的倍数时，两者模 4 同余，`LLL F` 的类型序列才对得上。
+`32:38` 这种 6 层划分会在解析阶段报 `layers=6 is not a multiple of 4`。
+
+---
+
+## 7. 投机怎么接进来
+
+两个草稿源，都插在验证器前面：
+
+| 源 | 是什么 | 深度 |
 | --- | --- | --- |
-| `gpu`（首段） | tokens（JSON） | hidden（float32） |
-| `cpu`（中段） | hidden | hidden |
-| `tail`（末段） | hidden | token（JSON） |
+| MTP | 模型自带的 NextN 头，递归喂自己的输出 | k=2 是上限（第 3 层掉到 36%） |
+| DFlash | 独立的小模型，一次前向出 16 个位置 | k=5 是拐点（k=8 起接受率崩塌） |
 
-**已知开销**：loopback 单跳 1.7 ms（实测）。局域网预计 1–3 ms，4 次边界共 4–12 ms。
+共同要求：**每一步必须能回滚**。验证块写 k+1 行，只保留接受的前缀，剩下的要退回去。
+hybrid 模型（30 层 linear + 10 层 full attention）的 recurrent state 没有位置索引，
+退回需要按 ubatch 滚动的快照——这是本项目最贵的一个坑，见
+[`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md)。
 
----
-
-## 7. 配置
-
-`topology.toml` 一个文件描述全部拓扑：
-
-```toml
-[[stage]]
-model      = "F:/qlh-models/stage-split-3/stage-0-8.gguf"
-host       = "127.0.0.1"
-port       = 9101
-layers     = 8
-kind       = "gpu"
-gpu_layers = 99
-cpu_moe    = 0
-cpus       = "0,1,2,3"
-threads    = 3
-
-[[stage]]
-model      = "F:/qlh-models/stage-split-3/stage-8-24.gguf"
-host       = "127.0.0.1"
-port       = 9102
-layers     = 16
-kind       = "cpu"
-gpu_layers = 99
-cpu_moe    = 13
-cpus       = "4,5,6,7"
-threads    = 3
-
-[[stage]]
-model      = "F:/qlh-models/stage-split-3/stage-24-40.gguf"
-host       = "192.168.1.x"
-port       = 9103
-layers     = 16
-kind       = "tail"
-gpu_layers = 0
-cpu_moe    = 16
-cpus       = ""
-threads    = 4
-```
-
-`host` 是 `127.0.0.1` 则本机 spawn，否则连远端（远端需手工一条命令启动 worker）。
-
-### 7.1 `cpu_moe` 的语义（已实测确认）
-
-**段内语义**，不是全局。实现见 `tools/llama-bench/llama-bench.cpp:1219-1223`：
-
-```cpp
-for (int i = 0; i < n_cpu_moe; ++i) {
-    patterns.push_back(llm_ffn_exps_block_regex(i));  // "blk\.<i>\.ffn_*_exps"
-    merged.push_back({ patterns.back().c_str(), ggml_backend_cpu_buffer_type() });
-}
-```
-
-`i` 是本段文件内部的行号（从 0 开始）。16 层工件配 `cpu_moe=13` = 前 13 层专家留 CPU。
+运行时只支持贪心：验证器只暴露 argmax，采样需要 rejection sampling，shim 还没做。
 
 ---
 
-## 8. 不做的事
+## 8. 与原生 RPC 的分界
 
-| 不做 | 理由 |
+| 维度 | 原生 RPC | 本项目 |
+| --- | --- | --- |
+| 权重从哪来 | 主机通过 `SET_TENSOR` 发到远端 | 各节点本地读整模的对应层 |
+| 首次跨机流量 | 权重总量（GB 级） | 0 |
+| 主机必须装下整模 | 是 | 否 |
+| 每步流量 | 激活 + 图指令 | 8 KB hidden |
+| 计算图 | 主机维护全局图 | 每段独立进程，无全局图 |
+| 异构 | 需要相同 ggml backend | 自定义 TCP，可跨不同 CPU/GPU |
+
+一句话：RPC 是**把设备虚拟化**，模型仍然一份；本项目是**把模型分段**，每段各自持有。
+代价是段内不能跨机器拆算子，每段必须能单独装下。
+
+---
+
+## 9. 什么算证据
+
+| 级别 | 例子 |
 | --- | --- |
-| 自动模型分发 | 一晚实验，手工拷一次更简单 |
-| 心跳 / 重连 / 重试 | 局域网内、实验期间，失败直接看报错 |
-| 状态机 / 租约 / 事务 / 数据库 | 无状态链式调用，不需要 |
-| 动态切分 | 切点在配置里写死，实验要固定变量 |
-| 跨框架（vLLM / PyTorch / NInfer） | 首期专注纯 llama 链路 |
-| OpenAI SSE 接口 | 与机制验证无关 |
-| ROG 显卡 | 需重编 sm_120，本期不值 |
-| 安卓 / Kotlin | 不在本期范围 |
+| **硬判据** | 贪心 token 与整模逐位一致；段间 hidden `max\|diff\| = 0` |
+| 参考 | 吞吐、接受率（要带口径：模型、量化、生成长度、设备） |
+| 不算 | "输出看起来通顺"、单次运行、跨配置比较 |
+
+跨机也验过逐位一致。`checks/` 里 20 个脚本按这个标准写。
 
 ---
 
-## 9. 验收
+## 10. SLIM-ARC 在哪一层
 
-### 9.1 数值（硬性）
+它不改上面任何一条机制，只改"某段装不下、真的在读盘时"的**读盘顺序**：把随机缺页变成
+按层边界的顺序预读。
 
-首段 hidden 与整模对应层输入**逐位相同**。已在本机验证（16 token）：
-
-```
-max abs diff = 0.000000e+00
-cosine       = 1.000000119
-```
-
-跨机后需重验，确认 TCP 传输无精度损失。
-
-### 9.2 机制（硬性）
-
-三段能正确串联，逐 token argmax 与整模一致。
-
-### 9.3 性能（参考，非判据）
-
-| 方案 | tg |
-| --- | ---: |
-| 单机单进程 | 28.02 |
-| 三机三段 | 预期 ~17.5 |
-
-**不以"超过单机"为判据**，因为数学上不成立。真正要拿到的是：
-- ROG 每层耗时（决定未来切分点）
-- 真实 RTT
-- SLIM-ARC 在"装得下"时是否退化到持平
+装得下的时候它是空操作——整模在页缓存里，没有可补的页，实测 `issued = 0`。
+接入形态与触发条件见 [`PATCHES.md`](PATCHES.md) 与 [`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md)。

@@ -13,6 +13,11 @@ Qwen3.6-35B-A3B（MoE，40 层，14.8 GiB）在两台机器上分成 32 + 8 层�
 
 与第一代 K-Llama 的差别见 `docs/PATCHES.md`：那代用"裁好的层段工件"，这代用"整模 + 层范围"。
 
+**机制怎么成立的**：每个节点都持有同一份整模，加载时只创建、只读取属于自己那几层的张量——
+三层机制是层数覆盖（`LLAMA_LAYER_RANGE`）、名字重映射（本地 `blk.i` → 源 `blk.lo+i`）、
+全局张量按需 lazy。接力向量取 `output_norm` 之前的值，段间只传 8 KB hidden。
+全文见 **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**（机制、约束、判据、与原生 RPC 的分界）。
+
 ---
 
 ## 这套东西的价值在哪
@@ -207,7 +212,7 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 | 文件 | 讲什么 |
 | --- | --- |
 | `docs/DEPLOYMENT.md` | 每台放什么、换分段怎么做、控制面**不做**什么 |
-| `docs/ARCHITECTURE.md` | 链路与协议 |
+| `docs/ARCHITECTURE.md` | **核心机制**：凭什么非整模加载、硬约束、判据、与 RPC 的分界 |
 | `docs/MEASUREMENTS.md` | 全部实测数据 |
 | `docs/MEASUREMENT-PITFALLS.md` | 段内计时为什么骗人 |
 | `docs/MEMORY-LIMITS.md` | 内存与显存的账怎么算 |
@@ -236,9 +241,5 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 - **多序列 token 共享**（需要 `kv_unified`；当前对这类请求明确报错）。
 - **非贪心下的投机**。验证器只暴露 argmax，采样需要 rejection sampling，shim 还没做。
 
-## 已完成，留在这里备查
-
-- 裁段工具的退场。整模 + `layer_range` 与裁段工件逐位一致（`max|diff|=0`），跨机也验过。
-  `cut.py` 留着只用于离线比对。
-- 两个草稿源的接入（MTP 递归 / DFlash 并行块）与 DFlash 的 k 扫描（k=5 是拐点）；
-  SLIM-ARC prefetch 一级的接入与 win32 移植。
+已完成项（裁段工具退场、两个草稿源、SLIM-ARC prefetch）与全部实测数字见
+[`docs/PROGRESS.md`](docs/PROGRESS.md) 与 [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md)。
