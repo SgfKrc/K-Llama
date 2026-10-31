@@ -126,6 +126,10 @@ class StageEngine:
         """hidden in, next token out. Used by the tail stage."""
         return int(self._up.forward_hidden_to_token(_f32_input(hidden), n_past=n_past))
 
+    def forward_tokens_out(self, hidden: np.ndarray, *, n_past: int) -> list[int]:
+        """k rows of hidden in, k token ids out. The speculative verification primitive."""
+        return self._up.forward_hidden_to_tokens(_f32_input(hidden), n_past=n_past)
+
     def set_sampling(self, **params) -> dict:
         """Configure the tail stage's sampler; returns the effective parameters.
 

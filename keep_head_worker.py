@@ -97,6 +97,12 @@ class Binding:
             ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
             ctypes.POINTER(ctypes.c_int32)]
         lib.qlh_kh_forward_embd_token.restype = ctypes.c_int32
+        lib.qlh_kh_forward_embd_tokens.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+            ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
+        lib.qlh_kh_forward_embd_tokens.restype = ctypes.c_int32
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_reset.restype = None
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
@@ -211,6 +217,22 @@ class Binding:
             self._handle, _f32(arr), int(arr.shape[0]), int(n_past), None, None, None,
             ctypes.byref(token))
         return self._checked(rc, int(token.value), "tail forward")
+
+    def tokens_of(self, arr: np.ndarray, n_past: int) -> list[int]:
+        """k rows of hidden -> k argmax token ids in one backend call.
+
+        This is the verification primitive for speculative decoding: the candidate tokens are
+        submitted as one batch and the backend returns one argmax per position, so verifying k
+        candidates costs one round trip rather than k.
+        """
+        k = int(arr.shape[0])
+        if k <= 0:
+            return []
+        out = (ctypes.c_int32 * k)()
+        rc = self._lib.qlh_kh_forward_embd_tokens(
+            self._handle, _f32(arr), k, int(n_past), None, None, None, out, k)
+        self._checked(rc, None, "tail forward (batch)")
+        return list(out)
 
     def tokenize(self, text: bytes) -> list[int]:
         """Text -> token ids.
@@ -403,6 +425,8 @@ def main() -> int:
                 _array_response(binding.hidden(_decode_hidden(request), n_past))
             elif operation == "hidden_token":
                 _response(ok=True, token=binding.token(_decode_hidden(request), n_past))
+            elif operation == "hidden_tokens":
+                _response(ok=True, tokens=binding.tokens_of(_decode_hidden(request), n_past))
             elif operation == "tokenize":
                 # Text crosses the worker boundary as UTF-8 bytes, not str: the shim
                 # wants raw bytes plus an explicit length so it never has to guess.

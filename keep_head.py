@@ -222,6 +222,21 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(f"keep-head worker returned an invalid token id: {token}")
         return token
 
+    def forward_hidden_to_tokens(self, hidden, *, n_past: int = 0) -> list[int]:
+        """Feed k rows in, get k argmax token ids back, in one call.
+
+        Each row is verified independently at its own position (n_past, n_past+1, ...), which is
+        what speculative decoding needs: submit the whole candidate block, read one argmax per
+        slot, then keep the agreeing prefix.
+        """
+        arr = self._checked_hidden(hidden, n_past)
+        reply = self._request(self._hidden_payload("hidden_tokens", arr, n_past))
+        toks = [int(t) for t in reply.get("tokens", [])]
+        if len(toks) != int(arr.shape[0]):
+            raise KeepHeadUnavailable(
+                f"keep-head worker returned {len(toks)} tokens for {arr.shape[0]} rows")
+        return toks
+
     def tokenize(self, text: str) -> list[int]:
         """Text -> token ids, for callers that start from a prompt instead of ids."""
         reply = self._request({"op": "tokenize", "text": text})

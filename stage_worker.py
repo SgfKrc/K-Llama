@@ -163,8 +163,15 @@ class StageWorker:
                     # at the point where the shim's ABI requires it.
                     hidden = wire.decode(msg.blob, dtype, (n_tokens, n_embd))
                     if self._role == "tail":
-                        token = self._engine.forward_token(hidden, n_past=n_past)
-                        protocol.send(conn, protocol.RESULT, {"token": token, "n_past": n_past})
+                        if n_tokens > 1:
+                            # Speculative verification: one argmax per submitted position.
+                            toks = self._engine.forward_tokens_out(hidden, n_past=n_past)
+                            protocol.send(conn, protocol.RESULT,
+                                          {"tokens": toks, "n_past": n_past})
+                        else:
+                            token = self._engine.forward_token(hidden, n_past=n_past)
+                            protocol.send(conn, protocol.RESULT,
+                                          {"token": token, "n_past": n_past})
                     else:
                         out = self._engine.forward_hidden(hidden, n_past=n_past)
                         protocol.send(

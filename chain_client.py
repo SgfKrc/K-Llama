@@ -292,6 +292,17 @@ class StageClient:
                              "dtype": dtype}, wire.encode(hidden, dtype))
         return int(msg.meta["token"])
 
+    def forward_tokens_out(self, hidden: np.ndarray, n_past: int) -> list[int]:
+        """k rows of hidden -> k token ids, in one round trip. Speculative verification."""
+        dtype = wire.current_dtype()
+        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past,
+                             "dtype": dtype}, wire.encode(hidden, dtype))
+        toks = [int(t) for t in msg.meta["tokens"]]
+        if len(toks) != int(hidden.shape[0]):
+            raise RuntimeError(
+                f"stage {self.stage.index}: {len(toks)} tokens for {hidden.shape[0]} rows")
+        return toks
+
     def _decode_hidden(self, msg: protocol.Message) -> np.ndarray:
         """Decode the reply's hidden in whatever dtype the worker declared.
 
