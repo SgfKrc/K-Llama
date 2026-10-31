@@ -1,7 +1,7 @@
 """Streaming text generation over the layer chain.
 
 This sits between the transport (chain_client) and whatever consumes the output
-(chat_tui or an OpenAI endpoint). It owns two things the numeric path does not need:
+(the TUI or an OpenAI endpoint). It owns two things the numeric path does not need:
 
   * UTF-8 reassembly. Byte-level BPE splits multi-byte characters across tokens, so
     a single piece is often not decodable on its own. Emitting raw pieces produces
