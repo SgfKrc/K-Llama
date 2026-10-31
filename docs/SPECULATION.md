@@ -207,7 +207,7 @@ layer dropout。
 5. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
 6. **DFlash**：k=8 天生在盈利区间，是唯一值得投入完整工程的方向。
 
-## 9. 两个数值障碍
+## 9. 数值验证结论
 
 位置账已修好（`checks/probe_spec_wip.py`，先验证后写入模式下 2 个 prompt 逐位一致、
 接受率 83-92%），但**真投机（批量验证 + 拒稿回滚）卡在两个底层行为上**：
@@ -231,11 +231,6 @@ layer dropout。
 
    **官方从不跨 ubatch 回滚**（verify batch 一次写 `n_draft+1` 个 token，回滚量总落在刚写的
    槽里；draft 端 `n_rs_seq=0`、整段重跑），所以这个缺陷只有「分段 + 单 token draft」才暴露。
-
-   机制已梳理：`seq_rm` 只放行 `rollback ≤ n_rs_seq` 且要求 `rs_idx == 0`（快照索引
-   single-use，`s_copy` 读完清零）；快照由 graph 在每次 decode 时把当前状态拷进
-   `rs_idx * size` 起始的槽位；hybrid 分发正确（先 recurrent、失败即中止，再 attention）。
-   **所以问题不在"要不要回滚"，而在快照恢复出的状态是否与当初逐位相同。**
 
 3. **tail 段 8 层里 6 层是 linear**（32/33/34/36/37/38，只有 35/39 是 full attention），
    recurrent state 没有位置索引——这是上面那条缺陷只在本项目暴露的根本原因。
