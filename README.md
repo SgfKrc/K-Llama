@@ -196,6 +196,8 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 | `docs/MEMORY-LIMITS.md` | 内存与显存的账怎么算 |
 | `docs/CUT-TOOL.md` | 裁切规则与 fail-closed 条件 |
 | `docs/RESPONSES-API.md` | Responses 协议，含与计划不符的实测 |
+| `docs/SPECULATION.md` | 投机解码的判定、成本模型与实测 |
+| `docs/ISSUE-recurrent-snapshot-rollback.md` | hybrid 模型跨 ubatch 回滚缺陷与修复 |
 | `docs/SAMPLING.md` | 采样参数如何映射到 llama.cpp |
 | `docs/TUI.md` | TUI 布局与启动画面 |
 | `docs/PATCHES.md` | 两代补丁的差异，以及和原生 RPC 的分界 |
