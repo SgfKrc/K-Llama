@@ -1,126 +1,122 @@
-# 原型进展与一个关键发现
+# 进展：当前能跑到什么程度
 
-> 状态：**进行中（P1 已通过，吞吐待 CUDA shim）**
-> 更新日期：2026-10-28
+> 状态：**现行**
+> 更新日期：2026-10-31
+>
+> 适用范围：本仓库当前的能力快照——能跑什么、做到过什么、还差什么。
+> 数字口径与出处不在本文重复，指向 `docs/MEASUREMENTS.md` 与 `docs/SPECULATION.md`。
 
 ---
 
-## 1. P1 已通过：两段拆分数值完全一致
+## 1. 现在能跑什么
 
-`gpu-0-8.gguf`（前 8 层，`nextn` 模式）与整模（`layer_inp cut_layer=8`）的 hidden 输出：
-
-```
-reference shape=(8, 2048)  candidate shape=(8, 2048)
-max abs diff : 0.000000e+00
-cosine       : 1.000000000
-result: PASS
-```
-
-**逐位相同**，说明裁层工具无损、两段串联的数值基础可靠。
-
-两段关键工件的实测能力（shim 加载）：
-
-| 段 | 工件 | 大小 | 张量数 |
-| --- | --- | ---: | ---: |
-| GPU | `gpu-0-8.gguf` | 5.03 GB | 149 |
-| CPU | `cpu-8-40.gguf` | 16.81 GB | 587 |
-
-## 2. 一个必须记录的架构发现
-
-**QLH 现存的 keep-head shim 全部是纯 CPU 构建，没有任何 CUDA 版本。**
-
-核对过项目里所有 `qlh_keep_head.dll`：
-
-- `build/keephead/build-cpu-skiplogits/bin/` 只有 `ggml-cpu.dll`，无 `ggml-cuda.dll`
-- `build/r6-unified-20261021/cuda-dist/.../keep_head/` 名为 CUDA dist，其 `keep_head/`
-  子目录里同样只有 `ggml-cpu.dll`
-- CUDA 构建（`build/moe-cache-20261026/b11889/`）把 llama 静态链进 exe，
-  **没有 `libllama.dll`**，而 shim 依赖这个 DLL
-
-原因合理：QLH 的 GPU 段用 PyTorch，CPU 段用 llama.cpp，shim 从未被要求支持 CUDA。
-
-**对本原型的直接影响**：两段串联实测只有 **3.71 t/s**，因为 GPU 段那 8 层实际跑在
-CPU 上。这与单进程 `-ncmoe 32` 的 28.47 t/s 差 7.7 倍。
-
-**因此必须为原型单独构建 CUDA 版 shim。** 构建脚本 `H:\slimarc-proto\build_cuda_shim.ps1`：
+两台机器、一个 35B-A3B MoE 模型、跨机层段接力 + DFlash 投机解码：
 
 ```
--DGGML_CUDA=ON -DBUILD_SHARED_LIBS=ON -DCMAKE_CUDA_ARCHITECTURES=89
--DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+本机（i9-13900H + RTX 4060 Laptop 8 GiB）  head 0:32   -ngl 32 -ncmoe 24
+        ↕  TCP，每轮 8 KB hidden
+ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
 ```
 
-工具链：MSVC 14.51（VS 18 BuildTools）+ CUDA 13.3 + Ninja。构建中。
+- **17.0 tok/s**，接受率 98.0%，每轮前进 3.94 token（`topology-cross-mtp.toml`，2026-10-31）
+- 输出与不做投机的贪心解码**逐位一致**
+- 对外是 OpenAI 兼容的 SSE 流式接口；TUI 与控制面在 Python 侧
 
-## 3. 单进程基线（已完成，作为对照）
+作为对照：同一个模型在本机单卡整模 `-ngl 6` 只有 **10.5 tok/s**，
+纯 CPU 是 7.1。跨机两段是这台机器上唯一超过单机的形态。
 
-| 方案 | 配置 | pp512 | tg256 |
-| --- | --- | ---: | ---: |
-| 纯 CPU | `-ngl 0 -t 8` | 91.5 | 8.23 |
-| 专家上 GPU，11 层 | `-ncmoe 29` | 263.2 | 30.45（违反 4 倍数，不可用于裁层） |
-| **专家上 GPU，8 层** | `-ncmoe 32` | 237.2 | **28.47 ± 0.34** |
-| 整层上 GPU，11 层 | `-ngl 11` | 201.2 | 10.11 |
+---
 
-**关键机理**：只把专家放 GPU 比整层放 GPU 快 3 倍。专家占 88% 权重但每 token 只用
-8/256，把「体积最大、访问最稀疏」的部分放进最快设备，收益最大。
+## 2. 里程碑
 
-**显存硬边界**：11 层装得下（约 4.84 GiB 专家），12 层溢出（WDDM 静默用系统内存
-当显存，tg 从 30 掉到 16，不报错）。
-
-## 4. 二期设计要点（待 CUDA shim 就绪后验证）
-
-### 4.1 两段的显存占用不同，需实测
-
-整模 `-ncmoe 32` 只把 8 层的**专家**放 GPU（约 3.5 GiB）；
-拆分方案的 GPU 段含 8 层**全部张量**（5.03 GiB）。拆分反而更占显存。
-
-这带来一个待验证的问题：**拆分方案的 GPU 段能否装下**（5.03 GiB + KV + compute
-在 8 GiB 内），以及吞吐能否保住 28 t/s 量级。
-
-### 4.2 若能装下但更慢，属预期
-
-拆分的价值不在单机提速，而在**能把 CPU 段挪到另一台设备**。单机两段若慢于整模，
-应记录为「分布式入场成本」，而非失败。
-
-### 4.3 阶段划分
-
-| 阶段 | 内容 | 状态 |
+| 阶段 | 内容 | 结果 |
 | --- | --- | --- |
-| P0 | 单进程基线 `-ncmoe 32` | **完成**（28.47 t/s） |
-| P1 | 两段拆分正确性 | **完成**（bit-exact） |
-| P1.5 | CUDA 版 shim 构建 | **进行中** |
-| P2 | 吞吐验证（目标 ≥28 t/s 量级） | 待 P1.5 |
-| P2.5 | 两进程 + socket 传输 | 待 P2 |
-| P3 | SLIM-ARC 可选开关 A/B | 待 P2.5 |
+| P0 | 单进程基线，`-ncmoe` 语义 | 28.02 ± 0.15 tok/s（旧 Q4_K_XL 20.81 GiB 模型） |
+| P1 | 多槽 `layer_inp` 打通 worker/engine/StageClient | 与单槽逐位相同 |
+| P2 | 两进程 + TCP 传输 | 段间 hidden 走 int16 定点，5 份拷贝降到 1 份 |
+| P3 | DFlash 草稿三件套（open/inject/block）+ rollback | 8 路注入、15 草稿、16 验证跑通 |
+| P4 | 六条定位修正后验收 | 98.0% 接受率（原生 `llama-speculative-simple` 94.1%），3.94 token/轮 |
 
-## 5. 代码现状
+`docs/PATCHES.md` 记的是两代补丁的分界，`docs/ISSUE-*.md` 记的是 P3/P4 期间定位到的
+三个缺陷：warmup 越界、hybrid `seq_rm` 语义、recurrent 快照跨 ubatch 不滚动。
 
-`H:\slimarc-proto\slimarc\`：
+---
 
-| 文件 | 行数 | 职责 |
-| --- | ---: | --- |
-| `config.py` | 118 | 14 个环境变量，切分点强制 4 的倍数 |
-| `protocol.py` | 82 | 6 种消息，长度前缀帧，hidden 走原始 float32 |
-| `engine.py` | 88 | keep-head shim 封装（复用 QLH 的 `llama_keep_head`） |
-| `runner.py` | 76 | 两段串行、贪心解码 |
-| `bench.py` | 52 | 吞吐测量（pp/tg 口径） |
-| `check_correct.py` | 79 | hidden 数值对照 |
-| `smoke.py` | 74 | 冒烟 |
-| **合计** | **569** | 预算 1220，余量充足 |
+## 3. 已做的优化（按收益排）
 
-## 6. 复用而非重写
+| 优化 | 手段 | 收益 |
+| --- | --- | --- |
+| 专家级 offload | `-ncmoe` 把专家放 GPU，而非整层 | 整层 11 层 10.11 → 专家 8 层 28.47 tok/s |
+| head 段混合切分 | `-ngl 32 -ncmoe 24`：注意力与 dense 上卡，前 24 层专家留 CPU、后 8 层专家上卡 | head 段单独 13.6 → 20.5 tok/s |
+| 草稿上 GPU | DFlash Q4_K_M 0.24 GB 放 4060 | 跨机 5.7 → 10.0 tok/s |
+| 释放远端内存 | 关掉 ROG 上的常驻浏览器 | `tail_fwd` 226 → 76 ms |
+| tail 线程数 | ROG 侧 10 线程 | 并入上面那档 |
+| 切点实验 | 32:40 → 36:40 | 17.0 → 17.7（+4%），**未采纳**，负载会压到笔记本 |
+| 投机按负载开关 | 代码类 k=2，其余 k=0；6 步后接受率 <35% 自动关 | 见 `docs/SPECULATION.md` §10 |
+| n-gram 草稿 | 上游原生，优先级在 DFlash 之前 | 代码 prompt 10.4 vs 无投机 7.4 tok/s；对话自动落空 |
 
-`engine.py` 直接 import QLH 的 `src/llama_keep_head.py`，不重写 C 绑定。理由：
+已被实测排除的方向（各条口径见 `docs/SPECULATION.md` 与 `local_docs/`）：
+`-fa on`、`-ub 64`、KV 量化 q8_0、CPU 绑核、`--load-mode mlock`、`--moe-cache-mib`、
+浅层投机（未训练的截断层接 `lm_head` 分布错位，α < 0.09）、k ≥ 5 的深草稿。
 
-- 该模块已有 `forward_tokens_to_hidden` / `forward_hidden_to_hidden` /
-  `forward_hidden_to_token`，正好对应首段/中段/末段
-- 已处理 worker 隔离、KV、多位置、错误码
-- 重写等于复制 900 行已验证逻辑
+---
 
-## 7. 纠正一个此前的判断
+## 4. 已接的组件
 
-先前认为「P1 的主要障碍是没有 hidden 注入 API」。实际 `llama.h` 只有导出
-（`llama_set_embeddings_layer_inp`），但 **QLH 的 keep-head shim 已实现完整通道**，
-且 `mode 0 = nextn` 配 head 裁层工件时**只跑文件内的层**，正是首段需要的。
+**llama.cpp fork（`H:\llamacpp-c`，相对上游 15 文件 +447/−26）**
 
-`mode 1 = layer_inp` 会跑满全部层，只适合配整模做验证——这一点在 `engine.py` 的
-注释里已写明。
+| 标记 | 内容 |
+| --- | --- |
+| `[C-scheme]` | `LLAMA_LAYER_RANGE=lo:hi` 层范围加载、`embeddings_pre_norm` 接力向量、lazy 全局张量、跳过 lm_head |
+| `[C-scheme]` | `qwen35` / `qwen35moe` 的 pre-norm tap；`extern "C"` 导出供 C 侧按名解析 |
+| `[TAG_RECURRENT_ROLLBACK_SPLITS]` | recurrent 快照按 ubatch 滚动，跨批回滚不再读到过期槽位 |
+| `[DFLASH-01]` | 末层输出挂 `t_layer_inp[n_layer]`、`llama_model_n_embd_inp_enc`、warmup 空跑越界修复 |
+
+**shim（`shim/qlh_keep_head_gpu.c`，约 1650 行 C）**
+
+把 llama 上下文包成 C ABI：多槽 `layer_inp`、DFlash `draft_open/inject/block/rollback/reset`、
+MTP 草稿、采样器、`seq_rm`。MSVC 导出的 C++ mangled 名用 `GetProcAddress` 运行时解析。
+
+**Python 侧（扁平布局，约 30 个模块）**
+
+| 文件 | 职责 |
+| --- | --- |
+| `topology.py` | TOML 拓扑解析，切分点按 `full_attention_interval` fail-closed |
+| `chain_client.py` | 绕链驱动、投机循环、按负载选 k、内存预检 |
+| `engine.py` / `keep_head.py` | shim 的 ctypes 绑定 |
+| `stage_worker.py` / `protocol.py` / `wire.py` | 段进程与帧协议 |
+| `server.py` / `stream.py` / `proto_responses.py` | OpenAI 兼容接口与 SSE |
+| `chat_tui.py` / `koakuma.py` | TUI 与控制面 |
+
+**通用跨机驱动（`scripts/`，设备无关，可入库）**
+
+`check_p4_cross.py` 从拓扑读一切（含 `ssh_user` / `start_cmd`），target layer id 按切点动态算；
+`tail-worker.cmd` 是远端启动模板；`topology-example.toml` 是占位模板。
+站点配置（IP、账号、路径）全部在 `.gitignore` 的 `topology-*.toml` 里，不进版本库。
+
+---
+
+## 5. 未接 / 未做
+
+| 方向 | 状态 | 依据 |
+| --- | --- | --- |
+| SLIM-ARC | **未接**，有触发条件 | `docs/SLIM-ARC-接入计划.md` |
+| 跨框架接力（llama.cpp ↔ torch） | 未做 | `README.md` 未做节 |
+| LiLiCorr 轻量重排头 | 方案已写，未实施 | `docs/LILICORR-轻量头.md` |
+| 弱设备（Y700 / Surface）接入 | 评估已写，当前为负收益 | `docs/ANDROID-SURFACE-段接入评估.md` |
+| 多序列 token 共享 | 未做，对这类请求明确报错 | `README.md` |
+| n-gram 影子模式 | 未做（上游原生策略已可用） | `docs/SPECULATION.md` §6 |
+
+---
+
+## 6. 复现
+
+```powershell
+# 拓扑里写清两段的 model / host / port / layer_range / gpu_layers / cpu_moe
+# --spec-k 默认 -1，按负载自动选（代码类 k=2，其余 k=0）；要强制就写具体值
+python chain_client.py --topology topology-cross-mtp.toml
+
+# 逐位正确性：与 --spec-k 0 的输出比对
+# 段区间与显存：
+python checks/verify_ranges.py ; python checks/verify_vram.py
+```

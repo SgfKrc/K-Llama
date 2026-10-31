@@ -201,7 +201,8 @@ checks/               八份验收脚本（含 wire 的数值判据与链路基�
 | `docs/SAMPLING.md` | 采样参数如何映射到 llama.cpp |
 | `docs/TUI.md` | TUI 布局与启动画面 |
 | `docs/PATCHES.md` | 两代补丁的差异，以及和原生 RPC 的分界 |
-| `docs/SPECULATION.md` | 投机解码四个方向的判定（MTP 首选、DFlash 次之、PLD 按负载） |
+| `docs/LILICORR-轻量头.md` | DFlash 草稿的块内一致性重排，以及训练成本 |
+| `docs/ANDROID-SURFACE-段接入评估.md` | 弱设备接入的条件、安卓侧硬约束、切点实测 |
 | `docs/SLIM-ARC-接入计划.md` | 缺页优化在什么条件下才启用 |
 | `docs/DECISIONS.md` | 为什么是这样 |
 
