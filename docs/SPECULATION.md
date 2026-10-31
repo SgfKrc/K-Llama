@@ -36,7 +36,7 @@ plain 生成 2 个 token = 4.00 个单位
 
 | 方向 | 判定 | 依据 |
 | --- | --- | --- |
-| MTP（模型自带） | **部件已通，不接主链路** | 单 head ⇒ k=1，§0 结构性亏损；实测慢 13-14% |
+| MTP（模型自带） | **代码场景 1.19×** | k=1 亏；**递归 k=2** 在代码上接受 1.60，达盈亏线 1.18 |
 | DFlash（外挂 0.24 GB） | **唯一值得投入** | k=8/16 在盈利区间，每草稿接受 16% 即回本 |
 | PLD / n-gram | 按负载开关 | 中文对话 m=1.05（无效），代码续写 m=2.56–3.37 |
 | 浅层投机（前 k 层） | 不做 | 实测 α=0.00–0.08，E[accept]≈1.0 |
@@ -94,9 +94,20 @@ blk.40.nextn.{eh_proj,enorm,hnorm,shared_head_norm}
 //   neither (qwen35 / qwen35moe): a single trained MTP head.
 ```
 
-**qwen35moe 是单 head，一次只能预投 1 个 token，即 k=1。** 按 §0 的成本模型，k=1 是结构性
-亏损（成本等于 plain 生成 2 个 token，却只多前进 r ≤ 1 个）。**所以 MTP 单头不值得接**——
-这与早期判断相反，早期那笔账漏算了轮内的四次位置操作。
+**qwen35moe 是单 head。k=1 结构性亏损**（成本等于 plain 生成 2 个 token，却只多前进 r ≤ 1 个），
+实测慢 28%。但**递归可以让它投多个**：同一个 hidden 反复喂自己的输出，`(h_p, d1) -> d2`。
+
+递归的接受率按层衰减，实测（50 token，k=2）：
+
+| 场景 | 第 1 层 | 第 2 层 | 平均接受 | 成本 4.36 ÷ 前进 | 结果 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **代码**（`def quicksort`） | 85.1% | 87.5% | **1.60** | 1.68 | **快 1.19×** |
+| 文档（Markdown 表头） | 62.2% | 65.2% | 1.03 | 2.15 | 慢 7% |
+| 对话（`中国的首都是`） | 60.0% | 73.3% | 1.24（k=4） | >2.0 | 慢 |
+
+k=2 的盈亏线是 **1.18 个草稿**，只有代码场景达标。第 3 层掉到 36%、第 4 层 17%——
+**递归深度上限就是 2**，再加 k 只多付成本。**MTP 定位是「代码续写场景的 1.19×」，不是通用
+加速**，收益随文本可预测性走，必须按负载开关（§6）。
 
 **接受率已实测**（head 0:32 + tail 32:40 + MTP，贪心，三个 prompt）：
 
@@ -140,16 +151,8 @@ dflash.target_layers  = [2, 7, 12, 17, 23, 28, 33, 38]  ← 需要目标模型�
 2. **llama.cpp 的 `draft-dflash` 要求 target 与 draft 在同一个 `llama_context`**。它直接读
    target 的中间层和 KV，没有"跨进程分段 target"的概念。这条路要自己在 Python 侧重写编排。
 
-按实测成本估算（本机 batch=16 是 269 ms、tail 段 90.3 ms、传输 16×8 KB 约 40 ms）：
-
-```
-验证 16 个 ≈ 269 + 135(ROG 含内存压力) + 40 = 444 ms
-接受率 20% → 3.2 个 → 139 ms/token（持平）
-接受率 30% → 4.8 个 → 92 ms/token（1.5×）
-接受率 40% → 6.4 个 → 69 ms/token（2.0×）
-```
-
-社区线索的接受率是 0.30–0.50。按 §0 的模型，k=8 且每草稿接受 16% 即回本：
+按 §0 的模型，k=8 且每草稿接受 16% 即回本（k=16 的验证一次约 444 ms：本机 269 + ROG 135
++ 传输 40）。社区线索的接受率是 0.30–0.50：
 
 ```
 接受 4/8 (50%)  → 1.30 单位/token，快 1.54×
@@ -202,32 +205,28 @@ layer dropout。
 
 1. **`n_rs_seq` 可配 + 按序回滚**。已完成：`SA_N_RS_SEQ`、`qlh_kh_seq_rm`。
 2. **批量验证链路**。已完成：`hidden_tokens` op 贯通到 `StageClient.forward_tokens_out`。
-3. **MTP 部件**。已完成，但**不接主链路**：k=1 结构性亏损（实测慢 28%）。
+3. **MTP 递归 k=2**。部件已完成；代码场景实测 1.19×，按负载开关接入（§4）。
 4. **回滚已修**（§9）。剩下的跨形状 kernel 差异不影响 argmax。
 5. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
 6. **DFlash**：k=8 天生在盈利区间，是唯一值得投入完整工程的方向。
 
 ## 9. 数值验证结论
 
-位置账已修好（`checks/probe_spec_wip.py`，先验证后写入模式下 2 个 prompt 逐位一致、
-接受率 83-92%），但**真投机（批量验证 + 拒稿回滚）卡在两个底层行为上**：
+位置账在 `checks/probe_spec_wip.py`（先验证后写入模式下 2 个 prompt 逐位一致、接受率 83-92%）。
+两个曾经的障碍都已澄清或修掉：
 
-1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻，批量验证是干净的**。
+1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻，批量验证是干净的**。hidden 差
+   2.5e-2~3.8e-2（相对 4e-3）但不翻转 argmax：用「完美草稿」跑 30 个 token，2B 与 35B 都
+   逐位一致，块的第 1 行（验货用）与第 2 行（免费 token）**都对**。之前的两次「批量出错」
+   都是实验设计问题（filler 污染 KV、`rebuild()` 重放不一致），`checks/probe_perfect_draft.py`
+   是干净的端到端版本。
 
-   hidden 确实差 2.5e-2~3.8e-2（相对 4e-3），但**不翻转 argmax**。用「完美草稿」（块的第 2 行
-   填单步真实会产出的 token，KV 无污染）跑 30 个 token，2B 与 35B 都**逐位一致**，块的第 1 行
-   （`tb[0]`，验货用）与第 2 行（`tb[1]`，免费 token）**都对**。之前两次「批量出错」都是实验
-   设计问题：一次 filler 塞了重复 token 污染 KV，一次 `rebuild()` 重放时 token 序列不一致。
-   `checks/probe_perfect_draft.py` 是干净的端到端版本（30 token 全序列对比）。
-2. ~~`qlh_kh_seq_rm` 不是干净回滚~~ —— **已修复**。根因是 `n_rs_seq` 快照**只有「单 ubatch
-   内」的语义**：上游只保证尾部 K 个 token 不拆到两个 ubatch（`split_equal`），**跨 ubatch
-   不做滚动**。单 token decode 每步只写 slot 0，slot 1..K-1 陈旧，`seq_rm` 后重写就读到
-   远古 state。修法是在 `build_rs` 里读出 pre-batch state 之后、写新槽之前插入移位节点
-   `new_slot[s] = old_slot[s + r - n_tokens]`，并修掉 conv 侧 `max(0,…)` 截断。
-
-   实测：单 token 写 → rm → 同形状重写，hidden **0.000e+00**（回滚后继续 3 步也是 0）。
-   **跨形状**（2-token 写 → rm1 → 单 token 重写）仍有 ~1e-2，那是 GDN 两套 kernel
-   （CH/AR）的算术差异，与回滚无关。
+2. ~~`qlh_kh_seq_rm` 不是干净回滚~~ —— **已修复**，详见
+   [`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md)。根因是
+   `n_rs_seq` 快照**只有「单 ubatch 内」语义、跨 ubatch 不滚动**：单 token decode 每步只写
+   slot 0，`seq_rm` 后重写就读到陈旧的 slot 1。修法是在 `build_rs` 里插移位节点让快照跨
+   ubatch 连续。实测同形状回滚 **0.000e+00**。跨形状仍有 ~1e-2，是 GDN 两套 kernel
+   （CH/AR）的算术差异，与回滚无关、不影响 argmax。
 
    **官方从不跨 ubatch 回滚**（verify batch 一次写 `n_draft+1` 个 token，回滚量总落在刚写的
    槽里；draft 端 `n_rs_seq=0`、整段重跑），所以这个缺陷只有「分段 + 单 token draft」才暴露。
