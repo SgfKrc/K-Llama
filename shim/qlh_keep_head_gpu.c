@@ -214,6 +214,10 @@ typedef struct qlh_keep_head {
     /* ★ 2026-10-30：context 的并行序列上限，从 qlh_kh_load 的入参归一化后存下。
      * 批次分配的 `n_seq_max` 必须与它一致 —— 详见 qlh_fill_explicit 上方的说明。 */
     int32_t n_seq_max;
+    /* ★ 2026-10-31（KV-SEQ-RM-01）：主 ctx **实际生效**的 n_rs_seq（回读 llama_n_rs_seq）。
+     * 只有 hybrid / recurrent memory 需要它，且必须覆盖一次验证块的回滚深度；见
+     * qlh_kh_load 里设置它的那段注释，以及 qlh_kh_draft_block 里的越界告警。 */
+    int32_t n_rs_seq;
     /* 是否启用统一 KV。= 0 时 llama.cpp 要求每个 token 恰好属于一个序列
      * （`llama-kv-cache.cpp` 在 `n_stream > 1` 时断言 `n_seq_id == 1`，而
      * `llama-context.cpp` 用 `n_stream = kv_unified ? 1 : n_seq_max`）。
@@ -461,9 +465,58 @@ void * qlh_kh_load(const char * model_path,
      * is what every non-speculative chain wants (it is pure overhead otherwise). SA_N_RS_SEQ sets
      * it; the value must be >= the number of tokens one verification batch covers. */
     {
+        /* ★ 2026-10-31（KV-SEQ-RM-01）：主 ctx 的 n_rs_seq 必须 >= **最坏一次 seq_rm 要回滚的位置数**，
+         * 不是 0，也不只是"draft 深度 - 1"。
+         *
+         * 现象：同一进程里 draft 侧 `llama_memory_seq_rm` 返回 1，而 head 段同一调用返回 0
+         * （`[kv] seq_rm p0=21 removed=0`，pos_max 仍 35）→ 下一次 n_past=21 的 decode 撞位 rc=-1。
+         *
+         * 根因：qwen35moe（`full_attention_interval=4`）每 4 层有 3 层是 gated delta net，
+         * `llama_model::create_memory()` 因此给主 ctx 选的是 `llama_memory_hybrid`
+         * （llama-model.cpp:3229 → 3315；加载日志里同时出现 `llama_kv_cache: size = ... 8 layers`
+         * 和 `llama_memory_recurrent: size = ... 32 layers`，即 8 层 attention + 24 层线性）。
+         * `llama_memory_hybrid::seq_rm` 先调 `mem_recr->seq_rm`，失败就**直接 return false**，
+         * attention 那 15 行一个都不删（llama-memory-hybrid.cpp:144-151）。
+         * 而 recurrent 的部分回滚只允许 `rollback <= n_rs_seq`
+         * （llama-memory-recurrent.cpp:208-216），其中
+         *   rollback = 尾部 cell.pos - (p0 - 1)
+         * 位置 0..35 写满、删 21.. 时 rollback = 35 - 20 = 15。
+         *
+         * 实测（H:\slimarc-proto\exp-c\repro_rs，gcc + llama.lib，35B 取 LLAMA_LAYER_RANGE=0:32）：
+         *   n_rs_seq  0 / 2 / 14 → removed=0, pos_max 35→35, 下一步 decode rc=-1
+         *   n_rs_seq 15 / 16    → removed=1, pos_max 35→20, 下一步 decode rc=0
+         * 边界正好落在 `rollback <= n_rs_seq`。
+         *
+         * 因此主 ctx 取 max(SA_N_RS_SEQ, SA_KH_RS_SEQ)：
+         *   - SA_N_RS_SEQ 是调用方要的深度（chain_client 默认 2，按 draft 深度 k 算的）；
+         *   - SA_KH_RS_SEQ 是本 shim 的**验证块上限**，默认 16（`qlh_kh_draft_block` 的 block
+         *     上限；整块被拒时最多回滚 16 个位置）。设成 0 可关掉这个提升（只用于测开销）。
+         * 只在 rs > 0（即调用方本来就要回滚）时提升，非 spec 链仍然 n_rs_seq = 0、不付代价。
+         *
+         * 代价：RS 行数 = mem_size*(1+n_rs_seq)（llama-memory-recurrent.cpp:102），
+         * 35B/0:32 实测 50.25 MiB → 854.25 MiB；decode 墙钟在噪声内
+         * （1-token 113→127 ms，15-token 1004→624 ms）。 */
         const char * rs_env = getenv("SA_N_RS_SEQ");
         const long rs = (rs_env != NULL && rs_env[0] != '\0') ? strtol(rs_env, NULL, 10) : 0;
-        cparams.n_rs_seq = (rs > 0 && rs <= 64) ? (uint32_t) rs : 0;
+        const char * kh_env = getenv("SA_KH_RS_SEQ");
+        const long kh = (kh_env != NULL && kh_env[0] != '\0') ? strtol(kh_env, NULL, 10) : 16;
+        long want = (rs > 0) ? rs : 0;
+        if (want > 0 && kh > want) {
+            want = kh;
+        }
+        if (want > 64) {
+            want = 64;
+        }
+        cparams.n_rs_seq = (uint32_t) want;
+        /* 快照按「同一个 ubatch 内尾部 1+n_rs_seq 个 token」维护
+         * （llama-memory-hybrid.cpp:86-90），n_ubatch 必须装得下。上面的逻辑已把
+         * n_ubatch 限到 512，通常满足；这里兜底，免得把回归引到 split_equal 里。 */
+        if (cparams.n_ubatch < (uint32_t) want + 1) {
+            cparams.n_ubatch = (uint32_t) want + 1;
+        }
+        fprintf(stderr, "[qlh_keep_head] n_rs_seq: SA_N_RS_SEQ=%ld SA_KH_RS_SEQ=%ld -> %u "
+                        "(n_ubatch=%u, block upper bound for rollback)\n",
+                rs, kh, cparams.n_rs_seq, cparams.n_ubatch);
     }
     cparams.n_outputs_max          = 0;   /* derive from n_batch */
     cparams.n_outputs_max_per_seq  = 0;   /* derive from n_outputs_max */
@@ -582,6 +635,9 @@ void * qlh_kh_load(const char * model_path,
      *
      * 现在 batch 按 handle 记录的上限分配，填充处越界时直接拒绝，见 qlh_fill_explicit。 */
     handle->n_seq_max = (int32_t) cparams.n_seq_max;
+    /* ★ KV-SEQ-RM-01：回读**实际生效**的快照深度（hybrid 在空过滤器下会把 n_rs_seq 夹到 0，
+     * llama-memory-recurrent.cpp:125-130），draft_block 用它做越界告警。 */
+    handle->n_rs_seq = (int32_t) llama_n_rs_seq(ctx);
     handle->kv_unified = 0;   /* llama.cpp 默认 false；见结构体注释 */
     /* ★ 2026-10-29（SAMPLING-01）：**中性**默认值，不是 calloc 的零。
      * `calloc` 会把 top_p / repeat_penalty 留成 0.0，而 0.0 在这套接口里的含义是
@@ -876,6 +932,14 @@ int32_t qlh_kh_draft_block(void * handle_void, int32_t anchor_id, int32_t n_bloc
     const int32_t block = n_block > 0 ? n_block : handle->draft_block_size;
     if (block < 2 || block > out_capacity + 1) {
         return -3;
+    }
+    /* ★ KV-SEQ-RM-01：这一块写进去多少位置，主链在被全拒时就可能要从主 ctx 回滚多少位置。
+     * 超过 n_rs_seq 时 llama_memory_hybrid::seq_rm 会整体拒绝 —— 连 attention 的 KV 都不删，
+     * 于是下一轮 n_past 撞位（rc=-1）。见 qlh_kh_load 里设置 n_rs_seq 的那段。 */
+    if (handle->n_rs_seq > 0 && block > handle->n_rs_seq) {
+        fprintf(stderr, "[qlh_keep_head] draft_block: block=%d > n_rs_seq=%d -- a fully rejected "
+                        "block cannot be rolled back on the main ctx (raise SA_KH_RS_SEQ to %d)\n",
+                block, handle->n_rs_seq, block);
     }
 
     struct llama_batch batch = llama_batch_init(block, 0, 1);
