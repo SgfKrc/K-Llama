@@ -104,16 +104,28 @@ static void qlh_resolve_layer_inp(void) {
     }
 }
 
-/* 两个分支用同一套：上游 DLL 也导出了这两个符号，退化成 llama_get_embeddings() 只会
- * 让多槽能力静默失效（加槽成功、取数 NULL），见 DFLASH-01 的说明。 */
-#define LLAMA_SET_RELAY_HIDDEN(ctx, lid) do {                      \
+/* ★ 2026-10-31（DFLASH-01）修正：**默认槽和多槽必须走两条不同的路径**。
+ *
+ * 前一版把它们统一成 layer_inp，结果接力直接崩在
+ *   llama-graph.cpp:1476  GGML_ASSERT(t_layer_inp[il] != nullptr)
+ * 原因是 `qwen35moe.cpp:178` 只登记 `t_layer_inp[0..n_layer-1]`，**没有 t_layer_inp[n_layer]**，
+ * 而 mode 0 的默认槽恰好是 lid=n_layer（"末层输出"）——它在 layer_inp 通道里不存在。
+ *
+ * 接力一直能用的真实原因是：`cparams.embeddings = !needs_logits`（本文件 L470），
+ * hidden 出口把 embeddings 打开，于是 `llama_get_embeddings()` 返回**末层 output_norm 之前**
+ * 的 hidden。所以默认槽继续走它，多槽走真正的 layer_inp。 */
+#define QLH_DEFAULT_SET(ctx, lid) ((void) (lid))
+#define QLH_DEFAULT_GET(ctx, lid) (llama_get_embeddings((ctx)))
+
+/* 多槽（add_layer_inp）解析 C++ 符号后走 layer_inp */
+#define QLH_SLOT_SET(ctx, lid) do {                                \
     qlh_resolve_layer_inp();                                       \
     if (qlh_p_set_layer_inp != NULL) {                             \
         qlh_p_set_layer_inp((ctx), (lid), true);                   \
     }                                                              \
 } while (0)
 
-#define LLAMA_GET_RELAY_HIDDEN(ctx, lid)                           \
+#define QLH_SLOT_GET(ctx, lid)                                     \
     (qlh_resolve_layer_inp(),                                      \
      qlh_p_get_layer_inp != NULL ? qlh_p_get_layer_inp((ctx), (lid)) : NULL)
 
@@ -596,9 +608,9 @@ void * qlh_kh_load(const char * model_path,
      * 与架构无关（槽位由 llama-context.cpp 多分配一个，由各架构 graph 在 `output_norm`
      * 之前登记）。 */
     if (mode == 0) {
-        LLAMA_SET_RELAY_HIDDEN(ctx, (uint32_t) n_layer);
+        QLH_DEFAULT_SET(ctx, (uint32_t) n_layer);
     } else {
-        LLAMA_SET_RELAY_HIDDEN(ctx, (uint32_t) cut_layer);
+        QLH_DEFAULT_SET(ctx, (uint32_t) cut_layer);
     }
 
     if (out_n_embd  != NULL) { *out_n_embd  = handle->n_embd;  }
@@ -615,7 +627,7 @@ void * qlh_kh_load(const char * model_path,
  * （旧实现按 token 逐个取 `llama_get_embeddings_nextn_ith`）。 */
 static int32_t qlh_extract_hidden(qlh_keep_head * handle, int32_t n_tokens, float * out) {
     const uint32_t lid = (uint32_t) ((handle->mode == 0) ? handle->n_layer : handle->cut_layer);
-    const float * ptr = LLAMA_GET_RELAY_HIDDEN(handle->ctx, lid);
+    const float * ptr = QLH_DEFAULT_GET(handle->ctx, lid);
     if (ptr == NULL) {
         return -3;
     }
@@ -646,7 +658,7 @@ int32_t qlh_kh_add_layer_inp(void * handle_void, uint32_t lid) {
     if (handle->n_lids >= cap) {
         return -2;
     }
-    LLAMA_SET_RELAY_HIDDEN(handle->ctx, lid);
+    QLH_SLOT_SET(handle->ctx, lid);
     /* 这里**不能**用 getter 验证：`embd_layer_inp` 要到 `extract_layer_inputs()`（即
      * decode 内）才被填，forward 之前 getter 恒为 NULL —— 早先在这里检查导致每次
      * add 都返回 -3（实测）。lid 是否真有效，由 get_layer_inp 在 forward 后报 -3。 */
@@ -686,7 +698,7 @@ int32_t qlh_kh_get_layer_inp(void * handle_void, uint32_t lid, float * out, int3
         capacity < handle->last_n_tokens * handle->n_embd) {
         return -1;
     }
-    const float * ptr = LLAMA_GET_RELAY_HIDDEN(handle->ctx, lid);
+    const float * ptr = QLH_SLOT_GET(handle->ctx, lid);
     if (ptr == NULL) {
         return -3;
     }

@@ -106,6 +106,16 @@ class Binding:
         lib.qlh_kh_last_hidden.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32]
         lib.qlh_kh_last_hidden.restype = ctypes.c_int32
+        # DFLASH-01: multi-slot intermediate hidden. Declaring these matters -- an undeclared
+        # function makes ctypes default to 32-bit ints and the 64-bit handle overflows, which
+        # killed the worker silently the first time it happened (qlh_kh_seq_rm).
+        lib.qlh_kh_add_layer_inp.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        lib.qlh_kh_add_layer_inp.restype = ctypes.c_int32
+        lib.qlh_kh_get_layer_inp.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_float), ctypes.c_int32]
+        lib.qlh_kh_get_layer_inp.restype = ctypes.c_int32
+        lib.qlh_kh_last_n_tokens.argtypes = [ctypes.c_void_p]
+        lib.qlh_kh_last_n_tokens.restype = ctypes.c_int32
         lib.qlh_kh_mtp_draft.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
             ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)]
@@ -251,6 +261,32 @@ class Binding:
             self._handle, _f32(arr), k, int(n_past), None, None, None, out, k)
         self._checked(rc, None, "tail forward (batch)")
         return list(out)
+
+    def add_layer_inp(self, lid: int) -> int:
+        """Open one extra intermediate-hidden slot. 0 = ok, negative = shim error."""
+        return int(self._lib.qlh_kh_add_layer_inp(self._handle, int(lid)))
+
+    def layer_inp(self, lids: list[int]) -> np.ndarray | None:
+        """All requested slots from the most recent forward, as [n_layers, n_tokens, n_embd].
+
+        Returns None if any slot is unavailable -- a partial result would be worse than none,
+        because the caller would silently feed zeros into the draft model.
+        """
+        if not lids:
+            return None
+        n_tok = int(self._lib.qlh_kh_last_n_tokens(self._handle))
+        if n_tok <= 0 or self.n_embd <= 0:
+            print(f"[kh.layer_inp] n_tokens={n_tok} n_embd={self.n_embd}",
+                  file=sys.stderr, flush=True)
+            return None
+        out = np.zeros((len(lids), n_tok, self.n_embd), dtype=np.float32)
+        for i, lid in enumerate(lids):
+            rc = self._lib.qlh_kh_get_layer_inp(
+                self._handle, int(lid), _f32(out[i]), int(out[i].size))
+            if rc != 0:
+                print(f"[kh.layer_inp] lid={lid} rc={rc}", file=sys.stderr, flush=True)
+                return None
+        return out
 
     def last_hidden(self) -> np.ndarray | None:
         """The trunk's final hidden of the most recent decode (needs SA_MTP=1).
@@ -511,6 +547,18 @@ def main() -> int:
             elif operation == "mtp_reset":
                 binding.mtp_reset()
                 _response(ok=True)
+            elif operation == "layer_inp":
+                arr = binding.layer_inp([int(v) for v in request.get("lids", [])])
+                if arr is None:
+                    _response(ok=False, error="layer_inp unavailable (see stage log)")
+                else:
+                    _array_response(arr.reshape(-1, arr.shape[-1]))
+            elif operation == "add_layer_inp":
+                rc = binding.add_layer_inp(int(request["lid"]))
+                if rc != 0:
+                    _response(ok=False, error=f"add_layer_inp({request['lid']}) rc={rc}")
+                else:
+                    _response(ok=True)
             elif operation == "seq_rm":
                 binding.seq_rm(n_past)
                 _response(ok=True)

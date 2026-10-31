@@ -131,6 +131,22 @@ class StageEngine:
         """k rows of hidden in, k token ids out. The speculative verification primitive."""
         return self._up.forward_hidden_to_tokens(_f32_input(hidden), n_past=n_past)
 
+    def add_layer_inp(self, lid: int) -> None:
+        """Open an intermediate-hidden slot; needed only by DFlash-style drafting."""
+        self._up.add_layer_inp(int(lid))
+
+    def layer_inp(self, lids: list[int]) -> np.ndarray | None:
+        """Multi-slot intermediate hidden of the most recent forward.
+
+        None when unavailable, matching last_hidden(): the caller treats "no hidden" as
+        "this model does not support it" rather than as a fatal error.
+        """
+        try:
+            return np.asarray(self._up.layer_inp(lids), dtype=np.float32)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[engine.layer_inp] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return None
+
     def last_hidden(self) -> np.ndarray | None:
         """Final hidden of the most recent decode, for the MTP head (needs SA_MTP=1)."""
         try:

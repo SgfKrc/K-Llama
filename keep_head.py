@@ -252,6 +252,20 @@ class KeepHeadUpstream:
                 f"keep-head worker returned {len(toks)} tokens for {arr.shape[0]} rows")
         return toks
 
+    def add_layer_inp(self, lid: int) -> None:
+        """Open one more intermediate-hidden slot (DFlash needs 8 of them)."""
+        self._request({"op": "add_layer_inp", "lid": int(lid)})
+
+    def layer_inp(self, lids: list[int]) -> np.ndarray:
+        """Requested slots from the most recent forward: [n_layers, n_tokens, n_embd]."""
+        if not lids:
+            raise KeepHeadUnavailable("layer_inp called with no lids")
+        reply = self._request({"op": "layer_inp", "lids": [int(v) for v in lids]})
+        arr = self._array(reply)
+        # The worker flattens to [n_layers*n_tokens, n_embd]; restore the slot axis so
+        # callers can index by slot instead of by arithmetic.
+        return arr.reshape(len(lids), -1, arr.shape[-1])
+
     def last_hidden(self) -> np.ndarray:
         """The trunk's final hidden of the most recent decode; raises when unavailable."""
         reply = self._request({"op": "last_hidden"})

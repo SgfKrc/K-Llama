@@ -322,6 +322,34 @@ class StageClient:
             return None
         return self._decode_hidden(msg).reshape(-1)
 
+    def add_layer_inp(self, lid: int) -> None:
+        """Open an intermediate-hidden slot on this stage."""
+        self._forward({"op": "add_layer_inp", "lid": int(lid)})
+
+    def layer_inp(self, lids: list[int]) -> np.ndarray | None:
+        """Multi-slot intermediate hidden from the most recent forward.
+
+        Shape [n_layers, n_tokens, n_embd]. None when the stage has no data (or the model has
+        no such layers) -- treated as "feature unavailable", not as an error.
+        """
+        if not lids:
+            return None
+        try:
+            msg = self._forward({"op": "layer_inp", "lids": [int(v) for v in lids]})
+            # Decode here instead of via _decode_hidden: that helper derives the expected
+            # payload length from n_tokens alone, and this reply carries n_layers of them
+            # (it rejected a correct 6x5x2048 blob for being "6 times too big").
+            n_layers = int(msg.meta["n_layers"])
+            n_tokens = int(msg.meta["n_tokens"])
+            n_embd = int(msg.meta["n_embd"])
+            dtype = wire.resolve(msg.meta.get("dtype"))
+            arr = wire.decode(msg.blob, dtype, (n_layers * n_tokens, n_embd))
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [layer_inp] stage {self.stage.index}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            return None
+        return arr.reshape(n_layers, n_tokens, n_embd)
+
     def mtp_draft(self, hidden: np.ndarray, token: int, n_past: int) -> int:
         """One draft token from the MTP head held by this stage."""
         # last_hidden() hands back a flat (n_embd,) row; the wire wants one row of that width.

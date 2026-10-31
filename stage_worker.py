@@ -127,6 +127,27 @@ class StageWorker:
                                           {"n_embd": int(h.shape[0]), "n_tokens": 1,
                                            "dtype": d},
                                           wire.encode(h.reshape(1, -1), d))
+                    elif op == "add_layer_inp":
+                        # DFLASH-01: open one more intermediate-hidden slot. The shim keeps
+                        # the list; this op is idempotent so a reconnecting driver can re-add.
+                        self._engine.add_layer_inp(int(msg.meta["lid"]))
+                        protocol.send(conn, protocol.RESULT, {})
+                    elif op == "layer_inp":
+                        # DFLASH-01: all requested slots from the most recent forward, in one
+                        # reply. Per-slot round trips would be 6 socket hops per decode step.
+                        arr = self._engine.layer_inp([int(v) for v in msg.meta.get("lids", [])])
+                        if arr is None:
+                            protocol.send(conn, protocol.ERROR,
+                                          {"code": "no_layer_inp",
+                                           "detail": "shim has no data for those slots"})
+                        else:
+                            d = wire.resolve(msg.meta.get("dtype"))
+                            protocol.send(conn, protocol.RESULT,
+                                          {"n_layers": int(arr.shape[0]),
+                                           "n_tokens": int(arr.shape[1]),
+                                           "n_embd": int(arr.shape[2]),
+                                           "dtype": d},
+                                          wire.encode(arr.reshape(-1, arr.shape[-1]), d))
                     elif op == "seq_rm":
                         self._engine.seq_rm(n_past)
                         protocol.send(conn, protocol.RESULT, {})
