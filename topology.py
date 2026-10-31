@@ -57,6 +57,16 @@ class Stage:
     # layers are selected at load time instead of pre-cut into an artifact. None keeps the
     # original behaviour (model points at a cut segment). See docs/DEPLOYMENT.md.
     layer_range: tuple[int, int] | None = None
+    # How to bring a REMOTE stage up. Both are optional: when `ssh_user` is empty the
+    # harness assumes the worker is already listening (start it by hand), which keeps the
+    # tooling free of any particular machine's name, address or filesystem layout.
+    ssh_user: str = ""
+    start_cmd: str = ""
+
+    @property
+    def ssh_target(self) -> str:
+        """``user@host`` for ssh, or "" when this stage must be started externally."""
+        return f"{self.ssh_user}@{self.host}" if self.ssh_user else ""
 
     @property
     def is_local(self) -> bool:
@@ -152,6 +162,8 @@ def _stage(index: int, raw: dict) -> Stage:
         _str(raw, "cpus", index, default="", blank=True),
         _int(raw, "threads", index, 1, 64, 3),
         _layer_range(raw, index, layers),
+        str(raw.get("ssh_user", "")).strip(),
+        str(raw.get("start_cmd", "")).strip(),
     )
 
 

@@ -35,3 +35,7 @@ torchinductor_Koakuma/
 
 # 实验 shim（含 66 MB DLL，可由 checks/build 脚本重建）
 checks/_exp_shim/
+
+# 站点拓扑（含主机名/IP/路径，不入公开仓库）。用 topology-example.toml 作模板。
+topology-*.toml
+!topology-example.toml
