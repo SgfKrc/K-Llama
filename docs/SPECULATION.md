@@ -202,9 +202,8 @@ layer dropout。
 
 1. **`n_rs_seq` 可配 + 按序回滚**。已完成：`SA_N_RS_SEQ`、`qlh_kh_seq_rm`。
 2. **批量验证链路**。已完成：`hidden_tokens` op 贯通到 `StageClient.forward_tokens_out`。
-3. **MTP 部件**。已完成（loader 保留 nextn、独立 context、`qlh_kh_mtp_draft`）。**但不接主链路**：
-   k=1 结构性亏损。
-4. **修两个数值障碍**（见 §9）。不修则任何 k≥2 的投机都无法保证输出一致。
+3. **MTP 部件**。已完成，但**不接主链路**：k=1 结构性亏损（实测慢 28%）。
+4. **回滚已修**（§9）。剩下的跨形状 kernel 差异不影响 argmax。
 5. **PLD 影子模式**统计真实负载命中率，达标后才对该类请求启用。
 6. **DFlash**：k=8 天生在盈利区间，是唯一值得投入完整工程的方向。
 
@@ -230,9 +229,8 @@ layer dropout。
    **跨形状**（2-token 写 → rm1 → 单 token 重写）仍有 ~1e-2，那是 GDN 两套 kernel
    （CH/AR）的算术差异，与回滚无关。
 
-   **官方从不跨 ubatch 回滚**：verify batch 一次写 `n_draft+1` 个 token，回滚量永远落在刚写
-   的那批槽里；draft 端直接 `n_rs_seq=0`、整段删掉重跑。所以这个缺陷一直没人发现——它是
-   分段 + 单 token draft 这个组合才暴露出来的。
+   **官方从不跨 ubatch 回滚**（verify batch 一次写 `n_draft+1` 个 token，回滚量总落在刚写的
+   槽里；draft 端 `n_rs_seq=0`、整段重跑），所以这个缺陷只有「分段 + 单 token draft」才暴露。
 
    机制已梳理：`seq_rm` 只放行 `rollback ≤ n_rs_seq` 且要求 `rs_idx == 0`（快照索引
    single-use，`s_copy` 读完清零）；快照由 graph 在每次 decode 时把当前状态拷进
@@ -244,5 +242,5 @@ layer dropout。
 
 ## 10. 已知限制
 
-只对 temp=0 无损（shim 暴露 argmax 而非 logits 分布，做不了标准 rejection sampling）。ROG 只有
-0.82 GiB 可用，`n_rs_seq` 要占 100 MiB。DFlash 的真实接受率与 k≥2 端到端收益都还没实测。
+只对 temp=0 无损（shim 暴露 argmax 而非 logits，做不了 rejection sampling）。ROG 只有 0.82 GiB，
+`n_rs_seq` 占 100 MiB。DFlash 接受率与 k≥2 端到端收益未实测。
