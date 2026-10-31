@@ -1359,6 +1359,27 @@ int32_t qlh_kh_get_sampling(void * handle_void,
  * dist 的 RNG 状态同理。注意不能改成"重建链"：重建会把 seed 重置回初始状态，
  * 那样每条请求从同一种子起步是合理的，但也会丢掉我们刻意要保留的链配置。
  * `llama_sampler_reset` 正是上游为此提供的接口。 */
+/* Clear the MTP context's memory. Independent of the trunk so a caller can recycle the draft
+ * head alone (recursive drafting reuses one mtp_ctx for many candidate positions). */
+static void qlh_mtp_clear(qlh_keep_head * handle) {
+    if (handle == NULL || handle->mtp_ctx == NULL) {
+        return;
+    }
+    llama_memory_t mem = llama_get_memory(handle->mtp_ctx);
+    if (mem != NULL) {
+        llama_memory_clear(mem, true);
+    }
+}
+
+int32_t qlh_kh_mtp_reset(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->mtp_ctx == NULL) {
+        return -5;
+    }
+    qlh_mtp_clear(handle);
+    return 0;
+}
+
 void qlh_kh_reset(void * handle_void) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     if (handle == NULL || handle->ctx == NULL) {
@@ -1372,6 +1393,11 @@ void qlh_kh_reset(void * handle_void) {
     if (mem != NULL) {
         llama_memory_clear(mem, true);
     }
+    /* The draft head is stateless per call, but its context is not: positions accumulate in
+     * mtp_ctx's KV, so a second generate in the same process would draft from a context still
+     * sitting at the old position and every draft would be wrong. Clear it here so one reset
+     * means "same state as a fresh process". */
+    qlh_mtp_clear(handle);
 }
 
 void qlh_kh_close(void * handle_void) {

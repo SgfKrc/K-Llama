@@ -9,6 +9,7 @@ EXPORTS
     qlh_kh_finite_logits_guard
     qlh_kh_n_vocab
     qlh_kh_mtp_draft
+    qlh_kh_mtp_reset
     qlh_kh_last_hidden
     qlh_kh_seq_rm
     qlh_kh_n_embd
