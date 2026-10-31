@@ -54,3 +54,21 @@ def load():
     import topology
 
     return topology.load(topology_path())
+
+
+#: Which roles need the output projection. Only the tail turns hidden into ids; every
+#: other stage otherwise makes the shim run `output.weight` over the whole 248,320-row
+#: vocabulary and throw the result away. The per-step cost of that is measured in the
+#: stage-timing breakdown; it is not repeated here, because two callers once carried
+#: this comment with two different numbers (6.4 ms and 3.6 ms) for the same measurement.
+LOGITS_ROLES = frozenset({"tail"})
+
+
+def needs_logits(role: str) -> str:
+    """The ``SA_NEEDS_LOGITS`` value for one stage role.
+
+    Both callers -- the in-process `engine.StageEngine` and the subprocess
+    `chain_client.spawn_worker` -- used to spell this rule out separately. One of them
+    was going to drift, and the duplicated justification already had.
+    """
+    return "1" if role in LOGITS_ROLES else "0"

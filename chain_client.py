@@ -511,11 +511,10 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int) -> tuple[subprocess.Popen, 
     ]
     if stage.cpus:
         cmd.extend(["--cpus", stage.cpus])
-    # Only the tail stage needs the output projection. Without this the shim computes
-    # logits for all 248,320 vocabulary rows on every step of every stage and discards
-    # all but the tail's -- measured 32.0 vs 3.6 ms/step on stage0.
+    # Only the tail stage needs the output projection; the rule is shared with the
+    # in-process path through config.needs_logits().
     env = dict(os.environ)
-    env["SA_NEEDS_LOGITS"] = "1" if stage.kind == "tail" else "0"
+    env["SA_NEEDS_LOGITS"] = config.needs_logits(stage.kind)
     # Speculative decode needs two things the plain path does not: the draft head (only the
     # tail holds it) and recurrent snapshots to roll a rejected draft back. Both are opt-in
     # because they cost memory and graph nodes that a non-speculative run should not pay.

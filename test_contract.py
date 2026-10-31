@@ -135,5 +135,79 @@ class MethodSurface(unittest.TestCase):
                              f"{unknown} -- add them to CONTRACT_OPS if they map to a shim op")
 
 
+class SingleSourceOfTruth(unittest.TestCase):
+    """One fact, one place.
+
+    Every bug this class guards against had the same shape: a fact written down a second
+    time, where the copy was correct-looking and only drifted on a path the tests never
+    exercised. ``doc-style.md`` states the rule; these assertions are what makes it
+    mechanical.
+    """
+
+    def test_only_chat_renders_chatml(self):
+        """A second prompt renderer is how the server ended up sending plain text.
+
+        Qwen answered "是 是 是 ..." because `flatten_messages` had its own idea of a
+        prompt while `chat.apply_chatml` had the right one. Two ways to write a second
+        renderer: spell the markers out, or reuse chat.IM_START. Both are caught;
+        prose that merely mentions the marker is not.
+        """
+        literal = re.compile(r'''["']\s*<\|im_start\|>''')
+        offenders = []
+        for path in sorted(ROOT.glob("*.py")):
+            if path.name in {"chat.py", "test_contract.py"}:
+                continue
+            for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace")
+                                     .splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if literal.search(code) or "IM_START" in code:
+                    offenders.append(f"{path.name}:{i}: {line.strip()}")
+        self.assertEqual([], offenders,
+                         "prompt rendering belongs to chat.apply_chatml; found a second "
+                         "implementation: %s" % offenders)
+
+    def test_needs_logits_has_one_implementation(self):
+        """`SA_NEEDS_LOGITS` is *computed* in config.needs_logits() and nowhere else.
+
+        Reading it (the shim-facing worker takes it out of the environment) is fine;
+        only assignments count as a second place where the rule lives.
+        """
+        assign = re.compile(r'SA_NEEDS_LOGITS"?\]\s*=\s*["\d]')
+        offenders = []
+        for path in sorted(ROOT.glob("*.py")):
+            if path.name in {"config.py", "test_contract.py"}:
+                continue
+            for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace")
+                                     .splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if not assign.search(code) or "config.needs_logits(" in code:
+                    continue
+                offenders.append(f"{path.name}:{i}: {line.strip()}")
+        self.assertEqual([], offenders,
+                         "spell the rule once in config.needs_logits(); found it inline: %s"
+                         % offenders)
+
+    def test_prompt_tokens_is_not_a_character_count(self):
+        """`len(prompt)` is characters. The token count comes from tokenize()."""
+        offenders = []
+        for name in ("server.py", "proto_responses.py"):
+            for i, line in enumerate(_read(name).splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if "len(prompt)" in code:
+                    offenders.append(f"{name}:{i}: {line.strip()}")
+        self.assertEqual([], offenders,
+                         "prompt_tokens must come from generate_stream's stats, not len(): %s"
+                         % offenders)
+
+    def test_server_has_one_generation_loop(self):
+        """Four response shapes, one drain. A fifth hand-rolled loop is how `usage`
+        started disagreeing between stream and non-stream."""
+        text = _read("server.py")
+        count = text.count("for chunk in self.generate(")
+        self.assertEqual(
+            1, count,
+            "server.py has %d generation loops; route new shapes through Chain.drain()" % count)
+
+
 if __name__ == "__main__":
     unittest.main()
