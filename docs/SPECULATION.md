@@ -220,19 +220,27 @@ layer dropout。
    （`tb[0]`，验货用）与第 2 行（`tb[1]`，免费 token）**都对**。之前两次「批量出错」都是实验
    设计问题：一次 filler 塞了重复 token 污染 KV，一次 `rebuild()` 重放时 token 序列不一致。
    `checks/probe_perfect_draft.py` 是干净的端到端版本（30 token 全序列对比）。
-2. **`qlh_kh_seq_rm` 不是干净回滚** ← **这是唯一剩下的障碍**。单 token 写完 → rm → 同输入
-   重写同一位置，hidden 差 0.13~0.62（相对 2~10%），token 偶发翻转（8 个位置里 3 次）。
-   残余误差会污染后续所有 hidden，把接受率从 88% 打到 50%。
+2. ~~`qlh_kh_seq_rm` 不是干净回滚~~ —— **已修复**。根因是 `n_rs_seq` 快照**只有「单 ubatch
+   内」的语义**：上游只保证尾部 K 个 token 不拆到两个 ubatch（`split_equal`），**跨 ubatch
+   不做滚动**。单 token decode 每步只写 slot 0，slot 1..K-1 陈旧，`seq_rm` 后重写就读到
+   远古 state。修法是在 `build_rs` 里读出 pre-batch state 之后、写新槽之前插入移位节点
+   `new_slot[s] = old_slot[s + r - n_tokens]`，并修掉 conv 侧 `max(0,…)` 截断。
+
+   实测：单 token 写 → rm → 同形状重写，hidden **0.000e+00**（回滚后继续 3 步也是 0）。
+   **跨形状**（2-token 写 → rm1 → 单 token 重写）仍有 ~1e-2，那是 GDN 两套 kernel
+   （CH/AR）的算术差异，与回滚无关。
+
+   **官方从不跨 ubatch 回滚**：verify batch 一次写 `n_draft+1` 个 token，回滚量永远落在刚写
+   的那批槽里；draft 端直接 `n_rs_seq=0`、整段删掉重跑。所以这个缺陷一直没人发现——它是
+   分段 + 单 token draft 这个组合才暴露出来的。
 
    机制已梳理：`seq_rm` 只放行 `rollback ≤ n_rs_seq` 且要求 `rs_idx == 0`（快照索引
    single-use，`s_copy` 读完清零）；快照由 graph 在每次 decode 时把当前状态拷进
    `rs_idx * size` 起始的槽位；hybrid 分发正确（先 recurrent、失败即中止，再 attention）。
    **所以问题不在"要不要回滚"，而在快照恢复出的状态是否与当初逐位相同。**
 
-3. **官方投机的假设在这里不成立**。`common/speculative.cpp:2726` 把 `n_rs_seq` 设为 **0**，
-   因为它的 target 是纯 transformer（KV 按位置删就够）。而 `qwen35moe` 的 tail 段 8 层里
-   **6 层是 linear**（32/33/34/36/37/38，只有 35/39 是 full attention），recurrent state
-   没有位置索引。**hybrid 模型 + 分段 target 的投机是官方没有覆盖的场景**，没有现成答案。
+3. **tail 段 8 层里 6 层是 linear**（32/33/34/36/37/38，只有 35/39 是 full attention），
+   recurrent state 没有位置索引——这是上面那条缺陷只在本项目暴露的根本原因。
 
 ## 10. 已知限制
 

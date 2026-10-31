@@ -1,0 +1,757 @@
+warning: in the working copy of 'src/llama-memory-recurrent.cpp', LF will be replaced by CRLF the next time Git touches it
+diff --git a/include/llama.h b/include/llama.h
+index 3877b69..5debae1 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -414,6 +414,14 @@ extern "C" {
+                           // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
+                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
+         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
++
++    // [C-scheme] Return the pre-output_norm hidden state as the embedding.
++    //
++    // A layer-segment chain relays the raw output of layer hi-1 into layer hi, so the
++    // vector it forwards must not have been through the model's final RMSNorm -- doing so
++    // applies the norm twice and the logits diverge at the first token. Upstream sets
++    // t_embd after build_norm because pooling wants the normalised value.
++    bool embeddings_pre_norm;
+                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4141e3c..929c588 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -368,6 +368,7 @@ llama_context::llama_context(
+ 
+     cparams.op_offload     = params.op_offload;
+     cparams.kv_unified     = params.kv_unified;
++    cparams.embeddings_pre_norm = params.embeddings_pre_norm;
+     cparams.moe_cache_size = params.moe_cache_size;
+ 
+     // initialized later
+@@ -410,6 +411,7 @@ llama_context::llama_context(
+     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
+     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
++    LLAMA_LOG_INFO("%s: embeddings_pre_norm   = %s\n",   __func__, cparams.embeddings_pre_norm ? "true" : "false");
+     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
+     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
+     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+@@ -4078,6 +4080,7 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
++        /*.embeddings_pre_norm         =*/ false,
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
+@@ -4321,7 +4324,7 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+     return ctx->get_embeddings_seq(seq_id);
+ }
+ 
+-void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
++extern "C" void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+     ctx->set_embeddings_nextn(value, masked);
+ }
+ 
+@@ -4341,7 +4344,7 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     return ctx->get_memory();
+ }
+ 
+-float * llama_get_embeddings_nextn(llama_context * ctx) {
++extern "C" float * llama_get_embeddings_nextn(llama_context * ctx) {
+     ctx->synchronize();
+ 
+     return ctx->get_embeddings_nextn();
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 0c260f7..9dd9bf1 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -33,6 +33,8 @@ struct llama_cparams {
+     float yarn_beta_slow;
+ 
+     bool embeddings;
++    // [C-scheme] expose the pre-output_norm hidden as the embedding (relay vector)
++    bool embeddings_pre_norm;
+     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+     bool causal_attn;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index fcd91e9..4d30bf7 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -126,7 +126,11 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+ // Set whether the context outputs nextn embeddings or not
+ // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+ // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+-LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
++//
++// [C-scheme] extern "C": this header is C++ (staging), but a C consumer such as the keep-head
++// shim links by plain name. Without the linkage specification the symbol is mangled and
++// GetProcAddress/ld fails even though the function is exported.
++extern "C" LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+ 
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+@@ -152,7 +156,7 @@ LLAMA_API const char * llama_model_decision_label(const struct llama_model * mod
+ 
+ // mirrors:
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+-LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
++extern "C" LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+ 
+ // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 7a94266..8f0968d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -426,6 +426,18 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
+ 
++    // the snapshot shift of the ubatch is encoded in the graph nodes: a rollback that
++    // changes any cell's distance must rebuild the graph instead of reusing it
++    res &= shifts.size() == (size_t) mctx->get_n_rs();
++    if (res) {
++        for (size_t i = 0; i < shifts.size(); ++i) {
++            if (shifts[i] != mctx->get_rs_shift((uint32_t) i)) {
++                res = false;
++                break;
++            }
++        }
++    }
++
+     return res;
+ }
+ 
+@@ -3971,6 +3983,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
+ 
++    // capture the rollback distance of every cell of this ubatch: the snapshot shift below
++    // encodes it, and a later rollback has to rebuild the graph (see can_reuse)
++    inp->shifts.resize(n_rs);
++    for (int64_t i = 0; i < n_rs; ++i) {
++        inp->shifts[i] = mctx_cur->get_rs_shift((uint32_t) i);
++    }
++
+     return inp;
+ }
+ 
+@@ -3994,9 +4013,72 @@ ggml_tensor * llm_graph_context::build_rs(
+     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
+     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+ 
+-    return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
++    ggml_tensor * out = build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                     get_state_rows);
++
++    // the graph above reads the pre-batch state; move the older snapshots up before the
++    // caller writes the states of this ubatch into slots 0..n_tokens-1
++    build_rs_shift_snapshots(s, state_size, kv_state->get_n_rs(), kv_state->get_head(),
++                             kv_state->get_size(), inp->shifts);
++
++    return out;
++}
++
++void llm_graph_context::build_rs_shift_snapshots(
++        ggml_tensor * s,
++            int32_t   state_size,
++           uint32_t   n_rs,
++           uint32_t   rs_head,
++           uint32_t   rs_size,
++ const std::vector<uint32_t> & shifts) const {
++    const int64_t K     = (int64_t) cparams.n_rs_seq + 1;
++    const int64_t n_tok = ubatch.n_seq_tokens;
++
++    // a ubatch that fills every snapshot slot needs no shift: slots 0..K-1 are rewritten
++    if (K <= 1 || n_tok <= 0 || n_tok >= K) {
++        return;
++    }
++
++    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
++
++    auto row = [&](int64_t slot, uint32_t cell) {
++        return ggml_view_2d(ctx0, states, state_size, 1, states->nb[1],
++                (size_t) (slot*(int64_t) rs_size + cell)*states->nb[1]);
++    };
++
++    for (uint32_t i = 0; i < n_rs; ++i) {
++        const uint32_t cell = rs_head + i;
++        if (cell >= rs_size) {
++            break;
++        }
++
++        const int64_t r = i < shifts.size() ? (int64_t) shifts[i] : 0;
++        if (r == n_tok) {
++            // the pre-batch head is exactly one slot away: every slot already holds the
++            // state of "last position - s", nothing to move
++            continue;
++        }
++
++        // slot s of the new layout holds the state of position (head + n_tok - s), which
++        // was slot (s + r - n_tok) of the old layout (head was rewound by r tokens).
++        // walking the slots from high to low is safe while the sources are below the
++        // destinations; when they are above, walk low to high instead, so every source is
++        // read before something overwrites it.
++        const bool ascending = r > n_tok;
++
++        for (int64_t k = 0; k < K - n_tok; ++k) {
++            const int64_t sl  = ascending ? n_tok + k : K - 1 - k;
++            const int64_t src = sl + r - n_tok;
++
++            if (src >= 0 && src < K) {
++                ggml_build_forward_expand(gf, ggml_cpy(ctx0, row(src, cell), row(sl, cell)));
++            } else {
++                // no such history yet (a rollback deeper than the recorded snapshots)
++                ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, row(sl, cell), 0.0f));
++            }
++        }
++    }
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c1a7d36..f086637 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -296,6 +296,11 @@ public:
+ 
+     const llama_memory_recurrent_context * mctx;
+ 
++    // per-cell rollback distance captured when this graph was built (see
++    // llama_memory_recurrent_context::get_rs_shift).  The snapshot shift is baked into the
++    // graph nodes, so a different rollback distance requires a different graph.
++    std::vector<uint32_t> shifts;
++
+     // used in view offsets, need to match for valid graph reuse
+     uint32_t head;
+     int32_t rs_z;
+@@ -1425,6 +1430,20 @@ struct llm_graph_context {
+                 int32_t   n_seqs,
+             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+ 
++    // Shift the per-token snapshots of `s` so that slot i keeps holding the state of
++    // "last position - i" after this ubatch is applied.  The recurrent layers write the
++    // states of the tokens of the current ubatch into slots 0..n_tokens-1; everything
++    // older has to move up by n_tokens (and by the rollback distance of the cell, when a
++    // sequence was just rewound).  Without this the snapshots only describe the tokens of
++    // one ubatch, and a rollback across a ubatch boundary reads a stale slot.
++    void build_rs_shift_snapshots(
++            ggml_tensor * s,
++                int32_t   state_size,
++               uint32_t   n_rs,
++               uint32_t   rs_head,
++               uint32_t   rs_size,
++     const std::vector<uint32_t> & shifts) const;
++
+     ggml_tensor * build_rwkv_token_shift_load(
+         llm_graph_input_rs * inp,
+         const llama_ubatch & ubatch,
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 5fd6446..ea09494 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -1377,3 +1377,26 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     }
+     return (int32_t)(idx * mem->size) + src0;
+ }
++
++uint32_t llama_memory_recurrent_context::get_rs_shift(uint32_t i) const {
++    if (is_full || mem->n_rs_seq == 0) {
++        return 0;
++    }
++
++    const uint32_t cell_idx = i + mem->head;
++    if (cell_idx >= mem->cells.size()) {
++        return 0;
++    }
++
++    const auto & cell = mem->cells[cell_idx];
++    if (cell.seq_id.empty()) {
++        return 0;
++    }
++
++    const llama_seq_id seq = *cell.seq_id.begin();
++    if (seq < 0 || (size_t) seq >= mem->rs_idx.size()) {
++        return 0;
++    }
++
++    return mem->rs_idx[seq];
++}
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index d0fc147..4fb92f3 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -183,6 +183,12 @@ public:
+ 
+     int32_t s_copy(int i) const;
+ 
++    // rollback distance (in tokens) of the i-th cell of the current ubatch, 0 when the
++    // cell is not being rolled back.  The graph builds the snapshot shift for the ubatch
++    // from these values before the recurrent layer writes its new states, so they have to
++    // be read at graph construction time (s_copy() consumes and clears rs_idx).
++    uint32_t get_rs_shift(uint32_t i) const;
++
+ private:
+     const llama_memory_status status;
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 485483b..4307587 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -10,6 +10,8 @@
+ #include <array>
+ #include <cinttypes>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <future>
+ #include <regex>
+@@ -719,6 +721,64 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+     }
+ 
++    // [C-scheme] LLAMA_LAYER_RANGE=lo:hi — expose source layers [lo, hi) as local layers 0..N-1.
++    // The metadata is already parsed here, so the override lands before load_hparams() reads it.
++    if (const char * lr = getenv("LLAMA_LAYER_RANGE")) {
++        int lo = 0;
++        int hi = 0;
++        if (sscanf(lr, "%d:%d", &lo, &hi) == 2 && lo >= 0 && hi > lo && !arch_name.empty()) {
++            layer_lo = lo;
++            layer_hi = hi;
++
++            llama_model_kv_override ov{};
++            ov.tag     = LLAMA_KV_OVERRIDE_TYPE_INT;
++
++            // The real layer counts, captured before the override lands: role inference needs
++            // n_layer_all to know whether hi is the model's last layer, and a tail range needs the
++            // original nextn to keep the MTP head.
++            char bc_key[256];
++            snprintf(bc_key, sizeof(bc_key), "%s.block_count", arch_name.c_str());
++            const int bc_idx = gguf_find_key(metadata, bc_key);
++            int32_t nextn_all = 0;
++            char nx_key[256];
++            snprintf(nx_key, sizeof(nx_key), "%s.nextn_predict_layers", arch_name.c_str());
++            const int nx_idx = gguf_find_key(metadata, nx_key);
++            if (nx_idx >= 0) {
++                nextn_all = (int32_t) gguf_get_val_u32(metadata, nx_idx);
++            }
++            if (bc_idx >= 0) {
++                // block_count counts the MTP layer too (Qwen3.6: 41 = 40 trunk + 1 nextn), so the
++                // trunk depth is block_count - nextn. Without subtracting, a tail range would look
++                // like a middle range and skip `output`.
++                n_layer_all = (int32_t) gguf_get_val_u32(metadata, bc_idx) - nextn_all;
++            }
++
++            // Only the tail range keeps the MTP head: it is the range whose last layer is the
++            // model's last layer, so blk.<n_layer_all>.nextn.* belongs to it. The local block count
++            // then includes the head, and get_weight() maps local n to source lo + n, which lands
++            // exactly on that block.
++            const int32_t nextn_keep = (layer_hi >= n_layer_all && nextn_all > 0) ? nextn_all : 0;
++            tail_keeps_mtp = nextn_keep > 0;
++
++            ov.val_i64 = (layer_hi - layer_lo) + nextn_keep;
++            snprintf(ov.key, sizeof(ov.key), "%s.block_count", arch_name.c_str());
++            kv_overrides[std::string(ov.key)] = ov;
++
++            ov.val_i64 = nextn_keep;
++            snprintf(ov.key, sizeof(ov.key), "%s.nextn_predict_layers", arch_name.c_str());
++            kv_overrides[std::string(ov.key)] = ov;
++
++            // Globals this range cannot use are made lazy instead of read (see create_tensor).
++            lazy.force = true;
++
++            LLAMA_LOG_INFO("%s: [C-scheme] layers [%d, %d) of %d, block_count -> %d, nextn -> %d, "
++                    "globals: tok_embd=%s output=%s\n",
++                    __func__, (int) layer_lo, (int) layer_hi, (int) n_layer_all,
++                    (int) (layer_hi - layer_lo + nextn_keep), (int) nextn_keep,
++                    needs_tok_embd() ? "load" : "skip", needs_output() ? "load" : "skip");
++        }
++    }
++
+     n_kv      = gguf_get_n_kv(metadata);
+     n_tensors = weights_map.size();
+ 
+@@ -839,7 +899,7 @@ llama_model_loader::llama_model_loader(
+ 
+     this->check_tensors = check_tensors;
+     this->no_alloc = no_alloc;
+-    this->load_mtp = load_mtp;
++    this->load_mtp = load_mtp || tail_keeps_mtp;
+ }
+ 
+ std::string llama_model_loader::get_arch_name() const {
+@@ -851,6 +911,22 @@ enum llm_arch llama_model_loader::get_arch() const {
+ }
+ 
+ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
++    // [C-scheme] local blk.i is served from source blk.(i + layer_lo). The remap must come
++    // first: a plain lookup would hit the source's own blk.i, which for lo > 0 is the wrong layer.
++    if (layer_lo > 0 && strncmp(name, "blk.", 4) == 0) {
++        char * end = nullptr;
++        const long i = strtol(name + 4, &end, 10);
++        if (end != name + 4 && end != nullptr && *end == '.') {
++            char buf[256];
++            const int n = snprintf(buf, sizeof(buf), "blk.%ld%s", i + layer_lo, end);
++            if (n <= 0 || (size_t) n >= sizeof(buf)) {
++                return nullptr;
++            }
++            const auto pos = weights_map.find(std::string(buf));
++            return pos != weights_map.end() ? &pos->second : nullptr;
++        }
++    }
++
+     auto pos = weights_map.find(name);
+     if (pos != weights_map.end()) {
+         return &pos->second;
+@@ -1105,7 +1181,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+ 
+     // do not lazy-read small tensors, it has significant overhead and is not worth it
+     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
+-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
++    if (mode != LLAMA_LAZY_MODE_ON && !force && ggml_nbytes(t) <= auto_min_size) {
+         return false;
+     }
+ 
+@@ -1352,7 +1428,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
+-    if (flags & TENSOR_READ_LAZY) {
++    // [C-scheme] A layer range leaves some global tensors provably unread: a middle segment
++    // takes hidden states in and never projects to vocabulary. Marking them lazy keeps the
++    // tensor object (the architecture indexes it) while leaving the weights on disk.
++    //
++    // Decided by tn.tensor, not by name: tied models create `output` as a duplicate of
++    // token_embd, so the name says token_embd while the tensor serves as the projection.
++    bool read_lazy = (flags & TENSOR_READ_LAZY) != 0;
++    if (!read_lazy && layer_range_active()) {
++        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD) {
++            const bool as_output_alias = (flags & TENSOR_DUPLICATED) != 0;
++            read_lazy = as_output_alias ? !needs_output() : !needs_tok_embd();
++        } else if (tn.tensor == LLM_TENSOR_OUTPUT) {
++            read_lazy = !needs_output();
++        }
++    }
++
++    if (read_lazy) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+     }
+@@ -1391,7 +1483,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     const bool duplicated = flags & TENSOR_DUPLICATED;
+ 
+     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+-    ggml_set_name(tensor, ggml_get_name(&t_meta));
++    // [C-scheme] name the local tensor after the requested (local) name, not after the source
++    // tensor: with a layer range the two differ, and get_weight()/get_mapping_ranges()/load_all_data()
++    // all re-resolve the tensor by name - a source name there would be remapped a second time.
++    ggml_set_name(tensor, tn.str().c_str());
+ 
+     if (duplicated) {
+         size_data += ggml_nbytes(&t_meta);
+@@ -1732,6 +1827,14 @@ bool llama_model_loader::load_all_data(
+                 }));
+             }
+ 
++            if (!buf_mmap && cur->data == nullptr) {
++                LLAMA_LOG_ERROR("%s: [C-scheme] no buffer covers tensor '%s' (offs=%zu n_size=%zu bufs=%zu)\n",
++                        __func__, ggml_get_name(cur), weight->offs, n_size, bufs.size());
++                for (const auto & b : bufs) {
++                    LLAMA_LOG_ERROR("  buf base=%p size=%zu\n",
++                            (void *) ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b));
++                }
++            }
+             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
+             if (buf_mmap && cur->data == nullptr) {
+                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
+@@ -1886,6 +1989,23 @@ bool llama_model_loader::load_all_data(
+         }
+     }
+ 
++    // [C-scheme] how many bytes were actually read, and how many were skipped as lazy.
++    // File-mapped pages show up in neither the process working set nor its IO counters on
++    // Windows, so this is the only place the saving from skipping globals is observable.
++    // Logged unconditionally: under a layer range `size_done` never reaches `size_data`,
++    // because the latter counts the whole file while only this range's tensors are created.
++    {
++        // `lazy.has(t)` is not the right counter: a lazy tensor still goes through the
++        // mmap branch, so nothing accumulates there and the old line always printed 0.00
++        // even when a 515 MiB token_embd had been skipped. What is observable is the gap
++        // between what this load was supposed to read and what it actually read.
++        const double read_mib  = (double) size_done / (1024.0 * 1024.0);
++        const double total_mib = (double) size_data / (1024.0 * 1024.0);
++        const double skip_mib  = total_mib > read_mib ? total_mib - read_mib : 0.0;
++        LLAMA_LOG_INFO("%s: [C-scheme] read %.2f of %.2f MiB (skipped %.2f MiB)\n",
++                __func__, read_mib, total_mib, skip_mib);
++    }
++
+     return true;
+ }
+ 
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..10ddf0e 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -69,6 +69,22 @@ struct llama_model_loader {
+     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
+     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+ 
++    // [C-scheme] load source layers [layer_lo, layer_hi) and expose them as local layers 0..N-1.
++    // Local blk.i is served from source blk.(i + layer_lo); block_count is overridden to hi-lo
++    // and nextn_predict_layers to 0 at metadata level (see the constructor).
++    int32_t layer_lo = 0;
++    int32_t layer_hi = -1;
++
++    // [C-scheme] the model's real layer count, read before block_count is overridden.
++    // Needed to tell a tail segment (hi == total) from a middle one.
++    int32_t n_layer_all = 0;
++
++    bool layer_range_active() const { return layer_hi > 0; }
++
++    // [C-scheme] which globals this range actually reads; non-range loads keep both.
++    bool needs_tok_embd() const { return !layer_range_active() || layer_lo == 0; }
++    bool needs_output()   const { return !layer_range_active() || layer_hi >= n_layer_all; }
++
+     int n_kv      = 0;
+     int n_tensors = 0;
+     int n_created = 0;
+@@ -82,12 +98,22 @@ struct llama_model_loader {
+     bool no_alloc;
+     bool load_mtp;
+ 
++    // [C-scheme] set when the active layer range ends at the model's last layer and the file
++    // carries a NextN/MTP head. The range override forces load_mtp=false upstream, so the tail
++    // range re-enables it here rather than relying on a constructor argument it cannot change.
++    bool tail_keeps_mtp = false;
++
+     // handle TENSOR_READ_LAZY
+     // use case: keep PLE / engrams embd tensors on disk, read them on demand
+     struct lazy_read {
+         // set by the caller before the create_tensor() calls
+         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+ 
++        // [C-scheme] ignore the AUTO size threshold in add(). Set when a layer range makes a
++        // global tensor provably unread; those are ~0.5 GiB, well under the 4 GiB default, so
++        // the size heuristic would otherwise refuse to make them lazy.
++        bool force = false;
++
+         // decide whether this tensor is read lazily
+         // pass w to also record it, or nullptr to only ask
+         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 83aed01..3783aec 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1888,7 +1888,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
+-    ml.done_getting_tensors();
++    ml.done_getting_tensors(ml.layer_range_active());
+ 
+     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
+@@ -1911,7 +1911,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // [C-scheme] with a layer range the rest of the file is never read: prefetching all of it
++    // would pull the whole (e.g. 20 GiB) model into the page cache for a 4-layer slice.
++    ml.init_mappings(!ml.layer_range_active(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
++
++
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+@@ -2055,6 +2059,59 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         });
+     }
+ 
++    // [C-scheme] Prefetch only what stays in host memory.
++    //
++    // Tensors uploaded to VRAM are read once and never again, so pulling their pages in is
++    // waste -- and it competes with the host-resident layers that must stay. Measured on a
++    // 32-layer range with 12 layers offloaded: prefetching everything read 17195 MiB, only
++    // 6.55 GiB stayed resident, and decode ran at 3.7 s/step.
++    if (ml.layer_range_active() && ml.use_mmap) {
++        const char * rp = getenv("LLAMA_RANGE_PREFETCH");
++        if (rp == nullptr || atoi(rp) != 0) {
++            size_t prefetched = 0;
++            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
++                void * addr = ml.mappings.at(idx)->addr();
++                llama_memory_ranges mr;
++                for (auto & [ctx_i, bufs_i] : ctx_bufs) {
++                    if (bufs_i.empty() || !ggml_backend_buffer_is_host(bufs_i[0])) {
++                        continue;   // this context's tensors live in VRAM
++                    }
++                    for (auto * cur = ggml_get_first_tensor(ctx_i); cur != nullptr;
++                         cur = ggml_get_next_tensor(ctx_i, cur)) {
++                        const auto * w = ml.get_weight(ggml_get_name(cur));
++                        if (w == nullptr || w->idx != idx) {
++                            continue;
++                        }
++                        mr.push_back({ (const char *) addr + w->offs, ggml_nbytes(cur) });
++                        prefetched += ggml_nbytes(cur);
++                    }
++                }
++                llama_prefetch(std::move(mr));
++            }
++            LLAMA_LOG_INFO("%s: [C-scheme] prefetched %.2f MiB of host-resident layers [%d, %d)\n",
++                    __func__, (double) prefetched / (1024.0 * 1024.0),
++                    (int) ml.layer_lo, (int) ml.layer_hi);
++        }
++    }
++
++
++    // [C-scheme] size_data was accumulated over every tensor in the file, but a partial load
++    // creates only some of them -- so size_done could never reach it and load_all_data's
++    // "last call" branch never ran: mmap fragments outside the used ranges were never
++    // unmapped and progress_callback(1.0) was skipped. Recount over what was actually
++    // created, which is what the loop below will read.
++    if (ml.layer_range_active()) {
++        size_t real_size_data = 0;
++        for (const auto & [name, t] : tensors_by_name) {
++            real_size_data += ggml_nbytes(t);
++        }
++        LLAMA_LOG_INFO("%s: [C-scheme] size_data %.2f MiB (file total %.2f MiB) for %zu created tensors\n",
++                __func__, (double) real_size_data / (1024.0 * 1024.0),
++                (double) ml.size_data / (1024.0 * 1024.0), tensors_by_name.size());
++        ml.size_data = real_size_data;
++    }
++
++
+     // load tensor data
+     for (auto & [ctx, bufs] : ctx_bufs) {
+         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index 2e15777..f7d2243 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -456,6 +456,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+     const auto mem_size = mctx_cur->get_size();
+ 
+     const int64_t n_seqs = ubatch.n_seqs;
++    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+ 
+     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+     cb(conv_states, "conv_states", il);
+@@ -495,12 +496,15 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         // [TAG_RECURRENT_ROLLBACK_SPLITS]
+         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
++        // only the slots covered by this ubatch are written here: the older ones were shifted up
++        //   by n_tokens in build_rs() and must keep the states of earlier tokens
+ 
+         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+ 
+-        for (int64_t t = 1; t <= K; ++t) {
+-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+-            const int64_t s_slot = K - t;
++        for (int64_t s = 0; s < std::min<int64_t>(n_seq_tokens, K); ++s) {
++            // slot s holds the conv window of "last position - s": its window starts at
++            //   index (n_seq_tokens - s) of conv_input
++            const int64_t s_idx = n_seq_tokens - s;
+ 
+             ggml_tensor * conv_state_last =
+                 ggml_view_3d(ctx0, conv_input,
+@@ -512,7 +516,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+                 ggml_view_2d(ctx0,
+                         conv_states_all, row_count, n_seqs,
+                         conv_states_all->nb[1],
+-                        (s_slot * mem_size + kv_head) * row_size);
++                        (s * mem_size + kv_head) * row_size);
+ 
+             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+         }
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 8a4e434..0558133 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -207,6 +207,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+     }
+     cur = inpL;
+ 
++    // [C-scheme] a relay segment must forward the PRE-norm hidden: the next segment's
++    // first layer expects the raw output of this one, and norming twice would diverge.
++    if (cparams.embeddings_pre_norm) {
++        res->t_embd = cur;
++    }
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+@@ -217,7 +222,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+     }
+ 
+     cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
++    if (!cparams.embeddings_pre_norm) {
++        res->t_embd = cur;
++    }
+ 
+     if (model.cls_out) {
+         ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
+@@ -230,10 +237,14 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+     }
+ 
+     // LM head
+-    cur = build_lora_mm(model.output, cur, model.output_s);
++    // [C-scheme] a relay segment has no use for logits; leaving t_logits null keeps the
++    // output projection (and its ~515 MB of weights) out of the graph entirely.
++    if (!cparams.embeddings_pre_norm) {
++        cur = build_lora_mm(model.output, cur, model.output_s);
+ 
+-    cb(cur, "result_output", -1);
+-    res->t_logits = cur;
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++    }
+ }
+ 
+ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 939f10f..f82e4ba 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -227,6 +227,11 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     cur = inpL;
+ 
+     // post-norm hidden state feeds both the LM head and the MTP seed below
++    // [C-scheme] a relay segment must forward the PRE-norm hidden: the next segment's
++    // first layer expects the raw output of this one, and norming twice would diverge.
++    if (cparams.embeddings_pre_norm) {
++        res->t_embd = cur;
++    }
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+@@ -237,13 +242,19 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     }
+ 
+     cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
++    if (!cparams.embeddings_pre_norm) {
++        res->t_embd = cur;
++    }
+ 
+     // LM head
+-    cur = build_lora_mm(model.output, cur, model.output_s);
++    // [C-scheme] a relay segment has no use for logits; leaving t_logits null keeps the
++    // output projection (and its ~515 MB of weights) out of the graph entirely.
++    if (!cparams.embeddings_pre_norm) {
++        cur = build_lora_mm(model.output, cur, model.output_s);
+ 
+-    cb(cur, "result_output", -1);
+-    res->t_logits = cur;
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++    }
+ }
+ 
+ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(
