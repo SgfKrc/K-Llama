@@ -139,6 +139,10 @@ class StageWorker:
                         hidden = wire.decode(msg.blob, dtype, (n_tokens, n_embd))
                         try:
                             out = self._engine.forward_hidden(hidden, n_past=n_past)
+                            if out is None:
+                                # 前向发生了，只是这一段不提供 dense hidden（tail 段
+                                # 必须开 logits，而 embeddings = !needs_logits）。
+                                raise RuntimeError("stage offers no dense hidden")
                         except Exception as exc:  # noqa: BLE001
                             # tail 段为了出 token 必须开 logits，而 logits 与
                             # cparams.embeddings 互斥 -> dense hidden 取不到。这不是错误：

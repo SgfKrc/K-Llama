@@ -340,8 +340,12 @@ class StageClient:
 
     def draft_inject(self, rows) -> int:
         arr = np.ascontiguousarray(rows, dtype=np.float32)
+        dtype = wire.current_dtype()
+        # 必须 wire.encode：直接传 ndarray 时 len() 给的是行数（5），对端会收到 5 字节
+        # 然后 die 在 numpy 的 "buffer is smaller than requested size"。
         msg = self._forward({"op": "draft_inject", "n_tokens": int(arr.shape[0]),
-                             "shape": list(arr.shape)}, arr)
+                             "shape": list(arr.shape), "dtype": dtype},
+                            wire.encode(arr, dtype))
         return int(msg.meta.get("draft_rc", 0))
 
     def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:

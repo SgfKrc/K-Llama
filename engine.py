@@ -120,7 +120,9 @@ class StageEngine:
         it disappears entirely on the float32 path because ascontiguousarray returns the
         same array when it is already contiguous float32.
         """
-        out = self._up.forward_hidden_to_hidden(_f32_input(hidden), n_past=n_past)
+        out = self._up.forward_hidden_to_hidden_or_none(_f32_input(hidden), n_past=n_past)
+        if out is None:
+            return None            # 前向发生了，只是这一段不提供 dense hidden
         return np.asarray(out, dtype=np.float32)
 
     def forward_token(self, hidden: np.ndarray, *, n_past: int) -> int:

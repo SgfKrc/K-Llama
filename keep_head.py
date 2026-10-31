@@ -37,6 +37,7 @@ import sys
 from typing import Mapping, Sequence
 
 import numpy as np
+import wire
 
 MODE_CODES = {"nextn": 0, "layer_inp": 1}
 
@@ -224,6 +225,18 @@ class KeepHeadUpstream:
         return self._array(self._request(
             {"op": "tokens", "tokens": toks, "n_past": int(n_past)}))
 
+    def forward_hidden_to_hidden_or_none(self, hidden, *, n_past: int = 0):
+        """hidden -> hidden, 或在 dense hidden 不可用时返回 None。
+
+        tail 段无法同时出 logits 与 dense hidden（cparams.embeddings = !needs_logits），
+        但它仍然完成了一次前向 —— 调用方要的 layer_inp 就在那里。
+        """
+        arr = self._checked_hidden(hidden, n_past)
+        reply = self._request(self._hidden_payload("hidden", arr, n_past))
+        if reply.get("no_hidden"):
+            return None
+        return self._array(reply)
+
     def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0) -> np.ndarray:
         """Feed ``hidden`` back in as embeddings; return this stage's hidden."""
         arr = self._checked_hidden(hidden, n_past)
@@ -262,8 +275,11 @@ class KeepHeadUpstream:
         return int(self._request({"op": "draft_n_embd_enc"}).get("n_embd_enc", 0))
 
     def draft_inject(self, rows) -> int:
+        # 这条管道是逐行 JSON，hidden 必须走 _hidden_payload（base64 进 "data" 字段）；
+        # _request 只接收一个 payload 参数，传第二个数组会直接 TypeError。
         arr = np.ascontiguousarray(rows, dtype=np.float32)
-        reply = self._request({"op": "draft_inject", "shape": list(arr.shape)}, arr)
+        reply = self._request(self._hidden_payload("draft_inject", arr, 0,
+                                                   n_tokens=int(arr.shape[0])))
         return int(reply.get("draft_rc", 0))
 
     def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:

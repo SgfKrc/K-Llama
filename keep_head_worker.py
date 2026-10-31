@@ -582,8 +582,26 @@ def main() -> int:
                 _response(ok=True)
             elif operation == "tokens":
                 _array_response(binding.tokens(request.get("tokens", []), n_past))
+            elif operation == "hidden_trace":
+                print(f"[kh.hidden_trace] shape={request.get('shape')} "
+                      f"blob={len(binding._pending_blob) if hasattr(binding,'_pending_blob') else '?'}",
+                      file=sys.stderr, flush=True)
+                _response(ok=False, error="trace only")
             elif operation == "hidden":
-                _array_response(binding.hidden(_decode_hidden(request), n_past))
+                # 这一段的 dense hidden 可能拿不到（tail 段为了出 token 必须开 logits，
+                # 而 cparams.embeddings = !needs_logits）。这不是致命错误：前向已经发生，
+                # 调用方往往只是想要它顺手产生的 layer_inp。早先让它抛出去，会把整个
+                # shim 子进程打死（handler 约定是"异常即退出"），后续 layer_inp 全部
+                # 变成 "worker exited"。所以这里降级成 no_hidden，进程继续。
+                try:
+                    _in = _decode_hidden(request)
+                    print(f"[kh.hidden] in.shape={getattr(_in,'shape',None)} n_past={n_past}",
+                          file=sys.stderr, flush=True)
+                    arr = binding.hidden(_in, n_past)
+                except KeepHeadUnavailable:
+                    _response(ok=True, no_hidden=True)
+                else:
+                    _array_response(arr)
             elif operation == "hidden_token":
                 _response(ok=True, token=binding.token(_decode_hidden(request), n_past))
             elif operation == "hidden_tokens":
