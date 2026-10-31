@@ -219,16 +219,19 @@ layer dropout。
 位置账已修好（`checks/probe_spec_wip.py`，先验证后写入模式下 2 个 prompt 逐位一致、
 接受率 83-92%），但**真投机（批量验证 + 拒稿回滚）卡在两个底层行为上**：
 
-1. **head 的多 token 批量 ≠ 逐位置**。每行 hidden 差 2.5e-2~3.8e-2（相对 4e-3），与批量长度
-   无关；MoE 放大后翻转 argmax（`token@6` 108820→95761）。实验 shim 证实 `n_ubatch=1` 时差
-   **0.00e+00**，即位置无误、是并行计算路径。但回滚要求 `n_rs_seq≥1` ⇒ llama.cpp 要求
-   `n_ubatch > n_rs_seq+1` ⇒ 2-token 批量无法退化成逐 token 路径。
-2. **`qlh_kh_seq_rm` 不是干净回滚**。单 token 写完 → rm → 同输入重写同一位置，hidden 差
-   0.13~0.62（相对 2~10%），token 偶发翻转（8 个位置里 3 次）。残余误差会污染后续所有
-   hidden，把接受率从 88% 打到 50%。
+1. ~~head 的多 token 批量 ≠ 逐位置~~ —— **已推翻，批量验证是干净的**。
+
+   hidden 确实差 2.5e-2~3.8e-2（相对 4e-3），但**不翻转 argmax**。用「完美草稿」（块的第 2 行
+   填单步真实会产出的 token，KV 无污染）跑 30 个 token，2B 与 35B 都**逐位一致**，块的第 1 行
+   （`tb[0]`，验货用）与第 2 行（`tb[1]`，免费 token）**都对**。之前两次「批量出错」都是实验
+   设计问题：一次 filler 塞了重复 token 污染 KV，一次 `rebuild()` 重放时 token 序列不一致。
+   `checks/probe_perfect_draft.py` 是干净的端到端版本（30 token 全序列对比）。
+2. **`qlh_kh_seq_rm` 不是干净回滚** ← **这是唯一剩下的障碍**。单 token 写完 → rm → 同输入
+   重写同一位置，hidden 差 0.13~0.62（相对 2~10%），token 偶发翻转（8 个位置里 3 次）。
+   残余误差会污染后续所有 hidden，把接受率从 88% 打到 50%。
 
 ## 10. 已知限制
 
 - **只对 temp=0 无损**。shim 暴露 argmax 而非 logits 分布，无法做标准 rejection sampling。
-- **ROG 内存余量**。0.82 GiB 可用，`n_rs_seq` 占 100 MiB（见 §2 实测）。
-- **未实测**：DFlash 的真实接受率（只有社区线索）、k≥2 的端到端收益。
+- **ROG 内存余量**：0.82 GiB 可用，`n_rs_seq` 占 100 MiB（§2）。
+- **未实测**：DFlash 真实接受率、k≥2 端到端收益。
