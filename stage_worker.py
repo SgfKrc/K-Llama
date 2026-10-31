@@ -178,6 +178,9 @@ class StageWorker:
                         ids = self._engine.draft_block(int(msg.meta["anchor"]),
                                                        int(msg.meta.get("n_block", 16)))
                         protocol.send(conn, protocol.RESULT, {"drafts": [int(v) for v in ids]})
+                    elif op == "draft_reset":
+                        rc = self._engine.draft_reset()
+                        protocol.send(conn, protocol.RESULT, {"draft_rc": int(rc)})
                     elif op == "draft_rollback":
                         rc = self._engine.draft_rollback(int(msg.meta["n_keep"]))
                         protocol.send(conn, protocol.RESULT, {"draft_rc": int(rc)})

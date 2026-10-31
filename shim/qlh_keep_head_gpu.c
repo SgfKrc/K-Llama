@@ -920,6 +920,22 @@ int32_t qlh_kh_draft_block(void * handle_void, int32_t anchor_id, int32_t n_bloc
     return n_out;
 }
 
+/* 彻底清空 draft 的 KV（连同 recurrent 状态）。用于"每轮重建上下文"的保守策略：
+ * seq_rm 在 DFlash 这个架构上只更新了 recurrent 的 cell.pos，attention 子缓存没有真正
+ * 截断（实测 rc=0 但 last position 仍是 36），所以每轮直接清空再全量重注入更可靠。 */
+int32_t qlh_kh_draft_reset(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->draft_ctx == NULL) {
+        return -1;
+    }
+    llama_memory_t mem = llama_get_memory(handle->draft_ctx);
+    if (mem != NULL) {
+        llama_memory_clear(mem, true);
+    }
+    handle->draft_n_past = 0;
+    return 0;
+}
+
 /* draft 的 KV 前进/回滚。`n_keep` = 保留多少行；之后的全部丢弃（验证失败时用）。 */
 int32_t qlh_kh_draft_rollback(void * handle_void, int32_t n_keep) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;

@@ -132,6 +132,8 @@ class Binding:
         lib.qlh_kh_draft_block.restype = ctypes.c_int32
         lib.qlh_kh_draft_rollback.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         lib.qlh_kh_draft_rollback.restype = ctypes.c_int32
+        lib.qlh_kh_draft_reset.argtypes = [ctypes.c_void_p]
+        lib.qlh_kh_draft_reset.restype = ctypes.c_int32
         lib.qlh_kh_draft_close.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_draft_close.restype = ctypes.c_int32
         lib.qlh_kh_draft_n_embd_enc.argtypes = [ctypes.c_void_p]
@@ -334,6 +336,9 @@ class Binding:
             print(f"[kh.draft_block] rc={n}", file=sys.stderr, flush=True)
             return []
         return [int(out[i]) for i in range(n)]
+
+    def draft_reset(self) -> int:
+        return int(self._lib.qlh_kh_draft_reset(self._handle))
 
     def draft_rollback(self, n_keep: int) -> int:
         rc = int(self._lib.qlh_kh_draft_rollback(self._handle, int(n_keep)))
@@ -640,6 +645,9 @@ def main() -> int:
             elif operation == "draft_block":
                 ids = binding.draft_block(int(request["anchor"]), int(request.get("n_block", 16)))
                 _response(ok=True, drafts=ids)
+            elif operation == "draft_reset":
+                rc = binding.draft_reset()
+                _response(ok=(rc == 0), draft_rc=rc)
             elif operation == "draft_rollback":
                 rc = binding.draft_rollback(int(request["n_keep"]))
                 # -6 表示"那段范围里没有可删的行"，是 no-op 不是失败 —— 与 seq_rm 同一条

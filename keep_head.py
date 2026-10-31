@@ -287,6 +287,9 @@ class KeepHeadUpstream:
                                "n_block": int(n_block)})
         return [int(v) for v in reply.get("drafts", [])]
 
+    def draft_reset(self) -> int:
+        return int(self._request({"op": "draft_reset"}).get("draft_rc", 0))
+
     def draft_rollback(self, n_keep: int) -> int:
         reply = self._request({"op": "draft_rollback", "n_keep": int(n_keep)})
         return int(reply.get("draft_rc", 0))

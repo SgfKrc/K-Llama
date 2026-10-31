@@ -146,6 +146,9 @@ class StageEngine:
     def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:
         return list(self._up.draft_block(anchor, n_block))
 
+    def draft_reset(self) -> int:
+        return int(self._up.draft_reset())
+
     def draft_rollback(self, n_keep: int) -> int:
         return int(self._up.draft_rollback(n_keep))
 

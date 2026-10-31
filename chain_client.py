@@ -353,6 +353,9 @@ class StageClient:
                              "n_block": int(n_block)})
         return [int(v) for v in msg.meta.get("drafts", [])]
 
+    def draft_reset(self) -> int:
+        return int(self._forward({"op": "draft_reset"}).meta.get("draft_rc", 0))
+
     def draft_rollback(self, n_keep: int) -> int:
         msg = self._forward({"op": "draft_rollback", "n_keep": int(n_keep)})
         return int(msg.meta.get("draft_rc", 0))
