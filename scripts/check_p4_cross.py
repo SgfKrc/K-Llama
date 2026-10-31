@@ -42,16 +42,27 @@ from topology import Stage, load  # noqa: E402
 
 SHIM = Path(os.environ.get("SA_SHIM", REPO / "shim" / "qlh_keep_head.dll"))
 DRAFT = os.environ.get("SA_DRAFT", "")
-HEAD_LIDS = [2, 7, 12, 17, 23, 28]
-TAIL_LIDS = [1, 6]
+# The draft model wants the INPUT of these eight source layers. Which stage owns each one
+# depends on where the chain is cut, so they are split at runtime instead of hard-coded:
+# asking a 4-layer tail segment for layer 6 would address a layer it never loaded.
+TARGET_LAYERS = [2, 7, 12, 17, 23, 28, 33, 38]
+
+
+def split_target_layers(head_range, tail_range):
+    """Source layers -> (head-local ids, tail-local ids) for a given cut point."""
+    head_lo, head_hi = head_range
+    tail_lo, tail_hi = tail_range
+    head_ids = [l - head_lo for l in TARGET_LAYERS if head_lo <= l < head_hi]
+    tail_ids = [l - tail_lo for l in TARGET_LAYERS if tail_lo <= l < tail_hi]
+    return head_ids, tail_ids
 N_BLOCK = int(os.environ.get("SA_P4_BLOCK", "4"))
 CTX = int(os.environ.get("SA_CTX", "1024"))
 
 
-def eight_layers(hc, tc, enc_w: int) -> np.ndarray:
+def eight_layers(hc, tc, enc_w: int, head_ids, tail_ids) -> np.ndarray:
     """The eight target-layer inputs for the most recent forward, in GGUF order."""
-    h = hc.layer_inp(HEAD_LIDS)
-    t = tc.layer_inp(TAIL_LIDS)
+    h = hc.layer_inp(head_ids)
+    t = tc.layer_inp(tail_ids)
     if h is None or t is None:
         raise RuntimeError("layer_inp unavailable (head=%s tail=%s)"
                            % (None if h is None else h.shape, None if t is None else t.shape))
@@ -126,9 +137,14 @@ def main() -> int:
         tc.tokenize("x")
         print("  prompt tokens = %d" % len(toks))
 
-        for lid in HEAD_LIDS:
+        head_ids, tail_ids = split_target_layers(head.layer_range, tail.layer_range)
+        print("  target layers: head-local %s, tail-local %s" % (head_ids, tail_ids))
+        if len(head_ids) + len(tail_ids) != len(TARGET_LAYERS):
+            raise RuntimeError("target layers split %d+%d != %d"
+                               % (len(head_ids), len(tail_ids), len(TARGET_LAYERS)))
+        for lid in head_ids:
             hc.add_layer_inp(lid)
-        for lid in TAIL_LIDS:
+        for lid in tail_ids:
             tc.add_layer_inp(lid)
         if not DRAFT:
             print("  SA_DRAFT is not set; pass the draft GGUF path in it")
@@ -143,7 +159,7 @@ def main() -> int:
         n_past = len(toks)
         anchor = int(ver0[-1])
 
-        rows: list[np.ndarray] = [eight_layers(hc, tc, enc_w)]
+        rows: list[np.ndarray] = [eight_layers(hc, tc, enc_w, head_ids, tail_ids)]
         pending: list[np.ndarray] = []
         primed = False
         stats = {"rounds": 0, "drafted": 0, "accepted": 0, "tokens": 0}
@@ -184,7 +200,7 @@ def main() -> int:
             stats["accepted"] += accept
             stats["tokens"] += len(emitted)
 
-            fresh = eight_layers(hc, tc, enc_w)
+            fresh = eight_layers(hc, tc, enc_w, head_ids, tail_ids)
             take = fresh[: 1 + accept]
             rows.append(take)
             pending.append(take)
