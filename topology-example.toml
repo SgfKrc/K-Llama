@@ -1,0 +1,38 @@
+# 两段式跨机拓扑模板。把 <...> 换成你自己的机器信息。
+#
+# 关键约束：两边的 `model` 必须是**同一个文件**（同一份 GGUF）。分段是在加载时按
+# `layer_range` 选的，两边各自读同一个文件的不同层区间；换文件会让 layer_range 之外的
+# 张量（tokenizer / output / nextn）对不上，输出会错得很隐蔽。
+#
+# `ssh_user` / `start_cmd` 只在远端段需要，用来把那一端拉起来。留空则假定你已经手工
+# 启动好了，harness 只负责连。
+
+source_layers = 40
+
+[[stage]]
+model       = "<本机路径>/model.gguf"
+host        = "127.0.0.1"
+port        = 9101
+layers      = 32
+layer_range = "0:32"
+kind        = "gpu"
+# attention/dense 上卡、MoE 专家留 CPU 通常比"整层 offload"快得多：
+# 前 N 层的专家留 CPU，其余上卡。N 按显存实测调整。
+gpu_layers  = 32
+cpu_moe     = 24
+cpus        = ""
+threads     = 8
+
+[[stage]]
+model       = "<远端路径>/model.gguf"
+host        = "<远端地址>"
+port        = 9103
+layers      = 8
+layer_range = "32:40"
+kind        = "tail"
+ssh_user    = "<远端用户名>"
+start_cmd   = "<远端启动脚本的绝对路径，反斜杠>"
+gpu_layers  = 0
+cpu_moe     = 0
+cpus        = ""
+threads     = 10

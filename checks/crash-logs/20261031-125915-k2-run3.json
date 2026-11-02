@@ -1,0 +1,9 @@
+{
+  "tag": "20261031-125915-k2-run3",
+  "spec_k": 2,
+  "rc": 0,
+  "elapsed_s": 6.2,
+  "stdout": "topology: topology-local-32-8.toml  stages=2  ctx=4096\n  stage 0: gpu  32 layers  local:9101  gpu_layers=4 cpu_moe=0 threads=6  Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality.gguf\n  stage 1: tail  8 layers  local:9103  gpu_layers=0 cpu_moe=0 threads=6  Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality.gguf\n\nlocal stages: 2  weights 43.74 GiB  expected resident 8.09 GiB  budget 21.58 GiB\nVRAM: need ~3.10 GiB  free 7.88 GiB  of 8.00 GiB\nworkers ready in 2.1s\n\n!! VRAM spill detected after load: 1.78 GiB resident for 2.19 GiB of GPU weights.\n   Stage(s) [0] did not fully fit. Windows spilled the rest to system RAM; decode will be slower than pure CPU.\n   Set gpu_layers = 0 for the largest stage, or lower it.\n  sampling: {'mode': 'greedy', 'temperature': 0.0, 'top_p': 1.0, 'top_k': 0, 'repeat_penalty': 1.0, 'repeat_last_n': 0, 'frequency_penalty': 0.0, 'presence_penalty': 0.0, 'seed': 4294967295}\n  prompt: 5 tokens  'def quicksort(arr):'\n  run 1: pp5=6.6 t/s  tg16=2.3 t/s  (median 440.5 ms, p90 480.8 ms)\n    stage 0 (gpu,  32 layers, local): 166.0 ms\n    stage 1 (tail,  8 layers, local): 44.8 ms\n    spec:   k=2 ���� 8/10 = 80.0%  ƽ��ÿ�� 3.20 token\n    tokens: [198, 262, 413, 2343, 10620, 8, 2564, 220]  unique=13\n    text:   '\\n    if len(arr) <= 1:\\n        return arr\\n   '\n",
+  "stderr": "",
+  "ok": true
+}

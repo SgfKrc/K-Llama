@@ -1,0 +1,47 @@
+# 本项目是独立起点分支，仓库根就是项目根，不套子目录。
+# 从 K-Llama 剥离历史时，原 .gitignore 一并丢弃，这里只留现在真正需要的规则。
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行时输出：worker 日志、临时工件。
+# build/relay-records 是 spawn_worker 重定向的 stage 日志，随运行重新生成。
+build/
+*.log
+
+# 模型与二进制不进 git
+*.gguf
+shim/bin/
+
+# 本地拓扑覆盖
+topology-local*.toml
+
+# 环境变量
+.env
+
+# 临时调试目录：一次性脚本与工件，不入库
+.qlh_tmp/
+
+# 待删除残留暂存区：只在管理员提权后才清得掉，清理说明见 _to_delete/README.md
+_to_delete/
+
+# 工作区里与本项目无关的本地目录（原仓库遗留的开发与素材目录）
+.agents/
+.claude/
+.codex/
+.reasonix/
+.venv-*/
+.vscode/
+local_docs/
+_archive/
+/tools/
+video-remotion/
+torchinductor_Koakuma/
+
+# 实验 shim（含 66 MB DLL，可由 checks/build 脚本重建）
+checks/_exp_shim/
+
+# 站点拓扑（含主机名/IP/路径，不入公开仓库）。用 topology-example.toml 作模板。
+topology-*.toml
+!topology-example.toml

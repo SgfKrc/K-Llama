@@ -1,0 +1,1847 @@
+"""N-stage client: read topology.toml, spawn the local stages, drive greedy decode.
+
+One topology file describes the whole chain, so this file no longer knows how many
+stages there are. It spawns every stage that runs on this host, connects to all of
+them (local and remote alike), and walks the chain left to right.
+
+Payload shape follows the stage kind, not its position:
+
+  gpu   tokens  (JSON list)   -> hidden (raw bytes, wire dtype)
+  cpu   hidden  (wire dtype)  -> hidden (raw bytes, wire dtype)
+  tail  hidden  (wire dtype)  -> token  (JSON int)
+
+The wire dtype is float32 unless SA_WIRE_DTYPE asks for float16 (see wire.py); the
+client declares it on every FORWARD and reads back whatever the worker declares.
+
+Only the first stage is spawned without an input; it is the one that owns the
+token embedding. Only the last one owns the output projection.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import config  # noqa: E402
+import protocol  # noqa: E402
+import topology  # noqa: E402
+import wire  # noqa: E402
+from topology import Stage  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+LOG_DIR = HERE / "build" / "relay-records"
+
+# Weights are not the only cost of a loaded stage: each one also builds a KV cache
+# and compute buffers, and the CUDA stage takes VRAM rather than RAM. Staying well
+# under available RAM is the point — Windows does not refuse an overshoot, it pages
+# and the machine stops responding.
+#
+# What the budget actually counts was calibrated by measuring, because the naive
+# "sum of file sizes" reading is off by a factor of two on this workload:
+#
+#   stage 0-8   4.53 GB file, all layers on GPU   -> 4.84 GB RAM gone
+#   stage 8-24  8.36 GB file, pure CPU, after warm -> 1.80 GB RAM gone
+#   both loaded together                          -> 6.67 GB total (sums to 6.64)
+#
+# Pure-CPU stages mmap their weights and only the resident pages that the graph
+# actually touches stay committed -- 8.36 GB of file became 1.80 GB of RAM. The GPU
+# stage is different: its weights go to VRAM, but `token_embd` is forced onto the CPU
+# ("cannot be used with preferred buffer type CUDA_Host"), and the CUDA context plus
+# compute buffer add up, so it costs roughly its file size in RAM.
+#
+# Hence two coefficients rather than one, both deliberately generous:
+# Fraction of *currently available* RAM a local set of stages may claim. 0.75 leaves a margin for
+# page cache that the OS will not hand back on demand. Override with SA_MEM_SAFETY when a run
+# genuinely needs to sit closer to the limit (e.g. a 35B two-segment split on one box, which needs
+# 17.96 GiB against a 17.71 GiB budget at 0.75).
+MEM_SAFETY = float(os.environ.get("SA_MEM_SAFETY", "0.75"))
+# Fraction of a CPU stage's file size that stays resident. Measured 0.215; 0.30 leaves
+# a margin for a longer context than the 4096 the measurement used.
+CPU_RESIDENT_RATIO = 0.30
+# Fraction of a file charged to RAM for the layers that are copied to VRAM. Reading them
+# for upload walks the whole tensor through the page cache, and those pages stay counted
+# until something evicts them, so a fully-offloaded artifact costs about its file size.
+GPU_RAM_RATIO = 1.00
+
+# A stage whose `gpu_layers` is between 0 and its layer count is a MIX, and charging such
+# a stage its full file size is what made 35B look like it could not fit on one machine.
+# Measured on the 40-layer 35B (20.82 GiB file) with 14 layers on the GPU:
+#
+#   estimate under the old rule   20.82 GiB   -> refused, since budget was ~11-17 GiB
+#   actual RAM used                9.10 GiB   -> 0.44x, and it ran at 12.64 t/s
+#
+# The two populations behave differently: uploaded layers cost their pages once and those
+# pages are reclaimable, while CPU layers keep re-reading the ~21.5% they touch. So the
+# ratio is a weighted average over the split, not a step function of "any GPU layers at
+# all". 14/40 predicts 0.35*1.00 + 0.65*0.30 = 0.545 against a measured 0.44 -- still
+# generous, which is the right side to err on, but no longer 2.3x pessimistic.
+
+# VRAM is a separate budget from RAM and it does not fail loudly. On Windows the display
+# driver (WDDM) lets an allocation exceed dedicated video memory and backs the excess with
+# system RAM, so llama.cpp reports "offloaded N/N layers" and everything looks fine while
+# every step copies weights over PCIe. Measured on a 8188 MiB RTX 4060 Laptop:
+#
+#   stage 0-8    4640 MiB file -> 5237 MiB VRAM delta   1.13x   5.6 ms/step
+#   stage 24-32  4542 MiB file -> 5139 MiB VRAM delta   1.13x   6.9 ms/step
+#   stage 8-24   8559 MiB file -> 7660 MiB VRAM delta   0.89x  42.1 ms/step  <- spilled
+#
+# The two that fit both cost exactly 597 MiB on top of the file size, so the model is
+# linear: file size times a fixed factor plus a fixed per-stage overhead. The one that did
+# not fit is the tell -- its delta is *smaller* than its file, and it ran 7.5x slower than
+# the same artifact on CPU. That is the silent spill.
+#
+# Both constants are rounded up from the measurements; a stage that trips this check has
+# never turned out to fit.
+VRAM_PER_BYTE = 1.13
+GPU_VRAM_OVERHEAD = 640 << 20   # measured 597 MiB of context + compute buffer, rounded up
+
+#: expert_share() reads a GGUF index; one read per artifact per run is enough.
+_EXPERT_SHARE_CACHE: dict[str, float] = {}
+
+
+def mem_budget_bytes() -> int:
+    import psutil
+
+    return int(psutil.virtual_memory().available * MEM_SAFETY)
+
+
+def vram_info() -> tuple[int, int] | None:
+    """(total, used) video memory in bytes, or None when no NVIDIA card is queryable.
+
+    nvidia-smi is the only source that reflects *dedicated* usage the driver has already
+    committed, which is exactly what decides whether the next allocation spills. Returning
+    None (rather than raising) keeps CPU-only machines working.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    line = (out.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    try:
+        total, used = (int(x) for x in line[0].split(",")[:2])
+    except ValueError:
+        return None
+    mib = 1 << 20
+    return total * mib, used * mib
+
+
+def expert_share(model_path) -> float:
+    """Fraction of an artifact's bytes that are MoE expert tensors, read from the GGUF index.
+
+    Read rather than assumed because it is the number that decides whether a `-ncmoe`
+    split fits: on Qwen3.6-35B-A3B the experts are 90.8% of the file, so a stage that
+    keeps 24 of 32 layers' experts on the host puts a very different amount on the card
+    than one that keeps none.
+
+    Cached per path: the index walk costs a fraction of a second and the answer cannot
+    change within a run.
+    """
+    cached = _EXPERT_SHARE_CACHE.get(str(model_path))
+    if cached is not None:
+        return cached
+    import gguf
+
+    reader = gguf.GGUFReader(str(model_path))
+    expert = other = 0
+    for tensor in reader.tensors:
+        size = int(getattr(tensor, "n_bytes", 0))
+        if "exps" in tensor.name:
+            expert += size
+        else:
+            other += size
+    total = expert + other
+    share = (expert / total) if total else 0.0
+    _EXPERT_SHARE_CACHE[str(model_path)] = share
+    return share
+
+
+def gpu_weight_bytes(stages) -> float:
+    """Weight bytes that actually land on the card.
+
+    Two things scale this, and missing either one overestimates by 2.5-3x: how many of a
+    stage's layers reach the card (`gpu_layers`), and how many of those keep their experts
+    on the host (`cpu_moe`, i.e. `-ncmoe`). The `-ngl 32 -ncmoe 24` head stage weighs
+    17.50 GiB as a layer share and puts ~5.6 GiB on the card.
+
+    One definition on purpose. The VRAM budget check and the post-load spill check both
+    need this number, and the first versions of them disagreed by exactly the `cpu_moe`
+    term: the estimate refused the configuration, then the spill check reported a spill
+    on the same run after it was allowed through.
+    """
+    source_total = sum(s.layers for s in stages)
+    total = 0.0
+    for stage in stages:
+        if not stage.is_local or not stage.gpu_layers:
+            continue
+        on_gpu = min(stage.gpu_layers, stage.layers)
+        per_layer = stage_bytes(stage, source_total) / max(stage.layers, 1)
+        share = expert_share(stage.model)
+        # `-ncmoe N` keeps the experts of the first N layers on the host, so only the
+        # layers above that contribute their experts to VRAM. Non-expert tensors always
+        # follow their layer onto the card.
+        experts_on_gpu = max(0, on_gpu - min(stage.cpu_moe, on_gpu))
+        total += per_layer * ((1.0 - share) * on_gpu + share * experts_on_gpu)
+    return total
+
+
+def estimate_vram_bytes(stages) -> int:
+    """Video memory the GPU-offloaded stages need: their weights plus per-stage overhead.
+
+    Only local GPU stages count: a remote one runs on its own card.
+    """
+    gpu_stages = sum(1 for s in stages if s.is_local and s.gpu_layers)
+    return int(gpu_weight_bytes(stages) * VRAM_PER_BYTE
+               + GPU_VRAM_OVERHEAD * gpu_stages)
+
+
+def stage_bytes(stage, source_total: int) -> float:
+    """Bytes of the artifact this stage actually touches.
+
+    For a pre-cut segment that is the file size. For a C-scheme stage the file is the full
+    checkpoint, so charging its size would claim 20.82 GiB of RAM for a stage that loads
+    8 of 40 layers -- which is exactly the pessimism that made 35B look unable to fit on
+    one machine. Scale by the layer fraction instead.
+    """
+    size = stage.model.stat().st_size
+    if stage.layer_range and source_total > 0:
+        return size * (stage.layers / source_total)
+    return float(size)
+
+
+def ram_ratio(stage) -> float:
+    """What fraction of one artifact's size to charge to system RAM.
+
+    A stage that offloads *some* layers is a mix, and it must be charged as one. The old
+    rule was a step: any `gpu_layers` at all meant the full file size in RAM. For 35B that
+    turned a 9.10 GiB load into a 20.82 GiB estimate, so the budget refused a configuration
+    that actually runs at 12.64 t/s -- and the workaround became splitting the model across
+    machines, which is slower (3.40 t/s) than not splitting it at all.
+
+    Layers go to VRAM but their pages still pass through the page cache on the way, and
+    they are reclaimable afterwards; CPU layers keep re-reading the ~21.5% they touch.
+    Weighting the two by the split predicts 0.545 where 0.44 was measured: still on the
+    cautious side, which is the direction that keeps the machine alive.
+    """
+    layers = max(stage.layers, 1)
+    on_gpu = min(max(stage.gpu_layers, 0), layers)
+    frac_gpu = on_gpu / layers
+    return frac_gpu * GPU_RAM_RATIO + (1.0 - frac_gpu) * CPU_RESIDENT_RATIO
+
+
+def estimate_ram_bytes(stages) -> int:
+    """What loading these stages is expected to cost in system RAM.
+
+    Replaces summing file sizes, which assumed every byte of every artifact becomes
+    resident. Only local stages count: a remote one is loaded on its own machine.
+    """
+    source_total = sum(s.layers for s in stages)
+    total = 0.0
+    for stage in stages:
+        if not stage.is_local:
+            continue
+        total += stage_bytes(stage, source_total) * ram_ratio(stage)
+    return int(total)
+
+
+#: After loading, a stage that fits occupies MORE video memory than its weights -- the
+#: compute buffer and context come on top -- while a stage that spilled occupies LESS: the
+#: driver quietly backed the remainder with system RAM and llama.cpp still printed
+#: "offloaded N/N layers". The delta is sampled before and after loading and the driver's
+#: reservations move a few percent either way (measured 5.44 GiB landed for 5.58 GiB of
+#: weights), so the comparison allows 15%. A real spill misses by a factor, not by 3%.
+VRAM_LANDED_SLACK = 0.85
+
+
+def vram_before_load(stages) -> tuple[int, int] | None:
+    """Sample VRAM before any worker spawns.
+
+    Sampled up front on purpose: the later delta is then attributable to this run rather
+    than to whatever else shares the card. ``None`` when no local stage offloads.
+    """
+    return vram_info() if any(s.is_local and s.gpu_layers for s in stages) else None
+
+
+def vram_after_load(stages, vram_before) -> dict | None:
+    """Compare the VRAM actually used after loading against the weights that went there.
+
+    The budget check runs before the spawn and is deliberately generous, so it can only
+    catch a gross miss; this catches the case the estimate got wrong. An overflow here is
+    silent -- WDDM backs the excess with system RAM, llama.cpp still reports every layer
+    offloaded, and the run merely crawls (measured: ``gpu_layers=7`` made stage 0 faster
+    but tg slower than pure CPU) -- so this check exists to name it.
+
+    Returns ``{landed, want, gpu_stages, spill}``, or ``None`` when nothing can be said:
+    no local GPU stage, or nvidia-smi unavailable.
+    """
+    if vram_before is None:
+        return None
+    after = vram_info()
+    if after is None:
+        return None
+    want = gpu_weight_bytes(stages)
+    landed = after[1] - vram_before[1]
+    return {"landed": landed, "want": want,
+            "gpu_stages": [s.index for s in stages if s.is_local and s.gpu_layers],
+            "spill": bool(want and landed < want * VRAM_LANDED_SLACK)}
+
+
+def vram_report(result: dict | None) -> str:
+    """The post-load verdict as an operator-readable block; "" when there was nothing to check.
+
+    One copy of the wording because all three entry points print it: a spill that is only
+    named in the CLI is a spill the TUI and the server still hide.
+    """
+    if result is None:
+        return ""
+    landed, want = result["landed"] / 2**30, result["want"] / 2**30
+    if not result["spill"]:
+        return f"VRAM verified: {landed:.2f} GiB resident for {want:.2f} GiB of GPU weights"
+    return (f"!! VRAM spill detected after load: {landed:.2f} GiB resident for "
+            f"{want:.2f} GiB of GPU weights.\n"
+            f"   Stage(s) {result['gpu_stages']} did not fully fit. Windows spilled the "
+            f"rest to system RAM; decode will be slower than pure CPU.\n"
+            f"   Set gpu_layers = 0 for the largest stage, or lower it.")
+
+
+def context_shortfall(prompt_tokens: int, max_tokens: int, ctx: int) -> str:
+    """Why ``prompt + max_tokens`` cannot fit the KV window; "" when it fits.
+
+    An overrun does not fail cleanly: llama_decode returns rc=-1 partway through the
+    session. One rule for all three entry points -- the CLI checks its synthetic prompt
+    length, the TUI checks what was typed, the server checks the request body -- because a
+    check only the CLI runs is a check the other two never perform.
+    """
+    if prompt_tokens + max_tokens <= ctx:
+        return ""
+    return (f"prompt+max_tokens={prompt_tokens + max_tokens} exceeds ctx={ctx}: the KV "
+            f"cache cannot hold the prompt and its answer in one session")
+
+
+# A worker finishes loading its artifact tens of seconds after spawn, and serve()
+# only starts listening afterwards, so connect has to retry rather than fail fast.
+CONNECT_DEADLINE = 120.0
+# create_connection's own timeout; the per-attempt probe, not the overall deadline.
+CONNECT_ATTEMPT = 5.0
+# Prefill can run for far longer than any sane connect timeout, so the socket is
+# widened once the session is established.
+SESSION_TIMEOUT = 600.0
+
+
+class StageClient:
+    """One TCP session to one stage. Holds no engine state of its own."""
+
+    def __init__(self, stage: Stage) -> None:
+        self.stage = stage
+        self._addr = (stage.host, stage.port)
+        self._sock: socket.socket | None = None
+        self._n_embd = 0
+        # What the worker announced in HELLO. Kept so callers can show which artifact a
+        # stage is really running instead of which one the topology asked for.
+        self._identity: dict = {}
+
+    @property
+    def identity(self) -> dict:
+        """The HELLO this stage answered with; empty until connect() succeeded."""
+        return dict(self._identity)
+
+    def _identity_problems(self, hello: dict) -> list[str]:
+        """Everything about `hello` that disagrees with the topology.
+
+        Returned as a list rather than raised one at a time so a stage that is wrong in
+        three ways says so in one message.
+        """
+        problems: list[str] = []
+        if hello.get("role") != self.stage.kind:
+            problems.append(
+                f"role {hello.get('role')!r}, topology says {self.stage.kind!r}")
+        if int(hello.get("n_layer", -1)) != self.stage.layers:
+            problems.append(
+                f"loaded {hello.get('n_layer')} layers, topology declares "
+                f"{self.stage.layers}")
+        if self.stage.layer_range:
+            want = ":".join(str(v) for v in self.stage.layer_range)
+            got = hello.get("layer_range", "")
+            if got != want:
+                problems.append(
+                    f"layer_range {got!r}, topology declares {want!r}")
+        dtype = hello.get("dtype")
+        if dtype and dtype != wire.current_dtype():
+            problems.append(
+                f"wire dtype {dtype!r}, this driver uses {wire.current_dtype()!r}")
+        return problems
+
+    def _read_identity(self) -> dict:
+        """Read the worker's HELLO and refuse the connection if it is not what we expect.
+
+        The worker speaks first, unconditionally. Before this the driver's readiness test
+        was "the TCP handshake completed", which any listener satisfies -- including one
+        holding a cut for a different layer range.
+        """
+        hello_msg = protocol.read(self.sock)
+        if hello_msg.kind != protocol.HELLO:
+            raise RuntimeError(
+                f"stage {self.stage.index} ({self.stage.kind}) at "
+                f"{self.stage.host}:{self.stage.port} answered {hello_msg.name} instead of "
+                f"hello: that worker predates the handshake (restart it from this checkout)")
+        hello = dict(hello_msg.meta)
+        problems = self._identity_problems(hello)
+        if problems:
+            raise RuntimeError(
+                f"stage {self.stage.index} ({self.stage.kind}) at "
+                f"{self.stage.host}:{self.stage.port} does not match the topology:\n  "
+                + "\n  ".join(problems))
+        return hello
+
+    def connect(self, deadline_s: float = CONNECT_DEADLINE,
+                proc: subprocess.Popen | None = None) -> float:
+        """Retry until the stage accepts, but not past a worker that already died.
+
+        Without the ``proc`` check a stage whose shim failed to load would be waited
+        on for the full 120 s deadline -- the connect error would read "did not
+        accept" when the real answer is already in the stage log.
+        """
+        deadline = time.monotonic() + deadline_s
+        started = time.monotonic()
+        while True:
+            if proc is not None and proc.poll() is not None:
+                raise RuntimeError(
+                    f"stage {self.stage.index} ({self.stage.kind}) worker exited with "
+                    f"code {proc.returncode} before accepting on "
+                    f"{self.stage.host}:{self.stage.port}")
+            try:
+                sock = socket.create_connection(self._addr, timeout=CONNECT_ATTEMPT)
+            except OSError as exc:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"stage {self.stage.index} ({self.stage.kind}) did not accept on "
+                        f"{self.stage.host}:{self.stage.port} within {deadline_s:.0f}s: {exc}"
+                    ) from exc
+                time.sleep(0.5)
+                continue
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(SESSION_TIMEOUT)
+            self._sock = sock
+            # The worker speaks first; validate before declaring this stage ready.
+            self._identity = self._read_identity()
+            return time.monotonic() - started
+
+    @property
+    def sock(self) -> socket.socket:
+        if self._sock is None:
+            raise RuntimeError(f"stage {self.stage.index} is not connected")
+        return self._sock
+
+    @property
+    def n_embd(self) -> int:
+        """Hidden width, known after the first forward.
+
+        A single-stage topology never runs `forward_tokens`, so ask the worker for it
+        via a tokenize round trip, which is cheap and always available.
+        """
+        if not self._n_embd:
+            # Must go through tokenize(): it is what stores n_embd from the reply. Calling
+            # _forward directly sent the same request and threw the answer away, so this
+            # property returned 0 forever and every caller built zero-width payloads.
+            self.tokenize("")
+        return self._n_embd
+
+    def _forward(self, meta: dict, blob: bytes = b"") -> protocol.Message:
+        protocol.send(self.sock, protocol.FORWARD, meta, blob)
+        msg = protocol.read(self.sock)
+        if msg.kind == protocol.ERROR:
+            raise RuntimeError(f"stage {self.stage.index} ({self.stage.kind}): {msg.meta}")
+        return msg
+
+    def forward_tokens(self, tokens: list[int], n_past: int) -> np.ndarray:
+        msg = self._forward({"tokens": tokens, "n_tokens": len(tokens),
+                             "n_past": n_past, "dtype": wire.current_dtype()})
+        return self._decode_hidden(msg)
+
+    def forward_hidden(self, hidden: np.ndarray, n_past: int) -> np.ndarray:
+        dtype = wire.current_dtype()
+        # 显式 op：tail 段的主路径只出 token，不带这个 op 的话它会走 forward_tokens_out
+        # 并回一个没有 n_embd 的响应（DFlash 需要 tail 真的前向一次好拿 layer_inp）。
+        msg = self._forward({"op": "forward_hidden", "n_tokens": int(hidden.shape[0]),
+                             "n_past": n_past, "dtype": dtype},
+                            wire.encode(hidden, dtype))
+        if msg.meta.get("no_hidden"):
+            # 前向发生了，但这一段的 logits/embeddings 开关不给 dense hidden。
+            # 调用方通常只为它的 layer_inp 而来，所以这里不是错误。
+            return None
+        return self._decode_hidden(msg)
+
+    def forward_token(self, hidden: np.ndarray, n_past: int) -> int:
+        dtype = wire.current_dtype()
+        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past,
+                             "dtype": dtype}, wire.encode(hidden, dtype))
+        return int(msg.meta["token"])
+
+    def forward_tokens_out(self, hidden: np.ndarray, n_past: int) -> list[int]:
+        """k rows of hidden -> k token ids, in one round trip. Speculative verification."""
+        dtype = wire.current_dtype()
+        msg = self._forward({"n_tokens": int(hidden.shape[0]), "n_past": n_past,
+                             "dtype": dtype}, wire.encode(hidden, dtype))
+        toks = [int(t) for t in msg.meta["tokens"]]
+        if len(toks) != int(hidden.shape[0]):
+            raise RuntimeError(
+                f"stage {self.stage.index}: {len(toks)} tokens for {hidden.shape[0]} rows")
+        return toks
+
+    def last_hidden(self, row: int = -1) -> np.ndarray | None:
+        """Row ``row`` of the final hidden of the most recent decode (MTP input).
+
+        ``row=-1`` is the last row. A verification pass of n rows writes n NextN rows (the
+        export runs unmasked, `shim:654`), so row ``accept`` is the last position the block
+        actually kept -- which is what a cascaded MTP drafter has to start from.
+        """
+        try:
+            msg = self._forward({"op": "last_hidden", "row": int(row),
+                                 "n_tokens": 1, "n_past": 0})
+        except Exception as exc:  # noqa: BLE001 - "no draft head" is a normal state
+            # Swallowing this silently made a broken MTP path look like "this model has no head",
+            # which is exactly how the cross-machine run looked healthy but barely sped up.
+            print(f"    [last_hidden] stage {self.stage.index}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            return None
+        return self._decode_hidden(msg).reshape(-1)
+
+    def set_skip_hidden_logits(self, skip: bool = True) -> None:
+        """Tell a relay stage to stop computing logits it throws away."""
+        self._forward({"op": "set_skip_logits", "skip": bool(skip), "n_tokens": 1, "n_past": 0})
+
+    def logits(self, row: int = -1) -> np.ndarray:
+        """Logits of one row from the most recent forward, flat with length n_vocab.
+
+        Goes straight to the shim's copy rather than being recomputed here: the tail is the
+        only stage holding logits, and they are already there after the forward.
+        """
+        msg = self._forward({"op": "logits", "row": int(row), "n_tokens": 1, "n_past": 0})
+        raw = msg.blob
+        return np.frombuffer(raw, dtype=np.float32).copy()
+
+    def draft_open(self, path: str, n_ctx: int = 256, n_batch: int = 32,
+                   n_gpu_layers: int = 0) -> int:
+        msg = self._forward({"op": "draft_open", "path": str(path), "n_ctx": int(n_ctx),
+                             "n_batch": int(n_batch), "n_gpu_layers": int(n_gpu_layers)})
+        return int(msg.meta.get("draft_rc", 0))
+
+    def draft_n_embd_enc(self) -> int:
+        return int(self._forward({"op": "draft_n_embd_enc"}).meta.get("n_embd_enc", 0))
+
+    def draft_inject(self, rows) -> int:
+        arr = np.ascontiguousarray(rows, dtype=np.float32)
+        dtype = wire.current_dtype()
+        # 必须 wire.encode：直接传 ndarray 时 len() 给的是行数（5），对端会收到 5 字节
+        # 然后 die 在 numpy 的 "buffer is smaller than requested size"。
+        msg = self._forward({"op": "draft_inject", "n_tokens": int(arr.shape[0]),
+                             "shape": list(arr.shape), "dtype": dtype},
+                            wire.encode(arr, dtype))
+        return int(msg.meta.get("draft_rc", 0))
+
+    def draft_block(self, anchor: int, n_block: int = 16) -> list[int]:
+        msg = self._forward({"op": "draft_block", "anchor": int(anchor),
+                             "n_block": int(n_block)})
+        return [int(v) for v in msg.meta.get("drafts", [])]
+
+    def draft_reset(self) -> int:
+        return int(self._forward({"op": "draft_reset"}).meta.get("draft_rc", 0))
+
+    def draft_rollback(self, n_keep: int) -> int:
+        msg = self._forward({"op": "draft_rollback", "n_keep": int(n_keep)})
+        return int(msg.meta.get("draft_rc", 0))
+
+    def draft_close(self) -> None:
+        self._forward({"op": "draft_close"})
+
+    def add_layer_inp(self, lid: int) -> None:
+        """Open an intermediate-hidden slot on this stage."""
+        self._forward({"op": "add_layer_inp", "lid": int(lid)})
+
+    def layer_inp(self, lids: list[int]) -> np.ndarray | None:
+        """Multi-slot intermediate hidden from the most recent forward.
+
+        Shape [n_layers, n_tokens, n_embd]. None when the stage has no data (or the model has
+        no such layers) -- treated as "feature unavailable", not as an error.
+        """
+        if not lids:
+            return None
+        try:
+            msg = self._forward({"op": "layer_inp", "lids": [int(v) for v in lids]})
+            # Decode here instead of via _decode_hidden: that helper derives the expected
+            # payload length from n_tokens alone, and this reply carries n_layers of them
+            # (it rejected a correct 6x5x2048 blob for being "6 times too big").
+            n_layers = int(msg.meta["n_layers"])
+            n_tokens = int(msg.meta["n_tokens"])
+            n_embd = int(msg.meta["n_embd"])
+            dtype = wire.resolve(msg.meta.get("dtype"))
+            arr = wire.decode(msg.blob, dtype, (n_layers * n_tokens, n_embd))
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [layer_inp] stage {self.stage.index}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            return None
+        return arr.reshape(n_layers, n_tokens, n_embd)
+
+    def mtp_draft(self, hidden: np.ndarray, token: int, n_past: int) -> int:
+        """One draft token from the MTP head held by this stage."""
+        # last_hidden() hands back a flat (n_embd,) row; the wire wants one row of that width.
+        # Reading shape[0] without this gave a 2048-row request and the worker rejected it.
+        arr = hidden.reshape(1, -1) if hidden.ndim == 1 else hidden
+        dtype = wire.current_dtype()
+        # No "op": this rides on FORWARD like a normal hidden-in call, with `token` marking it
+        # as a draft request. An op would be intercepted by the text-helper dispatch before the
+        # blob is decoded, and mtp_draft needs the hidden.
+        msg = self._forward({"n_tokens": int(arr.shape[0]),
+                             "n_past": n_past, "dtype": dtype, "token": int(token)},
+                            wire.encode(arr, dtype))
+        return int(msg.meta["token"])
+
+    def mtp_reset(self) -> None:
+        self._forward({"op": "mtp_reset", "n_tokens": 0, "n_past": 0})
+
+    def seq_rm(self, n_past: int) -> None:
+        """Drop everything at and after ``n_past``. Undoes a rejected draft."""
+        self._forward({"op": "seq_rm", "n_tokens": 0, "n_past": n_past})
+
+    def _decode_hidden(self, msg: protocol.Message) -> np.ndarray:
+        """Decode the reply's hidden in whatever dtype the worker declared.
+
+        The answer's dtype is not assumed to match this side's setting: a worker that
+        ignored `dtype` (an older build) still answers float32, and the declared value
+        is what decides how the bytes are read. Reading it wrong would be silent garbage,
+        so the byte count is checked against it.
+        """
+        n_embd = int(msg.meta["n_embd"])
+        n_tokens = int(msg.meta["n_tokens"])
+        dtype = msg.meta.get("dtype", wire.DEFAULT)
+        self._n_embd = n_embd
+        expected = wire.payload_size((n_tokens, n_embd), dtype)
+        if len(msg.blob) != expected:
+            raise RuntimeError(
+                f"stage {self.stage.index} ({self.stage.kind}) sent {len(msg.blob)} bytes "
+                f"for {n_tokens}x{n_embd} {dtype} hidden (expected {expected})")
+        return wire.decode(msg.blob, dtype, (n_tokens, n_embd))
+
+    def tokenize(self, text: str) -> list[int]:
+        """Text -> ids via the stage's own vocabulary (every stage loads the same one)."""
+        msg = self._forward({"op": "tokenize", "text": text})
+        if "n_embd" in msg.meta:
+            self._n_embd = int(msg.meta["n_embd"])
+        return [int(t) for t in msg.meta.get("tokens", [])]
+
+    def piece(self, token: int) -> bytes:
+        """Token id -> UTF-8 bytes, possibly a partial character."""
+        msg = self._forward({"op": "piece", "token": int(token)})
+        return str(msg.meta.get("piece", "")).encode("latin-1")
+
+    def is_eog(self, token: int) -> bool:
+        return bool(self._forward({"op": "is_eog", "token": int(token)}).meta.get("eog"))
+
+    def set_sampling(self, **params) -> dict:
+        """Install the tail stage's sampler; returns the parameters in effect.
+
+        Rides on FORWARD's meta like the other ops, so the six-message protocol is
+        untouched. The tail stage is the only one that produces tokens, so this is
+        a no-op for every other kind.
+        """
+        if self.stage.kind != "tail":
+            return {}
+        return dict(self._forward({"op": "set_sampling", **params}).meta.get("sampling") or {})
+
+    def sampling(self) -> dict:
+        """Effective sampler configuration as the tail stage reports it."""
+        if self.stage.kind != "tail":
+            return {}
+        return dict(self._forward({"op": "get_sampling"}).meta.get("sampling") or {})
+
+    def clear_sampling(self) -> dict:
+        """Return the tail stage to the untouched argmax default."""
+        if self.stage.kind != "tail":
+            return {}
+        return dict(self._forward({"op": "clear_sampling"}).meta.get("sampling") or {})
+
+    def reset(self) -> None:
+        protocol.send(self.sock, protocol.RESET)
+        msg = protocol.read(self.sock)
+        if msg.kind == protocol.ERROR:
+            raise RuntimeError(f"stage {self.stage.index} reset failed: {msg.meta}")
+
+    def close(self) -> None:
+        if self._sock is None:
+            return
+        try:
+            protocol.send(self._sock, protocol.BYE)
+        except OSError:
+            pass
+        self._sock.close()
+        self._sock = None
+
+
+def _port_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    """Whether something is already accepting on host:port.
+
+    Used only to decide whether to ask a remote stage to start itself: a worker that is
+    already up keeps its model loaded across chains, and launching a second one would
+    just fail to bind (or, worse, win the bind and leave the first orphaned).
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        return probe.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def start_remote(stage: Stage) -> float:
+    """Ask a remote stage to bring itself up; returns how long the request took.
+
+    Which script to run is a deployment fact, so the topology carries it and this file
+    stays free of any machine's paths. The ssh command runs the launcher detached: the
+    worker has to outlive the session, and from then on the chain only talks to it over
+    TCP.
+
+    The topology has always had these two fields; nothing read them, so every cross-machine
+    run silently required a human to start the far end by hand.
+    """
+    target = stage.ssh_target
+    if not target:
+        raise RuntimeError(
+            f"stage {stage.index} ({stage.kind}) runs on {stage.host} but the topology "
+            f"sets no ssh_user, so it must already be listening on "
+            f"{stage.host}:{stage.port}")
+    if _port_open(stage.host, stage.port):
+        # Already serving, and its model is already in memory. Reusing it is the point of
+        # the worker's serve loop; relaunching would only fight over the port.
+        print(f"stage {stage.index} ({stage.kind}) already listening on "
+              f"{stage.host}:{stage.port} ({target}), reusing it", flush=True)
+        return 0.0
+    started = time.perf_counter()
+    task = f"qlh-stage-{stage.index}"
+    # A one-shot scheduled task, not `start`: over ssh there is no interactive window
+    # station, so `start`'s new console never appears and the command silently does
+    # nothing -- verified by its side effect never showing up. A scheduled task runs
+    # detached in the logged-on user's session, which is also how this worker was
+    # started by hand before the topology could say so.
+    remote = (f'schtasks /create /tn "{task}" /f /tr "{stage.start_cmd}" '
+              f'/sc once /st 23:59 && schtasks /run /tn "{task}"')
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, remote]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout or "").strip() or f"ssh exit {done.returncode}"
+        raise RuntimeError(
+            f"could not start stage {stage.index} ({stage.kind}) on {target}: {detail}")
+    elapsed = time.perf_counter() - started
+    print(f"asked {target} to start stage {stage.index} ({stage.kind}) "
+          f"via {stage.start_cmd} ({elapsed:.1f}s)", flush=True)
+    return elapsed
+
+
+def tail_rs_depth(dflash: str, dflash_block: int, cascade_mtp: int) -> int:
+    """Recurrent snapshot depth the tail needs for one speculative round; 0 for plain decode.
+
+    A DFlash round submits ``dflash_block`` rows before it knows how many to keep, and a
+    cascade appends up to ``cascade_mtp`` more, so the tail's rollback depth has to cover
+    the sum. ``spawn_worker`` raises ``SA_N_RS_SEQ`` to it on the tail only: the same value
+    on the GPU head multiplies its snapshots and overflows VRAM.
+
+    Left at the default (``max(1, SA_SPEC_K)`` = 2) every rollback past two rows fails with
+    seq_rm rc=-6. That was a latent bug until 2026-11-01: only the CLI computed this, and only
+    when a cascade was attached, so a plain DFlash round from the TUI or the server asked the
+    tail for 2 snapshots while verifying a 6-row block. It stayed hidden because the shim
+    promotes a positive value to ``SA_KH_RS_SEQ`` (16), which covered blocks up to 16.
+
+    All three entry points now call this through ``bring_up``, so the depth follows the block
+    instead of leaning on that promotion. ``scripts/tail-worker.cmd`` keeps a floor of 1 for
+    the same reason the shim needs one: zero means "do not promote at all".
+    """
+    return int(dflash_block) + int(cascade_mtp) if dflash else 0
+
+
+def bring_up(stages, shim: Path, ctx: int, tail_rs_seq: int = 0,
+             procs: list | None = None, note=print) -> list:
+    """Start every stage this machine can start: local ones spawned, remote ones asked.
+
+    Returns ``[(proc, log, stage)]`` for the local stages, in topology order. Connecting is
+    left to the caller because the entry points connect differently: the CLI and the server
+    connect in order, the TUI needs one thread per stage so its splash can show per-stage
+    progress.
+
+    A remote stage with no ``start_cmd`` cannot be started from here; the topology then
+    means it is already listening. Said out loud rather than left to surface as a 120 s
+    "did not accept" with no explanation.
+
+    ``procs`` lets a caller that cleans up on failure own the list: it is appended to in
+    place, so a remote stage that fails to start still leaves the already-spawned locals
+    where the caller's ``finally`` finds them. ``note`` is the reporter (``print`` by
+    default); the TUI passes ``None`` because printing over its screen destroys the frame
+    it is drawing.
+    """
+    if procs is None:
+        procs = []
+    for stage in stages:
+        if stage.is_local:
+            procs.append((*spawn_worker(stage, shim, ctx, tail_rs_seq), stage))
+        elif stage.start_cmd:
+            # Remote with a launcher: ask it to come up, then connect like any other stage.
+            # The HELLO check in connect() is what turns "it is listening" into "it is
+            # listening and loaded what the topology says".
+            start_remote(stage)
+        elif note is not None:
+            note(f"stage {stage.index} ({stage.kind}) is on {stage.host}:{stage.port} and "
+                 f"the topology sets no start_cmd; expecting it to be already listening")
+    return procs
+
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+# Kept only so the handle stays valid for the life of the process; see _own_process_tree.
+_JOB_HANDLE: int | None = None
+
+
+def _own_process_tree() -> None:
+    """Bind this process and every worker it starts into a kill-on-close job object.
+
+    The `finally` in main() is not the whole cleanup story. It runs on SystemExit, on a
+    raised exception and on Ctrl-C, but NOT when this process is killed -- and being
+    killed is how a test run usually ends (Stop-Process, a runner that gives up on a
+    timeout, a crashed parent). Measured 2026-11-01, TerminateProcess on the driver 8 s
+    into a decode: two stage_worker and two keep_head_worker survived, 2.87 + 0.52 GiB
+    resident, unchanged at t+25 s. The next run then aborted at the memory gate wanting
+    8.09 GiB while 1.56 GiB was safe. Windows does not touch a child when its parent
+    dies, and the keep_head_worker -- the process that actually holds the weights --
+    only notices through a closed stdin pipe, so it never notices a hard kill.
+
+    A job object is what the kernel does enforce: CreateJobObject + KILL_ON_JOB_CLOSE,
+    then assign THIS process. Children inherit membership at CreateProcess, so the
+    stage_worker joins, and the keep_head_worker that the stage_worker starts joins too,
+    transitively. The handle is left open on purpose -- it closes when this process dies,
+    however it dies, and that is what fires the kill.
+
+    Called from spawn_worker rather than main() so every entry point gets it:
+    chain_client.py, server.py, koakuma.py and the checks/* scripts all start their
+    workers here. Idempotent. A failure is reported but never fatal: the normal path
+    still cleans up in the caller's `finally`, and the point of the warning is that a
+    silent failure restores exactly the leak this exists to prevent.
+    """
+    global _JOB_HANDLE
+    if os.name != "nt" or _JOB_HANDLE is not None:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class _ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimit),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    def _warn(what: str) -> None:
+        print(f"  warning: {what} failed (win32 error {ctypes.get_last_error()}); a "
+              f"killed driver will leave its workers resident", file=sys.stderr)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        _warn("CreateJobObject")
+        return
+    info = _ExtendedLimit()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+            job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+            ctypes.sizeof(info)):
+        _warn("SetInformationJobObject")
+        return
+    # -1 is the pseudo-handle for "this process"; a job that already contains it (a
+    # terminal or a test runner that put us in one) accepts the nested assignment on
+    # Windows 8 and later, which is every machine this runs on.
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        _warn("AssignProcessToJobObject")
+        return
+    _JOB_HANDLE = int(job)
+
+
+def spawn_worker(stage: Stage, shim: Path, ctx: int,
+                 tail_rs_seq: int = 0) -> tuple[subprocess.Popen, Path]:
+    """Start one stage process and return (process, log file).
+
+    Worker output goes to a file, not to this terminal: llama.cpp's loader writes
+    hundreds of lines per stage and would bury the timings. The file is still the
+    first thing to read when a stage dies before accepting.
+
+    ``tail_rs_seq`` raises SA_N_RS_SEQ on the tail only. A cascaded block round writes
+    ``--dflash-block + --cascade-mtp`` rows before it knows how many to keep, so the tail's
+    rollback depth has to cover that -- but the same value on the GPU head multiplies its
+    recurrent snapshots too, and that overflowed VRAM on this topology (measured 2026-11-01:
+    gpu_layers=4 wanted 2.19 GiB and landed 1.85 GiB, i.e. spilled to system RAM).
+    """
+    # Before the first CreateProcess: the job only captures processes created after this
+    # call, and it has to include this one so the workers die with it.
+    _own_process_tree()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = LOG_DIR / f"stage-{stage.index}-{stage.kind}.log"
+    handle = open(log, "w", encoding="utf-8", errors="replace")
+    cmd = [
+        sys.executable, str(HERE / "stage_worker.py"),
+        "--role", stage.kind,
+        "--model", str(stage.model),
+        "--shim", str(shim),
+        "--host", stage.host,
+        "--port", str(stage.port),
+        "--ctx", str(ctx),
+        "--threads", str(stage.threads),
+        "--n-gpu-layers", str(stage.gpu_layers),
+        "--n-cpu-moe", str(stage.cpu_moe),
+        "--layers", str(stage.layers),
+    ]
+    if stage.cpus:
+        cmd.extend(["--cpus", stage.cpus])
+    # Only the tail stage needs the output projection; the rule is shared with the
+    # in-process path through config.needs_logits().
+    env = dict(os.environ)
+    env["SA_NEEDS_LOGITS"] = config.needs_logits(stage.kind)
+    # Speculative decode needs two things the plain path does not: the draft head (only the
+    # tail holds it) and recurrent snapshots to roll a rejected draft back. Both are opt-in
+    # because they cost memory and graph nodes that a non-speculative run should not pay.
+    if stage.kind == "tail":
+        mtp_default = "1" if os.environ.get("SA_SPEC", "1") != "0" else "0"
+        # A cut artifact cannot serve an MTP head, and asking for one is a hard crash:
+        # `layer_range` remaps blk.i -> blk.lo+i, so the nextn block (at global blk.N,
+        # i.e. local index n_layer) lands outside the loaded range. llama.cpp drops it as
+        # "unused tensor", then qwen35moe.cpp:567 asserts on layer.nextn.eh_proj. The
+        # sidecar is what tells us we are looking at a cut artifact; a whole checkpoint
+        # with `layer_range` keeps its nextn block inside the range and works fine.
+        if topology.provenance(stage.model) is not None:
+            mtp_default = "0"
+        env.setdefault("SA_MTP", mtp_default)
+    # Recurrent snapshots. A speculative step submits a verification block of k+1
+    # positions (the trunk token plus k drafts) and keeps only the accepted prefix, so the
+    # worst case -- every draft rejected -- retracts k positions, not k-1. The snapshot
+    # depth therefore has to be k. With k-1 (what this used to be) the reject-all step
+    # makes llama_memory_seq_rm refuse the rollback (rc=-6, which seq_rm treats as a no-op),
+    # the stage's recurrent state then stays ahead of the position the chain believes in,
+    # and the next decode dies with "llama_decode failed rc=-1" -- measured at k=2 gen=40:
+    # [seq_rm] p0=25 rc=-6 immediately followed by a -2 on the head stage.
+    #
+    # The old comment here claimed k on the 32-layer head made the CUDA graph reservation
+    # fail ("k=1 fine, k=2 dead"). That was the seq_rm ctypes bug in keep_head_worker.py
+    # (missing argtypes), not the graph: with that fixed, k=2 on the same topology loads and
+    # runs (head CUDA compute buffer unchanged at 291.13 MiB, CUDA_Host 44.21 -> 60.30 MiB).
+    _k = int(os.environ.get("SA_SPEC_K", "2"))
+    # SA_NRS_FORCE decouples snapshot depth from draft depth: it lets k=3/4 be measured at
+    # n_rs_seq=2, which separates "the extra drafts are useless" from "the extra snapshots are
+    # expensive". Only for experiments -- depth k needs k-1 snapshots to roll back correctly.
+    _force = os.environ.get("SA_NRS_FORCE")
+    if stage.kind == "tail" and tail_rs_seq > 0:
+        # Cascaded rounds write more rows than SA_SPEC_K knows about; only the tail needs the
+        # deeper snapshots, and only the tail gets them (see the docstring).
+        env["SA_N_RS_SEQ"] = str(max(tail_rs_seq, int(_force or 0), 1))
+    else:
+        env.setdefault("SA_N_RS_SEQ", _force if _force else str(max(1, _k)))
+    # Layer selection at load time: with a range, `model` is the full checkpoint and
+    # llama.cpp (with the C-scheme patch) exposes only these layers. Unset for the
+    # pre-cut-artifact path, which needs no help.
+    if stage.layer_range:
+        env["LLAMA_LAYER_RANGE"] = f"{stage.layer_range[0]}:{stage.layer_range[1]}"
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(HERE), stdout=handle,
+                                stderr=subprocess.STDOUT, env=env)
+    finally:
+        handle.close()
+    return proc, log
+
+
+def _walk(clients: list[StageClient], tokens: list[int], n_past: int,
+          stage_ms: list[list[float]], want_all: bool):
+    """Push `tokens` into the head, relay hidden through cpu stages, stop at the tail.
+
+    The payload is chosen by each stage's kind, not by its position: a gpu stage takes
+    tokens, any number of cpu stages pass hidden through, and the tail turns hidden into
+    ids. Position is asserted once up front because a mis-ordered topology would
+    otherwise feed tokens into a hidden-in endpoint and fail inside the shim.
+
+    ``want_all=False`` returns the single next token, ``True`` returns one id per input
+    row (the verification primitive). The two used to be separate loops with the same
+    body; keeping one is what makes a fix to the relay apply to both.
+    """
+    if not clients or clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
+        raise RuntimeError("chain must start with a gpu stage and end with a tail stage")
+
+    hidden: np.ndarray | None = None
+    for i, client in enumerate(clients):
+        kind = client.stage.kind
+        t0 = time.perf_counter()
+        try:
+            if kind == "gpu":
+                hidden = client.forward_tokens(tokens, n_past)
+            elif kind == "cpu":
+                if hidden is None:
+                    raise RuntimeError(f"stage {i} (cpu) has no hidden to consume")
+                hidden = client.forward_hidden(hidden, n_past)
+            else:  # tail
+                if hidden is None:
+                    raise RuntimeError(f"stage {i} (tail) has no hidden to consume")
+                if want_all:
+                    return client.forward_tokens_out(hidden, n_past)
+                if hidden.shape[0] > 1:
+                    # A prefill pass hands the tail several rows at once. The worker answers
+                    # with one argmax per position, and the token this step should return is
+                    # the last one -- the same token a single-row call would give.
+                    return client.forward_tokens_out(hidden, n_past)[-1]
+                return client.forward_token(hidden, n_past)
+        finally:
+            stage_ms[i].append((time.perf_counter() - t0) * 1000.0)
+    raise RuntimeError("chain has no tail stage")
+
+
+def forward(clients: list[StageClient], tokens: list[int], n_past: int,
+            stage_ms: list[list[float]]) -> int:
+    """Walk the chain once and return the next token."""
+    return _walk(clients, tokens, n_past, stage_ms, want_all=False)
+
+
+def forward_batch(clients: list[StageClient], tokens: list[int], n_past: int,
+                  stage_ms: list[list[float]]) -> list[int]:
+    """Walk the chain once with a *block* of tokens and return one token per position.
+
+    The verification primitive: the whole candidate block goes through in one round trip and
+    the tail answers with an argmax per position. Verified bit-identical to running the same
+    positions one at a time (see checks/probe_perfect_draft.py).
+    """
+    return _walk(clients, tokens, n_past, stage_ms, want_all=True)
+
+
+# Speculation pays off only where the text is predictable. Measured on this chain (§10):
+# code continuation accepts 70-83% of drafts and lands ~1.13x faster, ordinary prose 60-73%
+# and the gain shrinks toward nothing. So the default is automatic: start from what the prompt
+# looks like, and switch off if the live acceptance rate says this request is not the kind.
+# Strong markers appear in code and essentially never in prose, so one is enough. Weak ones
+# ("return", "for") also occur in English, so those need corroboration. The split matters for
+# short prompts: "def quicksort(arr):" has exactly one marker and must still count as code.
+STRONG_MARKERS = ("def ", "class ", "import ", "from ", "self.", "print(", "```",
+                  "()", "):\n", "= [", "== ", "!=", ">>> ")
+WEAK_MARKERS = ("return ", "if ", "for ", "while ", " = ", "{\n", "};")
+
+
+def looks_like_code(text: str) -> bool:
+    """Rough code detector: strong marker wins alone, weak ones need two, indentation counts."""
+    if any(m in text for m in STRONG_MARKERS):
+        return True
+    hits = sum(1 for m in WEAK_MARKERS if m in text)
+    if "\n    " in text or "\n\t" in text:
+        hits += 1
+    return hits >= 2
+
+
+# Below this acceptance rate a speculative step costs more than it saves at k=2
+# (cost 4.36 units per round, so 0.35 accepted still breaks even). Checked after a warm-up
+# window, since the first steps draft from a nearly empty context and accept poorly.
+AUTO_MIN_ACCEPT = 0.35
+AUTO_WARMUP_STEPS = 6
+
+
+def speculate(clients: list[StageClient], token: int, n_past: int,
+              stage_ms: list[list[float]], k: int,
+              stats: dict) -> list[int]:
+    """One speculative step: trunk token + up to k recursive MTP drafts, verified in one block.
+
+    Returns the accepted tokens for this step (1 + accepted drafts), always starting with the
+    token the trunk itself produced. The trailing token of the verified block is free -- the
+    block already computed it -- so it is returned as well and the caller must not recompute it.
+
+    Correctness contract: the returned list is what plain greedy would have produced. The
+    verification compares the drafts against the trunk's own argmax at each position, and any
+    position after the first mismatch is rolled back on *every* stage.
+    """
+    tail = clients[-1]
+    stats["steps"] = stats.get("steps", 0) + 1
+
+    # 1. trunk step: one token, and the final hidden the draft head needs
+    t1 = forward(clients, [token], n_past, stage_ms)
+    h = tail.last_hidden()
+    if h is None:                      # no NextN head (or SA_MTP off): plain decode
+        stats["no_draft"] = stats.get("no_draft", 0) + 1
+        return [t1]
+
+    # 2. recursive drafts. Each one feeds the previous guess back in with the same hidden.
+    drafts: list[int] = []
+    tail.mtp_reset()
+    cur = t1
+    try:
+        for j in range(k):
+            d = tail.mtp_draft(h, cur, n_past + 1 + j)
+            drafts.append(d)
+            cur = d
+    except Exception:                  # noqa: BLE001 - a broken draft head must not break decode
+        stats["draft_error"] = stats.get("draft_error", 0) + 1
+        return [t1]
+
+    # 3. verify the whole block [t1, d0, d1, ...] in one pass
+    block = [t1] + drafts
+    try:
+        tb = forward_batch(clients, block, n_past + 1, stage_ms)
+    except Exception:                  # noqa: BLE001
+        stats["verify_error"] = stats.get("verify_error", 0) + 1
+        return [t1]
+
+    # 4. accept the longest prefix where the draft equals the trunk
+    accepted = 0
+    for j in range(len(drafts)):
+        if drafts[j] == tb[j]:
+            accepted += 1
+        else:
+            break
+
+    keep = 1 + accepted                # positions the block legitimately wrote
+    if keep < len(block):
+        # roll back everything past the accepted prefix, on both ends of the chain
+        for c in clients:
+            try:
+                c.seq_rm(n_past + 1 + keep)
+            except Exception:          # noqa: BLE001 - keep decoding even if rollback fails
+                stats["rollback_error"] = stats.get("rollback_error", 0) + 1
+
+    stats["drafts"] = stats.get("drafts", 0) + len(drafts)
+    stats["accepted"] = stats.get("accepted", 0) + accepted
+    # Per-round accepted count, not just the running totals: whether a scenario is worth
+    # speculating depends on the *shape* of this distribution, not its mean. A bimodal
+    # 0-or-all shape can be fixed by predicting which rounds to try; a flat one cannot.
+    stats.setdefault("per_round", []).append(accepted)
+    out = block[:keep]
+    # tb[accepted] is the trunk's token at the next position -- already paid for
+    out.append(tb[accepted])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# DFlash parallel drafting
+# ---------------------------------------------------------------------------
+
+# Source layers whose *input* hidden the DFlash encoder consumes, in GGUF order. Fixed by the
+# published checkpoint (`dflash.target_layers`); a draft model trained against a different
+# target would carry its own list.
+DFLASH_TARGET_LAYERS = (2, 7, 12, 17, 23, 28, 33, 38)
+
+
+def dflash_split_layers(head_range, tail_range):
+    """Map the draft's source-layer list onto head-local and tail-local ids.
+
+    Which stage owns a given source layer follows from where the chain is cut, so this cannot
+    be a constant: asking a 4-layer tail for source layer 6 would address a layer it never
+    loaded, and the shim answers a missing slot with an error rather than a wrong vector.
+    """
+    head_lo, head_hi = head_range
+    tail_lo, tail_hi = tail_range
+    head_ids = [l - head_lo for l in DFLASH_TARGET_LAYERS if head_lo <= l < head_hi]
+    tail_ids = [l - tail_lo for l in DFLASH_TARGET_LAYERS if tail_lo <= l < tail_hi]
+    if len(head_ids) + len(tail_ids) != len(DFLASH_TARGET_LAYERS):
+        raise RuntimeError(
+            "the cut point drops a layer the draft consumes: it wants %s, "
+            "head covers %s of %s, tail covers %s of %s"
+            % (list(DFLASH_TARGET_LAYERS), head_ids, head_range, tail_ids, tail_range))
+    return head_ids, tail_ids
+
+
+class DFlashDriver:
+    """One DFlash drafting session over an already connected chain.
+
+    DFlash proposes a whole block of future tokens in a single forward pass, so a round is:
+    draft `n_block` candidates from the anchor, verify `[anchor] + drafts` through the chain in
+    one trip, keep the longest correct prefix. Its KV is fed the *target's* intermediate hidden
+    states, which is why the chain has to expose per-layer `layer_inp` slots and why the rows
+    arrive one round behind the verification pass.
+
+    Cascade (``cascade_mtp > 0``): when the whole DFlash block was accepted, the same round
+    hands the tail's NextN hidden of its last row to the MTP head and drafts up to
+    ``cascade_mtp`` more tokens behind the block. Those are verified by appending
+    ``1 + cascade_mtp`` rows (`free` plus the drafts) to the chain at the block's end -- no
+    second full block, because the first one's KV already sits at the right positions. A round
+    then advances ``1 + accept + 1 + mtp_accept`` tokens instead of ``1 + accept``: the block
+    drafter and the MTP head are not two independent gains, they extend the same block.
+
+    Contract: the tokens it returns are what plain greedy decoding would have produced. The
+    verifier compares drafts against the chain's own argmax, so this only holds at
+    temperature 0 -- sampling would need rejection sampling, which the shim does not expose.
+    """
+
+    def __init__(self, clients, draft_path, n_block, ctx=1024, stage_ms=None, stats=None,
+                 cascade_mtp=0):
+        # Exactly two, not "a gpu head and a tail": `step` relays the head's hidden to the
+        # tail directly (and `_rows` taps only those two stages), so a middle stage would
+        # never execute the verify pass -- its KV would simply stay empty and the chain
+        # would answer from a partial model. topology.py allows gpu+cpu+tail, so this has
+        # to be said out loud rather than inferred from the kinds at the ends.
+        if len(clients) != 2:
+            raise RuntimeError(
+                "DFlash supports exactly two stages (gpu head + tail), got %d: a middle "
+                "stage would be skipped by the draft verify pass and its KV never written"
+                % len(clients))
+        if clients[0].stage.kind != "gpu" or clients[-1].stage.kind != "tail":
+            raise RuntimeError("DFlash needs a gpu head and a tail")
+        self.clients = clients
+        self.head = clients[0]
+        self.tail = clients[-1]
+        # The draft's source layers are mapped onto head-local and tail-local ids, which is
+        # only possible when each stage says which source layers it owns. A topology without
+        # `layer_range` (a pre-cut artifact) has no such statement, and unpacking None used
+        # to surface as a TypeError from dflash_split_layers.
+        if self.head.stage.layer_range is None or self.tail.stage.layer_range is None:
+            raise RuntimeError(
+                "DFlash needs `layer_range` on both stages (head=%r tail=%r): it maps the "
+                "draft's source layers %s onto per-stage local ids, and a stage without "
+                "layer_range cannot say which of them it owns"
+                % (self.head.stage.layer_range, self.tail.stage.layer_range,
+                   list(DFLASH_TARGET_LAYERS)))
+        self.n_block = int(n_block)
+        # How many tokens the MTP head may add behind an accepted DFlash block. 0 keeps the
+        # pure one-source round: the code path below is the same one it always was.
+        self.cascade_mtp = int(cascade_mtp)
+        self.stage_ms = stage_ms if stage_ms is not None else [[] for _ in clients]
+        self.stats = stats if stats is not None else {}
+        self.pending = []
+        self.primed = False
+        self.head_ids, self.tail_ids = dflash_split_layers(
+            self.head.stage.layer_range, self.tail.stage.layer_range)
+        for lid in self.head_ids:
+            self.head.add_layer_inp(lid)
+        for lid in self.tail_ids:
+            self.tail.add_layer_inp(lid)
+        if self.head.draft_open(draft_path, ctx, 512, 99) != 0:
+            raise RuntimeError("draft_open failed for %s" % draft_path)
+        self.enc_w = self.head.draft_n_embd_enc()
+
+    def _rows(self):
+        """The eight target-layer inputs of the most recent forward, in GGUF order."""
+        h = self.head.layer_inp(self.head_ids)
+        t = self.tail.layer_inp(self.tail_ids)
+        if h is None or t is None:
+            raise RuntimeError("layer_inp unavailable (head=%s tail=%s)"
+                               % (None if h is None else h.shape,
+                                  None if t is None else t.shape))
+        if h.shape[1] != t.shape[1]:
+            raise RuntimeError("row mismatch: head %d tail %d" % (h.shape[1], t.shape[1]))
+        n = h.shape[1]
+        rows = np.concatenate([h.transpose(1, 0, 2), t.transpose(1, 0, 2)],
+                              axis=1).reshape(n, -1)
+        if rows.shape[1] != self.enc_w:
+            raise RuntimeError("enc width %d != %d" % (rows.shape[1], self.enc_w))
+        return rows
+
+    def prime(self):
+        """Seed the draft KV with the prefill rows. Call once, after the prompt has run."""
+        self.head.draft_reset()
+        self.head.draft_inject(self._rows())
+        self.primed = True
+
+    def step(self, anchor: int, n_past: int):
+        """One round. Returns the tokens this round adds *beyond* `anchor`."""
+        self.stats["steps"] = self.stats.get("steps", 0) + 1
+        if not self.primed:
+            self.prime()
+        else:
+            # The previous round's accepted rows were never handed to the draft KV; its own
+            # history stopped at the verify pass, so rewind it to the chain's position first.
+            self.head.draft_rollback(n_past)
+            if self.pending:
+                self.head.draft_inject(np.concatenate(self.pending, axis=0))
+                self.pending = []
+
+        drafts = self.head.draft_block(anchor, self.n_block)
+        if not drafts:
+            self.stats["no_draft"] = self.stats.get("no_draft", 0) + 1
+            return [forward(self.clients, [anchor], n_past, self.stage_ms)]
+
+        # The verify pass is an ordinary chain walk, so it goes through `forward_batch`
+        # rather than calling head/tail by hand: that is what keeps this path identical to
+        # `_walk` (the two calls it replaces) and what records the per-stage timings.
+        verified = forward_batch(self.clients, [anchor] + drafts, n_past, self.stage_ms)
+
+        accept = 0
+        for i, draft in enumerate(drafts):
+            if i < len(verified) and int(verified[i]) == int(draft):
+                accept += 1
+            else:
+                break
+
+        # Rows for the accepted prefix, to feed the draft KV next round. They must come from
+        # this forward, not the previous one: the verify pass just wrote those positions.
+        take = self._rows()[: 1 + accept]
+        self.pending.append(take)
+
+        # The row after the accepted prefix was computed by the verify pass but paid for by no
+        # draft, so it is free -- that is what makes a round advance accept+1 tokens.
+        free = int(verified[accept]) if accept < len(verified) else int(verified[-1])
+
+        mtp_drafts: list[int] = []
+        mtp_accept = 0
+        free2 = None
+        if self.cascade_mtp > 0 and accept == len(drafts):
+            # Only a fully accepted block is worth extending. A partial accept sends the round
+            # down a branch the MTP head never saw (the row at `accept` then belongs to a
+            # rejected position), so the drafts would be spent on the wrong context. Cost when
+            # that happens: zero -- nothing was drafted yet.
+            mtp_drafts, mtp_accept, free2, rows2 = self._cascade(
+                accept, free, n_past)
+            if rows2 is not None:
+                self.pending.append(rows2[: 1 + mtp_accept])
+
+        self.stats["drafts"] = self.stats.get("drafts", 0) + len(drafts) + len(mtp_drafts)
+        self.stats["accepted"] = self.stats.get("accepted", 0) + accept + mtp_accept
+        self.stats.setdefault("per_round", []).append(accept + mtp_accept)
+        if mtp_drafts:
+            self.stats["mtp_drafts"] = self.stats.get("mtp_drafts", 0) + len(mtp_drafts)
+            self.stats["mtp_accepted"] = self.stats.get("mtp_accepted", 0) + mtp_accept
+
+        # Both stages wrote every row of both passes; anything past the accepted prefix has to
+        # go, or the next block starts from a polluted position (measured as a -1 from
+        # llama_decode on the following round).
+        written = len(drafts) + len(mtp_drafts)
+        keep = n_past + 1 + accept + (0 if free2 is None else 1 + mtp_accept)
+        if written > accept + mtp_accept:
+            # Every stage that wrote rows has to forget them, same as `speculate` does. With
+            # the two-stage check in `__init__` this is exactly (tail, head); iterating
+            # `self.clients` keeps it that way if the constraint ever changes.
+            for client in self.clients:
+                try:
+                    client.seq_rm(keep)
+                except Exception:  # noqa: BLE001 - a failed rollback must not kill the run
+                    self.stats["rollback_error"] = self.stats.get("rollback_error", 0) + 1
+
+        out = list(drafts[:accept]) + [free]
+        if free2 is not None:
+            out += list(mtp_drafts[:mtp_accept]) + [free2]
+        return out
+
+    def _cascade(self, accept: int, free: int, n_past: int):
+        """Draft `cascade_mtp` tokens behind a fully accepted block, and verify them.
+
+        The block's verify pass already produced one NextN row per position (the export is
+        unmasked), so row ``accept`` is the hidden of the last position this round kept. The
+        MTP head predicts from (h_p, x_{p+1}), so that row plus ``free`` gives the first
+        extension token -- no extra forward needed to obtain it.
+
+        Verification appends `[free, m0, m1, ...]` at the block's end instead of resending the
+        block: the accepted rows' KV is already in place at their positions, and the head is
+        69% of round time (311.8 of 452.6 ms measured on this two-stage topology), so paying
+        for the block twice would eat the whole gain.
+
+        Returns (drafts, accepted, free_token, rows) where `rows` are the layer_inp rows of
+        the append pass (None when it did not run) and `free_token` is None when no MTP head
+        was available.
+        """
+        try:
+            row_hidden = self.tail.last_hidden(accept)
+        except Exception:  # noqa: BLE001 - a broken NextN export must not break decode
+            row_hidden = None
+        if row_hidden is None:
+            self.stats["mtp_no_hidden"] = self.stats.get("mtp_no_hidden", 0) + 1
+            return [], 0, None, None
+
+        # Position bookkeeping: `free` sits at n_past+accept+1, so the first draft token is at
+        # n_past+accept+2 and mtp_draft wants the position of the token it is fed.
+        first_pos = n_past + accept + 1
+        drafts: list[int] = []
+        self.tail.mtp_reset()
+        cur = free
+        try:
+            for j in range(self.cascade_mtp):
+                d = self.tail.mtp_draft(row_hidden, cur, first_pos + j)
+                drafts.append(d)
+                cur = d
+        except Exception:  # noqa: BLE001 - a broken draft head must not break decode
+            self.stats["draft_error"] = self.stats.get("draft_error", 0) + 1
+            return [], 0, None, None
+        if not drafts:
+            return [], 0, None, None
+
+        block = [free] + drafts
+        verified = forward_batch(self.clients, block, first_pos, self.stage_ms)
+
+        rows = self._rows()
+        accept = 0
+        for i, draft in enumerate(drafts):
+            if i < len(verified) and int(verified[i]) == int(draft):
+                accept += 1
+            else:
+                break
+        free2 = int(verified[accept]) if accept < len(verified) else int(verified[-1])
+        return drafts, accept, free2, rows
+
+
+def _children(pid: int) -> list:
+    """Snapshot a worker's descendants, taken while its parent is still alive."""
+    try:
+        import psutil
+
+        return psutil.Process(pid).children(recursive=True)
+    except Exception:  # noqa: BLE001 - a process that already left has no children
+        return []
+
+
+def _report_death(proc: subprocess.Popen, log: Path, stage: Stage) -> None:
+    # A stage that died on its own is the interesting case, and its log tail is the
+    # only diagnostic that survives the process.
+    if proc.returncode in (0, None) or not log.is_file():
+        return
+    tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-15:]
+    print(f"  stage {stage.index} ({stage.kind}) exited {proc.returncode}, "
+          f"log tail: {log}", file=sys.stderr)
+    for line in tail:
+        print(f"    {line}", file=sys.stderr)
+
+
+def _terminate(procs: list[tuple[subprocess.Popen, Path, Stage]]) -> None:
+    """Stop every stage and every process a stage started.
+
+    Each stage_worker keeps a keep_head_worker child, and that child is the one that
+    actually holds the 8-16 GiB of weights. It only learns its parent is gone through
+    a closed stdin pipe, so it can outlive a terminated parent for as long as it takes
+    to notice -- or forever if it is stuck in a native call. A leak here is not tidiness:
+    the memory stays committed and the next run's pre-check then fails on a machine
+    that has nothing loaded. So reap the children explicitly, and never let one failing
+    stage skip the cleanup of the others.
+    """
+    for proc, log, stage in procs:
+        kids = _children(proc.pid)
+        try:
+            if proc.poll() is not None:
+                _report_death(proc, log, stage)
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print(f"  stage {stage.index} ({stage.kind}) ignored kill",
+                          file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - cleanup must reach the next stage
+            print(f"  stage {stage.index} ({stage.kind}) shutdown failed: {exc}",
+                  file=sys.stderr)
+        finally:
+            for kid in kids:
+                try:
+                    if kid.is_running():
+                        kid.terminate()
+                        kid.wait(timeout=10)
+                except Exception:  # noqa: BLE001 - already gone or gone after EOF
+                    pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--shim", default="", help="覆盖 SA_SHIM（见 config.find_shim）")
+    ap.add_argument("--topology", default="", help="override SA_TOPOLOGY for this run")
+    ap.add_argument("--prompt-tokens", type=int, default=32,
+                    help="synthetic prompt length; ignored with --prompt-text")
+    # The synthetic default is a sequence of unrelated token ids. It is fine for timing
+    # (fixed shape, no tokenizer cost) but it makes every model look degenerate, so it is
+    # not evidence about output quality either way.
+    ap.add_argument("--prompt-text", default=None,
+                    help="natural-language prompt instead of synthetic token ids")
+    ap.add_argument("--gen", type=int, default=64)
+    ap.add_argument("--spec-k", type=int, default=-1,
+                    help="MTP 递归草稿数；-1 = 按 prompt 自动判断（默认），0 = 强制关闭，"
+                         ">0 = 强制该深度。跨机实测 k=2 代码场景 1.13x（70%% 接受）")
+    # The checkpoint recommends temp 1.00 / top_k 20 / top_p 0.95. Greedy (the shim default)
+    # degenerates into repetition on this model, so sampling is the default here and
+    # --greedy opts back into it for reproducible comparisons.
+    ap.add_argument("--greedy", action="store_true",
+                    help="temperature 0; deterministic but prone to repetition on 35B")
+    ap.add_argument("--dflash", default="",
+                    help="DFlash 草稿模型 GGUF 路径。给了就走并行块草稿（需要 --greedy，"
+                         "验证器只暴露 argmax）。与纯 MTP 的 --spec-k>0 互斥：同一轮只用"
+                         "一个草稿源；要在 DFlash 块后再接 MTP 用 --cascade-mtp")
+    ap.add_argument("--dflash-block", type=int, default=6,
+                    help="每轮草稿数 = block-1；实测 6（k=5）最优，8 起接受率崩塌")
+    ap.add_argument("--cascade-mtp", type=int, default=0,
+                    help="级联：DFlash 块整块接受后，再用 tail 的 NextN 头在块尾起草 N 个"
+                         "（0 = 关，默认）。需要 --dflash；N=2 时合并验证块最多 "
+                         "block+N 行，SA_N_RS_SEQ 会自动提到这个深度")
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--chat", action="store_true",
+                    help="render --prompt-text as ChatML and parse special tokens")
+    ap.add_argument("--repeat", type=int, default=2)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="validate the topology and the memory budget, load no model")
+    args = ap.parse_args()
+
+    # Argument-level conflicts, caught before any model loads. They used to live inside the
+    # per-run loop, so a bad combination only surfaced after 2 minutes of weight loading (and
+    # --dry-run never reached them at all).
+    if args.cascade_mtp < 0:
+        raise SystemExit("--cascade-mtp 必须 >= 0")
+    if args.cascade_mtp and not args.dflash:
+        raise SystemExit("--cascade-mtp 需要 --dflash：级联是接在 DFlash 块后面的")
+    if args.spec_k != 0 and not args.greedy:
+        # Same rule as --dflash below, and for the same reason: the verifier only exposes an
+        # argmax, so a sampled round cannot be verified. This used to be unguarded -- the CLI
+        # decided whether to speculate from --spec-k alone, so `--spec-k 2 --temperature 0.7`
+        # silently mixed argmax-verified tokens into a sampled stream and printed a tok/s
+        # number that meant nothing.
+        raise SystemExit("--spec-k 需要 --greedy：验证器只暴露 argmax，采样下无法做 "
+                         "rejection sampling")
+    if args.dflash:
+        if not args.greedy:
+            raise SystemExit("--dflash 需要 --greedy：验证器只暴露 argmax，"
+                             "采样下无法做 rejection sampling")
+        # --cascade-mtp is the only way MTP joins a block round: it extends the DFlash block,
+        # it does not run a second independent source. A positive --spec-k would be a second,
+        # conflicting depth for the same head.
+        if args.spec_k > 0:
+            raise SystemExit("--dflash 与 --spec-k 互斥：要在 DFlash 块后接 MTP "
+                             "请用 --cascade-mtp N")
+
+    if args.topology:
+        os.environ[config.TOPOLOGY_ENV] = args.topology
+    stages = topology.load(config.topology_path())
+    ctx = config.ctx()
+    shim = config.find_shim(args.shim)
+    if not shim.is_file():
+        raise SystemExit(f"keep-head shim not found: {shim}")
+
+    if why := context_shortfall(args.prompt_tokens, args.gen, ctx):
+        raise SystemExit(why)
+
+    print(f"topology: {config.topology_path()}  stages={len(stages)}  ctx={ctx}")
+    for s in stages:
+        where = "local" if s.is_local else s.host
+        print(f"  stage {s.index}: {s.kind:<4} {s.layers:>2} layers  "
+              f"{where}:{s.port}  gpu_layers={s.gpu_layers} cpu_moe={s.cpu_moe} "
+              f"threads={s.threads}  {s.model.name}")
+
+    # Loading every local stage at once is the whole memory cost of the run, and
+    # Windows answers an overshoot by thrashing swap rather than failing — on this
+    # machine that hard-locked the desktop twice. Refuse up front instead.
+    #
+    # The estimate is not the sum of file sizes: see CPU_RESIDENT_RATIO for the
+    # measurement showing a pure-CPU stage keeps only ~21% of its artifact resident.
+    local_bytes = sum(s.model.stat().st_size for s in stages if s.is_local)
+    local_count = sum(1 for s in stages if s.is_local)
+    estimate = estimate_ram_bytes(stages)
+    budget = mem_budget_bytes()
+    print(f"\nlocal stages: {local_count}  weights {local_bytes / 2**30:.2f} GiB  "
+          f"expected resident {estimate / 2**30:.2f} GiB  "
+          f"budget {budget / 2**30:.2f} GiB")
+    if estimate > budget:
+        raise SystemExit(
+            f"refusing to start: local stages need an estimated "
+            f"{estimate / 2**30:.2f} GiB resident but only "
+            f"{budget / 2**30:.2f} GiB is safe (available x {MEM_SAFETY:.0%}). "
+            f"Move a stage to another host or lower the count.")
+
+    # VRAM gets its own check because an overshoot there is silent: WDDM backs the excess
+    # with system RAM, llama.cpp still reports every layer offloaded, and the run simply
+    # crawls. See VRAM_PER_BYTE for the measurement.
+    if any(s.is_local and s.gpu_layers for s in stages):
+        vram = vram_info()
+        want = estimate_vram_bytes(stages)
+        if vram is None:
+            print("\nVRAM: nvidia-smi unavailable, skipping the check. An overflow would "
+                  "be silent -- verify with nvidia-smi while it runs.")
+        else:
+            total, used = vram
+            free = total - used
+            print(f"VRAM: need ~{want / 2**30:.2f} GiB  free {free / 2**30:.2f} GiB  "
+                  f"of {total / 2**30:.2f} GiB")
+            if want > free:
+                # Per-stage VRAM cost, scaled to the layers that actually go to the card.
+                # Using the file size here charged a whole 20.82 GiB checkpoint to a stage
+                # that offloads 12 of its 32 layers, so it was refused as a 24 GiB stage.
+                src_total = sum(x.layers for x in stages)
+                gpu = [(s, stage_bytes(s, src_total) / max(s.layers, 1)
+                           * min(s.gpu_layers, s.layers) * VRAM_PER_BYTE
+                           + GPU_VRAM_OVERHEAD)
+                       for s in stages if s.is_local and s.gpu_layers]
+                gpu.sort(key=lambda pair: pair[1], reverse=True)
+                worst, cost = gpu[0]
+                raise SystemExit(
+                    f"refusing to start: GPU stages need ~{want / 2**30:.2f} GiB of video "
+                    f"memory but only {free / 2**30:.2f} GiB is free "
+                    f"(short by {(want - free) / 2**30:.2f} GiB).\n"
+                    f"  Largest: stage {worst.index} ({worst.model.name}) needs "
+                    f"~{cost / 2**30:.2f} GiB.\n"
+                    f"  Lower its gpu_layers, or set gpu_layers = 0 to run it on CPU. "
+                    f"Windows does not refuse the allocation -- it spills to system RAM "
+                    f"and runs slower than pure CPU.")
+
+    if args.dry_run:
+        print("\ndry run: topology and budget look fine, no model loaded")
+        return 0
+
+    procs: list[tuple[subprocess.Popen, Path, Stage]] = []
+    clients: list[StageClient] = []
+    # Sample VRAM before any worker starts, so the delta after loading is attributable to
+    # this run rather than to whatever else shares the card.
+    vram_before = vram_before_load(stages)
+    try:
+        # Spawn everything first, then connect: the stages load in parallel, so the
+        # chain is ready in the time of the slowest artifact, not the sum of them.
+        # Must be set BEFORE the workers spawn: they inherit the environment at start-up,
+        # and a later assignment would not reach the shim that tokenizes.
+        if args.chat:
+            os.environ["SA_PARSE_SPECIAL"] = "1"
+        # The depth is derived in one place (tail_rs_depth) because the TUI and the server
+        # need the same number for the same reason.
+        tail_rs = tail_rs_depth(args.dflash, args.dflash_block, args.cascade_mtp)
+        if tail_rs:
+            extra = f" + MTP {args.cascade_mtp}" if args.cascade_mtp else ""
+            print(f"  tail SA_N_RS_SEQ -> {tail_rs}（DFlash 块 {args.dflash_block} 行{extra}）")
+        spawn_start = time.perf_counter()
+        # Local stages spawned and launchable remote ones asked, by one function shared with
+        # the TUI and the server: `start_cmd` used to be read here only, so a cross-machine
+        # topology started from either of those waited 120 s for a worker nobody launched.
+        bring_up(stages, shim, ctx, tail_rs, procs=procs)
+        clients = [StageClient(s) for s in stages]
+        local_procs = {stage.index: proc for proc, _log, stage in procs}
+        for c in clients:
+            c.connect(proc=local_procs.get(c.stage.index))
+        print(f"workers ready in {time.perf_counter() - spawn_start:.1f}s")
+
+        # Verify the up-front VRAM estimate against what actually landed: the estimate is
+        # deliberately generous, so only a gross miss is caught there. One verdict shared
+        # with the TUI and the server -- a spill named only in the CLI is a spill the other
+        # two entry points still hide, and silence is exactly how it stayed unnoticed.
+        if report := vram_report(vram_after_load(stages, vram_before)):
+            print("\n" + report)
+
+        if args.chat and args.prompt_text:
+            from chat import apply_chatml
+            args.prompt_text = apply_chatml([{"role": "user", "content": args.prompt_text}])
+        _sampling = (dict(temperature=0.0) if args.greedy else
+                     dict(temperature=args.temperature, top_k=args.top_k,
+                          top_p=args.top_p, seed=args.seed))
+        # Every stage holds its own sampler; all of them must agree or the tail samples with
+        # a different distribution than the chain was tuned for.
+        for c in clients:
+            c.set_sampling(**_sampling)
+        print(f"  sampling: {clients[-1].sampling()}")
+
+        if args.prompt_text:
+            prompt = clients[0].tokenize(args.prompt_text)
+            if not prompt:
+                raise SystemExit("--prompt-text tokenized to nothing")
+        else:
+            # N unrelated ids. Keeps the shape fixed for timing; says nothing about
+            # whether the model writes sensible text.
+            prompt = list(range(100, 100 + args.prompt_tokens * 100, 100))[: args.prompt_tokens]
+        origin = repr(args.prompt_text) if args.prompt_text else "(synthetic token ids)"
+        print(f"  prompt: {len(prompt)} tokens  {origin}")
+        for run in range(1, args.repeat + 1):
+            # Fresh KV per run: a timing number only means something from a fixed start.
+            for c in clients:
+                c.reset()
+
+            stage_ms: list[list[float]] = [[] for _ in stages]
+            # The draft driver has to be built before the prompt runs: it opens the draft
+            # model and switches on the per-layer `layer_inp` taps, and the prefill pass is
+            # what fills them. Priming the draft KV happens after, below.
+            dflash = None
+            spec_stats: dict = {}
+            if args.dflash:
+                dflash = DFlashDriver(clients, args.dflash, args.dflash_block, ctx,
+                                      stage_ms, spec_stats,
+                                      cascade_mtp=args.cascade_mtp)
+            t0 = time.perf_counter()
+            token = forward(clients, prompt, 0, stage_ms)
+            prefill_s = time.perf_counter() - t0
+            # Per-stage numbers below are decode steps only: a prefill pass is an order
+            # of magnitude larger and would dominate the median of a short --gen run.
+            stage_ms = [[] for _ in stages]
+            if dflash is not None:
+                dflash.stage_ms = stage_ms
+                # The first step primes the draft KV; doing it here would need the rows the
+                # prefill just produced, which step() reads anyway.
+
+            step_ms: list[float] = []
+            out_tokens = [token]
+            n_past = len(prompt)
+            auto = args.spec_k < 0
+            if dflash is not None:
+                k = int(args.dflash_block) - 1
+            elif auto:
+                # Start from the prompt's shape; the live acceptance rate can veto it below.
+                k = 2 if (args.prompt_text and looks_like_code(args.prompt_text)) else 0
+            else:
+                k = args.spec_k
+            if os.environ.get("SA_DEBUG_AUTO"):
+                print(f"  [auto] spec_k={args.spec_k} auto={auto} k={k} "
+                      f"code={looks_like_code(args.prompt_text) if args.prompt_text else None}",
+                      file=sys.stderr, flush=True)
+            while len(out_tokens) < args.gen:
+                if auto and k > 0 and spec_stats.get("steps", 0) >= AUTO_WARMUP_STEPS:
+                    rate = spec_stats.get("accepted", 0) / max(spec_stats.get("drafts", 0), 1)
+                    if rate < AUTO_MIN_ACCEPT:
+                        # This request is not predictable enough; fall back to plain decode for
+                        # the rest of it rather than paying draft cost for nothing.
+                        spec_stats["auto_off_at"] = spec_stats["steps"]
+                        k = 0
+                start = time.perf_counter()
+                if dflash is not None:
+                    produced = dflash.step(token, n_past)
+                elif k > 0:
+                    produced = speculate(clients, token, n_past, stage_ms, k, spec_stats)
+                else:
+                    produced = [forward(clients, [token], n_past, stage_ms)]
+                step_ms.append((time.perf_counter() - start) * 1000.0)
+                # produced[0] is the token this step committed first; the rest are the extra
+                # tokens the block settled. A step that yields m tokens advances n_past by m.
+                token = produced[0]
+                out_tokens.append(token)
+                n_past += 1
+                for extra in produced[1:]:
+                    if len(out_tokens) >= args.gen:
+                        break
+                    token = extra
+                    out_tokens.append(token)
+                    n_past += 1
+
+            arr = np.asarray(step_ms)
+            pp = len(prompt) / prefill_s if prefill_s > 0 else 0.0
+            # --gen 1 leaves no decode step to time; an empty median is nan, not a number.
+            # `arr` holds one sample per DECODE STEP, and a speculative step advances several
+            # tokens. Two corrections matter:
+            #   1. divide by tokens per step, or speculation looks 3x slower than it is;
+            #   2. use the TOTAL over steps, not the median step -- steps advance a variable
+            #      number of tokens under speculation, so a median of step latencies does not
+            #      divide cleanly. Total tokens over total time is the only like-for-like
+            #      number between plain and speculative decoding.
+            # out_tokens includes the prefill token, which no step produced.
+            n_decoded = max(len(out_tokens) - 1, 1)
+            total_ms = float(np.sum(arr)) if arr.size else 0.0
+            tg = (f"{1000.0 * n_decoded / total_ms:.1f} t/s"
+                  f" ({total_ms / n_decoded:.1f} ms/token)"
+                  if total_ms > 0 else "n/a (--gen 1)")
+            print(f"  run {run}: pp{len(prompt)}={pp:.1f} t/s  "
+                  f"tg{args.gen}={tg}" +
+                  (f"  (median {np.median(arr):.1f} ms, p90 {np.percentile(arr, 90):.1f} ms)"
+                   if arr.size else ""))
+            for i, s in enumerate(stages):
+                ms = float(np.median(stage_ms[i])) if stage_ms[i] else 0.0
+                where = "local" if s.is_local else s.host
+                print(f"    stage {i} ({s.kind + ',':<5}{s.layers:>3} layers, {where}): "
+                      f"{ms:.1f} ms")
+            # Print whenever speculative decode ran at all, including the paths where it
+            # bailed out: "no MTP head" and "draft raised" used to leave no trace, so a
+            # silently-degraded run looked identical to a working one in the summary.
+            if spec_stats.get("drafts") or spec_stats.get("no_draft") or spec_stats.get("draft_error"):
+                acc = spec_stats.get("accepted", 0)
+                drf = spec_stats.get("drafts", 0)
+                no_draft = spec_stats.get("no_draft", 0)
+                draft_err = spec_stats.get("draft_error", 0)
+                auto_note = (f"  第 {spec_stats['auto_off_at']} 步起自动关闭"
+                             if spec_stats.get("auto_off_at") else "")
+                print(f"    spec:   k={k} 接受 {acc}/{drf} = {100.0*acc/max(drf,1):.1f}%"
+                      f"  平均每轮 {len(out_tokens)/max(len(step_ms),1):.2f} token"
+                      + auto_note
+                      + (f"  无 MTP 头 {no_draft}" if no_draft else "")
+                      + (f"  草稿异常 {draft_err}" if draft_err else "")
+                      + (f"  回滚失败 {spec_stats['rollback_error']}"
+                         if spec_stats.get("rollback_error") else ""))
+                # The cascade's own acceptance, separate from the block's: if the MTP head
+                # conditions badly on the block drafter's tokens this is the number that says
+                # so, and it is invisible in the merged total.
+                if spec_stats.get("mtp_drafts"):
+                    macc = spec_stats.get("mtp_accepted", 0)
+                    mdrf = spec_stats["mtp_drafts"]
+                    print(f"    cascade:  MTP 接受 {macc}/{mdrf} = "
+                          f"{100.0*macc/max(mdrf,1):.1f}%"
+                          + (f"  无 nextn hidden {spec_stats['mtp_no_hidden']}"
+                             if spec_stats.get("mtp_no_hidden") else ""))
+                # The shape matters more than the mean: a scenario where rounds are either
+                # all-accepted or all-rejected can be rescued by predicting which rounds to
+                # attempt, while a flat 13% cannot be rescued at all.
+                per_round = spec_stats.get("per_round") or []
+                if len(per_round) >= 4:
+                    hist: dict[int, int] = {}
+                    for n in per_round:
+                        hist[n] = hist.get(n, 0) + 1
+                    width = max(int(k), max(int(n) for n in hist)) if hist else 0
+                    cells = " ".join(f"{i}:{hist.get(i, 0)}" for i in range(width + 1))
+                    zero = hist.get(0, 0)
+                    full = hist.get(int(k), 0)
+                    print(f"    逐轮接受分布（{len(per_round)} 轮）  {cells}"
+                          f"    全拒 {100.0*zero/len(per_round):.0f}%"
+                          f" / 满额 {100.0*full/len(per_round):.0f}%")
+            print(f"    tokens: {out_tokens[:8]}  unique={len(set(out_tokens))}"
+                  f"{' (stuck on one token)' if len(set(out_tokens)) == 1 else ''}")
+            # Decode the generated ids, otherwise a degenerate run and a healthy one
+            # look the same except for a "unique" count.
+            try:
+                _text = b"".join(clients[-1].piece(t) for t in out_tokens)
+                print(f"    text:   {_text.decode('utf-8', 'replace')!r}")
+            except Exception:  # noqa: BLE001 - a decode failure must not kill a timing run
+                pass
+            if dflash is not None:
+                # The draft context holds its own KV and a second copy of the token table;
+                # dropping it here keeps a --repeat run from stacking them.
+                try:
+                    clients[0].draft_close()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  draft_close failed: {exc}", file=sys.stderr)
+                dflash = None
+    finally:
+        # One bad session must not leave the rest of the stages running: that is how
+        # the next run ends up loading models on top of still-resident ones.
+        for c in clients:
+            try:
+                c.close()
+            except Exception as exc:  # noqa: BLE001 - keep closing the others
+                print(f"  stage {c.stage.index} close failed: {exc}", file=sys.stderr)
+        _terminate(procs)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
