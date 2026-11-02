@@ -1,272 +1,201 @@
-# 弱 CPU + 16 GiB 设备能否作为推理链的一段
+# 弱 CPU + 16 GiB 设备跑 35B-A3B 的一段
 
-> 状态：**调研结论（未在目标设备实测）**，切点实验已实测
-> 更新日期：2026-10-31
->
+> 状态：**端到端已跑通**（2026-11-03 凌晨实测）
 > 候选：Y700 安卓平板（骁龙 8 Gen 3，16 GiB）、Surface Pro 7（i5-1035G4，4C/8T，16 GiB）
-> 基准：本机 head 0:32（RTX 4060 Laptop）+ ROG tail 32:40
+> 基准：主机链（本机 head 0:32 + ROG tail 32:40）
 >
-> 适用范围：什么条件下该把第三台弱设备接进链、接进来要付多少成本、安卓侧的硬约束。
-> 不含部署步骤——那部分等设备到手后再落到 `docs/DEPLOYMENT.md`。
+> 适用范围：什么条件下该把弱设备接进链、接进来要付多少成本、安卓侧的硬约束。
 
 ---
 
 ## 0. 结论
 
-**当前 35B 不需要第三段。** 它是串行链的一段，段耗时直接加进 TPOT，弱设备慢 3 倍就是慢 3 倍，
-没有摊薄机制：
+**弱设备之间自己组一条链，实测 6.50 t/s**（Qwen3.6-35B-A3B Q6_K，21.86 GiB / 35.51 B）：
 
-| 接法 | 每轮 | 吞吐 | 相对现状 |
-| --- | ---: | ---: | ---: |
-| 现状（ROG 跑 32:40，实测） | 236 ms | 16.7 t/s | 基线 |
-| 弱设备替代 ROG 跑 8 层 | ~375 ms | ~10.7 t/s | **−36%** |
-| 三段（本机 0:24 / 弱设备 24:32 / ROG 32:40） | ~442 ms | ~9.0 t/s | **−46%** |
-| 弱设备跑 36:40（本机 0:36） | ~281 ms | ~14.2 t/s | **−15%** |
+| 方案 | 每轮 | 吞吐 | 说明 |
+| --- | ---: | ---: | --- |
+| 主机链（本机 0:32 + ROG 32:40） | 236 ms | 16.7 t/s | 占着本机 |
+| **纯弱设备链（Surface 0:24 + Y700 24:40）** | **153 ms** | **6.50 t/s** | **不占本机** |
+| 单台 Surface 跑整模 | 363 ms | 2.75 t/s | 抖动区（22 GiB > 16 GiB） |
 
-弱设备 8 层取 220 ms（190–260 ms 区间的中值，§2.2），4 层按半量取 110 ms。
+- 比主机链慢 2.6 倍，但**换出整台主机**；
+- 比单台弱设备快 **2.4 倍**——单台 16 GiB 装不下整模，这条路本来跑不起来；
+- 两端都是**整模 + `LLAMA_LAYER_RANGE` 选择性加载**，没有裁层工件。
 
-**它变成必需品的条件是唯一的**：模型大到两个节点装不下，第三段是"容量的必要成本"
-而不是"算力的增益"。当前 35B（21.87 GiB 权重）分两段已经贴边（ROG 可用只剩 0.82 GiB）；
-换到 40–50 GiB 的 80B-A3B 级模型时，两节点必然装不下，那时才轮到它。
+**两端算力在 MoE 上是接近的**（§4）：Surface 3.76 ms/层 vs Y700 2.84 ms/层，1.3 倍。
+早先"Y700 快 2.6 倍"的说法来自 **9B dense 工件**——那是带宽受限场景（Y700 45 GB/s
+对 Surface 17.6 GB/s），不能外推到 MoE。
 
-**若必须二选一：Y700 优于 Surface**，主因是可用内存（10–12 vs 8–9.5 GiB）和散热余量，
-不是算力——两者算力基本打平（§4）。
+**它变成必需品的条件**：模型大到两个节点装不下。当前 35B 分两段已经贴边；换到 40–50 GiB
+的 80B-A3B 级模型时两节点必然装不下，那时弱设备是容量的一环而不只是"换出主机"。
 
 ---
 
-## 1. 安卓侧怎么跑
+## 1. 安卓侧怎么跑（已验证）
 
-### 1.1 三条路，只有两条能用
+### 1.1 平台选择：Termux，不是 NDK
 
-| 路径 | 官方状态 | 产物 | 能被 Python 调 |
-| --- | --- | --- | --- |
-| `examples/llama.android` + Android Studio | 支持，Kotlin binding | `.aar` + 示例 App | 否（JNI，不是 C ABI） |
-| Termux 自编译 | 官方推荐，`apt install libandroid-spawn` | ELF + `.so` | **是** |
-| NDK 交叉编译 | 支持，文档给了完整 cmake 命令行 | `libllama.so` + `libggml-*.so` | **是** |
+| 形态 | 产物 | 接线 |
+| --- | --- | --- |
+| Termux | ELF，链 Termux 的 `libc++_shared.so` | Python `ctypes.CDLL` 直接加载，零摩擦 |
+| NDK 交叉编译 | ELF，链 bionic 系统 libc++ | 要 JNI 或自己 `dlopen`；`llama.android` 是 Kotlin binding，不是 C ABI |
 
-现成 APK（PocketPal、ChatterUI、MLC Chat）全是 UI 应用，没有对外接口。`llama-server` 也不行：
-本协议是 **hidden 进 / hidden 出**，server 是 token 进 / token 出，入向的
-`llama_batch_ext_set_embd_state` 只在 shim 层存在。**必须自己编 .so + 自己的 TCP 服务。**
+**Termux 版实测可跑**：cmake 配置、编译、python ctypes 加载、worker 起监听全部通过。
+`GGML_NATIVE=ON` 自动检测到 `dotprod + i8mm`（`-mcpu=native+dotprod+i8mm+nosve+nosme`），
+正是 Q6_K MoE GEMV 需要的两条指令。NDK 形态没有实测，保留为后备。
 
-好消息是 `stage_worker.py` 只依赖 `argparse / os / socket / sys / pathlib / numpy`
-加本地 `protocol.py`、`wire.py`、`engine.py`——纯 stdlib，零移植成本。
+### 1.2 shim 的移植面：实测 3 处
 
-### 1.2 两条可行路径
+`qlh_keep_head_gpu.c` 里平台相关的只有：
 
-**路径 A：Termux 内编译（推荐）**
+| 位置 | Windows | POSIX |
+| --- | --- | --- |
+| `qlh_resolve_layer_inp` | `GetModuleHandleA` + `GetProcAddress`（MSVC mangled 名） | `dlsym(RTLD_DEFAULT, "_Z30...")`（Itanium mangled 名） |
+| `qlh_ensure_backends_loaded` | `GetModuleHandleExA` + `GetModuleFileNameA` | `dladdr()` 取本 .so 路径 |
+| 三处 `_putenv_s` | `<stdlib.h>` | `setenv` / `unsetenv` |
 
-```bash
-pkg install clang cmake make git python && apt install libandroid-spawn
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
-      -DGGML_LLAMAFILE=OFF -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=ON
-cmake --build build -j6
-clang -shared -fPIC -O3 qlh_keep_head.c -Iinclude -Iggml/include \
-      -Lbuild/bin -lllama -lggml -o libqlh_keep_head.so
-```
+**那两处 `GetProcAddress` 不能条件编译掉。** `llama_set/get_embeddings_layer_inp` 声明在
+`src/llama-ext.h:165/169`，没有 `extern "C"`，`LLAMA_API` 也只展开成 visibility 属性。
+所以两个符号在 Linux 上同样是 Itanium mangled 名，必须 `dlsym` 解析。
 
-产物天然链 Termux 的 libc++，`ctypes.CDLL` 零摩擦；`GGML_NATIVE=ON` 自动检测 i8mm/dotprod。
-耗时：编译 20–40 分钟（8 核平板，会发热降频），shim 移植 1–2 小时，联调 2–4 小时。
-风险：编译峰值内存 2–3 GiB 可能 OOM；切后台会中断。
+一分钟验证：`nm -D libllama.so | grep layer_inp`，看到 `_Z30...` 就是 mangled。
 
-**路径 B：PC 上 NDK 交叉编译 + adb push** —— 多两个坑：
-`-DANDROID_STL=c++_static`（否则 `libc++_shared.so` 与 Termux 的冲突）、
-`-DGGML_OPENMP=OFF`（NDK 不支持 CMake 的 OpenMP 查找，见上游 llama.cpp 的
-`H:\llamacpp-c\docs\android.md:74`——那是 upstream 的文档，不在本仓库里）。
-编译本身 10 分钟，其余 2–4 小时全在排 ABI/STL。
+编译产物 40 KB，`clang -shared -O2 -fPIC -Wl,-rpath,'$ORIGIN'` 即可。`$ORIGIN` 不能省——
+否则 `libllama.so.0` 找不到，报 `dlopen failed: library "libllama.so.0" not found`。
 
-### 1.3 shim 的移植面只有 4 处
+### 1.3 五个硬坑（全部实测确认）
 
-`qlh_keep_head_gpu.c` 里平台相关的代码：`#include <windows.h>`（:44）、
-两处 `GetProcAddress`（:96/:98）、`GetModuleFileNameA`（:159）。
-
-⚠️ **这两处 `GetProcAddress` 不能条件编译掉。** 2026-11-01 核实：`llama_set_embeddings_layer_inp`
-/ `llama_get_embeddings_layer_inp` 声明在 `src/llama-ext.h:165`、`:169`，**没有 `extern "C"`**；
-`LLAMA_API` 也只展开成 visibility 属性（`include/llama.h:18-26`），不带 linkage。同一份头里
-只有 `llama_get_embeddings_nextn`（`:157`）和它的 `_ith` 变体单独写了 `extern "C"`。
-
-`llama-ext.h` 开头的注释说明这是 "staging header for new llama.cpp API ... C++ are allowed"，
-所以这不是遗漏，是那批 API 还没 C 化。结果：这两个符号在 Linux 上同样是 Itanium mangled 名
-（`_Z30llama_set_embeddings_layer_inpP13llama_contextjb`），**必须 `dlsym` 解析，不能直接链接**。
-
-shim 本来就是这么干的（`shim/qlh_keep_head_gpu.c:46-52` 注释写明 "a QLH-local extension, not
-upstream llama.cpp"，并走 `GetProcAddress`）。移植时把那两处换成 `dlsym` + 同样的 mangled 名即可，
-预处理量不变——但性质从"删掉兼容层"变成"换掉解析方式"，别按前者估工。
-
-一分钟验证：`nm -D libllama.so | grep layer_inp`，看到 `_Z30...` 就说明是 mangled。
-
-### 1.4 五个硬坑
-
-1. **CPU variant 别指望 armv9.2。** 8 Gen 3 标称 Armv9.2-A，但高通这代没开 SVE/SVE2，
-   实际生效的是 `android_armv8.6_1`（DOTPROD + FP16 + i8mm）。手动指定就是
+1. **CPU variant 别指望 armv9.2。** 8 Gen 3 标称 Armv9.2-A 但没开 SVE/SME，实际生效
+   `android_armv8.6_1`（DOTPROD + FP16 + i8mm）。手动指定是
    `-DGGML_CPU_ARM_ARCH=armv8.6-a+dotprod+i8mm+fp16`。
-2. **KleidiAI 对本项目的量化无效。** 它覆盖 Q4_0/Q8_0 系；主力 Q6_K 走的是
-   `ggml-cpu/arch/arm/repack.cpp` 的专职 kernel（`ggml_gemv_q6_K_8x4_q8_K`:1381、
-   `_8x8_q8_K`:1570、`ggml_gemm_q6_K_8x4_q8_K`:4782），i16 加宽 + vdotq，不是标量。不需要它。
-3. **模型必须放 Termux 私有目录**，不能放 `/sdcard`——FUSE 上 mmap 极慢甚至失败，
-   而本方案靠 mmap 做按需换页。最容易踩、最难诊断。
-4. **整模 21.87 GiB 要传到设备上**（`layer_range` 要求每节点持有完整文件）。
-   `adb push` 约 100 MB/s → 2.5 分钟。
-5. **Android LMK**：4.4 GiB 权重在 16 GiB 设备上安全，但长时间无交互会被
-   `PhantomProcessKiller` 冻结，需要 wakelock。
+2. **KleidiAI 对本项目的量化无效。** 它覆盖 Q4_0/Q8_0 系；Q6_K 走
+   `ggml-cpu/arch/arm/repack.cpp` 的专职 kernel（`ggml_gemv_q6_K_8x4_q8_K`:1381 等）。
+3. **模型必须放 Termux 私有目录**，不能放 `/sdcard`——FUSE 上 mmap 极慢甚至失败。
+   实测补充：`run-as com.termux` 启动的进程连 `/sdcard` 和 `/data/local/tmp` 都读不了
+   （SELinux 拒绝），只有 Termux 自己的进程（sshd 等）有存储权限。
+4. **整模 21.86 GiB 要传到设备上**。实测 `adb push` 到 `/sdcard` 后 run-as 读不了，
+   最终走 `adb forward tcp:18022 tcp:8022` + `scp`，**40 MB/s**（Tailscale 直传只有 0.57 MB/s）。
+5. **Android LMK**：编译时 `-j 6` 会被 SIGKILL，必须 `-j 1`；推理时 20 层（11 GiB）会 OOM，
+   16 层（8.8 GiB）稳定。长时间无交互需要 wakelock。
 
 ---
 
-## 2. 算力与带宽的现实预期
+## 2. 实测耗时
 
-### 2.1 带宽
+### 2.1 每层耗时
 
-| 设备 | 内存规格 | 理论 | decode 有效 | 来源 |
+| 设备/平台 | 层数 | 耗时 | 每层 | 条件 |
+| --- | ---: | ---: | ---: | --- |
+| Y700（Android） | 16 | 45.5 ms | **2.84 ms** | tail，含 output 投影 |
+| Surface（Windows） | 24 | 90.3 ms | **3.76 ms** | head，含 token embedding |
+| Y700 单机 8 层 | 8 | 22.7 ms | 2.84 ms | worker 口径，热态 |
+| Surface 单机 8 层 | 8 | 112 ms | 14 ms | **Vulkan 未禁用时** |
+
+最后一行是关键对照：**Vulkan 后端只要被加载，即使 `-ngl 0`，CPU 侧权重也会进 Vulkan host
+buffer**（`make_cpu_buft_list` 把 host buft 插在 CPU buft 之前）。禁掉 `ggml-vulkan.dll`
+后 Surface 从 245 ms 降到 112 ms，再算上页缓存热起来，24 层只要 90 ms。
+
+### 2.2 带宽（MoE 不等价于带宽受限）
+
+| 设备 | 内存规格 | 理论 | dense 实测有效 | 来源 |
 | --- | --- | ---: | ---: | --- |
-| ROG 9600X | DDR5 双通道 | ~90 GB/s | ~50–55 | 推算 |
-| Surface Pro 7 | LPDDR4x-3733 双通道 | 59.7 GB/s | ~30–35 | notebookcheck |
-| Y700 (8 Gen 3) | LPDDR5X-9600，64-bit | 76.8 GB/s | ~26–30 | 规格 + 论文推断 |
+| Surface Pro 7 | LPDDR4x-3733 双通道 | 59.7 GB/s | ~17.6 | 实测 |
+| Y700 (8 Gen 3) | LPDDR5X-9600，64-bit | 76.8 GB/s | ~45 | 实测 |
 
-安卓侧硬锚点：COTS 移动设备测量（arXiv 2410.03613）里 Vivo Pad3 Pro（天玑 9300，16 GB /
-可用 10 GB）跑 Llama-2-7B Q4 得 **8.22 tok/s**；8 Gen 3 吞吐约为其 80% → 约 6.6 tok/s。
-7B Q4 权重 ≈ 4.1 GiB → 有效权重带宽 ≈ 26 GB/s。
+dense 9B Q4_K_M 全模型（5.37 GiB）实测：Y700 7.82 t/s（45 GB/s 打满），这就是两者在被带宽
+掐住时差 2.6 倍的原因。MoE 每 token 只激活一小撮专家，不落在带宽墙上，所以差距缩到 1.3 倍。
 
-同一篇给出了线程数的结论：**大核数即最优线程数，加小核会劣化**。
-8 Gen 3 = 1×X4 + 3×A720@3.15 + 2×A720@2.96 + 2×A520 → 大核 6 个，所以 `-t 5` 或 `-t 6`，
-实测扫 4/5/6。**不要绑核**。
+安卓侧锚点：COTS 测量（arXiv 2410.03613）里天玑 9300 平板跑 Llama-2-7B Q4 得 8.22 tok/s，
+8 Gen 3 约为其 80%。
 
-### 2.2 每层耗时
-
-ROG 的 76 ms 要拆开才可比。`README.md:173-175` 记的关键事实：
-
-- 同一段**独占内存**时 30.85 ms
-- worker 常驻后 53.55 ms
-- 差额 **22.7 ms 是内存压力**（8 层 4.16 GiB 把 15.2 GiB 内存压到只剩 0.82 GiB 可用）
-- 76 ms 是 4 行 token 的实测（专家路由在 4 行间不完全重合，约 1.4× 单行）
-
-换到 16 GiB 设备，那 22.7 ms 消失，纯算力基准应该是 **53 ms**。再按 Amdahl 缩放
-（4C Ice Lake-U 持续算力约为 9600X 的 1/6，带宽 0.6）：**190–260 ms**，标注为推测。
-
-### 2.3 这段有没有价值
-
-三条理由，按权重排：
-
-1. **它是串行链的一段，不是并行资源。** 没有摊薄。
-2. **它慢的幅度远大于它省下的东西。** 它唯一能"省"的是接过 ROG 的 8 层，而 ROG 那 8 层
-   只要 76 ms；换一台内存宽裕的机器就能免费拿到这 22.7 ms，不必牺牲算力。
-3. **跨机传输是常数税。** 8 KB hidden 走 Tailscale 要 24 ms（MTU 1280、6 个包、每包一 RTT）。
-   加第三段就多一次。若 Y700 在同一个 LAN（WiFi 6，<2 ms）这笔税能省掉。
+**线程数取大核数**：8 Gen 3 = 1×X4 + 3×A720@3.15 + 2×A720@2.96 + 2×A520。实测
+`-t 5` 最好（37.6 t/s），`-t 8` 反而退化到 22.6（线程落到 A520），`-t 6` 抖动大。**不要绑核**。
 
 ---
 
 ## 3. Surface Pro 7（i5-1035G4，4C/8T）
 
-纯 4 核 + SMT（Ice Lake-U，4×1.1–3.7 GHz，15 W，无 E 核），不是 P/E 异构。
+纯 4 核 + SMT（Ice Lake-U，4×1.1–3.7 GHz，15 W，无风扇被动散热）。
 
-**耗时 190–260 ms**（推测）。比 ROG 的 76 ms 慢 2.5–3.4 倍。额外的悲观因素：i5 版是
-**无风扇被动散热**，持续 decode 会稳定在 ~1.8–2.0 GHz 而非 3.7 GHz 睿频，实际可能到 280 ms。
+**`-t 6` 最优**（24 层 90.3 ms）。上游已把 `--threads -1` 改成优先取物理核数
+（PR #31209），纯 SMT 没有 P/E 异构的绑核惩罚。
 
-**线程数用 `-t 4`，不是 `-t 8`。** 依据：上游已把 `--threads -1` 改成优先取物理核数
-（PR #31209，配套 Issue #19110 与 PR #22460）。`MEMORY-LIMITS.md` §3.4 记的 24 倍惩罚是
-P/E 异构 + 绑核造成的，纯 SMT 没有这个问题。worker 有 5–6 个活动线程，8 个逻辑核：
+**16 GiB 的实际可用量 8–9.5 GiB**（Windows 11 空闲占 4.5–5.5）。整模 21.86 GiB 靠 mmap
+选择性加载后，head 24 层约 12.6 GiB 权重——**贴边**，这是 §2.1 里页缓存必须热的根本原因。
 
-| `-t` | 总线程 | 判断 |
-| ---: | ---: | --- |
-| 4 | 6 | **推荐**，留 2 个给调度 |
-| 6 | 8 | 可行，会互相挤 |
-| 8 | 10 | 过载 |
-
-**16 GiB 的实际可用量 8–9.5 GiB**（Windows 11 空闲占 4.5–5.5，Edge 再吃 1.5–2）。
-8 层约 4.4 GiB，占 46–55%，够且余量大——这正是 §2.2 那 22.7 ms 免费消失的原因。
-
-风险仍在：Windows 不因超内存拒绝分配，而是分页到 swap（`MEMORY-LIMITS.md` §1 的"黑屏"）。
-`chain_client.py` 已有预检：`MEM_SAFETY = 0.75`，8 层要可用 > 5.9 GiB。启动前别绕过预检。
+风险：Windows 不因超内存拒绝分配，而是分页到 swap（`MEMORY-LIMITS.md` §1 的"黑屏"）。
+`chain_client.py` 已有预检：`MEM_SAFETY = 0.75`。
 
 ---
 
-## 4. Surface 4 核 vs Y700 8 核
+## 4. Surface vs Y700（实测，不是推测）
 
-| 维度 | Surface Pro 7 (i5-1035G4) | Y700 (8 Gen 3) | 胜 |
+| 维度 | Surface Pro 7 | Y700 (8 Gen 3) | 胜 |
 | --- | --- | --- | --- |
-| sustained 算力 | ~130 GFLOPs（AVX2，4×2.1 GHz） | ~150 GFLOPs（NEON，1X4+5A720） | Y700 略 |
-| 有效带宽 | ~30–35 GB/s | ~26–30 GB/s | Surface 略 |
-| 8 层预测耗时 | 190–260 ms | 190–260 ms | 打平 |
-| 散热 | **无风扇被动**，必然降频 | 平板机身余量更好（待实测） | Y700（推测） |
-| 可用内存 | 8–9.5 GiB | **10–12 GiB** | **Y700** |
-| 能装几层 | 8–12 层 | 8–14 层 | Y700 略 |
-| Q6_K kernel | AVX2 + `vpmaddubsw` | ARM repack `q6_K_8x8` | 打平 |
-| 故障模式 | swap 静默分页 → 黑屏 | LMK 杀进程 + 后台冻结 | Surface（可观测） |
-| 接入手工 | 低（纯 Windows） | 中（Termux + shim 移植） | **Surface** |
+| MoE 每层 | 3.76 ms | **2.84 ms** | Y700 1.3× |
+| dense 有效带宽 | ~17.6 GB/s | **~45 GB/s** | Y700 2.6× |
+| 可用内存 | 8–9.5 GiB | **11.95 GiB** | Y700 |
+| 能装几层 | 24 层（贴边） | 16 层（安全） | Surface 略 |
+| 核显 | Iris Plus，**比 CPU 慢 30%** | Adreno 750，**比 CPU 慢 5–25%** | 都不可用 |
+| 散热 | 无风扇，持续降频 | 平板机身，编译时需 `-j 1` | — |
+| 故障模式 | swap 静默分页 → 黑屏 | LMK 杀进程（SIGKILL） | Surface（可观测） |
+| 接入手工 | 低（纯 Windows） | 中（Termux + shim 移植 + adb） | **Surface** |
 
-性能打平，Y700 胜在内存与散热，Surface 胜在接入成本。**接入成本那点差距是一次性的，
-内存和散热是持续的**——真要补一个节点，选 Y700。
+**核显都不值得用**。Surface 关掉 Vulkan 后 head 从 245 ms 降到 112 ms；Y700 上
+`-ngl 99` 是 29.8 t/s，纯 CPU 37.6 t/s。两者共享同一块 LPDDR，把层搬到另一组执行单元
+只增加一次拷贝，不增加带宽。Adreno 750 的 Vulkan 路径要额外绕：Termux 自带的
+`libvulkan.so` 找不到 driver（`vkCreateInstance` 返回 -9），必须软链到系统
+`/system/lib64/libvulkan.so` 才能枚举到设备。
 
 ---
 
-## 5. 切点 36:40：已实测，不采纳
+## 5. 切点 36:40：已实测，不采纳（主机链）
 
-`32:40` 的问题是 ROG 那 76 ms 里有 22.7 ms 来自内存压力。一个不需要新设备的改法是让 ROG 只背
-4 层、本机背 36 层。**已实测**（同一 prompt、同一链路、98% 接受率）：
+`32:40` 的问题是 ROG 那 76 ms 里有 22.7 ms 来自内存压力。让 ROG 只背 4 层、本机背 36 层
+的实测结果：
 
 | 切点 | 本机段 | ROG 段 | 吞吐 | 相对 |
 | --- | --- | --- | ---: | ---: |
 | **32:40（现行）** | 0:32 | 32:40（8 层） | **17.0 t/s** | 基线 |
 | 36:40 | 0:36 | 36:40（4 层） | **17.7 t/s** | **+4%** |
 
-预测的 +17% 没有实现（本文件的上一版按"ROG 4 层无内存压力省 22.7 ms、
-本机多 4 层 +16 ms"推算出 19.6 t/s）。未做分项归因，只知道总量只省了约 13 ms。
-
-**不采纳。** 4% 小于把 4 层负载从台式机挪到笔记本的代价：笔记本是日常使用的机器，
-head 段从 32 层涨到 36 层意味着更长的持续满载、更高温度与风扇噪音，而 ROG 是专职节点。
-`32:40` 保留为默认，`topology-cross-36.toml` 留作对照。
+预测的 +17% 没有实现。4% 小于把 4 层负载从台式机挪到笔记本的代价，**不采纳**。
 
 ---
 
 ## 6. 证据等级
 
-**已证实（源码/官方文档/实测）**
+**已证实（源码 / 官方文档 / 本次实测）**
 
-- 上游 `H:\llamacpp-c\docs\android.md` 三条路都存在，Termux 与 NDK 命令是文档原文
-- `examples/llama.android` 是 Kotlin/JNI binding，不是 C ABI
-- `llama_set/get_embeddings_layer_inp` **不是** `extern "C"`（`src/llama-ext.h:165/169`），
-  符号是 mangled，必须 `dlsym`/`GetProcAddress` 解析——2026-11-01 核实，推翻了早先的判断
-- shim 平台相关代码 4 处、约 20 行
-- `stage_worker.py` 依赖纯 stdlib
-- android CPU variant 7 个，`android_armv8.6_1` = DOTPROD+FP16+i8mm；armv9.x 需 SVE/SME
-- `ggml-cpu/arch/arm/repack.cpp` 有 Q6_K 专职 GEMV/GEMM kernel（:1381/:1570/:4782）
-- 上游 `-t -1` 已改为物理核优先（PR #31209 / Issue #19110 / PR #22460）
-- ROG 8 层 76 ms 中 22.7 ms 来自内存压力（`README.md:173-175`）
-- Surface Pro 7 i5-1035G4 = 4c/8t，LPDDR4x-3733 双通道（notebookcheck）
-- 8 Gen 3 LPDDR5X 理论 76.8 GB/s；天玑 9300 平板 7B Q4 decode 8.22 tok/s
-- 移动端最优线程数 = 大核数（arXiv 2410.03613）
-- **切点 36:40 = 17.7 t/s，32:40 = 17.0 t/s（§5）**
+- 弱设备链端到端 **153.4 ms / 6.50 t/s**（n=24，p90 165.1 ms，两次复测 6.50 / 6.52）
+- 时间可分解：head 90.3 + Y700 计算 45.5 + 网络 17.5 = 153.3，与实测 153.4 吻合
+- MoE 每层：Surface 3.76 ms / Y700 2.84 ms（1.3 倍）
+- dense 9B 的 8 层工件：Surface 7.55 t/s / Y700 19.76 t/s（2.6 倍）；Y700 跑 9B 全模型 7.82 t/s（带宽打满）
+- `llama_set/get_embeddings_layer_inp` 不是 `extern "C"`，符号 mangled，必须 `dlsym`
+- shim 平台相关代码实测 3 处（两处 Win32 + `_putenv_s`），移植后 40 KB
+- `-t 5` 在 Y700 上最优；`-t 8` 退化 40%；`GGML_NATIVE=ON` 检测到 dotprod+i8mm
+- 内核补丁：qwen35moe 的 `t_layer_inp[n_layer]` 在 `n_outputs=0` 时是 `[n_embd, 0]` 空张量
+  （`crop_before_nextn` 导致），需要在 relay 场景跳过一次裁剪
+- 切点 36:40 = 17.7 t/s，32:40 = 17.0 t/s（§5）
 
-**推测（未实测，标注了区间）**
+**推测（未实测）**
 
-- Surface / Y700 跑 8 层 4 行 = 190–260 ms
-- Surface 无风扇导致持续负载再慢 20–30%
-- Android 上 `/sdcard` 的 mmap 比私有目录慢（社区共识，未在 Y700 上验证）
-- 跨机 24 ms 传输在网络条件变化时的分布（数据来自 Tailscale 特定路径）
+- 80B-A3B 级模型（40–50 GiB）分两段的可行切分
+- 长 prompt 的 prefill 分布式开销（本轮只测了单 token 解码）
+- NDK 构建形态的性能
 
 ---
 
-## 7. 什么时候开始做，先做什么
+## 7. 已完成 / 下一步
 
-**先纠正本节的评价口径。** 上面 §5 算的是"Y700 替换 ROG 那段"——收益是 −36%，所以结论是
-"等 80B"。但真正要做的是**另一件事**：Y700 与 Surface 各自跑一段，凑成一条两段链，
-**完全不占用本机**。那时对比的基线不是 16.7 t/s，而是"本机被占着"这个成本。
+**已完成**：平台探针、shim 移植、worker 接线、端到端跑通、两端算力实测。
 
-两件事的判据完全不同：
+**下一步的优先级**：
 
-| 场景 | 对比基线 | 收益 | 判 |
-| --- | --- | --- | --- |
-| Y700 替换 ROG | 16.7 t/s | −36% 吞吐 | 不做 |
-| **Y700 + Surface 组两段，不占本机** | 本机被占用 | 换出整台本机 | **待验证** |
-
-后者的前提是两个设备都得能跑 worker，而这从来没有验证过。所以待办不是"移植 shim"，
-而是那 1 小时的平台探针（见 §5 末尾）：上游 llama.cpp 能否编过、`RLIMIT_MEMLOCK` 实测值、
-mmap 21.87 GiB 文件 touch 4.87 GiB 是否留得住。任一项失败，这条路直接判死，省掉 1 天移植。
-
-1. **先不改拓扑。** §5 已证伪"换切点"这条路，`32:40` 的 22.7 ms 是这台机器上的固有代价。
-2. **等模型换到 80B-A3B 级**（40–50 GiB 量级），两节点装不下时再走安卓路径。
-   那时按 本机 0:20 / ROG 20:32 / 弱设备 32:40 划分，弱设备是必需容量。
-   若是"两个弱设备凑两段"，同样在这个量级才有容量意义——35B 上它们只是换出本机，
-   不增加总容量。
-3. **动手时的顺序**：Termux 内编译（预算 1 天 = 编译 40 分钟 + shim 移植 2 小时 + 联调 4 小时）
-   → 模型放 Termux 私有目录 → `-t 5`、不绑核、开 wakelock →
-   先只跑 4 层验证数值（`checks/` 那套逐位判据）→ 再加层。
-4. **Surface 放在 Y700 之后**：同一套 shim 改动，Windows 侧没有新平台成本，但内存与散热都更差。
+1. **长 prompt 的 prefill**——这是本轮唯一没碰的部分。单 token 解码只反映 decode；
+   prefill 在分段链上要把 prompt 逐段前递，开销结构完全不同。
+2. **Y700 的内存边界再压**：16 层是当前安全值，20 层 OOM。如果能把页缓存压力降下去
+   （更小的 ctx、更紧的量化），20/20 是更均衡的切点。
+3. **两端内核版本统一**：Surface 用"编译宏 + default 通道"，Y700 用"内核补丁 + default 通道"，
+   两条路实测 hidden 逐位相同，但应该收敛到一条（建议补丁，因为不依赖编译宏）。
+4. **35B 上它的意义是换出本机，不是增加总容量**；真正的容量意义要等模型换到 80B-A3B 级。

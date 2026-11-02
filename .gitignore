@@ -14,6 +14,10 @@ build/
 *.gguf
 shim/bin/
 
+# shim 的 POSIX 移植是生成物：源码只有 qlh_keep_head_gpu.c 一份，
+# 由 shim/build_shim_posix.py 生成。别提交第二份，免得两边漂移。
+shim/qlh_keep_head_posix.c
+
 # 本地拓扑覆盖
 topology-local*.toml
 

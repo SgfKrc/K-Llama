@@ -68,7 +68,7 @@
 | `src/llama-model-loader.cpp` | `LLAMA_LAYER_RANGE` 解析、`get_weight` 重映射、全局张量的 lazy 标记 |
 | `src/llama-model.cpp` | `done_getting_tensors` 传范围、`init_mappings` 按范围、host-only 预读、`size_data` 重算 |
 | `src/models/qwen35.cpp` | 在 `build_norm` 之前 tap 出 `t_embd` |
-| `src/models/qwen35moe.cpp` | 同上 |
+| `src/models/qwen35moe.cpp` | 同上；另有 relay 末层不裁剪（见下第 4 条） |
 
 三个关键机制：
 
@@ -78,6 +78,16 @@
    tap 点前移，替代第一代的 `layer_inp` 槽位。只改了 qwen35 和 qwen35moe 两个架构。
 3. **lazy 全局张量**：head 段不需要 `output`、tail 段不需要 `token_embd`、middle 段两者都不需要。
    不创建就不读，middle 段因此省 1030.62 MiB。
+4. **relay 末层不裁剪**（2026-11-03 实测补上）：`qwen35moe.cpp` 的 `crop_before_nextn`
+   在 `n_outputs == 0`（只要 hidden、不要 logits）时会把末层裁成 `[n_embd, 0]`，而
+   `t_layer_inp[n_layer]` 登记的正是这条张量，于是 `extract_layer_inputs` 的
+   `row_floats == model.hparams.n_embd` 断言失败。修法是新增
+   `qlh_keep_full_rows = embeddings_pre_norm || embeddings_layer_inp[n_layer]`，为真时跳过
+   这次裁剪，并在 LM head 之前补回 `ggml_get_rows`。其余路径图完全不变。
+
+   这个坑在 Windows 上不会出现——那边靠编译宏 `QLH_ABI_UPSTREAM_HEADER` 把 `batch.logits`
+   钉成 1（`n_outputs == n_tokens`），绕开了裁剪。两条路实测 hidden **逐位相同**，但只有
+   补丁这条路不依赖编译期定义。
 
 **为什么第二代反而更小**：第一代要 9 个架构各自登记挂点，第二代把"取哪一层的输出"变成
 "只加载哪几层"——后者是加载器的事，与架构无关。架构侧只剩 2 处 tap。
