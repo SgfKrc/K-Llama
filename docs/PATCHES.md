@@ -6,7 +6,7 @@
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在**模型怎么装进显存和内存**：
 第一代靠"裁好的层段工件"，第二代靠"整模 + 层范围"。llama.cpp 侧的补丁因此完全不同。
 
-**补丁全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4263 行）。
+**补丁全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4014 行）。
 生成方式：`git -C H:\llamacpp-c add -A && git diff --cached --binary HEAD > <patch> && git reset`。
 校验方式：`git apply --reverse --check <patch>` 在打过补丁的树上通过，说明它与工作区
 逐字节对应，可以正向重放。

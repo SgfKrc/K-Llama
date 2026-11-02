@@ -135,7 +135,7 @@ index 97250c2..ddd881e 100644
              ${LLAMA_MODELS_SOURCES}
              )
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 4141e3c..5838931 100644
+index 4141e3c..3bd3d10 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -13,6 +13,7 @@
@@ -162,54 +162,42 @@ index 4141e3c..5838931 100644
      LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
      LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
      LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
-@@ -2772,6 +2775,46 @@ ggml_status llama_context::graph_compute(
+@@ -1552,7 +1555,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         res->reset();
  
-     copy_experts.reset();
+         ggml_backend_sched_reset(sched.get());
+-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        // [QLH] SLIM-ARC 2026-11-02: when the layer-ahead prefetcher is armed, the "which layer
++        // is running" signal comes from the per-node eval callback -- the whole graph is
++        // submitted at once, so nothing in graph_compute() can know the current layer. CPU only:
++        // the callback path splits the graph at every observed node and synchronizes there,
++        // which would break GPU pipelining. The user callback is chained inside eval_cb().
++        if (auto * sched_arc = slim_arc::get_global_prefetch_scheduler();
++                sched_arc != nullptr && model.n_gpu_layers() == 0) {
++            sched_arc->attach_user_callback(cparams.cb_eval, cparams.cb_eval_user_data);
++            ggml_backend_sched_set_eval_callback(sched.get(), slim_arc::prefetch_scheduler::eval_cb, sched_arc);
++        } else {
++            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        }
  
-+    // [QLH] SLIM-ARC: tell the layer-ahead prefetch scheduler which layer this graph is about
-+    // to compute, so it can issue madvise(WILLNEED) / PrefetchVirtualMemory for the next
-+    // `window` layers while the current one runs.
-+    //
-+    // Upstream reads the layer off the node names, which is wrong for this tree: the scheduler
-+    // renames every node to `node_%d` before compute, so `tensor_layer_from_name` only ever
-+    // matches on the *operands*, whose names still carry the source tensor ("blk.7.ffn_up_exps
-+    // .weight"). Reading src[0..] is therefore what actually finds the layer.
-+    // No-op unless SLIM_ARC_PREFETCH was set when the model was loaded.
-+    if (auto * slim_arc_sched = slim_arc::get_global_prefetch_scheduler()) {
-+        constexpr int no_layer = std::numeric_limits<int>::max();
-+        int min_layer = no_layer;
-+        const int n_graph_nodes = ggml_graph_n_nodes(gf);
-+        for (int i = 0; i < n_graph_nodes && min_layer != 0; ++i) {
-+            const ggml_tensor * t = ggml_graph_node(gf, i);
-+            if (t == nullptr) {
-+                continue;
-+            }
-+            int layer = slim_arc::tensor_layer_from_name(t->name);
-+            if (layer < 0) {
-+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
-+                    const ggml_tensor * src = t->src[s];
-+                    if (src == nullptr) {
-+                        break;
-+                    }
-+                    layer = slim_arc::tensor_layer_from_name(src->name);
-+                    if (layer >= 0) {
-+                        break;
-+                    }
-+                }
-+            }
-+            if (layer >= 0 && layer < min_layer) {
-+                min_layer = layer;
-+            }
+         //const auto t_start_us = ggml_time_us();
+ 
+@@ -1566,6 +1580,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        // [QLH] SLIM-ARC 2026-11-02: scan the freshly built graph for the first node of every
++        // layer. Has to run after build_graph() -- the per-tensor names that carry the layer
++        // index are assigned by graph_get_cb() while the graph is being built.
++        if (auto * sched_arc = slim_arc::get_global_prefetch_scheduler();
++                sched_arc != nullptr && model.n_gpu_layers() == 0) {
++            sched_arc->prepare_graph(gf);
 +        }
-+        if (min_layer != no_layer) {
-+            slim_arc_sched->notify_layer_compute(min_layer);
-+        }
-+    }
 +
-     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
-     if (status != GGML_STATUS_SUCCESS) {
-         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-@@ -4078,6 +4121,7 @@ llama_context_params llama_context_default_params() {
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+@@ -4078,6 +4100,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -217,7 +205,7 @@ index 4141e3c..5838931 100644
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
-@@ -4321,7 +4365,7 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+@@ -4321,7 +4344,7 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
      return ctx->get_embeddings_seq(seq_id);
  }
  
@@ -226,7 +214,7 @@ index 4141e3c..5838931 100644
      ctx->set_embeddings_nextn(value, masked);
  }
  
-@@ -4341,7 +4385,7 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+@@ -4341,7 +4364,7 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
      return ctx->get_memory();
  }
  
@@ -969,10 +957,37 @@ index 8a4e434..0558133 100644
  
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 939f10f..6b4f88e 100644
+index 939f10f..fd8560f 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
-@@ -226,7 +226,22 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+@@ -174,6 +174,17 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * inp_pos     = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // [QLH relay] hidden 出口（t_layer_inp[n_layer]）需要全部 token 行，而 crop_before_nextn
++    // 会把末层裁成 n_outputs 行。走 layer_inp 通道的调用方只取 hidden、不要 logits，于是
++    // n_outputs == 0，末层被裁成 [n_embd, 0] 空张量 —— extract_layer_inputs 的
++    // row_floats == n_embd 断言随即失败。
++    //
++    // 只跟 layer_inp 有关，不含 embeddings_pre_norm：那条路本来就不裁剪（batch.logits 全 1 时
++    // n_outputs == n_tokens）。若在那里也跳过裁剪，inp_out_ids 就没人用了、buffer 不会被分配，
++    // llm_graph_input_out_ids::set_input 反而会撞 GGML_ASSERT(buffer)。
++    const bool qlh_keep_full_rows =
++        n_layer < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
++
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = inpL;
+@@ -194,7 +205,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
+ 
+-        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids) && !qlh_keep_full_rows) {
+             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -226,7 +237,22 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
      }
      cur = inpL;
  
@@ -995,7 +1010,7 @@ index 939f10f..6b4f88e 100644
      cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
  
      cb(cur, "h_nextn", -1);
-@@ -237,13 +252,19 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+@@ -237,13 +263,23 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
      }
  
      cb(cur, "result_norm", -1);
@@ -1009,6 +1024,10 @@ index 939f10f..6b4f88e 100644
 +    // [C-scheme] a relay segment has no use for logits; leaving t_logits null keeps the
 +    // output projection (and its ~515 MB of weights) out of the graph entirely.
 +    if (!cparams.embeddings_pre_norm) {
++        // [QLH relay] 上面为 hidden 出口保住了全行，LM head 仍只要 output 行。
++        if (qlh_keep_full_rows && inp_out_ids != nullptr && cur->ne[1] != inp_out_ids->ne[0]) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
 +        cur = build_lora_mm(model.output, cur, model.output_s);
  
 -    cb(cur, "result_output", -1);
@@ -1968,10 +1987,10 @@ index 0000000..c740c43
 +} // namespace slim_arc
 diff --git a/src/slim-arc-prefetch.cpp b/src/slim-arc-prefetch.cpp
 new file mode 100644
-index 0000000..2777ecc
+index 0000000..8688c47
 --- /dev/null
 +++ b/src/slim-arc-prefetch.cpp
-@@ -0,0 +1,1842 @@
+@@ -0,0 +1,2078 @@
 +// SLIM-ARC: Tensor-level asynchronous prefetch scheduler
 +//
 +// Implements layer-ahead prefetch on top of upstream llama.cpp's mmap.
@@ -2232,6 +2251,58 @@ index 0000000..2777ecc
 +#endif
 +}
 +
++// [QLH] Free physical memory right now. The layer-ahead budget is derived from this because the
++// number that matters is how much room the kernel still has for read-ahead pages, not the model
++// size or a constant.
++size_t available_physical_bytes() noexcept {
++#if defined(_WIN32)
++    MEMORYSTATUSEX status{};
++    status.dwLength = sizeof(status);
++    if (GlobalMemoryStatusEx(&status) == 0) return 0;
++    return static_cast<size_t>(status.ullAvailPhys);
++#else
++    const long pages = sysconf(_SC_AVPHYS_PAGES);
++    const long page_size = sysconf(_SC_PAGESIZE);
++    if (pages <= 0 || page_size <= 0) return 0;
++    return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
++#endif
++}
++
++// [QLH] Ceiling for one prefetch request, in bytes.
++//
++// The budget is a *per-request* ceiling: worker_loop() spends it on the ranges of the request
++// (layers current+1 .. current+window) and skips whatever does not fit. Deriving it from free
++// physical memory rather than from a constant keeps the behaviour sane on both a 32 GiB desktop
++// and a 4 GiB SBC:
++//   - cap it at 1/8 of free RAM, so a burst of read-ahead cannot evict the pages the model is
++//     actively using;
++//   - floor at 64 MiB, else on a tight machine the floor rounds to zero pages and the scheduler
++//     goes back to issuing nothing;
++//   - ceiling at 1 GiB, because the ceiling is only a safety net: plan_request() then lowers the
++//     per-request budget again to one layer's worth of registered weights, which is what actually
++//     bounds the traffic.
++// SLIM_ARC_BUDGET_MB overrides all of it for experiments.
++size_t default_prefetch_budget_bytes() noexcept {
++    if (const char * raw = std::getenv("SLIM_ARC_BUDGET_MB")) {
++        const std::string_view value{raw};
++        uint64_t parsed{0};
++        const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
++        if (!value.empty() && result.ec == std::errc{} &&
++            result.ptr == value.data() + value.size() && parsed <= 65536) {
++            return static_cast<size_t>(parsed) * (1ULL << 20);
++        }
++        std::fprintf(stderr, "SLIM-ARC: invalid SLIM_ARC_BUDGET_MB; expected an integer in [0,65536]\n");
++    }
++    const size_t available = available_physical_bytes();
++    if (available == 0) {
++        return 128ULL << 20;
++    }
++    constexpr size_t budget_min = 64ULL << 20;
++    constexpr size_t budget_max = 1024ULL << 20;
++    const size_t share = available / 8;
++    return std::min(std::max(share, budget_min), budget_max);
++}
++
 +bool env_exact_one(const char * name) noexcept {
 +    const char * const value = std::getenv(name);
 +    return value != nullptr && std::strcmp(value, "1") == 0;
@@ -2443,6 +2514,28 @@ index 0000000..2777ecc
 +    return layer;
 +}
 +
++// [QLH] SLIM-ARC 2026-11-02: graph node names carry their layer as a trailing "-N" suffix --
++// llama_context::graph_get_cb() renames every tensor produced inside a layer with
++// ggml_format_name(cur, "%s-%d", name, il), e.g. "ffn_out-12". Weight names
++// ("blk.7.attn_norm.weight") have no such suffix and are rejected, and the fallback names that
++// ggml_build_forward_expand() assigns ("node_123", "leaf_7") contain no dash at all, so they are
++// rejected too. Only the trailing "-<digits>" form is accepted: the prefix must be non-empty and
++// every character after the last dash must be a digit.
++static int tensor_layer_from_suffix(const char * name) {
++    if (name == nullptr || name[0] == '\0') return -1;
++    const char * dash = std::strrchr(name, '-');
++    if (dash == nullptr || dash == name) return -1;
++    const char * p = dash + 1;
++    if (*p < '0' || *p > '9') return -1;
++    int layer = 0;
++    for (; *p != '\0'; ++p) {
++        if (*p < '0' || *p > '9') return -1;
++        layer = layer * 10 + (*p - '0');
++        if (layer > 4096) return -1; // implausible layer index: not one of our names
++    }
++    return layer;
++}
++
 +prefetch_scheduler::prefetch_scheduler(
 +    int n_threads,
 +    int window,
@@ -2483,6 +2576,9 @@ index 0000000..2777ecc
 +    const char * confidence = std::getenv("SLIM_ARC_EXPERT_CONF");
 +    conf_gating_ = confidence != nullptr && std::strcmp(confidence, "1") == 0;
 +    pop_k_ = parse_popularity_k(std::getenv("SLIM_ARC_EXPERT_POP"));
++    // [QLH] See default_prefetch_budget_bytes(): the budget used to stay 0 because the module
++    // that called set_memory_budget() (unified_io_scheduler) was never ported.
++    memory_budget_.store(default_prefetch_budget_bytes());
 +    workers_.reserve(n_threads_);
 +    for (int i = 0; i < n_threads_; ++i) {
 +        workers_.emplace_back([this] { worker_loop(); });
@@ -2612,8 +2708,138 @@ index 0000000..2777ecc
 +    return true;
 +}
 +
++void prefetch_scheduler::attach_user_callback(ggml_backend_sched_eval_callback cb, void * user_data) {
++    std::lock_guard<std::mutex> lock(mtx_);
++    user_cb_      = cb;
++    user_cb_data_ = user_data;
++}
++
++void prefetch_scheduler::prepare_graph(const ggml_cgraph * gf) {
++    if (gf == nullptr) return;
++    // the graph-reuse path calls this again for the very same graph; the tables cannot have
++    // changed because the tensors were not rebuilt
++    if (prepared_gf_ == gf) return;
++
++    std::lock_guard<std::mutex> lock(mtx_);
++
++    prepared_gf_ = gf;
++    observe_.clear();
++    observe_layer_.clear();
++    last_notified_ = -1;
++    graph_signalling_disabled_ = false;
++
++    auto * graph = const_cast<ggml_cgraph *>(gf);
++    const int n_nodes = ggml_graph_n_nodes(graph);
++    int32_t current = -1;
++    for (int i = 0; i < n_nodes; ++i) {
++        const ggml_tensor * t = ggml_graph_node(graph, i);
++        if (t == nullptr) continue;
++        int32_t layer = tensor_layer_from_suffix(t->name);
++        // a layer index that goes backwards is a name that merely ends in "-<digits>";
++        // the graph is built layer by layer, so the real sequence never decreases
++        if (layer >= 0 && current >= 0 && layer < current) layer = -1;
++        if (layer < 0) layer = current; // carry the previous layer over unnamed/leaf nodes
++        if (layer < 0) continue;        // still before the first layer (embeddings etc.)
++        if (layer != current) {
++            observe_.push_back(t);
++            observe_layer_.push_back(layer);
++            current = layer;
++        }
++    }
++
++    if (observe_.size() < 2) {
++        // nothing usable: stay out of the way instead of guessing
++        graph_signalling_disabled_ = true;
++        observe_.clear();
++        observe_layer_.clear();
++        std::fprintf(stderr, "[SLIM-ARC-PREFETCH] layer signalling disabled: no layer boundaries "
++                "recovered from %d graph nodes\n", n_nodes);
++        return;
++    }
++
++    // std::binary_search / std::lower_bound below compare the tensors by pointer value, so the
++    // table has to be in pointer order. Layer order is *not* pointer order (the graph is built
++    // layer by layer, the allocations are not), hence the explicit sort -- both tables move
++    // together so that observe_layer_[i] still describes observe_[i].
++    {
++        std::vector<size_t> order(observe_.size());
++        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
++        std::sort(order.begin(), order.end(),
++                  [this](size_t a, size_t b) { return observe_[a] < observe_[b]; });
++        std::vector<const ggml_tensor *> nodes;
++        std::vector<int32_t>             layers;
++        nodes.reserve(order.size());
++        layers.reserve(order.size());
++        for (const size_t i : order) {
++            nodes.push_back(observe_[i]);
++            layers.push_back(observe_layer_[i]);
++        }
++        observe_.swap(nodes);
++        observe_layer_.swap(layers);
++    }
++
++    std::fprintf(stderr, "[SLIM-ARC-PREFETCH] layer signalling armed: %zu boundaries over %d "
++            "graph nodes, layers %d..%d\n", observe_.size(), n_nodes,
++            *std::min_element(observe_layer_.begin(), observe_layer_.end()),
++            *std::max_element(observe_layer_.begin(), observe_layer_.end()));
++}
++
++void prefetch_scheduler::on_layer_boundary(int32_t layer) {
++    if (layer < 0) return;
++    // the layer counter wraps at the start of every token
++    if (last_notified_ >= 0 && layer < last_notified_) last_notified_ = -1;
++    // the request issued for `last_notified_` already covers [last+1, last+window]; issuing
++    // another one for a layer inside that window would advise the same pages twice
++    if (last_notified_ >= 0 && layer - last_notified_ < window_) return;
++    last_notified_ = layer;
++    notify_layer_compute(layer);
++}
++
++bool prefetch_scheduler::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
++    auto * sched = static_cast<prefetch_scheduler *>(user_data);
++    if (sched == nullptr || t == nullptr) return true;
++
++    const bool has_user = sched->user_cb_ != nullptr;
++    const bool user_ret = has_user && sched->user_cb_(t, ask, sched->user_cb_data_);
++
++    if (ask) {
++        // returning true makes the scheduler stop at this node to hand it back with ask == false
++        if (user_ret) return true;
++        if (sched->graph_signalling_disabled_) return false;
++        return std::binary_search(sched->observe_.begin(), sched->observe_.end(),
++                                  static_cast<const ggml_tensor *>(t));
++    }
++
++    if (!sched->graph_signalling_disabled_) {
++        const auto it = std::lower_bound(sched->observe_.begin(), sched->observe_.end(),
++                                         static_cast<const ggml_tensor *>(t));
++        if (it != sched->observe_.end() && *it == t) {
++            const size_t index = static_cast<size_t>(it - sched->observe_.begin());
++            sched->on_layer_boundary(sched->observe_layer_[index]);
++        }
++    }
++
++    // keep the user's cancel semantics; without a user callback the compute always continues
++    return has_user ? user_ret : true;
++}
++
 +void prefetch_scheduler::notify_layer_compute(int current_layer) {
 +    if (!enabled_.load()) return;
++    // [QLH] 2026-11-02 A/B: SLIM_ARC_NOOP=1 keeps the eval callback installed and keeps the
++    // graph splitting it causes, but issues no PrefetchVirtualMemory at all. This separates the
++    // cost of "callback + 40 split submits" from the cost of "actually advising pages".
++    if (std::getenv("SLIM_ARC_NOOP") != nullptr) return;
++    // [QLH] 2026-11-02 A/B: SLIM_ARC_MAX_CALLS=N bounds how many prefetch requests a process
++    // issues in total. After the cap nothing is advised, which separates two explanations for
++    // the 2.5x slowdown: "the call itself is expensive" (a small cap is already slow) from
++    // "steady-state prefetch keeps the page cache thrashing" (a small cap is fast).
++    static std::atomic<uint64_t> issued_notifications{0};
++    if (const char * cap_env = std::getenv("SLIM_ARC_MAX_CALLS")) {
++        const uint64_t cap = std::strtoull(cap_env, nullptr, 10);
++        if (issued_notifications.fetch_add(1, std::memory_order_relaxed) >= cap) {
++            return;
++        }
++    }
 +    prefetch_request request = plan_request(current_layer);
 +    {
 +        std::lock_guard<std::mutex> lk(mtx_);
@@ -2646,6 +2872,7 @@ index 0000000..2777ecc
 +    request.layer = current_layer;
 +    request.memory_budget = memory_budget_.load();
 +    std::vector<tensor_prefetch_info> items;
++    int window_layers = 0;
 +    {
 +        std::lock_guard<std::mutex> lock(mtx_);
 +        if (stop_.load()) return request;
@@ -2655,7 +2882,9 @@ index 0000000..2777ecc
 +            for (int offset = 1; offset <= window_; ++offset) {
 +                const int layer = current_layer + offset;
 +                if (layer < 0 || static_cast<size_t>(layer) >= tensors_by_layer_.size()) continue;
-+                for (const tensor_prefetch_info & tensor : tensors_by_layer_[layer]) {
++                const std::vector<tensor_prefetch_info> & layer_tensors = tensors_by_layer_[layer];
++                if (!layer_tensors.empty()) ++window_layers;
++                for (const tensor_prefetch_info & tensor : layer_tensors) {
 +                    if (tensor.addr != nullptr && tensor.size > 0) items.push_back(tensor);
 +                }
 +            }
@@ -2668,6 +2897,26 @@ index 0000000..2777ecc
 +            static_cast<uint64_t>(item.size));
 +    }
 +    request.advice_requests = static_cast<uint64_t>(items.size());
++    // [QLH] Per-request ceiling, part 2: never advise more than one layer's worth of weights in a
++    // single request. The window covers `window_` layers, so the request sizes are derived from
++    // the actual bytes registered per layer rather than from a constant -- a dense 70B and a
++    // small MoE get correctly different budgets. Workers still walk the ranges in order, so
++    // "one layer" means the nearest one, which is the one the next step needs first.
++    // [QLH] SLIM-ARC 2026-11-02: with per-layer signalling (on_layer_boundary()) the next
++    // notification is a whole window further along, so clipping every request to a single layer
++    // would leave layers 2..window of each window prefetched never. The request may spend the
++    // whole window; the free-memory ceiling in memory_budget_ still caps it.
++    if (window_layers > 0) {
++        const uint64_t per_layer = request.requested_bytes / static_cast<uint64_t>(window_layers);
++        // [QLH] 2026-11-02 A/B: cap the request to ONE layer, not to the whole window.
++        // The window-sized budget made every token advise ~17 GB on a 16 GB machine
++        // (40 layers / window 3 notifications, x 3 layers each), which evicted the hot
++        // working set and measured 2.2x slower than prefetch-off. One layer per request
++        // cuts the volume by window_layers and keeps the layer ordering intact.
++        if (per_layer > 0 && per_layer < request.memory_budget) {
++            request.memory_budget = per_layer;
++        }
++    }
 +    const long raw_page_size = page_size_query_();
 +    if (raw_page_size <= 0) {
 +        request.invalid_ranges = request.advice_requests;
@@ -3717,11 +3966,17 @@ index 0000000..2777ecc
 +    // the expert prefetcher is switched on. Without this line a plain layer-ahead run is
 +    // indistinguishable from a scheduler that never fired at all.
 +    std::fprintf(stderr,
-+            "[SLIM-ARC-PREFETCH] calls=%llu issued=%.1fMB window=%d threads=%d\n",
++            "[SLIM-ARC-PREFETCH] calls=%llu issued=%.1fMB window=%d threads=%d "
++            "requested=%.1fMB advice_requests=%llu coalesced=%llu invalid=%llu covered=%.1fMB\n",
 +            static_cast<unsigned long long>(total_calls_.load()),
 +            static_cast<double>(total_bytes_.load()) / 1048576.0,
 +            effective_window(),
-+            n_threads_);
++            n_threads_,
++            static_cast<double>(budget_requested_bytes_.load()) / 1048576.0,
++            static_cast<unsigned long long>(budget_advice_requests_.load()),
++            static_cast<unsigned long long>(budget_coalesced_ranges_.load()),
++            static_cast<unsigned long long>(budget_invalid_ranges_.load()),
++            static_cast<double>(budget_covered_bytes_.load()) / 1048576.0);
 +    size_t issued = expert_prefetch_bytes_.load();
 +    size_t hit    = expert_hit_bytes_.load();
 +    size_t waste  = expert_waste_bytes_.load();
@@ -3816,15 +4071,17 @@ index 0000000..2777ecc
 +} // namespace slim_arc
 diff --git a/src/slim-arc-prefetch.h b/src/slim-arc-prefetch.h
 new file mode 100644
-index 0000000..7dff667
+index 0000000..9c8126a
 --- /dev/null
 +++ b/src/slim-arc-prefetch.h
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,481 @@
 +#pragma once
 +
 +#include "slim-arc-expert-residency.h"
 +#include "slim-arc-expert-transition.h"
 +#include "slim-arc-page-range.h"
++
++#include "ggml-backend.h"
 +
 +// SLIM-ARC: Tensor-level asynchronous prefetch scheduler
 +//
@@ -3974,6 +4231,24 @@ index 0000000..7dff667
 +    // [current_layer+1, current_layer+window].
 +    void notify_layer_compute(int current_layer);
 +
++    // ---- SLIM-ARC 2026-11-02: real per-layer signalling ----
++    // The graph is submitted to ggml_backend_sched as a whole (~3.8k nodes covering all layers),
++    // so llama_context::graph_compute has no "we are now computing layer N" moment. The signal
++    // is taken from the per-node eval callback instead: prepare_graph() scans the built graph
++    // once and remembers the first node of every layer, eval_cb() then fires
++    // notify_layer_compute() for the layers it observes.
++    //
++    // Call after the graph is built (the layer index lives in the tensor name, which
++    // llama_context::graph_get_cb() assigns while building). Idempotent for the same graph.
++    void prepare_graph(const ggml_cgraph * gf);
++
++    // Chain the user callback (llama_context_params::cb_eval) so that installing eval_cb does
++    // not disable it. Must be called before the callback is handed to the scheduler.
++    void attach_user_callback(ggml_backend_sched_eval_callback cb, void * user_data);
++
++    // ggml_backend_sched_eval_callback body. user_data must be a prefetch_scheduler *.
++    static bool eval_cb(ggml_tensor * t, bool ask, void * user_data);
++
 +    // Disable prefetch (e.g., when memory budget exceeded).
 +    void set_enabled(bool enabled) { enabled_.store(enabled); }
 +
@@ -4081,6 +4356,11 @@ index 0000000..7dff667
 +    int n_threads_;
 +    int window_;
 +    std::atomic<compute_phase> phase_{compute_phase::DECODE};
++    // [QLH] unified_io_scheduler (the module that used to hand this scheduler its byte budget)
++    // is not ported, so nothing calls set_memory_budget() and the upstream default of 0 truncated
++    // every request to zero bytes. The constructor now derives a ceiling from the free physical
++    // memory, and plan_request() additionally caps each request at one layer of weights.
++    // SLIM_ARC_BUDGET_MB overrides the ceiling; set_memory_budget() still wins if a caller shows up.
 +    std::atomic<size_t> memory_budget_{0};
 +    std::atomic<bool>       enabled_{true};
 +    std::atomic<bool>       stop_{false};
@@ -4248,6 +4528,21 @@ index 0000000..7dff667
 +    std::atomic<uint64_t>                           residency_pressure_normal_{0};
 +    std::atomic<uint64_t>                           residency_pressure_high_{0};
 +    std::atomic<uint64_t>                           residency_pressure_critical_{0};
++
++    // ---- SLIM-ARC 2026-11-02: per-layer signalling state ----
++    void on_layer_boundary(int32_t layer);
++    // first node of every layer, sorted by pointer value -- searched with binary_search
++    std::vector<const ggml_tensor *>                observe_;
++    // layer index of the matching observe_ entry (not sorted: it follows observe_)
++    std::vector<int32_t>                            observe_layer_;
++    // last layer we issued a request for; reset when the layer counter wraps (= new token)
++    int32_t                                         last_notified_ = -1;
++    // graph the tables above were built from, for idempotency across the graph-reuse path
++    const ggml_cgraph *                             prepared_gf_ = nullptr;
++    // set when the scan could not recover layer boundaries; eval_cb then degrades to the user cb
++    bool                                            graph_signalling_disabled_ = false;
++    ggml_backend_sched_eval_callback                user_cb_ = nullptr;
++    void *                                          user_cb_data_ = nullptr;
 +};
 +
 +// Helper: extract layer index from tensor name (blk.%d.*)
