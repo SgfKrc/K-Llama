@@ -290,7 +290,14 @@ class TopologyTest(unittest.TestCase):
     def test_localhost_and_ipv6_are_local(self) -> None:
         self.assertTrue(Stage(0, Path("m"), "localhost", 9101, 8, "gpu", 0, 0, "", 3).is_local)
         self.assertTrue(Stage(0, Path("m"), "::1", 9101, 8, "gpu", 0, 0, "", 3).is_local)
-        self.assertFalse(Stage(0, Path("m"), "0.0.0.0", 9101, 8, "gpu", 0, 0, "", 3).is_local)
+        # 0.0.0.0 / :: 是 bind 地址而不是连接地址：拓扑里这么写的段必然跑在本机，
+        # 而且必须绑全部接口，否则远端连不进来。放进 LOCAL_HOSTS 是为了让 supervisor
+        # 认出「这是本机该起的那段」——写 127.0.0.1 的话 worker 只绑回环，对端
+        # connection refused（2026-11-03 实测过一次）。
+        self.assertTrue(Stage(0, Path("m"), "0.0.0.0", 9101, 8, "gpu", 0, 0, "", 3).is_local)
+        self.assertTrue(Stage(0, Path("m"), "::", 9101, 8, "gpu", 0, 0, "", 3).is_local)
+        # 真正的远端仍然不是本机。
+        self.assertFalse(Stage(0, Path("m"), "100.99.211.13", 9101, 8, "gpu", 0, 0, "", 3).is_local)
 
 
 class ProvenanceTest(unittest.TestCase):
