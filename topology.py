@@ -7,6 +7,7 @@ starts.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 
 import tomllib
@@ -63,6 +64,13 @@ class Stage:
     # tooling free of any particular machine's name, address or filesystem layout.
     ssh_user: str = ""
     start_cmd: str = ""
+    # Optional sha256 of the checkpoint. Every stage must point at the SAME file: the
+    # per-stage `layer_range` only selects which blocks are touched, while everything
+    # outside it (tokenizer, output projection, nextn) is shared and a different file
+    # silently misaligns them. Hashing 20+ GiB costs ~30 s, so this is deliberately NOT
+    # done in load() -- verify_model_hashes() runs it once at start-up. Empty = not
+    # declared, nothing to check.
+    model_sha256: str = ""
 
     @property
     def ssh_target(self) -> str:
@@ -165,6 +173,7 @@ def _stage(index: int, raw: dict) -> Stage:
         _layer_range(raw, index, layers),
         str(raw.get("ssh_user", "")).strip(),
         str(raw.get("start_cmd", "")).strip(),
+        str(raw.get("sha256", "")).strip().lower(),
     )
 
 
@@ -390,3 +399,38 @@ def verify_artifacts(stages: tuple[Stage, ...]) -> list[str]:
                 f"stage[{s.index}] {s.model.name} is {s.model.stat().st_size} bytes but "
                 f"its sidecar describes {size}; the artifact was replaced, re-cut it")
     return verify_ranges(stages) + extra
+
+
+def verify_model_hashes(stages: tuple["Stage", ...], *, chunk: int = 8 << 20,
+                        progress=None) -> list[str]:
+    """Check the sha256 of every local stage that declares one.
+
+    Returns a list of mismatches; empty means every declared hash matched. Stages that do
+    not declare `sha256` are skipped -- the eight topology-*.toml files predate this field.
+
+    Deliberately a separate function rather than a branch inside `verify_artifacts`: that
+    one reads only the sidecar and never opens the GGUF (opening a 35B header costs ~7 s
+    for the 248k-element tokenizer array), while hashing 20+ GiB costs ~30 s. Two orders of
+    magnitude apart, so this runs once at start-up, not on every load().
+
+    Streams in 8 MiB chunks: the file is larger than the page cache on some of the target
+    machines, so reading it whole would be a memory bug rather than a style choice.
+    """
+    bad: list[str] = []
+    for s in stages:
+        if not s.is_local or not s.model_sha256:
+            continue
+        digest = hashlib.sha256()
+        with open(s.model, "rb") as f:
+            while block := f.read(chunk):
+                digest.update(block)
+        actual = digest.hexdigest()
+        if actual != s.model_sha256:
+            bad.append(
+                f"stage[{s.index}] {s.model.name} sha256 is {actual[:16]}... but the "
+                f"topology declares {s.model_sha256[:16]}...; the two stages are then "
+                f"running different checkpoints and everything outside layer_range "
+                f"(tokenizer, output projection) will not line up")
+        elif progress is not None:
+            progress(f"stage[{s.index}] sha256 ok: {s.model.name}")
+    return bad

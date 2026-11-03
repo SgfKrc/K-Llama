@@ -36,7 +36,9 @@ SKIP_STDLIB = {"test", "idlelib", "tkinter", "turtledemo", "lib2to3", "ensurepip
 SKIP_DLLS = {"_tkinter.pyd", "tcl86t.dll", "tk86t.dll", "tkinter_common.zip"}
 
 WORKER_FILES = ["stage_worker.py", "engine.py", "keep_head.py", "keep_head_worker.py",
-                "config.py", "protocol.py", "wire.py", "chat.py", "server.py", "stream.py"]
+                "config.py", "protocol.py", "wire.py", "chat.py", "server.py", "stream.py",
+                # 常驻形态：supervisor 起本机的段并负责重启，它需要这两个。
+                "stage_supervisor.py", "chain_client.py", "topology.py"]
 
 LLAMA_DLLS = ["llama.dll", "ggml.dll", "ggml-base.dll", "mtmd.dll"]
 GGML_CPU_DLLS = ["ggml-cpu-alderlake.dll", "ggml-cpu-cannonlake.dll", "ggml-cpu-cascadelake.dll",
@@ -193,14 +195,35 @@ HERE = Path(__file__).resolve().parent
 def main() -> int:
     cfg = tomllib.loads((HERE / "config.toml").read_text(encoding="utf-8"))
 
+    st = cfg["stage"]
+    role = st["role"]
+
+    # role = "supervisor" 时不看 layer_range：它读 topology.toml，把本机的每一段都起起来，
+    # 崩了负责重启。这是常驻形态；单跑一段用 gpu / tail。模型路径也由 topology 各自声明，
+    # 所以这里的 model.path 不参与校验。
+    if role == "supervisor":
+        env = dict(os.environ)
+        env["PATH"] = str(HERE / "bin") + os.pathsep + env.get("PATH", "")
+        env["PYTHONPATH"] = str(HERE / "worker")
+        # supervisor 自己不认 --shim，它靠 config.find_shim() 从 cwd 往上找 checkout 的
+        # shim/bin/；包里的布局是 bin/，所以必须显式告诉它。
+        env["SA_SHIM"] = str(HERE / "bin" / "qlh_keep_head.dll")
+        topo = HERE / "topology.toml"
+        if not topo.is_file():
+            print(f"role=supervisor 需要 {topo}：它描述整条链，本机是哪几段由它决定。")
+            return 2
+        env["SA_TOPOLOGY"] = str(topo)
+        print(f"拓扑：{topo}")
+        import subprocess
+        return subprocess.call([sys.executable, str(HERE / "worker" / "stage_supervisor.py")],
+                               env=env, cwd=str(HERE / "worker"))
+
     model = Path(cfg["model"]["path"])
     if not model.is_file():
         print(f"模型不存在：{model}")
         print("改 config.toml 里的 model.path，指向完整整模的 .gguf。")
         return 2
 
-    st = cfg["stage"]
-    role = st["role"]
     rng = st["layer_range"]
     lo, hi = (int(x) for x in rng.split(":"))
 
