@@ -18,7 +18,7 @@
 | 单机两段跨进程 + DFlash | 20.9 tok/s（64 token 口径） | [`SPECULATION.md`](SPECULATION.md) §11 |
 | 跨机两段，无投机 | 12.2 tok/s | [`MEASUREMENTS.md`](MEASUREMENTS.md) |
 | 两台弱设备各持整模 | decode 6.50 tok/s，prefill 22 tok/s | [`PROGRESS.md`](PROGRESS.md) §1.1 |
-| 多轮对话 | 35B 三轮 PASS；增量 KV 与从头重放逐位相同（23/23 token） | `checks/verify_multiturn.py` |
+| 多轮对话 | 35B 三轮 PASS（本机两段与 **Surface+Y700 弱设备链**各一次）；增量 KV 与从头重放逐位相同（23/23 token） | `checks/verify_multiturn.py` |
 | 非贪心采样 | 分段不引入误差（TV=0）；输出连贯 | `checks/probe_logits_delta.py` |
 | 常驻与自愈 | kill 掉任一段 worker 后 2 秒重启，链路恢复 | `stage_supervisor.py` |
 | 绿色目录 | 96 MB，清空工作区后独立跑通 | `scripts/pack-portable.py` |
