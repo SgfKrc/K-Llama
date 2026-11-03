@@ -1,11 +1,11 @@
 # 打成 Windows 绿色目录
 
-> 状态：**已在一台清空的机器上验证**（2026-11-03）
-> 适用：把当前这套 worker 交给别人跑，或换一台机器复现。
+> 状态：**已验证**
+> 更新日期：2026-11-03
+> 适用范围：把当前这套 worker 打成 Windows 绿色目录交给别人跑，或换一台机器复现；
+> 不含安装器、服务发现与模型分发。
 
 目标很窄：**拷走一个目录，改一行模型路径就能跑**。不做安装器、不做服务发现。
-
----
 
 ## 1. 打包
 
@@ -75,7 +75,7 @@ runtime\python.exe probe.py --head 127.0.0.1:9103 --tail 100.x.x.x:9106
 - **`launcher.py` 不用 `os.execve`**。它替换进程后，调用方的 ssh/shell 会认为本进程已结束、
   关闭连接，新进程随即被杀（Windows 上实测 exit 0 且没有 worker 存活）。用 `subprocess`
   保持前台阻塞。
-- **模型不进包**。23.5 GiB，只能由用户自己放，`config.toml` 指过去。
+- **模型不进包**。21.87 GiB（23.48 GB），只能由用户自己放，`config.toml` 指过去。
 - **两份整模**。`LLAMA_LAYER_RANGE` 要求每个节点持有完整文件，只 touch 自己那几层。
 
 ## 5. 已验证的边界
@@ -108,7 +108,7 @@ supervisor 形态不需要 `--range` / `--port`：本机是哪几段、切点在
 `setsid` + `termux-wake-lock` 后台起服务。幂等，重复跑只补缺的部分。
 
 **为什么不是 APK**：NDK 要重编（Termux 的 `libc++_shared.so` 和 bionic 不是一回事），
-python 栈要么塞解释器要么重写，23.5 GiB 模型还得让用户 SAF 选一次再复制。而一键脚本
+python 栈要么塞解释器要么重写，21.87 GiB 模型还得让用户 SAF 选一次再复制。而一键脚本
 只要装个 Termux，成本差一个数量级，且是我们自己调研用的最佳形态。
 
 **三个写进脚本校验的约束**：
@@ -121,11 +121,11 @@ python 栈要么塞解释器要么重写，23.5 GiB 模型还得让用户 SAF �
 
 实测：启动后 PID 17412，`adb kill-server` + `start-server` 之后进程仍存活。
 
-## 7. 骨架现状
+## 7. 实现现状与缺口
 
 | 缺口 | 状态 |
 | --- | --- |
-| 启动编排 | ✅ `chain_client.bring_up()`（:776）+ `stage_supervisor.py` 常驻形态 |
+| 启动编排 | ✅ `chain_client.bring_up()` + `stage_supervisor.py` 常驻形态 |
 | 断线重连 | ✅ `stage_supervisor.py`：死的只重启那一个，退避 2→4→8→16→30 封顶，稳定存活 60 s 才归零 |
 | 模型校验 | ✅ `topology.verify_model_hashes()`：拓扑里声明 `sha256` 才校验，没声明就跳过 |
 | 地址配置 | ⚠️ `topology.toml` 的 host/port，**没有服务发现**，IP 仍要手填 |

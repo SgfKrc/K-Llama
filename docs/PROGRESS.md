@@ -64,7 +64,7 @@ Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两�
 
 | 阶段 | 内容 | 结果 |
 | --- | --- | --- |
-| P0 | 单进程基线，`-ncmoe` 语义 | 28.02 ± 0.15 tok/s（旧 Q4_K_XL 20.81 GiB 模型） |
+| P0 | 单进程基线，`-ncmoe` 语义 | 28.02 ± 0.15 tok/s（旧 Q4_K_XL 20.82 GiB 模型） |
 | P1 | 多槽 `layer_inp` 打通 worker/engine/StageClient | 与单槽逐位相同 |
 | P2 | 两进程 + TCP 传输 | 段间 hidden 走 int16 定点，5 份拷贝降到 1 份 |
 | P3 | DFlash 草稿三件套（open/inject/block）+ rollback | 8 路注入、15 草稿、16 验证跑通 |

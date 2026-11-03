@@ -1,14 +1,17 @@
 # 裁切工具：已退场
 
-> 状态：**工具退场，sidecar 格式仍在生效**
-> 更新日期：2026-11-01
+> 状态：**已退场**
+> 更新日期：2026-11-03
+> 适用范围：裁切工件生成器（`cut.py`）退场的原因、仍在生效的 sidecar 契约格式、以及重建时的陷阱；读者为部署与工具维护者。替代物是整模 + `LLAMA_LAYER_RANGE`（`PATCHES.md` 第二代）。
+
+生成器已退场，它写出的 provenance sidecar 仍是活契约（§2）。
 
 ---
 
 ## 1. 为什么退场
 
-裁切工件曾经是唯一的加载方式：每段一个 `.gguf`，只含自己那几层。
-现在改成**整模 + `LLAMA_LAYER_RANGE`**，每台机器持有同一份完整 checkpoint，
+裁切工件是早期唯一的加载方式：每段一个 `.gguf`，只含自己那几层。
+现行形态是**整模 + `LLAMA_LAYER_RANGE`**，每台机器持有同一份完整 checkpoint，
 加载时只创建、只读取自己那几层。
 
 三个原因：
@@ -51,7 +54,7 @@ A/B/C 三个用例读 `archive-q35-2b` 的工件（range 与字节数都从 side
 | `artifact_contains` | `token_embd` / `output_norm` / `output_weight` / `can_serve_tail` 四个布尔 |
 
 **顶层字段描述源模型，`kept_block_count` / `source_layer_range` / `artifact_contains`
-描述本段。** 这个双口径划分是修过的 bug：混写之后下游再也分不清工件出自哪个模型、
+描述本段。** 这个双口径划分必须守住：混写之后下游再也分不清工件出自哪个模型、
 覆盖哪一段（存量 head4 工件顶层写 `block_count=33` 而 GGUF 内实际是 4）。
 
 同样的信息也写进 GGUF 的 `qlh.*` 键作为兜底，但验证只读 sidecar——读回 GGUF 键要
@@ -60,7 +63,7 @@ sidecar 是毫秒级。
 
 ---
 
-## 3. 历史验证结论（工具退场后仍有参考价值）
+## 3. 工具退场前的验证结论
 
 **三种模式与旧工具逐项一致**。用 `qwen3-5-9b-local-Q4_K_M.gguf`（5.38 GB，`block_count=33`、
 `n_layer=32`、`interval=4`）：
@@ -79,9 +82,9 @@ sidecar 是毫秒级。
 末段职责，需要 `output_norm`，且要么有独立 `output.weight`，要么 tie embeddings
 （`token_embd` 兼作 `lm_head`）。判断结果记在 `artifact_contains.can_serve_tail`。
 
-**两个修过的 bug**：字典字面量会立即求值所有 value（head 模式下 `args.end is None` 直接
+**两个已知陷阱**：字典字面量会立即求值所有 value（head 模式下 `args.end is None` 直接
 `TypeError`）；manifest 计数在调用方和函数内各 `len()` 一次导致重复。两者都不影响现行
-形态，但如果重建工具会再遇到。
+形态，但重建工具时会再遇到。
 
 ---
 
@@ -91,5 +94,5 @@ sidecar 是毫秒级。
 
 但在动手之前先问一句：**现在需要切段吗**。现行方案是整模 + `layer_range`，切段只在
 "某台机器必须只持有一段"时才需要，而 `ARCHITECTURE.md` 已经把"同一台机器拆两段"
-定性为设计错误。真要裁，先看 `PATCHES.md` 第一代（裁切工件）与第二代（整模 + 层范围）
+定性为设计错误。真要裁，先看 `PATCHES.md` 第一代（层输出通道）与第二代（整模 + 层范围）
 的差别，别把已经解决的 MTP 头问题重新引回来。

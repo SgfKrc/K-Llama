@@ -2,14 +2,13 @@
 
 > 状态：**现行**
 > 更新日期：2026-11-03
->
-> 回答两件事：现在能交付什么、拿到手怎么跑起来。
-> 机制见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，数字口径见 [`MEASUREMENTS.md`](MEASUREMENTS.md)，
-> 弱设备链的拆解见 [`ANDROID-SURFACE-段接入评估.md`](ANDROID-SURFACE-段接入评估.md)。
+> 适用范围：现在能交付什么、拿到手怎么跑起来；读者为交付与部署执行者。
+> 相关：`ARCHITECTURE.md`（机制）、`MEASUREMENTS.md`（数字口径）、
+> `ANDROID-SURFACE-段接入评估.md`（弱设备链的拆解）
 
 ---
 
-## 一、能交付什么
+## 1. 能交付什么
 
 ### 1.1 已验证的能力
 
@@ -21,7 +20,7 @@
 | 多轮对话 | 35B 三轮 PASS（本机两段与 **Surface+Y700 弱设备链**各一次）；增量 KV 与从头重放逐位相同（23/23 token） | `checks/verify_multiturn.py` |
 | 非贪心采样 | 分段不引入误差（TV=0）；输出连贯 | `checks/probe_logits_delta.py` |
 | 常驻与自愈 | kill 掉任一段 worker 后 2 秒重启，链路恢复 | `stage_supervisor.py` |
-| 绿色目录 | 96 MB，清空工作区后独立跑通 | `scripts/pack-portable.py` |
+| 绿色目录 | 96 MB（解压后），清空工作区后独立跑通 | `scripts/pack-portable.py` |
 
 **分段本身不引入误差**（2026-11-03）：同 kernel 布局下整模与链路在同一位置的 logits
 逐位相同（`max_abs=0`、`cos=1.0000000`、top-8 全重合、TV=0），2B 测 16 个位置、
@@ -37,11 +36,11 @@
 
 ---
 
-## 二、部署
+## 2. 部署
 
 ### 2.1 每台机器放什么
 
-一台机器跑一段。每段都要**同一份完整整模**（`LLAMA_LAYER_RANGE` 只选层，不建裁层工件）。
+一台机器跑一段。每段都要**同一份整模**（`LLAMA_LAYER_RANGE` 只选层，不建裁层工件）。
 
 ```bash
 python scripts/pack-portable.py \
@@ -62,7 +61,7 @@ source_layers = 40
 
 [[stage]]
 model       = "<本机路径>/model.gguf"
-host        = "0.0.0.0"        # 本机段写 0.0.0.0，见下
+host        = "0.0.0.0"        # 本机段写 0.0.0.0，理由见 2.2 的约束 1
 port        = 9103
 layers      = 24
 layer_range = "0:24"
@@ -110,19 +109,19 @@ python scripts/probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
 
 ---
 
-## 三、明确不做的
+## 3. 明确不做的
 
 | 想法 | 理由 |
 | --- | --- |
 | 服务发现（mDNS / 注册中心） | 2–3 台机器，Tailscale 加手填 IP 够用；出问题时 `probe.py` 能立刻分出「连不上」与「连上了没发 HELLO」 |
-| Android APK | 要 NDK 重编（Termux 的 libc++ 与 bionic 不是一回事）、python 栈要么塞解释器要么重写、23.5 GiB 模型还得让用户 SAF 选一次。一键脚本成本低一个数量级 |
+| Android APK | 要 NDK 重编（Termux 的 libc++ 与 bionic 不是一回事）、python 栈要么塞解释器要么重写、21.87 GiB（23.48 GB）的模型还得让用户 SAF 选一次。一键脚本成本低一个数量级 |
 | 单独的健康探测层 | 已用「`keep_head` 子进程没了就让 `stage_worker` 自己退出」消除了「活着但不可用」这个状态；再加探测就是给同一事实造第二份判断 |
 | 真并发混批（多序列换吞吐） | 8–12 人天，且一个 worker 一个 context、decode 仍串行。多序列的收益是会话共存与前缀复用，见 [`ISSUE-multi-sequence.md`](ISSUE-multi-sequence.md) |
 | 非贪心的 GPU 逐位等价 | head 段 6 层在 GPU 时 TV 0.0014–0.0299；要逐位就把 `gpu_layers` 设 0，代价是 32 层全走 CPU |
 
 ---
 
-## 四、已知边界
+## 4. 已知边界
 
 - **hybrid 不允许删最后位置**：`seq_rm` 收不回投机多算的位置（实测 `removed=0`，
   随后 decode 报 `pos_max X must be < n_past Y`），只能记账。
@@ -137,7 +136,7 @@ python scripts/probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
 
 ---
 
-## 五、验收命令
+## 5. 验收命令
 
 ```bash
 python -m unittest test_contract test_topology    # 39 项

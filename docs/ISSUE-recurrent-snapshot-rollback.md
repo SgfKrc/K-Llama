@@ -1,7 +1,16 @@
 # ISSUE：recurrent 快照不跨 ubatch 滚动，跨 ubatch 回滚读到陈旧槽
 
-> 状态：已定位、已修复（本地 patch，未提交上游）
-> 更新日期：2026-10-31
+> 状态：**已实现**
+> 更新日期：2026-11-03
+> 适用范围：hybrid 模型（Qwen3.5/3.6 的 GDN + full attention 交替结构）上 recurrent 快照的跨 ubatch 回滚；读者为内核维护者。修复是 `H:\llamacpp-c` 的本地 patch，未提交上游。
+> 相关：`ISSUE-dflash-kv-rollback.md`（同一 hybrid memory 的 `seq_rm` 路径）
+
+`llama_memory_seq_rm()` 把位置退掉之后，用相同输入重写同一位置，得到的 hidden 与从未写
+过那次不同，而 `seq_rm` 本身返回 true 不报错。根因是 `n_rs_seq` 的逐 token 快照只在一个
+ubatch 内有语义；修复后单 token 与 2-token 同形状回滚的 max|d| 均降到 0。跨形状残留的
+2.5e-2 来自两套 GDN kernel 的浮点累加顺序，与回滚无关（〈修复后实测〉）。
+
+---
 
 ## 现象
 
@@ -36,7 +45,7 @@ hybrid 模型（Qwen3.5/3.6 的 `LLL F` 交替结构）上，`llama_memory_seq_r
 `n_tokens < K` 时把多个槽写成同一段旧窗口，主动写坏本应 caller-owned 的历史
 （这是 2-token 批量回滚后仍差 2e-2 的原因）。
 
-## 为什么上游没发现
+## 上游为何未覆盖这条路径
 
 **llama.cpp 官方投机从不跨 ubatch 回滚**：
 
@@ -85,7 +94,7 @@ hybrid 模型（Qwen3.5/3.6 的 `LLL F` 交替结构）上，`llama_memory_seq_r
 两套 kernel 的浮点累加顺序不同，同一位置的 state 差 ~1e-2。**同形状回滚是精确的**，
 跨形状的差异与回滚无关。
 
-**「不影响 argmax」只在短上下文成立**（2026-11-03 修正）。35B 多轮对话实测：`spec_k=0`
+**「不影响 argmax」只在短上下文成立。** 35B 多轮对话实测：`spec_k=0`
 时续用增量 KV 与从头重放逐位相同（23/23 token）；`spec_k=1/2` 时出现措辞分叉
 （`first_diff` 9~11，上下文 100+ token），答案仍对，但已经不是同一条计算。这 ~2e-2
 会随上下文累积，长上下文里足以翻一个 argmax。判据与数据见
@@ -94,7 +103,7 @@ hybrid 模型（Qwen3.5/3.6 的 `LLL F` 交替结构）上，`llama_memory_seq_r
 ## 代价与限制
 
 - **性能**：每步每层每 tensor 增加 `K-1` 次 state 拷贝（head 约 +192 个图节点/步，
-  734 → 926）。本机 GPU 频率漂移太大无法可靠量化，保守估计 +2~8 ms/step（<10%）；
+  734 → 926）。本机 GPU 频率漂移太大无法可靠量化，推算 +2~8 ms/step（<10%）；
   `n_rs_seq=1` 时约 1/4。可将 `K-1` 次单槽 cpy 合并成 scratch 往返（节点减半），未做。
 - **其它 arch**：mamba / plamo2 / glm5-next / kimi-k3 / lfm / bailingmoe3 共用同一个
   `build_rs()`，自动获得移位；但它们的 conv/scan 写入若有同类 clamp（如

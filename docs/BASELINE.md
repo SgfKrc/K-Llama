@@ -126,11 +126,11 @@ for step in range(max_tokens):
 | # | 文档说法 | 代码事实 | 影响 |
 | --- | --- | --- | --- |
 | 1 | `H:\slimarc-proto\DESIGN.md:80` 图示 "hidden (BF16, 4 KiB)" | wire 是 **f32 LE**（`relay_transport.py:39-40`；`scheduler_pipeline.py:265-306`）；`n_embd=2048` ⇒ **8 KiB/token**，`n_embd=4096` ⇒ 16 KiB | 带宽/延迟预算算错一倍；f16 需自己加，不是现成默认 |
-| 2 | `DESIGN.md:216` 把 `qlh_kh_forward_embd_tokens` 标为"hidden 进、hidden 出（中段）★本次用" | 该函数返回 `int32_t * out_tokens`（**argmax 列表**），是末段多位置出 token 用的（`qlh_keep_head.c:472-476`、`:553-557`）；中段应用 `qlh_kh_forward_embd` / `_seq`（`:363-393`） | 按文档接会得到 token 而非 hidden |
-| 3 | `DESIGN.md:209-223` "hidden 通道已存在，不必新写"、`include/llama.h:1058` "只有导出接口，无注入接口" | 注入确实靠官方 `llama_batch.embd`；但**导出**依赖 QLH 补丁（`llama.h:1058-1063` 的声明、`llama-context.cpp:80-81` 的 `n_layer+1` 槽位、9 个架构的 `t_layer_inp[n_layer]` 登记） | "不必碰 llama.cpp"不成立：**必须用带该补丁的 fork**，否则上游出处只能拿到 `output_norm(H)`（实测 cos 0.999998 但首步分叉） |
+| 2 | `H:\slimarc-proto\DESIGN.md:216` 把 `qlh_kh_forward_embd_tokens` 标为"hidden 进、hidden 出（中段）★本次用" | 该函数返回 `int32_t * out_tokens`（**argmax 列表**），是末段多位置出 token 用的（`qlh_keep_head.c:472-476`、`:553-557`）；中段应用 `qlh_kh_forward_embd` / `_seq`（`:363-393`） | 按文档接会得到 token 而非 hidden |
+| 3 | `H:\slimarc-proto\DESIGN.md:209-223` "hidden 通道已存在，不必新写"、`include/llama.h:1058` "只有导出接口，无注入接口" | 注入确实靠官方 `llama_batch.embd`；但**导出**依赖 QLH 补丁（`llama.h:1058-1063` 的声明、`llama-context.cpp:80-81` 的 `n_layer+1` 槽位、9 个架构的 `t_layer_inp[n_layer]` 登记） | "不必碰 llama.cpp"不成立：**必须用带该补丁的 fork**，否则上游出处只能拿到 `output_norm(H)`（实测 cos 0.999998 但首步分叉） |
 | 4 | `docs/已知问题记录.md:2279` "shim 把 `layer_inp` 限制为 `cut_layer < n_layer`（`qlh_keep_head.c:111`）" | 该检查今天在 `qlh_keep_head.c:154-159`（行号已漂移）；同段还说"qwen3* 挂点在之后，代码显式拒用" | 后半句已过时：该判据 2026-10-07 删除（`llama_engine.py:2485-2497`） |
 | 5 | 存量工件 manifest 与当前裁切口径 | 新代码非尾段丢 `output.weight`（`gguf_tensor_selection.py:30-33`）；**[实测]** `q35-9b-local-head4.gguf` / `mid4-24.gguf` **仍含 `output.weight`** | 旧段件比新口径多约 0.8 GB/段；预算按"旧工件实际大小"记，勿按新口径推算 |
-| 6 | `DESIGN.md:64` "≈1,400 行 Python" | 本链路的**真实**依赖面见 §4（单 `llama_engine.py` 就 146 KB / 2954 行，`scheduler_pipeline.py` 456 KB） | 1,400 行只能覆盖"串行两段 + 裁剪协议"，不能覆盖现有合同的校验面 |
+| 6 | `H:\slimarc-proto\DESIGN.md:64` "≈1,400 行 Python" | 本链路的**真实**依赖面见 §4（单 `llama_engine.py` 就 146 KB / 2954 行，`scheduler_pipeline.py` 456 KB） | 1,400 行只能覆盖"串行两段 + 裁剪协议"，不能覆盖现有合同的校验面 |
 
 ---
 

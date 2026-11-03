@@ -79,7 +79,7 @@
 3. 非 `blk.*` 张量原样保留；非尾段可省略 `output.weight`。
 4. **切点必须是 `<arch>.full_attention_interval` 的整数倍**（Qwen3.5 MoE 为 4），
    否则 hybrid 层类型错位、llama.cpp 报 `missing tensor 'blk.x...'` 无法加载。
-   这是已验证的硬约束（`DESIGN.md:172-181`）。
+   这是已验证的硬约束（`DESIGN.md` §5.1）。
 
 **最少需要多少行**：**150–200 行**。可以砍掉：`_validate_layer_types` 的 HF config 交叉校验（137 行）、
 `_validate_model_preflight_metadata`（19 行）、`_per_layer_array_overrides` 的 per-layer KV（46 行，
@@ -125,7 +125,7 @@ if not is_loopback_host(host):
 是同一个约束的第二次表达。
 
 **含义**：新原型「一个 token 依次经过各节点」要真跨机，这条传输层**必须重写**，不能复用。
-同时它也解释了为什么旧仓库接力很慢（`DESIGN.md:92`：链路 + 固定开销 297 ms，占 49.7%）——
+同时它也解释了为什么旧仓库接力很慢（`DESIGN.md` §3.1：链路 + 固定开销 297 ms，占 49.7%）——
 SSH 隧道 + 每段 2 次往返（`relay_cut_objective.py` 的 `STAGE_ROUND_TRIPS = 2`）。
 
 ### §4.2 状态机 / 租约 / 事务 / 两阶段提交 / 代际
@@ -207,6 +207,6 @@ SQLite 出现在 4 处：`local_store.py`、`recovery_journal.py`、`journal_rep
 
 1. **`relay_transport.py` 不能复用**。它硬性拒绝非 loopback 端点（`relay_transport.py:535`），跨机靠外部 SSH 隧道。新原型要真跨机，传输层必须重写——但只抄它的 6 帧形状，不抄 1,247 行实现。
 2. **keep-head 是硬依赖，不是可选加速件**。裸 llama.cpp 拿不到 `output_norm` 之前的 hidden，必须走补丁 + shim。原型 `engine.py:19` 已经在 `sys.path` 注入旧仓库——这个耦合必须在合并时显式化（把 `llama_keep_head.py` 精简后收进仓库根，C shim 进 `shim/`）。
-3. **裁切真身不在 `src/`**。如果只盘 `src/`，会得出「裁切功能只有 200 行」的错误结论——实际 690 行在 `scripts/cut_layers.py`，且是全仓唯一被原型依赖的旧代码（`DESIGN.md:174,196`）。
+3. **裁切真身不在 `src/`**。如果只盘 `src/`，会得出「裁切功能只有 200 行」的错误结论——实际 690 行在 `scripts/cut_layers.py`，且是全仓唯一被原型依赖的旧代码（`DESIGN.md` §5.1）。
 4. **`scheduler_pipeline.py` 的重点不是接力**。接力循环本体在 `qlh_core/execution/linear.py`，只有 62 行；8,691 行的主体是 A3 供给编排（准备/提交/就绪/清理/重试/恢复）。真正纯接力路径（A1）已被降级为探针（`config.py:741-748`）。这解释了「旧仓库功能多」的具体形态：**不是功能多，是把一条 62 行的循环包在 29,752 行控制面里**。
 5. **`tcp_comm.py` 的价值被高估**。2,834 行里可直接迁移的只有约 280 行帧编解码；余下 2,000+ 行是心跳/重连/epoch/注册重放，全部属于「首期不做」。

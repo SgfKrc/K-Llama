@@ -1,7 +1,9 @@
 # 三代补丁，以及与原生 RPC 的分界
 
-> 状态：已核对源码
-> 更新日期：2026-10-31
+> 状态：**现行**
+> 更新日期：2026-11-03
+> 适用范围：本项目对 `H:\llamacpp-c` 三代补丁的构成，以及与 llama.cpp 原生 RPC 的分界；读者为内核与部署维护者。
+> 相关：`SLIM-ARC-接入计划.md`（第三代第二级未接的理由）、`CUT-TOOL.md`（裁段工具退场）
 
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在**模型怎么装进显存和内存**：
 第一代靠"裁好的层段工件"，第二代靠"整模 + 层范围"。llama.cpp 侧的补丁因此完全不同。
@@ -10,29 +12,6 @@
 生成方式：`git -C H:\llamacpp-c add -A && git diff --cached --binary HEAD > <patch> && git reset`。
 校验方式：`git apply --reverse --check <patch>` 在打过补丁的树上通过，说明它与工作区
 逐字节对应，可以正向重放。
-
----
-
-## 杂项：工具层的参数校验（非分布式必需）
-
-`common/arg.cpp`，14 行，2026-11-01。逻辑上与上面三代无关，是为 `--spec-type ngram-simple`
-加一条交叉校验；它出现在这份 patch 里，是因为 patch 按工作区快照整体生成。
-
-`ngram-map.cpp:95-101` 的实现是：`copy_max = min(size_m, 剩余历史)`，只要
-`copy_max < n_draft_min` 就返回空草稿，而 `n_draft_min` 就是 `size_ngram`。所以
-**`size_m < size_n` 是恒空配置**——一个草稿都产不出来，且没有任何警告。上游默认值 12/48
-（`m >> n`）永远走不到这个分支，但用户单独调这两个参数时会。
-
-校验放在 `common_params_parse` 解析完成之后而不是各选项的回调里，因为两个参数在命令行上
-可以任意顺序出现，放在回调里会让 `-size-n 60 -size-m 100` 误报。
-
-验证（`llama-server` 参数解析，不需要真模型）：
-
-    -size-n 4 -size-m 3  ->  "ngram size M (3) must be >= ngram size N (4): smaller values
-                              produce no drafts at all (ngram-map.cpp:95-101)"
-    -size-n 2 -size-m 7  ->  通过参数校验
-
-要不要往上流提 PR 尚未决定；这条对本地用法无影响（本项目的有效组合是 `m > n`）。
 
 ---
 
@@ -68,9 +47,9 @@
 | `src/llama-model-loader.cpp` | `LLAMA_LAYER_RANGE` 解析、`get_weight` 重映射、全局张量的 lazy 标记 |
 | `src/llama-model.cpp` | `done_getting_tensors` 传范围、`init_mappings` 按范围、host-only 预读、`size_data` 重算 |
 | `src/models/qwen35.cpp` | 在 `build_norm` 之前 tap 出 `t_embd` |
-| `src/models/qwen35moe.cpp` | 同上；另有 relay 末层不裁剪（见下第 4 条） |
+| `src/models/qwen35moe.cpp` | 同上；另有 relay 末层不裁剪（见下文第 4 条机制） |
 
-三个关键机制：
+四个关键机制：
 
 1. **`LLAMA_LAYER_RANGE=lo:hi`**：覆盖 `block_count` 与 `nextn`，让架构以为自己只有 `hi-lo`
    层；`get_weight` 把本地 `blk.i` 映射回源文件的 `blk.lo+i`。
@@ -78,7 +57,7 @@
    tap 点前移，替代第一代的 `layer_inp` 槽位。只改了 qwen35 和 qwen35moe 两个架构。
 3. **lazy 全局张量**：head 段不需要 `output`、tail 段不需要 `token_embd`、middle 段两者都不需要。
    不创建就不读，middle 段因此省 1030.62 MiB。
-4. **relay 末层不裁剪**（2026-11-03 实测补上）：`qwen35moe.cpp` 的 `crop_before_nextn`
+4. **relay 末层不裁剪**（2026-11-03 实测）：`qwen35moe.cpp` 的 `crop_before_nextn`
    在 `n_outputs == 0`（只要 hidden、不要 logits）时会把末层裁成 `[n_embd, 0]`，而
    `t_layer_inp[n_layer]` 登记的正是这条张量，于是 `extract_layer_inputs` 的
    `row_floats == model.hparams.n_embd` 断言失败。修法是新增
@@ -138,6 +117,29 @@ win32 移植面（3 个函数 + 1 个锁包装）：
 
 ---
 
+## 附：工具层的参数校验（非分布式必需）
+
+`common/arg.cpp`，14 行。逻辑上与三代补丁无关，是为 `--spec-type ngram-simple` 加一条交叉
+校验；它出现在这份 patch 里，是因为 patch 按工作区快照整体生成。
+
+`ngram-map.cpp:95-101` 的实现是：`copy_max = min(size_m, 剩余历史)`，只要
+`copy_max < n_draft_min` 就返回空草稿，而 `n_draft_min` 就是 `size_ngram`。所以
+**`size_m < size_n` 是恒空配置**——一个草稿都产不出来，且没有任何警告。上游默认值 12/48
+（`m >> n`）永远走不到这个分支，但用户单独调这两个参数时会。
+
+校验放在 `common_params_parse` 解析完成之后而不是各选项的回调里，因为两个参数在命令行上
+可以任意顺序出现，放在回调里会让 `-size-n 60 -size-m 100` 误报。
+
+验证（`llama-server` 参数解析，不需要真模型）：
+
+    -size-n 4 -size-m 3  ->  "ngram size M (3) must be >= ngram size N (4): smaller values
+                              produce no drafts at all (ngram-map.cpp:95-101)"
+    -size-n 2 -size-m 7  ->  通过参数校验
+
+待定项：是否向上游提交 PR。这条对本地用法无影响（本项目的有效组合是 `m > n`）。
+
+---
+
 ## 与 llama.cpp 原生 RPC 的分界
 
 原生 RPC（`-DGGML_RPC=ON`）也能跨机，但两者解决的不是同一个问题。RPC 的协议命令里，
@@ -155,7 +157,7 @@ touch 自己那几层，段间只传 `n_embd` 个浮点。
 | 权重从哪来 | 主机通过 `SET_TENSOR` 发给远端 | 各节点本地读整模的对应层 |
 | 首次跨机流量 | 权重总量（GB 级） | 0，只要本地有整模 |
 | 主机必须装下整模 | 是 | 否（只装自己那几层） |
-| 每步流量 | 激活 + 图指令 | hidden 一个向量（FP16 4 KB） |
+| 每步流量 | 激活 + 图指令 | hidden 一个向量（FP16，2048 × 2 B = 4 KB） |
 | 计算图 | 主机维护全局图 | 每段是独立进程，无全局图 |
 | 异构 | 需要相同的 ggml backend | 自定义 TCP 协议，可跨不同 CPU/GPU |
 | 层范围加载 | 不支持，要自己切模型 | `LLAMA_LAYER_RANGE` 原生支持 |

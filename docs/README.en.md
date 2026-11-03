@@ -2,9 +2,11 @@
 
 [中文](../README.md) | **English**
 
-> Status: two-stage cross-machine chain working; DFlash parallel drafting, SLIM-ARC prefetch,
-> the TUI, the OpenAI-compatible endpoint, sampling and VRAM verification are all in place
-> Last updated: 2026-11-02
+> Status: **Current** — two-stage cross-machine chain working; DFlash parallel drafting, SLIM-ARC
+> prefetch, the TUI, the OpenAI-compatible endpoint, sampling and VRAM verification are all in place
+> Last updated: 2026-11-03
+> Applies to: the engine as a whole — what it is, what has been measured, and what is still
+> missing; readers are integrators and reviewers.
 
 A llama.cpp engine built around **non-whole-model loading**. The full checkpoint stays where it
 is; each node reads only the layers it owns, and stages exchange nothing but a hidden state
@@ -139,8 +141,6 @@ koakuma.py            TUI and boot screen
 checks/               verification and diagnostic scripts (10 verify_*, the rest diagnostics/probes)
 ```
 
-Line counts are omitted on purpose: they expire with every refactor, responsibilities do not.
-
 ---
 
 ## Four constraints worth knowing
@@ -202,12 +202,11 @@ state would be isolated per sequence.
 **Done**: cutting tool retired, both draft sources integrated, DFlash k sweep, SLIM-ARC prefetch
 with its win32 port, speculation wired into the serving path, and a sampling switch for the TUI.
 
-On that serving-path work: `stream.py` used to carry its own plain decode loop, which is why the
-server and TUI never saw DFlash. It now keeps only UTF-8 reassembly, timing and stop conditions,
-and delegates decoding to `chain_client`'s `forward` / `speculate` / `DFlashDriver`. Both the
-server and the TUI gained drafting flags, honoured only at `temperature=0` — measured: the same
-greedy request produces byte-identical output with drafting on and off. Details in
-[`PROGRESS.md`](PROGRESS.md).
+The serving path holds no decode loop of its own: `stream.py` keeps only UTF-8 reassembly, timing
+and stop conditions, and delegates decoding to `chain_client`'s `forward` / `speculate` /
+`DFlashDriver`. Both the server and the TUI expose drafting flags, honoured only at
+`temperature=0` — measured: the same greedy request produces byte-identical output with drafting on
+and off. Details in [`PROGRESS.md`](PROGRESS.md).
 
 ---
 

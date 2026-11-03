@@ -1,7 +1,8 @@
 # TUI 设计
 
-> 状态：**已实现**（`koakuma.py`，Textual）
-> 更新日期：2026-10-31
+> 状态：**已实现**
+> 更新日期：2026-11-03
+> 适用范围：`koakuma.py`（Textual）的布局、启动流程、配置与验收判据；不含管理后台。
 
 ## 1. 要解决的问题
 
@@ -24,10 +25,10 @@
 
 新 TUI 的规模上限：**450 行**。超了说明在往管理后台的方向长，那不在本项目范围内。
 
-> 2026-11-01 实测：`koakuma.py` 已到 567 行，**违反此上限**。超出部分经核对是 Textual 的
-> 组件声明与启动画面（`Boot` / `Metrics` / 三个 `Static` 面板），不是管理功能——没有配置
-> 编辑器、没有设备探测、没有任务队列。上限保留：它是方向哨兵，改数字等于取消它。
-> 真要压回去，先看 `ANTI-ROT.md` §2.2 对 `main()` 的最小切法。
+`koakuma.py` 现为 567 行，超出部分是 Textual 的组件声明与启动画面（`Boot` / `Metrics` /
+三个 `Static` 面板），不是管理功能——没有配置编辑器、没有设备探测、没有任务队列。上限
+保留：它是方向哨兵，改数字等于取消它。真要压回去，看 `ANTI-ROT.md` §2.2 对 `main()` 的
+最小切法。
 
 ## 3. 布局
 
@@ -82,7 +83,7 @@ koakuma
 命令名沿用前身仓库的引擎层命名（`Koakuma` = 统一引擎入口，上层不区分 llama.cpp /
 torch）。放在 `koakuma.cmd`，同时给一个 `koakuma.ps1` 供 PowerShell 直接调。
 
-命令要做的事，按顺序：
+命令按顺序做这些事：
 
 1. 找拓扑：`SA_TOPOLOGY` 环境变量 → 否则 `topology.toml` → 否则列出目录下的候选文件并提示用 `--topology` 指定
 2. 找 shim：`SA_SHIM` → 否则 `H:\slimarc-proto\shim\bin\qlh_keep_head.dll`（`koakuma.py` 的
@@ -91,14 +92,13 @@ torch）。放在 `koakuma.cmd`，同时给一个 `koakuma.ps1` 供 PowerShell �
 4. 起 worker（本机段），连远端段
 5. 进 TUI
 
-**失败要说清楚。** 现在 `chain_client` 报错是 `refusing to start: ... Move a stage to
+**失败要说清楚。** `chain_client` 的报错是 `refusing to start: ... Move a stage to
 another host`，这句话对使用者没有帮助。TUI 启动阶段要把"哪一段、多少内存、差多少"直接
 打在屏幕上。
 
 ## 6. 启动动画
 
-前身仓库的动画"做得很一般"，原因大概率是：全屏擦除 + 逐行打印 ASCII art，一次性的，
-和后面的加载过程没有关系。
+前身仓库的启动动画是全屏擦除 + 逐行打印 ASCII art，一次性的，和后面的加载过程没有关系。
 
 这次的做法：**动画就是加载进度本身**。
 

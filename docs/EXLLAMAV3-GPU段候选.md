@@ -1,29 +1,29 @@
 # ExLlamaV3 作为 GPU 段引擎 —— 候选评估
 
-> 状态：**调研结论，未实施**（只读了代码，没有跑过 v3 的任何一次推理）
-> 更新日期：2026-11-02
->
-> 对象：[turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)（v2 已归档，不讨论）
-> 本地克隆：`H:\_ref\exllamav3`（`git clone --depth 1`）
->
+> 状态：**方案**
+> 更新日期：2026-11-03
 > 适用范围：是否值得把 head 段的推理引擎换成 v3。**不含** CPU 段的任何变更——CPU 段仍由
 > llama.cpp + `LLAMA_LAYER_RANGE` 承担，见 `docs/ARCHITECTURE.md`。
+> 对象：[turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)（v2 已归档，不讨论）；
+> 本地克隆 `H:\_ref\exllamav3`（`git clone --depth 1`）。
 
 ---
 
 ## 0. 结论
+
+证据全部来自读代码，v3 未跑过一次推理（复现步骤见 §8）。
 
 **列为将来候选，不在 v2 做。** 触发条件只有一个：
 
 > 单机单进程的 v3（EXL3 + `-mcl`）在这台机器的 head 段上，decode 明显快于 llama.cpp CUDA 的同一段。
 
 跑不出这条，跨机拆分要付的 22 ms 往返（单程 11 ms，实测）就补不回来，整条路不用走。
-这个判据必须在**改 v3 之前**验证，顺序反了就是白干一周。
+这个判据必须在**改 v3 之前**验证，顺序反了，改动全部返工。
 
 三条已核实的硬障碍（§3）：无 layer_range、EXL3 只能从 HF safetensors 转、8 GB 显存跑 32 层必须配
 `-mcl`。其中只有第一条是真正的开发工作。
 
-**为什么不是"现在就做"**：这条路 v1 走过，就是被砍掉的 F12（`docs/INVENTORY.md:27`，37 文件 /
+**为什么不是"现在就做"**：这条路 v1 走过，就是被砍掉的 F12（`docs/INVENTORY.md` §1，37 文件 /
 27,825 行 / 21.5%，理由"用户明确不接跨框架、不引入 PyTorch"）。v2 至今在 `docs/PROGRESS.md` §5
 挂着"跨框架接力（llama.cpp ↔ torch）| 未做"。重开这条路要先解除那条约束，否则它会以同样的方式
 第二次被否。
@@ -36,10 +36,10 @@ v1 的跨框架接力（GPU 段 PyTorch / CPU 段 llama.cpp）不是技术不可
 
 | 证据 | 位置 |
 | --- | --- |
-| F12 多模态/跨框架/PyTorch = 27,825 行（21.5%），处置**抛弃** | `docs/INVENTORY.md:27` |
-| 理由："用户明确不接跨框架、不引入 PyTorch。这是整仓最大单块" | `docs/INVENTORY.md:107` |
-| SLIM-ARC 设计范围明写"不含 PyTorch" | `docs/DESIGN.md:8`、§2.2 |
-| "跨框架接力（llama.cpp ↔ torch）| 未做" | `docs/PROGRESS.md:116` |
+| F12 多模态/跨框架/PyTorch = 27,825 行（21.5%），处置**抛弃** | `docs/INVENTORY.md` §1 |
+| 理由："用户明确不接跨框架、不引入 PyTorch。这是整仓最大单块" | `docs/INVENTORY.md` §3 |
+| SLIM-ARC 设计范围明写"不含 PyTorch" | `docs/DESIGN.md` 头部适用范围、§2.2 |
+| "跨框架接力（llama.cpp ↔ torch）| 未做" | `docs/PROGRESS.md` §5 |
 
 所以本评估的隐含前提是：**"不引入 PyTorch"这条约束解除**。建议将来单开仓库时把它写进 README
 第一段，作为显式前提，而不是留成一个会被反复重新讨论的隐性否决。
@@ -76,7 +76,7 @@ v3 README 的架构表里有 `Qwen3NextForCausalLM` / `Qwen3_5MoeForConditionalG
 | 多卡层切分 | 支持（含 autosplit：跑 measuring forward 真实测 transient，OOM 就退到下一张卡） | `model/model_ls.py` 的 `_load_autosplit` |
 
 CUDA graph 那一条对本项目有直接意义：Surface 侧 Vulkan 的 perf 日志里 `CPY ×136 = 13 ms/token`
-是纯 launch/拷贝开销（见 `docs/MEASUREMENTS.md`），v3 的 graph capture 正是治这个的。
+是纯 launch/拷贝开销（Surface 侧 Vulkan perf 日志实测），v3 的 graph capture 正是治这个的。
 
 ---
 
@@ -104,12 +104,12 @@ CUDA graph 那一条对本项目有直接意义：Surface 侧 Vulkan 的 perf �
 
 ### 3.4 8 GB 显存
 
-32 层 3 bpw ≈ 10+ GB，8 GB 装不下，必须配 `-mcl`（部分专家落本机内存）。这不是障碍，是配置约束。
+32 层 3 bpw ≈ 10+ GB（推算），8 GB 装不下，必须配 `-mcl`（部分专家落本机内存）。这不是障碍，是配置约束。
 
-### 3.5 CUDA-only —— 在本架构下**不构成障碍**
+### 3.5 CUDA-only 在本架构下不构成障碍
 
-v3 只在 head 的 NVIDIA 上跑，永远不需要认识 Intel 核显；Surface 继续跑 llama.cpp CPU。
-这一条在本评估里要明确写下来，避免被误当成否决理由。
+v3 只在 head 的 NVIDIA 上跑，不需要认识 Intel 核显；Surface 继续跑 llama.cpp CPU。
+CUDA-only 因此不是否决理由。
 
 ---
 
@@ -150,7 +150,7 @@ v3 + EXL3（0:32 层）  ──hidden 8 KB──▶  llama.cpp + LLAMA_LAYER_RAN
 
 ## 7. 与 NInfer 的比较判据
 
-本评估**没有调研 NInfer**（只在 `docs/DESIGN.md:8` 见过一句"NInfer 为并行评估支线"）。将来两者
+本评估**没有调研 NInfer**（只在 `docs/DESIGN.md` 头部「相关」行见过一句"NInfer 为并行评估支线"）。将来两者
 并列时，建议统一用下面四条打分，否则不可比：
 
 1. 本项目架构（`qwen35moe` + GDN + MTP 头）是否原生支持
@@ -160,7 +160,7 @@ v3 + EXL3（0:32 层）  ──hidden 8 KB──▶  llama.cpp + LLAMA_LAYER_RAN
 
 ---
 
-## 8. 复现本次调研
+## 8. 调研复现
 
 ```powershell
 git clone --depth 1 https://github.com/turboderp-org/exllamav3 H:\_ref\exllamav3

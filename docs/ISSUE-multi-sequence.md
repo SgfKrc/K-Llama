@@ -1,8 +1,17 @@
 # ISSUE：多序列共享的可行性
 
-> 状态：调研结论，未实现
+> 状态：**方案**
 > 更新日期：2026-11-03
-> 结论：**有条件做**。推荐「一条连接内 2 个 seq 轮流 decode」，3~4 人天；README 那条描述的两个前提都是错的。
+> 适用范围：一条链路内多序列（`n_seq_max > 1`）的可行性评估与最小改动清单；读者为链路与内核维护者。代码未实现。
+> 相关：`SPECULATION.md`（`SA_N_RS_SEQ`）、`MEMORY-LIMITS.md`（每段固定开销）
+
+README「未做」第 3 条把 `kv_unified` 与 recurrent state 隔离当成前提，两个前提都不成立
+（见下文）。可行路径是「一条连接内 2 个 seq 轮流 decode」，**有条件做**，3~4 人天，收益是
+会话共存与前缀复用。**待定项**：三条推断未经实验——交替 decode 与各自单独 decode 逐位
+等价、`build_rs_shift_snapshots` 在多 seq 下逐 cell 正确、两段 `n_seq_max` 同值即可同步；
+实验设计与靶子见〈证据边界〉。
+
+---
 
 ## 结论
 
@@ -10,7 +19,7 @@
 
 多序列买到的是**会话共存 + 前缀复用**（`server.py:159` 现在每个请求都 `client.reset()` 重放整个 prompt），不是吞吐：一个 worker 一个 context，decode 仍串行。
 
-## README「未做」第 3 条哪里不准
+## README「未做」第 3 条的两个前提不成立
 
 > 多序列共享。需 `kv_unified` 与每段多序列位置；先解决 hybrid 模型那 30 层 linear 的 recurrent state 隔离。
 
@@ -37,7 +46,7 @@
 | `src/llama-memory-recurrent.cpp:781-861` | `state_write(io, seq_id)` 支持 per-seq 序列化；API 在 `include/llama.h:900-915` |
 | `src/llama-memory-hybrid.cpp:144-151` | `seq_rm` 先 recurrent 后 attn，前者失败直接 return false |
 
-**关于第 3 问的追问**（跨 ubatch 快照 vs 跨 seq）：**不是同一个根**。前者是 `n_rs_seq` 的时间维度（快照不滚动，已修）；后者是 cell 索引的空间维度（`s_copy` 按 cell 的 `seq_id` 取 `rs_idx`，`:1361-1378`）。我们的补丁 `build_rs_shift_snapshots`（`src/llama-graph.cpp:4028-4090`）以 `ubatch.n_seq_tokens` 为单位、逐 cell 独立移位，与 seq 数无关，两者不冲突。
+**跨 ubatch 快照与跨 seq 不是同一个根。** 前者是 `n_rs_seq` 的时间维度（快照不滚动，已修）；后者是 cell 索引的空间维度（`s_copy` 按 cell 的 `seq_id` 取 `rs_idx`，`:1361-1378`）。我们的补丁 `build_rs_shift_snapshots`（`src/llama-graph.cpp:4028-4090`）以 `ubatch.n_seq_tokens` 为单位、逐 cell 独立移位，与 seq 数无关，两者不冲突。
 
 ### shim（本项目）：ABI 有一半，装载与分发全锁死
 
@@ -66,29 +75,31 @@ llama_kv_cache:        10.00 MiB (512 cells, 10 layers, 1/1 seqs)
 llama_memory_recurrent: 62.81 MiB (1 cells, 40 layers, 1 seqs 0 rs_seq)
 ```
 
-KV 总量不随 seq 数增长（非 unified 时 ctx 被切分，unified 时池共享）；**RS 每 seq 一份，约 62.81 MiB/seq（ctx 无关）**。开投机时按 `n_rs_seq+1` 再乘：`docs/SPECULATION.md:61` 的 `SA_N_RS_SEQ=4` 下 head 251.25 + tail 62.81 MiB，2 seq 就是 628 MiB。
+KV 总量不随 seq 数增长（非 unified 时 ctx 被切分，unified 时池共享）；**RS 每 seq 一份，约 62.81 MiB/seq（ctx 无关）**。开投机时按 `n_rs_seq+1` 再乘：`docs/SPECULATION.md:61` 的 `SA_N_RS_SEQ=4` 下 head 251.25 + tail 62.81 MiB，2 seq 推算 `(251.25 + 62.81) × 2 = 628.12` MiB。
 
 ## 三条路径
 
-| 路径 | 做法 | 改动面 | 代价 | 人天 |
+| 路径 | 做法 | 改动面 | 代价 | 人天（推算） |
 | --- | --- | --- | --- | --- |
 | **A 单连接多 seq** | 装载放开 `n_seq_max=2`；shim 加 token 通道多 seq 前向；协议 meta 加 `seq_id`；客户端按 seq 记位置 | `keep_head_worker.py` 2 行、shim +40 行 C、`keep_head/engine/stage_worker` 约 30 行、`chain_client` 约 60 行、`server.py` 会话→seq 映射约 80 行 | 显存 +63 MiB/seq（不投机）；decode 仍串行，收益只在前缀复用 | **3~4** |
-| **B 每 seq 一个 context** | 每段起 N 个 worker，一条连接绑一个 context | 内核零改动，但拓扑、启动、预算、端口全要扩；权重靠 OS 页缓存共享 | 每 seq 多一份 compute buffer + RS + KV：`docs/MEMORY-LIMITS.md:46` 的每段固定开销 640 MiB 会乘 N | **4~6** |
+| **B 每 seq 一个 context** | 每段起 N 个 worker，一条连接绑一个 context | 内核零改动，但拓扑、启动、预算、端口全要扩；权重靠 OS 页缓存共享 | 每 seq 多一份 compute buffer + RS + KV：`docs/MEMORY-LIMITS.md` §2 的每段固定开销 640 MiB 会乘 N | **4~6** |
 | **C state 存盘/重放** | 导出 `llama_state_seq_get_data/set_data`（`include/llama.h:900-915`），切换时整体换 state | shim +60 行（4 个导出）；Python 侧只用 seq 0 | 每次切换 memcpy 约 140 MiB（4096 ctx，全模），几十 ms；对每步 48 ms 的链路是可感知的抖动 | **2~3** |
 
-真并发混批（多 seq 的 token 进同一个 ubatch 换吞吐）不建议：要同时满足 `equal_seqs`、batch 内 seq 递增（`src/llama-batch.cpp:648`）、kq_mask 按 `n_stream` 分块（`src/llama-graph.cpp:37`）、per-seq 采样；而且 DFlash 的 draft context 固定 `n_seq_max=1`（`shim/qlh_keep_head_gpu.c:684`），混批后它按行取 `layer_inp` 会对不上 seq。**8~12 人天**，且收益是吞吐不是延迟。
+真并发混批（多 seq 的 token 进同一个 ubatch 换吞吐）不建议：要同时满足 `equal_seqs`、batch 内 seq 递增（`src/llama-batch.cpp:648`）、kq_mask 按 `n_stream` 分块（`src/llama-graph.cpp:37`）、per-seq 采样；而且 DFlash 的 draft context 固定 `n_seq_max=1`（`shim/qlh_keep_head_gpu.c:684`），混批后它按行取 `layer_inp` 会对不上 seq。**8~12 人天（推算）**，且收益是吞吐不是延迟。
 
 ## 只做「2 个 seq 轮流用」的最小改动
 
 按依赖顺序，除 `server.py` 外共 5 处：
 
-| # | 位置 | 改什么 | 量 |
+| # | 位置 | 改什么 | 量（推算） |
 | --- | --- | --- | --- |
 | 1 | `keep_head_worker.py:240` | 从 `SA_N_SEQ_MAX` 读，替掉硬编码的 `1` | 2 行 |
 | 2 | `shim/qlh_keep_head_gpu.c` | 新增 token 通道多 seq 前向：照抄 `qlh_kh_forward`，改用 `qlh_fill_explicit` 填 `n_seq_id/seq_ids/positions` | +35 行 C |
 | 3 | `keep_head_worker.py:456` → `keep_head.py:342` → `engine.py:202` | `seq_rm` 一路加 `seq_id`（shim 的 ABI 已有，只是被传 0） | 约 12 行 |
 | 4 | `stage_worker.py:136-138` 与 `:259-261` | forward / `op=seq_rm` 从 meta 读 `seq_id`，缺省 0 即完全向后兼容；`RESET` 保持全局 | 约 10 行 |
 | 5 | `chain_client.py:470-497,1000-1046` | `StageClient` 与 `_walk` 透传 `seq_id`；调用方把单个 `n_past` 换成每 seq 一份位置 | 约 50 行 |
+
+表中行数按现有调用链估算，非实测。
 
 `protocol.py` 一行不动（meta 是自由 dict）。真正的大头在 `server.py:150-159` 的「会话 → seq」映射与去掉每请求 `reset()`（约 80 行），但那是产品层，不参与「内核能不能做」的判断。
 
@@ -98,7 +109,7 @@ KV 总量不随 seq 数增长（非 unified 时 ctx 被切分，unified 时池�
 
 1. **收益场景必须确认为 `server.py` 的多轮前缀复用**。若目标是吞吐，别做——瓶颈在跨机往返与串行 decode，多序列一点不改善。
 2. **先花 0.5 人天做等价性判据**：2B 整模、`n_seq_max=2`、`SA_N_RS_SEQ=0`，同一段 prompt 交替 decode 两条 seq（覆盖反序首次 decode、清空一条后重建），与各自单独跑逐位对比 token 与 hidden（判据沿用 `checks/verify_equiv.py`）。代码读下来结构是自洽的，但有两处只靠约定：`seq_rm` 的部分回滚用 `cells[seq_id].tail` 取本 seq 的 cell（`:193`），而 `cells` 同时兼作「每 seq 一条元数据」的表——这个双重身份只在 `size == n_seq_max`（`src/llama-model.cpp:3226`）且 `seq_id < size`（`:187` 与 `:545` 两处检查）时成立；`rs_idx` 是消费式的（`s_copy` 读一次清零，`:1370-1375`），多 cell 交错 decode 时是否每次都取对，只有跑一遍才算数。
-3. **两段的 `n_seq_max` 与 `n_ctx` 必须同值**。`n_ctx_seq = n_ctx / n_seq_max` 在两段各算一次，不一致会让两个 seq 的位置边界错开——这正是第 5 问的坑，且是静默的。
+3. **两段的 `n_seq_max` 与 `n_ctx` 必须同值**。`n_ctx_seq = n_ctx / n_seq_max` 在两段各算一次，不一致会让两个 seq 的位置边界错开——这是静默的。
 4. **DFlash 先不开**。draft context 是独立 context 且 `n_seq_max=1`（`shim/qlh_keep_head_gpu.c:684`），多 seq 与 `n_rs_seq` 相乘的显存账要先算清。
 5. `RESET` 保持全局，`seq_rm` 加 `seq_id`——回滚本来就是 per-seq 的（`rs_idx`），别做成全局删。
 
