@@ -43,6 +43,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
+# 仓库里本文件在 checks/ 下、模块在上一级；打进包里时它与 worker/ 同级。
+# 判据用 protocol.py 落在哪，和 scripts/probe.py 用同一套，别再造第三份布局假设。
+for _cand in (HERE.parent, HERE, HERE / "worker", HERE.parent / "worker"):
+    if (_cand / "protocol.py").is_file():
+        REPO = _cand
+        break
 sys.path.insert(0, str(REPO))
 
 import config  # noqa: E402
@@ -154,6 +160,11 @@ def run(args: argparse.Namespace) -> dict:
         local = {stage.index: proc for proc, _log, stage in procs}
         for c in clients:
             c.connect(proc=local.get(c.stage.index))
+        # 复用已有 worker 时（弱设备链上 tail 常年常驻）KV 里可能留着上一次的位置，
+        # 不 reset 就会从那个 n_past 接着写、llama_decode 直接 rc=-1。本机自己 spawn
+        # 的段是全新的所以看不出这个问题，跨机时才暴露。
+        for c in clients:
+            c.reset()
         # greedy：R4 要比 token 序列，任何采样随机性都会让两边"不一致"变得不可解释。
         for c in clients:
             c.set_sampling(temperature=0.0, top_p=1.0, top_k=0)
