@@ -83,7 +83,13 @@ hybrid 模型（Qwen3.5/3.6 的 `LLL F` 交替结构）上，`llama_memory_seq_r
 
 最后一行不是回滚缺陷：`n_tokens > 1` 走 `GDN_CH`（chunked）、单 token 走 `GDN_AR`，
 两套 kernel 的浮点累加顺序不同，同一位置的 state 差 ~1e-2。**同形状回滚是精确的**，
-跨形状的差异与回滚无关，且实测不影响 argmax。
+跨形状的差异与回滚无关。
+
+**「不影响 argmax」只在短上下文成立**（2026-11-03 修正）。35B 多轮对话实测：`spec_k=0`
+时续用增量 KV 与从头重放逐位相同（23/23 token）；`spec_k=1/2` 时出现措辞分叉
+（`first_diff` 9~11，上下文 100+ token），答案仍对，但已经不是同一条计算。这 ~2e-2
+会随上下文累积，长上下文里足以翻一个 argmax。判据与数据见
+`checks/verify_multiturn.py` 的 R4 与 `checks/_multiturn-35b-spec{1,2}.json`。
 
 ## 代价与限制
 

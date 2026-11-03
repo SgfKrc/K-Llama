@@ -1,246 +1,148 @@
-# 交付清单与 ROG 部署
+# 交付状态与部署
 
-> 状态：**待提交**
-> 更新日期：2026-10-29
+> 状态：**现行**
+> 更新日期：2026-11-03
+>
+> 回答两件事：现在能交付什么、拿到手怎么跑起来。
+> 机制见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，数字口径见 [`MEASUREMENTS.md`](MEASUREMENTS.md)，
+> 弱设备链的拆解见 [`ANDROID-SURFACE-段接入评估.md`](ANDROID-SURFACE-段接入评估.md)。
 
 ---
 
-## 一、首期已完成
+## 一、能交付什么
 
-### 1.1 代码（仓库根，1406 行 + 裁切工具 269 行）
+### 1.1 已验证的能力
 
-| 模块 | 行数 | 职责 | 验证状态 |
-| --- | ---: | --- | --- |
-| `protocol.py` | 66 | 6 种消息，长度前缀帧，hidden 走原始 f32 | ✅ 两段链路跑通 |
-| `config.py` | 43 | 环境变量（7 个） | ✅ |
-| `topology.py` | 166 | TOML → `tuple[Stage, ...]`，10 条校验 | ✅ 26 单测通过 |
-| `keep_head.py` | 227 | shim 客户端（子进程架构） | ✅ 逐位正确 |
-| `keep_head_worker.py` | 201 | shim worker（隔离 CRT 与后端注册表） | ✅ |
-| `engine.py` | 85 | 单段引擎封装 | ✅ |
-| `stage_worker.py` | 132 | 单段 TCP 服务端 | ✅ |
-| `chain_client.py` | 333 | N 段链式客户端 + 内存预检 | ✅ 两段 10.6 t/s |
-| `cut.py` | 269 | GGUF 裁层（三模式） | ✅ SHA256 与旧工具一致 |
-| `check_correct.py` | 74 | 数值对照 | ✅ max abs diff = 0 |
-| `runner.py` | 79 | 同进程两段串联（工具用） | ✅ |
+| 能力 | 结果 | 证据 |
+| --- | --- | --- |
+| 单机两段跨进程 + DFlash | 20.9 tok/s（64 token 口径） | [`SPECULATION.md`](SPECULATION.md) §11 |
+| 跨机两段，无投机 | 12.2 tok/s | [`MEASUREMENTS.md`](MEASUREMENTS.md) |
+| 两台弱设备各持整模 | decode 6.50 tok/s，prefill 22 tok/s | [`PROGRESS.md`](PROGRESS.md) §1.1 |
+| 多轮对话 | 35B 三轮 PASS；增量 KV 与从头重放逐位相同（23/23 token） | `checks/verify_multiturn.py` |
+| 非贪心采样 | 分段不引入误差（TV=0）；输出连贯 | `checks/probe_logits_delta.py` |
+| 常驻与自愈 | kill 掉任一段 worker 后 2 秒重启，链路恢复 | `stage_supervisor.py` |
+| 绿色目录 | 96 MB，清空工作区后独立跑通 | `scripts/pack-portable.py` |
 
-### 1.2 已验收的硬指标
+**分段本身不引入误差**（2026-11-03）：同 kernel 布局下整模与链路在同一位置的 logits
+逐位相同（`max_abs=0`、`cos=1.0000000`、top-8 全重合、TV=0），2B 测 16 个位置、
+35B 测 12 个位置无例外。段间传 float32 hidden 不是「误差落在量化噪声底下」，是没有误差。
 
-| 指标 | 结果 |
+### 1.2 没验证的
+
+| 项 | 为什么算未验证 |
 | --- | --- |
-| 裁层数值无损 | `max abs diff = 0.000000e+00`，`cosine = 1.000000119` |
-| 裁切工具字节一致 | 三种模式写出的文件 SHA256 与旧工具**完全相同** |
-| 跨进程链路 | 两段 `tg32 = 10.6 t/s`（tail 段 81 ms） |
-| fail-closed | 4 种非法切点全部 rc=2，错误含 `full_attention_interval` |
-| 单进程基线 | `-ngl 99 -ncmoe 32` = **28.02 t/s** |
-
-### 1.3 文档（14 份）
-
-| 文档 | 内容 |
-| --- | --- |
-| `ARCHITECTURE.md` | 架构定稿（两路径正交、设备切分、协议、配置） |
-| `MEASUREMENTS.md` | 全部实测数据（单进程扫描、两进程、分段方差） |
-| `MEMORY-LIMITS.md` | 内存硬约束（黑屏教训、绑核 24 倍惩罚） |
-| `CUT-TOOL.md` | 裁切工具验证报告 |
-| `DECISIONS.md` | 保留/抛弃决策（基于旧仓库盘点） |
-| `INVENTORY.md` | 旧仓库 232 文件 / 129,337 行全量盘点 |
-| `BASELINE.md` | 层段接力链路盘点（含 3 处设计文档纠错） |
-| `PRIMA-LESSONS.md` / `PRIMA-ANALYSIS.md` | prima.cpp 借鉴结论 |
-| `SLIMARC-INTEGRATION.md` | SLIM-ARC 接入障碍（不支持 qwen35moe） |
-| `TESTING.md` | 测试策略（反 CI 脆性） |
-| `FIXES.md` | 已修缺陷（含 shim 的 C bug） |
-| `PROGRESS.md` / `DESIGN.md` | 早期设计 |
+| 真正干净的 Windows | 只清空了工作区，VC++ 运行库等系统依赖还在；`bin/` 里那 4 个 MSVC dll 就是为此准备的，但没在全新系统上确认过 |
+| 三台及以上机器 | 拓扑与 supervisor 都支持 N 段，但只跑过 2 段 |
+| 除 `qwen35` / `qwen35moe` 外的架构 | 见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 的架构适配说明 |
 
 ---
 
-## 二、提交到 git
+## 二、部署
 
-### 2.1 应提交
+### 2.1 每台机器放什么
 
-仓库根就是项目根（本分支是独立起点，不套子目录）：
+一台机器跑一段。每段都要**同一份完整整模**（`LLAMA_LAYER_RANGE` 只选层，不建裁层工件）。
 
-```
-*.py                        # 协议 / 链路 / 引擎 / 服务端 / TUI
-*.toml                      # 拓扑
-README.md
-docs/                       # 文档
-  *.md
-checks/                     # 验收脚本，可独立运行
-  verify_responses.py
-  verify_tui.py
-  verify_tui_text.py
-shim/
-  qlh_keep_head_gpu.c       # 改版 shim 源码（+80 行）
-  qlh_keep_head.def         # MSVC 导出清单
-  qlh_keep_head-gpu.patch   # 可应用补丁
-  build_cuda_shim.ps1       # 构建脚本
-  build_shim_msvc.ps1
+```bash
+python scripts/pack-portable.py \
+    --python  <装好 numpy 的 CPython 3.12> \
+    --llama-bin <llama.dll 与 ggml*.dll 所在目录> \
+    --shim    <带 QLH_ABI_UPSTREAM_HEADER 的 qlh_keep_head.dll>
+
+cd .qlh_tmp/dist && tar czf qlh-portable.tgz qlh-portable
 ```
 
+产物解压到目标机器，改 `config.toml` 后跑 `run.bat`。安卓侧用
+`scripts/termux-install.sh`，见 [`PACKAGING.md`](PACKAGING.md)。
 
-### 2.2 不应提交
-
-| 项 | 原因 |
-| --- | --- |
-| `shim/bin/`（553 MB） | 二进制，应放 release 或构建产出 |
-| `build/` | 构建中间产物 |
-| `exp/`（14 MB） | 实测日志，选几个代表性的进 docs 即可 |
-| `SLIM-ARC-main/` / `SLIM-ARC-sparse/` | 第三方克隆，用 `.gitignore` |
-| `slimarc-trial/` | 临时试用目录 |
-| `F:\qlh-models\*` | 模型，不进 git |
-
-### 2.3 建议的 `.gitignore`
-
-```gitignore
-build/
-__pycache__/
-shim/bin/
-shim/_gen/
-shim/_test/
-exp/
-SLIM-ARC-main/
-SLIM-ARC-sparse/
-slimarc-trial/
-*.gguf
-```
-
----
-
-## 三、ROG 需要拷什么
-
-### 3.1 结论：只需要 3 样，共约 9 MB 代码 + 8.96 GB 模型
-
-| # | 内容 | 大小 | 说明 |
-| --- | --- | ---: | --- |
-| 1 | **CPU 版 shim**（9 个 DLL） | **9.9 MB** | 从 `G:\C\PYT\qlh\build\keephead\build-cpu-skiplogits\bin\` 整个目录 |
-| 2 | **仓库根（Python 代码）** | 约 250 KB | Python 代码 |
-| 3 | **`stage-24-40.gguf`** | **8.96 GB** | tail 段工件 |
-
-**不需要**：CUDA 版 shim（553 MB）、整模（20.8 GB）、其他两段。
-
-### 3.2 为什么用 CPU 版 shim
-
-已实测验证（本机模拟）：
-
-```
-用 build-cpu-skiplogits/bin 的 shim 加载 stage-24-40.gguf
-→ LOADED n_embd=2048  n_layer=16  ✅
-```
-
-它是**旧版 shim**（不含 `SA_N_GPU_LAYERS` / `SA_N_CPU_MOE` / `SA_BACKEND_DIR`），
-但硬编码 `n_gpu_layers=0`——**这正是 ROG 纯 CPU 需要的**。
-
-### 3.3 模型：两个方案
-
-#### 方案 A：直接拷切好的 tail 段（推荐，省时）
-
-拷贝 `F:\qlh-models\stage-split-3\stage-24-40.gguf`（8.96 GB）。
-
-#### 方案 B：ROG 上有整模则本地切
-
-```powershell
-python cut.py --src <整模路径> --dst stage-24-40.gguf --k 24
-```
-
-- 峰值内存仅 **1.5 GB**（实测，与模型规模无关）
-- 耗时约 3–5 分钟
-- 缺点：需要 ROG 上有 20.8 GB 整模
-
-**若 ROG 要下载模型，方案 A 更快**（8.96 GB vs 20.8 GB）。
-
-### 3.4 ROG 上的目录结构
-
-```
-D:\slimarc\                       # 或任意盘
-  slimarc\                        # Python 代码
-    stage_worker.py
-    keep_head.py
-    keep_head_worker.py
-    engine.py
-    protocol.py
-    config.py
-    topology.py
-    cut.py
-  shim\bin\                       # 9 个 CPU DLL（9.9 MB）
-    qlh_keep_head.dll
-    libllama.dll
-    ggml.dll
-    ggml-base.dll
-    ggml-cpu.dll
-    libgcc_s_seh-1.dll
-    libgomp-1.dll
-    libstdc++-6.dll
-    libwinpthread-1.dll
-  models\
-    stage-24-40.gguf              # 8.96 GB
-```
-
-### 3.5 ROG 上启动命令
-
-```powershell
-cd D:\slimarc\slimarc
-python stage_worker.py `
-    --role tail `
-    --model D:\slimarc\models\stage-24-40.gguf `
-    --shim D:\slimarc\shim\bin\qlh_keep_head.dll `
-    --host 0.0.0.0 --port 9103 `
-    --ctx 4096 --threads 6 --layers 16 `
-    --n-gpu-layers 0 --n-cpu-moe 0
-```
-
-**注意**：
-- `--host 0.0.0.0` 才能接受外部连接（不是 `127.0.0.1`）
-- `--threads 6`：ROG 是 6 核 12 线程，给 6
-- **不需要 `--cpus`**：ROG 是同构 x86，没有 P/E 核
-- 需要 Python 3.10+ 与 `numpy`、`psutil`
-
-### 3.6 ROG 上的 Python 依赖
-
-```powershell
-pip install numpy psutil
-```
-
-`gguf` 只在裁切时需要，跑 worker 不需要。
-
----
-
-## 四、master 侧的配置改动
-
-把 `topology.toml` 里 tail 段的 host 改成 ROG 的局域网 IP：
+### 2.2 拓扑怎么写
 
 ```toml
+source_layers = 40
+
 [[stage]]
-model      = "F:/qlh-models/stage-split-3/stage-24-40.gguf"
-host       = "192.168.1.XX"      # ← 改成 ROG 的实际 IP
-port       = 9103
-layers     = 16
-kind       = "tail"
-gpu_layers = 0
-cpu_moe    = 0
-cpus       = ""
-threads    = 6
+model       = "<本机路径>/model.gguf"
+host        = "0.0.0.0"        # 本机段写 0.0.0.0，见下
+port        = 9103
+layers      = 24
+layer_range = "0:24"
+kind        = "gpu"
+threads     = 6
+
+[[stage]]
+model       = "<那台机器上的路径>/model.gguf"
+host        = "100.x.x.x"      # 远端段写真实地址
+port        = 9106
+layers      = 16
+layer_range = "24:40"
+kind        = "tail"
+threads     = 5
 ```
 
-改完后 master 只加载段 0 与段 1（12.89 GiB），内存预算：
-`12.89 / 0.75 = 17.2 GiB` —— 本机常态可用 20–26 GiB，**通过**。
+三条硬约束：
+
+1. **`host` 有两个含义**：既是连接地址，也是 worker 的 bind 地址。本机段写
+   `127.0.0.1` 会让 worker 只绑回环、远端 connection refused；写 `0.0.0.0` 才既绑全接口
+   又被 `topology.is_loopback` 认成本机段。
+2. **切点与段内层数都是 4 的倍数**：`qwen35moe` 是 hybrid（每 4 层一个 full attention），
+   错位会层类型不匹配。`32:38` 这种 6 层划分在解析阶段就被拒绝。
+3. **两段的 `model` 必须是同一个文件**。要机器可查就填 `sha256`（可选，代价约 30 秒）。
+
+### 2.3 起服务
+
+```bash
+# 单段（调试）
+python stage_worker.py --role gpu --model <gguf> --shim <dll> \
+    --host 0.0.0.0 --port 9103 --threads 6 --layers 24 --ctx 2048
+
+# 常驻（推荐）：读拓扑起本机段，崩了按退避重启
+SA_TOPOLOGY=<topology.toml> python stage_supervisor.py
+```
+
+两端都起来后自检：
+
+```bash
+python scripts/probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
+```
+
+它会校验层数合计、层范围首尾相接、hidden 宽度三项，任一不符直接非零退出——
+这三项都是「不报错但输出错误」的那类故障。
 
 ---
 
-## 五、还需要做什么
+## 三、明确不做的
 
-### 5.1 首期未完成项
+| 想法 | 理由 |
+| --- | --- |
+| 服务发现（mDNS / 注册中心） | 2–3 台机器，Tailscale 加手填 IP 够用；出问题时 `probe.py` 能立刻分出「连不上」与「连上了没发 HELLO」 |
+| Android APK | 要 NDK 重编（Termux 的 libc++ 与 bionic 不是一回事）、python 栈要么塞解释器要么重写、23.5 GiB 模型还得让用户 SAF 选一次。一键脚本成本低一个数量级 |
+| 单独的健康探测层 | 已用「`keep_head` 子进程没了就让 `stage_worker` 自己退出」消除了「活着但不可用」这个状态；再加探测就是给同一事实造第二份判断 |
+| 真并发混批（多序列换吞吐） | 8–12 人天，且一个 worker 一个 context、decode 仍串行。多序列的收益是会话共存与前缀复用，见 [`ISSUE-multi-sequence.md`](ISSUE-multi-sequence.md) |
+| 非贪心的 GPU 逐位等价 | head 段 6 层在 GPU 时 TV 0.0014–0.0299；要逐位就把 `gpu_layers` 设 0，代价是 32 层全走 CPU |
 
-| 项 | 状态 | 说明 |
-| --- | --- | --- |
-| 三段端到端 | ❌ | 必须等 ROG 就位 |
-| SLIM-ARC 接入 | ❌ | 不支持 `qwen35moe`，需改补丁 15–25 行 |
-| Rust 控制面 | ❌ | 计划在实验之后 |
-| 逐 token argmax 全链对照 | ❌ | 两段已验 hidden 逐位一致，全链未验 |
-| OpenAI SSE | ⛔ 不做 | 本期范围外 |
+---
 
-### 5.2 建议的实验顺序
+## 四、已知边界
 
-1. ROG 配好 → master 改 `topology.toml` 的 host
-2. **先 `--dry-run`** 确认内存预算通过
-3. 跑 `--gen 32 --repeat 2`，看三段是否串通
-4. 若通了，跑 `scripts/check_correct.py` 验数值
-5. 记录 ROG 每层耗时与真实 RTT
+- **hybrid 不允许删最后位置**：`seq_rm` 收不回投机多算的位置（实测 `removed=0`，
+  随后 decode 报 `pos_max X must be < n_past Y`），只能记账。
+- **spec_k>0 时多轮不逐位可复现**：投机回滚的 ~2e-2 跨形状偏差在 100+ token 上下文里
+  累积到翻转一个 argmax（答案仍对）。`spec_k=0` 下逐位相同。
+- **supervisor 只看进程存活**：`stage_worker` 的内部失效已靠自愈退出覆盖，但
+  「进程活着且 keep_head 也活着、但输出错」这种不在它的判据里。
+- **端口被占会等 60 秒后放弃该段**：不需要自愈，需要人去看是谁占着；`*.prev.log`
+  留着崩溃现场。
+- **`n_ctx / n_seq_max` 在两段各算一次**：多序列时两段的 `n_seq_max` 与 `n_ctx`
+  必须同值，否则位置边界错开且不报错。
+
+---
+
+## 五、验收命令
+
+```bash
+python -m unittest test_contract test_topology    # 39 项
+python checks/verify_multiturn.py                 # 多轮 R1–R5
+python checks/probe_logits_delta.py --topology topology-2b.toml --steps 7
+```
+
+补丁或 shim 重编后跑等价性对照：`checks/verify_equiv.py`、`checks/verify_cli.py`。
