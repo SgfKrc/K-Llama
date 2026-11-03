@@ -156,3 +156,16 @@ supervisor 自己的 PID 不变。
 会自己以非零码退出（先关监听 socket，好让接手的进程立刻绑回同一端口），让 supervisor
 的 `poll()` 看见。这样「进程存活」重新等价于「段可用」，不需要第二套健康探测——
 就绪判据仍然只有 HELLO。
+
+## 8. Windows 侧常驻：三个坑
+
+Surface Pro 7 是纯 Windows，没有 termux 的 `setsid`，让 supervisor 真正常驻踩了三个：
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| ssh 一断子进程被收走 | `start /b` 起的 python 在会话结束时悄悄消失，日志停在中间 | `schtasks /ru SYSTEM /rl HIGHEST` 建任务，进程挂到 service 会话下 |
+| `.cmd` 里的中文注释 | cmd.exe 按 GBK 解析 UTF-8，注释被当成命令：`'...' 不是内部或外部命令` | 启动脚本只写 ASCII 注释 |
+| 防火墙拦入站 | 本机连 9104 是 connection refused，对端 `netstat` 却显示 LISTENING | `netsh advfirewall firewall add rule name=qlh9104 dir=in action=allow protocol=TCP localport=9104` |
+
+`SA_CTX` 必须在启动脚本里显式导出（`set SA_CTX=1024`），否则 `config.DEFAULT_CTX=4096`
+会让这一段的 seq 边界和另外两段错开——不报错，只是算得不对。
