@@ -1,8 +1,13 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # 把一台 Termux 设备准备成推理链的一段，然后后台常驻。
 #
+# 单段（调试用）：
 #   bash termux-install.sh --fork ~/qlh-fork --model ~/qwen36-35b-a3b-q6k.gguf \
 #                          --range 24:40 --port 9106
+#
+# 常驻（推荐）：把自己这段交给 supervisor，崩了按退避自动重启
+#   bash termux-install.sh --fork ~/qlh-fork --model ~/qwen36-35b-a3b-q6k.gguf \
+#                          --role supervisor --topology ~/qlh-worker/topology.toml
 #
 # 脚本是幂等的：依赖已装、fork 已编、shim 已编都会跳过，重复跑只做缺的部分。
 #
@@ -29,37 +34,50 @@ die() { printf '\033[31m错误：%s\033[0m\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --fork)    FORK="$2"; shift 2 ;;
-        --model)   MODEL="$2"; shift 2 ;;
-        --range)   RANGE="$2"; shift 2 ;;
-        --port)    PORT="$2"; shift 2 ;;
-        --threads) THREADS="$2"; shift 2 ;;
-        --ctx)     CTX="$2"; shift 2 ;;
-        --role)    ROLE="$2"; shift 2 ;;
-        --host)    HOST="$2"; shift 2 ;;
-        --log)     LOG="$2"; shift 2 ;;
+        --fork)     FORK="$2"; shift 2 ;;
+        --model)    MODEL="$2"; shift 2 ;;
+        --range)    RANGE="$2"; shift 2 ;;
+        --port)     PORT="$2"; shift 2 ;;
+        --threads)  THREADS="$2"; shift 2 ;;
+        --ctx)      CTX="$2"; shift 2 ;;
+        --role)     ROLE="$2"; shift 2 ;;
+        --host)     HOST="$2"; shift 2 ;;
+        --topology) TOPOLOGY="$2"; shift 2 ;;
+        --log)      LOG="$2"; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) die "未知参数 $1" ;;
     esac
 done
 
 [ -n "$FORK" ]  || die "必须给 --fork（llama.cpp fork 的源码目录）"
-[ -n "$MODEL" ] || die "必须给 --model（完整整模的 .gguf 路径）"
-[ -n "$RANGE" ] || die "必须给 --range（如 0:24 或 24:40）"
-
-case "$RANGE" in
-    *:*) ;;
-    *) die "--range 要写成 lo:hi" ;;
-esac
-LO=${RANGE%%:*}; HI=${RANGE##*:}
-[ $((HI - LO)) -gt 0 ] || die "--range 的 hi 必须大于 lo"
-# qwen35moe 是 hybrid（每 4 层一个 full attention），切点和段内层数都必须是 4 的倍数
-[ $((LO % 4)) -eq 0 ] || die "切点 $LO 不是 4 的倍数，hybrid 架构会层类型错位"
-[ $(((HI - LO) % 4)) -eq 0 ] || die "段内层数 $((HI - LO)) 不是 4 的倍数"
-
 [ -f "$MODEL" ] || die "模型不存在：$MODEL"
+
+# supervisor 形态下，本机是哪几段、切点在哪，全部由 topology 决定，--range 不再参与。
+# 单段形态（role = gpu / tail）才需要 --range。
+if [ "$ROLE" = "supervisor" ]; then
+    [ -n "$TOPOLOGY" ] || die "role=supervisor 必须给 --topology（描述整条链的 toml）"
+    [ -f "$TOPOLOGY" ] || die "拓扑不存在：$TOPOLOGY"
+    RANGE="-"
+    LO=0; HI=0
+else
+    [ -n "$RANGE" ] || die "必须给 --range（如 0:24 或 24:40）"
+    case "$RANGE" in
+        *:*) ;;
+        *) die "--range 要写成 lo:hi" ;;
+    esac
+    LO=${RANGE%%:*}; HI=${RANGE##*:}
+    [ $((HI - LO)) -gt 0 ] || die "--range 的 hi 必须大于 lo"
+    # qwen35moe 是 hybrid（每 4 层一个 full attention），切点和段内层数都必须是 4 的倍数
+    [ $((LO % 4)) -eq 0 ] || die "切点 $LO 不是 4 的倍数，hybrid 架构会层类型错位"
+    [ $(((HI - LO) % 4)) -eq 0 ] || die "段内层数 $((HI - LO)) 不是 4 的倍数"
+fi
+
 say "模型 $MODEL（$(du -h "$MODEL" | cut -f1)）"
-say "角色 $ROLE  层范围 $RANGE（$((HI - LO)) 层）"
+if [ "$ROLE" = "supervisor" ]; then
+    say "角色 supervisor  拓扑 $TOPOLOGY"
+else
+    say "角色 $ROLE  层范围 $RANGE（$((HI - LO)) 层）"
+fi
 
 # ---------- 1. 依赖 ----------
 say "检查依赖"
@@ -132,25 +150,39 @@ command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
 WORKER="$HOME/qlh-worker"
 [ -f "$WORKER/stage_worker.py" ] || die "缺 $WORKER/stage_worker.py"
 
-setsid python "$WORKER/stage_worker.py" \
-    --role "$ROLE" \
-    --model "$MODEL" \
-    --shim "$SHIM" \
-    --host "$HOST" \
-    --port "$PORT" \
-    --threads "$THREADS" \
-    --layers "$((HI - LO))" \
-    --ctx "$CTX" \
-    >"$LOG" 2>&1 < /dev/null &
+if [ "$ROLE" = "supervisor" ]; then
+    # supervisor 自己读拓扑决定起几段、绑哪个地址，所以不传 --range/--host/--port；
+    # 它还会在段崩溃时按退避重启（见 stage_supervisor.py）。
+    [ -f "$WORKER/stage_supervisor.py" ] || die "缺 $WORKER/stage_supervisor.py"
+    export SA_TOPOLOGY="$TOPOLOGY"
+    export SA_SHIM="$SHIM"
+    unset LLAMA_LAYER_RANGE
+    setsid python "$WORKER/stage_supervisor.py" >"$LOG" 2>&1 < /dev/null &
+    PATTERN="[s]tage_supervisor.py"
+else
+    setsid python "$WORKER/stage_worker.py" \
+        --role "$ROLE" \
+        --model "$MODEL" \
+        --shim "$SHIM" \
+        --host "$HOST" \
+        --port "$PORT" \
+        --threads "$THREADS" \
+        --layers "$((HI - LO))" \
+        --ctx "$CTX" \
+        >"$LOG" 2>&1 < /dev/null &
+    PATTERN="[s]tage_worker.py"
+fi
 
 sleep 8
-if pgrep -f "[s]tage_worker.py" >/dev/null; then
-    say "已启动，PID $(pgrep -f '[s]tage_worker.py' | head -1)"
-    printf '监听 %s:%s\n' "$HOST" "$PORT"
+if pgrep -f "$PATTERN" >/dev/null; then
+    say "已启动，PID $(pgrep -f "$PATTERN" | head -1)"
+    if [ "$ROLE" != "supervisor" ]; then
+        printf '监听 %s:%s\n' "$HOST" "$PORT"
+    fi
     printf '日志 %s\n' "$LOG"
     printf '\n它是脱离会话的，adb/ssh 断开不会带走它。\n'
-    printf '停：pkill -f "[s]tage_worker.py"\n'
-    printf '看状态：pgrep -f "[s]tage_worker.py" && tail -5 %s\n' "$LOG"
+    printf '停：pkill -f "%s"\n' "$PATTERN"
+    printf '看状态：pgrep -f "%s" && tail -5 %s\n' "$PATTERN" "$LOG"
 else
     say "启动失败，日志尾部："
     tail -30 "$LOG"

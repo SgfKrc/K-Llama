@@ -6,6 +6,12 @@
 #
 # `ssh_user` / `start_cmd` 只在远端段需要，用来把那一端拉起来。留空则假定你已经手工
 # 启动好了，harness 只负责连。
+#
+# `sha256`（可选，写在 [[stage]] 里）：填了就在启动前校验整模，代价约 30 秒（20 GiB 起）。
+# 上面那条"必须是同一个文件"靠它就变成机器可查的。取值：
+#   sha256sum <model>            （Linux / Termux）
+#   Get-FileHash -Algorithm SHA256 <model>   （Windows）
+# 不填则跳过校验，八份现存拓扑都没填。
 
 source_layers = 40
 

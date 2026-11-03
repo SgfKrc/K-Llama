@@ -24,7 +24,11 @@ TOTAL_LAYERS = 40
 # the wrong attention type at the seam and the artifact fails to load.
 LAYER_ALIGN = 4
 KINDS = ("gpu", "cpu", "tail")
-LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# ``0.0.0.0`` / ``::`` are bind addresses rather than connect addresses: a stage declared
+# that way is necessarily running on this machine, and it must bind every interface or the
+# remote peer cannot reach it. Recognising them here keeps one list instead of adding a
+# second `is_bind_all` rule elsewhere.
+LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "::"})
 _REQUIRED = object()
 
 
