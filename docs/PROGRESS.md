@@ -31,6 +31,28 @@ ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
 > 不含 prefill 与协议开销），prompt 是 `def quicksort(arr):`。
 > 跨 prompt 比较要重测——接受率由文本可预测性决定，不由模型规模决定。
 
+### 1.1 另一种形态：两台弱设备（2026-11-03）
+
+同一模型切成 24 + 16 层，放在一台 Surface Pro 7（i5-1035G4，纯 CPU）与一台
+Y700 平板（8 Gen 3，Termux，纯 CPU）上，两端都持**完整整模** + `LLAMA_LAYER_RANGE`，
+零裁层工件：
+
+| 段 | 设备 | 层 | 每层耗时 |
+| --- | --- | ---: | ---: |
+| head `0:24` | Surface | 24 | 3.76 ms |
+| tail `24:40` | Y700 | 16 | 2.84 ms |
+
+- decode **6.50 tok/s**（153.4 ms/token，p90 165.1 ms，n=24，两次复测 6.50 / 6.52）
+- prefill 稳态 **22 tok/s**（N=256 要 11.7 秒；另有约 750 ms 首轮图 reserve 开销）
+
+两台核显都不参与：Surface 的 Vulkan 后端一加载就把 CPU 侧权重塞进 host buffer
+（head 245 → 112 ms），Y700 的 Adreno `-ngl 99` 比纯 CPU 慢。逐层拆解、带宽口径
+与切点约束见 [`ANDROID-SURFACE-段接入评估.md`](ANDROID-SURFACE-段接入评估.md)。
+
+**部署形态**：`stage_supervisor.py` 常驻，读拓扑起本机段，崩了按退避重启；
+`scripts/pack-portable.py` 出 96 MB 绿色目录；`scripts/termux-install.sh` 一条命令
+准备安卓侧并能从参数生成拓扑。见 [`PACKAGING.md`](PACKAGING.md)。
+
 ---
 
 ## 2. 里程碑
@@ -42,6 +64,7 @@ ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
 | P2 | 两进程 + TCP 传输 | 段间 hidden 走 int16 定点，5 份拷贝降到 1 份 |
 | P3 | DFlash 草稿三件套（open/inject/block）+ rollback | 8 路注入、15 草稿、16 验证跑通 |
 | P4 | 六条定位修正后验收 | 98.0% 接受率（原生 `llama-speculative-simple` 94.1%），3.94 token/轮 |
+| P5 | 弱设备串两段 + 常驻 supervisor + 绿色包（2026-11-03） | 6.50 tok/s；kill 掉任一段的 worker 后 supervisor 自动重启、链路恢复 |
 
 `docs/PATCHES.md` 记的是两代补丁的分界，`docs/ISSUE-*.md` 记的是 P3/P4 期间定位到的
 三个缺陷：warmup 越界、hybrid `seq_rm` 语义、recurrent 快照跨 ubatch 不滚动。
