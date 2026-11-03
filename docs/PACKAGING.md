@@ -92,11 +92,17 @@ runtime\python.exe probe.py --head 127.0.0.1:9103 --tail 100.x.x.x:9106
 安卓上没有 APK——不走 NDK 那条路，直接用 Termux + 一个脚本：
 
 ```bash
-bash scripts/termux-install.sh \
-    --fork ~/qlh-fork \
+# 单段（调试）
+bash scripts/termux-install.sh --fork ~/qlh-fork \
+    --model ~/qwen36-35b-a3b-q6k.gguf --range 24:40 --port 9106
+
+# 常驻（推荐）：交给 supervisor 管本机段，崩了自动重启
+bash scripts/termux-install.sh --fork ~/qlh-fork \
     --model ~/qwen36-35b-a3b-q6k.gguf \
-    --range 24:40 --port 9106
+    --role supervisor --topology ~/qlh-worker/topology.toml
 ```
+
+supervisor 形态不需要 `--range` / `--port`：本机是哪几段、切点在哪，全部来自拓扑。
 
 脚本做五件事：查依赖 → 编 libllama（**缺才编**，`-j 1`）→ 编 shim → 校验层范围 →
 `setsid` + `termux-wake-lock` 后台起服务。幂等，重复跑只补缺的部分。
@@ -132,6 +138,13 @@ supervisor 自己判断哪几段在 `127.0.0.1` 上、只起那些；远端段�
 
 实测（Surface head 24 层 + Y700 tail 16 层）：kill 掉 head 的 `stage_worker`（PID 11028）后，
 6 秒内 9103 由新 PID 4816 重新监听，90 秒后 `probe.py` 仍能出 token。
+Y700 侧同样验过：`kill -9` 掉 tail 的 worker（PID 24931）→ `restart in 2s` → 新 PID 25800，
+supervisor 自己的 PID 不变。
+
+**拓扑里的 host 有两个含义，容易踩**：它既是客户端的连接地址，也是 worker 的 bind 地址。
+本机段如果写 `127.0.0.1`，worker 就只绑回环，远端连不进来（日志是 `listening on 127.0.0.1:9106`，
+对端是 connection refused）。写 `0.0.0.0` 才既绑全接口、又被 `topology.is_loopback` 认成本机段。
+远端段照旧写真实地址（`100.x` / 主机名）。
 
 **两个已知边界**（不打算在这一版解决）：
 
