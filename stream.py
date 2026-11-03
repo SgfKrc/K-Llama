@@ -66,8 +66,32 @@ def generate_stream(
     cascade_mtp: int = 0,
     stats: dict | None = None,
     ctx: int | None = None,
+    prefix_ids: Sequence[int] | None = None,
+    n_past: int = 0,
 ) -> Iterator[Chunk]:
     """Tokenize ``prompt``, drive the chain, yield text as it becomes readable.
+
+    ``prefix_ids`` / ``n_past`` are the multi-turn form: the caller hands over already
+    tokenized *new* tokens and says how much of the KV is already filled, so this call
+    continues an existing sequence instead of starting at position 0. Defaults (``None`` /
+    ``0``) are the single-turn behaviour every existing caller already has.
+
+    Why here and not in a second loop: this module is the decode loop for the TUI and the
+    server, and `chain_client` is the one for the CLI (AGENTS §7 forbids a third). The
+    multi-turn driver needs exactly this loop with a different start position, so the
+    ability lives here as a parameter rather than as a copy in `checks/`.
+
+    What a continuation needs is reported through ``stats``, because a generator cannot return
+    a value:
+
+    * ``stats["n_past"]`` -- the position this round finished at.
+    * ``stats["pending"]`` -- the token that was emitted but never entered the KV (the loop
+      breaks after emitting, before the forward that would place it). Dropping it makes the
+      next round write a different token at that position, and the KV then silently disagrees
+      with the transcript by one token.
+    * ``stats["kv_tail"]`` -- tokens that ARE in the KV but were never emitted. Non-empty only
+      when a speculative block was cut short by the end of the round; llama.cpp will not roll
+      the last position back, so these have to be replayed to keep the history aligned.
 
     The decode loop is not implemented here: `chain_client` owns it (`forward`,
     `speculate`, and the DFlash driver). Going through those is what makes a server or TUI
@@ -88,7 +112,13 @@ def generate_stream(
         raise ValueError("generate_stream needs at least one stage")
 
     tail = clients[-1]
-    prompt_tokens = clients[0].tokenize(prompt)
+    if prefix_ids is None:
+        prompt_tokens = clients[0].tokenize(prompt)
+    else:
+        # Already tokenized by the caller: a continuation has to feed back token *ids* it
+        # generated (including the one that is still pending), and round-tripping those
+        # through decode/text/encode is not lossless for byte-level BPE.
+        prompt_tokens = [int(t) for t in prefix_ids]
     if not prompt_tokens:
         return
     if stats is not None:
@@ -115,14 +145,28 @@ def generate_stream(
 
     # Prefill. A single-stage topology walks the protocol with zero hidden states -- the
     # numbers are meaningless there, only the wire paths are real.
+    round_start = n_past          # 本轮起点；块内截断时按它算出哪些位置已在 KV 里
     if single_stage:
         prefix = np.zeros((len(prompt_tokens), tail.n_embd), dtype=np.float32)
-        queued = [tail.forward_token(prefix, 0)]
+        queued = [tail.forward_token(prefix, n_past)]
     else:
-        queued = [forward(clients, prompt_tokens, 0, stage_ms)]
-    n_past = len(prompt_tokens)
+        queued = [forward(clients, prompt_tokens, n_past, stage_ms)]
+    # `n_past` is the first free position, so it advances by what was just written -- not
+    # reset to the length of this round's tokens, which would only be right at n_past == 0.
+    n_past += len(prompt_tokens)
 
     emitted = 0
+    # The last emitted token does not get a forward of its own: the loop breaks after
+    # emitting, and the forward that would place it never runs. A continuation has to write it
+    # back, or the next round puts a different token at that position. Exception: a token that
+    # came out of a speculative block is already placed, so `pending` stays None (see below).
+    pending: int | None = None
+    #: Tokens a speculative block computed but that this round neither emitted nor kept:
+    #: diagnostic only, a continuation generates its own. Non-empty means the round ended
+    #: inside a block, i.e. the extra drafts were paid for and thrown away.
+    orphans: list[int] = []
+    #: Positions that really are in the KV but were never emitted (see the break below).
+    kv_tail: list[int] = []
     while emitted < max_tokens:
         token = queued.pop(0)
         yield Chunk(
@@ -133,6 +177,23 @@ def generate_stream(
         )
         emitted += 1
         if tail.is_eog(token) or emitted >= max_tokens:
+            pending = token
+            # A speculative step writes its whole verification block to the KV and rolls back
+            # only the rejected tail. If the round ends on the *first* token of that block, the
+            # rest of the block is already placed: the model holds positions the user never saw.
+            # Trimming them back is what this needs and what llama.cpp will not do -- on a
+            # hybrid model `llama_memory_seq_rm` refuses to drop the last position
+            # (measured: seq_rm p0=82 over pos_max=82 -> removed=0, and the next decode then
+            # dies on "pos_max X must be < n_past Y"). So the positions stay, and the round
+            # reports them instead: `pending` is None (the token just emitted is already in the
+            # KV, re-writing it at the next position would duplicate it) and `kv_tail` names the
+            # tokens that are in play but never shown. A single-turn caller ignores both; a
+            # continuation has to replay `kv_tail` or its history is short by that many tokens.
+            written = n_past - round_start - len(prompt_tokens)
+            if emitted <= written:
+                pending = None
+                kv_tail = list(queued[:written - emitted])
+            orphans = list(queued)
             break
         if queued:
             # A speculative round settles several tokens at once; emit the rest without
@@ -151,6 +212,14 @@ def generate_stream(
         else:
             queued = [forward(clients, [token], n_past, stage_ms)]
         n_past += len(queued)
+
+    if stats is not None:
+        # Reported even when nothing continues this sequence, so a caller never has to guess
+        # whether the number it holds is current.
+        stats["n_past"] = n_past
+        stats["pending"] = pending
+        stats["orphans"] = orphans
+        stats["kv_tail"] = kv_tail
 
     tail_text = assembler.flush()
     if tail_text:
