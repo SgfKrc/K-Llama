@@ -115,12 +115,27 @@ python 栈要么塞解释器要么重写，23.5 GiB 模型还得让用户 SAF �
 
 实测：启动后 PID 17412，`adb kill-server` + `start-server` 之后进程仍存活。
 
-## 7. 还没做的骨架
+## 7. 骨架现状
 
-这些不是打包问题，是产品化缺口，按影响排序：
+| 缺口 | 状态 |
+| --- | --- |
+| 启动编排 | ✅ `chain_client.bring_up()`（:776）+ `stage_supervisor.py` 常驻形态 |
+| 断线重连 | ✅ `stage_supervisor.py`：死的只重启那一个，退避 2→4→8→16→30 封顶，稳定存活 60 s 才归零 |
+| 模型校验 | ✅ `topology.verify_model_hashes()`：拓扑里声明 `sha256` 才校验，没声明就跳过 |
+| 地址配置 | ⚠️ `topology.toml` 的 host/port，**没有服务发现**，IP 仍要手填 |
+| 多轮会话 | ❌ `probe.py` 每轮从 `n_past=0` 开始，真实对话要维护 KV 与位置 |
 
-1. **地址配置**：现在 Tailscale IP 要手填，且两端都不知道对方在不在。
-2. **断线重连**：worker 崩了只能手动重启（这轮调试里重启了十几次）。
-3. **启动编排**：两个 `run.bat` 谁先谁后、对方没起来时怎么重试，现在靠人。
-4. **模型校验**：只检查文件存在，没校验 sha256 / 是不是同一份整模。
-5. **多轮会话**：`probe.py` 每轮都从 `n_past=0` 开始，真实对话要维护 KV 和位置。
+**常驻形态**：`config.toml` 里 `role = "supervisor"`，同目录放一份 `topology.toml`（两台机器内容相同）。
+supervisor 自己判断哪几段在 `127.0.0.1` 上、只起那些；远端段由那台机器自己的 supervisor 负责。
+只把本机段交给 `bring_up` 是刻意的——传整份拓扑会让 A 机按 `start_cmd` 去 ssh 拉起 B 机的段，
+而 B 机已占着端口，新 worker bind 失败后会被当成反复崩溃。
+
+实测（Surface head 24 层 + Y700 tail 16 层）：kill 掉 head 的 `stage_worker`（PID 11028）后，
+6 秒内 9103 由新 PID 4816 重新监听，90 秒后 `probe.py` 仍能出 token。
+
+**两个已知边界**（不打算在这一版解决）：
+
+- supervisor 只看进程存活，不管段内部健康。撞到过 `keep_head` 子进程已死、`stage_worker`
+  还活着、一直回 `keep-head worker is not running`，而 supervisor 认为一切正常。
+  加健康探测要引入第二份就绪判据（HELLO 已经是判据），按单一事实源的原则没做。
+- 端口被残留进程占住时会 2 s→30 s 循环重启，靠 `*.prev.log` 留崩溃现场，不会自愈。
