@@ -159,7 +159,12 @@ Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB 权重），单序列，greedy：
 
 1. **非贪心下投机。** logits 已能回传，缺一次判据实验：整模与链路在同位置的 top-8 是否重合。探针就位 `checks/probe_logits_delta.py`。
 2. **SLIM-ARC 的预取。** 预算恒 0 与层号恒 0 两个 bug 已修（后者改用图节点名后缀），日志确认 40 层全通，但本机实测为负收益：22 GB 模型 / 16 GB 内存落在「抖动区」，预取量与速度严格反比。上游 80B 级模型的「流式区」本机无同体量模型可复现，因此不否定上游结论。见 [`docs/SLIM-ARC-接入计划.md`](docs/SLIM-ARC-接入计划.md) §6.5。
-3. **多序列共享。** 需 `kv_unified` 与每段多序列位置；先解决 hybrid 模型那 30 层 linear 的 recurrent state 隔离。
+3. **多序列共享。** 有条件做。`kv_unified` 与 recurrent 隔离**都不是前提**——两条独立对话
+   交替 decode 时每个 token 只属于一个 seq（`kv_unified` 只在「一个 token 属于多条序列」时
+   才是硬要求），recurrent state 本来就是每序列一个 cell。缺的是本仓库三处硬编码：装载时
+   `n_seq_max=1`（`keep_head_worker.py:240`）、token 通道 `seq_id=0`、协议里没有 seq 维度。
+   推荐路径 3~4 人天，买到的是会话共存与前缀复用，**不是吞吐**。见
+   [`docs/ISSUE-multi-sequence.md`](docs/ISSUE-multi-sequence.md)。
 4. **两个弱设备凑两段。** 前提是两个设备都能跑 worker，而这点从未验证——先做 1 小时平台探针，任一项失败就判死。见 [`docs/ANDROID-SURFACE-段接入评估.md`](docs/ANDROID-SURFACE-段接入评估.md) §7。
 
 ---
