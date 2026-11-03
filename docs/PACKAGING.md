@@ -87,7 +87,35 @@ runtime\python.exe probe.py --head 127.0.0.1:9103 --tail 100.x.x.x:9106
 但 VC++ 运行库、显卡驱动这些系统级依赖还在。`bin/` 里带的那 4 个 MSVC dll 就是为此准备的，
 但没有在真正干净的机器上确认过。
 
-## 6. 还没做的骨架
+## 6. Termux 侧（Y700）
+
+安卓上没有 APK——不走 NDK 那条路，直接用 Termux + 一个脚本：
+
+```bash
+bash scripts/termux-install.sh \
+    --fork ~/qlh-fork \
+    --model ~/qwen36-35b-a3b-q6k.gguf \
+    --range 24:40 --port 9106
+```
+
+脚本做五件事：查依赖 → 编 libllama（**缺才编**，`-j 1`）→ 编 shim → 校验层范围 →
+`setsid` + `termux-wake-lock` 后台起服务。幂等，重复跑只补缺的部分。
+
+**为什么不是 APK**：NDK 要重编（Termux 的 `libc++_shared.so` 和 bionic 不是一回事），
+python 栈要么塞解释器要么重写，23.5 GiB 模型还得让用户 SAF 选一次再复制。而一键脚本
+只要装个 Termux，成本差一个数量级，且是我们自己调研用的最佳形态。
+
+**三个写进脚本校验的约束**：
+
+| 约束 | 原因 |
+| --- | --- |
+| 切点与段内层数都是 4 的倍数 | qwen35moe 是 hybrid，每 4 层一个 full attention，错位会层类型不匹配 |
+| 编译 `-j 1` | 并发编译会被 Android 的 lmkd 直接 SIGKILL（实测 `-j 6` 在第 26% 被杀） |
+| `setsid` + `termux-wake-lock` | 否则 adb/ssh 一断就被带走（实测 `exit 255`），或 CPU 休眠时被冻结 |
+
+实测：启动后 PID 17412，`adb kill-server` + `start-server` 之后进程仍存活。
+
+## 7. 还没做的骨架
 
 这些不是打包问题，是产品化缺口，按影响排序：
 
