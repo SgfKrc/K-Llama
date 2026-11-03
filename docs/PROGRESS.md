@@ -53,6 +53,11 @@ Y700 平板（8 Gen 3，Termux，纯 CPU）上，两端都持**完整整模** + 
 `scripts/pack-portable.py` 出 96 MB 绿色目录；`scripts/termux-install.sh` 一条命令
 准备安卓侧并能从参数生成拓扑。见 [`PACKAGING.md`](PACKAGING.md)。
 
+**三段形态（2026-11-03）**：两段再拆开、本机也进来（本机 `0:24` + Surface `24:32` +
+Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两段慢 31%，换来
+两台弱设备各只背 8 层、离开内存边界。瓶颈是每段约 33–35 ms 的**固定开销**（与层数
+无关），不是网络。见 [`THREE-SEGMENT.md`](THREE-SEGMENT.md)。
+
 ---
 
 ## 2. 里程碑
@@ -139,7 +144,7 @@ MTP 草稿、采样器、`seq_rm`。MSVC 导出的 C++ mangled 名用 `GetProcAd
 | 跨框架接力（llama.cpp ↔ torch） | 未做 | `README.md` 未做节 |
 | GPU 段引擎候选（ExLlamaV3） | 评估已写，未实施；先验证单机是否快过 llama.cpp CUDA，再谈切分 | `docs/EXLLAMAV3-GPU段候选.md` |
 | LiLiCorr 轻量重排头 | 方案已写，未实施 | `docs/LILICORR-轻量头.md` |
-| 弱设备（Y700 / Surface）接入 | 评估已写，当前为负收益 | `docs/ANDROID-SURFACE-段接入评估.md` |
+| 弱设备（Y700 / Surface）接入 | **三段已跑通**（24/8/8，Tailscale 5 GHz 校园网，201.7 ms / 5.00 t/s）；延迟是负收益（比两段 +31%），收益在把两台弱设备从内存边界上拉下来 | `docs/THREE-SEGMENT.md` |
 | 多序列 token 共享 | 未做，对这类请求明确报错 | `README.md` |
 | n-gram 影子模式 | 未做（上游原生策略已可用） | `docs/SPECULATION.md` §6 |
 

@@ -102,3 +102,13 @@ ROG 段单跑 16 层是 10.6 ms/层，master 同样 16 层是 2.7 ms/层。换 C
 qemu/npm 负载**，不是代码问题。
 
 `qemu-system-x86_64` 在 ROG 上累计了 4145 秒 CPU 时间，那是 docker 后端。
+
+## 7. 跨机链路的两个坑
+
+见 `THREE-SEGMENT.md` §7：
+
+- **`adb shell ping <tailscale-ip>` 永远 100% 丢包**，因为 shell 进程不在
+  VpnService 的 per-app 路由里。这是假象，不是链路故障。判链路只看主机侧
+  `tailscale ping` / `logcat | grep magicsock` / 段墙钟。
+- **`tailscale ping --c N` 建立直连就停**，只回一行属于设计。降级要看
+  `netcheck` 的 UDP 可达性与 `Nearest DERP` 延迟，不看 ping 的行数。
