@@ -64,11 +64,16 @@ class StageWorker:
             except OSError:
                 _trace("accept raised OSError, leaving serve loop")
                 break
+            # accept 之后先查一次：子进程可能在上一个 session 之后的空闲期崩掉，这时候
+            # 服务这个客户端只会让它第一帧拿到 "keep-head worker is not running"。
+            self._exit_if_keep_head_lost(server, conn)
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"[{self._role}] client {addr}", flush=True)
             try:
                 self._session(conn)
             except Exception as exc:  # noqa: BLE001 - one bad session must not kill the worker
+                # 这条 except 兜的是"一个坏请求"，不是"模型没了"：后者由下面的健康检查
+                # 主动退出处理，那种情况本来也不该继续服务。
                 print(f"[{self._role}] session error: {type(exc).__name__}: {exc}", flush=True)
                 _trace("session error handler: engine.reset()")
                 self._engine.reset()
@@ -79,7 +84,33 @@ class StageWorker:
                 except OSError:
                     pass
                 print(f"[{self._role}] client {addr} closed, ready for next", flush=True)
+            # session 结束后再查一次：崩在 session 中间的那一次已经把错误回给了客户端，
+            # 这里退出，supervisor 下次拉起的是一个模型重新加载好的段。
+            self._exit_if_keep_head_lost(server)
         server.close()
+
+    def _exit_if_keep_head_lost(self, server: socket.socket,
+                                conn: socket.socket | None = None) -> None:
+        """keep-head 子进程没了就关掉监听、以非零码退出，而不是继续服务。
+
+        为什么退出：这一段真正持有模型权重的是子进程，本进程只是转发。子进程崩了以后本进程
+        照样 accept、照样回 "keep-head worker is not running"，而 stage_supervisor 只看本进程
+        的 proc.poll()，于是这一段永久不可用、supervisor 日志一片安静。非零退出是唯一能让
+        重启逻辑看见这个事实的信号；监听先关掉，是为了让接手的段能立刻绑回同一个端口。
+        """
+        if self._engine.healthy:
+            return
+        # 子进程自己的崩溃输出（llama_decode 失败、断言）就在上面几行的 stderr 里。
+        print(f"[{self._role}] keep-head child process is gone; exiting non-zero so "
+              f"stage_supervisor restarts this stage", flush=True)
+        for sock in (conn, server):
+            if sock is None:
+                continue
+            try:
+                sock.close()
+            except OSError:
+                pass
+        raise SystemExit(1)
 
     def _session(self, conn: socket.socket) -> None:
         # HELLO goes first, unsolicited: the driver reads exactly one frame after connecting

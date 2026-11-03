@@ -85,6 +85,15 @@ class StageEngine:
         """Block count the shim found in this artifact, i.e. the layers it runs."""
         return int(self._up.n_layer)
 
+    @property
+    def healthy(self) -> bool:
+        """这一段的模型还在不在：keep-head 子进程活着才算。
+
+        判据只有 keep_head.KeepHeadUpstream.is_available 一处，这里只转发——持有权重的
+        是那个子进程，本进程活着（还在 accept、还在回包）不代表这一段还能算。
+        """
+        return self._up.is_available
+
     def tokenize(self, text: str) -> list[int]:
         """Text -> ids. Any stage can do this; all of them load the same vocab."""
         return self._up.tokenize(text)
