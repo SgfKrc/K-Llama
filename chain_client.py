@@ -796,6 +796,17 @@ def bring_up(stages, shim: Path, ctx: int, tail_rs_seq: int = 0,
         procs = []
     for stage in stages:
         if stage.is_local:
+            # 端口已经在听，说明这一段已经有主（常驻 supervisor 起的，或上一轮留下的）。
+            # 再 spawn 一个会与它抢同一个端口：Windows 的 SO_REUSEADDR 允许双绑，结果是
+            # HELLO 一半概率拿到、一半超时，而两份权重各占一份内存。先探再决定。
+            # 这个竞态真实发生过：supervisor 加载 32 层要几十秒，期间端口没开，任何一个
+            # chain_client 都会自己再起一个。
+            host = "127.0.0.1" if stage.host in ("0.0.0.0", "::") else stage.host
+            if _port_open(host, stage.port, timeout=0.3):
+                if note is not None:
+                    note(f"stage {stage.index} ({stage.kind}) already listening on "
+                         f"{stage.host}:{stage.port}; reusing it")
+                continue
             procs.append((*spawn_worker(stage, shim, ctx, tail_rs_seq), stage))
         elif stage.start_cmd:
             # Remote with a launcher: ask it to come up, then connect like any other stage.
@@ -946,6 +957,9 @@ def spawn_worker(stage: Stage, shim: Path, ctx: int,
     # in-process path through config.needs_logits().
     env = dict(os.environ)
     env["SA_NEEDS_LOGITS"] = config.needs_logits(stage.kind)
+    # 段的心跳文件：worker 每转一圈 touch 一次，supervisor 看 mtime 判断「还在走」。
+    # 放在日志旁边，两端的路径都由这一处决定。
+    env["SA_HEARTBEAT"] = str(log.with_suffix(".heartbeat"))
     # Speculative decode needs two things the plain path does not: the draft head (only the
     # tail holds it) and recurrent snapshots to roll a rejected draft back. Both are opt-in
     # because they cost memory and graph nodes that a non-speculative run should not pay.

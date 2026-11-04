@@ -62,6 +62,16 @@ PORT_GIVE_UP = 12
 #: 2 s，疑似安全软件丢包），用默认值等于每次重启白等 1.5 s，"2 s 重启"就变成 3.5 s。
 #: 0.3 s 足以把两种情形分开；判错的方向也只是"超时→当作空闲→照常 spawn"，即退回旧行为。
 PORT_PROBE_S = 0.3
+#: 心跳文件多久没更新就判段僵死（秒）。worker 每 10 s touch 一次，30 s 等于容忍两次
+#: 漏跳——足够跨过一次慢 prefill，又不会让真僵死拖过一分钟。
+#:
+#: 为什么用心跳而不是网络探针：worker 是单线程 `accept → _session`，正在服务一个长连接
+#: 时，新的探测连接只能躺在 backlog 里等 accept，探针永远拿不到响应——那会把「正在正常
+#: 推理」误判成僵死并杀掉（实测发生过）。心跳是 worker 主动报告，不受这个限制。
+#: 机制与复现步骤见 docs/ISSUE-tail-worker-hang.md。
+HEARTBEAT_STALE_S = 30.0
+#: 多久看一次心跳文件。`stat` 很便宜，但没必要跟着 0.2 s 的轮询走。
+HEARTBEAT_CHECK_S = 10.0
 
 
 @dataclass
@@ -82,6 +92,8 @@ class _Run:
     blocked: int = 0
     #: 已放弃：端口在窗口内始终没释放，不再 spawn、也不再探测。只影响这一段。
     given_up: bool = False
+    #: 下次检查心跳的时间（monotonic）。None 表示这一段还没查过。
+    checked: float | None = None
 
 
 def _say(message: str) -> None:
@@ -112,6 +124,11 @@ def _start(run: _Run, shim: Path, ctx: int) -> None:
     proc, log = chain_client.spawn_worker(run.stage, shim, ctx)
     run.proc, run.log, run.started = proc, log, time.monotonic()
     run.due = None
+    run.checked = None
+    # 新进程还在加载、还没开始 serve，而上一轮的心跳文件还躺在那里、带着几分钟前的
+    # mtime。不先删掉它，这一段就会在加载完成之前被判成僵死——实测在 Y700 上连杀三次，
+    # 每次都是 "heartbeat stale 230s+"。
+    log.with_suffix(".heartbeat").unlink(missing_ok=True)
 
 
 def _keep_previous_log(run: _Run) -> None:
@@ -158,6 +175,16 @@ def _port_held(stage: topology.Stage) -> bool:
     `netstat` 里看到 supervisor 的 pid 挂在这几个端口上是正常的。
     """
     return chain_client._port_open(_probe_host(stage), stage.port, timeout=PORT_PROBE_S)
+
+
+def _heartbeat_age(run: _Run) -> float | None:
+    """心跳文件多久没更新（秒）。文件不存在返回 None——那是还在加载，不是僵死。"""
+    if run.log is None:
+        return None
+    try:
+        return time.time() - run.log.with_suffix(".heartbeat").stat().st_mtime
+    except OSError:
+        return None
 
 
 def _hold_off(run: _Run) -> None:
@@ -225,6 +252,27 @@ def _supervise(runs: list[_Run], shim: Path, ctx: int, stop: threading.Event) ->
                         _say(f"stage {run.stage.index} ({run.stage.kind}) up for "
                              f"{STABLE_S:.0f}s, backoff reset")
                         run.failures = 0
+                    # 「进程活着」不等于「段还在走」：worker 卡在 engine 调用里时心跳就停
+                    # 了（见 docs/ISSUE-tail-worker-hang.md）。心跳文件不存在说明还在
+                    # 加载，不判——加载实测 4 s 完成，等得起。
+                    if run.checked is None or now - run.checked >= HEARTBEAT_CHECK_S:
+                        run.checked = now
+                        age = _heartbeat_age(run)
+                        if age is not None and age > HEARTBEAT_STALE_S:
+                            _say(f"stage {run.stage.index} ({run.stage.kind}) heartbeat "
+                                 f"stale {age:.0f}s, killing pid {run.proc.pid}")
+                            run.proc.kill()
+                            try:
+                                run.proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            run.proc = None
+                            run.failures += 1
+                            delay = _backoff(run.failures)
+                            run.due = now + delay
+                            _say(f"stage {run.stage.index} ({run.stage.kind}) restart in "
+                                 f"{delay}s (log: {run.log})")
+                            continue
                     continue
                 # 只把这一段标成待重启，其余段继续跑。整批重启会让一次崩溃变成全链路的
                 # 停顿，而单段崩溃才是常态（显存、端口、OOM）。

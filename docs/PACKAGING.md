@@ -43,6 +43,11 @@ qlh-portable/
     README.txt   给最终用户看的
 ```
 
+**`chain_client.py` 有两份**：根目录一份、`worker/` 一份。supervisor 的工作目录是
+`worker/`，`import chain_client` 命中的是**后者**。所以改部署逻辑（比如给 worker 传环境
+变量）只更新根那份会静默失效——2026-11-04 的心跳机制就这样在 Surface 上白接了一次。
+两份都要同步。
+
 ## 3. 用
 
 两台机器各解压一份，各改 `config.toml`：

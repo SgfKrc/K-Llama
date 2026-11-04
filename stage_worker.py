@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import socket
 import sys
 from pathlib import Path
@@ -34,15 +35,35 @@ def _trace(message: str) -> None:
         print(f"[trace {os.getpid()}] {message}", file=sys.stderr, flush=True)
 
 
+#: 心跳文件多久 touch 一次，也是 select 等一次数据的最长空转时间。
+HEARTBEAT_S = 10.0
+#: 一个连接空转多久就放弃它（秒）。单线程 `accept → _session` 的代价：一条客户端崩溃
+#: 但 TCP 未关的连接会把整段堵死，而它自己永远不会超时。60 s 的取法——正常推理每步都有
+#: 请求（150 ms 级），空闲到这个量级的只可能是死连接；环境变量可覆盖，给交互式客户端留
+#: 余量（用户思考间隔可能比这长）。
+SESSION_IDLE_S = float(os.environ.get("SA_SESSION_IDLE_S", "60"))
+
+
 class StageWorker:
-    def __init__(self, engine: StageEngine, role: str,
-                 identity: dict | None = None) -> None:
+    def __init__(self, engine: StageEngine, role: str,                 identity: dict | None = None) -> None:
         self._engine = engine
         self._role = role
         # What this process actually loaded, announced before the first request is
         # answered. Until this existed the chain's whole readiness test was "the port
         # accepts", which is equally true of a worker holding the wrong cut.
         self._identity = dict(identity or {})
+        #: supervisor 通过 `SA_HEARTBEAT` 指定这个文件，每转一圈 touch 一次。
+        #: 为什么用文件 mtime 而不是网络探针：worker 是单线程 `accept → _session`，
+        #: 正在服务一个长连接时，新的探测连接只能躺在 backlog 里等 accept，探针永远
+        #: 拿不到响应（实测见 docs/ISSUE-tail-worker-hang.md）。心跳是"我主动报告"，
+        #: 不受这个限制。
+        beat = os.environ.get("SA_HEARTBEAT")
+        self._heartbeat = Path(beat) if beat else None
+
+    def _beat(self) -> None:
+        """报告「我还在走」。卡在 engine 调用里时走不到这里，心跳就停了。"""
+        if self._heartbeat is not None:
+            self._heartbeat.touch(exist_ok=True)
 
     def serve(self, host: str, port: int) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -58,12 +79,19 @@ class StageWorker:
         # measurement, and a stale worker silently refusing the next connection. The model
         # stays loaded across sessions; only the KV cache is reset (`reset` op), which is
         # what a fresh chain wants anyway.
+        # 空闲时也要报心跳。supervisor 判的是「这一段还在走」，不是「有请求正在处理」；
+        # 没有这个超时，accept 会一直阻塞，一个空闲的段就会被自己的心跳机制杀掉。
+        server.settimeout(HEARTBEAT_S)
         while True:
             try:
                 conn, addr = server.accept()
+            except socket.timeout:
+                self._beat()
+                continue
             except OSError:
                 _trace("accept raised OSError, leaving serve loop")
                 break
+            self._beat()
             # accept 之后先查一次：子进程可能在上一个 session 之后的空闲期崩掉，这时候
             # 服务这个客户端只会让它第一帧拿到 "keep-head worker is not running"。
             self._exit_if_keep_head_lost(server, conn)
@@ -117,7 +145,24 @@ class StageWorker:
         # and validates it before it trusts anything else on this socket. Both ends must be
         # from the same checkout -- the previous protocol had no handshake at all.
         protocol.send(conn, protocol.HELLO, self._identity)
+        idle = 0.0
         while True:
+            # 先等可读、再读。中间那一跳是心跳：阻塞在 read 上时没法报告自己还活着，
+            # 而「活着但卡住」正是要区分的两种状态。
+            ready, _, _ = select.select([conn], [], [], HEARTBEAT_S)
+            self._beat()
+            if not ready:
+                # 空闲累计。worker 是单线程 `accept → _session`，一条客户端崩溃但 TCP
+                # 未关的连接会把整段堵在这里——期间新连接只能在 listen(4) 的 backlog 里
+                # 排队，拿不到 HELLO（实测见 docs/ISSUE-tail-worker-hang.md §1）。
+                # 断开它需要 `SESSION_IDLE_S` 秒内一个请求都没收到；正常推理每步都有
+                # 请求，间隔远小于这个值，所以不会误伤。
+                idle += HEARTBEAT_S
+                if idle >= SESSION_IDLE_S:
+                    _trace(f"session idle for {idle:.0f}s, dropping it")
+                    return
+                continue
+            idle = 0.0
             try:
                 msg = protocol.read(conn)
             except protocol.ProtocolError:
