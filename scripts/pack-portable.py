@@ -153,6 +153,13 @@ def main() -> int:
     (out / "launcher.py").write_text(LAUNCHER, encoding="utf-8")
     (out / "run.bat").write_text(RUN_BAT, encoding="ascii")
     (out / "README.txt").write_text(README, encoding="utf-8")
+    # 许可随包走。README.txt 里写了「完整条款见 LICENSE」，不复制就成了空指针——
+    # 拿到包的人有权知道这份东西能怎么用。
+    license_file = REPO / "LICENSE"
+    if license_file.exists():
+        shutil.copy2(license_file, out / "LICENSE")
+    else:
+        print(f"警告：{license_file} 不存在，包里没有许可证正文")
     probe = HERE / "probe.py"
     if probe.exists():
         shutil.copy2(probe, out / "probe.py")
@@ -297,6 +304,13 @@ README = """qlh-portable
 - 不打包模型（23.5 GiB），config.toml 指过去。
 - 不带 Vulkan 后端（iGPU 上反而拖慢 CPU 侧权重）。
 - 不含服务发现，两台机器的地址自己填、网络自己保证（Tailscale 之类）。
+
+许可
+----
+MIT。完整条款见随包分发的 LICENSE。
+
+上游 llama.cpp 同为 MIT，本包 bin/ 下的 llama.dll / ggml-*.dll / qlh_keep_head.dll
+按同一许可分发。模型权重不随包分发，其许可取决于你用的那一份。
 """
 
 

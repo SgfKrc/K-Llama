@@ -237,3 +237,8 @@ The Chinese README is the source of truth; this file mirrors it.
 | [`PROGRESS.md`](PROGRESS.md) | Current capability snapshot and optimisations applied |
 
 Verification: `python checks/verify_*.py`, `python -m unittest test_topology test_contract`.
+
+## License
+
+MIT — see [`LICENSE`](../LICENSE). Upstream llama.cpp is MIT too; `PATCHES.md` ships under the
+same terms. Model weights are not bundled and keep their own license.

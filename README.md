@@ -197,3 +197,12 @@ Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB 权重），单序列，greedy：
 
 等价性脚本在补丁更新、拓扑变更、shim 重编后跑：`checks/verify_equiv.py`（token 序列 /
 同通道 hidden / 层号 slot）、`checks/verify_cli.py`（llama-server 对照）。
+
+---
+
+## 许可
+
+MIT，见 [`LICENSE`](LICENSE)。
+
+上游 llama.cpp 同为 MIT，本仓库的补丁（`docs/PATCHES.md`）按同一许可分发；PDF、模型权重等
+第三方产物的许可见其各自来源。
