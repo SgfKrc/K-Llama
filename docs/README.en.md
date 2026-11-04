@@ -33,13 +33,11 @@ See **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for the full account.
 The layer-segment relay here is our own; it is not the same layer of the stack as
 [SLIM-ARC](https://github.com/Nexa-Language/SLIM-ARC).
 
-SLIM-ARC is a submission by Sun Yat-sen University to the 2026 National Collegiate Computer
-System Capability Competition (OS Design track, Proj59). It is a **MoE inference runtime for
-memory-constrained edge systems**: mmap-backed on-demand loading, phase-aware page advice,
-MoE expert prediction and reclamation, pressure-aware residency, a unified I/O budget and KV
-cache management. It targets the case where the model is much larger than physical memory —
-its headline result fits Qwen3-Next-80B-A3B into an 8 GiB cgroup and moves decode from
-0.08 to 0.43 tok/s.
+SLIM-ARC (Sun Yat-sen University, 2026 National Collegiate Computer System Capability Competition,
+OS Design track Proj59) is a **MoE inference runtime for memory-constrained edge systems**:
+on-demand mmap loading, phase-aware page advice, expert prediction and reclamation,
+pressure-aware residency, a unified I/O budget, KV cache management. Its headline result fits
+Qwen3-Next-80B-A3B into an 8 GiB cgroup and moves decode from 0.08 to 0.43 tok/s.
 
 Two paths at the same problem:
 
@@ -50,12 +48,19 @@ Two paths at the same problem:
 | Cross-boundary cost | 8 KB hidden state over TCP | page faults from disk |
 | Shape | multiple processes + TCP | one process + page-level scheduling |
 
-What we borrow is its **prefetch module** — layer-boundary readahead that turns random page
-faults into sequential reads. It is compiled into `llama.dll` with a win32 port. Its expert
-residency, KV eviction, unified I/O scheduler and on-demand loader are not integrated.
-See [`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md) and [`PATCHES.md`](PATCHES.md).
+We borrow only its **prefetch module** — layer-boundary readahead turning random page faults into
+sequential reads, compiled into `llama.dll` with a win32 port; expert residency, KV eviction, the I/O
+scheduler and the on-demand loader are not integrated. See
+[`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md), [`PATCHES.md`](PATCHES.md).
 
 ---
+
+## Sibling repository
+
+[K-sd.cpp](https://github.com/SgfKrc/K-sd.cpp) is the same relay on diffusion models (its upstream
+already runs one block per segment); boundaries carry 4–64 MiB against 8 KB here, and **neither side
+can pipeline within one sequence** — diffusion waits for every segment, LLM tokens are causal. The
+headroom is **many requests** (~2.6×, no latency gain), not supported yet; see `ARCHITECTURE.md` §11.
 
 ## What the split buys
 
@@ -144,7 +149,6 @@ koakuma.py            TUI and boot screen
 checks/               verification and diagnostic scripts (10 verify_*, the rest diagnostics/probes)
 ```
 
----
 
 ## Four constraints worth knowing
 
@@ -164,7 +168,6 @@ qwen35moe derives layer type from the *local* layer index while that index is ma
 source index, so the two only agree modulo 4 when `lo` is a multiple of 4. A 6-layer split like
 `32:38` is rejected at parse time.
 
----
 
 ## Measured
 
@@ -188,22 +191,20 @@ and lower throughput — the full k=3/5/8/15 sweep and its two conclusions are i
 
 ## Not done (ordered by what this machine can verify)
 
-**1. Speculation with sampling.** The prerequisites are all in place — splitting introduces no error
-(2B over 16 positions and 35B over 12, logits bit-identical, top-8 fully coincident, TV=0; see
-`DELIVERY.md` §1.1), and both logit return and the probe (`checks/probe_logits_delta.py`) exist.
-What is missing is the acceptance test itself: today it compares token equality, while sampling
-needs rejection sampling, which compares two distributions.
+**1. Speculation with sampling.** Prerequisites are all in place — splitting introduces no error
+(2B over 16 positions, 35B over 12; logits bit-identical, top-8 coincident, TV=0 — see
+`DELIVERY.md` §1.1), and both logit return and the probe exist. What is missing is the acceptance
+test: today it compares token equality, while sampling needs rejection sampling, comparing two
+distributions.
 
 **2. SLIM-ARC's on-demand loader.** Only prefetch is integrated. Verifying the loader means
 manufacturing a segment that does not fit — the whole checkpoint sits in the page cache here, so
-`issued` stays at 0. On the weak devices the memory headroom is thin enough that the loader *could*
-fire, but the measured effect there is negative: 22 GB of model against 16 GB of RAM lands in the
-thrashing band. It optimises the degraded mode, which is not today's bottleneck.
+`issued` stays at 0. On the weak devices the headroom is thin enough that it *could* fire, but the
+measured effect there is negative: 22 GB of model against 16 GB of RAM lands in the thrashing band.
 
-**3. Multi-sequence token sharing.** Needs `kv_unified`, and every segment has to track
-per-sequence positions. The server serialises requests behind one global lock, so concurrency
-demand is low for a single user. Doing it properly starts with how the 30 linear layers' recurrent
-state would be isolated per sequence.
+**3. Multi-sequence token sharing.** Needs `kv_unified` plus per-sequence positions in every
+segment; the server serialises behind one global lock, so demand is low for a single user. Doing it
+properly starts with isolating the 30 linear layers' recurrent state per sequence.
 
 **Done**: cutting tool retired, both draft sources integrated, DFlash k sweep, SLIM-ARC prefetch
 with its win32 port, speculation wired into the serving path, and a sampling switch for the TUI.

@@ -177,3 +177,42 @@ shim 已能按行回传完整 logits（`qlh_kh_logits`，`shim/qlh_keep_head.def
 
 装得下的时候它是空操作——整模在页缓存里，没有可补的页，实测 `issued = 0`。
 接入形态与触发条件见 [`PATCHES.md`](PATCHES.md) 与 [`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md)。
+
+---
+
+## 11. 为什么没有 token 间流水
+
+链是严格串行的：`chain_client._walk`（`chain_client.py:1084`）就是 `for i, client in
+enumerate(clients)` 逐段同步调用（`:1101`），每段都阻塞在 `_forward` 的 `send`/`read` 上
+（`:508`）。一次 decode 的墙钟 ≈ 各段耗时**之和**，不是最大值。
+
+这条串行是单序列 decode 的因果关系，不是排程偷懒：
+
+```
+head(p)   ← t_p                 → h_p
+mid(p)    ← h_p                 → h'_p
+tail(p)   ← h'_p                → t_{p+1}
+head(p+1) ← t_{p+1}   ←── 只可能由 tail(p) 产出
+```
+
+要把 `tail(p)` 与 `head(p+1)` 重叠，得先知道 `t_{p+1}`，而它正是 `tail(p)` 的输出。依赖图是
+一条 3N 个节点的单链，没有第二条独立路径可以填——所以「token 间流水」在单序列上**不可行**，
+不存在「做出来就快 2–3 倍」的版本。
+
+（扩散那边「每步都要等所有段算完」对单序列 LLM decode 逐字同样成立。兄弟仓库
+[K-sd.cpp](https://github.com/SgfKrc/K-sd.cpp) 的「token 间可并行」（其 `ARCHITECTURE.zh.md`
+§8）只有读成「多请求的 token 同时在飞」才成立，不是单序列相邻 token。）
+
+**能重叠的只有相互独立的工作单位**：
+
+| 方向 | 结论 | 机制与代价 |
+| --- | --- | --- |
+| 段内批位置（已做） | 收益已被吃掉 | 投机一轮把 k+1 个位置打进同一个 batch，每段 33–35 ms 的固定开销只付一次，每多一行边际成本 0.178 个单行（[`SPECULATION.md`](SPECULATION.md) §0）。这是单序列上唯一能「让 token 并行」的形态，代价是接受率，代码场景 1.13–1.25× |
+| 段内 offload | 另一个维度 | `-ncmoe`、专家预取只改每段耗时，不改依赖图与往返次数 |
+| 计算 ∥ 传输 | 不可行 | 8 KB 传输是亚毫秒级，每段真正付的是往返里**等待**的那一半（尾段 25–30 ms，[`THREE-SEGMENT.md`](THREE-SEGMENT.md) §4）；等待期没有别的工作可派，下游要的正是这一跳的载荷 |
+| 多请求 / 多序列 | 有条件可行，唯一的大块 | 不同序列互不依赖，三条同时在飞把合计吞吐从 `1/Σ` 推到 `1/max`：按 73.4/64.6/55.7 ms，上限 **13.6 t/s（2.6×）**，但每 token 延迟不降（约 0.2 s，排队时更差）。三件前置都还没有：`n_seq_max` 硬编码 1（`keep_head_worker.py:249`）、协议与 token 通道的 `seq_id`、驱动侧并发。本体估 3–4 人天（[`ISSUE-multi-sequence.md`](ISSUE-multi-sequence.md)），驱动改排队另算 |
+| prefill ∥ decode | 多序列之后才谈得上 | prefill 现在是一次走完整链的大 batch，`server.py` 一把锁串行；要让第二个请求在别人 prefill 时 decode，得先有 seq 维度、再把 prefill 切块插入。买的是公平性，不是吞吐 |
+
+单序列的延迟只有三个旋钮：投机接受率、段数（每段 33–35 ms 是串行叠加的）、往返（星形拓扑，
+hidden 每段都回本机再发下一段，[`THREE-SEGMENT.md`](THREE-SEGMENT.md) §4）。吞吐那个旋钮叫
+多序列，要单独立项。
