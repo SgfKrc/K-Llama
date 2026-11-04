@@ -641,8 +641,15 @@ class StageClient:
             return None
         return arr.reshape(n_layers, n_tokens, n_embd)
 
-    def mtp_draft(self, hidden: np.ndarray, token: int, n_past: int) -> int:
-        """One draft token from the MTP head held by this stage."""
+    def mtp_draft(self, hidden: np.ndarray, token: int, n_past: int,
+                  want_logits: bool = False):
+        """One draft token from the MTP head held by this stage.
+
+        ``want_logits=False`` returns the token alone -- the greedy drafter's contract, and
+        every existing caller keeps that. ``want_logits=True`` returns ``(token, logits)``
+        with logits flat and length n_vocab, which is what rejection sampling needs: the
+        ratio p[d]/q[d] is undefined when the draft side only reports its argmax.
+        """
         # last_hidden() hands back a flat (n_embd,) row; the wire wants one row of that width.
         # Reading shape[0] without this gave a 2048-row request and the worker rejected it.
         arr = hidden.reshape(1, -1) if hidden.ndim == 1 else hidden
@@ -650,10 +657,32 @@ class StageClient:
         # No "op": this rides on FORWARD like a normal hidden-in call, with `token` marking it
         # as a draft request. An op would be intercepted by the text-helper dispatch before the
         # blob is decoded, and mtp_draft needs the hidden.
-        msg = self._forward({"n_tokens": int(arr.shape[0]),
-                             "n_past": n_past, "dtype": dtype, "token": int(token)},
-                            wire.encode(arr, dtype))
-        return int(msg.meta["token"])
+        meta = {"n_tokens": int(arr.shape[0]), "n_past": n_past, "dtype": dtype,
+                "token": int(token)}
+        if want_logits:
+            meta["want_logits"] = True
+        msg = self._forward(meta, wire.encode(arr, dtype))
+        if not want_logits:
+            return int(msg.meta["token"])
+        n_vocab = int(msg.meta["n_vocab"])
+        # Always float32, never the wire dtype: the shim's answer is declared by this op, and
+        # quantizing logits would move the two distributions differently.
+        got = np.frombuffer(msg.blob, dtype=np.float32)
+        if got.size != n_vocab:
+            raise RuntimeError(
+                f"stage {self.stage.index}: draft logits row is {got.size} floats, "
+                f"the worker declared {n_vocab}")
+        return int(msg.meta["token"]), got
+
+    def mtp_draft_logits(self, hidden: np.ndarray, token: int,
+                         n_past: int) -> tuple[int, np.ndarray]:
+        """Draft token plus the logits row behind it.
+
+        Same operation as ``mtp_draft(want_logits=True)``, under the name the pipe client
+        (`keep_head.KeepHeadUpstream`) uses -- `test_contract` requires both clients to expose the
+        shim's operations under one name, and rejection sampling is the only caller.
+        """
+        return self.mtp_draft(hidden, token, n_past, want_logits=True)
 
     def mtp_reset(self) -> None:
         self._forward({"op": "mtp_reset", "n_tokens": 0, "n_past": 0})
@@ -1151,21 +1180,131 @@ AUTO_MIN_ACCEPT = 0.35
 AUTO_WARMUP_STEPS = 6
 
 
+# ---------------------------------------------------------------------------
+# Rejection sampling: the distributions behind a sampled speculative round
+# ---------------------------------------------------------------------------
+#
+# Everything here is float64 on purpose. p and q are divided by each other, and the residual
+# p - q is a difference of two numbers near 1 in the head of the distribution: float32 logits
+# are plenty for an argmax but the subtraction loses the small differences that decide the
+# ratio. Reading the rows as float32 (that is what the shim holds) and normalizing in float64
+# costs one 2 MB temporary per row and keeps the estimator honest.
+
+def _sampling_probs(logits: np.ndarray, temperature: float) -> np.ndarray:
+    """``softmax(logits / T)`` as a normalized float64 probability vector.
+
+    This is the *same* transform the tail's sampler chain applies for a temperature-only
+    chain: llama.cpp's temp sampler divides the logits by T and dist softmaxes them. Building
+    it here is what lets the draft head (which never goes through the sampler) be compared
+    against the trunk on equal terms.
+    """
+    if not temperature > 0.0:
+        raise ValueError(f"sampling needs temperature > 0, got {temperature!r}")
+    # copy=True: the arithmetic below is in place, and a caller that already handed us a
+    # float64 array must not have its logits rewritten under it.
+    z = np.array(logits, dtype=np.float64, copy=True)
+    if temperature != 1.0:
+        z /= temperature
+    z -= z.max()
+    np.exp(z, out=z)
+    total = float(z.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise RuntimeError(f"degenerate logits: softmax total={total!r}")
+    z /= total
+    return z
+
+
+def _draw(probs: np.ndarray, rng: np.random.Generator) -> int:
+    """One token id from ``probs``.
+
+    cumulative-draw instead of ``rng.choice(p=...)``: choice re-validates the sum and walks a
+    size-n_vocab array through a general path every call, and this runs 2k+2 times per round
+    at k=5 (248k entries on this checkpoint). ``u * cdf[-1]`` keeps the last bucket reachable
+    even when the sum is a hair below 1.
+    """
+    cdf = np.cumsum(probs)
+    u = rng.random() * float(cdf[-1])
+    idx = int(np.searchsorted(cdf, u, side="right"))
+    return min(idx, probs.size - 1)
+
+
+def _accept_prob(p: np.ndarray, q: np.ndarray, token: int) -> float:
+    """``min(1, p[token] / q[token])``; 0 when the draft gave it no mass at all."""
+    qd = float(q[token])
+    if qd <= 0.0:
+        return 0.0
+    return min(1.0, float(p[token]) / qd)
+
+
+def _draw_residual(p: np.ndarray, q: np.ndarray, rng: np.random.Generator) -> int:
+    """Draw from the normalized ``(p - q)+`` -- the rejection branch of speculative sampling.
+
+    Drawing from p instead is the tempting shortcut and it is wrong: it over-represents what
+    the draft already over-represents, so the stream stops being distributed as p. ``(p - q)+``
+    is exactly the mass that acceptance left uncovered.
+    """
+    diff = p - q
+    np.maximum(diff, 0.0, out=diff)
+    total = float(diff.sum())
+    if total <= 0.0:
+        # p <= q everywhere, so the acceptance test could not have failed (it accepts with
+        # probability >= 1). Floating point can still land here by a hair; p is the only
+        # meaningful answer, and the alternative is raising in the middle of a decode.
+        return _draw(p, rng)
+    diff /= total
+    return _draw(diff, rng)
+
+
+def _timed_logits(tail: StageClient, row: int, stats: dict) -> np.ndarray:
+    """``tail.logits(row)`` with the cost accounted for separately.
+
+    A row is n_vocab floats over the socket (993 KB at 248320), so a k=5 round moves several
+    megabytes just to look at distributions. The number belongs next to the tok/s figure
+    rather than hidden inside a step time.
+    """
+    started = time.perf_counter()
+    logits = tail.logits(row)
+    stats["logits_ms"] = stats.get("logits_ms", 0.0) + (
+        (time.perf_counter() - started) * 1000.0)
+    stats["logits_rows"] = stats.get("logits_rows", 0) + 1
+    return logits
+
+
 def speculate(clients: list[StageClient], token: int, n_past: int,
               stage_ms: list[list[float]], k: int,
-              stats: dict) -> list[int]:
+              stats: dict, sampling: dict | None = None) -> list[int]:
     """One speculative step: trunk token + up to k recursive MTP drafts, verified in one block.
 
     Returns the accepted tokens for this step (1 + accepted drafts), always starting with the
     token the trunk itself produced. The trailing token of the verified block is free -- the
     block already computed it -- so it is returned as well and the caller must not recompute it.
 
-    Correctness contract: the returned list is what plain greedy would have produced. The
-    verification compares the drafts against the trunk's own argmax at each position, and any
-    position after the first mismatch is rolled back on *every* stage.
+    Greedy contract (``sampling=None``, every existing caller): the returned list is what plain
+    greedy would have produced. The verification compares the drafts against the trunk's own
+    argmax at each position, and any position after the first mismatch is rolled back on
+    *every* stage.
+
+    Sampling contract (``sampling={"temperature": T, "rng": Generator}``): the returned tokens
+    are distributed EXACTLY as T-sampling from the trunk would, which is the only property that
+    makes non-greedy speculation worth having. That requires the standard rejection scheme:
+
+      * the draft is drawn from q (the MTP head's own distribution), not argmaxed;
+      * a draft is accepted with probability min(1, p[d]/q[d]);
+      * on the first rejection the token is drawn from the normalized ``(p - q)+``, not from p.
+        Drawing from p there is the usual shortcut and it biases the stream toward the draft's
+        own peaks; the residual is what makes the marginal distribution come back to exactly p.
+
+    Both p and q are ``softmax(logits / T)``, applied here from raw logits, so the ratio is
+    between two distributions that went through the same transform. top_k / top_p / penalties
+    are refused rather than approximated: they live inside the shim's sampler chain, which is
+    never exposed as a distribution, and computing them here while the tail applies them too
+    would produce two different transforms on the two sides of the ratio.
     """
     tail = clients[-1]
     stats["steps"] = stats.get("steps", 0) + 1
+    sampled = sampling is not None
+    rng = sampling["rng"] if sampled else None
+    temperature = float(sampling["temperature"]) if sampled else 1.0
 
     # 1. trunk step: one token, and the final hidden the draft head needs
     t1 = forward(clients, [token], n_past, stage_ms)
@@ -1174,13 +1313,34 @@ def speculate(clients: list[StageClient], token: int, n_past: int,
         stats["no_draft"] = stats.get("no_draft", 0) + 1
         return [t1]
 
+    if sampled:
+        # The trunk's own token has to be a sample from its distribution, not an argmax. It is
+        # drawn from the SAME softmax(logits/T) the verifier will use for p, so a round whose
+        # drafts all die still advances by exactly one correctly distributed token.
+        try:
+            p0 = _sampling_probs(_timed_logits(tail, -1, stats), temperature)
+            t1 = _draw(p0, rng)
+        except Exception:              # noqa: BLE001 - fall back to the shim's own sample
+            stats["sampling_error"] = stats.get("sampling_error", 0) + 1
+            return [t1]
+
     # 2. recursive drafts. Each one feeds the previous guess back in with the same hidden.
     drafts: list[int] = []
+    # Draft distributions q_j, kept only on the sampling path (aligned with `drafts`).
+    qs: list[np.ndarray] = []
     tail.mtp_reset()
     cur = t1
     try:
         for j in range(k):
-            d = tail.mtp_draft(h, cur, n_past + 1 + j)
+            if sampled:
+                # One forward, two uses: the same logits row that gives the argmax also gives
+                # the distribution the token is actually drawn from.
+                _, logits_q = tail.mtp_draft(h, cur, n_past + 1 + j, want_logits=True)
+                q = _sampling_probs(logits_q, temperature)
+                d = _draw(q, rng)
+                qs.append(q)
+            else:
+                d = tail.mtp_draft(h, cur, n_past + 1 + j)
             drafts.append(d)
             cur = d
     except Exception:                  # noqa: BLE001 - a broken draft head must not break decode
@@ -1195,13 +1355,45 @@ def speculate(clients: list[StageClient], token: int, n_past: int,
         stats["verify_error"] = stats.get("verify_error", 0) + 1
         return [t1]
 
-    # 4. accept the longest prefix where the draft equals the trunk
-    accepted = 0
-    for j in range(len(drafts)):
-        if drafts[j] == tb[j]:
-            accepted += 1
-        else:
-            break
+    # 4. accept the longest prefix; stop at the first mismatch / rejection.
+    if sampled:
+        # Row j of the verification pass predicts position n_past+2+j from the block's prefix,
+        # so p_j is exactly the distribution drafts[j] was drawn from the other side of. The
+        # rows past a rejection describe a context the chain never should have seen, which is
+        # why they are neither read nor used.
+        accepted = 0
+        next_tok: int | None = None
+        try:
+            for j in range(len(drafts)):
+                p = _sampling_probs(_timed_logits(tail, j, stats), temperature)
+                if rng.random() <= _accept_prob(p, qs[j], drafts[j]):
+                    accepted += 1
+                    continue
+                # First rejection: the residual distribution is what restores p exactly.
+                next_tok = _draw_residual(p, qs[j], rng)
+                break
+            if next_tok is None:
+                # Everything accepted: the free token is row k's own sample.
+                next_tok = _draw(
+                    _sampling_probs(_timed_logits(tail, len(drafts), stats), temperature), rng)
+        except Exception:              # noqa: BLE001 - a distribution we cannot read must not
+            stats["sampling_error"] = stats.get("sampling_error", 0) + 1
+            # `t1` is a correctly distributed token and the block's KV is already written, so
+            # the only cleanup needed is the same rollback the greedy path performs.
+            for c in clients:
+                try:
+                    c.seq_rm(n_past + 1)
+                except Exception:      # noqa: BLE001
+                    stats["rollback_error"] = stats.get("rollback_error", 0) + 1
+            return [t1]
+    else:
+        accepted = 0
+        for j in range(len(drafts)):
+            if drafts[j] == tb[j]:
+                accepted += 1
+            else:
+                break
+        next_tok = tb[accepted]
 
     keep = 1 + accepted                # positions the block legitimately wrote
     if keep < len(block):
@@ -1219,9 +1411,9 @@ def speculate(clients: list[StageClient], token: int, n_past: int,
     # 0-or-all shape can be fixed by predicting which rounds to try; a flat one cannot.
     stats.setdefault("per_round", []).append(accepted)
     out = block[:keep]
-    # tb[accepted] is the trunk's token at the next position -- already paid for
-    out.append(tb[accepted])
+    out.append(next_tok)
     return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -1589,18 +1781,26 @@ def main() -> int:
         raise SystemExit("--cascade-mtp 必须 >= 0")
     if args.cascade_mtp and not args.dflash:
         raise SystemExit("--cascade-mtp 需要 --dflash：级联是接在 DFlash 块后面的")
-    if args.spec_k != 0 and not args.greedy:
-        # Same rule as --dflash below, and for the same reason: the verifier only exposes an
-        # argmax, so a sampled round cannot be verified. This used to be unguarded -- the CLI
-        # decided whether to speculate from --spec-k alone, so `--spec-k 2 --temperature 0.7`
-        # silently mixed argmax-verified tokens into a sampled stream and printed a tok/s
-        # number that meant nothing.
-        raise SystemExit("--spec-k 需要 --greedy：验证器只暴露 argmax，采样下无法做 "
-                         "rejection sampling")
+    if args.spec_k != 0 and not args.greedy and not args.dry_run:
+        # Non-greedy speculation is now supported, but only for a temperature-only sampler.
+        # --dry-run skips this: it only validates the topology and never decodes, and refusing
+        # it over sampler flags would make the cheap sanity check unusable.
+        # p and q are built here from raw logits as softmax(logits/T); the tail's sampler chain
+        # applies penalties -> top_k -> top_p -> temp before picking a token, and none of those
+        # transforms comes back as a distribution. Approximating them on this side while the
+        # tail applies the real chain is how a silently biased stream ships, so they are
+        # refused instead of degraded. --greedy keeps the old argmax-verified path unchanged.
+        if args.temperature <= 0:
+            raise SystemExit("采样投机需要 --temperature > 0（贪心投机用 --greedy）")
+        if args.top_k != 0 or args.top_p < 1.0:
+            raise SystemExit(
+                "--spec-k 的采样路径只支持 temperature：top_k/top_p 在 shim 的采样链内部，"
+                "不会以分布形式暴露，两边就得不到同一个变换。请显式给 --top-k 0 --top-p 1.0，"
+                "或改用 --greedy 走原来的贪心投机。")
     if args.dflash:
         if not args.greedy:
-            raise SystemExit("--dflash 需要 --greedy：验证器只暴露 argmax，"
-                             "采样下无法做 rejection sampling")
+            raise SystemExit("--dflash 仍是贪心专用：块草稿器只出 argmax，"
+                             "采样下的拒绝验证还没实现")
         # --cascade-mtp is the only way MTP joins a block round: it extends the DFlash block,
         # it does not run a second independent source. A positive --spec-k would be a second,
         # conflicting depth for the same head.
@@ -1781,6 +1981,12 @@ def main() -> int:
                 k = 2 if (args.prompt_text and looks_like_code(args.prompt_text)) else 0
             else:
                 k = args.spec_k
+            # Non-greedy rounds draw from real distributions; the RNG is seeded from the CLI so
+            # a run (and the distribution check on top of it) is replayable token for token.
+            spec_sampling = None
+            if not args.greedy:
+                spec_sampling = {"temperature": float(args.temperature),
+                                 "rng": np.random.default_rng(args.seed)}
             if os.environ.get("SA_DEBUG_AUTO"):
                 print(f"  [auto] spec_k={args.spec_k} auto={auto} k={k} "
                       f"code={looks_like_code(args.prompt_text) if args.prompt_text else None}",
@@ -1797,7 +2003,8 @@ def main() -> int:
                 if dflash is not None:
                     produced = dflash.step(token, n_past)
                 elif k > 0:
-                    produced = speculate(clients, token, n_past, stage_ms, k, spec_stats)
+                    produced = speculate(clients, token, n_past, stage_ms, k, spec_stats,
+                                         sampling=spec_sampling)
                 else:
                     produced = [forward(clients, [token], n_past, stage_ms)]
                 step_ms.append((time.perf_counter() - start) * 1000.0)
@@ -1850,11 +2057,26 @@ def main() -> int:
                              if spec_stats.get("auto_off_at") else "")
                 print(f"    spec:   k={k} 接受 {acc}/{drf} = {100.0*acc/max(drf,1):.1f}%"
                       f"  平均每轮 {len(out_tokens)/max(len(step_ms),1):.2f} token"
+                      + (f"  T={args.temperature:g} 拒绝采样" if spec_sampling else "  贪心")
                       + auto_note
                       + (f"  无 MTP 头 {no_draft}" if no_draft else "")
                       + (f"  草稿异常 {draft_err}" if draft_err else "")
+                      + (f"  分布读取失败 {spec_stats['sampling_error']}"
+                         if spec_stats.get("sampling_error") else "")
                       + (f"  回滚失败 {spec_stats['rollback_error']}"
                          if spec_stats.get("rollback_error") else ""))
+                # What the distributions cost, separately from the step time: a row is
+                # n_vocab floats over the socket, and this is the price non-greedy
+                # speculation pays that greedy never does.
+                if spec_stats.get("logits_rows"):
+                    rows = spec_stats["logits_rows"]
+                    lms = spec_stats["logits_ms"]
+                    per_step = lms / max(len(step_ms), 1)
+                    print(f"    分布:  {rows} 行 logits / {len(step_ms)} 步  "
+                          f"累计 {lms:.0f} ms = 每步 {per_step:.1f} ms"
+                          f"（{per_step / max(total_ms / max(len(step_ms), 1), 1e-9) * 100:.0f}%"
+                          f" 的步时）")
+
                 # The cascade's own acceptance, separate from the block's: if the MTP head
                 # conditions badly on the block drafter's tokens this is the number that says
                 # so, and it is invisible in the merged total.

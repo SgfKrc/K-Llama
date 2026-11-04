@@ -370,10 +370,22 @@ class StageWorker:
                     hidden = wire.decode(msg.blob, dtype, (n_tokens, n_embd))
                     if self._role == "tail":
                         if "token" in msg.meta:
-                            token = self._engine.mtp_draft(hidden, int(msg.meta["token"]),
-                                                           n_past=n_past)
-                            protocol.send(conn, protocol.RESULT,
-                                          {"token": token, "n_past": n_past})
+                            if msg.meta.get("want_logits"):
+                                # SPEC-SAMPLE-01: same draft forward, distribution attached.
+                                # The blob is always float32: the wire dtype is for hidden
+                                # state, and quantizing logits to fp16 would move p and q
+                                # differently and break the acceptance ratio.
+                                token, values = self._engine.mtp_draft_logits(
+                                    hidden, int(msg.meta["token"]), n_past=n_past)
+                                protocol.send(conn, protocol.RESULT,
+                                              {"token": token, "n_vocab": int(values.size),
+                                               "n_past": n_past},
+                                              wire.encode(values.reshape(1, -1), None))
+                            else:
+                                token = self._engine.mtp_draft(hidden, int(msg.meta["token"]),
+                                                               n_past=n_past)
+                                protocol.send(conn, protocol.RESULT,
+                                              {"token": token, "n_past": n_past})
                         elif n_tokens > 1:
                             # Speculative verification: one argmax per submitted position.
                             toks = self._engine.forward_tokens_out(hidden, n_past=n_past)

@@ -174,6 +174,15 @@ class Binding:
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
             ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)]
         lib.qlh_kh_mtp_draft.restype = ctypes.c_int32
+        # SPEC-SAMPLE-01: optional symbol. An older shim has no distribution export; the
+        # request handler answers a clear "unavailable" instead of the load failing, so the
+        # same checkout still works against a DLL built before this existed.
+        if hasattr(lib, "qlh_kh_mtp_draft_logits"):
+            lib.qlh_kh_mtp_draft_logits.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+                ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int32]
+            lib.qlh_kh_mtp_draft_logits.restype = ctypes.c_int32
         lib.qlh_kh_mtp_reset.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_mtp_reset.restype = ctypes.c_int32
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
@@ -446,6 +455,31 @@ class Binding:
                                         int(token), int(n_past), ctypes.byref(out))
         return self._checked(rc, int(out.value), "mtp draft")
 
+    def mtp_draft_logits(self, hidden: np.ndarray, token: int,
+                         n_past: int) -> tuple[int, np.ndarray]:
+        """One draft token plus the full logits row it was argmaxed from.
+
+        Same forward as ``mtp_draft`` (one batch, one position); the difference is that the
+        n_vocab floats are copied out instead of thrown away. Rejection sampling needs the
+        draft's distribution q, and an argmax alone cannot express p[d]/q[d].
+
+        The array is a fresh buffer owned by the caller (the shim's own logits are invalid
+        after the next decode). Returns ``(argmax_token, logits)``.
+        """
+        if not hasattr(self._lib, "qlh_kh_mtp_draft_logits"):
+            raise RuntimeError("shim has no qlh_kh_mtp_draft_logits (rebuild it from this "
+                               "checkout: shim/build_shim_msvc.ps1)")
+        n_vocab = self.n_vocab
+        if n_vocab <= 0:
+            raise RuntimeError(f"cannot size the draft logits row: n_vocab={n_vocab}")
+        out = ctypes.c_int32(-1)
+        buf = np.zeros(n_vocab, dtype=np.float32)
+        rc = int(self._lib.qlh_kh_mtp_draft_logits(
+            self._handle, _f32(hidden), int(hidden.shape[-1]),
+            int(token), int(n_past), ctypes.byref(out), _f32(buf), n_vocab))
+        token_out = self._checked(rc, int(out.value), "mtp draft logits")
+        return token_out, buf
+
     def mtp_reset(self) -> None:
         """Clear the draft context's memory. Positions accumulate in mtp_ctx, so recursive
         drafting has to start each candidate chain from a clean slate."""
@@ -707,6 +741,14 @@ def main() -> int:
             elif operation == "mtp_draft":
                 _response(ok=True, token=binding.mtp_draft(
                     _decode_hidden(request), int(request["token"]), n_past))
+            elif operation == "mtp_draft_logits":
+                # Same frame with the distribution attached: `token` stays where the greedy
+                # path puts it, so a reader that only wants the token can ignore `data`.
+                token, values = binding.mtp_draft_logits(
+                    _decode_hidden(request), int(request["token"]), n_past)
+                contiguous = np.ascontiguousarray(values, dtype=np.float32)
+                _response(ok=True, token=int(token), shape=list(contiguous.shape),
+                          data=base64.b64encode(contiguous).decode("ascii"))
             elif operation == "mtp_reset":
                 binding.mtp_reset()
                 _response(ok=True)

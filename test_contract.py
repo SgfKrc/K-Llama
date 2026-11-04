@@ -30,7 +30,7 @@ CONTRACT_OPS = (
     "draft_open", "draft_n_embd_enc", "draft_inject", "draft_block",
     "draft_reset", "draft_rollback", "draft_close",
     "add_layer_inp", "layer_inp", "last_hidden", "logits", "set_skip_hidden_logits",
-    "mtp_draft", "mtp_reset", "seq_rm",
+    "mtp_draft", "mtp_draft_logits", "mtp_reset", "seq_rm",
     "tokenize", "piece", "is_eog",
     "set_sampling", "sampling", "clear_sampling",
     "reset", "close",

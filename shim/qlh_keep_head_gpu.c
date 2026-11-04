@@ -1759,6 +1759,87 @@ int32_t qlh_kh_mtp_draft(void * handle_void,
     return rc;
 }
 
+/* ★ SPEC-SAMPLE-01：与 qlh_kh_mtp_draft 完全同一条路径，额外交出该位置**完整的
+ * logits 行**。
+ *
+ * 为什么需要这份拷贝而不是让老函数调用它再丢掉 logits：`qlh_kh_mtp_draft` 是贪心
+ * 投机的回归基线，它的行为必须逐位不变，所以老函数一行不动；这里只是把已经算出来
+ * 的 n_vocab 个浮点拷走。非贪心（拒绝）采样需要草稿分布 q，而 MTP 头只回 argmax
+ * 时比值 p[d]/q[d] 根本没有定义。
+ *
+ * `capacity` 必须 >= n_vocab：截断后的分布不等于原分布，静默截断会让拒绝采样给出
+ * 偏掉的分布，而那正是这套代码唯一要保证的东西，所以宁可直接失败。
+ *
+ * 返回 0 成功；-5 参数非法；-2 后端解码失败；-6 拿不到 logits / vocab；-7 logits
+ * 含 NaN/Inf；-8 capacity 不足。
+ */
+int32_t qlh_kh_mtp_draft_logits(void * handle_void,
+                                const float * hidden,
+                                int32_t n_embd,
+                                int32_t token,
+                                int32_t n_past,
+                                int32_t * out_token,
+                                float * out_logits,
+                                int32_t capacity) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle != NULL) {
+        handle->last_error = 0;
+    }
+    if (handle == NULL || handle->mtp_ctx == NULL || hidden == NULL ||
+        out_token == NULL || out_logits == NULL ||
+        n_embd != handle->n_embd || token < 0 || n_past < 0) {
+        if (handle != NULL) handle->last_error = -5;
+        return -5;
+    }
+
+    struct llama_batch_ext * batch = llama_batch_ext_init(handle->mtp_ctx);
+    if (batch == NULL) {
+        handle->last_error = -5;
+        return -5;
+    }
+
+    int32_t rc = 0;
+    do {
+        const int32_t idx = llama_batch_ext_add_token(batch, 0, (llama_token) token);
+        if (idx < 0) { rc = -5; break; }
+
+        struct llama_embd state;
+        state.data   = hidden;
+        state.n_rows = 1;
+        state.n_embd = (size_t) n_embd;
+        if (!llama_batch_ext_set_embd_state(batch, idx, state)) { rc = -5; break; }
+
+        const llama_pos pos = (llama_pos) n_past;
+        if (!llama_batch_ext_set_pos(batch, idx, &pos)) { rc = -5; break; }
+        if (!llama_batch_ext_set_output_logits(batch, idx, true)) { rc = -5; break; }
+
+        const int32_t drc = llama_process(handle->mtp_ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+        if (drc != 0) { rc = -2; break; }
+
+        const float * logits = llama_get_logits_ith(handle->mtp_ctx, 0);
+        if (logits == NULL) { rc = -6; break; }
+
+        const int n_vocab = qlh_vocab_size(handle);
+        if (n_vocab <= 0) { rc = -6; break; }
+        if (capacity < n_vocab) { rc = -8; break; }
+
+        int best = 0;
+        float best_v = logits[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            const float v = logits[i];
+            if (!isfinite(v)) { rc = -7; break; }
+            if (v > best_v) { best_v = v; best = i; }
+        }
+        if (rc == -7) break;
+        memcpy(out_logits, logits, (size_t) n_vocab * sizeof(float));
+        *out_token = best;
+    } while (0);
+
+    llama_batch_ext_free(batch);
+    handle->last_error = rc;
+    return rc;
+}
+
 /* Drop KV/state at and after `p0` for one sequence, keeping [0, p0).
  *
  * Speculative decode verifies k tokens, accepts j <= k, and has to retract the rest. Plain

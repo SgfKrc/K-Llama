@@ -202,6 +202,12 @@ class StageEngine:
     def mtp_draft(self, hidden: np.ndarray, token: int, *, n_past: int) -> int:
         return int(self._up.mtp_draft(hidden, int(token), n_past=n_past))
 
+    def mtp_draft_logits(self, hidden: np.ndarray, token: int, *,
+                         n_past: int) -> tuple[int, np.ndarray]:
+        """Draft token plus its logits row; the distribution rejection sampling needs."""
+        token_out, values = self._up.mtp_draft_logits(hidden, int(token), n_past=n_past)
+        return int(token_out), np.asarray(values, dtype=np.float32).reshape(-1)
+
     def mtp_reset(self) -> None:
         self._up.mtp_reset()
 

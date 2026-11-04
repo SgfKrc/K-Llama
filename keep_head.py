@@ -336,6 +336,18 @@ class KeepHeadUpstream:
         return int(self._request(
             self._hidden_payload("mtp_draft", arr, n_past, token=int(token)))["token"])
 
+    def mtp_draft_logits(self, hidden, token: int, *, n_past: int) -> tuple[int, np.ndarray]:
+        """One draft token *and* the logits row behind it, flat with length n_vocab.
+
+        The greedy drafter only ever needed the argmax, so the distribution was computed and
+        discarded inside the shim. Rejection sampling compares p against the draft's q, which
+        is exactly the row this returns. Returns ``(argmax_token, logits)``.
+        """
+        arr = self._checked_hidden(hidden, n_past)
+        reply = self._request(
+            self._hidden_payload("mtp_draft_logits", arr, n_past, token=int(token)))
+        return int(reply["token"]), self._array(reply).reshape(-1)
+
     def mtp_reset(self) -> None:
         self._request({"op": "mtp_reset"})
 
