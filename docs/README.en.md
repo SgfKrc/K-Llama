@@ -2,9 +2,11 @@
 
 [中文](../README.md) | **English**
 
-> Status: **Current** — two- and three-stage cross-machine chains working (the three-stage form
-> passed a 60-round soak run); DFlash parallel drafting, SLIM-ARC
-> prefetch, the TUI, the OpenAI-compatible endpoint, sampling and VRAM verification are all in place
+> Status: **Usable** — three shapes are working and have been soak-tested: two machines at
+> 20.9 tok/s, two weak devices at 6.50, three-stage over the public internet at 5.00; the
+> three-stage form ran 60 rounds of `gen 256` with zero anomalies. The portable bundle deploys
+> from scratch and produces tokens in-bundle (verified by three independent walkthroughs). The
+> one shape never verified is a **clean Windows install** — see `DELIVERY.md` §1.2.
 > Last updated: 2026-11-04
 > Applies to: the engine as a whole — what it is, what has been measured, and what is still
 > missing; readers are integrators and reviewers.
@@ -173,6 +175,8 @@ Qwen3.6-35B-A3B (MoE, 40 layers, 21.87 GiB of weights), single sequence, greedy:
 | Whole model on the laptop, `-ngl 6` | 10.5 tok/s | end to end |
 | Two machines, 32:40, no speculation | 12.2 tok/s | decode phase, 128-token runs |
 | **Two machines + DFlash k=5** | **20.9 tok/s** | decode phase, 64-token runs |
+| Two weak devices, 24:40 (Surface + Y700, both CPU-only) | 6.50 tok/s | decode phase, 24-token runs |
+| Three-stage 0:24 / 24:32 / 32:40 over Tailscale | 5.00 tok/s | decode phase, 24-token runs |
 
 Everything the two-machine chain gains over one machine comes from speculation; the split itself
 remains a net loss. Longer runs decay: the same configuration at 128 tokens gives lower acceptance
@@ -184,16 +188,17 @@ and lower throughput — the full k=3/5/8/15 sweep and its two conclusions are i
 
 ## Not done (ordered by what this machine can verify)
 
-**1. Speculation with sampling.** The verifier hands back argmax only. Sampling needs rejection
-sampling, which compares two distributions; the shim already returns per-position logits
-(`qlh_kh_logits`, 2026-11-01), so what is missing is a measurement, not a data path: at the same
-position, do the whole model and the chain pick the same top-8 candidates? Probe in place:
-`checks/probe_logits_delta.py`. The decode path itself still has no sampling.
+**1. Speculation with sampling.** The prerequisites are all in place — splitting introduces no error
+(2B over 16 positions and 35B over 12, logits bit-identical, top-8 fully coincident, TV=0; see
+`DELIVERY.md` §1.1), and both logit return and the probe (`checks/probe_logits_delta.py`) exist.
+What is missing is the acceptance test itself: today it compares token equality, while sampling
+needs rejection sampling, which compares two distributions.
 
 **2. SLIM-ARC's on-demand loader.** Only prefetch is integrated. Verifying the loader means
-manufacturing a segment that does not fit — the whole checkpoint is in the page cache here, so
-`issued` stays at 0. Either wait for the weak device or squeeze available memory artificially.
-It optimises the degraded mode, which is not today's bottleneck.
+manufacturing a segment that does not fit — the whole checkpoint sits in the page cache here, so
+`issued` stays at 0. On the weak devices the memory headroom is thin enough that the loader *could*
+fire, but the measured effect there is negative: 22 GB of model against 16 GB of RAM lands in the
+thrashing band. It optimises the degraded mode, which is not today's bottleneck.
 
 **3. Multi-sequence token sharing.** Needs `kv_unified`, and every segment has to track
 per-sequence positions. The server serialises requests behind one global lock, so concurrency

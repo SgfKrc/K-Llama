@@ -2,7 +2,10 @@
 
 **中文** | [English](docs/README.en.md)
 
-> 状态：两段与三段跨机链路都可用（三段跑过 60 轮长跑）。DFlash 并行草稿、TUI、OpenAI 兼容接口、采样与显存校验已接入。
+> 状态：**可用**。三种形态都跑通并做过长跑验证——本机两段 20.9 tok/s、两台弱设备 6.50 tok/s、
+> 三段跨公网 5.00 tok/s；三段连跑 60 轮 `gen 256` 零异常。绿色包能从零部署并在包内直接出
+> token（三次独立演练）。唯一没验证过的形态是**全新 Windows 装机**，见
+> [`docs/DELIVERY.md`](docs/DELIVERY.md) §1.2。
 
 面向**非整模加载**的定制 llama.cpp 引擎。整模文件留在原地，每个节点只把属于自己那几层
 读进内存，段间只传 hidden state（`n_embd` 个 float32，8 KB）。
@@ -117,7 +120,7 @@ server.py             /v1/chat/completions、/v1/models
 proto_responses.py    /v1/responses 的纯翻译层
 koakuma.py            TUI 与启动画面
 checks/               验收（`verify_*`）与诊断脚本
-scripts/              实验探针与跨机驱动
+scripts/              验证探针与跨机驱动
 ```
 
 不写行数：这类数字每次重构都会过期，而职责不会。
@@ -149,15 +152,18 @@ Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB 权重），单序列，greedy：
 | 本机单卡整模 `-ngl 6` | 10.5 tok/s | 端到端 |
 | 跨机两段 32:40，无投机 | 12.2 tok/s | 解码阶段、128-token 生成 |
 | **跨机两段 + DFlash k=5** | **20.9 tok/s** | 解码阶段、64-token 生成 |
+| 两台弱设备两段 24:40（Surface + Y700，均纯 CPU） | 6.50 tok/s | 解码阶段、24-token 生成 |
+| 三段 0:24 / 24:32 / 32:40（跨公网 Tailscale） | 5.00 tok/s | 解码阶段、24-token 生成 |
 
 跨机比单机快的那部分来自投机，拆分本身是负收益。完整 k 扫描见
-[`docs/SPECULATION.md`](docs/SPECULATION.md) §11。
+[`docs/SPECULATION.md`](docs/SPECULATION.md) §11；弱设备与三段的切点依据见
+[`docs/THREE-SEGMENT.md`](docs/THREE-SEGMENT.md)。
 
 ---
 
 ## 未做（按本机可验证性排序）
 
-1. **非贪心下投机。** logits 已能回传，缺一次判据实验：整模与链路在同位置的 top-8 是否重合。探针就位 `checks/probe_logits_delta.py`。
+1. **非贪心下投机。** 前置已齐，缺的是接受判据本身：分段不引入误差（2B 测 16 个位置、35B 测 12 个位置 logits 逐位相同、top-8 全重合、TV=0，见 [`docs/DELIVERY.md`](docs/DELIVERY.md) §1.1），logits 回传与探针 `checks/probe_logits_delta.py` 都已就位。现在投机验证比的是「token 相等」，采样要的是拒绝采样——比较两个分布。
 2. **SLIM-ARC 的预取。** 预算恒 0 与层号恒 0 两个 bug 已修（后者改用图节点名后缀），日志确认 40 层全通，但本机实测为负收益：22 GB 模型 / 16 GB 内存落在「抖动区」，预取量与速度严格反比。上游 80B 级模型的「流式区」本机无同体量模型可复现，因此不否定上游结论。见 [`docs/SLIM-ARC-接入计划.md`](docs/SLIM-ARC-接入计划.md) §6.5。
 3. **多序列共享。** 有条件做。`kv_unified` 与 recurrent 隔离**都不是前提**——两条独立对话
    交替 decode 时每个 token 只属于一个 seq（`kv_unified` 只在「一个 token 属于多条序列」时
@@ -165,7 +171,7 @@ Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB 权重），单序列，greedy：
    `n_seq_max=1`（`keep_head_worker.py:240`）、token 通道 `seq_id=0`、协议里没有 seq 维度。
    推荐路径 3~4 人天，买到的是会话共存与前缀复用，**不是吞吐**。见
    [`docs/ISSUE-multi-sequence.md`](docs/ISSUE-multi-sequence.md)。
-4. **两个弱设备凑两段。** 前提是两个设备都能跑 worker，而这点从未验证——先做 1 小时平台探针，任一项失败就判死。见 [`docs/ANDROID-SURFACE-段接入评估.md`](docs/ANDROID-SURFACE-段接入评估.md) §7。
+4. **四台及以上。** 拓扑与 supervisor 支持 N 段，三段已跑通；更多段没有实测过。
 
 ---
 
