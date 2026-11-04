@@ -2,9 +2,10 @@
 
 [中文](../README.md) | **English**
 
-> Status: **Current** — two-stage cross-machine chain working; DFlash parallel drafting, SLIM-ARC
+> Status: **Current** — two- and three-stage cross-machine chains working (the three-stage form
+> passed a 60-round soak run); DFlash parallel drafting, SLIM-ARC
 > prefetch, the TUI, the OpenAI-compatible endpoint, sampling and VRAM verification are all in place
-> Last updated: 2026-11-03
+> Last updated: 2026-11-04
 > Applies to: the engine as a whole — what it is, what has been measured, and what is still
 > missing; readers are integrators and reviewers.
 

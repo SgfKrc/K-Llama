@@ -2,7 +2,7 @@
 
 **中文** | [English](docs/README.en.md)
 
-> 状态：两段跨机链路可用。DFlash 并行草稿、TUI、OpenAI 兼容接口、采样与显存校验已接入。
+> 状态：两段与三段跨机链路都可用（三段跑过 60 轮长跑）。DFlash 并行草稿、TUI、OpenAI 兼容接口、采样与显存校验已接入。
 
 面向**非整模加载**的定制 llama.cpp 引擎。整模文件留在原地，每个节点只把属于自己那几层
 读进内存，段间只传 hidden state（`n_embd` 个 float32，8 KB）。

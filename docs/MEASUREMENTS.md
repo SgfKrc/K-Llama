@@ -237,3 +237,21 @@ loopback worker 往返（2B tail 段，300 次中位）：`StageEngine` 直调 1
   还要约 0.3 ms。没有收益。
 - **35B / ROG 上的 dtype 验证**：2B 已是 1/5 分叉，方向明确；将来要试别的 dtype，
   `checks/verify_wire.py --record/--compare` 是现成的判据。
+
+## 9. 三段长跑与观察者效应（2026-11-04）
+
+三段 `0:32` / `32:36`（cpu 中继，4 层）/ `36:40`（tail，4 层），`--gen 256`：
+
+| 组 | 诊断 | 轮数 | 结果 | 每 token |
+| --- | --- | ---: | --- | --- |
+| B1 | 无 | **60** | **0 异常** | 224–331 ms |
+| A1 | `faulthandler` 周期 dump | 16（崩） | `0xc0000005` | 224–331 ms |
+| A4 | `faulthandler` + `py-spy` | 20 | 0 异常 | — |
+| A5 | `faulthandler` + `py-spy` | 14（崩） | `0xc0000005` | — |
+
+有 `faulthandler` 累计 77 轮 2 次 AV，无诊断 60 轮 0 次。两次 AV 都在 10 s 周期 dump
+之后约 1 秒、栈停在普通 Python 语句（`b64encode` / `recv_into`）——**周期 dump 自己触发的**。
+详见 `ISSUE-tail-worker-hang.md` §2。
+
+两段 `0:32` / `32:40`（8 层 tail，带 MTP）：`gen 256` × 20 轮、`gen 900`（932/1024 位置）
+× 3 轮全部零异常；`gen 900` 时 `n_past` 到 919，`find_slot` / `GGML_ASSERT` / `nan` 零命中。

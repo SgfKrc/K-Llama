@@ -31,7 +31,7 @@
 | 项 | 为什么算未验证 |
 | --- | --- |
 | 真正干净的 Windows | 只清空了工作区，VC++ 运行库等系统依赖还在；`bin/` 里那 4 个 MSVC dll 就是为此准备的，但没在全新系统上确认过 |
-| 三台及以上机器 | 拓扑与 supervisor 都支持 N 段，但只跑过 2 段 |
+| 四台及以上机器 | 拓扑与 supervisor 支持 N 段，三段（本机 + 两台弱设备）已跑通，但没试过更多 |
 | 除 `qwen35` / `qwen35moe` 外的架构 | 见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 的架构适配说明 |
 
 ---
@@ -115,7 +115,7 @@ python scripts/probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
 | --- | --- |
 | 服务发现（mDNS / 注册中心） | 2–3 台机器，Tailscale 加手填 IP 够用；出问题时 `probe.py` 能立刻分出「连不上」与「连上了没发 HELLO」 |
 | Android APK | 要 NDK 重编（Termux 的 libc++ 与 bionic 不是一回事）、python 栈要么塞解释器要么重写、21.87 GiB（23.48 GB）的模型还得让用户 SAF 选一次。一键脚本成本低一个数量级 |
-| 单独的健康探测层 | 已用「`keep_head` 子进程没了就让 `stage_worker` 自己退出」消除了「活着但不可用」这个状态；再加探测就是给同一事实造第二份判断 |
+| 单独的健康探测**服务** | 心跳已经内建在 worker 里（`_session` 每圈 touch 一个文件），supervisor 看 mtime 就够；再起一个独立探测进程就是给同一事实造第二份判断 |
 | 真并发混批（多序列换吞吐） | 8–12 人天，且一个 worker 一个 context、decode 仍串行。多序列的收益是会话共存与前缀复用，见 [`ISSUE-multi-sequence.md`](ISSUE-multi-sequence.md) |
 | 非贪心的 GPU 逐位等价 | head 段 6 层在 GPU 时 TV 0.0014–0.0299；要逐位就把 `gpu_layers` 设 0，代价是 32 层全走 CPU |
 
@@ -127,8 +127,13 @@ python scripts/probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
   随后 decode 报 `pos_max X must be < n_past Y`），只能记账。
 - **spec_k>0 时多轮不逐位可复现**：投机回滚的 ~2e-2 跨形状偏差在 100+ token 上下文里
   累积到翻转一个 argmax（答案仍对）。`spec_k=0` 下逐位相同。
-- **supervisor 只看进程存活**：`stage_worker` 的内部失效已靠自愈退出覆盖，但
-  「进程活着且 keep_head 也活着、但输出错」这种不在它的判据里。
+- **supervisor 的判据有两道，但不是全知**：`poll()` 看进程退出，心跳看「还在走」
+  （`stage_worker` 卡在 engine 调用里时心跳会停）。覆盖不到的是「段还在正常服务、但算错了」
+  ——那一类只能靠验收脚本发现。
+- **一条长连接会占满一个段的 session**：`stage_worker` 单线程 `accept → _session`，期间新
+  连接只在 `listen(4)` 的 backlog 里排队（表现为「端口 LISTENING、连得上、不回 HELLO」）。
+  空闲 60 秒的 session 会被主动断开，所以死连接最多堵这么久；但**同一段不要同时挂两个
+  客户端**。见 [`ISSUE-tail-worker-hang.md`](ISSUE-tail-worker-hang.md)。
 - **端口被占会等 60 秒后放弃该段**：不需要自愈，需要人去看是谁占着；`*.prev.log`
   留着崩溃现场。
 - **`n_ctx / n_seq_max` 在两段各算一次**：多序列时两段的 `n_seq_max` 与 `n_ctx`
