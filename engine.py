@@ -58,7 +58,13 @@ class StageEngine:
         env["SA_N_CPU_MOE"] = str(int(n_cpu_moe))
         # The shim loads ggml backends by directory; without this it only sees the
         # executable and CWD search paths, which do not contain our DLLs.
-        env["SA_BACKEND_DIR"] = str(Path(shim_path).resolve().parent)
+        # `setdefault`, not assignment: the shim and llama.dll are usually siblings, but
+        # running a stage straight out of the repo (docs/DELIVERY.md §2.3) puts the shim in
+        # `.qlh_tmp/shimout/` while llama.dll sits in the llama.cpp build dir. Forcing the
+        # shim's own directory made that fail with "Could not find module ... (or one of its
+        # dependencies)" naming a file that does exist. One word buys back a documented
+        # command that was otherwise unusable.
+        env.setdefault("SA_BACKEND_DIR", str(Path(shim_path).resolve().parent))
         # Only the tail stage chooses a token, so only it needs the output projection.
         # The rule lives in config.needs_logits() because the subprocess path needs it too.
         env["SA_NEEDS_LOGITS"] = config.needs_logits(role)

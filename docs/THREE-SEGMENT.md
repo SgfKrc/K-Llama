@@ -46,8 +46,9 @@ Tailscale 组链。本文记录切点怎么定、实测多少、以及为什么�
 
 切点必须同时满足两个约束：
 
-- `LLAMA_LAYER_RANGE=lo:hi` 要求 `lo` 和 `hi-lo` 都是 `full_attention_interval=4` 的倍数
-  （`llama-model-loader.cpp:725`，越界的 `blk.i` 会被映射到源 `blk.lo+i`）
+- `LLAMA_LAYER_RANGE=lo:hi` 把源 `blk.lo+i` 映射成本地 `blk.i`；层类型由**本地层号**模
+  `full_attention_interval=4` 现算，所以切点必须与 4 对齐（机制与解除代价见
+  `ARCHITECTURE.md` §6）。这条是 `topology.py` 在解析阶段的检查，不是 llama.cpp 的
 - 各段权重之和要落在各自的可用内存里
 
 **这个模型不是均匀量化**，「平均每层多大」的估算不成立。逐张量清点

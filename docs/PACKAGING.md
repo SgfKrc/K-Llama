@@ -18,6 +18,9 @@ python scripts/pack-portable.py \
 cd .qlh_tmp/dist && tar czf qlh-portable.tgz qlh-portable
 ```
 
+**注意 `--out`**：默认输出到 `.qlh_tmp/dist/qlh-portable`，且会**先删掉同名目录**。要保留
+上一份包就显式给 `--out <别的路径>`，否则照上面原样跑会覆盖已有的产物。
+
 三个外部输入都是本机路径，所以必须显式给：
 
 | 参数 | 要求 |
@@ -35,7 +38,7 @@ cd .qlh_tmp/dist && tar czf qlh-portable.tgz qlh-portable
 qlh-portable/
     runtime/     精简 Python 3.12（stdlib 529 文件 + numpy 2.5.1）
     bin/         llama.dll、ggml*.dll×10、qlh_keep_head.dll、MSVC 运行时×4
-    worker/      stage_worker.py 那套（10 个文件）
+    worker/      stage_worker.py 那套（13 个文件）
     config.toml  模型路径、角色、层范围、线程数、端口
     launcher.py  读配置、校验模型、设环境变量、起 worker
     probe.py     链路自检客户端
@@ -43,10 +46,10 @@ qlh-portable/
     README.txt   给最终用户看的
 ```
 
-**`chain_client.py` 有两份**：根目录一份、`worker/` 一份。supervisor 的工作目录是
-`worker/`，`import chain_client` 命中的是**后者**。所以改部署逻辑（比如给 worker 传环境
-变量）只更新根那份会静默失效——2026-11-04 的心跳机制就这样在 Surface 上白接了一次。
-两份都要同步。
+**`chain_client.py` 在仓库里有两份**：根目录一份、`worker/` 一份（打包时只带 `worker/`
+那份）。开发机的 supervisor 工作目录是 `worker/`，`import chain_client` 命中的是**后者**。
+所以改部署逻辑（比如给 worker 传环境变量）只更新根那份会静默失效——2026-11-04 的心跳机制
+就这样在 Surface 上白接了一次。两份都要同步。
 
 ## 3. 用
 
@@ -66,6 +69,26 @@ port = 9103
 ```
 
 另一台 `role = "tail"`、`layer_range = "24:40"`、`host = "0.0.0.0"`。然后双方各双击 `run.bat`。
+
+**两种形态别混用**：
+
+- **单段**（上面这套）：`config.toml` 写 `[stage] role`，一台机器一段
+- **多段常驻**（推荐）：另放一份 `topology.toml` 在包根，把 `config.toml` 的
+  `[stage] role` 改成 `supervisor`。此时 `config.toml` 的 `layer_range` 与 `ctx` 都不生效
+  ——层段由 topology 决定，`ctx` 只能由 `SA_CTX` 给
+
+**包里能不能直接出 token**：能（2026-11-04 第三次从零演练实测，包内解释器 5.1 / 5.2 tok/s）。
+`runtime/` 只带 numpy，`chain_client.py` 需要 `psutil` 时靠 `_available_bytes()` 自己读系统
+信息（Windows `GlobalMemoryStatusEx`、POSIX `sysconf`），量到的就是真实可用内存，不是常量
+——所以「本机装得下就让你跑」这条判断在包里同样成立。要在包内跑推理：
+
+```bash
+runtime\python.exe worker\chain_client.py --topology topology.toml \
+    --shim bin\qlh_keep_head.dll --greedy --prompt-text "你好" --gen 32
+```
+
+`run.bat` 失败会 `pause` 等按键，无人值守（ssh / 计划任务）下会挂住，改用
+`runtime\python.exe launcher.py` 直接起。
 
 自检（任意一台能同时访问两者的机器）：
 

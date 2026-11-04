@@ -128,6 +128,10 @@ def _start(run: _Run, shim: Path, ctx: int) -> None:
     # 新进程还在加载、还没开始 serve，而上一轮的心跳文件还躺在那里、带着几分钟前的
     # mtime。不先删掉它，这一段就会在加载完成之前被判成僵死——实测在 Y700 上连杀三次，
     # 每次都是 "heartbeat stale 230s+"。
+    # 起段就把日志路径报出来。加载 20+ GiB 期间没有任何输出，不给人这一行的话，
+    # "supervising 2 of 2 stage(s)" 之后几十秒的沉默跟卡死没区别
+    # （从零部署演练里，找日志要靠 find -newermt）。
+    _say(f"stage {run.stage.index} ({run.stage.kind}) starting, pid {proc.pid} (log: {log})")
     log.with_suffix(".heartbeat").unlink(missing_ok=True)
 
 
@@ -147,15 +151,8 @@ def _keep_previous_log(run: _Run) -> None:
 
 
 def _probe_host(stage: topology.Stage) -> str:
-    """探测本机段端口时连哪个地址。
-
-    `stage.host` 是 **bind** 地址：`0.0.0.0` / `::` 的意思是"绑所有网卡"，拿它去 connect
-    不可靠（连不连得上取决于协议栈对方言的解释），所以换回环地址。`::` 也给 `127.0.0.1`
-    是因为复用的 `chain_client._port_open` 只建 AF_INET 套接字；本仓库的部署（termux、
-    ROG、各份验证拓扑）都是 IPv4，为 IPv6 再写一份探测属于重复造轮子。`localhost` 同样
-    给定成 `127.0.0.1`：`getaddrinfo` 可能先返回 `::1`，而 worker 绑的是 IPv4 那一个。
-    """
-    return "127.0.0.1" if stage.host in ("0.0.0.0", "::", "localhost") else stage.host
+    """探测本机段端口时连哪个地址——规则只有一处实现，见 `Stage.connect_host`。"""
+    return stage.connect_host
 
 
 def _port_held(stage: topology.Stage) -> bool:

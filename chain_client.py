@@ -107,10 +107,53 @@ GPU_VRAM_OVERHEAD = 640 << 20   # measured 597 MiB of context + compute buffer, 
 _EXPERT_SHARE_CACHE: dict[str, float] = {}
 
 
-def mem_budget_bytes() -> int:
-    import psutil
+def _available_bytes() -> int:
+    """本机可用物理内存；``0`` 表示读不到。
 
-    return int(psutil.virtual_memory().available * MEM_SAFETY)
+    优先 `psutil`（可选件），退到操作系统自己的查询。**不能退成常量**：早先这里在没有
+    `psutil` 时给 4 GiB × 安全系数，而 `mem_budget_bytes()` 的唯一消费点是「启动前的拒绝
+    检查」——于是绿色包里（只打了 numpy）一台有 15.5 GiB 空闲的机器会因为"库没打进去"而
+    拒绝启动，两段要 6.56 GiB、被 3.00 GiB 拦死。那不是保守，是错。
+    """
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        pass
+
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+        return 0
+
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return 0
+
+
+def mem_budget_bytes() -> int:
+    """本机可用内存的安全预算；``0`` 表示读不到，调用方应跳过检查而不是拒绝启动。"""
+    available = _available_bytes()
+    return int(available * MEM_SAFETY) if available > 0 else 0
 
 
 def vram_info() -> tuple[int, int] | None:
@@ -347,7 +390,9 @@ class StageClient:
 
     def __init__(self, stage: Stage) -> None:
         self.stage = stage
-        self._addr = (stage.host, stage.port)
+        # `connect_host`, 不是 `host`：本机段的 host 是 bind 地址 `0.0.0.0`，拿它 connect
+        # 报 WinError 10049（从零部署演练实测：probe 通、客户端 120 s 超时）。
+        self._addr = (stage.connect_host, stage.port)
         self._sock: socket.socket | None = None
         self._n_embd = 0
         # What the worker announced in HELLO. Kept so callers can show which artifact a
@@ -725,7 +770,7 @@ def start_remote(stage: Stage) -> float:
             f"stage {stage.index} ({stage.kind}) runs on {stage.host} but the topology "
             f"sets no ssh_user, so it must already be listening on "
             f"{stage.host}:{stage.port}")
-    if _port_open(stage.host, stage.port):
+    if _port_open(stage.connect_host, stage.port):
         # Already serving, and its model is already in memory. Reusing it is the point of
         # the worker's serve loop; relaunching would only fight over the port.
         print(f"stage {stage.index} ({stage.kind}) already listening on "
@@ -801,13 +846,19 @@ def bring_up(stages, shim: Path, ctx: int, tail_rs_seq: int = 0,
             # HELLO 一半概率拿到、一半超时，而两份权重各占一份内存。先探再决定。
             # 这个竞态真实发生过：supervisor 加载 32 层要几十秒，期间端口没开，任何一个
             # chain_client 都会自己再起一个。
-            host = "127.0.0.1" if stage.host in ("0.0.0.0", "::") else stage.host
-            if _port_open(host, stage.port, timeout=0.3):
+            if _port_open(stage.connect_host, stage.port, timeout=0.3):
                 if note is not None:
                     note(f"stage {stage.index} ({stage.kind}) already listening on "
                          f"{stage.host}:{stage.port}; reusing it")
                 continue
-            procs.append((*spawn_worker(stage, shim, ctx, tail_rs_seq), stage))
+            proc, log = spawn_worker(stage, shim, ctx, tail_rs_seq)
+            # 首次起段也要报出日志路径。`stage_supervisor._start` 那条只覆盖重启路径，
+            # 直接跑 chain_client 时用户看到的是「supervising…」之后几十秒的沉默，跟卡死
+            # 没区别（第二次从零部署演练实测）。
+            if note is not None:
+                note(f"stage {stage.index} ({stage.kind}) starting, pid {proc.pid} "
+                     f"(log: {log})")
+            procs.append((proc, log, stage))
         elif stage.start_cmd:
             # Remote with a launcher: ask it to come up, then connect like any other stage.
             # The HELLO check in connect() is what turns "it is listening" into "it is
@@ -1585,10 +1636,11 @@ def main() -> int:
     local_count = sum(1 for s in stages if s.is_local)
     estimate = estimate_ram_bytes(stages)
     budget = mem_budget_bytes()
+    budget_text = f"{budget / 2**30:.2f} GiB" if budget else "unknown"
     print(f"\nlocal stages: {local_count}  weights {local_bytes / 2**30:.2f} GiB  "
           f"expected resident {estimate / 2**30:.2f} GiB  "
-          f"budget {budget / 2**30:.2f} GiB")
-    if estimate > budget:
+          f"budget {budget_text}")
+    if budget and estimate > budget:
         raise SystemExit(
             f"refusing to start: local stages need an estimated "
             f"{estimate / 2**30:.2f} GiB resident but only "

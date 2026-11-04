@@ -85,6 +85,20 @@ class Stage:
     def is_local(self) -> bool:
         return is_loopback(self.host)
 
+    @property
+    def connect_host(self) -> str:
+        """连这个段时用哪个地址。
+
+        ``host`` 是 **bind** 地址：本机段写 ``0.0.0.0`` 才能绑全部网卡（见
+        `DELIVERY.md` §2.2 的约束），而 ``0.0.0.0`` 不能当目的地址——connect 过去报
+        ``WinError 10049``。同一个 ``host`` 被当成"连接地址"用的时候必须换回环。
+
+        这条规则只该有这一处实现。`stage_supervisor` 早就知道要换，`chain_client` 却一直
+        拿 ``stage.host`` 直接连——结果是**照文档写 ``0.0.0.0`` 的拓扑，probe 通过而推理
+        客户端 120 秒超时**（2026-11-04 从零部署演练实测）。
+        """
+        return "127.0.0.1" if self.host in ("0.0.0.0", "::", "localhost", "") else self.host
+
 
 def is_loopback(host: str) -> bool:
     """True when this host runs the stage itself, i.e. the master spawns it."""

@@ -80,12 +80,20 @@ threads     = 5
 
 三条硬约束：
 
-1. **`host` 有两个含义**：既是连接地址，也是 worker 的 bind 地址。本机段写
-   `127.0.0.1` 会让 worker 只绑回环、远端 connection refused；写 `0.0.0.0` 才既绑全接口
-   又被 `topology.is_loopback` 认成本机段。
+1. **`host` 是 bind 地址**：本机段写 `0.0.0.0` 才能绑全部网卡（写 `127.0.0.1` 会让远端
+   connection refused）。客户端连它时会自动换成回环（`Stage.connect_host`），所以 `0.0.0.0`
+   不会让推理客户端连不上。
 2. **切点与段内层数都是 4 的倍数**：`qwen35moe` 是 hybrid（每 4 层一个 full attention），
    错位会层类型不匹配。`32:38` 这种 6 层划分在解析阶段就被拒绝。
 3. **两段的 `model` 必须是同一个文件**。要机器可查就填 `sha256`（可选，代价约 30 秒）。
+4. **`source_layers` 是 40，不是 GGUF 里写的 41**：那 41 含 MTP/nextn 头（`blk.40`），
+   层段只覆盖主干 40 层。写成 41 会被拒（`stages sum to 40 layers but the model has 41`）。
+5. **拓扑里没有 `ctx` 字段**：它由 `SA_CTX` 环境变量给（supervisor 与 launcher 都是）。
+   写在拓扑里会被静默忽略，`config.toml` 的 `ctx` 在 supervisor 形态下也不生效。
+
+字段必填与默认：`model` / `host` / `port` / `kind` / `layers` 必填；`gpu_layers=0`、
+`cpu_moe=0`、`cpus=""`、`threads=3`、`layer_range` 可省。`kind` 的形状是
+`gpu`（至多一个）→ `cpu`（任意个）→ `tail`（必须一个，放最后）。
 
 ### 2.3 起服务
 
@@ -98,6 +106,14 @@ python stage_worker.py --role gpu --model <gguf> --shim <dll> \
 SA_TOPOLOGY=<topology.toml> python stage_supervisor.py
 ```
 
+单段命令要能跑，**shim 与 `llama.dll` / `ggml-*.dll` 必须在同一目录**。否则
+`ctypes.CDLL(shim)` 阶段就失败，报 `Could not find module '<shim 的绝对路径>' (or one of
+its dependencies)`——**它点名的那个文件其实存在**，缺的是同目录下的依赖。
+
+注意 `SA_BACKEND_DIR` 解决不了这个问题：它是 shim **初始化期**才读的环境变量，而失败发生在
+那之前（加载器解析静态依赖时）。可以用的两条路：把 `llama.dll` 复制到 shim 旁边，或者在
+Python 里 `os.add_dll_directory(<llama.dll 所在目录>)` 之后再 `CDLL`。
+
 两端都起来后自检：
 
 ```bash
@@ -106,6 +122,10 @@ python scripts/probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
 
 它会校验层数合计、层范围首尾相接、hidden 宽度三项，任一不符直接非零退出——
 这三项都是「不报错但输出错误」的那类故障。
+
+**段日志在哪**：`<worker 目录>/build/relay-records/stage-<i>-<kind>.log`。崩溃时 supervisor
+会把它的路径打出来，正常启动时不打（加载 20+ GiB 期间没有进度输出，别以为是卡死了）。
+同目录的 `.heartbeat` 是心跳文件，mtime 超过 30 秒没更新就说明段卡住了。
 
 ---
 

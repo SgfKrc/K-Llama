@@ -98,8 +98,26 @@ MoE 的权重分布是专家占 88%，而每个 token 只用到 8/256 个专家�
 - `topology.py` 在解析阶段就拒绝，不自动纠正
 
 原因：`src/models/qwen35moe.cpp:24` 用**本地层号**推算层类型，而本地层号被映射回源层号。
-只有 `lo` 是 4 的倍数时，两者模 4 同余，`LLL F` 的类型序列才对得上。
+只有 `lo` 是 4 的倍数时，两者模 4 同余，层类型序列才对得上。
 `32:38` 这种 6 层划分会在解析阶段报 `layers=6 is not a multiple of 4`。
+
+严格说 `topology.py` 查的是**段宽**（`s.layers % 4`），不是切点偏移；但在「每段都声明
+`layer_range`、宽度必须等于 `layers`、各段之和必须等于总层数」三条同时成立时，两者等价，
+所以没有漏网。llama.cpp 自己不做这个检查——`LLAMA_LAYER_RANGE` 只校验 `lo >= 0 && hi > lo`。
+
+**错位不是静默算错，是加载期直接失败**：本地层 `i` 被当成与源层 `lo+i` 同类型，于是它去要
+`blk.<lo+i>.ssm_conv1d.weight`（或反过来要 `attn_q_norm`），而那个张量在源层不存在、且没有
+`TENSOR_NOT_REQUIRED` 标记，`llama-model-loader.cpp` 走到 `throw "missing tensor"`。
+2026-09-18 的裁层实验里 `N=2` 就是这样报的 `missing tensor 'blk.1.ssm_conv1d.weight'`。
+这是这条约束唯一的优点：从不静默。
+
+**要解除的话**（评估过，暂不做）：把 `is_recr_impl[i]` 的取模从本地号换成源层号——
+`ml.layer_lo` 在 `load_hparams()` 时已可见（`llama_model_loader` 是 struct，字段全 public），
+改 `qwen35moe.cpp` 与 `qwen35.cpp` 各两行即可；下游的 KV／recurrent 分配、graph 分派全走
+`is_recr()` 这一真源，自动跟着对。不做的理由是收益太小：可选切点从 9 个变成 39 个、最小
+台阶约 0.43 GiB，但「把 full attention 集中到有 GPU 的段」做不到——full 层在源模型里均匀
+固定（`attn_q.weight` 只出现在 `3,7,…,39`），任何切分都改不了「每 4 层必有 1 个 full」。
+那点内存收益会被多一个段边界的跨网往返吃掉。真遇到「某台设备必须 ≤3 层」时，先试 `-ncmoe`。
 
 ---
 
