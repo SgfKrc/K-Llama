@@ -72,6 +72,18 @@ SAMPLING_FIELDS = {
 }
 
 
+def request_max_tokens(body: dict, default: int) -> int:
+    """How many tokens this request may generate.
+
+    DSH sends `max_completion_tokens` only -- the newer OpenAI name, and the only one the
+    reasoning models accept. Reading `max_tokens` alone capped every such request at the
+    server default, which looks exactly like the model stopping early on its own. Both
+    names are accepted; the new one wins when a client sends both, since it is the one
+    the client means today.
+    """
+    return int(body.get("max_completion_tokens") or body.get("max_tokens") or default)
+
+
 def sampling_request(body: dict) -> dict:
     """Translate an OpenAI request body into shim setter arguments.
 
@@ -564,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
         tools = body.get("tools") or None
         tool_choice = body.get("tool_choice")
         parallel = body.get("parallel_tool_calls")
-        max_tokens = int(body.get("max_tokens") or self.default_max_tokens)
+        max_tokens = request_max_tokens(body, self.default_max_tokens)
         stream = bool(body.get("stream"))
         model = str(body.get("model") or "slimarc")
         ignored = [k for k in UNSUPPORTED if k in body]

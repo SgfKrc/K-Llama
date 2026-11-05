@@ -123,6 +123,27 @@ class RenderMessages(unittest.TestCase):
         self.assertEqual("call_x", turns[3]["tool_call_id"])
 
 
+class RequestMaxTokens(unittest.TestCase):
+    """`max_completion_tokens` is the name DSH actually sends; `max_tokens` is the old one."""
+
+    def test_old_name_alone_is_honoured(self):
+        self.assertEqual(99, server.request_max_tokens({"max_tokens": 99}, 512))
+
+    def test_new_name_alone_is_honoured(self):
+        self.assertEqual(99, server.request_max_tokens({"max_completion_tokens": 99}, 512))
+
+    def test_new_name_wins_when_both_are_sent(self):
+        body = {"max_tokens": 11, "max_completion_tokens": 99}
+        self.assertEqual(99, server.request_max_tokens(body, 512))
+
+    def test_neither_name_falls_back_to_the_server_default(self):
+        self.assertEqual(512, server.request_max_tokens({}, 512))
+
+    def test_null_and_zero_count_as_absent(self):
+        self.assertEqual(512, server.request_max_tokens({"max_tokens": None}, 512))
+        self.assertEqual(512, server.request_max_tokens({"max_tokens": 0}, 512))
+
+
 class OpenAIAssistantMessage(unittest.TestCase):
     def test_tool_call_shape(self):
         parsed = {"role": "assistant", "content": "", "reasoning_content": "想想",

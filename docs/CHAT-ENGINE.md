@@ -144,7 +144,17 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 
 ## 6. DSH 的实际要求（读其源码确认）
 
-它会发 `max_completion_tokens`（**不是 `max_tokens`**）、`stream_options.include_usage`、
-`tools`（不带 `strict`）；会消费 `finish_reason`（**不给就抛** `"Stream ended without
+它只发 `max_completion_tokens`（**不是 `max_tokens`**）和 `stream_options.include_usage`，
+带 `tools`（不带 `strict`）；会消费 `finish_reason`（**不给就抛** `"Stream ended without
 finish_reason"`）、`delta.content`、`delta.reasoning_content`、按 index 归并的
 `delta.tool_calls`。必须容忍 `role: "developer"`。
+
+四处都已处理，逐条都有出处：
+
+- `max_completion_tokens` —— `server.request_max_tokens()` 两个名字都接，新的优先。
+  只读旧名时每个请求都被压回服务端默认值，看起来像模型自己早停，最难查。
+- `include_usage` —— 末 chunk 带 usage；DSH 先读 `chunk.usage` 再判 `choices`，通过。
+- `developer` —— Qwen 模板把它渲染成 `<|im_start|>system`，与 `system` 逐字节相同。
+- `tool_calls` 的 `id` —— 层里 `to_json_oaicompat()` 不生成，由 `server.py` 补。
+
+以上按 DSH 的报文形状在 2B 端到端跑过；**尚未在 DSH GUI 里真连一次**，那是最后一步。
