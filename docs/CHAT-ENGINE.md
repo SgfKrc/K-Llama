@@ -53,6 +53,7 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 | **四** | 流式 `delta.tool_calls`（按 index 累积）、`delta.reasoning_content`、`finish_reason` | 2B 端到端 48 个 chunk：`finish_reason: "tool_calls"`、`reasoning` 87 字独立成段、`id` 只宣告 1 次、拼回 `{"city":"北京"}` 与一次性解析逐字节相同；无 tools 的流式 122 chunk 仍是原样文本（无 `reasoning_content`） | **完成** |
 | 五 | **多模态**：验证已完成（视觉活着、未漂移）；实现走原生还是旁路待定 | 一张图能进去并被正确描述 | 验证已过，实现待定 |
 | 六 | grammar 约束（可选） | 出现真实的格式错误样本才做 | 未开始 |
+| 七 | **KV cache 复用**：调研完成，结论见 [KV-CACHE.md](KV-CACHE.md) | server 每轮省掉整段 prefill（按会话续写前缀） | 待开工 |
 
 期与期之间不并行：每一期的判据依赖上一期的产物。
 
