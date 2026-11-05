@@ -172,10 +172,18 @@ class FakeChain:
 
     def tokenize(self, text: str) -> list[int]:
         self.texts.append(text)
-        return [len(text)]                 # one token per render, easy to reason about
+        return [1 + (ord(ch) % 40) for ch in text]
+
+    def piece(self, token: int) -> bytes:
+        # One byte per token keeps the UTF-8 assembler out of the picture.
+        return b"x"
 
     def is_eog(self, token: int) -> bool:
         return token == self.eog
+
+    def forward_token(self, hidden, n_past: int) -> int:
+        self.forwards.append(n_past)
+        return self.script.pop(0)
 
     def reset(self) -> None:
         self.reset_calls += 1
@@ -186,66 +194,114 @@ class FakeChain:
         self.removed.append(n_past)
 
 
+class FakeRenderer:
+    """A template with the shape the Qwen ones have, without the DLL.
+
+    Historical assistant turns render as ``header + trim(content) + end``; the generation
+    prompt is ``header + thinking marker``. That is the structure the delta logic depends
+    on: `chat.Conversation` records the generated text behind one leading space, the trim
+    eats that space, and what is left is exactly the generation prompt plus the text.
+    """
+
+    HEAD = "<|assistant|>\n"
+    THINK = "<|think|>"
+    END = "<|end|>"
+
+    def __init__(self) -> None:
+        self.renders = 0
+
+    @property
+    def generation_prompt(self) -> str:
+        return f"{self.HEAD}{self.THINK}\n"
+
+    def render(self, messages, *, thinking: bool = True, **_kw):
+        self.renders += 1
+        parts: list[str] = []
+        for msg in messages:
+            role, content = msg["role"], msg.get("content", "")
+            if role == "assistant":
+                parts.append(f"{self.HEAD}{content.strip()}{self.END}\n")
+            else:
+                parts.append(f"<|{role}|>\n{content}{self.END}\n")
+        generation = self.generation_prompt
+        return chat.Rendered(prompt="".join(parts) + generation,
+                             generation_prompt=generation, stops=(),
+                             thinking=thinking, format="fake", supports_thinking=True)
+
+
 class SessionLedger(unittest.TestCase):
     """The KV/ids invariant that makes a second question a continuation, not a reset."""
 
     def setUp(self) -> None:
         self.chain = FakeChain()
         self.clients = [self.chain]
-        self.session = Session()
+        self.renderer = FakeRenderer()
+        self.session = Session(self.renderer)
 
-    def test_first_round_starts_at_zero_and_renders_chatml(self):
-        prefix, n_past, fresh = self.session.prepare(
-            self.clients, "你好", plain=False, system=None)
+    def _first(self, question: str = "q1", system: str | None = None):
+        return self.session.prepare(self.clients, question, plain=False, system=system)
+
+    def test_first_round_starts_at_zero_and_renders_the_whole_prompt(self):
+        prefix, n_past, fresh = self._first("你好")
         self.assertEqual(0, n_past)
-        self.assertEqual(fresh, prefix)
+        self.assertEqual(fresh, prefix)          # 首轮没有历史，整段 prompt 就是新增
         text = self.chain.texts[0]
-        # First turn renders a whole conversation: the user block and an open assistant turn.
-        self.assertIn("user\n", text)
-        self.assertTrue(text.endswith(chat.ASSISTANT_OPEN))
-        self.assertNotIn("system\n", text)      # no system message injected
+        self.assertIn("<|user|>", text)
+        self.assertTrue(text.endswith(self.renderer.generation_prompt))
+        self.assertNotIn("<|system|>", text)     # 没有注入默认 system
 
     def test_system_block_only_on_the_first_turn(self):
-        self.session.prepare(self.clients, "q1", plain=False, system="你是助手")
-        self.assertIn("system\n你是助手", self.chain.texts[0])
-        self.session.record({"n_past": 1, "pending": 5, "last_token": 5}, [1], [5])
+        self._first("q1", system="你是助手")
+        self.assertIn("<|system|>", self.chain.texts[0])
+        self.assertIn("你是助手", self.chain.texts[0])
+        fresh = self.session.ids[:]
+        self.session.record({"n_past": len(fresh), "pending": 5, "last_token": 5},
+                            fresh, [5], text="答")
         self.session.prepare(self.clients, "q2", plain=False, system="你是助手")
-        self.assertNotIn("system\n", self.chain.texts[1])
+        self.assertNotIn("<|system|>", self.chain.texts[1])
 
     def test_pending_is_replayed_as_the_first_prefix_token(self):
-        # Round 1: prefill wrote 1 position, the answer's only token was never forwarded.
-        self.session.record({"n_past": 1, "pending": 5, "last_token": 5}, [1], [5])
-        self.assertEqual([1, 5], self.session.ids)
-        self.assertEqual(1, self.session.kv_target())
+        # 第 1 轮：prefill 全写进 KV，答案唯一那个 token 从没 forward 过。
+        _prefix, _n, fresh = self._first("q1")
+        self.session.record({"n_past": len(fresh), "pending": 5, "last_token": 5},
+                            fresh, [5], text="答")
+        self.assertEqual(fresh + [5], self.session.ids)
+        self.assertEqual(len(fresh), self.session.kv_target())
         self.assertEqual(0, self.session.stray())
-        prefix, n_past, fresh = self.session.prepare(
+
+        prefix, n_past, fresh2 = self.session.prepare(
             self.clients, "q2", plain=False, system=None)
-        self.assertEqual(1, n_past)
-        self.assertEqual(5, prefix[0])           # the un-forwarded token goes first
-        self.assertEqual(fresh, prefix[1:])
-        # Round 2's ChatML delta continues the conversation instead of re-rendering it.
-        self.assertIn("user\nq2", self.chain.texts[0])
-        self.assertTrue(self.chain.texts[0].endswith(chat.ASSISTANT_OPEN))
+        self.assertEqual(len(fresh), n_past)
+        self.assertEqual(5, prefix[0])           # 未 forward 的 token 排在最前
+        self.assertEqual(fresh2, prefix[1:])
+        # 第 2 轮发的是「块尾 + 新 user 块 + 生成头」，不是重渲染整段。
+        self.assertIn("<|user|>", self.chain.texts[1])
+        self.assertIn("q2", self.chain.texts[1])
+        self.assertTrue(self.chain.texts[1].endswith(self.renderer.generation_prompt))
 
     def test_closed_previous_turn_gets_no_extra_end_marker(self):
         self.chain.eog = 7
-        self.session.record({"n_past": 1, "pending": 7, "last_token": 7}, [1], [7])
+        _prefix, _n, fresh = self._first("q1")
+        self.session.record({"n_past": len(fresh), "pending": 7, "last_token": 7},
+                            fresh, [7], text="答")
         self.session.prepare(self.clients, "q2", plain=False, system=None)
-        # The eog token itself is the end marker, so the delta opens with a newline only.
-        self.assertTrue(self.chain.texts[0].startswith("\n"))
-        self.assertEqual(1, self.chain.texts[0].count("user\n"))
+        # eog token 本身就是结束标记，增量只从一个换行开始。
+        self.assertTrue(self.chain.texts[1].startswith("\n"))
+        self.assertEqual(1, self.chain.texts[1].count("<|user|>"))
 
     def test_open_previous_turn_gets_its_end_marker(self):
         self.chain.eog = 99
-        self.session.record({"n_past": 1, "pending": 7, "last_token": 7}, [1], [7])
+        _prefix, _n, fresh = self._first("q1")
+        self.session.record({"n_past": len(fresh), "pending": 7, "last_token": 7},
+                            fresh, [7], text="答")
         self.session.prepare(self.clients, "q2", plain=False, system=None)
-        # Truncated answer: without the marker the next user block would interrupt it.
-        self.assertTrue(self.chain.texts[0].startswith(chat.IM_END))
+        # 被截断的回答：没有结束标记，新 user 块会直接截断它。
+        self.assertTrue(self.chain.texts[1].startswith("<|end|>"))
 
     def test_plain_mode_sends_no_chat_markup(self):
         self.session.prepare(self.clients, "q1", plain=True, system=None)
         self.assertEqual("q1", self.chain.texts[0])
-        self.session.record({"n_past": 1, "pending": 5, "last_token": 5}, [1], [5])
+        self.session.record({"n_past": 2, "pending": 5, "last_token": 5}, [1, 2], [5])
         self.session.prepare(self.clients, "q2", plain=True, system=None)
         self.assertEqual("\nq2\n", self.chain.texts[1])
 
@@ -257,58 +313,93 @@ class SessionLedger(unittest.TestCase):
         try: it replays the sequence. Slower, and the only version that is verifiably
         consistent.
         """
-        # Round 1 ended inside a speculative block: n_past is 2 positions ahead of ids.
-        self.session.record({"n_past": 4, "pending": None, "last_token": 7,
-                             "kv_tail": [7, 8]}, [1], [7])
-        self.assertEqual([1, 7], self.session.ids)
+        _prefix, _n, fresh = self._first("q1")
+        # 第 1 轮停在投机块内：n_past 比 ids 多 2 个位置。
+        self.session.record({"n_past": len(fresh) + 3, "pending": None,
+                             "last_token": 7, "kv_tail": [7, 8]},
+                            fresh, [7], text="答")
+        self.assertEqual(fresh + [7], self.session.ids)
         self.assertEqual(2, self.session.stray())
-        prefix, n_past, fresh = self.session.prepare(
+        prefix, n_past, fresh2 = self.session.prepare(
             self.clients, "q2", plain=False, system=None)
-        self.assertEqual([], self.chain.removed)    # no optimistic rollback attempt
+        self.assertEqual([], self.chain.removed)     # 不尝试乐观回滚
         self.assertEqual(1, self.chain.reset_calls)
         self.assertEqual(0, n_past)
         self.assertEqual(1, self.session.replays)
-        self.assertEqual([1, 7], prefix[:2])        # the whole history is replayed
-        self.assertEqual(fresh, prefix[2:])
-        self.assertEqual(0, self.session.stray())   # the ledger is consistent again
+        # 重放的是这一轮渲染出的完整 prompt（历史 + 新块），从 0 写。
+        self.assertEqual(fresh2, prefix)
+        self.assertIn("q2", self.chain.texts[1])
+        self.assertEqual(0, self.session.stray())    # 账本重新一致
 
     def test_dirty_session_replays_without_touching_align(self):
-        self.session.record({"n_past": 1, "pending": 5, "last_token": 5}, [1], [5])
+        _prefix, _n, fresh = self._first("q1")
+        self.session.record({"n_past": len(fresh), "pending": 5, "last_token": 5},
+                            fresh, [5], text="答")
         self.session.dirty = True
-        prefix, n_past, fresh = self.session.prepare(
+        prefix, n_past, fresh2 = self.session.prepare(
             self.clients, "q2", plain=False, system=None)
         self.assertEqual(1, self.chain.reset_calls)
-        self.assertEqual([], self.chain.removed)    # dirty means the KV cannot be trusted
+        self.assertEqual([], self.chain.removed)     # dirty 表示 KV 不可信
         self.assertEqual(0, n_past)
         self.assertFalse(self.session.dirty)
-        self.assertEqual([1, 5], prefix[:2])
-        self.assertEqual(fresh, prefix[2:])
+        self.assertEqual(fresh2, prefix)             # 整段重放
 
     def test_reset_forgets_everything(self):
-        self.session.record({"n_past": 4, "pending": 5, "last_token": 5}, [1], [5])
+        _prefix, _n, fresh = self._first("q1")
+        self.session.record({"n_past": len(fresh), "pending": 5, "last_token": 5},
+                            fresh, [5], text="答")
         self.session.reset()
         self.assertEqual([], self.session.ids)
         self.assertEqual(0, self.session.n_past)
         self.assertIsNone(self.session.pending)
         self.assertEqual(0, self.session.rounds)
+        self.assertIsNone(self.session.conversation)  # /clear 之后是一条新对话
 
 
-class ChatML(unittest.TestCase):
-    """The continuation renderer, checked for the two things callers depend on."""
+class Continuation(unittest.TestCase):
+    """「只发新增」的判定：前缀成立就发尾块，不成立就整段。"""
 
-    def test_next_turn_is_additive(self):
-        text = chat.next_turn("下一个问题", assistant_closed=True)
-        self.assertIn(f"user\n下一个问题{chat.IM_END}", text)
-        self.assertTrue(text.endswith(chat.ASSISTANT_OPEN))
-        # It must NOT re-render history: one assistant header, no system block.
-        self.assertEqual(1, text.count("assistant\n"))
+    def setUp(self) -> None:
+        self.renderer = FakeRenderer()
+        self.conv = chat.Conversation(self.renderer)
 
-    def test_truncated_turn_is_closed(self):
-        self.assertTrue(chat.next_turn("q", assistant_closed=False).startswith(chat.IM_END))
+    def test_first_turn_renders_the_whole_prompt(self):
+        text, replay = self.conv.add_user("q")
+        self.assertTrue(replay)
+        self.assertTrue(text.endswith(self.renderer.generation_prompt))
 
-    def test_assistant_open_is_shared_with_the_first_render(self):
-        first = chat.apply_chatml([{"role": "user", "content": "q"}])
-        self.assertTrue(first.endswith(chat.ASSISTANT_OPEN))
+    def test_second_turn_is_additive(self):
+        self.conv.add_user("q1")
+        self.conv.add_assistant("答")
+        text, replay = self.conv.add_user("q2", closed=True)
+        self.assertFalse(replay)
+        # 增量是「块尾之后的换行 + 新 user 块 + 生成头」，历史一个字都不重发。
+        self.assertTrue(text.startswith("\n"))
+        self.assertEqual(1, text.count("<|user|>"))
+        self.assertTrue(text.endswith(self.renderer.generation_prompt))
+
+    def test_truncated_turn_keeps_its_end_marker(self):
+        self.conv.add_user("q1")
+        self.conv.add_assistant("答")
+        text, replay = self.conv.add_user("q2", closed=False)
+        self.assertFalse(replay)
+        self.assertTrue(text.startswith("<|end|>"))
+
+    def test_trimmed_generated_text_forces_a_replay(self):
+        """模板 trim 掉生成文本的尾部空白时，前缀对不上，必须整段重放。"""
+        self.conv.add_user("q1")
+        self.conv.add_assistant("答  ")      # 尾部空白会被模板 trim 吃掉
+        text, replay = self.conv.add_user("q2", closed=True)
+        self.assertTrue(replay)
+        self.assertEqual(1, text.count("q2"))   # 整段 prompt，不是增量块
+        self.assertTrue(text.endswith(self.renderer.generation_prompt))
+
+    def test_changed_system_prompt_forces_a_replay(self):
+        self.conv.add_user("q1")
+        self.conv.add_assistant("答")
+        self.conv.system = "另一个系统提示"
+        _text, replay = self.conv.add_user("q2", closed=True)
+        self.assertTrue(replay)
 
 
 class SamplingRules(unittest.TestCase):

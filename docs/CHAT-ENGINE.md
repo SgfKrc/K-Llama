@@ -47,8 +47,8 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 
 | 期 | 内容 | 判据 | 状态 |
 | --- | --- | --- | --- |
-| **一** | `shim/chat/`（vendored 上游 20 文件 + `UPSTREAM.txt`）、`shim/qlh_chat.cpp`（C ABI 五函数）、两个构建脚本、`checks/verify_chat.py` | dll 编出来；`dumpbin /dependents` 零 llama 依赖；golden 模板渲染逐字节对上；P0 那份真实输出能被解析出正确 tool_calls | **进行中** |
-| 二 | `chat.py` 换成薄封装（删 `apply_chatml` 与 `next_turn`）、`verify_equiv` 断言加强、`test_contract` 规则倒置（任何 .py 不许出现 `<|im_start|>`） | 现有 68 项单测全过；`verify_multiturn` 在 2B 上与接之前逐位相同 | 未开始 |
+| **一** | `shim/chat/`（vendored 上游 60 文件 + `UPSTREAM.txt`）、`shim/qlh_chat.cpp`（C ABI 五函数）、两个构建脚本、`checks/verify_chat.py` | dll 编出来（1,732 KB）；PE 导入表零 llama/ggml 符号；golden 模板渲染逐字节对上；P0 那份真实输出能被解析出正确 tool_calls。**63 PASS / 0 FAIL** | **完成** |
+| **二** | `chat.py` 换成薄封装（删 `apply_chatml` 与 `next_turn`）、`verify_equiv --mode prompt`、`test_contract` 规则倒置（任何 .py 不许出现 `<|im_start|>`） | 71 项单测全过；`verify_multiturn` 在 2B 上与接之前**逐位相同**（三轮 `ids`/`text` 全 `==`）；`test_contract` 扫 9 个根 `.py` 得 0 处字面量 | **完成** |
 | 三 | `server.py` 工具调用（非流式）：读 `tools`/`tool_choice`、产出 `tool_calls` + `finish_reason: "tool_calls"`、`role: tool` 回传 | DSH 真机连一次，能读文件/跑命令 | 未开始 |
 | 四 | 流式 `delta.tool_calls`（按 index 累积）、`delta.reasoning_content`、`finish_reason` | openai SDK `.stream()` 累积结果与非流式**逐字段一致** | 未开始 |
 | 五 | **多模态**：验证已完成（视觉活着、未漂移）；实现走原生还是旁路待定 | 一张图能进去并被正确描述 | 验证已过，实现待定 |
@@ -114,6 +114,12 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 - **`parse` 用上游的 `common_chat_msg_diff::compute_diffs`** 产出增量，Python 侧不重新实现
   tool_call 增量拼接——那是这块最容易写错的地方
 - 跨 DLL 边界的堆内存必须由分配方释放，`str_free` 不能省
+- **两个千问检查点的思考标记不一样**：2B 模板开 `thinking`，35B 开 `thinking`。旧的
+  手写 ChatML 只按 35B 写，所以它在 2B 上从第一个 token 起就与模板不一致（7047 vs
+  248068）。唯一可信来源是渲染出的 `generation_prompt` 的最后一行，不是任何常量
+- **读一次 `tokenizer.chat_template` 在 35B 上要 7 秒**（H: 盘、21.87 GiB GGUF），而
+  `server.flatten_messages` 每个请求都读一次。`chat.read_template` 按
+  `(路径, mtime, size)` 缓存；建 handle 只要 6 ms，不缓存（handle 带 parse 状态）
 
 ## 6. DSH 的实际要求（读其源码确认）
 

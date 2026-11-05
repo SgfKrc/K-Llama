@@ -113,6 +113,16 @@ class Chain:
         self._procs: list[tuple] = []
         self.ready = False
 
+    @property
+    def model_path(self) -> Path:
+        """The checkpoint whose ``tokenizer.chat_template`` renders this chain's prompts.
+
+        Every stage of a chain loads the same file (a split model is one artifact with
+        layer ranges), so stage 0 speaks for all of them. Read rather than configured a
+        second time: a second model path is a second thing that can disagree.
+        """
+        return self._stages[0].model
+
     def start(self) -> None:
         # Local stages spawned and launchable remote ones asked, by the same function the
         # CLI and the TUI use: `start_cmd`/`ssh_user` used to be read in chain_client only,
@@ -277,33 +287,27 @@ class Chain:
         self.ready = False
 
 
-def flatten_messages(messages: list[dict]) -> str:
-    """Collapse a chat into ChatML -- the format these checkpoints were trained on.
+def flatten_messages(messages: list[dict], model) -> str:
+    """Collapse a chat into the prompt the checkpoint expects -- through qlh_chat.dll.
 
     This used to emit plain text with Chinese role prefixes ("用户：", "助手：") on the
     reasoning that a split model might not be a chat model. That held for numerics but not
     for usefulness: Qwen answered every question with degenerate repetition because it
     never saw `<|im_start|>`. `chat.py` carries the two facts that settled it, and the
-    same renderer the CLI uses is used here so the two paths cannot drift again.
+    template renderer now lives in C++ (`shim/chat/`), so every entry point renders the
+    same way by construction rather than by three copies agreeing.
 
-    A missing system turn gets Qwen's default; `apply_chatml` decides that, not this
-    function, because it also has to know whether system came first.
+    A system turn is passed through as a message: the template decides where it goes, and
+    for the Qwen family it may fold tool descriptions into it. `model` is the checkpoint
+    whose `tokenizer.chat_template` is authoritative.
     """
-    from chat import apply_chatml
+    from chat import Chat, merge_system
 
-    system: str | None = None
-    turns: list[dict] = []
-    for msg in messages:
-        if str(msg.get("role", "user")) == "system":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = "".join(p.get("text", "") for p in content
-                                  if isinstance(p, dict) and p.get("type") == "text")
-            text = str(content)
-            system = text if system is None else f"{system}\n{text}"
-        else:
-            turns.append(msg)
-    return apply_chatml(turns, system=system)
+    system, turns = merge_system(messages)
+    if system is not None:
+        turns = [{"role": "system", "content": system}, *turns]
+    with Chat.for_model(model) as renderer:
+        return renderer.render(turns).prompt
 
 
 # Responses request/response translation. Kept in its own module because the two
@@ -397,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "type": "invalid_request_error"}})
             return
 
-        prompt = flatten_messages(messages)
+        prompt = flatten_messages(messages, self.chain.model_path)
         max_tokens = int(body.get("max_tokens") or self.default_max_tokens)
         stream = bool(body.get("stream"))
         model = str(body.get("model") or "slimarc")
@@ -518,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "param": "input"}})
             return
 
-        prompt = flatten_messages(messages)
+        prompt = flatten_messages(messages, self.chain.model_path)
         # Same fallback and the same cast as the chat route, so an identical request
         # produces an identical `max_tokens` and therefore identical text.
         max_tokens = int(body.get("max_output_tokens") or self.default_max_tokens)

@@ -266,7 +266,7 @@ class Session:
     ``prefix_ids`` 前面，位置就接上了（`stream.generate_stream` 的续写契约）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, renderer: "chat.Chat | None" = None) -> None:
         self.ids: list[int] = []
         self.n_past = 0                 # KV 已写到的位置数
         self.pending: int | None = None  # 已 emit、未写 KV 的最后一个 token
@@ -274,10 +274,21 @@ class Session:
         self.rounds = 0
         self.replays = 0                # 被强制整段重放的次数（诊断用）
         self.dirty = False              # 上一轮异常退出，KV 状态未知
+        #: 渲染器与对话状态（chat.Chat / chat.Conversation）。None 时第一次 encode 从
+        #: clients[0].stage.model 建；单测注入一个假的，因为它们没有模型文件也没有 DLL。
+        self.renderer = renderer
+        self.conversation: "chat.Conversation | None" = None
+        #: 本轮 encode 判定为「前缀不成立，必须整段重放」。prepare 据此清掉前缀。
+        self._replay = False
+        #: 本轮是不是 --plain（裸文本没有可回放的渲染历史）。
+        self._plain = False
 
     def reset(self) -> None:
         self.ids, self.n_past, self.pending, self.last = [], 0, None, None
         self.rounds, self.replays, self.dirty = 0, 0, False
+        # /clear 之后是一条新对话：渲染历史与增量基准都归零。
+        self.conversation = None
+        self._replay = False
 
     def kv_target(self) -> int:
         """KV 里应该有多少个位置，即 ``ids`` 中已经写进 KV 的那部分。
@@ -311,43 +322,66 @@ class Session:
         return self.stray() > 0
 
     def encode(self, clients, question: str, *, plain: bool, system: str | None) -> list[int]:
-        """本轮新增部分的 token。渲染只交给 chat：第二个渲染器就是漂移的起点。"""
+        """本轮要写进链的 token，从 ``n_past`` 开始（整段重放时是完整 prompt）。
+
+        渲染只有一份实现：`chat.Conversation` 每轮 apply 全量 messages 给 qlh_chat.dll，
+        再拿「本轮 prompt 是否以上一轮 prompt + 生成文本为前缀」决定是只发新增还是整段。
+        前缀不成立就整段重放——模板对历史 assistant 做了 trim 或丢了思考段时，接着旧 KV
+        写会得到一个模型从未见过的上下文，而输出仍然「看起来像话」。
+
+        ``--plain`` 不走渲染：裸文本的历史就留在 KV 里，下一问只接一个新块。
+        """
+        self._plain = plain
+        self._replay = False
         if plain:
             text = question if not self.rounds else f"\n{question}\n"
-        elif not self.rounds:
-            text = chat.apply_chatml([{"role": "user", "content": question}], system=system)
-        else:
-            # 上一轮是否已经写了 <|im_end|>：自然停止时 pending 就是它；被 max_tokens
-            # 截断时缺这个边界，next_turn 会补上。
-            closed = self.last is not None and clients[-1].is_eog(self.last)
-            text = chat.next_turn(question, assistant_closed=closed)
+            return clients[0].tokenize(text)
+        if self.renderer is None:
+            self.renderer = chat.Chat.for_model(clients[0].stage.model)
+        if self.conversation is None:
+            self.conversation = chat.Conversation(self.renderer, system=system)
+        self.conversation.system = system
+        # 上一轮是否已经写了结束标记：自然停止时 pending 就是它；被 max_tokens 截断时
+        # 缺这个边界，模板补的标记必须跟着进 KV。
+        closed = self.last is not None and clients[-1].is_eog(self.last)
+        text, self._replay = self.conversation.add_user(question, closed=closed)
         return clients[0].tokenize(text)
 
     def prepare(self, clients, question: str, *, plain: bool,
                 system: str | None) -> tuple[list[int], int, list[int]]:
         """返回 ``(prefix_ids, n_past, fresh)``：这一轮要写进链的 token、起始位置、新增部分。"""
-        if self.dirty or self.align(clients):
-            # 整段重放：清掉 KV，把累积的对话 token 重新写回去。dirty 时连位置账都不能
-            # 信——上一轮的异常可能停在一次 forward 中间，KV 的实际内容无从推断。
-            for client in clients:
-                client.reset()
-            self.n_past, self.pending, self.dirty = 0, None, False
-            if self.ids:
-                self.replays += 1
-            prefix = list(self.ids)
-        else:
-            prefix = [] if self.pending is None else [self.pending]
         fresh = self.encode(clients, question, plain=plain, system=system)
+        if self._replay or self.dirty or self.align(clients):
+            # 整段重放：清掉 KV，把这一轮渲染出的完整 prompt 从位置 0 写回去。dirty 时连
+            # 位置账都不能信——上一轮的异常可能停在一次 forward 中间，KV 的实际内容无从
+            # 推断；前缀不成立时同理，历史文本已经与模板渲染对不上了。
+            # 首轮 KV 本来就是空的：清一次没有意义，也不该记成一次重放。
+            if self.rounds or self.ids or self.n_past:
+                for client in clients:
+                    client.reset()
+                if self.ids:
+                    self.replays += 1
+            self.n_past, self.pending, self.dirty = 0, None, False
+            self.ids = []
+            return fresh, self.n_past, fresh
+        prefix = [] if self.pending is None else [self.pending]
         return prefix + fresh, self.n_past, fresh
 
-    def record(self, stats: dict, fresh: list[int], generated: list[int]) -> None:
-        """一轮结束（自然结束或被停止）后记账，使下一轮的起点有据可依。"""
+    def record(self, stats: dict, fresh: list[int], generated: list[int],
+               *, text: str = "") -> None:
+        """一轮结束（自然结束或被停止）后记账，使下一轮的起点有据可依。
+
+        ``text`` 是本轮模型写出的文本（不含 prompt），历史 assistant 消息要按它重建；
+        缺了它，下一轮就只能整段重放。
+        """
         self.ids.extend(fresh)
         self.ids.extend(generated)
         self.n_past = int(stats.get("n_past", self.n_past))
         self.pending = stats.get("pending")
         self.last = stats.get("last_token")
         self.rounds += 1
+        if self.conversation is not None and not self._plain:
+            self.conversation.add_assistant(text)
 
 
 class Ask(Input):
@@ -718,6 +752,9 @@ class KLlamaApp(App):
                             "rng": np.random.default_rng(args.seed)}
             stats: dict = {}
             generated: list[int] = []
+            #: 本轮模型写出的文本。历史 assistant 消息要按它重建（见 Session.record），
+            #: 所以它必须与 emit 出去的 token 一一对应——chunk.text 就是那个文本。
+            answer: list[str] = []
             for chunk in generate_stream(
                     clients, "", prefix_ids=prefix, n_past=n_past,
                     max_tokens=args.max_tokens, spec_k=args.spec_k,
@@ -727,8 +764,9 @@ class KLlamaApp(App):
                 # token == -1 是组装器收尾补的剩余文本，不是模型生成的 id，不能进历史。
                 if chunk.token >= 0:
                     generated.append(chunk.token)
+                answer.append(chunk.text)
                 self.call_from_thread(self.on_chunk, chunk, time.perf_counter())
-            self.session.record(stats, fresh, generated)
+            self.session.record(stats, fresh, generated, text="".join(answer))
             note = ("⏹ 已停止：已生成的部分留在上下文里，下一问接着这段写"
                     if stats.get("stopped") else "")
             self.call_from_thread(self.flush, "", note)

@@ -55,7 +55,7 @@ import config  # noqa: E402
 import topology  # noqa: E402
 import chain_client  # noqa: E402
 from chain_client import StageClient, _terminate, bring_up, tail_rs_depth  # noqa: E402
-from chat import apply_chatml, next_turn  # noqa: E402
+from chat import Chat, Conversation  # noqa: E402
 from stream import generate_stream  # noqa: E402
 
 # Worker 日志走一个本脚本专属的目录。`build/relay-records` 是共享路径，而本机可能同时
@@ -79,19 +79,21 @@ TURNS = [
 
 
 # --------------------------------------------------------------------------- 单轮驱动
-def _turn(clients, delta_text: str, n_past: int, pending: int | None,
+def _turn(clients, tokens: list[int], n_past: int, pending: int | None,
           max_tokens: int, spec_k: int) -> dict:
-    """跑一轮：把 ``delta_text`` 接在 KV 已填到的位置后面，贪心生成至多 max_tokens。
+    """跑一轮：把 ``tokens`` 接在 KV 已填到的位置后面，贪心生成至多 max_tokens。
 
     这里**不实现解码循环**：本仓库只允许一个（AGENTS §7），而 `stream.generate_stream`
-    就是 TUI / server 共用的那一个。这个函数只负责把「增量 token + 起始位置」交给它，
+    就是 TUI / server 共用的那一个。这个函数只负责把「本轮 token + 起始位置」交给它，
     再把结果收回来——所以多轮能力是给既有循环加参数，不是新写一份。
+
+    ``tokens`` 已经是 token id：渲染与 tokenize 由调用方按 `chat.Conversation` 的判定
+    完成（增量时只是新增块，前缀不成立时是整段 prompt）。
     """
-    tokens = clients[0].tokenize(delta_text)
     if pending is not None:
         # 上一轮最后 emit 出的那个 token 从没走过 forward（循环在 emit 之后就 break 了），
-        # 但它的位置就是 n_past。把它接在增量最前面，KV 才与对话文本严格对齐。
-        tokens = [pending] + tokens
+        # 但它的位置就是 n_past。把它接在最前面，KV 才与对话文本严格对齐。
+        tokens = [pending] + list(tokens)
     stats: dict = {}
     ids: list[int] = []
     text = ""
@@ -116,25 +118,6 @@ def _turn(clients, delta_text: str, n_past: int, pending: int | None,
             "prefill_written": stats["n_past"] >= n_past + len(tokens)}
 
 
-def _delta_text(index: int, question: str, pending_is_eog: bool) -> str:
-    """把一问接成 ChatML 的下一个块。
-
-    第 1 轮用 `chat.apply_chatml`，后续轮用 `chat.next_turn`——**唯一**的 ChatML 渲染器。
-    这里原先自己拼 `<|im_start|>` 标记，是第二份渲染器（TUI 的多轮也要同一段文本，
-    两边一定会漂）；现在两个入口调同一个函数。
-
-    之所以不每轮都用 apply_chatml 渲染整段：那样就得把历史文本重新 token 化一遍，而生成
-    出来的 token 序列经 文本→token 往返并不无损（字节级 BPE），KV 里留着的和重新编码出来
-    的会悄悄错开。next_turn 只渲染**新增的部分**，历史原样留在 KV 里。
-
-    `pending_is_eog`：上一轮若是自然停止，pending 就是 `<|im_end|>`，收尾已经写进 KV；
-    被 max_tokens 截断时才需要补一个结束标记，否则模型会看到「回答直接被新的 user 块截断」。
-    """
-    if index == 0:
-        return apply_chatml([{"role": "user", "content": question}], system=SYSTEM)
-    return next_turn(question, assistant_closed=pending_is_eog)
-
-
 def _decode(clients, ids: list[int]) -> str:
     return b"".join(clients[-1].piece(t) for t in ids).decode("utf-8", "replace")
 
@@ -153,6 +136,7 @@ def run(args: argparse.Namespace) -> dict:
     os.environ.setdefault("SA_MEM_SAFETY", "0.88")
 
     procs: list = []
+    renderer: Chat | None = None
     clients = [StageClient(s) for s in stages]
     report: dict = {"topology": str(config.topology_path()), "model": str(stages[0].model),
                     "ctx": ctx, "spec_k": args.spec_k, "secret": SECRET, "rounds": []}
@@ -177,16 +161,26 @@ def run(args: argparse.Namespace) -> dict:
 
         n_past = 0
         pending: int | None = None
-        # （上一轮的文本不再需要：ChatML 的下一个块只取决于 pending 是不是结束符。）
         #: KV 里当前实际有哪些 token，顺序即位置。R4 的「重放」组直接用它。
         kv_ids: list[int] = []
+        # 渲染只有一份实现：模型自己的模板，在 qlh_chat.dll 里跑。Conversation 每轮全量
+        # render，再按「本轮 prompt 是否以上一轮 prompt + 生成文本为前缀」决定只发新增
+        # 还是整段——与 koakuma.Session 用的是同一个判定，不是第二份。
+        renderer = Chat.for_model(stages[0].model, dll=args.chat_dll or None)
+        conversation = Conversation(renderer, system=SYSTEM)
 
         for i, (question, budget) in enumerate(TURNS):
             pending_is_eog = pending is not None and clients[-1].is_eog(pending)
-            delta = _delta_text(i, question, pending_is_eog)
+            text, replay = conversation.add_user(question, closed=pending_is_eog)
+            tokens = clients[0].tokenize(text)
+            if replay:
+                # 前缀不成立：这一轮渲染出的 prompt 才是权威，KV 里的旧内容作废，从 0 重写。
+                for c in clients:
+                    c.reset()
+                n_past, pending, kv_ids = 0, None, []
             kv_before = list(kv_ids)
             t0 = time.perf_counter()
-            res = _turn(clients, delta, n_past, pending, budget, args.spec_k)
+            res = _turn(clients, tokens, n_past, pending, budget, args.spec_k)
             took = time.perf_counter() - t0
 
             # 已进 KV 的 = 本轮 prefill 的（含 replay 的 pending）+ 生成里除 pending 之外的
@@ -199,6 +193,7 @@ def run(args: argparse.Namespace) -> dict:
             entry = {
                 "round": i + 1,
                 "question": question,
+                "replay": bool(replay),
                 "n_past_start": res["n_past_before"],
                 "n_past_end": res["n_past_after"],
                 "prefill_tokens": len(res["prefill"]),
@@ -220,23 +215,30 @@ def run(args: argparse.Namespace) -> dict:
             report["rounds"].append(entry)
 
             print(f"\n轮 {i + 1}  n_past {res['n_past_before']} -> {res['n_past_after']}"
-                  f"  (prefill {len(res['prefill'])} + gen {len(res['ids'])}, {took:.1f}s)")
+                  f"  (prefill {len(res['prefill'])} + gen {len(res['ids'])}, {took:.1f}s)"
+                  f"{'  [整段重放]' if replay else ''}")
             print(f"  问: {question}")
             print(f"  答: {res['text'].strip()!r}")
 
             n_past = res["n_past_after"]
             pending = res["pending"]
+            conversation.add_assistant(res["text"])
 
         # ------------------------------------------------------------- R1 / R2 / R3
         checks: dict = {}
         bad_npast = [r["round"] for r in report["rounds"] if not r["prefill_written"]]
         starts = [r["n_past_start"] for r in report["rounds"]]
         ends = [r["n_past_end"] for r in report["rounds"]]
-        # 起点必须等于上一轮终点；第 1 轮必须从 0 起。
-        chained = all(starts[i] == ends[i - 1] for i in range(1, len(starts)))
+        # 起点必须等于上一轮终点；第 1 轮必须从 0 起。整段重放的轮次是例外：模板对历史
+        # assistant 做了有损渲染（trim / 丢思考）时 KV 被清空，从 0 重写才是正确的位置账，
+        # 报告里把那些轮次单独列出来，免得「重置」被当成单调性失败。
+        # 第 1 轮本来就是整段（没有历史），不算重放；只统计第 2 轮以后被模板差异逼出来的。
+        replays = [r["round"] for r in report["rounds"] if r["replay"] and r["round"] > 1]
+        chained = all(starts[i] == ends[i - 1] or report["rounds"][i]["replay"]
+                      for i in range(1, len(starts)))
         checks["R1_npast_monotonic"] = {
             "pass": starts[0] == 0 and chained and not bad_npast,
-            "starts": starts, "ends": ends,
+            "starts": starts, "ends": ends, "replayed_rounds": replays,
             "not_increasing": [(r["round"], r["n_past_start"], r["n_past_end"])
                                for r in report["rounds"]
                                if r["n_past_end"] <= r["n_past_start"]],
@@ -282,7 +284,10 @@ def run(args: argparse.Namespace) -> dict:
         # --------------------------------------- R3 的反向对照：没有第 1 轮时还知道暗号吗
         for c in clients:
             c.reset()
-        control = _turn(clients, _delta_text(1, TURNS[1][0], False), 0, None,
+        # 对照组是一条没有第 1 轮的新对话：同样的渲染器、同样的模板，只少了那段历史。
+        control_conv = Conversation(renderer, system=SYSTEM)
+        control_text, _ = control_conv.add_user(TURNS[1][0], closed=False)
+        control = _turn(clients, clients[0].tokenize(control_text), 0, None,
                         TURNS[1][1], args.spec_k)
         checks["R3_control_without_round1"] = {
             # 对照组的正确结果是**不知道**；知道反而说明 R3 的证据是假的。
@@ -301,6 +306,8 @@ def run(args: argparse.Namespace) -> dict:
                                 else "DIVERGED")
         return report
     finally:
+        if renderer is not None:
+            renderer.close()
         for c in clients:
             try:
                 c.close()
@@ -312,6 +319,7 @@ def run(args: argparse.Namespace) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shim", default="", help="覆盖 SA_SHIM（见 config.find_shim）")
+    ap.add_argument("--chat-dll", default="", help="覆盖 SA_CHAT_DLL（见 config.find_chat_dll）")
     ap.add_argument("--topology", default="topology-local-32-8.toml")
     ap.add_argument("--spec-k", type=int, default=0,
                     help="0 = 纯 decode（默认，隔离 KV 变量）；>0 顺带验投机路径跨轮")

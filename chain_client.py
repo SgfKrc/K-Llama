@@ -1914,8 +1914,12 @@ def main() -> int:
             print("\n" + report)
 
         if args.chat and args.prompt_text:
-            from chat import apply_chatml
-            args.prompt_text = apply_chatml([{"role": "user", "content": args.prompt_text}])
+            # 渲染只有一份实现：模型自己的模板，在 qlh_chat.dll 里跑。
+            from chat import Chat
+
+            with Chat.for_model(stages[0].model) as renderer:
+                args.prompt_text = renderer.render(
+                    [{"role": "user", "content": args.prompt_text}]).prompt
         _sampling = (dict(temperature=0.0) if args.greedy else
                      dict(temperature=args.temperature, top_k=args.top_k,
                           top_p=args.top_p, seed=args.seed))
