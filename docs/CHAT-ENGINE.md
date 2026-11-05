@@ -49,7 +49,7 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 | --- | --- | --- | --- |
 | **一** | `shim/chat/`（vendored 上游 60 文件 + `UPSTREAM.txt`）、`shim/qlh_chat.cpp`（C ABI 五函数）、两个构建脚本、`checks/verify_chat.py` | dll 编出来（1,732 KB）；PE 导入表零 llama/ggml 符号；golden 模板渲染逐字节对上；P0 那份真实输出能被解析出正确 tool_calls。**63 PASS / 0 FAIL** | **完成** |
 | **二** | `chat.py` 换成薄封装（删 `apply_chatml` 与 `next_turn`）、`verify_equiv --mode prompt`、`test_contract` 规则倒置（任何 .py 不许出现 `<|im_start|>`） | 71 项单测全过；`verify_multiturn` 在 2B 上与接之前**逐位相同**（三轮 `ids`/`text` 全 `==`）；`test_contract` 扫 9 个根 `.py` 得 0 处字面量 | **完成** |
-| 三 | `server.py` 工具调用（非流式）：读 `tools`/`tool_choice`、产出 `tool_calls` + `finish_reason: "tool_calls"`、`role: tool` 回传 | DSH 真机连一次，能读文件/跑命令 | 未开始 |
+| **三** | `server.py` 工具调用（非流式）：读 `tools`/`tool_choice`、产出 `tool_calls` + `finish_reason: "tool_calls"`、`role: tool` 回传 | `verify_openai_tools.py` 28 PASS；2B 端到端自己调出 `get_weather`（prompt 278 / gen 66 / 9.35 tok/s），回传 `role:tool` 后答出「晴，25 度」；非法 `arguments` 历史 → 400。**DSH 验收推迟到第四期** | **完成** |
 | 四 | 流式 `delta.tool_calls`（按 index 累积）、`delta.reasoning_content`、`finish_reason` | openai SDK `.stream()` 累积结果与非流式**逐字段一致** | 未开始 |
 | 五 | **多模态**：验证已完成（视觉活着、未漂移）；实现走原生还是旁路待定 | 一张图能进去并被正确描述 | 验证已过，实现待定 |
 | 六 | grammar 约束（可选） | 出现真实的格式错误样本才做 | 未开始 |
@@ -120,6 +120,19 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 - **读一次 `tokenizer.chat_template` 在 35B 上要 7 秒**（H: 盘、21.87 GiB GGUF），而
   `server.flatten_messages` 每个请求都读一次。`chat.read_template` 按
   `(路径, mtime, size)` 缓存；建 handle 只要 6 ms，不缓存（handle 带 parse 状态）
+- **渲染 handle 必须活到 parse**：`qlh_chat_parse` 要求同一个 handle 上先 `apply`（否则
+  rc=-1）。旧的 `flatten_messages` 在 `return` 时关了 handle，于是「渲染 → 生成 → 解析」
+  根本走不通。现在一次请求一个 `Chat`，`with` 包住全过程
+- **只在请求带 `tools` 时 parse**：`parse` 会把 `thinking` 从 content 里剥出去，一条没写
+  结束标记的回答会变成 `content=""` 加一堆 `reasoning_content`。不请求工具的调用方不该
+  看到这个变化
+- **`parse` 不产出 `tool_calls[].id`**：`to_json_oaicompat()` 只给
+  `type`/`function{name,arguments}`，`arguments` 已是 JSON 字符串。id 必须自己发
+  `call_<24 hex>`——客户端要靠它把 `role:"tool"` 配对回这次调用
+- **历史 `arguments` 的字符串形式并不总是被静默丢弃**：上游对
+  `caps.supports_object_arguments` 的模板（Qwen3.5 命中）会自己 parse，实测字符串与
+  mapping 渲染逐字节相同。仍然在 Python 侧归一，是不让行为依赖上游对模板的分析；非法
+  JSON 也因此能给出点名字段的 400，而不是模板内的一行 `Failed to parse tool call arguments`
 
 ## 6. DSH 的实际要求（读其源码确认）
 

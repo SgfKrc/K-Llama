@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
 import topology  # noqa: E402
+from chat import Chat, ChatError  # noqa: E402 - after the sys.path insert above
 from chain_client import (StageClient, _terminate, bring_up, context_shortfall,
                           tail_rs_depth, vram_after_load, vram_before_load,
                           vram_report)  # noqa: E402
@@ -287,27 +288,145 @@ class Chain:
         self.ready = False
 
 
-def flatten_messages(messages: list[dict], model) -> str:
-    """Collapse a chat into the prompt the checkpoint expects -- through qlh_chat.dll.
+def _renderer(model):
+    """One handle per request, open across render -> generate -> parse.
 
-    This used to emit plain text with Chinese role prefixes ("用户：", "助手：") on the
-    reasoning that a split model might not be a chat model. That held for numerics but not
-    for usefulness: Qwen answered every question with degenerate repetition because it
-    never saw `<|im_start|>`. `chat.py` carries the two facts that settled it, and the
-    template renderer now lives in C++ (`shim/chat/`), so every entry point renders the
-    same way by construction rather than by three copies agreeing.
-
-    A system turn is passed through as a message: the template decides where it goes, and
-    for the Qwen family it may fold tool descriptions into it. `model` is the checkpoint
-    whose `tokenizer.chat_template` is authoritative.
+    `parse()` needs the `apply()` state of the *same* handle (`shim/qlh_chat.cpp`: parse
+    before apply returns -1), so the handle cannot be closed when the prompt comes back.
+    The old `flatten_messages` did exactly that, which left no way to parse the answer
+    without a second, stateless handle -- and that one can only fail.
     """
-    from chat import Chat, merge_system
+    return Chat.for_model(model)
+
+
+def normalize_tool_call_arguments(messages: list[dict]) -> list[dict]:
+    """Turn historical `tool_calls[].function.arguments` strings into mappings.
+
+    OpenAI sends the arguments of a past tool call as a JSON *string*, and the template
+    renders each parameter with `tool_call.arguments | items`, where iterating a string
+    yields nothing. Upstream parses the string back for templates whose jinja caps say
+    `supports_object_arguments` (`chat.cpp`: `func_args_not_string`), and Qwen3.5 does hit
+    that workaround -- measured here: the string and mapping forms render byte for byte
+    identical. Doing it in Python anyway keeps the behaviour from depending on that
+    template analysis: a template it classifies differently would silently drop every
+    argument, with no error and no trace in the prompt.
+
+    Malformed JSON is refused instead of passed through. Upstream would raise "chat
+    template apply failed: Failed to parse tool call arguments as JSON" from inside the
+    render, naming neither the message nor the field; a 400 does. An empty string means
+    "this call took no arguments" (llama.cpp renders a zero-argument call as `{}`), not a
+    syntax error.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            out.append(msg)
+            continue
+        calls = msg.get("tool_calls")
+        if not isinstance(calls, list):
+            out.append(msg)
+            continue
+        fixed = []
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict) or not isinstance(function.get("arguments"), str):
+                fixed.append(call)      # already a mapping, or not ours to reinterpret
+                continue
+            raw = function["arguments"].strip()
+            if not raw:
+                arguments: object = {}
+            else:
+                try:
+                    arguments = json.loads(raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"tool_calls[].function.arguments is not valid JSON: "
+                        f"{raw[:80]!r} ({exc})") from exc
+                if not isinstance(arguments, dict):
+                    raise ValueError(
+                        f"tool_calls[].function.arguments must be a JSON object, got "
+                        f"{type(arguments).__name__}: {raw[:80]!r}")
+            fixed.append({**call, "function": {**function, "arguments": arguments}})
+        out.append({**msg, "tool_calls": fixed})
+    return out
+
+
+def render_messages(renderer, messages: list[dict], *, tools=None, tool_choice=None,
+                    parallel_tool_calls=None):
+    """Render a request's messages through an already-open handle.
+
+    This is the only prompt builder: the streaming chat path, the non-streaming one and
+    `/v1/responses` all call it, so `test_contract`'s "no root Python file may spell the
+    ChatML markers" cannot be bypassed by a second renderer.
+
+    `tools` and `tool_choice` go through untouched -- the template decides how they read,
+    and an empty tool list means "no tools", the same as OpenAI. `parallel_tool_calls` is
+    forwarded only when the client sent it, so the DLL default (false) stays a default
+    rather than becoming a value this server invented.
+    """
+    from chat import merge_system
 
     system, turns = merge_system(messages)
     if system is not None:
         turns = [{"role": "system", "content": system}, *turns]
-    with Chat.for_model(model) as renderer:
-        return renderer.render(turns).prompt
+    return renderer.render(normalize_tool_call_arguments(turns), tools=tools,
+                           tool_choice=tool_choice,
+                           parallel_tool_calls=parallel_tool_calls)
+
+
+def _new_tool_call_id() -> str:
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
+def _tool_arguments(value) -> str:
+    """OpenAI's wire form is a JSON string; the DLL already produces one."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def openai_assistant_message(parsed: dict, *, tokens: int, max_tokens: int,
+                             new_id=_new_tool_call_id) -> tuple[dict, str]:
+    """Build the OpenAI `message` and `finish_reason` from one parsed answer.
+
+    `parsed` is `qlh_chat_parse`'s `msg`: already OpenAI-shaped, with `arguments` as a
+    JSON string but no `id` (the DLL only emits one when the model wrote it). An id is
+    generated per call because the client needs it to pair up the `role: "tool"` message
+    it sends back, and without it the next turn's history is unpairable.
+
+    `content` is `null` when a tool call carries no prose -- what the OpenAI spec shows
+    for tool calls, and a more precise statement than an empty string. Prose the model
+    wrote *before* calling is kept, because the Qwen template explicitly allows it.
+
+    `reasoning_content` is the field name DSH reads from streaming deltas (its provider
+    lists `reasoning_content` / `reasoning` / `reasoning_text`); its non-streaming path
+    never runs, so carrying it here costs nothing and keeps the thinking text instead of
+    dropping it.
+
+    `finish_reason` stays inside DSH's vocabulary (`stop` / `length` / `tool_calls`; any
+    other value becomes an error there). A tool call wins over the length cutoff: the call
+    is what the client has to act on.
+    """
+    calls = parsed.get("tool_calls") or []
+    content = parsed.get("content")
+    message: dict = {"role": "assistant"}
+    if calls:
+        message["content"] = content or None
+        message["tool_calls"] = [
+            {"id": new_id(), "type": "function",
+             "function": {
+                 "name": str(call.get("function", {}).get("name", "")),
+                 "arguments": _tool_arguments(call.get("function", {}).get("arguments", "{}")),
+             }}
+            for call in calls
+        ]
+        finish = "tool_calls"
+    else:
+        message["content"] = content or ""
+        finish = "length" if tokens >= max_tokens else "stop"
+    if reasoning := parsed.get("reasoning_content"):
+        message["reasoning_content"] = reasoning
+    return message, finish
 
 
 # Responses request/response translation. Kept in its own module because the two
@@ -401,7 +520,11 @@ class Handler(BaseHTTPRequestHandler):
                                         "type": "invalid_request_error"}})
             return
 
-        prompt = flatten_messages(messages, self.chain.model_path)
+        # `tools: []` is "no tools", the same as absent: the template then renders no tool
+        # section, and the answer is not parsed for tool calls.
+        tools = body.get("tools") or None
+        tool_choice = body.get("tool_choice")
+        parallel = body.get("parallel_tool_calls")
         max_tokens = int(body.get("max_tokens") or self.default_max_tokens)
         stream = bool(body.get("stream"))
         model = str(body.get("model") or "slimarc")
@@ -418,18 +541,35 @@ class Handler(BaseHTTPRequestHandler):
                                         "type": "service_unavailable"}})
             return
 
-        if stream:
-            self._stream_response(completion_id, created, model, prompt, max_tokens,
-                                  ignored, sampling)
-        else:
-            self._full_response(completion_id, created, model, prompt, max_tokens,
-                                ignored, sampling)
+        # One handle for the whole request: `parse()` shares the `apply()` state, so the
+        # renderer has to outlive generation. Streaming does not parse yet (fourth phase),
+        # but it renders tools into the prompt, and closing the handle early there would
+        # let the two paths diverge on exactly the input this phase is about.
+        try:
+            with _renderer(self.chain.model_path) as renderer:
+                prompt = render_messages(renderer, messages, tools=tools,
+                                         tool_choice=tool_choice,
+                                         parallel_tool_calls=parallel).prompt
+                if stream:
+                    self._stream_response(completion_id, created, model, prompt,
+                                          max_tokens, ignored, sampling)
+                else:
+                    self._full_response(completion_id, created, model, prompt,
+                                        max_tokens, ignored, sampling,
+                                        renderer=renderer, tools=bool(tools))
+        except (ChatError, ValueError) as exc:
+            # A template that refuses the request (bad tool_choice type, malformed tool
+            # definition, unparsable historical arguments) is the client's mistake, and
+            # the DLL's message says what it rejected.
+            self._json(400, {"error": {"message": str(exc),
+                                        "type": "invalid_request_error"}})
 
     # -- response shapes -------------------------------------------------------
 
     def _full_response(self, cid: str, created: int, model: str, prompt: str,
                        max_tokens: int, ignored: list[str],
-                       sampling: dict | None = None) -> None:
+                       sampling: dict | None = None, renderer=None,
+                       tools: bool = False) -> None:
         try:
             text, tokens, prompt_tokens, elapsed, drain_stats = self.chain.drain(
                 prompt, max_tokens, sampling)
@@ -446,25 +586,47 @@ class Handler(BaseHTTPRequestHandler):
         # Read back from the native handle while the lock is free: this is what the
         # client actually got, not what it asked for (clamping happens in C).
         effective = self.chain.sampling_state()
+        message: dict = {"role": "assistant", "content": text}
+        finish = "length" if tokens >= max_tokens else "stop"
+        parse_error = ""
+        if tools:
+            # Parsed only when the request carried tools. Without a tool definition the
+            # PEG parser still splits `thinking` out of the text, which would change the
+            # existing answer silently -- measured: a text that never closes its thinking
+            # block comes back with content "" and everything in reasoning_content.
+            try:
+                parsed = renderer.parse(text, partial=False)["msg"]
+            except ChatError as exc:
+                # Parsing happens after generation, so failing the request would throw
+                # away a complete answer. Answer with the raw text and say why.
+                parse_error = str(exc)
+            else:
+                message, finish = openai_assistant_message(
+                    parsed, tokens=tokens, max_tokens=max_tokens)
+        slimarc = {
+            "tokens_per_second": round(tokens / elapsed, 2) if elapsed > 0 else 0,
+            "elapsed_seconds": round(elapsed, 3),
+            "ignored_parameters": ignored,
+            "sampling": effective,
+            # Whether the configured drafts ran for *this* request, and the reason when
+            # they did not. A sampled request that also asked for top_k/top_p degrades
+            # to plain decode; without this field that slowdown would be invisible.
+            "speculation": drain_stats.get("speculation"),
+        }
+        if parse_error:
+            # A tool_calls-shaped answer that could not be parsed is not a 500: the text
+            # is complete, only the split into content/reasoning/tool calls failed.
+            slimarc["parse_error"] = parse_error
         payload = {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "length" if tokens >= max_tokens else "stop",
+                "message": message,
+                "finish_reason": finish,
             }],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens,
                       "total_tokens": prompt_tokens + tokens},
-            "slimarc": {
-                "tokens_per_second": round(tokens / elapsed, 2) if elapsed > 0 else 0,
-                "elapsed_seconds": round(elapsed, 3),
-                "ignored_parameters": ignored,
-                "sampling": effective,
-                # Whether the configured drafts ran for *this* request, and the reason when
-                # they did not. A sampled request that also asked for top_k/top_p degrades
-                # to plain decode; without this field that slowdown would be invisible.
-                "speculation": drain_stats.get("speculation"),
-            },
+            "slimarc": slimarc,
         }
         self._json(200, payload)
 
@@ -522,7 +684,15 @@ class Handler(BaseHTTPRequestHandler):
                                         "param": "input"}})
             return
 
-        prompt = flatten_messages(messages, self.chain.model_path)
+        try:
+            # The Responses route keeps the same renderer as the chat route, so the same
+            # conversation still produces the same prompt on both endpoints.
+            with _renderer(self.chain.model_path) as renderer:
+                prompt = render_messages(renderer, messages).prompt
+        except (ChatError, ValueError) as exc:
+            self._json(400, {"error": {"message": str(exc),
+                                        "type": "invalid_request_error"}})
+            return
         # Same fallback and the same cast as the chat route, so an identical request
         # produces an identical `max_tokens` and therefore identical text.
         max_tokens = int(body.get("max_output_tokens") or self.default_max_tokens)
@@ -692,7 +862,7 @@ def main() -> int:
                   cascade_mtp=args.cascade_mtp)
     # Must be set BEFORE the workers spawn: they inherit the environment at start-up, and a
     # later assignment would not reach the shim that tokenizes. Without it the ChatML
-    # markers flattened by flatten_messages are split into ordinary fragments, which is
+    # markers the renderer emits are split into ordinary fragments, which is
     # worse than sending plain text -- the model then sees broken control tokens.
     from chat import chat_token_env
     os.environ.update(chat_token_env())

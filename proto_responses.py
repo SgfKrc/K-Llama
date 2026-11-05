@@ -10,7 +10,7 @@ goes in; JSON-ready dicts or a normalised message list comes out. No socket, no 
 no server state. That is what makes it testable without loading a model.
 
 `flatten_input` returns *messages*, not a prompt, and `server.py` runs them through the
-same `flatten_messages` the chat endpoint uses. Deliberate: the acceptance criterion is
+same `render_messages` the chat endpoint uses. Deliberate: the acceptance criterion is
 that an identical request produces identical text on both endpoints, and a second prompt
 formatter is exactly how those two drift apart.
 
@@ -101,7 +101,7 @@ def _content_text(content) -> str:
 
     Responses names text parts `input_text` / `output_text`; chat completions names
     them `text`. All three are read here because handing this list to
-    `flatten_messages` untouched would drop the Responses spellings -- it filters on
+    `render_messages` untouched would drop the Responses spellings -- it filters on
     ``type == "text"`` -- and the prompt would silently lose its body. Non-text parts
     are refused rather than dropped for the same reason.
     """
@@ -129,7 +129,7 @@ def _content_text(content) -> str:
 def flatten_input(payload, instructions=None) -> list[dict]:
     """Normalise a Responses ``input`` into chat-completions ``messages``.
 
-    Returns messages rather than a prompt, on purpose: `flatten_messages` then builds
+    Returns messages rather than a prompt, on purpose: `render_messages` then builds
     the prompt, so `/v1/responses` and `/v1/chat/completions` cannot drift apart for the
     same conversation. Keeping the two prompt builders equal is an acceptance
     criterion, so it is enforced structurally instead of by keeping two formatters in
@@ -158,8 +158,10 @@ def flatten_input(payload, instructions=None) -> list[dict]:
             raise ValueError(
                 f"input item of type {item.get('type')!r} is not supported: "
                 "only message items with a role are accepted")
-        # `developer` is this protocol's system role. flatten_messages maps an unknown
-        # role onto "用户", which would invert the meaning of an instruction.
+        # `developer` is this protocol's system role. render_messages only lifts `system`
+        # out and hands every other role to the template, which writes the role name into
+        # the header verbatim -- `developer` would become an unknown turn type instead of
+        # an instruction.
         role = "system" if role == "developer" else str(role)
         messages.append({"role": role, "content": _content_text(item.get("content"))})
     if not messages:

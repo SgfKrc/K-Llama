@@ -83,7 +83,7 @@ def read_template(model: str | Path) -> str:
     the DLL is that it renders *that* checkpoint's conversation format.
 
     Cached by (path, mtime, size) because opening a GGUF to read one metadata string costs
-    **7 s** on the 35B checkpoint, and `server.flatten_messages` does it on every request.
+    **7 s** on the 35B checkpoint, and `server._renderer` does it on every request.
     Building a handle costs 6 ms and is not cached -- a handle carries parse state.
     """
     st = Path(model).stat()
