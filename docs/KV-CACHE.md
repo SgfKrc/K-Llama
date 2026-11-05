@@ -42,38 +42,41 @@ for client in self._clients:
 
 ## 3. 能做什么（按收益排序）
 
-### 3.1 【做过、实测零命中、已删除】server 走 token 前缀续写
+### 3.1 【做成】server 走 token 前缀续写 —— 命中 88%
 
-曾经实现过：`Chain` 记一份「KV 里逐位置的 token id」账本，请求 tokenize 后与它比公共
-前缀，命中就只写新增；分叉、KV 比 prompt 长、投机、`kv_tail`、计数对不上都清账本退回全量
-重放。判据本身是保守的、逐条有单测。**后来删掉了**，两个理由都成立且互不依赖：
+`Chain._reusable` / `_remember` 记一份「KV 里逐位置的 token id」账本：下一个请求 tokenize
+后与它比公共前缀，命中就只写新增（`generate_stream` 的 `prefix_ids` / `n_past`），分叉、
+KV 比 prompt 长、投机、`kv_tail`、计数对不上都清账本退回全量重放。
 
-**一、当前模板 + DSH 组合下命中率是 0。**
+**曾经判过一次死刑，理由是错的。** 第一次实测命中率 0，我归因于「Qwen 模板在
+generation prompt 末尾注入 `<think>`，与历史 assistant 段的渲染不一致」，认为这是模板的
+固有性质。真正的差别在别处：
 
-- generation prompt 末尾是 `<|im_start|>assistant\n<think>\n`（`thinking=False` 时是
-  `<think>\n\n<｜end▁of▁thinking｜>\n\n`），而历史 assistant 段渲染成
-  `<|im_start|>assistant\n<答案>`。**两者在 assistant 头之后第一个 token 就分叉**，实测字符
-  公共前缀 59 / 总长 144，token 公共前缀 15 / 总长 429。
-- `chat.Conversation.add_assistant` 正是为这件事存在：用
-  `" " + thinking_start + "\n" + generated` 桥接生成文本与历史渲染（`chat.py:283-296`，
-  注释原话「Get this wrong and every turn replays」）。`koakuma` 因此能续写；**接 DSH 时
-  历史由客户端给，server 没有这条拼接，也不该有**。
+- `chat.Conversation.add_assistant` 用 `" " + thinking_start + "\n" + generated` 把标记
+  **拼进 content**（`chat.py:294`），下一轮模板渲染历史 assistant 时就和 KV 对齐了。
+- `server.py` 把客户端回传的 content 原样塞进模板，**没有这一拼**，于是历史 assistant 少了
+  `<think>\n`，前缀在 assistant 头之后立刻断。
+- 也就是说：**模板不是不对称的，是我们少写了两个 token**。DeepSeek 那边没这问题，因为它是
+  自己的服务端在渲染。
 
-**二、就算命中，收益上限也只有一成**（2B 实测，这条更关键）：
+修法是 `_close_assistant_turn`：渲染前给**每一条** `role=assistant` 且 content 不以标记开头
+的 turn 前缀 `" " + thinking_start + "\n"`（前导空格被模板 trim 吃掉）。只补最后一条是错的
+——真实追问最后一条永远是 user，要补的历史 assistant 在中间。
 
-| | prompt | 生成 | 总时长 |
+**实测（2B，`max_tokens=48` 逐轮截断）**：
+
+| | prompt | reused | 占比 |
 |---|---|---|---|
-| 轮1 | 15 | 400 | 38.2 s |
-| 轮2 | 429 | 400 | 42.6 s |
+| 轮1 | 15 | 0 | 首轮无可复用 |
+| 轮2 | 77 | 0 | 见下 |
+| 轮3 | 141 | **124** | **88%** |
 
-多出的 414 个 prompt token 约 4.4 s，即 **prefill 只占总时长的 10%**，生成是大头。
+轮2 断在 61 是因为轮1 的回复被 `max_tokens=48` 从中间切断，解码出的文本重新 tokenize 与
+生成时的 token 不再逐一相等。自然结束或按字符边界截断时不会这样。
 
-删掉而不是留着的理由：它零收益，却依赖 `stream.py` 的 `pending` / `kv_tail` 契约和三处
-对外 stats 字段；任一处改错不会报错，只会让下一轮写进一个模型没见过的上下文。删完之后
-`generate()` 无条件 reset（`server.py:228-229`），与本文件 §2 实测的 `seq_rm` 行为一致。
-
-要真正吃到它，得让 server 篡改渲染输入（给历史 assistant 补 `thinking_start`），风险高于
-收益，未做。
+- 动的不变量：`n_past ≈ 已写 token 数` 从请求内的局部量升级成跨请求的持久账本。少一条判定
+  就是静默错上下文（不报错，只是答得不对），所以 `_remember` 见疑即清。
+- 并发注意：多个请求共用一把锁串行，不同会话交错会毁掉前缀局部性。
 
 ### 3.2 【可做】让 `seq_rm` 的失败可见（~25 行）
 
@@ -111,15 +114,15 @@ shim 加一个 `qlh_kh_seq_pos_max(handle, seq)` 导出（C 3 行 + `.def` 1 行
 这条路 3.1 就是。做不了的只是 Radix/LMCache 那种「多个不同会话复用同一前缀」，因为它
 要求所有段同时命中同一前缀，任何一段没命中，`n_past` 就分叉，而分叉是静默的。
 
-补一句 3.1 实测之后的话：**「同会话内续写」也不是自动成立的**。它要求模板渲染历史
-assistant 的方式与生成时逐 token 一致，而末尾注入的 thinking 引导破坏了这个一致性。
-所以 prefix caching 在这套形态里两边都要额外条件才成立。
+补一句 3.1 实测之后的话：**「同会话内续写」不是自动成立的**。它要求模板渲染历史 assistant
+的方式与生成时逐 token 一致，而这一步靠调用方在历史里补回 thinking 标记才成立（服务端的
+历史来自客户端，所以由服务端补）。跨请求共享那一半仍然做不了，理由如上一段。
 
 ## 6. 待验证
 
 - `llama-memory-hybrid.cpp:143` / `llama-memory-recurrent.cpp:192` 的回滚条件来自调研时的
   阅读，未在本仓库复跑；上一轮实测只到 `[seq_rm] p0=236 rc=-6` 这一层。
-- 3.1 的一成收益上限是在 2B + 400 token 生成下量的。生成更长（比如 2000 token）时
-  prefill 占比会更低，结论只会更偏向「不值得」；生成极短时反过来，未测。
-- 3.1 若要让命中率变成 100%，路径是 server 给历史 assistant 补 `thinking_start`。这等于
-  改写客户端给出的历史，未评估对 35B 与不同 checkpoint 的影响，也未做。
+- 3.1 的 88% 是 2B、48 token 生成、逐轮截断下量的。35B（实际生产模型）未测：拿不到
+  ROG 那台机器时只能在 2B 上验证机制，收益数字要在 35B 上重测。
+- 3.1 的 12% 未命中来自「截断切在多字节字符中间」。真实对话若被 `max_tokens` 从中间截断，
+  同样会断；按字符边界结束则不会。这一条没有修，因为它取决于模型的停止时机。

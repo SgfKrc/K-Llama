@@ -138,6 +138,10 @@ class Chat:
         if not handle:
             raise ChatError(err.value.decode("utf-8", "replace") or "qlh_chat_new failed")
         self._handle: int | None = handle
+        #: What the template opens an assistant turn with, for callers that have to write
+        #: a *historical* assistant message back in the shape the template will render.
+        #: A template is one checkpoint's, so this never changes within a handle.
+        self._thinking_start: str | None = None
 
     @classmethod
     def for_model(cls, model: str | Path, *, dll: str | Path | None = None) -> "Chat":
@@ -182,6 +186,21 @@ class Chat:
                         format=str(out.get("format", "")),
                         supports_thinking=bool(out.get("supports_thinking", False)),
                         thinking_start_tag=str(out.get("thinking_start_tag", "")))
+
+    def thinking_start(self) -> str:
+        """The marker an assistant turn opens with, e.g. ``<think>``.
+
+        Templates are asymmetric: the generation prompt opens the assistant turn with this
+        marker, but a *historical* assistant message renders without it. A conversation
+        re-rendered from history therefore diverges from the KV exactly at the assistant
+        header -- which is the one place prefix reuse has to match. Cached because it is a
+        property of the template, not of the request.
+        """
+        if self._thinking_start is None:
+            probe = self.render([{"role": "user", "content": ""}],
+                                add_generation_prompt=True)
+            self._thinking_start = probe.thinking_start_tag
+        return self._thinking_start
 
     def parse(self, text: str, *, partial: bool = True) -> dict:
         """Parse the **whole accumulated** answer text into a message plus the new diffs.

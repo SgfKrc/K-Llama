@@ -131,6 +131,9 @@ class Chain:
         self._lock = threading.Lock()
         self._clients: list[StageClient] = []
         self._procs: list[tuple] = []
+        #: Token ids the KV holds, position by position. Empty whenever that cannot be
+        #: stated with certainty, which is the signal to replay the whole prompt.
+        self._kv_tokens: list[int] = []
         self.ready = False
 
     @property
@@ -204,6 +207,56 @@ class Chain:
         already too big to bother measuring precisely."""
         return int(self._ctx)
 
+    @property
+    def kv_ledger_size(self) -> int:
+        """How many positions the reuse ledger claims. 0 means the next request replays."""
+        return len(self._kv_tokens)
+
+    def _reusable(self, prompt_ids: list[int]) -> int:
+        """How many leading positions the KV already holds for this prompt, or -1.
+
+        -1 means "cannot continue". Two ways to get there, both silent-wrong-context bugs
+        if ignored: the ids diverge (the template rendered the previous answer differently
+        this time), or the KV holds *more* than this prompt's prefix -- trimming that tail
+        needs a rollback depth the hybrid recurrent layers only have up to 64 positions,
+        which a whole generated answer exceeds.
+
+        No ledger means no knowledge of the KV, so it returns -1 too: every
+        non-continuation then goes through a reset, which is both cleanup and liveness
+        check.
+        """
+        held = self._kv_tokens
+        if not held:
+            return -1
+        common = 0
+        for old, new in zip(held, prompt_ids):
+            if old != new:
+                return -1
+            common += 1
+        if len(held) > len(prompt_ids):
+            return -1
+        return common
+
+    def _remember(self, prompt_ids: list[int], generated: list[int],
+                  stats: dict | None, spec: dict) -> None:
+        """Record what the KV holds now, or drop the ledger when that cannot be known.
+
+        A slow turn is visible; a ledger that disagrees with the KV is not. So every doubt
+        clears it and the next request replays.
+        """
+        if stats is None or spec.get("active") or stats.get("kv_tail"):
+            # Speculation leaves block positions the ledger cannot describe, and `kv_tail`
+            # says exactly that happened.
+            self._kv_tokens = []
+            return
+        ids = list(prompt_ids) + list(generated)
+        if stats.get("pending") is not None:
+            ids = ids[:-1]       # emitted, but the forward that places it never ran
+        if int(stats.get("n_past", -1)) != len(ids):
+            self._kv_tokens = []
+            return
+        self._kv_tokens = ids
+
     def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None,
                  stats: dict | None = None):
         """Yield Chunk, serialised under the chain lock.
@@ -226,16 +279,21 @@ class Chain:
         with self._lock:
             if not self._clients:
                 raise RuntimeError("chain has no stages")
-            # Reset first, because it is also the liveness check: the worker drops a
-            # session after a minute of silence, and `reset()` reconnects when it finds
-            # the old socket dead. Everything after this would otherwise run into the
-            # same closed socket.
-            for client in self._clients:
-                client.reset()
+            # Tokenizing first is what makes continuing possible: it is also the liveness
+            # check, because the worker drops an idle session and `tokenize` reconnects
+            # when it finds the socket dead. Resetting unconditionally here would throw
+            # away the very KV this request came to reuse.
+            prompt_ids = self._clients[0].tokenize(prompt)
+            reuse = self._reusable(prompt_ids)
+            if reuse < 0:
+                for client in self._clients:
+                    client.reset()
+                self._kv_tokens = []
+                reuse = 0
             # Refuse a request that cannot fit before generating anything. An overrun does
             # not fail cleanly: llama_decode returns rc=-1 partway through the answer, and
-            # the client sees a truncated stream rather than a rejected request.
-            prompt_ids = self._clients[0].tokenize(prompt)
+            # the client sees a truncated stream rather than a rejected request. Measured
+            # on the whole prompt: reused positions still occupy the KV.
             if why := context_shortfall(len(prompt_ids), max_tokens, self._ctx):
                 raise ContextOverflow(why)
             greedy = config.is_greedy(sampling)
@@ -250,6 +308,7 @@ class Chain:
             spec = self.spec_plan(sampling)
             if stats is not None:
                 stats["speculation"] = spec
+                stats["reused_tokens"] = reuse
             spec_sampling = None
             if not greedy and spec["active"]:
                 # Temperature-only by construction (spec_plan refused everything else), so
@@ -258,15 +317,29 @@ class Chain:
                     "temperature": float((sampling or {}).get("temperature", 1.0)),
                     "rng": np.random.default_rng((sampling or {}).get("seed")),
                 }
-            yield from generate_stream(
-                self._clients, prompt, max_tokens=max_tokens,
-                spec_k=self._spec_k if spec["active"] else 0,
-                dflash_path=self._dflash if (spec["active"] and greedy) else "",
-                dflash_block=self._dflash_block,
-                cascade_mtp=self._cascade_mtp,
-                sampling=spec_sampling,
-                stats=stats,
-            )
+            generated: list[int] = []
+            try:
+                for chunk in generate_stream(
+                    self._clients, prompt, max_tokens=max_tokens,
+                    spec_k=self._spec_k if spec["active"] else 0,
+                    dflash_path=self._dflash if (spec["active"] and greedy) else "",
+                    dflash_block=self._dflash_block,
+                    cascade_mtp=self._cascade_mtp,
+                    sampling=spec_sampling,
+                    prefix_ids=prompt_ids[reuse:], n_past=reuse,
+                    stats=stats,
+                ):
+                    if chunk.token >= 0:
+                        generated.append(chunk.token)
+                    yield chunk
+            finally:
+                # A caller that walks away mid-answer still leaves a KV behind, and the
+                # loop writes its settled position into `stats` whatever happens.
+                self._remember(prompt_ids, generated, stats, spec)
+                if stats is not None:
+                    # Usage is the whole prompt: the reused part still cost the client
+                    # those tokens to produce.
+                    stats["prompt_tokens"] = len(prompt_ids)
 
     def drain(self, prompt: str, max_tokens: int, sampling: dict | None,
               sink=None):
@@ -380,6 +453,41 @@ def normalize_tool_call_arguments(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _close_assistant_turn(renderer, turns: list[dict]) -> list[dict]:
+    """Give the last assistant turn the marker the template opens one with.
+
+    Templates are asymmetric: the *generation* prompt opens the assistant turn with
+    ``thinking_start`` (``<think>``), while a **historical** assistant message renders as
+    ``assistant header + trim(content)`` and gets no marker. A conversation re-rendered
+    from the client's history therefore diverges from the KV exactly at the assistant
+    header -- the one place prefix reuse has to match.
+
+    `chat.Conversation` has always bridged this by writing the marker into the content it
+    hands back (`chat.py:294`), with a leading space because the template trims it. A
+    server whose history comes from the client has to do the same, or every turn replays
+    in full. Only the last turn is touched: earlier ones sit inside the KV's prefix either
+    way, and rewriting them would change a transcript the client already displayed.
+
+    Measured before this existed: the common prefix stopped at the assistant header
+    (13 of 78 tokens on turn 2), so reuse was 0% on every turn.
+    """
+    marker = renderer.thinking_start()
+    if not marker:
+        return turns
+    out = None
+    for i, turn in enumerate(turns):
+        if turn.get("role") != "assistant":
+            continue
+        content = turn.get("content")
+        # A tool-call turn carries its payload in `tool_calls` and has no text to mark.
+        if not isinstance(content, str) or content.startswith(marker):
+            continue
+        if out is None:
+            out = list(turns)
+        out[i] = dict(turn, content=f" {marker}\n{content}")
+    return turns if out is None else out
+
+
 def render_messages(renderer, messages: list[dict], *, tools=None, tool_choice=None,
                     parallel_tool_calls=None):
     """Render a request's messages through an already-open handle.
@@ -387,6 +495,10 @@ def render_messages(renderer, messages: list[dict], *, tools=None, tool_choice=N
     This is the only prompt builder: the streaming chat path, the non-streaming one and
     `/v1/responses` all call it, so `test_contract`'s "no root Python file may spell the
     ChatML markers" cannot be bypassed by a second renderer.
+
+    The last assistant turn gets the template's thinking marker before rendering, so that
+    re-rendering a conversation from history produces the same bytes the previous round
+    left in the KV. Without it every turn is a full replay (see `_close_assistant_turn`).
 
     `tools` and `tool_choice` go through untouched -- the template decides how they read,
     and an empty tool list means "no tools", the same as OpenAI. `parallel_tool_calls` is
@@ -398,7 +510,8 @@ def render_messages(renderer, messages: list[dict], *, tools=None, tool_choice=N
     system, turns = merge_system(messages)
     if system is not None:
         turns = [{"role": "system", "content": system}, *turns]
-    return renderer.render(normalize_tool_call_arguments(turns), tools=tools,
+    turns = _close_assistant_turn(renderer, normalize_tool_call_arguments(turns))
+    return renderer.render(turns, tools=tools,
                            tool_choice=tool_choice,
                            parallel_tool_calls=parallel_tool_calls)
 
@@ -713,6 +826,10 @@ class Handler(BaseHTTPRequestHandler):
             # they did not. A sampled request that also asked for top_k/top_p degrades
             # to plain decode; without this field that slowdown would be invisible.
             "speculation": drain_stats.get("speculation"),
+            # How much of this prompt the KV already held. Without it, "the answer got
+            # faster" and "prefix reuse works" cannot be told apart.
+            "reused_prompt_tokens": drain_stats.get("reused_tokens", 0),
+            "kv_ledger": self.chain.kv_ledger_size,
         }
         if parse_error:
             # A tool_calls-shaped answer that could not be parsed is not a 500: the text
@@ -840,7 +957,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             finish = "length" if tokens >= max_tokens else "stop"
         closing = {"sampling": self.chain.sampling_state(),
-                   "speculation": drain_stats.get("speculation")}
+                   "speculation": drain_stats.get("speculation"),
+                   "reused_prompt_tokens": drain_stats.get("reused_tokens", 0),
+                   "kv_ledger": self.chain.kv_ledger_size}
         if parse_error:
             closing["parse_error"] = parse_error
         sse({"id": cid, "object": "chat.completion.chunk", "created": created,

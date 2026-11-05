@@ -26,6 +26,9 @@ class StubRenderer:
         self.calls.append({"messages": messages, **kwargs})
         return type("Rendered", (), {"prompt": "PROMPT"})()
 
+    def thinking_start(self) -> str:
+        return "<think>"
+
 
 def assistant_with(arguments) -> dict:
     return {"role": "assistant", "content": "", "tool_calls": [
@@ -341,6 +344,52 @@ class FakeChain:
 
     def sampling_state(self):
         return {}
+
+
+class AssistantTurnClosing(unittest.TestCase):
+    """The last assistant turn has to be rendered in the shape the template wrote it.
+
+    Qwen-style templates open the generation prompt with `<think>` but render a historical
+    assistant message without it, so a conversation re-rendered from history diverges from
+    the KV at the assistant header. Measured before this existed: reuse was 0% on every
+    turn because the common prefix stopped at that header.
+    """
+
+    def render(self, messages):
+        renderer = StubRenderer()
+        server.render_messages(renderer, messages)
+        return renderer.calls[-1]["messages"]
+
+    def test_the_last_assistant_turn_gets_the_marker(self):
+        turns = self.render([{"role": "user", "content": "问"},
+                             {"role": "assistant", "content": "答"}])
+        self.assertEqual(" <think>\n答", turns[-1]["content"])
+
+    def test_a_marker_already_present_is_not_doubled(self):
+        turns = self.render([{"role": "user", "content": "问"},
+                             {"role": "assistant", "content": "<think>\n答"}])
+        self.assertEqual("<think>\n答", turns[-1]["content"])
+
+    def test_a_history_turn_is_marked_even_when_the_request_ends_in_user(self):
+        # The interesting case: every real follow-up ends in a user turn, so the assistant
+        # message needing the marker is never the last one.
+        turns = self.render([{"role": "user", "content": "问"},
+                             {"role": "assistant", "content": "答"},
+                             {"role": "user", "content": "再问"}])
+        self.assertEqual(" <think>\n答", turns[1]["content"])
+
+    def test_an_assistant_turn_carrying_tool_calls_is_left_alone(self):
+        turns = self.render([{"role": "user", "content": "问"},
+                             {"role": "assistant", "content": None, "tool_calls": [
+                                 {"id": "c", "type": "function",
+                                  "function": {"name": "f", "arguments": "{}"}}]}])
+        self.assertIsNone(turns[-1]["content"])
+
+    def test_the_input_messages_are_not_mutated(self):
+        messages = [{"role": "user", "content": "问"},
+                    {"role": "assistant", "content": "答"}]
+        server.render_messages(StubRenderer(), messages)
+        self.assertEqual("答", messages[-1]["content"])
 
 
 if __name__ == "__main__":
