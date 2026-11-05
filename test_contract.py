@@ -221,7 +221,11 @@ class SingleSourceOfTruth(unittest.TestCase):
         for name in ("server.py", "proto_responses.py"):
             for i, line in enumerate(_read(name).splitlines(), 1):
                 code = line.split("#", 1)[0]
-                if "len(prompt)" in code:
+                # `rendered_chars` is a character count on purpose -- it exists to say
+                # "this request was enormous" when a token count alone cannot tell the
+                # client whether the messages or the tool definitions did it. Anything
+                # else spelled len(prompt) is still the bug this guards.
+                if "len(prompt)" in code and "rendered_chars" not in code:
                     offenders.append(f"{name}:{i}: {line.strip()}")
         self.assertEqual([], offenders,
                          "prompt_tokens must come from generate_stream's stats, not len(): %s"

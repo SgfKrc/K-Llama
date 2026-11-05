@@ -198,6 +198,12 @@ class Chain:
         why = config.sampled_spec_problem(temperature, top_k, top_p, extra)
         return {"requested": True, "active": not why, "reason": why}
 
+    @property
+    def ctx(self) -> int:
+        """The KV window every stage was loaded with. Used to judge whether a request is
+        already too big to bother measuring precisely."""
+        return int(self._ctx)
+
     def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None,
                  stats: dict | None = None):
         """Yield Chunk, serialised under the chain lock.
@@ -615,6 +621,7 @@ class Handler(BaseHTTPRequestHandler):
                 # A request that does not fit is the one case where the server knows the
                 # client built something enormous and the client only ever sees a token
                 # count. Record what actually arrived, and echo it back with the refusal.
+                rendered_chars = len(prompt)
                 self._shape = {
                     "messages": len(messages),
                     # Characters in what the client sent, not in the rendered prompt and
@@ -622,7 +629,23 @@ class Handler(BaseHTTPRequestHandler):
                     # this request" when it gets refused for being too big.
                     "prompt_chars": sum(len(str(m.get("content") or ""))
                                         for m in messages),
-                    "tools": len(tools or [])}
+                    "tools": len(tools or []),
+                    # Characters the template actually produced. A client cannot tell a
+                    # long transcript from 96 tool definitions by the token count alone,
+                    # and on DSH it was the tools: 7 messages of 14.5k characters became
+                    # 158k tokens.
+                    "rendered_chars": rendered_chars}
+                if tools and rendered_chars > self.chain.ctx * 4:
+                    # Only when the request is already far too big: rendering it a second
+                    # time without the tool definitions is what separates "the tools did
+                    # this" from "the conversation did this", and it costs a template
+                    # pass nobody needs on a request that fits.
+                    try:
+                        bare = render_messages(renderer, messages).prompt
+                    except (ChatError, ValueError):
+                        pass
+                    else:
+                        self._shape["tool_chars"] = rendered_chars - len(bare)
                 sys.stderr.write("[req] messages=%d prompt_chars=%d tools=%d max_tokens=%d\n"
                                  % (self._shape["messages"], self._shape["prompt_chars"],
                                     self._shape["tools"], max_tokens))
