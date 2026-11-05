@@ -1,23 +1,189 @@
-# K-Llama v2
+# K-Llama v2.1
 
 **中文** | [English](docs/README.en.md)
 
-> 状态：**可用**。三种形态都跑通并做过长跑验证——本机两段 20.9 tok/s、两台弱设备 6.50 tok/s、
-> 三段跨公网 5.00 tok/s；三段连跑 60 轮 `gen 256` 零异常。绿色包能从零部署并在包内直接出
-> token（三次独立演练）。唯一没验证过的形态是**全新 Windows 装机**，见
-> [`docs/DELIVERY.md`](docs/DELIVERY.md) §1.2。
+> 状态：**现行**
+> 更新日期：2026-11-08
+> 能力状态：**可用**。`build-split/verify.sh` 九组 25 项全过，判据全是逐位 / 逐字节的 logits
+> 对比，不比生成的文字。架构限定 qwen3.5 系（`qwen35` / `qwen35moe`）；远程链单序列。没验过的
+> 那一处（多模态图像输入）写在边界里，不打包成结论。跨机投机自 2026-11-08 起是五类真实 prompt
+> 的实测：中位约 **+6%**（+8.4% ~ −1.2%），弱机器与回环上是负的，判据也不是「与不投机一致」。
 
-面向**非整模加载**的定制 llama.cpp 引擎。整模文件留在原地，每个节点只把属于自己那几层
-读进内存，段间只传 hidden state（`n_embd` 个 float32，8 KB）。
+v2.1 是一次**下沉式深度改造**。上一代 v2 是浅层改造：Python 驱动 + 多进程协议，llama.cpp
+只当哑计算。这一代把分段链做进 `llama_context`——`llama-server` 自己就是链的驱动者，它不
+需要知道段在哪台机器上，`/completion`、`/chat/completions`、slot、prompt cache 照常工作。
+目标是：在限定的 qwen3.5 系架构上（`qwen35` / `qwen35moe`，主力是 MoE 那一支），
+**llama.cpp 该有的都有**。
 
-Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB）在两台机器上分成 32 + 8 层：本机背 32 层、
-注意力与 dense 全上卡，远端背 8 层纯 CPU。解码阶段 **20.9 tok/s**（DFlash k=5），
-同一个模型在本机单卡整模只有 10.5 tok/s。
+一句话的分工：**v2 解决「模型怎么摊到多台机器上」，v2.1 解决「摊开之后能力还得跟整模一样」**。
 
-**机制怎么成立的**：每个节点都持有同一份整模，加载时只创建、只读取属于自己那几层的张量——
-三层机制是层数覆盖（`LLAMA_LAYER_RANGE`）、名字重映射（本地 `blk.i` → 源 `blk.lo+i`）、
-全局张量按需 lazy。接力向量取 `output_norm` 之前的值，段间只传 8 KB hidden。
-全文见 **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**。
+---
+
+## 两代的分野
+
+| | v2（浅层改造） | v2.1（下沉） |
+| --- | --- | --- |
+| 改造层次 | Python 驱动 + 多进程协议，llama.cpp 只当哑计算 | 下沉到 `llama_context`；`llama-server` 原生支持 |
+| 能用什么接口 | 自定义 chat 引擎（`chain_client.py`） | `llama-server` 的 `/completion`、`/chat/completions`、slot、prompt cache 全套 |
+| 能力范围 | 只有 chat | 多 slot 并发、前缀复用 / checkpoint、MTP 与 DFlash 投机、远程段、KV 管理 |
+
+### v2 的成果（数字都属于 v2）
+
+v2 那条 Python 驱动链还在仓库里（`chain_client.py` / `stage_worker.py` / `stream.py`，
+`koakuma` TUI 是它的入口），它解决的是「分布式 chat 引擎」。下面的数是**它的**，不是 v2.1 的：
+
+| 配置 | 吞吐 | 口径 |
+| --- | ---: | --- |
+| 本机单卡整模 `-ngl 6` | 10.5 tok/s | 端到端 |
+| 跨机两段 + DFlash k=5 | **20.9 tok/s** | 解码阶段、64-token 生成 |
+| 两台弱设备两段（Surface + Y700，纯 CPU） | 6.50 tok/s | 解码阶段、24-token 生成 |
+| 三段跨公网（Tailscale） | 5.00 tok/s | 解码阶段、24-token 生成 |
+
+三段形态连跑 60 轮 `gen 256` 零异常。跨机比单机快出来的部分是投机挣的，**拆分本身是负
+收益**（同一块显存摊给两段比单进程慢）。口径见 [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md)、
+[`docs/SPECULATION.md`](docs/SPECULATION.md) §11。
+
+v2.1 不给吞吐对标：本机的 `build-split` 是纯 CPU 构建（启动即打印 `no usable GPU found`，
+全部 `-ngl 0`），而双进程又测不出投机收益（见边界⑤）。这一代可比的数字有三个——前缀复用
+（3103 token 的历史整段重算 19847 ms，第二轮只解 38 个新 token 是 **714 ms**）、跨机 decode 的
+候选回传（每 token 352 B）、跨机投机（ROG 五类 prompt 上 MTP k=2 中位 **+6%**，区间
+**+8.4% ~ −1.2%**）。口径：
+[`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §1 / §8 / §9。
+
+---
+
+## v2.1 的能力
+
+七项，每条都在验收里实测过：
+
+| 能力 | 一句 | 怎么验的 |
+| --- | --- | --- |
+| 多 slot 并发 | `-np 4` 四并发的输出与串行**逐字节相同** | `verify.sh` 组 5、`accept_np.py --np 2` |
+| 前缀复用 | chat 重渲染场景下，3103 token 历史第一轮 19847 ms，第二轮只解 38 个新 token、**714 ms** | `verify.sh` 链上 checkpoint、`reuselong` 日志 |
+| MTP 投机 | 链上 draft 与整模 draft 的 logits **248320 维逐位相同** | `verify.sh` 组 8（链上 MTP） |
+| DFlash | 8 个 `target_layers` 跨两段（head 6 + tail 2），单 ubatch 下 8 路 tap 与整模**逐位相同** | `verify.sh` 组 9（`dflash-taps` 目标） |
+| 远程链 | `--split-remote host:port`；KV 广播、checkpoint 覆盖全链、120 s 超时；身份握手；decode 每 token 回 40 个候选而不再回整行 logits；链死后可自愈 | `verify.sh` 组 6 / 7；链路死亡与自愈走 `verify_chain_death.py` |
+| 远程链的投机 | 协议 v7 让 tail 对验证帧每行回一个 argmax（单帧 993,312 B → 48 B），协议 v8 把 MTP draft 下沉到 tail；**能做**，但收益随负载从 +8.4% 到 −1.2%，弱机器与回环上是负的 | `verify_mtp.sh` / `verify_mtp_e2e.sh`；数据见 [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §9 |
+| 段的内存 | tail 的 logits 缓冲 1710.76 MiB → **3.79 MiB**；远程 stage 的 CPU compute buffer 2052.10 → **240.09 MiB** | 同一 ubatch 的 prefill 172.6 → 219.4 t/s |
+
+前两项的收益不来自跨机往返，所以在单机上测也是真的。MTP / DFlash 两行说明**正确性**；
+加速比只能按部署形态报：本机双进程测不出来（边界⑤），ROG 跨机五类 prompt 中位 +6%、区间
++8.4% ~ −1.2%，Surface 上是 −40%（§9）。
+
+---
+
+## 代码在哪
+
+- llama.cpp fork：单提交 `c5bd787b`，父提交 `e0f142d`，树 `f455ed79`，**55 文件 / +16216 −229**。
+- 主补丁 [`docs/llamacpp-split.patch`](docs/llamacpp-split.patch)：**45 个文件、+12672 −228、14557 行、
+  748.9 KiB**——纯分段链（层范围加载 + 本地/远程段 + 聚合 memory + checkpoint + 协议 v7/v8 的
+  投机通道 + grammar / rbudget 的兼容路径 + `seq_rm` 失败显式化），**不含 SLIM-ARC**。它能单独
+  编译、单独通过全部验收。
+- 可选增量 [`docs/llamacpp-slimarc.patch`](docs/llamacpp-slimarc.patch)：13 个文件、+3544 −1、
+  3662 行、155.2 KiB——SLIM-ARC prefetch，默认关闭（`SLIM_ARC_PREFETCH=1` 才装）。不需要预取
+  就不必应用它。
+- 可重放：`e0f142d` + 主补丁 → 树 `b1646d6d`；再叠增量 → 树 `f455ed79`，与 fork HEAD 逐字节
+  相同（`git write-tree` 校验）。叠加顺序就是先主补丁、后增量。
+- 主仓库分支 `slimarc/segmented`，已推送。
+
+机制怎么成立的（层范围进 `llama_model_params`、段间传 `n_embd` 个 float、隐藏态在
+`output_norm` 之前交接）见 [`docs/PATCHES.md`](docs/PATCHES.md) 第四代与
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+
+---
+
+## 怎么跑
+
+本地两段（tail 在同一进程里，最省事）：
+
+```powershell
+llama-server -m model.gguf --split-layer-range 0:32 --split-tail-range 32:40 -c 8192 -np 4
+```
+
+远程链：head 那台起 `llama-server`，其余每台起一个 `split-stage`，每个进程只加载自己那段。
+
+```powershell
+# 远端 relay：源层 24:32，只出 hidden
+split-stage -m model.gguf --layer-range 24:32 --role relay --rs-seq 8 -c 8192 --host 0.0.0.0 --port 9331
+
+# 远端 tail：源层 32:40（必须到末层），出 logits
+split-stage -m model.gguf --layer-range 32:40 --role tail --rs-seq 8 -c 8192 --host 0.0.0.0 --port 9332
+
+# 链首：本机加载 0:24，远程段按链序列出
+llama-server -m model.gguf --split-layer-range 0:24 -c 8192 `
+  --split-remote 10.0.0.2:9331 --split-remote 10.0.0.3:9332
+```
+
+三个参数的分工：`--split-layer-range` 是**本进程**加载的层，链首必然是它；`--split-tail-range`
+是同机尾段；`--split-remote` 可重复、按链序，与 `--split-tail-range` 互斥。`split-stage` 的
+`--role` 与 `--rs-seq` 都必填——角色原来是从本地层数猜的，猜错不报错，只是答案错。链首的
+`--split-rs-seq` 默认 0 也能服务；只在开投机时要抬高下限（一轮要回滚 `n_max` 个位置）。
+
+远程链开投机（贪心，`k` 用 `--draft-max`；**tail 段必须在 `OP_HELLO` 里报 `has_nextn`**）：
+
+```powershell
+# tail 端照常起，不要加额外参数；它的 NextN 头就是 draft，k 步递归在 stage 内部跑。
+# 弱机器（4C8T 之类）要把线程显式抬高：-t 同时设 n_threads 与 n_threads_batch，
+# 两者默认都是 4、不会自动跟随；只设 n_threads 拿不到收益。
+split-stage -m model.gguf --layer-range 32:40 --role tail --rs-seq 8 -c 8192 -t 8 --port 9332
+
+# 链首：--spec-type draft-mtp + --draft-max 2。收益中位约 +6%（+8.4% ~ −1.2%），
+# JSON 负载与弱机器上是负的，别按「快 15%」规划。
+llama-server -m model.gguf --split-layer-range 0:32 -c 8192 `
+  --split-remote 10.0.0.3:9332 --spec-type draft-mtp --draft-max 2
+```
+
+tail 报不出 `has_nextn`（模型没有 NextN 块、范围不到末层、或 MTP context 建不起来）时，server
+打一行 WARN 并把 draft-mtp 从类型表里摘掉——链照常服务，只是不投机；同一次请求里其它投机类型
+（如 `ngram-simple`）不受影响。**别用 ngram 测跨机收益**：它的接受率取决于 prompt 的重复性，
+真实负载上常常一个 draft 都提不出来（`SEGMENTED-LIMITS.md` §2.2 有反例）。
+
+单独跑 `--split-layer-range` 的两道误配都在加载后、建上下文前被拒：范围在模型中间结束、又没给
+后续段（`0:20` 这种缺尾巴）；以及范围不从 0 开始（`20:24` 加载了输出头、会返回 200，但前 20
+层从没算过——纯乱码）。第二道只能靠一个内部标记区分「用户手打」与「server 内部加载尾段」：
+`common_params::split_range_is_stage`，判据读的是从模型读回的层范围，所以 `LLAMA_LAYER_RANGE`
+那条入口也一起覆盖。残留边界是「标记由谁置真」而不是「范围是否合法」，见
+[`docs/SEGMENTED-LIMITS.md`](docs/SEGMENTED-LIMITS.md) §2.6。
+
+---
+
+## 边界（六条）
+
+1. **架构限定。** `embeddings_pre_norm` 只覆盖 `qwen35` / `qwen35moe` 两个架构（`src/models/`
+   下 171 个模型实现文件里的 2 个）。别的架构建链时**直接拒绝**，不是静默降级——静默拿到
+   post-norm 向量会让下一段多 norm 一次，输出通顺但数值偏移。
+2. **远程链是单序列。** 这是设计决定，不是缺口：要并发就在 head 那台起多个 server、各走自己
+   的链，或者改用本地链（本地链 `-np 4` 已验证逐字节相同）。
+3. **远程链的投机能做，但收益随负载从 +8.4% 到 −1.2%。** 协议 v7 让 tail 对验证帧的每一行回
+   一个 argmax（一帧 k+1 行是 4(k+1) 字节，单帧回复从 993,312 B 降到 48 B），协议 v8 又把 MTP
+   draft 下沉到 tail（`OP_MTP_DRAFT`）；grammar 与 reasoning budget 各有一条兼容路径（前者被拒
+   就**整帧回退**，后者预算耗尽只收紧不放宽）。ROG 五类 prompt 上 MTP k=2 是 **+3.6% / +8.4% /
+   −1.2% / +1.5% / +10.5%**，中位约 +6%；Surface 上 **−40%**，本机回环带 grammar 也是负的。
+   **采样式投机仍不做**——rejection 要比两边完整分布。**判据也不是「与不投机逐字节相同」**：
+   llama.cpp 在 CPU + 量化上不承诺 batch invariance（上游把确定性限定在 RMSNorm 与 CUDA 的
+   MatMul/Attention），所以判据是「无回退时与**整模投机**逐字节相同」。详见
+   [`docs/SEGMENTED-LIMITS.md`](docs/SEGMENTED-LIMITS.md) §2.2。
+4. **多模态没有端到端验证。** 4 个 M-RoPE section 跨段传递的代码在（`split_expand_pos`），但
+   图像输入的端到端从未跑过——「图像位置能传」目前是代码级结论。出处与未验范围见
+   [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §7 末尾。
+5. **投机加速比只能按部署形态看。** 本机双进程 head↔tail 走内存、没有跨机往返可省，测出来的
+   0.6–0.9× 是退化配置的数——**不要把它当结论**，但也别反推「多机一定赚」。跨机五类 prompt
+   实测（ROG，LAN，协议 v8）：中位 **+6%**，区间 +8.4% ~ −1.2%；弱机器（Surface）**−40%**，
+   回环带 grammar 也是负的。在 27-token 的高确定任务上 k=1/2/3 分别是 10.11/10.20/9.76 tok/s
+   ——k≥3 变宽后代价几乎全在 head（32 层），所以甜点随切点走、换链就要重测。见
+   [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §9。
+6. **核显要用就全量 offload。** 单卡隔离后实测（Iris Xe、`GGML_VK_VISIBLE_DEVICES=0`、
+   `-ngl 99`）：prefill 长 prompt **2.5–3.2×**、decode **+5~9%**；而 `-ngl 0`（加载了后端
+   却一层不上）反而比纯 CPU 慢 41%，中间值也一律更差。**交叉点在 pp≈32–64**，短 prompt 的
+   prefill 是核显唯一输的地方。35B（20.8 GiB）装不进共享堆（~15.4 GiB），所以本项目 35B
+   主线仍只用纯 CPU；机制见 [`docs/IGPU-SLOWDOWN.md`](docs/IGPU-SLOWDOWN.md)。
+
+完整版在 [`docs/SEGMENTED-LIMITS.md`](docs/SEGMENTED-LIMITS.md)，那里面写的是「为什么不修」和
+「修的时候要付什么代价」，不是 TODO。六条之外还有一条 2026-11-08 补的：上游 hybrid 的 partial
+`seq_rm` 在 server 默认配置（`n_rs_seq = 0`）下**永远失败**且 attention KV 一行都不删（上游
+open PR #28007 / issue #31656），本仓只做「失败可见 + 五个调用点各自降级」，见该文 §2.9。
+六条有个共同形状：**都不报错，只算错或悄悄退化**。所以验收比 logits 不比生成的文字（argmax
+一致经常是巧合），跨 ubatch 的逐位对比还会假阳性。
 
 ---
 
@@ -41,10 +207,12 @@ decode 0.08 → 0.43 tok/s。
 | 交叉代价 | 8 KB hidden 过网络 | 缺页读盘 |
 | 形态 | 多进程 + TCP | 单进程 + 页级调度 |
 
-借用的只有它的 **prefetch 模块**——按层边界预读，把随机缺页变成顺序读。已编译进
-`llama.dll` 并做了 win32 移植；它的专家驻留、KV 驱逐、统一 I/O 调度器、on-demand
-加载器都没有接。触发条件见 [`docs/SLIM-ARC-接入计划.md`](docs/SLIM-ARC-接入计划.md)，
-接入形态见 [`docs/PATCHES.md`](docs/PATCHES.md)。
+借用的只有它的 **prefetch 模块**——按层边界预读，把随机缺页变成顺序读。它以**可选增量补丁**
+的形式存在（[`docs/llamacpp-slimarc.patch`](docs/llamacpp-slimarc.patch)，`SLIM_ARC_PREFETCH=1`
+才装调度器），主补丁 [`docs/llamacpp-split.patch`](docs/llamacpp-split.patch) 不含它；已做
+win32 移植。它的专家驻留、KV 驱逐、统一 I/O 调度器、on-demand 加载器都没有接。触发条件见
+[`docs/SLIM-ARC-接入计划.md`](docs/SLIM-ARC-接入计划.md)，接入形态见
+[`docs/PATCHES.md`](docs/PATCHES.md)。
 
 ---
 
@@ -55,138 +223,10 @@ decode 0.08 → 0.43 tok/s。
 「让某一段在别处执行」的入口；这边要从无到有造出段机制（改写 `block_count`、注入 hidden、
 接管解码循环），这是两者的工作量差别所在。
 
-代价方向相反：扩散的段间载荷是 `[4096, 267]` 的 F32 张量（4～64 MiB），LLM 这边是 8 KB
-hidden。但**同一条序列内部，两边都不能流水**——扩散每步要等所有段算完，LLM 的相邻 token
-之间是纯因果依赖（`t_{p+1}` 由尾段产出，头段才可能算下一步）。真正的吞吐空间在**多请求**：
-不同序列互不依赖，三条同时在飞能把合计吞吐从 `1/Σ` 推到 `1/max`（上限约 2.6 倍，单 token
-延迟不降）。当前都不支持，见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §11。
-
----
-
-## 这套东西的价值在哪
-
-拆分的用处在单机装不下的时候：那时两台机器的资源是相加的，而不是共享一块显存。
-
-但**拆分本身是负收益**——同一块显存分摊给两段，比单进程慢。跨机之后快出来的部分是
-投机解码挣的，与拆分无关：
-
-| 环节 | 手段 | 解码阶段吞吐 |
-| --- | --- | ---: |
-| 无投机 | 每步 1 token、一次绕链 | 12.2 |
-| MTP 递归 | k=2，草稿在末段的 NextN 头 | 1.13× |
-| **DFlash 并行块** | k=5，一次出 6 个候选、一轮验证 | **20.9** |
-
-口径与写满 128 token 时的衰减见 [`docs/SPECULATION.md`](docs/SPECULATION.md) §11。
-
----
-
-## 适用范围
-
-- **架构**：Qwen 3.5 及以上（`qwen35` / `qwen35moe`）。别的架构要支持，得先补 tensor 命名、
-  RoPE 变体、MTP 位置这几处差异。
-- **量化**：8 bit 以下（Q4_K 这类）。这不只是限制，还是**段间传 float32 就够**的前提：
-  Q4_K 的相对误差约 1e-2，比 float32 传输误差大得多，传输误差落在量化噪声底下。
-- **段数 = 节点数**。同一台机器拆两段是设计错误：每多一个进程就多一份全局张量读取、
-  一块 compute buffer、一轮页竞争。
-
-### 传输 dtype 保持 float32
-
-float16 与 int16 定点都会让贪心输出分叉，判据是**全部 prompt 逐位一致**。三次实验见
-[`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) §8。
-
----
-
-## 快速开始
-
-```powershell
-koakuma                                    # 一条命令进 TUI
-koakuma --topology topology-cross.toml     # 跨机两段
-koakuma --dflash <dflash.gguf>             # TUI 也走投机（默认贪心，k=5）
-
-# 直接跑链路（--spec-k 默认 -1 = 按负载自动选）
-python chain_client.py --topology topology-cross.toml --prompt-text "中国的首都是" --chat --gen 32
-
-# 加 DFlash 并行草稿（k=5 是实测拐点；需要 --greedy）
-python chain_client.py --topology topology-cross.toml --greedy --dflash <dflash.gguf> \
-       --dflash-block 6 --prompt-text "def quicksort(arr):" --gen 64
-```
-
-依赖：`pip install numpy psutil gguf textual`（`gguf` 只有裁切与溯源校验要，`textual` 只有 TUI 要）。
-
-手动三步：编译 shim（`shim\build_shim_msvc.ps1`）→ 每台放同一份整模 →
-拓扑里的 `layer_range` 决定各段拿哪几层。远端 worker 由拓扑的 `start_cmd` 拉起，
-完整流程见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
-
----
-
-## 结构
-
-```
-protocol.py           帧格式与消息编解码
-wire.py               段间 hidden 的传输 dtype（默认 float32）
-topology.py           拓扑解析 + fail-closed 校验
-keep_head.py          同进程的 shim 封装
-keep_head_worker.py   子进程封装（n_gpu_layers=0 必须新进程）
-engine.py             段的加载与前向
-stage_worker.py       单段进程（TCP 服务端）
-chain_client.py       拉起 worker、驱动解码、两个草稿源、内存与显存预算
-stream.py             流式生成与 UTF-8 重组
-server.py             /v1/chat/completions、/v1/models
-proto_responses.py    /v1/responses 的纯翻译层
-koakuma.py            TUI 与启动画面
-checks/               验收（`verify_*`）与诊断脚本
-scripts/              验证探针与跨机驱动
-```
-
-不写行数：这类数字每次重构都会过期，而职责不会。
-
----
-
-## 四条必须知道的约束
-
-**① 段必须精确拼满源模型。** 缺层不会报错，只会输出通顺但错的中文。`topology.load()`
-每次校验区间连续、无重叠、宽度与声明一致。
-
-**② 显存超额是静默的。** WDDM 允许分配超过专用显存，用系统内存兜住，llama.cpp 照旧打印
-`offloaded N/N`。现在启动前预算、加载后实测核对（`chain_client.py` 的 `VRAM_PER_BYTE`）。
-
-**③ 不要绑核。** worker 有 5+ 活动线程，绑到同一物理核的两个超线程上会互相抢占。
-
-**④ 切点和末段层数必须是 `full_attention_interval`（=4）的倍数。** qwen35moe 用本地层号
-推算层类型，而本地层号被映射回源层号，只有 `lo` 是 4 的倍数时两者模 4 同余、类型才对得上。
-`32:38` 这种 6 层划分会在解析阶段被拒绝。
-
----
-
-## 实测数字
-
-Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB 权重），单序列，greedy：
-
-| 配置 | 吞吐 | 口径 |
-| --- | ---: | --- |
-| 本机单卡整模 `-ngl 6` | 10.5 tok/s | 端到端 |
-| 跨机两段 32:40，无投机 | 12.2 tok/s | 解码阶段、128-token 生成 |
-| **跨机两段 + DFlash k=5** | **20.9 tok/s** | 解码阶段、64-token 生成 |
-| 两台弱设备两段 24:40（Surface + Y700，均纯 CPU） | 6.50 tok/s | 解码阶段、24-token 生成 |
-| 三段 0:24 / 24:32 / 32:40（跨公网 Tailscale） | 5.00 tok/s | 解码阶段、24-token 生成 |
-
-跨机比单机快的那部分来自投机，拆分本身是负收益。完整 k 扫描见
-[`docs/SPECULATION.md`](docs/SPECULATION.md) §11；弱设备与三段的切点依据见
-[`docs/THREE-SEGMENT.md`](docs/THREE-SEGMENT.md)。
-
----
-
-## 未做（按本机可验证性排序）
-
-1. **非贪心下投机。** 前置已齐，缺的是接受判据本身：分段不引入误差（2B 测 16 个位置、35B 测 12 个位置 logits 逐位相同、top-8 全重合、TV=0，见 [`docs/DELIVERY.md`](docs/DELIVERY.md) §1.1），logits 回传与探针 `checks/probe_logits_delta.py` 都已就位。现在投机验证比的是「token 相等」，采样要的是拒绝采样——比较两个分布。
-2. **SLIM-ARC 的预取。** 预算恒 0 与层号恒 0 两个 bug 已修（后者改用图节点名后缀），日志确认 40 层全通，但本机实测为负收益：22 GB 模型 / 16 GB 内存落在「抖动区」，预取量与速度严格反比。上游 80B 级模型的「流式区」本机无同体量模型可复现，因此不否定上游结论。见 [`docs/SLIM-ARC-接入计划.md`](docs/SLIM-ARC-接入计划.md) §6.5。
-3. **多序列共享。** 有条件做。`kv_unified` 与 recurrent 隔离**都不是前提**——两条独立对话
-   交替 decode 时每个 token 只属于一个 seq（`kv_unified` 只在「一个 token 属于多条序列」时
-   才是硬要求），recurrent state 本来就是每序列一个 cell。缺的是本仓库三处硬编码：装载时
-   `n_seq_max=1`（`keep_head_worker.py:240`）、token 通道 `seq_id=0`、协议里没有 seq 维度。
-   推荐路径 3~4 人天，买到的是会话共存与前缀复用，**不是吞吐**。见
-   [`docs/ISSUE-multi-sequence.md`](docs/ISSUE-multi-sequence.md)。
-4. **四台及以上。** 拓扑与 supervisor 支持 N 段，三段已跑通；更多段没有实测过。
+代价方向相反：扩散的段间载荷是 MB 级张量，LLM 这边是 `n_embd` 个 float。但**同一条序列
+内部，两边都不能流水**——扩散每步要等所有段算完，LLM 的相邻 token 之间是纯因果依赖
+（`t_{p+1}` 由尾段产出，头段才可能算下一步）。真正的吞吐空间在**多请求**：不同序列互不
+依赖。这条在 v2.1 的本地链上落了地（`-np 4`，逐字节相同）；远程链仍是单序列，见边界②。
 
 ---
 
@@ -195,23 +235,35 @@ Qwen3.6-35B-A3B（MoE，40 层，21.87 GiB 权重），单序列，greedy：
 | 文件 | 讲什么 |
 | --- | --- |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **核心机制**：凭什么非整模加载、硬约束、判据、与 RPC 的分界 |
+| [`docs/PATCHES.md`](docs/PATCHES.md) | 四代补丁的差异（第四代现行：分段链与跨进程）、补丁全文 |
+| [`docs/SEGMENTED-LIMITS.md`](docs/SEGMENTED-LIMITS.md) | **v2.1 的边界**：每条为什么不修、修要付什么代价 |
+| [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) | **v2.1 的实测**：checkpoint、MTP、DFlash、并发、内存、验收覆盖，带日志出处 |
+| [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) | v2 驱动链的全部实测数据 |
+| [`docs/SPECULATION.md`](docs/SPECULATION.md) | 投机判定、成本模型、k 扫描（§11）与接入实测 |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 每台放什么、换分段怎么做 |
-| [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) | 全部实测数据 |
 | [`docs/MEASUREMENT-PITFALLS.md`](docs/MEASUREMENT-PITFALLS.md) | 段内计时为什么骗人 |
 | [`docs/MEMORY-LIMITS.md`](docs/MEMORY-LIMITS.md) | 内存与显存的账怎么算 |
-| [`docs/SPECULATION.md`](docs/SPECULATION.md) | 投机判定、成本模型、k 扫描（§11）与接入实测 |
-| [`docs/PATCHES.md`](docs/PATCHES.md) | 三代补丁的差异、补丁全文、与原生 RPC 的分界 |
 | [`docs/SLIM-ARC-接入计划.md`](docs/SLIM-ARC-接入计划.md) | 缺页优化在什么条件下才启用 |
 | [`docs/LILICORR-轻量头.md`](docs/LILICORR-轻量头.md) | DFlash 的块内一致性重排，以及训练成本 |
 | [`docs/ANDROID-SURFACE-段接入评估.md`](docs/ANDROID-SURFACE-段接入评估.md) | 弱设备接入的条件与安卓侧硬约束 |
+| [`docs/IGPU-SLOWDOWN.md`](docs/IGPU-SLOWDOWN.md) | **为什么核显拖慢**：host buffer 抢占、往返拷贝、共享总线；含 `-ngl` 扫描实测 |
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) · [`docs/TUI.md`](docs/TUI.md) | 采样映射 · TUI 设计 |
 | [`docs/ISSUE-recurrent-snapshot-rollback.md`](docs/ISSUE-recurrent-snapshot-rollback.md) | hybrid 模型跨 ubatch 回滚缺陷与修复 |
 | [`docs/PROGRESS.md`](docs/PROGRESS.md) | 当前能力快照与已做的优化 |
 
-验收：`python checks/verify_*.py`，`python -m unittest test_topology test_contract`。
+验收：`bash build-split/verify.sh`（九组，逐位 / 逐字节）。逐位对照的三个目标是
+`split-smoke`、`split-rows`、`dflash-taps`，组 9 需要 35B + DFlash 权重。
 
-等价性脚本在补丁更新、拓扑变更、shim 重编后跑：`checks/verify_equiv.py`（token 序列 /
-同通道 hidden / 层号 slot）、`checks/verify_cli.py`（llama-server 对照）。
+七个脚本 + 两个 seq_rm 专项，全部独立可重跑：`verify.sh` **25 项**、
+`verify_chain_death.py` **36 项**（链路死亡与自愈，单独跑，约 12 分钟）、`verify_seq_id.py` **7 项**、
+`verify_mtp.sh` **6 项**、`verify_mtp_e2e.sh` **6 项**、`verify_grammar_spec.sh` **22 项**、
+`verify_rbudget_spec.sh` **36 项**；`seq_rm` 专项是 `verify_seq_rm_exact.py --expect-known-fail`
+（A/B/C 三形态，当前 A 两红、B 三绿、C 一绿，退出 0）与 `verify_seq_rm_shared.py`（shared-prefix
+形态，注入不触发时打 `[INFO] injection never fired`）。
+
+v2 驱动链另有：`python checks/verify_*.py`，`python -m unittest test_topology test_contract`，
+`checks/verify_equiv.py`（token 序列 / 同通道 hidden / 层号 slot）、`checks/verify_cli.py`
+（llama-server 对照）。
 
 ---
 

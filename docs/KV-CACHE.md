@@ -3,6 +3,11 @@
 结论先给：**DSH 每轮重放整段前缀，根因不在 KV cache 技术，在 server 每个请求无条件
 reset**。KV 这一层能做的三件事里，只有一件量级正确。
 
+> 本文写的是 **v2 的 `server.py` 驱动链**。v2.1 把链下沉进 `llama_context` 之后，这条根因
+> 已经消失：`llama-server` 的 slot / prompt cache 直接作用于整条链（checkpoint 覆盖全链，
+> 3103 token 历史第二轮只解 38 个新 token）。本文的结论只用于解释 v2 的历史行为，不是
+> v2.1 的现状。
+
 ## 1. 为什么会重放
 
 `server.py:228-229` 每个请求都走一遍
@@ -79,6 +84,10 @@ generation prompt 末尾注入 `<think>`，与历史 assistant 段的渲染不�
 - 并发注意：多个请求共用一把锁串行，不同会话交错会毁掉前缀局部性。
 
 ### 3.2 【可做】让 `seq_rm` 的失败可见（~25 行）
+
+> 这一条说的是 **v2 的 shim / Python 侧**（`qlh_kh_seq_rm` 与 `keep_head_worker`），那里至今没改。
+> v2.1 走了另一条路：`llama-server` 的 `common_memory::seq_rm` / `common_context_seq_rm` 已经
+> 从 `void` 改成 `bool`，五个调用点各自降级——见 [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2.9。
 
 shim 加一个 `qlh_kh_seq_pos_max(handle, seq)` 导出（C 3 行 + `.def` 1 行），
 `keep_head_worker.seq_rm` 改成返回 rc 并核对 `pos_max`；`align()` 从「永远重放」改成

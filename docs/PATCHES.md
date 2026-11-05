@@ -1,17 +1,48 @@
-# 三代补丁，以及与原生 RPC 的分界
+# 四代补丁，以及与原生 RPC 的分界
 
 > 状态：**现行**
-> 更新日期：2026-11-03
-> 适用范围：本项目对 `H:\llamacpp-c` 三代补丁的构成，以及与 llama.cpp 原生 RPC 的分界；读者为内核与部署维护者。
-> 相关：`SLIM-ARC-接入计划.md`（第三代第二级未接的理由）、`CUT-TOOL.md`（裁段工具退场）
+> 更新日期：2026-11-08（终态重导：55 文件 / +16216 −229，tree `f455ed79`）
+> 适用范围：本项目对 `H:\llamacpp-c` 四代补丁的构成，以及与 llama.cpp 原生 RPC 的分界；读者为内核与部署维护者。
+> 相关：`SLIM-ARC-接入计划.md`（第三代第二级未接的理由）、`CUT-TOOL.md`（裁段工具退场）、`SEGMENTED-LIMITS.md`（第四代的已知边界）
 
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在**模型怎么装进显存和内存**：
 第一代靠"裁好的层段工件"，第二代靠"整模 + 层范围"。llama.cpp 侧的补丁因此完全不同。
 
-**补丁全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4014 行）。
-生成方式：`git -C H:\llamacpp-c add -A && git diff --cached --binary HEAD > <patch> && git reset`。
-校验方式：`git apply --reverse --check <patch>` 在打过补丁的树上通过，说明它与工作区
-逐字节对应，可以正向重放。
+**代码现状**：相对基提交 `e0f142d` 共 **55 文件 / +16216 −229**（`git diff --stat`，fork HEAD
+`c5bd787b`，树 `f455ed79`），覆盖本文第一代到第四代的全部改动。这 55 个文件拆成**两个可独立
+应用的补丁**：
+
+| 补丁 | 包含 | 统计 |
+| --- | --- | --- |
+| [`docs/llamacpp-split.patch`](llamacpp-split.patch)（主补丁） | 第一、二、四代：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash 接线、协议 v7 验证通道与 v8 远程 MTP draft、grammar / rbudget 兼容路径、`seq_rm` 失败显式化。**不含任何 SLIM-ARC** | 45 文件 / +12672 −228 / 14557 行 / 748.9 KiB |
+| [`docs/llamacpp-slimarc.patch`](llamacpp-slimarc.patch)（可选增量） | 第三代 SLIM-ARC prefetch：10 个源文件 + 3 个文件里的 6 处钩子（清单见第三代小节） | 13 文件 / +3544 −1 / 3662 行 / 155.2 KiB |
+
+两者是**叠加**关系，主补丁可以单独用：
+
+```bash
+git worktree add /tmp/v1 e0f142d && cd /tmp/v1
+git apply docs/llamacpp-split.patch        # 纯分段，无 SLIM-ARC
+git add -A && git write-tree               # 必须 = b1646d6d（纯分段树）
+git apply docs/llamacpp-slimarc.patch      # 再叠增量，回到完整功能
+git add -A && git write-tree               # 必须 = f455ed79（完整树）
+```
+
+- 只应用主补丁得到的树是 `b1646d6d`：它能独立 `--clean-first` 编译，并独立通过 `verify.sh`
+  25 项与 `verify_chain_death.py` 36 项——没有 SLIM-ARC 不影响分段链的任何一条验收（2026-11-08
+  在只有主补丁的工作树上实测：`PASS=25 FAIL=0` / `PASS=36 FAIL=0`，日志见
+  `.qlh_tmp/pure-split-acceptance/`）。
+- 叠加两个补丁后 `git write-tree` = `f455ed79`（fork HEAD 的树），这是"拆分没有改动任何
+  内容"的唯一判据，比"能 apply"更强。
+- SLIM-ARC 与分段链零耦合：那 10 个文件只 include 彼此和上游 `ggml-backend.h`，不碰本 fork
+  新增的任何头；6 处钩子摘掉后，`llama-context.cpp` / `llama-model-loader.cpp` 的对应片段与
+  `e0f142d` 逐字节相同。
+
+**历史全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4014 行），基提交更早，
+只到第三代；保留它是为了对照第一/二代的实现，不能再正向应用。
+
+fork 侧的历史是**两个提交**：上游 `e0f142d` 加一个 `[QLH-SPLIT]`（`c5bd787b`）。开发期间的
+wip 提交已经 squash 掉；当时记录的 squash 前后 tree 值是 `d628e2a8`，与当前 HEAD 的
+`f455ed79` 不同（差异来自 squash 之后又合入的修复）。这项核对只能当历史记录，不能重放。
 
 ---
 
@@ -73,28 +104,39 @@
 
 ---
 
-## 第三代：SLIM-ARC prefetch（2026-10-31）
+## 第三代：SLIM-ARC prefetch（2026-10-31，现为可选增量）
 
 上游 SLIM-ARC 是给 Linux 写的，本机是 Windows，所以是**带回移植的接入**，只接它两级里的
 第一级（`prefetch`）。第二级（on-demand 加载器）仍未接，理由见
 [`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md)。
 
-新增 5 个源文件：`slim-arc-prefetch.{h,cpp}` 加它依赖的
-`page-range` / `expert-reclaim` / `expert-residency` / `expert-transition`。
-`src/CMakeLists.txt` 用 `SKIP_UNITY_BUILD_INCLUSION` 把它们挡在 unity 批次之外——这批文件带
-`WIN32_LEAN_AND_MEAN` 和 POSIX 名字，混进 unity 会污染同批的翻译单元。
+新增 5 对 / 10 个文件：`slim-arc-prefetch.{h,cpp}`（2085 + 495 行）加它依赖的
+`page-range` / `expert-reclaim` / `expert-residency` / `expert-transition`（各一对 `.h/.cpp`），
+合计 3479 行。这 10 个文件自包含：只 include 彼此和上游 `ggml-backend.h`，不碰本 fork 新增
+的任何头，所以能整块摘下而不牵连分段链。
 
-两个挂点：
+**这一代不在主补丁里**，只存在于 `docs/llamacpp-slimarc.patch`（13 文件 / +3544 −1），叠在
+`docs/llamacpp-split.patch` 之上才回到完整树。6 处钩子（下表按位置归并成 4 行）：
 
-| 文件 | 位置 | 作用 |
+| 文件:行（完整树 `f455ed79`） | 位置 | 作用 |
 | --- | --- | --- |
-| `llama-model-loader.cpp` | `init_mappings()` 末尾 | 把每个权重的 `(mmap 基址 + 偏移, 大小, 层号)` 注册进调度器 |
-| `llama-context.cpp` | `graph_compute()` 调 `sched_graph_compute_async` 之前 | 通知"现在要算第 N 层"，调度器据此预取 N+1..N+window |
+| `src/CMakeLists.txt:50-60` | `LLAMA_SLIMARC_SOURCES` | 注册 5 个 `.cpp`，并用 `SKIP_UNITY_BUILD_INCLUSION` 挡在 unity 批次外——这批文件带 `WIN32_LEAN_AND_MEAN` 和 POSIX 名字，混进 unity 会污染同批的翻译单元 |
+| `src/llama-model-loader.cpp:1587-1615` | `init_mappings()` 末尾 | 只有设了 `SLIM_ARC_PREFETCH` 才构造全局调度器，把每个权重的 `(mmap 基址 + 偏移, 大小, 层号)` 注册进去 |
+| `src/llama-context.cpp:1613-1624` | `process_ubatch()`：`ggml_backend_sched_reset()` 之后 | 调度器在装且 `model.n_gpu_layers() == 0` 时，把 `prefetch_scheduler::eval_cb` 装到 sched 上，用户 `cparams.cb_eval` 串在它里面；否则原样用用户回调（即 `e0f142d` 那一行） |
+| `src/llama-context.cpp:1638-1644` | `process_ubatch()`：`build_graph()` 之后 | `prepare_graph(gf)` 扫一遍新图，记下每层的第一个节点，运行期由 `eval_cb` 在层边界上发预取 |
+
+表里归并后的 4 行覆盖 6 处：`src/CMakeLists.txt` 的 `set(LLAMA_SLIMARC_SOURCES ...)` 与
+`add_library()` 里的 `${LLAMA_SLIMARC_SOURCES}` 各一处，`src/llama-context.cpp:17` 与
+`src/llama-model-loader.cpp:8` 的 `#include "slim-arc-prefetch.h"` 各一处，再加两个 `.cpp`
+里的代码块。摘掉后 `src/llama-context.cpp` 的 `process_ubatch()` 恢复成 `e0f142d` 的
+单行 `ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);`，
+`src/llama-model-loader.cpp` 的 `init_mappings()` 末尾恢复成空行加 `}`——两处都与 `e0f142d` 逐字节相同。
 
 **层号怎么来**：上游从图节点名里读 `blk.N`，在本树里取不到——GGML 的 scheduler 在计算前把
-每个节点重命名成 `node_%d`，真正的张量名留在**操作数**上，所以改成读 `src[0..]` 的名字。
-按上游写法接时 `calls` 恒为 0；改成读 src 后 `calls=5`（3 个 token 各一次通知加上 prefill），
-链路确认通了。
+每个节点重命名成 `node_%d`，真正的张量名留在**操作数**上。本树改成读 `graph_get_cb()` 给每个
+tensor 打的 `-<层号>` 后缀（`ggml_format_name`，上游行为，不是本 fork 新增），`prepare_graph`
+再按"层号只会前进"把名字尾数恰好是数字的节点滤掉。按上游写法接时 `calls` 恒为 0；改成读
+后缀后 `calls=5`（3 个 token 各一次通知加上 prefill），链路确认通了。
 
 win32 移植面（3 个函数 + 1 个锁包装）：
 
@@ -113,7 +155,114 @@ win32 移植面（3 个函数 + 1 个锁包装）：
 
 **当前生效范围**：默认关闭，`SLIM_ARC_PREFETCH=1` 才装调度器。整模在页缓存里时
 `issued` 为 0——它只在"段装不下、真的在读盘"的降级形态里才有事可做，与
-`SLIM-ARC-接入计划.md` 的触发条件一致。
+`SLIM-ARC-接入计划.md` 的触发条件一致。这一代现在只存在于 `docs/llamacpp-slimarc.patch`：
+主补丁不含这 10 个文件，所以不叠增量的构建里连相关符号都不存在。
+
+---
+
+## 第四代（现行）：分段链与跨进程
+
+前三代解决"每台机器只装自己那几层"，第四代解决"这么多段怎么跑成一次推理"。一个
+`llama_context` 成为链的驱动者：本地段输出 pre-norm hidden，后续段（本地或远程）消费
+hidden 继续算，最后一段产 logits。llama-server 的 slot、prompt cache、`seq_rm` 通过聚合
+memory 看到整条链，不需要知道段在哪台机器上。
+
+这一代后来还长出了**远程链的投机**：协议 v7 加了逐行 argmax 的验证通道，v8 把 MTP draft 下沉
+到远程 tail（`OP_MTP_DRAFT`），随后又补了 grammar 与 reasoning budget 两条兼容路径。它们都是
+**增量改协议/加判据**，没有动链的驱动结构——所以在这张表里各占一行，而不是另开一代。
+
+**收益结论按终态写**：能做，但 ROG 五类真实 prompt 上 MTP k=2 中位只有 **+6%**（区间
++8.4% ~ −1.2%），弱机器（Surface）与回环上是负的；判据不是「与不投机逐字节相同」，而是
+「无回退时与**整模投机**逐字节相同」。数字与归因见
+[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §9、[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2.2。
+
+**实测数据见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md)**（checkpoint 复用、MTP、DFlash、
+并发、内存、验收覆盖各一节，每条带日志出处与口径）。
+
+| 机制 | 位置 | 要点 |
+| --- | --- | --- |
+| 层范围进参数 | `include/llama.h` 的 `llama_model_params.split_layer_lo/hi` | 同一进程才能加载多个层范围；`LLAMA_LAYER_RANGE` 降级为兜底 |
+| hidden 传递 | `llama_context::decode_split` | 走标准 embedding 路径（`embeddings_pre_norm` + `get_embeddings_ith`），不是 `nextn` 通道 |
+| relay 段省 GET_ROWS | `src/llama-graph.cpp` 的 `build_inp_embd` | 没有 `tok_embd` 时不建；那一行被 `ggml_build_forward_order` 强制入图，只看分支选择不够 |
+| 聚合 memory | `src/llama-memory-split.{h,cpp}` | 本地段走 `llama_memory_t`、远程段走协议；`seq_pos_*` 问链首，`can_shift` 恒 false |
+| 远程段 | `src/llama-split-{proto,net,remote}.*`、`tools/split-stage` | 定长协议 **v8**（v3 定长头 + v4 身份握手 `OP_HELLO` + v5 候选通道 + v7 验证行 + v8 远程 MTP draft）；socket 层两端共用一份；`--host` 绑地址，默认 loopback |
+| 远程段进聚合 | `llama_context::split_attach_remote` | 装 `llama_memory_split`，远程指针借给视图；`seq_rm` / `clear` 广播到协议 |
+| server 入口 | `common/arg.cpp` 的 `--split-tail-range` / `--split-remote` / `--split-rs-seq` | `--split-remote` 可重复、按链序；与 `--split-tail-range` 互斥 |
+| 位置下发 | `decode_split` 的 `split_expand_pos` | 每个 token 的 4 个 M-RoPE section 全量下发，`req.n_pos` 让两端对齐 stride |
+| 角色显式声明 | `split-stage --role relay\|tail` | 用源层数校验：relay 要求 `hi < n_layer_src`，tail 要求 `hi == n_layer_src` |
+| checkpoint 覆盖全链 | `state_seq_*` 走 `get_memory()`；`llama_memory_split::state_read()` | 远程段先恢复、链首最后；每段带 `pos_max`，落后于快照的一律拒绝 |
+| 候选回传（v5） | `common/sampling.cpp` 的 `common_sampler_candidates_check()`、`server-context.cpp` 的 `plan_remote_candidates()` | 普通 decode 让 tail 跑 `logit_bias → penalties → top_n_sigma → top_k` 后只回候选、不回整行 logits；不等价时按白名单回退整行。帧尺寸与等价性实测见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §8 |
+| 验证通道（v7） | `DECODE_FLAG_VERIFY_ROWS`（`src/llama-split-proto.h`）、`request_remote_verify_rows()` / `plan_remote_verify_rows()`（`tools/server/server-context.cpp`） | 验证帧的**每行**回一个 int32 argmax，一帧 k+1 行是 4(k+1) B（单帧 993,312 → 48 B）；`MAX_VERIFY_ROWS` 是两端共享常量；要求 `off == 0`（帧内行号 = batch 绝对下标）；不满足就 `spec_blocked` 整个请求关投机，帧内无法改路 |
+| 远程 MTP draft（v8） | `OP_MTP_DRAFT`、`DECODE_FLAG_NEXTN_ROWS` / `RSP_FLAG_NEXTN_ROWS`、`common/speculative.cpp` 的 `is_remote` | tail 内部跑 k 步递归（每步输入是上一步的输出），回 k 个 id；`stage_id.has_nextn` 占 `_pad` 且**不参与身份比较**；tail 没有 NextN 时 server 摘掉 draft-mtp 并 WARN，不拦启动 |
+| grammar / rbudget 兼容 | `common/sampling.cpp` 的 `common_sampler_grammar_rejects()` / `common_sampler_rbudget_rejects()`、`common/reasoning-budget.cpp` 的 `common_reasoning_budget_rejects()`、`tools/server/server-context.cpp` 的 `skip_draft_once` | draft 不看这两个采样器，所以接受率会掉（无 grammar 2.76 → 1.46–1.73 token/帧）：head 侧对每个候选 token 做**单 token 自检**（只掩码不推进状态），被拒就**整帧回退**（撤 KV + prompt + sampler）；预算耗尽只收紧不放宽；`skip_draft_once` 防一条路径空转 |
+| split-stage 的线程 / ubatch | `tools/split-stage` 的 `-t/--threads`、`-tb/--threads-batch`、`-ub/--ubatch-size` | `GGML_DEFAULT_N_THREADS = 4` **且 `n_threads_batch` 也是 4、不会自动跟随**；`-t` 同时设两者（head 的 `-t` 不过网），`-ub` 是测量旋钮（让验证帧在帧内逐行跑）。Surface 上不投机 +3.5%、MTP +7% |
+| 链死自愈 | `llama_memory_split::try_rebuild()` | 位置 0 的请求 → 逐个 `reconnect()`（含重握手）→ 整链 `clear()`；失败保持 dead + 5 s 节流 |
+| MTP 投机在本地链上 | `tools/server/server-context.cpp` 的 `ctx_tail` | draft context 建在 tail 的模型上——head 段 nextn 为 0，建在 head 上会启动失败（远程链走 v8，没有 `ctx_dft`） |
+| DFlash 8 路 tap 跨两段 | `common/speculative.cpp` 的 `tap_ctx` / `tap_lid` | 源层号按 head/tail 拆成（context, 局部层号）；tail 的 tap 是进程内读，不加往返 |
+| tail 的 logits 缓冲按角色 | `common/common.cpp` 的 `n_outputs_max` | head 每 token 一行 hidden；tail 只为实际输出行（1 + k）分配 |
+| socket 超时 | `src/llama-split-net.h` 的 `set_timeout` | 每 send/recv 120 s，只兜"整体停摆"；stage 侧不设，靠对端关闭 |
+| 单独层范围的拒绝 | `common_init_from_params()`（`common/common.cpp`） | 范围结束早于末层、又没有后续段时，加载后立即报错；范围不从 0 开始且 `split_range_is_stage` 为假时同样拒绝 |
+
+五处语义值得单独记，都改过：
+
+- **`seq_rm` 失败不再静默**（2026-11-08）。`common_memory::seq_rm` / `common_context_seq_rm`
+  从 `void` → `bool`，五个调用点按场景降级（全量重算 / 结束响应 / 请求失败），不再
+  `GGML_ABORT`。触发它的是上游 hybrid 的短路（先删 recurrent，失败就 `return false`，
+  attention KV 一行都不删；server 默认 `n_rs_seq=0` 下 partial 分支恒不成立），上游有
+  open PR #28007 与 issue #31656，所以不另提 issue。两个坑——链死时**不能**结束请求
+  （会跳过 `try_rebuild` 唯一触发的那次 pos 0 decode，自愈永久失效）、`p0 > pos_max`
+  的空删除**是成功**——见 [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2.9。
+- **`--split-rs-seq` 不再是正确性必需**。早先 `n_rs_seq = 0` 的段会让截断式 `seq_rm` 失败，
+  而 `common_context_seq_rm` 把 false 当致命错误，于是必崩（当时远程链还没有 `remote_failure`
+  这条「不 abort」的出口）；现在 checkpoint 覆盖全链，默认 0 是可服务的配置。这个参数只在
+  投机时要抬高下限（一轮回滚 `n_max` 个位置），
+  而 `split-stage` 仍强制 `--rs-seq N`：server 的 `common_context_can_seq_rm()` 会回退到探测
+  `seq_rm`，0 快照的段会让这次探测失败（远端拒绝，链随即被标死），理由写在 `split-stage`
+  的 `--rs-seq` 必填检查里。
+- **失败不区分"对端拒绝"与"没连上"**。两者对链是同一件事——位置要分叉了。`decode` 的
+  传输失败降级成 `-3` 让请求失败；`seq_rm` / `clear` 失败都写 `remote_failure` 把链标死，
+  `common_context_seq_rm()` 对已死的远程链只记日志并 return **false**（`bool` 化之后本地链
+  也走同一条，不再 `GGML_ABORT`：调用方降级成「清空重算 / 结束响应 / 请求失败」），此后
+  `decode_split()` 在算任何东西之前就查这个状态并返 `-3`——请求失败，进程活着。
+- **链死能自愈**（`llama_memory_split::try_rebuild()`）。下一个从位置 0 开始的 batch 逐个
+  `reconnect()` → 整链 `clear()` → 恢复数据通路超时；失败保持 dead 并做 5 s 节流。闸门是
+  结构性的：重建后唯一一致的状态是「所有段都空」，空链只能从 0 写。重连必须重新握手
+  （`OP_HELLO`），接错的 stage 让重建失败，而不是被当成链好了。
+- **checkpoint 覆盖全链之后**，3103 token 历史的第二轮从 19.85 s 降到 0.71 s（实测数据见
+  [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §1；那一节同时也记了两个数字各自的口径）。
+- **v8 的 per-frame 槽位顺序**：`split_remote_reset()` 清掉所有 per-frame 槽位，包括新加的
+  h_nextn 行。所以 `store_nextn` 必须在三个回答分支（候选 / 验证行 / 整行）**之后**执行——
+  原来先存行、后存 logits，行被 `store_logits()` 的 reset 抹掉，结果 stage 回 2048 floats、
+  head 收到 0 行，**draft 静默消失**（不报错、不变慢，只是不投机）。
+
+验证（Qwen3.5-2B，`0:20` + `20:24`，独立 `build-split`）：
+
+- N=1 直通：默认 / `--split-layer-range 0:24` / `0:20` 三种配置输出与改动前逐字节相同
+- N=2 本地双段：head 输出与整模层 20 输入逐位相同；tail 单独跑与 baseline 相同；链路
+  logits 逐位相同；`seq_rm` 广播后两段的 `pos_max` 同步下降
+- N=2 经 llama-server：两个端口的 `reasoning_content` 一致
+- 跨进程：本地 head + 远程 `split-stage`，logits 逐位相同；服务器的 `--split-remote` 走同一条路径
+- 投机：**判据分两段**（2026-11-08 更正）。严格判据是「无回退时链上投机与**整模投机**逐字节
+  相同」；「与不投机逐字节相同」降级为 INFO——它测的是 batch invariance，而 llama.cpp 在
+  CPU + 量化上不承诺它（分段链的分界见
+  [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §9.4）。远程链的三组（不投机 / ngram / MTP）
+  输出逐字节相同（`verify_mtp_e2e.sh`），远程 tail 内部递归 3 步与整模 + MTP 逐个相同
+  （`verify_mtp.sh`）
+- 远程链的死亡与自愈：`build-split/verify_chain_death.py` 36 项——挂起 stage 后请求 500 而 head
+  存活、`/health?deep=1` 给 503、只重启 stage 就自愈（`prompt_n` / `cache_n` / 输出三项同时成立）、
+  接错 stage 被 `OP_HELLO` 拒绝；候选通道的等价性见
+  [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §8
+- `seq_rm` 的删尾部：`verify_seq_rm_exact.py --expect-known-fail` 的 A/B/C 三形态（纯 llama API、
+  无 split、无 server）——FULL 形态两红（`seq_rm=false`、`pos_max` 不变、重放 `-1`）、RS 形态三绿
+  （重放 logits 逐位相同）、超窗明确拒绝一绿；`verify_seq_rm_shared.py` 的 shared-prefix 注入不触发
+  （`[INFO] injection never fired`）。见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §10
+
+第四代仍成立的边界（`embeddings_pre_norm` 只覆盖两个架构、上游 hybrid 的 partial `seq_rm` 在
+`n_rs_seq = 0` 下永远失败而我们只做「失败可见 + 调用方降级」、远程链的投机能做但收益随负载从
++8.4% 到 −1.2% 且判据不是「与不投机一致」、DFlash 在远程链上仍缺 `OP_LAYER_INP`、级联在
+server 侧不做、远程链是单序列 append-only、checkpoint 每段约 12.56 MiB 过网、浅 `/health`
+不反映链路状态（要问 `?deep=1`）、单独层范围的拒绝只覆盖一条加载路径）逐条记在
+[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2，那里写的是代价而不是 TODO。
 
 ---
 
@@ -136,7 +285,8 @@ win32 移植面（3 个函数 + 1 个锁包装）：
                               produce no drafts at all (ngram-map.cpp:95-101)"
     -size-n 2 -size-m 7  ->  通过参数校验
 
-待定项：是否向上游提交 PR。这条对本地用法无影响（本项目的有效组合是 `m > n`）。
+这条与上游无关：本项目的有效组合是 `m > n`，校验只在本仓的启动参数上生效，
+提不提上游都不改变本地行为。
 
 ---
 
@@ -157,7 +307,7 @@ touch 自己那几层，段间只传 `n_embd` 个浮点。
 | 权重从哪来 | 主机通过 `SET_TENSOR` 发给远端 | 各节点本地读整模的对应层 |
 | 首次跨机流量 | 权重总量（GB 级） | 0，只要本地有整模 |
 | 主机必须装下整模 | 是 | 否（只装自己那几层） |
-| 每步流量 | 激活 + 图指令 | hidden 一个向量（FP16，2048 × 2 B = 4 KB） |
+| 每步流量 | 激活 + 图指令 | hidden 一个向量（FP32，2048 × 4 B = 8 KB） |
 | 计算图 | 主机维护全局图 | 每段是独立进程，无全局图 |
 | 异构 | 需要相同的 ggml backend | 自定义 TCP 协议，可跨不同 CPU/GPU |
 | 层范围加载 | 不支持，要自己切模型 | `LLAMA_LAYER_RANGE` 原生支持 |
