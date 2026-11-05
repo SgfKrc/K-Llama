@@ -42,24 +42,24 @@ for client in self._clients:
 
 ## 3. 能做什么（按收益排序）
 
-### 3.1 【已实现，实测零命中】server 走 token 前缀续写
+### 3.1 【做过、实测零命中、已删除】server 走 token 前缀续写
 
-代码在 `server.py` 的 `Chain._reusable` / `_remember`，判据是 **token id 前缀**：只有 KV
-里恰好是本轮 prompt 的真前缀时才续写；分叉、或 KV 比 prompt 长（要裁剪，正是 hybrid 拒绝
-的操作）都退回全量重放。账本说不清的时候一律清空——慢是看得见的，错不是。
+曾经实现过：`Chain` 记一份「KV 里逐位置的 token id」账本，请求 tokenize 后与它比公共
+前缀，命中就只写新增；分叉、KV 比 prompt 长、投机、`kv_tail`、计数对不上都清账本退回全量
+重放。判据本身是保守的、逐条有单测。**后来删掉了**，两个理由都成立且互不依赖：
 
-**但在当前模板 + DSH 组合下命中率是 0**，根因不在实现：
+**一、当前模板 + DSH 组合下命中率是 0。**
 
 - generation prompt 末尾是 `<|im_start|>assistant\n<think>\n`（`thinking=False` 时是
-  `<think>\n\n<｜end▁of▁thinking｜>\n\n`），而历史 assistant 段渲染成 `<|im_start|>assistant\n<答案>`。
-  **两者在 assistant 头之后第一个 token 就分叉**，实测字符公共前缀 59 / 总长 144，
-  token 公共前缀 15 / 总长 429。
+  `<think>\n\n<｜end▁of▁thinking｜>\n\n`），而历史 assistant 段渲染成
+  `<|im_start|>assistant\n<答案>`。**两者在 assistant 头之后第一个 token 就分叉**，实测字符
+  公共前缀 59 / 总长 144，token 公共前缀 15 / 总长 429。
 - `chat.Conversation.add_assistant` 正是为这件事存在：用
   `" " + thinking_start + "\n" + generated` 桥接生成文本与历史渲染（`chat.py:283-296`，
   注释原话「Get this wrong and every turn replays」）。`koakuma` 因此能续写；**接 DSH 时
   历史由客户端给，server 没有这条拼接，也不该有**。
 
-**而且收益上限本身就不够**（2B 实测，这条更关键）：
+**二、就算命中，收益上限也只有一成**（2B 实测，这条更关键）：
 
 | | prompt | 生成 | 总时长 |
 |---|---|---|---|
@@ -67,15 +67,13 @@ for client in self._clients:
 | 轮2 | 429 | 400 | 42.6 s |
 
 多出的 414 个 prompt token 约 4.4 s，即 **prefill 只占总时长的 10%**，生成是大头。
-即使前缀 100% 命中，也只能省这一成。
+
+删掉而不是留着的理由：它零收益，却依赖 `stream.py` 的 `pending` / `kv_tail` 契约和三处
+对外 stats 字段；任一处改错不会报错，只会让下一轮写进一个模型没见过的上下文。删完之后
+`generate()` 无条件 reset（`server.py:228-229`），与本文件 §2 实测的 `seq_rm` 行为一致。
 
 要真正吃到它，得让 server 篡改渲染输入（给历史 assistant 补 `thinking_start`），风险高于
-收益。**所以这条不再投入**；代码保留是因为判据是保守的，哪天客户端回传能对齐它会自己生效，
-`reused_prompt_tokens` / `kv_ledger` 两个字段会立刻显示出来。
-
-- 动的不变量：`n_past ≈ 已写 token 数` 从一个请求内的局部量升级成跨请求的持久账本。少一条
-  判定就是静默错上下文（不报错，只是答得不对）。
-- 并发注意：DSH 的多个请求共用一把锁串行，不同会话交错会毁掉前缀局部性。
+收益，未做。
 
 ### 3.2 【可做】让 `seq_rm` 的失败可见（~25 行）
 

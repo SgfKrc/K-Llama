@@ -131,10 +131,6 @@ class Chain:
         self._lock = threading.Lock()
         self._clients: list[StageClient] = []
         self._procs: list[tuple] = []
-        #: Token ids the KV holds, position by position, in the order they were written.
-        #: Empty whenever that cannot be stated with certainty -- which is the signal for
-        #: the next request to replay its whole prompt instead of continuing.
-        self._kv_tokens: list[int] = []
         self.ready = False
 
     @property
@@ -202,64 +198,6 @@ class Chain:
         why = config.sampled_spec_problem(temperature, top_k, top_p, extra)
         return {"requested": True, "active": not why, "reason": why}
 
-    @property
-    def kv_ledger_size(self) -> int:
-        """How many positions the reuse ledger claims right now.
-
-        Reported per response so that "reuse did not help" can be told apart from "reuse
-        never had a ledger to work with" -- the two point at completely different fixes.
-        """
-        return len(self._kv_tokens)
-
-    def _reusable(self, prompt_ids: list[int]) -> int:
-        """How many leading positions the KV already holds for this prompt, or -1.
-
-        -1 means "cannot continue", and both ways of getting there are silent-wrong-context
-        bugs if ignored:
-
-        * the ids diverge, because the template rendered the previous answer differently
-          this time (it trims the thinking block, for one), so the KV describes a context
-          the model never saw;
-        * the KV holds *more* than this prompt's prefix. Trimming that tail is precisely
-          what `seq_rm` refuses on a hybrid model, and it refuses by silently leaving the
-          attention half untouched.
-
-        No ledger means no knowledge of what is in the KV, so it also returns -1: that way
-        every non-continuation goes through a reset, which is both the cleanup and the
-        liveness check.
-        """
-        held = self._kv_tokens
-        if not held:
-            return -1
-        common = 0
-        for old, new in zip(held, prompt_ids):
-            if old != new:
-                return -1
-            common += 1
-        if len(held) > len(prompt_ids):
-            return -1
-        return common
-
-    def _remember(self, prompt_ids: list[int], generated: list[int],
-                  stats: dict | None, spec: dict) -> None:
-        """Record what the KV holds now, or drop the ledger when that cannot be known.
-
-        A slow request is visible; a ledger that disagrees with the KV is not. So every
-        doubt clears it and the next request replays the whole prompt.
-        """
-        if stats is None or spec.get("active") or stats.get("kv_tail"):
-            # Speculation can leave block positions behind that this ledger cannot
-            # describe, and `kv_tail` says exactly that happened.
-            self._kv_tokens = []
-            return
-        ids = list(prompt_ids) + list(generated)
-        if stats.get("pending") is not None:
-            ids = ids[:-1]       # emitted, but the forward that places it never ran
-        if int(stats.get("n_past", -1)) != len(ids):
-            self._kv_tokens = []
-            return
-        self._kv_tokens = ids
-
     def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None,
                  stats: dict | None = None):
         """Yield Chunk, serialised under the chain lock.
@@ -282,21 +220,16 @@ class Chain:
         with self._lock:
             if not self._clients:
                 raise RuntimeError("chain has no stages")
-            # Tokenizing first is what makes continuing safe: it is also the liveness
-            # check, because the worker drops an idle session and `tokenize` reconnects
-            # when it finds the socket dead. Resetting here instead would throw away the
-            # very KV this request came to reuse.
-            prompt_ids = self._clients[0].tokenize(prompt)
-            reuse = self._reusable(prompt_ids)
-            if reuse < 0:
-                for client in self._clients:
-                    client.reset()
-                self._kv_tokens = []
-                reuse = 0
+            # Reset first, because it is also the liveness check: the worker drops a
+            # session after a minute of silence, and `reset()` reconnects when it finds
+            # the old socket dead. Everything after this would otherwise run into the
+            # same closed socket.
+            for client in self._clients:
+                client.reset()
             # Refuse a request that cannot fit before generating anything. An overrun does
             # not fail cleanly: llama_decode returns rc=-1 partway through the answer, and
-            # the client sees a truncated stream rather than a rejected request. The fit is
-            # measured on the whole prompt: reused positions still occupy the KV.
+            # the client sees a truncated stream rather than a rejected request.
+            prompt_ids = self._clients[0].tokenize(prompt)
             if why := context_shortfall(len(prompt_ids), max_tokens, self._ctx):
                 raise ContextOverflow(why)
             greedy = config.is_greedy(sampling)
@@ -311,7 +244,6 @@ class Chain:
             spec = self.spec_plan(sampling)
             if stats is not None:
                 stats["speculation"] = spec
-                stats["reused_tokens"] = reuse
             spec_sampling = None
             if not greedy and spec["active"]:
                 # Temperature-only by construction (spec_plan refused everything else), so
@@ -320,29 +252,15 @@ class Chain:
                     "temperature": float((sampling or {}).get("temperature", 1.0)),
                     "rng": np.random.default_rng((sampling or {}).get("seed")),
                 }
-            generated: list[int] = []
-            try:
-                for chunk in generate_stream(
-                    self._clients, prompt, max_tokens=max_tokens,
-                    spec_k=self._spec_k if spec["active"] else 0,
-                    dflash_path=self._dflash if (spec["active"] and greedy) else "",
-                    dflash_block=self._dflash_block,
-                    cascade_mtp=self._cascade_mtp,
-                    sampling=spec_sampling,
-                    prefix_ids=prompt_ids[reuse:], n_past=reuse,
-                    stats=stats,
-                ):
-                    if chunk.token >= 0:
-                        generated.append(chunk.token)
-                    yield chunk
-            finally:
-                # A caller that walks away mid-answer still leaves a KV behind, and the
-                # generator writes its settled position into `stats` whatever happens.
-                self._remember(prompt_ids, generated, stats, spec)
-                if stats is not None:
-                    # Usage is the whole prompt, not the tail: what was reused still cost
-                    # the client those tokens to produce.
-                    stats["prompt_tokens"] = len(prompt_ids)
+            yield from generate_stream(
+                self._clients, prompt, max_tokens=max_tokens,
+                spec_k=self._spec_k if spec["active"] else 0,
+                dflash_path=self._dflash if (spec["active"] and greedy) else "",
+                dflash_block=self._dflash_block,
+                cascade_mtp=self._cascade_mtp,
+                sampling=spec_sampling,
+                stats=stats,
+            )
 
     def drain(self, prompt: str, max_tokens: int, sampling: dict | None,
               sink=None):
@@ -772,10 +690,6 @@ class Handler(BaseHTTPRequestHandler):
             # they did not. A sampled request that also asked for top_k/top_p degrades
             # to plain decode; without this field that slowdown would be invisible.
             "speculation": drain_stats.get("speculation"),
-            # How much of this prompt the KV already held. Without it, "the answer got
-            # faster" and "prefix reuse works" cannot be told apart.
-            "reused_prompt_tokens": drain_stats.get("reused_tokens", 0),
-            "kv_ledger": self.chain.kv_ledger_size,
         }
         if parse_error:
             # A tool_calls-shaped answer that could not be parsed is not a 500: the text
@@ -903,9 +817,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             finish = "length" if tokens >= max_tokens else "stop"
         closing = {"sampling": self.chain.sampling_state(),
-                   "speculation": drain_stats.get("speculation"),
-                   "reused_prompt_tokens": drain_stats.get("reused_tokens", 0),
-                   "kv_ledger": self.chain.kv_ledger_size}
+                   "speculation": drain_stats.get("speculation")}
         if parse_error:
             closing["parse_error"] = parse_error
         sse({"id": cid, "object": "chat.completion.chunk", "created": created,
