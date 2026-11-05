@@ -3,6 +3,11 @@
 结论先给：**DSH 每轮重放整段前缀，根因不在 KV cache 技术，在 server 每个请求无条件
 reset**。KV 这一层能做的三件事里，只有一件量级正确。
 
+> 本文写的是 **v2 的 `server.py` 驱动链**。v2.1 把链下沉进 `llama_context` 之后，这条根因
+> 已经消失：`llama-server` 的 slot / prompt cache 直接作用于整条链（checkpoint 覆盖全链，
+> 3103 token 历史第二轮只解 38 个新 token）。本文的结论只用于解释 v2 的历史行为，不是
+> v2.1 的现状。
+
 ## 1. 为什么会重放
 
 `server.py:228-229` 每个请求都走一遍

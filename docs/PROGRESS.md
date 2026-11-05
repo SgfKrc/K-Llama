@@ -1,7 +1,7 @@
 # 进展：当前能跑到什么程度
 
 > 状态：**现行**
-> 更新日期：2026-11-02
+> 更新日期：2026-11-06
 >
 > 适用范围：本仓库当前的能力快照——能跑什么、做到过什么、还差什么。
 > 数字口径与出处不在本文重复，指向 `docs/MEASUREMENTS.md` 与 `docs/SPECULATION.md`。
@@ -45,8 +45,9 @@ Y700 平板（8 Gen 3，Termux，纯 CPU）上，两端都持**完整整模** + 
 - decode **6.50 tok/s**（153.4 ms/token，p90 165.1 ms，n=24，两次复测 6.50 / 6.52）
 - prefill 稳态 **22 tok/s**（N=256 要 11.7 秒；另有约 750 ms 首轮图 reserve 开销）
 
-两台核显都不参与：Surface 的 Vulkan 后端一加载就把 CPU 侧权重塞进 host buffer
-（head 245 → 112 ms），Y700 的 Adreno `-ngl 99` 比纯 CPU 慢。逐层拆解、带宽口径
+这两台的核显都不参与（**只对这两台弱设备成立**；本机 Iris Xe 单卡隔离后全量 offload 是赢的，
+见 [`IGPU-SLOWDOWN.md`](IGPU-SLOWDOWN.md)）：Surface 的 Vulkan 后端一加载就把 CPU 侧权重塞进
+host buffer（head 245 → 112 ms），Y700 的 Adreno `-ngl 99` 比纯 CPU 慢。逐层拆解、带宽口径
 与切点约束见 [`ANDROID-SURFACE-段接入评估.md`](ANDROID-SURFACE-段接入评估.md)。
 
 **部署形态**：`stage_supervisor.py` 常驻，读拓扑起本机段，崩了按退避重启；
@@ -71,7 +72,7 @@ Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两�
 | P4 | 六条定位修正后验收 | 98.0% 接受率（原生 `llama-speculative-simple` 94.1%），3.94 token/轮 |
 | P5 | 弱设备串两段 + 常驻 supervisor + 绿色包（2026-11-03） | 6.50 tok/s；kill 掉任一段的 worker 后 supervisor 自动重启、链路恢复 |
 
-`docs/PATCHES.md` 记的是两代补丁的分界，`docs/ISSUE-*.md` 记的是 P3/P4 期间定位到的
+`docs/PATCHES.md` 记的是四代补丁的分界，`docs/ISSUE-*.md` 记的是 P3/P4 期间定位到的
 三个缺陷：warmup 越界、hybrid `seq_rm` 语义、recurrent 快照跨 ubatch 不滚动。
 
 ---
@@ -98,7 +99,7 @@ Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两�
 
 ## 4. 已接的组件
 
-**llama.cpp fork（`H:\llamacpp-c`，相对上游 16 文件 +532/−26，另有 10 个 `slim-arc-*` 新增文件，合 26 文件）**
+**llama.cpp fork（`H:\llamacpp-c`，相对上游 `e0f142d`，四代补丁；文件数与行数见 [`PATCHES.md`](PATCHES.md)）**
 
 | 标记 | 内容 |
 | --- | --- |
