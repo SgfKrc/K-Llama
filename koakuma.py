@@ -421,6 +421,11 @@ class KLlamaApp(App):
             return
         if self.buf:
             self.answer, self.buf = self.answer + "".join(self.buf), []
+            # `show_chat` 渲染的是 `self.turns`，而 `turns[-1]` 原先只在 `flush` 时写。
+            # 结果生成期间对话区恒为空、结束后一次性出现——流式数据、0.08 s 节拍都在，
+            # 只是接错了源。这里同步一次，才真的"边生成边显示"。
+            if self.turns:
+                self.turns[-1] = (self.turns[-1][0], self.answer)
             self.show_chat()
         self.paint()
 
