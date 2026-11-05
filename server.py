@@ -694,6 +694,20 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = render_messages(renderer, messages, tools=tools,
                                          tool_choice=tool_choice,
                                          parallel_tool_calls=parallel).prompt
+                # A request that does not fit is the one case where the server knows the
+                # client built something enormous and the client only ever sees a token
+                # count. Record what actually arrived, and echo it back with the refusal.
+                self._shape = {
+                    "messages": len(messages),
+                    # Characters in what the client sent, not in the rendered prompt and
+                    # emphatically not a token count: this exists to answer "how big was
+                    # this request" when it gets refused for being too big.
+                    "prompt_chars": sum(len(str(m.get("content") or ""))
+                                        for m in messages),
+                    "tools": len(tools or [])}
+                sys.stderr.write("[req] messages=%d prompt_chars=%d tools=%d max_tokens=%d\n"
+                                 % (self._shape["messages"], self._shape["prompt_chars"],
+                                    self._shape["tools"], max_tokens))
                 if stream:
                     self._stream_response(completion_id, created, model, prompt,
                                           max_tokens, ignored, sampling,
@@ -722,7 +736,8 @@ class Handler(BaseHTTPRequestHandler):
             # The request asks for more than ctx can hold; that is the client's mistake,
             # so it is a 400 rather than the 500 every other failure is.
             self._json(400, {"error": {"message": str(exc),
-                                       "type": "invalid_request_error"}})
+                                       "type": "invalid_request_error",
+                                       **getattr(self, "_shape", {})}})
             return
         except Exception as exc:  # noqa: BLE001 - report, do not kill the server
             self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}",
@@ -869,9 +884,10 @@ class Handler(BaseHTTPRequestHandler):
             if not sent:
                 self._json(400, {"error": {"message": str(exc),
                                            "type": "invalid_request_error",
-                                           "param": "max_tokens"}})
+                                           "param": "max_tokens",
+                                           **getattr(self, "_shape", {})}})
                 return
-            sse({"error": {"message": str(exc)}})
+            sse({"error": {"message": str(exc), **getattr(self, "_shape", {})}})
             sse("[DONE]")
             return
         except Exception as exc:  # noqa: BLE001
@@ -955,7 +971,8 @@ class Handler(BaseHTTPRequestHandler):
                 prompt, max_tokens, sampling)
         except ContextOverflow as exc:
             self._json(400, {"error": {"message": str(exc),
-                                       "type": "invalid_request_error"}})
+                                       "type": "invalid_request_error",
+                                       **getattr(self, "_shape", {})}})
             return
         except Exception as exc:  # noqa: BLE001 - report, do not kill the server
             self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}",
