@@ -1,6 +1,10 @@
-# K-Llama v2
+# K-Llama v2 (English)
 
 [中文](../README.md) | **English**
+
+> **Note**: this English version still describes **v2** (the Python-driven distributed chat engine).
+> The current generation is **v2.1**, which moves the split chain down into `llama_context` so that
+> `llama-server` drives it natively. See [README.md](../README.md) (Chinese) for v2.1.
 
 > Status: **Usable** — three shapes are working and have been soak-tested: two machines at
 > 20.9 tok/s, two weak devices at 6.50, three-stage over the public internet at 5.00; the

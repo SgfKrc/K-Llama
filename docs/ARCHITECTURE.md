@@ -1,7 +1,7 @@
 # 机制：非整模加载凭什么成立
 
 > 状态：**现行**
-> 更新日期：2026-11-03
+> 更新日期：2026-11-06
 >
 > 适用范围：不切模型怎么分段加载、段之间传什么、哪些约束是硬的；读者为维护或移植该机制的开发者。
 > 相关：补丁改动清单 [`PATCHES.md`](PATCHES.md)、实测数字 [`MEASUREMENTS.md`](MEASUREMENTS.md)、
@@ -71,7 +71,11 @@ llama.cpp 用 mmap 把整个文件映射进地址空间。**映射不等于读�
 token，int16 定点同样 1/5（第 16 步）——量化步长细 20 倍也照样翻转，因为分叉点都落在输出接近
 平局的位置。判据是**逐位一致**，不是"误差足够小"。条件见 [`MEASUREMENTS.md`](MEASUREMENTS.md) §8.1。
 
-协议：4 字节大端长度 + 1 字节类型 + payload，hidden 走原始字节，不套 JSON。
+协议是定长头 + 原始字节（`src/llama-split-proto.h`）：`req_header` 带 `n_tokens` / `n_embd` /
+`n_pos` / `n_bytes`，随后是 `n_tokens × n_pos` 个 int32 位置、再是 `n_tokens × n_embd` 个 float 的
+hidden。位置必须全量下发：M-RoPE 每 token 4 个 section，只传标量会让后续段算出不同的旋转编码。
+协议 v4 起，每条连接的第一帧是 `OP_HELLO` 身份握手（`stage_id`：层范围、源层数、宽度、vocab、
+role）；v5 起，tail 的回复可以只是 top-k 候选而不是整行 logits（普通 decode 默认走这条）。
 
 ---
 
@@ -127,18 +131,37 @@ MoE 的权重分布是专家占 88%，而每个 token 只用到 8/256 个专家�
 
 | 源 | 是什么 | 深度 |
 | --- | --- | --- |
-| MTP | 模型自带的 NextN 头，递归喂自己的输出 | k=2 是上限（第 3 层掉到 36%） |
-| DFlash | 独立的小模型，一次前向出 16 个位置 | k=5 是拐点（k=8 起接受率崩塌） |
+| MTP | 模型自带的 NextN 头，递归喂自己的输出 | 随模型：35B 上 k=2 是经验上限（第 3 层掉到 36%），2B 上 k=3 优于 k=2 |
+| DFlash | 独立的小模型，一次前向出 16 个位置 | k=5 在盈利区间（k=8 起接受率崩塌） |
+
+深度是**实测值，不是结构上限**：2B 上 k=3 的接受率只从 97.7% 掉到 96.6%，所以「k=2 是上限」
+只对 35B 成立。链上默认不开投机，开之前按负载选源和 k。
+
+**本机双进程测出的投机「亏」不能外推**：head↔tail 走内存与管道、没有 25–30 ms 跨机往返可省，
+而两进程抢同一套 CPU 与内存带宽——付出成本却拿不到好处；多机省 `(N−N/3.2)×25–30 ms` 往返、
+多花 tail 一次 draft 前向，差一个量级，大概率划算但没测过（[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §0.1）。
+
+**两条链的接法不同，结论不能互搬**：
+
+- **llama-server 原生路径**：draft context 建在 **tail 段**的模型上。head 段的加载范围
+  `nextn = 0`，NextN 头只在 tail 里；把 draft 建在 head 上会在启动阶段失败。DFlash 反过来
+  要 head——它的词表与 embedding 在前段——8 路 tap 按 head/tail 拆成（context, 局部层号）
+  解析，tail 那两路是进程内读，不增加往返。两者都只在**本地**双段链上可用；远程链的普通 decode
+  已经走候选通道（协议 v5，每 token 40 个候选 = 352 B），但验证要 k+1 行的 **argmax**，
+  那需要整行 logits（993 KB/行），瓶颈仍是带宽与公共协议而不是延迟
+  （[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2.2）。
+- **qlh 的 Python 驱动链**：`chain_client.py` 的 `--spec-k` / `--dflash` / `--cascade-mtp`，
+  验证由 `forward_batch` 一次绕链完成，只支持贪心。
 
 共同要求：**每一步必须能回滚**。验证块写 k+1 行，只保留接受的前缀，剩下的要退回去。
 hybrid 模型（30 层 linear + 10 层 full attention）的 recurrent state 没有位置索引，
 退回需要按 ubatch 滚动的快照——这是本项目最贵的一个坑，见
 [`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md)。
 
-运行时只支持贪心：验证器给的是 argmax。采样要 rejection sampling，比的是两个分布的比值，
-shim 已能按行回传完整 logits（`qlh_kh_logits`，`shim/qlh_keep_head.def`），缺的是一次判据实验——
-同一位置上整模与链路的 top-k 候选是否重合，探针是 `checks/probe_logits_delta.py`，
-缺口在哪见 `README.md` 的「未做」第 1 条。推理路径本身还没接采样。
+采样：llama-server 的原生实现的验证器已经支持 rejection sampling（草稿侧按目标温度重采样，
+把 q 交给验证器），qlh 链这条路径还只支持贪心。shim 已能按行回传完整 logits
+（`qlh_kh_logits`，`shim/qlh_keep_head.def`），缺的是一次判据实验——同一位置上整模与链路的
+top-k 候选是否重合，探针是 `checks/probe_logits_delta.py`。
 
 ---
 
@@ -166,7 +189,7 @@ shim 已能按行回传完整 logits（`qlh_kh_logits`，`shim/qlh_keep_head.def
 | 参考 | 吞吐、接受率（要带口径：模型、量化、生成长度、设备） |
 | 不算 | "输出看起来通顺"、单次运行、跨配置比较 |
 
-跨机同样验过逐位一致。`checks/` 里 20 个脚本按这个标准写。
+跨机同样验过逐位一致。`checks/` 里 24 个脚本按这个标准写。
 
 ---
 
@@ -178,13 +201,15 @@ shim 已能按行回传完整 logits（`qlh_kh_logits`，`shim/qlh_keep_head.def
 装得下的时候它是空操作——整模在页缓存里，没有可补的页，实测 `issued = 0`。
 接入形态与触发条件见 [`PATCHES.md`](PATCHES.md) 与 [`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md)。
 
----
-
 ## 11. 为什么没有 token 间流水
 
-链是严格串行的：`chain_client._walk`（`chain_client.py:1084`）就是 `for i, client in
-enumerate(clients)` 逐段同步调用（`:1101`），每段都阻塞在 `_forward` 的 `send`/`read` 上
-（`:508`）。一次 decode 的墙钟 ≈ 各段耗时**之和**，不是最大值。
+先划清本节否定的东西：它说的是**相邻 token 之间**的流水——`t_{p+1}` 还没生成时，没有任何
+办法开始算 p+1。它**不是**「跨段投机不可行」（投机把一个 batch 里的 k+1 个位置一次算完，
+正是这里唯一能重叠的形态，见 §7），也**不是**「多请求不可行」（那在最后一行，有条件可行）。
+
+链是严格串行的：`chain_client._walk`（`chain_client.py:1141`）就是 `for i, client in
+enumerate(clients)` 逐段同步调用（`:1158`），每段都阻塞在 `_forward` 的 `send`/`read` 上
+（`:519`）。一次 decode 的墙钟 ≈ 各段耗时**之和**，不是最大值。
 
 这条串行是单序列 decode 的因果关系，不是排程偷懒：
 
@@ -213,6 +238,5 @@ head(p+1) ← t_{p+1}   ←── 只可能由 tail(p) 产出
 | 多请求 / 多序列 | 有条件可行，唯一的大块 | 不同序列互不依赖，三条同时在飞把合计吞吐从 `1/Σ` 推到 `1/max`：按 73.4/64.6/55.7 ms，上限 **13.6 t/s（2.6×）**，但每 token 延迟不降（约 0.2 s，排队时更差）。三件前置都还没有：`n_seq_max` 硬编码 1（`keep_head_worker.py:249`）、协议与 token 通道的 `seq_id`、驱动侧并发。本体估 3–4 人天（[`ISSUE-multi-sequence.md`](ISSUE-multi-sequence.md)），驱动改排队另算 |
 | prefill ∥ decode | 多序列之后才谈得上 | prefill 现在是一次走完整链的大 batch，`server.py` 一把锁串行；要让第二个请求在别人 prefill 时 decode，得先有 seq 维度、再把 prefill 切块插入。买的是公平性，不是吞吐 |
 
-单序列的延迟只有三个旋钮：投机接受率、段数（每段 33–35 ms 是串行叠加的）、往返（星形拓扑，
-hidden 每段都回本机再发下一段，[`THREE-SEGMENT.md`](THREE-SEGMENT.md) §4）。吞吐那个旋钮叫
-多序列，要单独立项。
+单序列的延迟只有三个旋钮：投机接受率、段数（每段 33–35 ms 串行叠加）、往返（星形拓扑，hidden
+每段都回本机再发下一段）。吞吐那个旋钮叫多序列。见 [`THREE-SEGMENT.md`](THREE-SEGMENT.md) §4。
