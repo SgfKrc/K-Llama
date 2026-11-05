@@ -1782,25 +1782,16 @@ def main() -> int:
     if args.cascade_mtp and not args.dflash:
         raise SystemExit("--cascade-mtp 需要 --dflash：级联是接在 DFlash 块后面的")
     if args.spec_k != 0 and not args.greedy and not args.dry_run:
-        # Non-greedy speculation is now supported, but only for a temperature-only sampler.
-        # --dry-run skips this: it only validates the topology and never decodes, and refusing
-        # it over sampler flags would make the cheap sanity check unusable.
-        # p and q are built here from raw logits as softmax(logits/T); the tail's sampler chain
-        # applies penalties -> top_k -> top_p -> temp before picking a token, and none of those
-        # transforms comes back as a distribution. Approximating them on this side while the
-        # tail applies the real chain is how a silently biased stream ships, so they are
-        # refused instead of degraded. --greedy keeps the old argmax-verified path unchanged.
-        if args.temperature <= 0:
-            raise SystemExit("采样投机需要 --temperature > 0（贪心投机用 --greedy）")
-        if args.top_k != 0 or args.top_p < 1.0:
-            raise SystemExit(
-                "--spec-k 的采样路径只支持 temperature：top_k/top_p 在 shim 的采样链内部，"
-                "不会以分布形式暴露，两边就得不到同一个变换。请显式给 --top-k 0 --top-p 1.0，"
-                "或改用 --greedy 走原来的贪心投机。")
+        # Non-greedy speculation is supported for a temperature-only sampler; the rule
+        # lives in config.sampled_spec_problem because the TUI and the server ask the same
+        # question and each would otherwise carry its own copy. --dry-run skips this: it
+        # only validates the topology and never decodes, and refusing it over sampler flags
+        # would make the cheap sanity check unusable.
+        if why := config.sampled_spec_problem(args.temperature, args.top_k, args.top_p):
+            raise SystemExit(why)
     if args.dflash:
         if not args.greedy:
-            raise SystemExit("--dflash 仍是贪心专用：块草稿器只出 argmax，"
-                             "采样下的拒绝验证还没实现")
+            raise SystemExit(config.DFLASH_NEEDS_GREEDY)
         # --cascade-mtp is the only way MTP joins a block round: it extends the DFlash block,
         # it does not run a second independent source. A positive --spec-k would be a second,
         # conflicting depth for the same head.

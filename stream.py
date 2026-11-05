@@ -16,6 +16,7 @@ render incrementally instead of waiting for the whole sentence.
 from __future__ import annotations
 
 import codecs
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Iterator, Sequence
@@ -68,6 +69,8 @@ def generate_stream(
     ctx: int | None = None,
     prefix_ids: Sequence[int] | None = None,
     n_past: int = 0,
+    sampling: dict | None = None,
+    stop: threading.Event | None = None,
 ) -> Iterator[Chunk]:
     """Tokenize ``prompt``, drive the chain, yield text as it becomes readable.
 
@@ -81,10 +84,27 @@ def generate_stream(
     multi-turn driver needs exactly this loop with a different start position, so the
     ability lives here as a parameter rather than as a copy in `checks/`.
 
+    ``sampling`` is ``{"temperature": T, "rng": Generator}`` and is handed to
+    `chain_client.speculate`, which uses rejection sampling to make the speculative stream
+    distributed exactly like T-sample. ``None`` is the greedy contract (argmax-verified
+    drafts). Only a temperature-only chain is supported: top_k / top_p / penalties live
+    inside the shim's sampler and are never exposed as a distribution, so a caller that
+    asked for them must refuse or degrade *and say so* -- this loop does not silently
+    approximate them. A non-greedy caller therefore either leaves ``spec_k`` at 0 or passes
+    a temperature-only sampler; passing a DFlash path with ``sampling`` raises, because the
+    block drafter only produces argmax.
+
+    ``stop`` is checked once per token, so an interactive caller can end a round without
+    killing the chain. A stopped round is a *complete* round from the caller's point of
+    view: it still settles ``stats`` (below), so the next round can continue from a KV that
+    agrees with what the user was shown. What was already emitted stays emitted.
+
     What a continuation needs is reported through ``stats``, because a generator cannot return
     a value:
 
-    * ``stats["n_past"]`` -- the position this round finished at.
+    * ``stats["n_past"]`` -- the position this round finished at. Updated after every step,
+      not only at the end, so a consumer that stops the round (or the generator that is
+      closed early) still sees the position the KV really reached.
     * ``stats["pending"]`` -- the token that was emitted but never entered the KV (the loop
       breaks after emitting, before the forward that would place it). Dropping it makes the
       next round write a different token at that position, and the KV then silently disagrees
@@ -92,15 +112,19 @@ def generate_stream(
     * ``stats["kv_tail"]`` -- tokens that ARE in the KV but were never emitted. Non-empty only
       when a speculative block was cut short by the end of the round; llama.cpp will not roll
       the last position back, so these have to be replayed to keep the history aligned.
+    * ``stats["stopped"]`` -- this round ended because ``stop`` was set.
+    * ``stats["last_token"]`` -- the last token emitted, whether or not it reached the KV.
+      A caller continuing a ChatML conversation needs it to decide whether the previous
+      assistant turn already wrote its closing marker.
+    * ``stats["emitted"]`` -- tokens emitted in this round.
 
     The decode loop is not implemented here: `chain_client` owns it (`forward`,
     `speculate`, and the DFlash driver). Going through those is what makes a server or TUI
     get the same speculative paths as the CLI -- an earlier version of this module carried
     its own plain loop, so the OpenAI endpoint silently ran without any drafting.
 
-    Speculation is opt-in and only valid at temperature 0. The verifier compares drafts
-    against the chain's own argmax, so a sampling tail would make it accept tokens the
-    sampler never produced.
+    Speculation is opt-in. The greedy path is argmax-verified; the sampled path uses
+    `chain_client.speculate`'s rejection sampler and needs ``sampling``.
 
     ``ctx`` is the draft model's KV window. ``None`` means ask ``config.ctx()``, which is
     the run's only source of truth for the KV budget; a caller that already holds that
@@ -110,6 +134,13 @@ def generate_stream(
     """
     if not clients:
         raise ValueError("generate_stream needs at least one stage")
+    if sampling is not None and dflash_path:
+        # The block drafter answers with argmax rows only; its verifier has no sampling
+        # contract. Refusing beats running a greedy block under a sampling request and
+        # reporting text that is not distributed as asked.
+        raise ValueError(
+            "DFlash drafting is greedy-only: a sampled round must use spec_k / MTP "
+            "drafting, or drop --dflash")
 
     tail = clients[-1]
     if prefix_ids is None:
@@ -167,8 +198,21 @@ def generate_stream(
     orphans: list[int] = []
     #: Positions that really are in the KV but were never emitted (see the break below).
     kv_tail: list[int] = []
+    last_token: int | None = None
+    # Incremental, not only at the end: a caller that stops the round (or closes the
+    # generator) still has to know where the KV actually got to, and the end-of-round
+    # settlement below may never run for it.
+    stats["n_past"] = n_past
+    stats["emitted"] = 0
     while emitted < max_tokens:
+        if stop is not None and stop.is_set():
+            # One check per token: the loop body is exactly one token, so this is the
+            # finest granularity that costs nothing. The token already emitted stays
+            # emitted; the settlement below makes the KV agree with the transcript.
+            stats["stopped"] = True
+            break
         token = queued.pop(0)
+        last_token = token
         yield Chunk(
             text=assembler.feed(tail.piece(token)),
             token=token,
@@ -176,24 +220,10 @@ def generate_stream(
             stage_ms=[seg[-1] if seg else 0.0 for seg in stage_ms],
         )
         emitted += 1
+        stats["emitted"] = emitted
+        stats["last_token"] = token
+        stats["n_past"] = n_past
         if tail.is_eog(token) or emitted >= max_tokens:
-            pending = token
-            # A speculative step writes its whole verification block to the KV and rolls back
-            # only the rejected tail. If the round ends on the *first* token of that block, the
-            # rest of the block is already placed: the model holds positions the user never saw.
-            # Trimming them back is what this needs and what llama.cpp will not do -- on a
-            # hybrid model `llama_memory_seq_rm` refuses to drop the last position
-            # (measured: seq_rm p0=82 over pos_max=82 -> removed=0, and the next decode then
-            # dies on "pos_max X must be < n_past Y"). So the positions stay, and the round
-            # reports them instead: `pending` is None (the token just emitted is already in the
-            # KV, re-writing it at the next position would duplicate it) and `kv_tail` names the
-            # tokens that are in play but never shown. A single-turn caller ignores both; a
-            # continuation has to replay `kv_tail` or its history is short by that many tokens.
-            written = n_past - round_start - len(prompt_tokens)
-            if emitted <= written:
-                pending = None
-                kv_tail = list(queued[:written - emitted])
-            orphans = list(queued)
             break
         if queued:
             # A speculative round settles several tokens at once; emit the rest without
@@ -208,10 +238,34 @@ def generate_stream(
         elif driver is not None:
             queued = driver.step(token, n_past)
         elif spec_k > 0:
-            queued = speculate(clients, token, n_past, stage_ms, spec_k, stats)
+            queued = speculate(clients, token, n_past, stage_ms, spec_k, stats,
+                               sampling=sampling)
         else:
             queued = [forward(clients, [token], n_past, stage_ms)]
         n_past += len(queued)
+        stats["n_past"] = n_past
+
+    # One settlement for every way a round can end -- eog, the token cap, or `stop`. Three
+    # copies of this arithmetic is how a stopped round ends up with a KV that disagrees
+    # with the text on screen; the caller has no other way to learn it.
+    written = n_past - round_start - len(prompt_tokens)
+    if last_token is not None:
+        pending = last_token
+    if emitted <= written:
+        # A speculative step writes its whole verification block to the KV and rolls back
+        # only the rejected tail. If the round ends on the *first* token of that block, the
+        # rest of the block is already placed: the model holds positions the user never saw.
+        # Trimming them back is what this needs and what llama.cpp will not do -- on a
+        # hybrid model `llama_memory_seq_rm` refuses to drop the last position
+        # (measured: seq_rm p0=82 over pos_max=82 -> removed=0, and the next decode then
+        # dies on "pos_max X must be < n_past Y"). So the positions stay, and the round
+        # reports them instead: `pending` is None (the token just emitted is already in the
+        # KV, re-writing it at the next position would duplicate it) and `kv_tail` names the
+        # tokens that are in play but never shown. A single-turn caller ignores both; a
+        # continuation has to replay `kv_tail` or its history is short by that many tokens.
+        pending = None
+        kv_tail = list(queued[:max(0, written - emitted)])
+    orphans = list(queued)
 
     if stats is not None:
         # Reported even when nothing continues this sequence, so a caller never has to guess
@@ -220,6 +274,7 @@ def generate_stream(
         stats["pending"] = pending
         stats["orphans"] = orphans
         stats["kv_tail"] = kv_tail
+        stats["last_token"] = last_token
 
     tail_text = assembler.flush()
     if tail_text:

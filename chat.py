@@ -29,6 +29,11 @@ IM_END = "<|im_end|>"
 #: (measured: 16/16 different, see checks/verify_equiv.py).
 THINK = "<think>\n"
 
+#: An open assistant turn. One definition for both the first render and a continuation:
+#: the two used to be spelled separately in checks/verify_multiturn.py, which is exactly
+#: how a renderer drifts.
+ASSISTANT_OPEN = f"{IM_START}assistant\n{THINK}"
+
 
 def apply_chatml(messages: list[dict], system: str | None = None) -> str:
     """Render messages as ChatML, ending on an open assistant turn.
@@ -59,8 +64,29 @@ def apply_chatml(messages: list[dict], system: str | None = None) -> str:
         parts.append(f"{IM_START}{role}\n{content}{IM_END}\n")
 
     # Open the assistant turn: the model continues from here.
-    parts.append(f"{IM_START}assistant\n{THINK}")
+    parts.append(ASSISTANT_OPEN)
     return "".join(parts)
+
+
+def next_turn(question: str, *, assistant_closed: bool) -> str:
+    """Render only the *new* part of a ChatML conversation that is already in the KV.
+
+    A multi-turn driver must not re-render the whole history: the generated tokens are
+    already in the KV, and round-tripping them through text -> token is not lossless for
+    byte-level BPE. What is missing is only the boundary between turns, so this emits the
+    previous assistant turn's closing marker (when the round was cut short before writing
+    it), the new user block, and an open assistant header -- nothing else.
+
+    ``assistant_closed`` says whether the previous turn already wrote ``<|im_end|>`` into
+    the KV, i.e. it stopped on the eog token. When it was truncated by max_tokens the
+    marker is absent, and without it the model would see the next user block interrupting
+    the answer with no turn boundary at all.
+
+    Keeping this here rather than in a caller is what `test_contract.py` enforces: one
+    renderer, or the two drift the way `server.flatten_messages` once did.
+    """
+    opener = "\n" if assistant_closed else f"{IM_END}\n"
+    return f"{opener}{IM_START}user\n{question}{IM_END}\n{ASSISTANT_OPEN}"
 
 
 def chat_token_env() -> dict[str, str]:

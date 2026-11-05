@@ -142,3 +142,37 @@ def needs_logits(role: str) -> str:
     was going to drift, and the duplicated justification already had.
     """
     return "1" if role in LOGITS_ROLES else "0"
+
+
+#: The block drafter (`DFlashDriver`) answers with argmax rows only; there is no sampling
+#: contract behind its verifier. This text is shared because all three entry points have to
+#: say the same thing: the CLI and the TUI refuse the combination, and the server degrades
+#: it per request and reports why.
+DFLASH_NEEDS_GREEDY = ("--dflash 仍是贪心专用：块草稿器只出 argmax，采样下的拒绝验证还没实现")
+
+
+def sampled_spec_problem(temperature: float, top_k: int = 0, top_p: float = 1.0,
+                         extra: dict | None = None) -> str:
+    """Why a *sampled* speculative round cannot honour this sampler; "" when it can.
+
+    `chain_client.speculate` builds p and q as ``softmax(logits / T)`` from raw logits, so a
+    round is only sound when temperature is the only transform on both sides. top_k / top_p
+    / penalties live inside the shim's sampler chain and are never exposed as a
+    distribution; approximating them here while the tail applies the real chain is how a
+    silently biased stream ships. Hence: refuse in the entry points that can (CLI, TUI) and
+    degrade visibly in the one that cannot (the server, one request at a time).
+
+    One implementation because the CLI carried this check inline and the TUI and server
+    would have copied it -- the TUI's copy was already going to drift on the top_p default.
+    """
+    if not temperature > 0.0:
+        return "采样投机需要 temperature > 0（贪心投机用 --greedy）"
+    if top_k not in (0, -1) or top_p < 1.0:
+        return ("采样投机只支持 temperature：top_k/top_p 在 shim 的采样链内部，不会以分布形式"
+                "暴露，两边就得不到同一个变换。请显式给 --top-k 0 --top-p 1.0，"
+                "或改用 --greedy 走原来的贪心投机。")
+    transforms = sorted(k for k, v in (extra or {}).items() if v)
+    if transforms:
+        return (f"采样投机只支持 temperature：{transforms} 在 shim 的采样链内部，不会以分布形式"
+                f"暴露，两边就得不到同一个变换。关掉它们，或改用 --greedy。")
+    return ""

@@ -18,12 +18,14 @@ import time
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
+import chat
 import config
 import topology
 from chain_client import (GPU_VRAM_OVERHEAD, VRAM_PER_BYTE, StageClient, _terminate,
@@ -121,6 +123,12 @@ class Boot:
     def run(self) -> None:
         """后台线程里跑完整准备流程；失败写进 self.error，不抛给界面。"""
         try:
+            # ChatML 的 <|im_start|> 必须按 special token 解析，否则它会碎成普通片段，模型
+            # 看到的是被拆坏的对话标记 —— 比裸文本更糟。必须在 spawn 之前设：worker 继承
+            # 启动时的环境，晚一步就只影响下一次启动。--plain 不设，裸文本里那几个字符
+            # 本来就该当普通文本。
+            if not getattr(self.args, "plain", False):
+                os.environ.update(chat.chat_token_env())
             self.topology, self.ctx = find_topology(self.args.topology), config.ctx()
             self.stages = topology.load(self.topology)
             self.done.add("topology")
@@ -239,6 +247,107 @@ class Metrics:
     def stage_ms(self) -> list[float]:
         """每段取样本中位数：单次抖动不该让条形跳一下。"""
         return [0.0 if not h else sorted(h)[len(h) // 2] for h in self.hist]
+
+
+class Session:
+    """真多轮的账本：累积的 token、KV 已写到哪、以及两者之间的差额。
+
+    真多轮的地基只有一条不变量：KV 里的位置 ``[0, n_past)`` 恰好等于 ``ids[:n_past]``。
+    守住它，下一轮才能把新 token 接在后面而不必重放整段历史；丢掉它，模型看到的就是一段
+    用户从未见过的上下文，而输出「看起来像话」，没人会发现。
+
+    破坏这条不变量的只有一件事：投机块在轮末被截断时，llama.cpp 已经把整块写进 KV，却
+    不允许回退最后一个位置（见 docs/ISSUE-recurrent-snapshot-rollback.md），于是 KV 里
+    留下若干「已写但没 emit」的 token。``align()`` 一发现这种差额就要求调用者「从 ids
+    重放整段」——它不尝试裁剪，原因见 ``align()`` 的 docstring（hybrid 上 seq_rm 会静默
+    失败）。重放慢一次，但 KV 与对话文本严格一致。
+
+    ``ids`` 里包含 ``pending``——已 emit、但还没写进 KV 的最后一个 token。下一轮把它前置到
+    ``prefix_ids`` 前面，位置就接上了（`stream.generate_stream` 的续写契约）。
+    """
+
+    def __init__(self) -> None:
+        self.ids: list[int] = []
+        self.n_past = 0                 # KV 已写到的位置数
+        self.pending: int | None = None  # 已 emit、未写 KV 的最后一个 token
+        self.last: int | None = None     # 本轮最后 emit 的 token（判 ChatML 是否收尾）
+        self.rounds = 0
+        self.replays = 0                # 被强制整段重放的次数（诊断用）
+        self.dirty = False              # 上一轮异常退出，KV 状态未知
+
+    def reset(self) -> None:
+        self.ids, self.n_past, self.pending, self.last = [], 0, None, None
+        self.rounds, self.replays, self.dirty = 0, 0, False
+
+    def kv_target(self) -> int:
+        """KV 里应该有多少个位置，即 ``ids`` 中已经写进 KV 的那部分。
+
+        ``pending`` 那个 token 已经在 ``ids`` 里（它被 emit 出去了），但还没走过
+        forward，所以 KV 应比 ``ids`` 少一个。
+        """
+        return len(self.ids) - (1 if self.pending is not None else 0)
+
+    def stray(self) -> int:
+        """KV 里多出来、不属于对话的位置数（投机块残留）。"""
+        return max(0, self.n_past - self.kv_target())
+
+    def align(self, clients) -> bool:
+        """KV 里有多余位置时返回 True，调用者必须整段重放。
+
+        这里**不尝试** `seq_rm` 把尾巴裁掉，因为实测它在 hybrid 模型上会静默失败：
+
+            [seq_rm] p0=236 rc=-6
+            ... the last position stored in the memory module ... is X = 237
+            ... the tokens ... have a starting position of Y = 236
+            llama_decode: failed to decode, ret = -1
+
+        `-6` 表示「那段范围里没有可删的行」，shim 把它当 no-op 不报错（`keep_head_worker`
+        的既有约定，对投机回滚是对的），于是调用方从返回值上分辨不出「裁掉了」和「没裁」。
+        下一次 prefill 直接死在 `X < Y` 上，整条链报废。
+
+        重放一次 prefill 是看得见的慢；一个静默坏掉的 KV 是看不见的错。选前者。这条路径
+        只在「轮末停在投机块内」时触发——纯 decode 不会产生多余位置。
+        """
+        return self.stray() > 0
+
+    def encode(self, clients, question: str, *, plain: bool, system: str | None) -> list[int]:
+        """本轮新增部分的 token。渲染只交给 chat：第二个渲染器就是漂移的起点。"""
+        if plain:
+            text = question if not self.rounds else f"\n{question}\n"
+        elif not self.rounds:
+            text = chat.apply_chatml([{"role": "user", "content": question}], system=system)
+        else:
+            # 上一轮是否已经写了 <|im_end|>：自然停止时 pending 就是它；被 max_tokens
+            # 截断时缺这个边界，next_turn 会补上。
+            closed = self.last is not None and clients[-1].is_eog(self.last)
+            text = chat.next_turn(question, assistant_closed=closed)
+        return clients[0].tokenize(text)
+
+    def prepare(self, clients, question: str, *, plain: bool,
+                system: str | None) -> tuple[list[int], int, list[int]]:
+        """返回 ``(prefix_ids, n_past, fresh)``：这一轮要写进链的 token、起始位置、新增部分。"""
+        if self.dirty or self.align(clients):
+            # 整段重放：清掉 KV，把累积的对话 token 重新写回去。dirty 时连位置账都不能
+            # 信——上一轮的异常可能停在一次 forward 中间，KV 的实际内容无从推断。
+            for client in clients:
+                client.reset()
+            self.n_past, self.pending, self.dirty = 0, None, False
+            if self.ids:
+                self.replays += 1
+            prefix = list(self.ids)
+        else:
+            prefix = [] if self.pending is None else [self.pending]
+        fresh = self.encode(clients, question, plain=plain, system=system)
+        return prefix + fresh, self.n_past, fresh
+
+    def record(self, stats: dict, fresh: list[int], generated: list[int]) -> None:
+        """一轮结束（自然结束或被停止）后记账，使下一轮的起点有据可依。"""
+        self.ids.extend(fresh)
+        self.ids.extend(generated)
+        self.n_past = int(stats.get("n_past", self.n_past))
+        self.pending = stats.get("pending")
+        self.last = stats.get("last_token")
+        self.rounds += 1
 
 
 class Ask(Input):
@@ -411,6 +520,9 @@ class KLlamaApp(App):
     #splash { padding: 1 2; }
     """
     BINDINGS = [Binding("ctrl+c", "quit", "退出", system=True),
+                # Esc 是生成中唯一的软出口。Ctrl+C 会连着 worker 一起杀，而一段 35B 的
+                # 权重要几十秒才装载回来；Esc 只让生成循环在下一个 token 处收尾。
+                Binding("escape", "stop", "停止生成", priority=True),
                 Binding("q", "quit", "退出")]
     # Textual 会在屏幕顶行画 TITLE/SUB_TITLE；名字已经在自己的顶栏里，这里留空以免
     # 同一行出现两个标题（实测不设时它会画类名 KLlamaApp）。
@@ -425,6 +537,11 @@ class KLlamaApp(App):
         self.answer = ""
         self.busy = self.main_shown = False
         self.exit_code = 0
+        #: 真多轮的账本。启动画面期间是空的，第一问从位置 0 起。
+        self.session = Session()
+        self.stop_event = threading.Event()
+        #: 参数行上的一句状态（已停止 / 停止中…）；下一问开始时清掉。
+        self.note = ""
 
     def compose(self) -> ComposeResult:
         yield Static(id="splash")          # 启动画面，与主界面互斥
@@ -434,7 +551,8 @@ class KLlamaApp(App):
         yield Static(id="pipehead", classes="main")
         yield VerticalScroll(id="pipe", classes="main")          # 段数不定，必须可滚动
         yield Static(id="params", classes="main")
-        yield Ask(id="ask", classes="main", placeholder="输入问题，Enter 发送　·　空输入按 q 退出")
+        yield Ask(id="ask", classes="main",
+                  placeholder="输入问题，Enter 发送　·　/clear 清空上下文　·　Esc 停止生成")
 
     def on_mount(self) -> None:
         self.set_interval(0.08, self.tick)                       # 唯一的刷新节拍
@@ -472,10 +590,11 @@ class KLlamaApp(App):
         self.paint()
 
     def show_chat(self) -> None:
-        """把当前对话推给对话区并滚到底。"""
+        """把当前对话推给对话区并滚到底。question 为空的行是系统提示（/clear 分界）。"""
         t = Text()
         for question, answer in self.turns:
-            t.append(f"你  {question}\n", style="bold #4d8de0")
+            if question:
+                t.append(f"你  {question}\n", style="bold #4d8de0")
             t.append(f"{answer}\n\n", style="#e6e8f0")
         self.query_one("#chat", Static).update(t)
         self.query_one("#chatbox", VerticalScroll).scroll_end(animate=False)
@@ -514,9 +633,9 @@ class KLlamaApp(App):
         greedy = config.is_greedy({"temperature": self.args.temperature})
         mode = "贪心" if greedy else f"采样 temp={self.args.temperature:g}"
         drafts: list[str] = []
-        if greedy and self.args.dflash:
+        if self.args.dflash:
             drafts.append(f"DFlash k={self.args.dflash_block - 1}")
-        if greedy and self.args.spec_k:
+        if self.args.spec_k:
             drafts.append(f"MTP k={self.args.spec_k}")
         draft_txt = (" · " + " + ".join(drafts)) if drafts else ""
         # 加载后的显存实测：预检是估算，段真正驻留后只有这一份能抓到溢出。溢出完全
@@ -527,77 +646,161 @@ class KLlamaApp(App):
         if v and v["spill"]:
             spill = (f"  [#e3596b]⚠ 显存溢出 {v['landed'] / GIB:.2f}/"
                      f"{v['want'] / GIB:.2f} GiB —— 降最贵段的 gpu_layers[/]")
+        # 真多轮之后「每问重置 KV」不再成立，这里换成 KV 的已用位置：它既是下一问能否
+        # 继续的唯一依据（满了会被拒绝，不静默截断），也是 /clear 前后唯一可见的差别。
+        sess = self.session
+        used = f"KV {sess.n_past}/{boot.ctx} tok" if boot.ctx else f"KV {sess.n_past} tok"
+        turns = f"{sess.rounds} 轮" if sess.rounds else "首问"
+        fmt = "plain" if self.args.plain else "ChatML"
+        note = f"  [#e3a04a]{self.note}[/]" if self.note else ""
+        replay = f"  [#e3a04a]重放 {sess.replays} 次[/]" if sess.replays else ""
         self.query_one("#params", Static).update(
             f"[#8f96a8]ctx {boot.ctx}  max_tokens {self.args.max_tokens}  "
-            f"{mode}{draft_txt}  每问重置 KV[/]  [#7b8194]· "
-            f"{boot.topology.name if boot.topology else ''}[/]{spill}")
+            f"{mode}{draft_txt}  {fmt} · {turns} · {used}[/]{note}{replay}  "
+            f"[#7b8194]· {boot.topology.name if boot.topology else ''}[/]{spill}")
 
     def ask(self, prompt: str) -> None:
         if self.busy or not self.boot.clients:
             return
+        self.stop_event.clear()
+        self.note = ""
         self.turns.append((prompt, ""))
         self.answer, self.busy = "", True
         self.metrics, self.metrics.t0 = Metrics(len(self.boot.stages)), time.perf_counter()
         self.paint()
         self.run_worker(lambda: self.generate(prompt), thread=True, name="gen")
 
+    def action_stop(self) -> None:
+        """Esc：让生成在下一个 token 处收尾，不碰 worker。
+
+        Ctrl+C 走 action_quit，会连 worker 一起清理——那是对的退出，但对「这段答歪了」
+        是灾难：35B 两段要几十秒才装载回来。这里只置一个 Event，解码循环每 token 看一次，
+        停下来以后 KV 由 Session 对齐，链保持可用。
+        """
+        if not self.busy:
+            return
+        if not self.stop_event.is_set():
+            self.stop_event.set()
+            self.note = "停止中…"
+            self.paint()
+
     def generate(self, prompt: str) -> None:
+        """生成线程：真多轮续写 + ChatML + 采样投机 + 可被 Esc 打断。"""
+        args, clients = self.args, self.boot.clients
         try:
-            args = self.args
-            # Tokenize before resetting anything: a prompt that cannot fit ctx together with
-            # max_tokens makes llama_decode return rc=-1 partway through the answer, which
-            # surfaces as a dead chain rather than as a bad question. Tokenizing here costs
-            # one extra round trip (generate_stream tokenizes too) and is the only place the
-            # real token count exists on this side of it.
-            n_prompt = len(self.boot.clients[0].tokenize(prompt))
-            if why := context_shortfall(n_prompt, args.max_tokens, self.boot.ctx):
-                self.call_from_thread(self.on_error, why)
+            # 先把 KV 账对齐（裁掉上一轮的投机块残留，必要时整段重放），再决定本轮从哪
+            # 个位置写。prefix 里可能带着上一轮 pending 的那个 token。
+            prefix, n_past, fresh = self.session.prepare(
+                clients, prompt, plain=args.plain, system=args.system or None)
+            # 上下文检查必须在任何 decode 之前：超额时 llama_decode 返回 rc=-1，链会死在
+            # 半路，看起来像「模型坏了」而不是「放不下」。给的是差额，不是一句 ctx 超了。
+            if why := context_shortfall(n_past + len(prefix), args.max_tokens, self.boot.ctx):
+                self.call_from_thread(
+                    self.on_error,
+                    f"{why}（历史 {n_past} tok + 本轮 {len(prefix)} tok；"
+                    f"用 /clear 清空上下文，或调小 --max-tokens）")
                 return
-            for client in self.boot.clients:  # 每问独立：KV 与位置都从一开始
-                client.reset()
             greedy = config.is_greedy({"temperature": args.temperature})
-            tail = self.boot.clients[-1]
-            # Sampler state lives in the shim and survives a KV reset, so it is set on
-            # every request rather than once at boot: a run that switched modes must not
-            # leave the tail sampling for the next question.
+            tail = clients[-1]
+            # 采样器状态在 shim 里、能活过 KV reset，所以每问都设一次：否则上一问的模式
+            # 会留到这一问。
+            sampling = None
             if greedy:
                 tail.clear_sampling()
             else:
                 tail.set_sampling(temperature=args.temperature, top_k=args.top_k,
                                   top_p=args.top_p, seed=args.seed)
-            # Drafting is only sound at temperature 0; a sampling tail would make the
-            # verifier accept tokens the sampler never produced.
+                # 采样投机：拒绝采样要 p、q 两张分布，而 top_k/top_p/penalties 在 shim 的
+                # 采样链内部、不以分布形式暴露。能走到这里说明 main() 已经拒绝过不支持
+                # 的组合（config.sampled_spec_problem）；这里只把 temperature 与 RNG 交给
+                # 解码循环，使同一 --seed 的两次运行逐 token 可复现。
+                sampling = {"temperature": args.temperature,
+                            "rng": np.random.default_rng(args.seed)}
+            stats: dict = {}
+            generated: list[int] = []
             for chunk in generate_stream(
-                    self.boot.clients, prompt,
-                    max_tokens=args.max_tokens,
-                    spec_k=args.spec_k if greedy else 0,
-                    dflash_path=args.dflash if greedy else "",
-                    dflash_block=args.dflash_block,
-                    cascade_mtp=getattr(args, "cascade_mtp", 0)):
+                    clients, "", prefix_ids=prefix, n_past=n_past,
+                    max_tokens=args.max_tokens, spec_k=args.spec_k,
+                    dflash_path=args.dflash, dflash_block=args.dflash_block,
+                    cascade_mtp=getattr(args, "cascade_mtp", 0),
+                    sampling=sampling, stop=self.stop_event, stats=stats):
+                # token == -1 是组装器收尾补的剩余文本，不是模型生成的 id，不能进历史。
+                if chunk.token >= 0:
+                    generated.append(chunk.token)
                 self.call_from_thread(self.on_chunk, chunk, time.perf_counter())
+            self.session.record(stats, fresh, generated)
+            note = ("⏹ 已停止：已生成的部分留在上下文里，下一问接着这段写"
+                    if stats.get("stopped") else "")
+            self.call_from_thread(self.flush, "", note)
         except Exception as exc:  # noqa: BLE001 - 错误要显示在对话区
-            self.call_from_thread(self.on_error, f"{type(exc).__name__}: {exc}")
-            return
-        self.call_from_thread(self.flush)
+            # 这一轮可能停在一次 forward 中间，KV 的实际内容无从推断：下一轮整段重放，
+            # 而不是接着一个说不清的 n_past 写下去。
+            self.session.dirty = True
+            self.call_from_thread(
+                self.on_error,
+                f"{type(exc).__name__}: {exc}\n（本轮未计入上下文，下一问会从已确认的历史重放）")
 
     def on_chunk(self, chunk, now: float) -> None:
         self.metrics.add(chunk, now)
         self.buf.append(chunk.text)
 
-    def on_error(self, message: str) -> None: self.flush(extra=f"\n[错误] {message}")
+    def on_error(self, message: str) -> None:
+        self.note = ""
+        self.flush(extra=f"\n[错误] {message}")
 
-    def flush(self, extra: str = "") -> None:
-        """一轮生成结束（或出错）：把累积的文本落到对话区，然后刷新指标。"""
+    def flush(self, extra: str = "", note: str = "") -> None:
+        """一轮生成结束（正常 / 被停止 / 出错）：把累积的文本落到对话区，然后刷新指标。"""
         self.busy, self.answer = False, self.answer + "".join(self.buf) + extra
         self.buf = []
+        if note:
+            self.answer += f"\n{note}"
+            self.note = "已停止"
+        elif not extra:
+            self.note = ""
         if self.turns:
             self.turns[-1] = (self.turns[-1][0], self.answer)
             self.show_chat()
         self.paint()
 
+    def clear_context(self) -> None:
+        """丢弃上下文：KV 置空、累积序列清零。
+
+        对话文本留在屏幕上（否则用户会以为历史被吞了），但明确标出分界线：这条线以上
+        的内容不再喂给模型。下一问从位置 0 重新开一段 ChatML 对话。
+        """
+        if self.busy:
+            return
+        failed: list[int] = []
+        for client in self.boot.clients:
+            try:
+                client.reset()
+            except Exception:  # noqa: BLE001 - 一段失败不该挡住其它段，但必须记住
+                failed.append(client.stage.index)
+        self.session.reset()
+        self.note = ""
+        if failed:
+            # reset 失败的段 KV 状态未知，下一问必须先重放而不是从「位置 0」开始。
+            self.session.dirty = True
+            self.turns.append(("", f"── 上下文已清空，但 stage {failed} 的 reset 失败："
+                                   f"下一问会重放已确认的历史 ──"))
+        else:
+            self.turns.append(("", "── 上下文已清空：上面的对话不再喂给模型，下一问从位置 0 开始 ──"))
+        self.show_chat()
+        self.paint()
+
+    def command(self, text: str) -> None:
+        name = text.split()[0].lower()
+        if name in ("/clear", "/reset"):
+            self.clear_context()
+        else:
+            self.turns.append(("", f"[未知命令 {name}；可用 /clear 清空上下文]"))
+            self.show_chat()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.input.value, prompt = "", event.value.strip()
-        if prompt:
+        if prompt.startswith("/"):
+            self.command(prompt)
+        elif prompt:
             self.ask(prompt)
 
 
@@ -614,12 +817,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--greedy", action="store_true",
                     help="temperature 0（默认即如此；显式给出便于与 --temperature 对照）")
     ap.add_argument("--temperature", type=float, default=0.0,
-                    help="采样温度；>0 时关闭投机（验证器只暴露 argmax）")
+                    help="采样温度；>0 时默认仍可投机，但只支持 temperature（见 --spec-k）")
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--plain", action="store_true",
+                    help="不渲染 ChatML，直接发裸文本（默认走 ChatML；多轮也按 ChatML 续写）")
+    ap.add_argument("--system", default="",
+                    help="ChatML 的 system 段（默认不注入，与 server 的行为一致）")
     ap.add_argument("--spec-k", type=int, default=0,
-                    help="MTP 递归草稿数；只在 temperature 0 下生效")
+                    help="MTP 递归草稿数；贪心与采样都支持，采样时要求 --top-k 0 --top-p 1.0")
     ap.add_argument("--dflash", default="",
                     help="DFlash 草稿 GGUF；只在 temperature 0 下生效")
     ap.add_argument("--dflash-block", type=int, default=6,
@@ -629,6 +836,14 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.greedy:
         args.temperature = 0.0
+    # 参数组合的冲突在装载任何权重之前就拒绝：跑到生成里才发现，代价是几十秒的加载和
+    # 一个死掉的链。判据本身只有一份（config.sampled_spec_problem），CLI 与 TUI 共用。
+    greedy = config.is_greedy({"temperature": args.temperature})
+    if args.dflash and not greedy:
+        raise SystemExit(config.DFLASH_NEEDS_GREEDY)
+    if args.spec_k and not greedy:
+        if why := config.sampled_spec_problem(args.temperature, args.top_k, args.top_p):
+            raise SystemExit(why)
     if args.ctx:
         os.environ[config.CTX_ENV] = str(args.ctx)
     app = KLlamaApp(args)

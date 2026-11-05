@@ -30,6 +30,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
@@ -128,6 +130,44 @@ class Chain:
             client.connect(proc=local.get(client.stage.index))
         self.ready = True
 
+    def spec_plan(self, sampling: dict | None) -> dict:
+        """This request's speculation outcome: ``{requested, active, reason}``.
+
+        The greedy path keeps the startup configuration unchanged. A sampled request can
+        also speculate now (`chain_client.speculate`'s rejection sampler), but only when the
+        sampler is temperature-only: p and q are built from raw logits as softmax(logits/T),
+        and top_k / top_p / penalties live inside the shim's sampler chain without ever being
+        exposed as a distribution. Asking for them therefore *degrades* this request to plain
+        decode -- and says so in the response. A silent downgrade would be indistinguishable
+        from network jitter: the same client gets speculative speed until it passes top_p,
+        then suddenly does not.
+
+        The rule itself is `config.sampled_spec_problem`, shared with the CLI and the TUI;
+        those two can refuse the combination outright because their flags are fixed for the
+        run, while here it is decided per request.
+        """
+        greedy = config.is_greedy(sampling)
+        if not (self._spec_k or self._dflash):
+            return {"requested": False, "active": False, "reason": ""}
+        if greedy:
+            return {"requested": True, "active": True, "reason": ""}
+        if self._dflash:
+            # The block drafter answers with argmax rows only; there is no sampled verifier.
+            return {"requested": True, "active": False,
+                    "reason": config.DFLASH_NEEDS_GREEDY}
+        params = sampling or {}
+        try:
+            temperature = float(params.get("temperature", 1.0))
+            top_k = int(params.get("top_k", 0) or 0)
+            top_p = float(params.get("top_p", 1.0))
+        except (TypeError, ValueError):
+            return {"requested": True, "active": False,
+                    "reason": "malformed sampler parameters"}
+        extra = {k: v for k, v in params.items()
+                 if k not in ("temperature", "top_k", "top_p", "seed")}
+        why = config.sampled_spec_problem(temperature, top_k, top_p, extra)
+        return {"requested": True, "active": not why, "reason": why}
+
     def generate(self, prompt: str, max_tokens: int, sampling: dict | None = None,
                  stats: dict | None = None):
         """Yield Chunk, serialised under the chain lock.
@@ -167,15 +207,24 @@ class Chain:
                 else:
                     # Restore the pristine argmax path, not a greedy chain.
                     tail.clear_sampling()
-            # Drafting only holds at temperature 0: the verifier compares drafts against
-            # the chain's argmax, so a sampling tail would make it accept tokens the
-            # sampler never produced. A sampling request therefore runs plain decode.
+            spec = self.spec_plan(sampling)
+            if stats is not None:
+                stats["speculation"] = spec
+            spec_sampling = None
+            if not greedy and spec["active"]:
+                # Temperature-only by construction (spec_plan refused everything else), so
+                # the rejection sampler's p/q match the tail's own transform.
+                spec_sampling = {
+                    "temperature": float((sampling or {}).get("temperature", 1.0)),
+                    "rng": np.random.default_rng((sampling or {}).get("seed")),
+                }
             yield from generate_stream(
                 self._clients, prompt, max_tokens=max_tokens,
-                spec_k=self._spec_k if greedy else 0,
-                dflash_path=self._dflash if greedy else "",
+                spec_k=self._spec_k if spec["active"] else 0,
+                dflash_path=self._dflash if (spec["active"] and greedy) else "",
                 dflash_block=self._dflash_block,
                 cascade_mtp=self._cascade_mtp,
+                sampling=spec_sampling,
                 stats=stats,
             )
 
@@ -183,13 +232,16 @@ class Chain:
               sink=None):
         """One generation pass, shared by all four response shapes.
 
-        Returns ``(text, completion_tokens, prompt_tokens, elapsed)``. The four shapes
+        Returns ``(text, completion_tokens, prompt_tokens, elapsed, stats)``. The four shapes
         used to carry their own loops, and the counting differed between them: the
         streaming variants skipped chunks whose text was empty (a partial UTF-8 byte
         group the assembler is still holding) before counting, the full variants counted
         them -- so the same answer reported a different ``completion_tokens`` depending
         on ``stream``. Counting tokens rather than chunks also stops the final flush
         chunk (``token == -1``) from being counted as one.
+
+        ``stats`` is returned as well because it now carries the per-request speculation
+        verdict: whether the configured drafts actually ran, and why not when they did not.
         """
         parts: list[str] = []
         tokens = 0
@@ -203,7 +255,7 @@ class Chain:
             if chunk.token >= 0:
                 tokens += 1
         return ("".join(parts), tokens, int(stats.get("prompt_tokens", 0)),
-                time.perf_counter() - started)
+                time.perf_counter() - started, stats)
 
     def sampling_state(self) -> dict:
         """What the tail stage currently has in effect, for the response body."""
@@ -375,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
                        max_tokens: int, ignored: list[str],
                        sampling: dict | None = None) -> None:
         try:
-            text, tokens, prompt_tokens, elapsed = self.chain.drain(
+            text, tokens, prompt_tokens, elapsed, drain_stats = self.chain.drain(
                 prompt, max_tokens, sampling)
         except ContextOverflow as exc:
             # The request asks for more than ctx can hold; that is the client's mistake,
@@ -404,6 +456,10 @@ class Handler(BaseHTTPRequestHandler):
                 "elapsed_seconds": round(elapsed, 3),
                 "ignored_parameters": ignored,
                 "sampling": effective,
+                # Whether the configured drafts ran for *this* request, and the reason when
+                # they did not. A sampled request that also asked for top_k/top_p degrades
+                # to plain decode; without this field that slowdown would be invisible.
+                "speculation": drain_stats.get("speculation"),
             },
         }
         self._json(200, payload)
@@ -431,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "finish_reason": None}]})
 
         try:
-            _text, tokens, prompt_tokens, _elapsed = self.chain.drain(
+            _text, tokens, prompt_tokens, _elapsed, drain_stats = self.chain.drain(
                 prompt, max_tokens, sampling, sink=emit_text)
         except (BrokenPipeError, ConnectionResetError):
             return              # client hung up; the chain lock is released by the generator
@@ -444,7 +500,8 @@ class Handler(BaseHTTPRequestHandler):
                    "choices": [{"index": 0, "delta": {},
                                 "finish_reason": "length" if tokens >= max_tokens else "stop"}],
                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens},
-                   "slimarc": {"sampling": self.chain.sampling_state()}})
+                   "slimarc": {"sampling": self.chain.sampling_state(),
+                               "speculation": drain_stats.get("speculation")}})
         self._sse("[DONE]")
 
     # -- /v1/responses ---------------------------------------------------------
@@ -491,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
                         prompt: str, max_tokens: int, meta: dict,
                         sampling: dict | None) -> None:
         try:
-            text, tokens, prompt_tokens, _elapsed = self.chain.drain(
+            text, tokens, prompt_tokens, _elapsed, drain_stats = self.chain.drain(
                 prompt, max_tokens, sampling)
         except ContextOverflow as exc:
             self._json(400, {"error": {"message": str(exc),
@@ -508,6 +565,10 @@ class Handler(BaseHTTPRequestHandler):
             [responses_message(mid, text, item_status)],
             responses_usage(prompt_tokens, tokens), incomplete_reason=reason,
             **{k: v for k, v in meta.items() if v is not None})
+        # An extra field beside the protocol object, for the same reason the chat endpoint
+        # has carried `slimarc` all along: a request whose sampler cannot be verified gets
+        # plain decode, and the client has to be able to see that instead of guessing.
+        payload["slimarc"] = {"speculation": drain_stats.get("speculation")}
         self._json(200, payload)
 
     def _responses_stream(self, rid: str, mid: str, created: float, model: str,
@@ -545,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
         seq += 1
 
         try:
-            full, tokens, prompt_tokens, _elapsed = self.chain.drain(
+            full, tokens, prompt_tokens, _elapsed, drain_stats = self.chain.drain(
                 prompt, max_tokens, sampling, sink=lambda text: emit(
                     # `logprobs` is part of the schema, not an option here: the SDK's
                     # typed model declares it required, so it is always sent, empty.
@@ -578,6 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             rid, created, model, status,
             [responses_message(mid, full, item_status)],
             responses_usage(prompt_tokens, tokens), incomplete_reason=reason, **meta)
+        final["slimarc"] = {"speculation": drain_stats.get("speculation")}
         self._sse({"type": "response.completed", "sequence_number": seq,
                    "response": final})
         self._sse("[DONE]")
@@ -591,9 +653,11 @@ def main() -> int:
     ap.add_argument("--topology", default="")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--spec-k", type=int, default=0,
-                    help="MTP 递归草稿数；只对 temperature=0 的请求生效（默认 0 = 关闭）")
+                    help="MTP 递归草稿数（默认 0 = 关闭）。贪心的请求全速生效；"
+                         "采样请求只在 sampler 仅含 temperature 时生效，否则该请求降级"
+                         "为普通 decode 并在响应里说明")
     ap.add_argument("--dflash", default="",
-                    help="DFlash 草稿 GGUF；给了就走并行块草稿，同样只在 temperature=0 生效")
+                    help="DFlash 草稿 GGUF；给了就走并行块草稿，只在 temperature=0 生效")
     ap.add_argument("--cascade-mtp", type=int, default=0,
                     help="DFlash 块整块接受后再用 MTP 追加几个草稿（0=关，见 chain_client）")
     ap.add_argument("--dflash-block", type=int, default=6,
@@ -641,7 +705,9 @@ def main() -> int:
         spec_note.append(f"DFlash block={args.dflash_block}")
     if args.spec_k:
         spec_note.append(f"MTP k={args.spec_k}")
-    spec_txt = ("; speculation: " + ", ".join(spec_note) + " at temperature 0") if spec_note else ""
+    spec_txt = ("; speculation: " + ", ".join(spec_note)
+                + " (greedy requests always; sampled requests only when the sampler is "
+                  "temperature-only -- otherwise the response says so)") if spec_note else ""
     print(f"ready on http://{args.host}:{args.port}  "
           f"(stages={len(stages)}, sampling on the tail stage; argmax by default{spec_txt})",
           flush=True)

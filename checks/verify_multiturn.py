@@ -55,7 +55,7 @@ import config  # noqa: E402
 import topology  # noqa: E402
 import chain_client  # noqa: E402
 from chain_client import StageClient, _terminate, bring_up, tail_rs_depth  # noqa: E402
-from chat import IM_END, IM_START, THINK, apply_chatml  # noqa: E402
+from chat import apply_chatml, next_turn  # noqa: E402
 from stream import generate_stream  # noqa: E402
 
 # Worker 日志走一个本脚本专属的目录。`build/relay-records` 是共享路径，而本机可能同时
@@ -119,19 +119,20 @@ def _turn(clients, delta_text: str, n_past: int, pending: int | None,
 def _delta_text(index: int, question: str, pending_is_eog: bool) -> str:
     """把一问接成 ChatML 的下一个块。
 
-    第 1 轮用 `chat.apply_chatml`（唯一的 ChatML 渲染器，§7 的守卫会盯着它），后续轮
-    只追加「上一轮 assistant 的收尾 + 新的 user 块 + 开着的 assistant 头」。之所以不
-    每轮都用 apply_chatml 渲染整段：那样就得把历史文本重新 token 化一遍，而生成出来的
-    token 序列经 文本→token 往返并不无损（字节级 BPE），KV 里留着的和重新编码出来的会
-    悄悄错开。这里只渲染**新增的部分**，历史原样留在 KV 里。
+    第 1 轮用 `chat.apply_chatml`，后续轮用 `chat.next_turn`——**唯一**的 ChatML 渲染器。
+    这里原先自己拼 `<|im_start|>` 标记，是第二份渲染器（TUI 的多轮也要同一段文本，
+    两边一定会漂）；现在两个入口调同一个函数。
+
+    之所以不每轮都用 apply_chatml 渲染整段：那样就得把历史文本重新 token 化一遍，而生成
+    出来的 token 序列经 文本→token 往返并不无损（字节级 BPE），KV 里留着的和重新编码出来
+    的会悄悄错开。next_turn 只渲染**新增的部分**，历史原样留在 KV 里。
+
+    `pending_is_eog`：上一轮若是自然停止，pending 就是 `<|im_end|>`，收尾已经写进 KV；
+    被 max_tokens 截断时才需要补一个结束标记，否则模型会看到「回答直接被新的 user 块截断」。
     """
-    turn = f"{IM_START}user\n{question}{IM_END}\n{IM_START}assistant\n{THINK}"
     if index == 0:
         return apply_chatml([{"role": "user", "content": question}], system=SYSTEM)
-    # 上一轮若是自然停止，pending 就是 <|im_end|>，收尾已经写进 KV；被 max_tokens 截断时
-    # 才需要自己补一个结束标记，否则模型会看到「回答直接被新的 user 块截断」。
-    opener = "\n" if pending_is_eog else f"{IM_END}\n"
-    return opener + turn
+    return next_turn(question, assistant_closed=pending_is_eog)
 
 
 def _decode(clients, ids: list[int]) -> str:
