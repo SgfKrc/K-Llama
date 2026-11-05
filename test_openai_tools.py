@@ -343,5 +343,63 @@ class FakeChain:
         return {}
 
 
+class PromptReuse(unittest.TestCase):
+    """Turning a replay into a continuation, and every case where that must not happen.
+
+    The failure mode here is not an exception, it is an answer computed over a context the
+    model never saw: the ledger has to describe the KV position by position, and any doubt
+    has to drop it so the next request replays.
+    """
+
+    def chain(self, held):
+        chain = object.__new__(server.Chain)
+        chain._kv_tokens = list(held)
+        return chain
+
+    def test_a_true_prefix_is_reused_up_to_what_the_kv_holds(self):
+        chain = self.chain([1, 2, 3])
+        self.assertEqual(3, chain._reusable([1, 2, 3, 4, 5]))
+
+    def test_diverging_ids_force_a_replay(self):
+        chain = self.chain([1, 2, 9])
+        self.assertEqual(-1, chain._reusable([1, 2, 3, 4]))
+
+    def test_a_kv_longer_than_the_prompt_forces_a_replay(self):
+        # Continuing would mean trimming the tail, which a hybrid model refuses silently.
+        chain = self.chain([1, 2, 3, 4])
+        self.assertEqual(-1, chain._reusable([1, 2]))
+
+    def test_no_ledger_means_no_reuse(self):
+        self.assertEqual(-1, self.chain([])._reusable([1, 2, 3]))
+
+    def test_a_finished_round_is_recorded_without_its_pending_token(self):
+        chain = self.chain([])
+        stats = {"n_past": 3, "pending": 7}
+        chain._remember([1, 2], [8, 7], stats, {"active": False})
+        # prompt 1,2 then generated 8 went into the KV; 7 was emitted but never forwarded.
+        self.assertEqual([1, 2, 8], chain._kv_tokens)
+
+    def test_a_clean_round_records_the_whole_prompt_and_answer(self):
+        chain = self.chain([])
+        chain._remember([1, 2], [8, 9], {"n_past": 4, "pending": None}, {"active": False})
+        self.assertEqual([1, 2, 8, 9], chain._kv_tokens)
+
+    def test_speculation_clears_the_ledger(self):
+        chain = self.chain([1, 2])
+        chain._remember([1, 2], [8], {"n_past": 3, "pending": None}, {"active": True})
+        self.assertEqual([], chain._kv_tokens)
+
+    def test_a_leftover_kv_tail_clears_the_ledger(self):
+        chain = self.chain([1, 2])
+        chain._remember([1, 2], [8], {"n_past": 3, "pending": None, "kv_tail": [9]},
+                        {"active": False})
+        self.assertEqual([], chain._kv_tokens)
+
+    def test_a_count_that_does_not_add_up_clears_the_ledger(self):
+        chain = self.chain([1, 2])
+        chain._remember([1, 2], [8], {"n_past": 99, "pending": None}, {"active": False})
+        self.assertEqual([], chain._kv_tokens)
+
+
 if __name__ == "__main__":
     unittest.main()

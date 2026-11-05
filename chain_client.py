@@ -721,7 +721,20 @@ class StageClient:
         return wire.decode(msg.blob, dtype, (n_tokens, n_embd))
 
     def tokenize(self, text: str) -> list[int]:
-        """Text -> ids via the stage's own vocabulary (every stage loads the same one)."""
+        """Text -> ids via the stage's own vocabulary (every stage loads the same one).
+
+        This doubles as the liveness probe on the reuse path: a session the worker dropped
+        for idling fails here first, and reconnecting is safe because tokenizing changes no
+        state. The reset path has the same recovery, but a request that continues an
+        existing KV must not reset, so it needs a probe that does not.
+        """
+        try:
+            return self._tokenize_once(text)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.reconnect()
+            return self._tokenize_once(text)
+
+    def _tokenize_once(self, text: str) -> list[int]:
         msg = self._forward({"op": "tokenize", "text": text})
         if "n_embd" in msg.meta:
             self._n_embd = int(msg.meta["n_embd"])

@@ -42,19 +42,40 @@ for client in self._clients:
 
 ## 3. 能做什么（按收益排序）
 
-### 3.1 【做】server 走 token 前缀续写（60–80 行）
+### 3.1 【已实现，实测零命中】server 走 token 前缀续写
 
-把 `Session` 已有的账本（`ids` / `n_past` / `pending` / `kv_tail`）搬进 `Chain`：每请求
-tokenize 后与账本比公共前缀，命中就 `generate_stream(prefix_ids=..., n_past=...)`，
-不匹配才 reset。`spec_k=0` 时没有 stray，不需要 align。
+代码在 `server.py` 的 `Chain._reusable` / `_remember`，判据是 **token id 前缀**：只有 KV
+里恰好是本轮 prompt 的真前缀时才续写；分叉、或 KV 比 prompt 长（要裁剪，正是 hybrid 拒绝
+的操作）都退回全量重放。账本说不清的时候一律清空——慢是看得见的，错不是。
 
-- 收益：DSH 每轮省掉 1–2k token 的 prefill，是唯一量级正确的收益。
-- 动的不变量：`n_past ≈ 已写 token 数` 从一个请求内的局部量升级成**跨请求的持久账本**。
-  必须同时补三条判定——前缀不匹配就 reset、`pending` 要回放、`kv_tail` 要重放——少一条
-  就是静默错上下文（不报错，只是答得不对）。
-- 风险：中。错就错在语义上，不会有异常提醒。
-- 并发注意：DSH 的多个请求共用一把锁串行，不同会话交错会毁掉前缀局部性。**按会话排队**
-  能显著提高命中率。
+**但在当前模板 + DSH 组合下命中率是 0**，根因不在实现：
+
+- generation prompt 末尾是 `<|im_start|>assistant\n<think>\n`（`thinking=False` 时是
+  `<think>\n\n<｜end▁of▁thinking｜>\n\n`），而历史 assistant 段渲染成 `<|im_start|>assistant\n<答案>`。
+  **两者在 assistant 头之后第一个 token 就分叉**，实测字符公共前缀 59 / 总长 144，
+  token 公共前缀 15 / 总长 429。
+- `chat.Conversation.add_assistant` 正是为这件事存在：用
+  `" " + thinking_start + "\n" + generated` 桥接生成文本与历史渲染（`chat.py:283-296`，
+  注释原话「Get this wrong and every turn replays」）。`koakuma` 因此能续写；**接 DSH 时
+  历史由客户端给，server 没有这条拼接，也不该有**。
+
+**而且收益上限本身就不够**（2B 实测，这条更关键）：
+
+| | prompt | 生成 | 总时长 |
+|---|---|---|---|
+| 轮1 | 15 | 400 | 38.2 s |
+| 轮2 | 429 | 400 | 42.6 s |
+
+多出的 414 个 prompt token 约 4.4 s，即 **prefill 只占总时长的 10%**，生成是大头。
+即使前缀 100% 命中，也只能省这一成。
+
+要真正吃到它，得让 server 篡改渲染输入（给历史 assistant 补 `thinking_start`），风险高于
+收益。**所以这条不再投入**；代码保留是因为判据是保守的，哪天客户端回传能对齐它会自己生效，
+`reused_prompt_tokens` / `kv_ledger` 两个字段会立刻显示出来。
+
+- 动的不变量：`n_past ≈ 已写 token 数` 从一个请求内的局部量升级成跨请求的持久账本。少一条
+  判定就是静默错上下文（不报错，只是答得不对）。
+- 并发注意：DSH 的多个请求共用一把锁串行，不同会话交错会毁掉前缀局部性。
 
 ### 3.2 【可做】让 `seq_rm` 的失败可见（~25 行）
 
@@ -92,8 +113,15 @@ shim 加一个 `qlh_kh_seq_pos_max(handle, seq)` 导出（C 3 行 + `.def` 1 行
 这条路 3.1 就是。做不了的只是 Radix/LMCache 那种「多个不同会话复用同一前缀」，因为它
 要求所有段同时命中同一前缀，任何一段没命中，`n_past` 就分叉，而分叉是静默的。
 
+补一句 3.1 实测之后的话：**「同会话内续写」也不是自动成立的**。它要求模板渲染历史
+assistant 的方式与生成时逐 token 一致，而末尾注入的 thinking 引导破坏了这个一致性。
+所以 prefix caching 在这套形态里两边都要额外条件才成立。
+
 ## 6. 待验证
 
 - `llama-memory-hybrid.cpp:143` / `llama-memory-recurrent.cpp:192` 的回滚条件来自调研时的
   阅读，未在本仓库复跑；上一轮实测只到 `[seq_rm] p0=236 rc=-6` 这一层。
-- 3.1 的收益估算（1–2k token）按 DSH 当前 prompt 体量推的，实施后要用真实对话量一次。
+- 3.1 的一成收益上限是在 2B + 400 token 生成下量的。生成更长（比如 2000 token）时
+  prefill 占比会更低，结论只会更偏向「不值得」；生成极短时反过来，未测。
+- 3.1 若要让命中率变成 100%，路径是 server 给历史 assistant 补 `thinking_start`。这等于
+  改写客户端给出的历史，未评估对 35B 与不同 checkpoint 的影响，也未做。
