@@ -100,24 +100,24 @@ class Rendered:
     thinking: bool
     format: str
     supports_thinking: bool
+    #: What the template says it opens an assistant turn with. The DLL derives this from
+    #: the template itself, which is the thing that decides it -- guessing it out of the
+    #: last line of ``generation_prompt`` worked only because every checkpoint in use
+    #: happens to agree.
+    thinking_start_tag: str = ""
 
     @property
     def thinking_start(self) -> str:
-        """The marker the template opens the assistant turn with (`` thinking``).
+        """The marker an assistant turn opens with (`` thinking``).
 
-        Derived from ``generation_prompt`` rather than taken from the DLL's
-        ``thinking_start_tag``: the two checkpoints in this project disagree on the tag
-        itself (2B writes ``thinking``, 35B ``thinking``), and only the rendered prompt
-        is authoritative for what the model will actually see.
-
-        With thinking off the template already closes the empty block itself, so the last
-        line is blank and this returns ``""``. An assistant history written from that is a
-        lossy one, and `Conversation.add_user` sees the prefix break and replays the whole
-        prompt -- slower, still correct. No entry point turns thinking off today.
+        Taken from the DLL rather than reverse-engineered from ``generation_prompt``.
+        Measured: with thinking on the two agree (``<think>``); with thinking off the
+        template closes an empty block itself (``<think>\n\n</think>\n\n``), so no
+        single marker describes it and an assistant history built from one is lossy.
+        `Conversation.add_user` then sees the prefix break and replays the whole prompt --
+        slower, still correct. No entry point turns thinking off today.
         """
-        body = self.generation_prompt[:-1] if self.generation_prompt.endswith("\n") \
-            else self.generation_prompt
-        return body.rsplit("\n", 1)[-1]
+        return self.thinking_start_tag
 
 
 class Chat:
@@ -180,7 +180,8 @@ class Chat:
                         stops=tuple(out.get("stops") or ()),
                         thinking=bool(thinking) and bool(out.get("supports_thinking", True)),
                         format=str(out.get("format", "")),
-                        supports_thinking=bool(out.get("supports_thinking", False)))
+                        supports_thinking=bool(out.get("supports_thinking", False)),
+                        thinking_start_tag=str(out.get("thinking_start_tag", "")))
 
     def parse(self, text: str, *, partial: bool = True) -> dict:
         """Parse the **whole accumulated** answer text into a message plus the new diffs.

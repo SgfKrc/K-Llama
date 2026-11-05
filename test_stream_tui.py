@@ -226,7 +226,10 @@ class FakeRenderer:
         generation = self.generation_prompt
         return chat.Rendered(prompt="".join(parts) + generation,
                              generation_prompt=generation, stops=(),
-                             thinking=thinking, format="fake", supports_thinking=True)
+                             thinking=thinking, format="fake", supports_thinking=True,
+                             # The real DLL derives this from the template; the fake one
+                             # states it, because `thinking_start` is read from here now.
+                             thinking_start_tag=self.THINK)
 
 
 class SessionLedger(unittest.TestCase):
