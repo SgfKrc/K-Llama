@@ -51,28 +51,30 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 | 二 | `chat.py` 换成薄封装（删 `apply_chatml` 与 `next_turn`）、`verify_equiv` 断言加强、`test_contract` 规则倒置（任何 .py 不许出现 `<|im_start|>`） | 现有 68 项单测全过；`verify_multiturn` 在 2B 上与接之前逐位相同 | 未开始 |
 | 三 | `server.py` 工具调用（非流式）：读 `tools`/`tool_choice`、产出 `tool_calls` + `finish_reason: "tool_calls"`、`role: tool` 回传 | DSH 真机连一次，能读文件/跑命令 | 未开始 |
 | 四 | 流式 `delta.tool_calls`（按 index 累积）、`delta.reasoning_content`、`finish_reason` | openai SDK `.stream()` 累积结果与非流式**逐字段一致** | 未开始 |
-| 五 | **多模态验证**：下载匹配的 mmproj，用 llama-server 跑一张图，判断蒸馏版是否保留视觉 | 视觉活着就拆实现；废了则整个议题关闭 | 未开始 |
+| 五 | **多模态**：验证已完成（视觉活着、未漂移）；实现走原生还是旁路待定 | 一张图能进去并被正确描述 | 验证已过，实现待定 |
 | 六 | grammar 约束（可选） | 出现真实的格式错误样本才做 | 未开始 |
 
 期与期之间不并行：每一期的判据依赖上一期的产物。
 
-### 第五期：先验证，再谈实现
+### 第五期：验证已通过
 
-多模态不是纯工程问题。已核实的事实：
+2026-11-05 实测：**`opus47-distill` 的视觉活着，且未漂移。**
 
-- 基座 `Qwen/Qwen3.6-35B-A3B` 确是多模态（`pipeline_tag = Image-Text-to-Text`，
-  `architectures = Qwen3_5MoeForConditionalGeneration`）；我们的 GGUF 词表完整保留
-  `<|vision_start|>`=248053 … `<|image_pad|>`=248056，template 也含 vision 分支
-- 主模型不带视觉张量是正常的——视觉塔在独立的 mmproj 里。社区有现成的
-  `unsloth/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf`（857 MiB），`clip_n_mmproj_embd` = 2048
-  与主模型 `n_embd` 匹配
-- 该基座 `deepstack_visual_indexes = []`，没有 deepstack，注入退化成「替换 `image_pad` 行的
-  embedding」，省掉多路融合
+- mmproj 用 `unsloth/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf`（857.6 MiB，sha256 与 HF
+  LFS ETag 一致），放在 `H:\qlh_models\mmproj\`
+- 五个输入五个相符输出：红圆（位置/颜色/形状全对）、大字 “QLH-42”（OCR 读出 QLH42，
+  连字符省略）、三色条（「蓝黄绿」顺序对）、2×2 网格（四角映射全对）、纯白图（答「空白」）
+- **阴性对照双向成立**：纯白图不编造内容、不给图就答「我没看到图片」——排除「顺着 prompt 编」
+- `prompt_tokens` 随图变化：纯文本 23 / 512² 图 281 / 768×384 文字图 318 / 600×200 色条 139，
+  说明 image token 真实进了上下文而非固定占位
 
-**但蒸馏是否保留视觉未验证**：LoRA SFT 的语料是纯文本推理轨迹，视觉塔没被改，但文本侧 SFT
-会让视觉→语言层的联合表示漂移。验证方式是一条命令加一张图，**废了整个议题关闭**。
+运行参数（实测可交互）：`-ngl 99 -cmoe`（MoE 专家留 CPU）→ 显存 3.5 GiB、加载 5.3 s、
+生成 7–21 tok/s、单次问答 8–40 s。
 
-### 若验证通过，实现期的真实难点（不在模型，在链路）
+**注意**：llama.cpp 警告 Qwen-VL 建议 `--image-min-tokens 1024`（grounding 精度）。本次不加
+也能正确 OCR，将来做 bounding box / 小字识别时要加上复测。
+
+### 实现期的真实难点（不在模型，在链路）
 
 1. **M-RoPE 让位置与 token 数脱钩**：图像 token 的 `t` 恒定、x/y 是网格，推进量是
    `max(nx,ny)`=32 而非 1024。而本链路处处假设 `n_past ≈ 已写 token 数`（`stream.py:192`、
@@ -84,11 +86,12 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 
 估算 800–1500 行、跨 8 个文件，是工具调用那一期的 3–5 倍。
 
-### 备选：旁路
+### 备选：旁路（成本已实测）
 
-若只为「让 agent 能看图」，可用独立视觉模型把图转成文字再喂进本链路——几小时的工作量，
-不碰 `n_past` 不变量，代价是细节丢失、受旁路模型描述质量限制。这条路与「模型自己理解图」
-不是一回事，需要在第五期开工前明确要哪一个。
+`llama-server --mmproj` 独立跑视觉那套，3.5 GiB 显存、7–21 tok/s、几小时可接完，**不碰
+`n_past` 不变量**。代价是图由另一个推理过程描述后再喂进本链路，细节受描述质量限制。
+
+两条路的分界：**「让 agent 能看图」用旁路；「模型自己理解图」才需要原生**。开工前必须选一个。
 
 ## 4. 明确不做
 
