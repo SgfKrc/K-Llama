@@ -260,12 +260,43 @@ class Ask(Input):
             self.app.exit()
 
 
+#: 启动画面的大标题：6 行高的大写 K，右侧挂名字与副标题。
+#: 逐行渐显（每行 50 ms）——启动要几秒到几十秒，一个立刻出现然后静止的 logo 会让人以为
+#: 卡住了；而进度条式的渐显本身就是"我还在动"的证据。
+LOGO = (
+    ("██╗  ██╗", "#4d8de0"),
+    ("██║ ██╔╝", "#4f93d8"),
+    ("█████╔╝", "#4f9ad0"),
+    ("██╔═██╗", "#4fa2c8"),
+    ("██║  ██╗", "#4faac0"),
+    ("╚═╝  ╚═╝", "#4fb2b8"),
+)
+#: 每行出现间隔。六行全部出现用 0.3 s，比一次 tick（80 ms）长，肉眼能看出是"长出来的"。
+LOGO_STEP_S = 0.05
+
+
+def logo_text(age: float) -> Text:
+    """按已用时间渐显大标题；右侧第 3、4 行分别是名字与副标题。"""
+    t = Text()
+    shown = int(age / LOGO_STEP_S) + 1
+    for i, (line, colour) in enumerate(LOGO):
+        if i > shown:
+            break
+        t.append(line, style=f"bold {colour}")
+        if i == 2:
+            t.append("   K-Llama", style="bold #eef0f8")
+        elif i == 3:
+            t.append("   层段分布式推理 · 四区 TUI", style="#9aa3b8")
+        t.append("\n")
+    return t
+
+
 def splash_text(b: Boot) -> Text:
     """启动画面：每行一件真发生过的工作，进行中的行显示真实百分比与真实已用时。
 
     模块级函数而非 App 方法：它只依赖 Boot 的状态，独立出来更好读、也更好在测试里断言。
     """
-    t = Text("  ▄▄▄  ", style="bold #4d8de0")
+    t = logo_text(time.perf_counter() - b.started_at)
 
     def step(label: str, ok: bool, detail: str, bad: bool = False) -> None:
         mark, colour = ("✓", "#59c26a") if ok else ("✗", "#e3596b") if bad else ("·", "#7b8194")
@@ -273,9 +304,20 @@ def splash_text(b: Boot) -> Text:
         t.append(f"{label:<9}{detail}\n" if detail else f"{label:<9}\n",
                  style="#9aa3b8" if ok else "#7b8194")
 
-    t.append("K-Llama\n", style="bold #eef0f8")
-    t.append(" ▐███▌ ", style="bold #4d8de0")
-    t.append("层段分布式推理 · 四区 TUI\n\n", style="#9aa3b8")
+    # 模型与运行参数。官方 TUI 第一屏就给 model / ftype，这边跑完 HELLO 校验却从不显示——
+    # 校验通过了却看不见，等于没校验。每段可以是不同文件（弱设备那套就是这样），所以文件
+    # 数不是 0/1 时如实报个数，不假装只有一个。
+    if b.stages:
+        names = {s.model.name for s in b.stages}
+        model = names.pop() if len(names) == 1 else f"{len(b.stages)} 段 · {len(names) + 1} 个文件"
+        gpu = sorted({s.gpu_layers for s in b.stages})
+        t.append(f"  model    {model}\n", style="#9aa3b8")
+        t.append(f"  ctx      {b.ctx or '—'}    "
+                 f"{len(b.stages)} 段 / {sum(s.layers for s in b.stages)} 层    "
+                 f"gpu_layers {'/'.join(str(x) for x in gpu) if gpu else '—'}\n\n",
+                 style="#9aa3b8")
+    else:
+        t.append("\n")
     shape = f"{len(b.stages)} 段 / {sum(s.layers for s in b.stages)} 层" if b.stages else ""
     bad = bool(b.error)
     step("topology", "topology" in b.done,
