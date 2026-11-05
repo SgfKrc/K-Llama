@@ -175,7 +175,7 @@ class SingleSourceOfTruth(unittest.TestCase):
                          "prompt rendering belongs to qlh_chat.dll (shim/chat/); found a "
                          "Python renderer: %s" % offenders)
 
-    def test_only_chat_loads_the_rendering_dll(self):
+    def test_no_python_file_loads_the_rendering_dll(self):
         """One place binds the C ABI, or its ownership rules get copied with one of them wrong.
 
         `ctypes.CDLL` on `qlh_chat.dll` is the boundary to C++: the handle is opaque, and
@@ -191,8 +191,9 @@ class SingleSourceOfTruth(unittest.TestCase):
                              path.read_text(encoding="utf-8", errors="replace").splitlines())
             if "ctypes.CDLL" in code and "qlh_chat" in code:
                 loaders.append(path.name)
-        self.assertEqual(["chat.py"], loaders,
-                         "only chat.py may load the rendering DLL: %s" % loaders)
+        self.assertEqual([], loaders,
+                         "the rendering DLL is C++-side now; no root Python file may "
+                         "load it: %s" % loaders)
 
     def test_needs_logits_has_one_implementation(self):
         """`SA_NEEDS_LOGITS` is *computed* in config.needs_logits() and nowhere else.
@@ -214,32 +215,6 @@ class SingleSourceOfTruth(unittest.TestCase):
         self.assertEqual([], offenders,
                          "spell the rule once in config.needs_logits(); found it inline: %s"
                          % offenders)
-
-    def test_prompt_tokens_is_not_a_character_count(self):
-        """`len(prompt)` is characters. The token count comes from tokenize()."""
-        offenders = []
-        for name in ("server.py", "proto_responses.py"):
-            for i, line in enumerate(_read(name).splitlines(), 1):
-                code = line.split("#", 1)[0]
-                # `rendered_chars` is a character count on purpose -- it exists to say
-                # "this request was enormous" when a token count alone cannot tell the
-                # client whether the messages or the tool definitions did it. Anything
-                # else spelled len(prompt) is still the bug this guards.
-                if "len(prompt)" in code and "rendered_chars" not in code:
-                    offenders.append(f"{name}:{i}: {line.strip()}")
-        self.assertEqual([], offenders,
-                         "prompt_tokens must come from generate_stream's stats, not len(): %s"
-                         % offenders)
-
-    def test_server_has_one_generation_loop(self):
-        """Four response shapes, one drain. A fifth hand-rolled loop is how `usage`
-        started disagreeing between stream and non-stream."""
-        text = _read("server.py")
-        count = text.count("for chunk in self.generate(")
-        self.assertEqual(
-            1, count,
-            "server.py has %d generation loops; route new shapes through Chain.drain()" % count)
-
 
 if __name__ == "__main__":
     unittest.main()

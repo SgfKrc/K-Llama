@@ -1840,7 +1840,8 @@ def main() -> int:
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--chat", action="store_true",
-                    help="render --prompt-text as ChatML and parse special tokens")
+                    help="parse special tokens in --prompt-text (rendering moved into the "
+                         "C++ side; this only flips SA_PARSE_SPECIAL)")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--dry-run", action="store_true",
                     help="validate the topology and the memory budget, load no model")
@@ -1985,13 +1986,6 @@ def main() -> int:
         if report := vram_report(vram_after_load(stages, vram_before)):
             print("\n" + report)
 
-        if args.chat and args.prompt_text:
-            # 渲染只有一份实现：模型自己的模板，在 qlh_chat.dll 里跑。
-            from chat import Chat
-
-            with Chat.for_model(stages[0].model) as renderer:
-                args.prompt_text = renderer.render(
-                    [{"role": "user", "content": args.prompt_text}]).prompt
         _sampling = (dict(temperature=0.0) if args.greedy else
                      dict(temperature=args.temperature, top_k=args.top_k,
                           top_p=args.top_p, seed=args.seed))
