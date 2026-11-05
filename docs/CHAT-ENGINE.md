@@ -50,7 +50,7 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
 | **一** | `shim/chat/`（vendored 上游 60 文件 + `UPSTREAM.txt`）、`shim/qlh_chat.cpp`（C ABI 五函数）、两个构建脚本、`checks/verify_chat.py` | dll 编出来（1,732 KB）；PE 导入表零 llama/ggml 符号；golden 模板渲染逐字节对上；P0 那份真实输出能被解析出正确 tool_calls。**63 PASS / 0 FAIL** | **完成** |
 | **二** | `chat.py` 换成薄封装（删 `apply_chatml` 与 `next_turn`）、`verify_equiv --mode prompt`、`test_contract` 规则倒置（任何 .py 不许出现 `<|im_start|>`） | 71 项单测全过；`verify_multiturn` 在 2B 上与接之前**逐位相同**（三轮 `ids`/`text` 全 `==`）；`test_contract` 扫 9 个根 `.py` 得 0 处字面量 | **完成** |
 | **三** | `server.py` 工具调用（非流式）：读 `tools`/`tool_choice`、产出 `tool_calls` + `finish_reason: "tool_calls"`、`role: tool` 回传 | `verify_openai_tools.py` 28 PASS；2B 端到端自己调出 `get_weather`（prompt 278 / gen 66 / 9.35 tok/s），回传 `role:tool` 后答出「晴，25 度」；非法 `arguments` 历史 → 400。**DSH 验收推迟到第四期** | **完成** |
-| 四 | 流式 `delta.tool_calls`（按 index 累积）、`delta.reasoning_content`、`finish_reason` | openai SDK `.stream()` 累积结果与非流式**逐字段一致** | 未开始 |
+| **四** | 流式 `delta.tool_calls`（按 index 累积）、`delta.reasoning_content`、`finish_reason` | 2B 端到端 48 个 chunk：`finish_reason: "tool_calls"`、`reasoning` 87 字独立成段、`id` 只宣告 1 次、拼回 `{"city":"北京"}` 与一次性解析逐字节相同；无 tools 的流式 122 chunk 仍是原样文本（无 `reasoning_content`） | **完成** |
 | 五 | **多模态**：验证已完成（视觉活着、未漂移）；实现走原生还是旁路待定 | 一张图能进去并被正确描述 | 验证已过，实现待定 |
 | 六 | grammar 约束（可选） | 出现真实的格式错误样本才做 | 未开始 |
 
@@ -133,6 +133,14 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
   `caps.supports_object_arguments` 的模板（Qwen3.5 命中）会自己 parse，实测字符串与
   mapping 渲染逐字节相同。仍然在 Python 侧归一，是不让行为依赖上游对模板的分析；非法
   JSON 也因此能给出点名字段的 400，而不是模板内的一行 `Failed to parse tool call arguments`
+- **流式可以每个 chunk 都 parse**：全量 1372 字一次 `partial=False` 是 0.17 ms，逐片
+  `partial=True` 平均 0.05 ms，而生成一个 token 要 50–150 ms。不需要「看到 `<tool_call>`
+  才开始解析」这类启发式
+- **流式一个调用只宣告一次 id**：`parse` 的 diff 只在第一片给 `name`，`id` 永远为空串。
+  按 `tool_call_index` 记住自己发的 id，后续片只发 `{"function":{"arguments": ...}}`；
+  每片都发新 id 会让客户端把一次调用拆成多个块
+- **收尾要用 `partial=False` 再 parse 一次**：工具调用只有在闭合标签到达后才算完成，
+  增量那一遍不会吐出这段尾巴
 
 ## 6. DSH 的实际要求（读其源码确认）
 

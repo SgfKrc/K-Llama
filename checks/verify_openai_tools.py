@@ -187,6 +187,55 @@ def main() -> int:
         check("历史 arguments：字符串与 mapping 渲染逐字节相同", from_string == from_mapping,
               "" if from_string == from_mapping else _first_diff(from_string, from_mapping))
 
+    # -- D. 流式 ---------------------------------------------------------------
+    print("\n=== D. 流式：逐片 partial=True，拼回的调用必须与一次性解析一致 ===")
+    with Chat(tmpl_src) as renderer:
+        server.render_messages(renderer, case["messages"], tools=case["tools"])
+        seen: dict[int, str] = {}
+        deltas: list[dict] = []
+        step = max(1, len(p0) // 40)        # ~40 片，必然跨过每个标签边界
+        for end in range(step, len(p0) + step, step):
+            for diff in renderer.parse(p0[:end], partial=True)["diff"]:
+                if delta := server.stream_delta(diff, seen):
+                    deltas.append(delta)
+        # 尾声用最终态补一次，与 server._stream_response 的收尾一致
+        for diff in renderer.parse(p0, partial=False)["diff"]:
+            if delta := server.stream_delta(diff, seen):
+                deltas.append(delta)
+
+    calls: dict[int, dict] = {}
+    announced = 0
+    text = ""
+    for delta in deltas:
+        text += delta.get("content") or ""
+        for piece in delta.get("tool_calls") or []:
+            slot = calls.setdefault(piece["index"],
+                                    {"id": "", "name": "", "arguments": ""})
+            if piece.get("id"):
+                announced += 1
+                slot["id"] = piece["id"]
+            function = piece.get("function") or {}
+            if function.get("name"):
+                slot["name"] = function["name"]
+            slot["arguments"] += function.get("arguments") or ""
+
+    print(f"  {len(deltas)} 个 delta，{len(calls)} 个调用，id 出现 {announced} 次")
+    if args.verbose:
+        print("  deltas =", json.dumps(deltas, ensure_ascii=False)[:1200])
+    check("流式重建出 1 个调用", len(calls) == 1, str(len(calls)))
+    only = calls.get(0) or {}
+    check("流式拼出的函数名 == get_weather", only.get("name") == "get_weather",
+          repr(only.get("name")))
+    check("流式拼出的 arguments 解出 {\"city\": \"北京\"}",
+          json.loads(only.get("arguments") or "{}") == {"city": "北京"},
+          repr(only.get("arguments"))[:80])
+    check("id 只宣告一次（否则客户端会建出多个调用）", announced == 1, str(announced))
+    check("流式与一次性的 arguments 逐字节相同",
+          only.get("arguments") == args_text,
+          _first_diff(only.get("arguments") or "", args_text or ""))
+    check("流式 delta 里没有裸 XML（调用部分已被解析掉）",
+          "<parameter=" not in text and "</function>" not in text, repr(text[:80]))
+
     print("\nRESULT:", "ALL PASS" if ok else "FAILURES PRESENT")
     return 0 if ok else 1
 

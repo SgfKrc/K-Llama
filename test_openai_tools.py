@@ -190,5 +190,64 @@ class OpenAIAssistantMessage(unittest.TestCase):
         self.assertEqual(29, len(message["tool_calls"][0]["id"]))   # call_ + 24 hex
 
 
+class StreamDelta(unittest.TestCase):
+    """`qlh_chat_parse`'s per-chunk diff, turned into OpenAI streaming deltas.
+
+    The observed partial-mode behaviour (real DLL, real template) is the contract these
+    encode: the first slice names the function and leaves `id` empty, every later slice
+    carries only an `arguments` fragment, and `index` is constant for one call.
+    """
+
+    @staticmethod
+    def diff(arguments="", name="", index=0, reasoning="", content=""):
+        return {"reasoning_content_delta": reasoning, "content_delta": content,
+                "tool_call_index": index,
+                "tool_call_delta": {"name": name, "arguments": arguments, "id": ""}}
+
+    def test_first_slice_announces_the_call(self):
+        seen: dict[int, str] = {}
+        delta = server.stream_delta(self.diff(name="get_weather", arguments="{"), seen,
+                                    new_id=lambda: "call_1")
+        self.assertEqual([{"index": 0, "id": "call_1", "type": "function",
+                           "function": {"name": "get_weather", "arguments": "{"}}],
+                         delta["tool_calls"])
+
+    def test_later_slices_only_append_arguments(self):
+        seen: dict[int, str] = {}
+        server.stream_delta(self.diff(name="get_weather", arguments="{"), seen,
+                            new_id=lambda: "call_1")
+        delta = server.stream_delta(self.diff(arguments='"city":'), seen,
+                                    new_id=lambda: "call_2")
+        self.assertEqual([{"index": 0, "function": {"arguments": '"city":'}}],
+                         delta["tool_calls"])
+        self.assertEqual({"0": "call_1"}, {str(k): v for k, v in seen.items()})
+
+    def test_empty_argument_slice_is_dropped(self):
+        seen: dict[int, str] = {}
+        server.stream_delta(self.diff(name="f", arguments="{"), seen, new_id=lambda: "c")
+        self.assertEqual({}, server.stream_delta(self.diff(arguments=""), seen,
+                                                 new_id=lambda: "c"))
+
+    def test_reasoning_comes_before_content_in_one_delta(self):
+        delta = server.stream_delta(self.diff(index=None, reasoning="想", content="答"),
+                                    {}, new_id=lambda: "c")
+        self.assertEqual({"reasoning_content": "想", "content": "答"}, delta)
+
+    def test_no_tool_call_index_means_no_tool_calls_key(self):
+        delta = server.stream_delta(self.diff(index=None, content="答"), {},
+                                    new_id=lambda: "c")
+        self.assertNotIn("tool_calls", delta)
+
+    def test_second_call_gets_its_own_id(self):
+        seen: dict[int, str] = {}
+        ids = iter(["call_1", "call_2"])
+        first = server.stream_delta(self.diff(name="a", arguments="{}", index=0), seen,
+                                    new_id=lambda: next(ids))
+        second = server.stream_delta(self.diff(name="b", arguments="{}", index=1), seen,
+                                     new_id=lambda: next(ids))
+        self.assertEqual("call_1", first["tool_calls"][0]["id"])
+        self.assertEqual("call_2", second["tool_calls"][0]["id"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -429,6 +429,45 @@ def openai_assistant_message(parsed: dict, *, tokens: int, max_tokens: int,
     return message, finish
 
 
+def stream_delta(diff: dict, seen: dict[int, str],
+                 new_id=_new_tool_call_id) -> dict:
+    """One `qlh_chat_parse` diff -> one OpenAI streaming `delta`.
+
+    `parse(partial=True)` reports three kinds of progress at once: reasoning text, answer
+    text, and a tool call being filled in. They travel in one delta object, reasoning
+    first, because a client that renders blocks in arrival order must see the thinking
+    block open before the answer text lands in it.
+
+    A tool call is announced once and then only appended to. The ABI's diff names the
+    function on the first slice and leaves `id` empty on every slice (the DLL does not
+    mint ids), so the id is generated here on first sight and remembered by `index`;
+    sending a new id per slice would make the client build one call per chunk. Later
+    slices with an empty `arguments` are dropped: they would be chunks that say nothing.
+    """
+    out: dict = {}
+    if reasoning := diff.get("reasoning_content_delta"):
+        out["reasoning_content"] = reasoning
+    if content := diff.get("content_delta"):
+        out["content"] = content
+    index = diff.get("tool_call_index")
+    if index is not None:
+        call = diff.get("tool_call_delta") or {}
+        arguments = call.get("arguments") or ""
+        first = index not in seen
+        if not first and not arguments:
+            return out
+        piece: dict = {"index": index}
+        if first:
+            seen[index] = new_id()
+            piece["id"] = seen[index]
+            piece["type"] = "function"
+            piece["function"] = {"name": call.get("name") or "", "arguments": arguments}
+        else:
+            piece["function"] = {"arguments": arguments}
+        out["tool_calls"] = [piece]
+    return out
+
+
 # Responses request/response translation. Kept in its own module because the two
 # protocol shapes differ more than the code that carries them.
 from proto_responses import (  # noqa: E402 - after the sys.path insert above
@@ -552,7 +591,8 @@ class Handler(BaseHTTPRequestHandler):
                                          parallel_tool_calls=parallel).prompt
                 if stream:
                     self._stream_response(completion_id, created, model, prompt,
-                                          max_tokens, ignored, sampling)
+                                          max_tokens, ignored, sampling,
+                                          renderer=renderer, tools=bool(tools))
                 else:
                     self._full_response(completion_id, created, model, prompt,
                                         max_tokens, ignored, sampling,
@@ -632,7 +672,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_response(self, cid: str, created: int, model: str, prompt: str,
                          max_tokens: int, ignored: list[str],
-                         sampling: dict | None = None) -> None:
+                         sampling: dict | None = None, renderer=None,
+                         tools: bool = False) -> None:
         self._sse_head()
         first = {"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": model,
@@ -646,28 +687,70 @@ class Handler(BaseHTTPRequestHandler):
         first["slimarc"] = announced
         self._sse(first)
 
-        def emit_text(text: str) -> None:
+        def chunk(delta: dict, finish: str | None = None) -> None:
             self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                        "model": model,
-                       "choices": [{"index": 0, "delta": {"content": text},
-                                    "finish_reason": None}]})
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+        # Without tools the answer is forwarded verbatim: `parse` would pull the thinking
+        # block out of the text, and a client that asked for no tools did not ask for that.
+        # With tools the whole accumulated text goes through the parser on every chunk --
+        # measured 0.05 ms per call, against 50-150 ms to generate one token -- so the
+        # deltas are the parser's own, not a regex over the stream.
+        acc: list[str] = []
+        seen: dict[int, str] = {}
+        parsed_msg: dict = {}
+        parse_error = ""
+
+        def emit_parsed(text: str) -> None:
+            nonlocal parse_error
+            acc.append(text)
+            try:
+                result = renderer.parse("".join(acc), partial=True)
+            except ChatError as exc:
+                # A chunk the parser rejects must not kill a running stream; the final
+                # message and `slimarc.parse_error` say what happened.
+                parse_error = str(exc)
+                return
+            for diff in result["diff"]:
+                if delta := stream_delta(diff, seen):
+                    chunk(delta)
 
         try:
             _text, tokens, prompt_tokens, _elapsed, drain_stats = self.chain.drain(
-                prompt, max_tokens, sampling, sink=emit_text)
+                prompt, max_tokens, sampling, sink=emit_parsed if tools else
+                lambda text: chunk({"content": text}))
+            if tools:
+                # One last parse in final mode: a tool call only counts as complete once
+                # its closing tag arrived, and the partial pass has not emitted that tail.
+                try:
+                    final = renderer.parse("".join(acc), partial=False)
+                except ChatError as exc:
+                    parse_error = str(exc)
+                else:
+                    parsed_msg = final["msg"]
+                    for diff in final["diff"]:
+                        if delta := stream_delta(diff, seen):
+                            chunk(delta)
         except (BrokenPipeError, ConnectionResetError):
             return              # client hung up; the chain lock is released by the generator
         except Exception as exc:  # noqa: BLE001
             self._sse({"error": {"message": f"{type(exc).__name__}: {exc}"}})
             self._sse("[DONE]")
             return
+        if tools and parsed_msg.get("tool_calls"):
+            finish = "tool_calls"
+        else:
+            finish = "length" if tokens >= max_tokens else "stop"
+        closing = {"sampling": self.chain.sampling_state(),
+                   "speculation": drain_stats.get("speculation")}
+        if parse_error:
+            closing["parse_error"] = parse_error
         self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                    "model": model,
-                   "choices": [{"index": 0, "delta": {},
-                                "finish_reason": "length" if tokens >= max_tokens else "stop"}],
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens},
-                   "slimarc": {"sampling": self.chain.sampling_state(),
-                               "speculation": drain_stats.get("speculation")}})
+                   "slimarc": closing})
         self._sse("[DONE]")
 
     # -- /v1/responses ---------------------------------------------------------
