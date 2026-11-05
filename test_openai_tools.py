@@ -270,5 +270,78 @@ class StreamDelta(unittest.TestCase):
         self.assertEqual("call_2", second["tool_calls"][0]["id"])
 
 
+class StreamResponseFailures(unittest.TestCase):
+    """A stream that cannot start must not claim 200 first.
+
+    DSH reads the status line as the answer: "200, then one error frame, then EOF" is
+    indistinguishable from a connection that broke mid-answer, and that is exactly how a
+    request that was merely too large for the KV window got reported as WinError 10053.
+    """
+
+    def handler(self, chain, write_error=None):
+        handler = type("H", (), {})()
+        handler.chain = chain
+        handler.heads = 0
+        handler.frames = []
+        handler.jsons = []
+
+        def head():
+            handler.heads += 1
+
+        def sse(payload):
+            if write_error:
+                raise write_error
+            handler.frames.append(payload)
+
+        handler._sse_head = head
+        handler._sse = sse
+        handler._json = lambda code, payload: handler.jsons.append((code, payload))
+        return handler
+
+    def test_overflow_before_the_first_byte_is_a_plain_400(self):
+        handler = self.handler(FakeChain([], server.ContextOverflow("too big")))
+        server.Handler._stream_response(handler, "cid", 0, "m", "prompt", 8, [])
+        self.assertEqual(0, handler.heads)          # nothing was written yet
+        self.assertEqual(400, handler.jsons[0][0])
+        self.assertIn("too big", handler.jsons[0][1]["error"]["message"])
+
+    def test_overflow_mid_stream_ends_with_an_error_frame(self):
+        handler = self.handler(FakeChain(["一", "二"], server.ContextOverflow("too big")))
+        server.Handler._stream_response(handler, "cid", 0, "m", "prompt", 8, [])
+        self.assertEqual(1, handler.heads)          # the stream had already started
+        self.assertEqual([], handler.jsons)         # and cannot be re-typed as a 400
+        self.assertIn("error", handler.frames[-2])
+        self.assertEqual("[DONE]", handler.frames[-1])
+
+    def test_a_hung_up_client_is_not_reported_as_a_failure(self):
+        handler = self.handler(FakeChain(["一"]), write_error=ConnectionAbortedError(10053))
+        server.Handler._stream_response(handler, "cid", 0, "m", "prompt", 8, [])
+        # The status line did go out (that is when the write failed), but nothing is
+        # turned into a 500 and no second write is attempted on the dead socket.
+        self.assertEqual([], handler.jsons)
+        self.assertEqual([], handler.frames)
+
+    def test_connection_aborted_counts_as_a_hung_up_client(self):
+        self.assertIn(ConnectionAbortedError, server.CLIENT_GONE)
+
+
+class FakeChain:
+    """Feeds pre-baked text through the sink, then raises the configured error."""
+
+    def __init__(self, texts, error=None):
+        self.texts = list(texts)
+        self.error = error
+
+    def drain(self, prompt, max_tokens, sampling, sink=None):
+        for text in self.texts:
+            sink(text)
+        if self.error is not None:
+            raise self.error
+        return "".join(self.texts), len(self.texts), 3, 0.1, {}
+
+    def sampling_state(self):
+        return {}
+
+
 if __name__ == "__main__":
     unittest.main()

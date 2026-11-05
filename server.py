@@ -47,6 +47,13 @@ class ContextOverflow(ValueError):
     """The request cannot fit the KV window; the HTTP layer answers 400, not 500."""
 
 
+#: What writing to a client that hung up raises. Windows raises ``ConnectionAbortedError``
+#: where POSIX raises the other two, and it was missing from this tuple: a client pressing
+#: stop mid-answer then surfaced as a server-side traceback, followed by a second failed
+#: write of the very error frame that was supposed to report the hang-up.
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
 # Parameters this server still cannot honour. Reported per response instead of
 # dropped, so a client can see why its output did not change. Everything else in the
 # OpenAI sampling surface now maps onto a real sampler in llama.dll.
@@ -686,7 +693,32 @@ class Handler(BaseHTTPRequestHandler):
                          max_tokens: int, ignored: list[str],
                          sampling: dict | None = None, renderer=None,
                          tools: bool = False) -> None:
-        self._sse_head()
+        # Nothing goes on the wire until the first chunk is genuinely ready. A request that
+        # can never generate -- a prompt that does not fit the KV -- then still gets a JSON
+        # refusal with a status code, instead of "200 + a single error frame", which a
+        # client cannot tell apart from a stream that broke mid-flight.
+        sent = False
+        first_sent = False
+
+        def sse(payload: dict | str) -> None:
+            nonlocal sent
+            if not sent:
+                self._sse_head()
+                sent = True
+            self._sse(payload)
+
+        def chunk(delta: dict, finish: str | None = None) -> None:
+            nonlocal first_sent
+            if not first_sent:
+                # The role announcement rides on the first real chunk rather than opening
+                # the response, so a request that never produces one has written no status
+                # line yet and can still be answered with a plain JSON refusal.
+                sse(first)
+                first_sent = True
+            sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                 "model": model,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
         first = {"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": model,
                  "choices": [{"index": 0, "delta": {"role": "assistant"},
@@ -697,12 +729,6 @@ class Handler(BaseHTTPRequestHandler):
         announced = {"ignored_parameters": ignored} if ignored else {}
         announced["requested_sampling"] = dict(sampling or {})
         first["slimarc"] = announced
-        self._sse(first)
-
-        def chunk(delta: dict, finish: str | None = None) -> None:
-            self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
-                       "model": model,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
 
         # Without tools the answer is forwarded verbatim: `parse` would pull the thinking
         # block out of the text, and a client that asked for no tools did not ask for that.
@@ -744,11 +770,27 @@ class Handler(BaseHTTPRequestHandler):
                     for diff in final["diff"]:
                         if delta := stream_delta(diff, seen):
                             chunk(delta)
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_GONE:
             return              # client hung up; the chain lock is released by the generator
+        except ContextOverflow as exc:
+            # The request asks for more than the KV can hold. Before the first byte that
+            # is an ordinary 400 -- the same answer the non-streaming path gives; after it
+            # the status line is gone, so the stream has to end with an error frame.
+            if not sent:
+                self._json(400, {"error": {"message": str(exc),
+                                           "type": "invalid_request_error",
+                                           "param": "max_tokens"}})
+                return
+            sse({"error": {"message": str(exc)}})
+            sse("[DONE]")
+            return
         except Exception as exc:  # noqa: BLE001
-            self._sse({"error": {"message": f"{type(exc).__name__}: {exc}"}})
-            self._sse("[DONE]")
+            if not sent:
+                self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}",
+                                           "type": "server_error"}})
+                return
+            sse({"error": {"message": f"{type(exc).__name__}: {exc}"}})
+            sse("[DONE]")
             return
         if tools and parsed_msg.get("tool_calls"):
             finish = "tool_calls"
@@ -758,12 +800,12 @@ class Handler(BaseHTTPRequestHandler):
                    "speculation": drain_stats.get("speculation")}
         if parse_error:
             closing["parse_error"] = parse_error
-        self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
-                   "model": model,
-                   "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-                   "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens},
-                   "slimarc": closing})
-        self._sse("[DONE]")
+        sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+             "model": model,
+             "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": tokens},
+             "slimarc": closing})
+        sse("[DONE]")
 
     # -- /v1/responses ---------------------------------------------------------
 
@@ -880,7 +922,7 @@ class Handler(BaseHTTPRequestHandler):
                     # `logprobs` is part of the schema, not an option here: the SDK's
                     # typed model declares it required, so it is always sent, empty.
                     "response.output_text.delta", delta=text, logprobs=[]))
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_GONE:
             return              # client hung up; the chain lock is released by the generator
         except Exception as exc:  # noqa: BLE001
             self._sse({"type": "response.failed", "sequence_number": seq,
