@@ -1,9 +1,12 @@
-"""Prefill slicing: one forward call may never carry more than a stage's n_batch.
+"""Two chain-level behaviours that the HTTP layer depends on being true.
 
+First, prefill slicing: one forward call may never carry more than a stage's n_batch.
 The head raises "batch too large" and the whole request dies before a single token is
 generated -- which is exactly what a normal chat turns into the moment the transcript
-outgrows 512 tokens. These tests pin the slicing, the position each slice continues
-from, and the ceiling picked when the stages disagree.
+outgrows 512 tokens.
+
+Second, session recovery: the worker drops an idle session after a minute, and the
+driver has to notice rather than write into the closed socket forever.
 """
 from __future__ import annotations
 
@@ -76,6 +79,41 @@ class PrefillSlicing(unittest.TestCase):
         clients[0].n_batch = 0                     # a worker that predates the HELLO field
         self.assertEqual(4, chain_client.prefill_block(clients[1:]))
         self.assertEqual(512, chain_client.prefill_block([object()]))
+
+
+class ResetReconnects(unittest.TestCase):
+    """An idle-closed session has to heal on the next request, not stay dead forever.
+
+    Measured before this existed: the first request after 95 s of silence answered 500
+    ConnectionAbortedError, and so did every request after it until a restart.
+    """
+
+    def dead_then_alive(self) -> tuple[object, dict]:
+        client = object.__new__(chain_client.StageClient)
+        client.stage = type("Stage", (), {"index": 0, "kind": "gpu"})()
+        seen = {"reset": 0, "reconnect": 0}
+
+        def reset_once() -> None:
+            seen["reset"] += 1
+            if seen["reset"] == 1:
+                raise ConnectionAbortedError(10053)
+
+        client._reset_once = reset_once
+        client.reconnect = lambda: seen.__setitem__("reconnect", seen["reconnect"] + 1)
+        return client, seen
+
+    def test_a_dead_socket_is_reconnected_and_the_reset_retried(self):
+        client, seen = self.dead_then_alive()
+        client.reset()
+        self.assertEqual(2, seen["reset"])       # tried once, then retried after reconnect
+        self.assertEqual(1, seen["reconnect"])
+
+    def test_a_healthy_socket_is_never_reconnected(self):
+        client = object.__new__(chain_client.StageClient)
+        client.stage = type("Stage", (), {"index": 0, "kind": "gpu"})()
+        client._reset_once = lambda: None
+        client.reconnect = lambda: self.fail("must not reconnect a healthy session")
+        client.reset()
 
 
 if __name__ == "__main__":

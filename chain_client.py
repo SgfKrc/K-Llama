@@ -759,10 +759,34 @@ class StageClient:
         return dict(self._forward({"op": "clear_sampling"}).meta.get("sampling") or {})
 
     def reset(self) -> None:
+        """Clear this stage's KV, reconnecting first if the session had gone stale.
+
+        The worker drops a session after ``SESSION_IDLE_S`` of silence -- it is single
+        threaded ``accept → _session``, so a connection whose client vanished would
+        otherwise block the next one. The driver cannot see that happen and used to keep
+        writing into the closed socket: the first request after an idle spell failed with
+        ``ConnectionAbortedError``, and every request after it failed the same way until
+        the server was restarted (measured: idle 95 s → 500 forever).
+
+        Retrying here is safe where retrying a forward would not be: a reset is idempotent
+        and a fresh session starts empty, so nothing is replayed twice.
+        """
+        try:
+            self._reset_once()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.reconnect()
+            self._reset_once()
+
+    def _reset_once(self) -> None:
         protocol.send(self.sock, protocol.RESET)
         msg = protocol.read(self.sock)
         if msg.kind == protocol.ERROR:
             raise RuntimeError(f"stage {self.stage.index} reset failed: {msg.meta}")
+
+    def reconnect(self) -> None:
+        """Drop whatever socket we hold and handshake again."""
+        self.close()
+        self.connect()
 
     def close(self) -> None:
         if self._sock is None:

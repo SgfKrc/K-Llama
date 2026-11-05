@@ -218,15 +218,19 @@ class Chain:
         would avoid that round trip but means changing `generate_stream`'s contract.
         """
         with self._lock:
-            # Refuse a request that cannot fit before touching any state. An overrun does
+            # Reset first, because it is also the liveness check: the worker drops a
+            # session after a minute of silence, and `reset()` reconnects when it finds
+            # the old socket dead. Everything after this -- starting with the tokenize
+            # below -- would otherwise run into the same closed socket.
+            for client in self._clients:
+                client.reset()
+            # Refuse a request that cannot fit before generating anything. An overrun does
             # not fail cleanly: llama_decode returns rc=-1 partway through the answer, and
             # the client sees a truncated stream rather than a rejected request.
             if self._clients:
                 n_prompt = len(self._clients[0].tokenize(prompt))
                 if why := context_shortfall(n_prompt, max_tokens, self._ctx):
                     raise ContextOverflow(why)
-            for client in self._clients:
-                client.reset()
             greedy = config.is_greedy(sampling)
             if self._clients:
                 tail = self._clients[-1]

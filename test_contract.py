@@ -120,6 +120,9 @@ class MethodSurface(unittest.TestCase):
         known = set(CONTRACT_OPS) | {
             # transport-specific or naming variants, not shim operations
             "connect", "sock", "n_embd",
+            # reconnect is a socket-level recovery, not a shim operation: it drops the
+            # connection and redoes the handshake, then the caller re-issues the op.
+            "reconnect",
             "forward_tokens", "forward_hidden", "forward_token", "forward_tokens_out",
             "forward_tokens_to_hidden", "forward_hidden_to_hidden_or_none",
             "forward_hidden_to_hidden", "forward_hidden_to_token", "forward_hidden_to_tokens",
