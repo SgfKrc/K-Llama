@@ -404,6 +404,16 @@ class StageClient:
         """The HELLO this stage answered with; empty until connect() succeeded."""
         return dict(self._identity)
 
+    @property
+    def n_batch(self) -> int:
+        """How many tokens one forward call may carry on this stage.
+
+        A worker that predates the HELLO field answers 512, which is what every stage
+        loads with anyway -- guessing the default is safe here, missing the ceiling is
+        not: one oversized batch fails the whole request with "batch too large".
+        """
+        return int(self._identity.get("n_batch") or 512)
+
     def _identity_problems(self, hello: dict) -> list[str]:
         """Everything about `hello` that disagrees with the topology.
 
@@ -1134,10 +1144,35 @@ def _walk(clients: list[StageClient], tokens: list[int], n_past: int,
     raise RuntimeError("chain has no tail stage")
 
 
+def prefill_block(clients: list[StageClient]) -> int:
+    """The largest number of tokens one forward call may carry down this chain.
+
+    Every stage has to accept the batch, so the answer is the smallest ceiling. A stage
+    that never announced one is assumed to run the default, which is what it does.
+    """
+    sizes = [int(getattr(c, "n_batch", 0) or 0) for c in clients]
+    sizes = [s for s in sizes if s > 0]
+    return min(sizes) if sizes else 512
+
+
 def forward(clients: list[StageClient], tokens: list[int], n_past: int,
             stage_ms: list[list[float]]) -> int:
-    """Walk the chain once and return the next token."""
-    return _walk(clients, tokens, n_past, stage_ms, want_all=False)
+    """Walk the chain and return the next token, slicing long prompts into batches.
+
+    A prompt longer than the stages' ``n_batch`` cannot go down in one call: the head
+    refuses it with "batch too large" and the request dies before generating a token --
+    which is what a normal chat turned into the moment the transcript outgrew 512 tokens.
+    Slicing is the same arithmetic, only split: each slice continues from where the
+    previous one stopped, and only the last slice's answer is wanted.
+    """
+    block = prefill_block(clients)
+    if len(tokens) <= block:
+        return _walk(clients, tokens, n_past, stage_ms, want_all=False)
+    token = -1
+    for start in range(0, len(tokens), block):
+        token = _walk(clients, tokens[start:start + block], n_past + start,
+                      stage_ms, want_all=False)
+    return token
 
 
 def forward_batch(clients: list[StageClient], tokens: list[int], n_past: int,

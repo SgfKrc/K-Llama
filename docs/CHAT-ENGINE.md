@@ -81,7 +81,9 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
    `keep_head.py:198`、`speculate` 的 `n_past+1+j`、`seq_rm`）
 2. 图像 token **必须走 embd 输入**（M-RoPE 只允许 embedding 输入的位置重叠）
 3. **4 维位置要传到每一段**（每段都持整模、各算自己层的 RoPE）
-4. `keep_head.py:196` 硬拒 `n_tokens > 512`，1024 token 的图直接抛
+4. ~~`keep_head.py:196` 硬拒 `n_tokens > 512`~~：**已修**，`forward()` 现在按各段
+   `n_batch` 切块 prefill（见 §5）。图像 token 走 embd 路径时同样要切，但每块的位置
+   推进要按 M-RoPE 算，不能沿用「块大小」——这部分留给第五期。
 5. 带宽：1024 行 × 2048 × 4 B = 8 MB/图，跨 Tailscale
 
 估算 800–1500 行、跨 8 个文件，是工具调用那一期的 3–5 倍。
@@ -141,6 +143,11 @@ Python 扩展（项目现有原生边界全是 ctypes，没有扩展先例）。
   每片都发新 id 会让客户端把一次调用拆成多个块
 - **收尾要用 `partial=False` 再 parse 一次**：工具调用只有在闭合标签到达后才算完成，
   增量那一遍不会吐出这段尾巴
+- **一次 forward 不能超过段声明的 `n_batch`**：`keep_head._check_context` 超了直接
+  `batch too large`，整条请求在出第一个 token 之前就死。切块 prefill 是同一份算术拆着
+  算（每块从上一块的落点续），`chain_client.forward()` 一处覆盖所有调用方；`n_batch`
+  由 stage 在 HELLO 里报，旧 worker 不报时按 512。实测 1856 token 的 prompt 从「119 ms
+  报错」变成「603 片跑完」，这也是图文那一期要先解决的东西
 
 ## 6. DSH 的实际要求（读其源码确认）
 

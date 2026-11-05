@@ -24,7 +24,7 @@ from typing import Iterator, Sequence
 import numpy as np
 
 import config
-from chain_client import DFlashDriver, forward, speculate
+from chain_client import DFlashDriver, forward, prefill_block, speculate
 
 
 @dataclass
@@ -178,8 +178,13 @@ def generate_stream(
     # numbers are meaningless there, only the wire paths are real.
     round_start = n_past          # 本轮起点；块内截断时按它算出哪些位置已在 KV 里
     if single_stage:
-        prefix = np.zeros((len(prompt_tokens), tail.n_embd), dtype=np.float32)
-        queued = [tail.forward_token(prefix, n_past)]
+        block = prefill_block(clients)
+        token = -1
+        for start in range(0, len(prompt_tokens), block):
+            chunk = prompt_tokens[start:start + block]
+            prefix = np.zeros((len(chunk), tail.n_embd), dtype=np.float32)
+            token = tail.forward_token(prefix, n_past + start)
+        queued = [token]
     else:
         queued = [forward(clients, prompt_tokens, n_past, stage_ms)]
     # `n_past` is the first free position, so it advances by what was just written -- not
