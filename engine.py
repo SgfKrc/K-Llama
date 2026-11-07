@@ -83,6 +83,11 @@ class StageEngine:
         )
 
     @property
+    def n_batch(self) -> int:
+        """Tokens one forward call may carry. The upstream refuses anything larger."""
+        return int(self._up.n_batch)
+
+    @property
     def n_embd(self) -> int:
         return int(self._up.n_embd)
 

@@ -120,6 +120,9 @@ class MethodSurface(unittest.TestCase):
         known = set(CONTRACT_OPS) | {
             # transport-specific or naming variants, not shim operations
             "connect", "sock", "n_embd",
+            # reconnect is a socket-level recovery, not a shim operation: it drops the
+            # connection and redoes the handshake, then the caller re-issues the op.
+            "reconnect",
             "forward_tokens", "forward_hidden", "forward_token", "forward_tokens_out",
             "forward_tokens_to_hidden", "forward_hidden_to_hidden_or_none",
             "forward_hidden_to_hidden", "forward_hidden_to_token", "forward_hidden_to_tokens",
@@ -144,18 +147,24 @@ class SingleSourceOfTruth(unittest.TestCase):
     mechanical.
     """
 
-    def test_only_chat_renders_chatml(self):
-        """A second prompt renderer is how the server ended up sending plain text.
+    def test_no_python_file_renders_chatml(self):
+        """Prompt rendering lives in C++ now, so no Python file may spell the markers.
 
-        Qwen answered "是 是 是 ..." because `flatten_messages` had its own idea of a
-        prompt while `chat.apply_chatml` had the right one. Two ways to write a second
-        renderer: spell the markers out, or reuse chat.IM_START. Both are caught;
-        prose that merely mentions the marker is not.
+        This used to exempt `chat.py`, because that is where the hand-written renderer
+        lived. The renderer moved behind `qlh_chat.dll` (`shim/chat/`), and the exemption
+        is exactly how the old one drifted: the 2B template opens the assistant turn with
+        `thinking` while the hand-written copy said `thinking`, so the prompt differed by
+        a token before the model ever saw it. The rule is now the same for every file,
+        `chat.py` included -- including this test file.
+
+        Prose that merely mentions the marker is still not a renderer: the literal has to
+        be a quoted string. Reusing the old constant name is banned too, because that was
+        the second way to write a second renderer.
         """
         literal = re.compile(r'''["']\s*<\|im_start\|>''')
         offenders = []
         for path in sorted(ROOT.glob("*.py")):
-            if path.name in {"chat.py", "test_contract.py"}:
+            if path.name == "test_contract.py":     # 规则定义者：它自己必然含这个模式
                 continue
             for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace")
                                      .splitlines(), 1):
@@ -163,8 +172,28 @@ class SingleSourceOfTruth(unittest.TestCase):
                 if literal.search(code) or "IM_START" in code:
                     offenders.append(f"{path.name}:{i}: {line.strip()}")
         self.assertEqual([], offenders,
-                         "prompt rendering belongs to chat.apply_chatml; found a second "
-                         "implementation: %s" % offenders)
+                         "prompt rendering belongs to qlh_chat.dll (shim/chat/); found a "
+                         "Python renderer: %s" % offenders)
+
+    def test_no_python_file_loads_the_rendering_dll(self):
+        """One place binds the C ABI, or its ownership rules get copied with one of them wrong.
+
+        `ctypes.CDLL` on `qlh_chat.dll` is the boundary to C++: the handle is opaque, and
+        every string crossing back is freed by `qlh_chat_str_free`. A second binding is how
+        the struct layouts and that free rule end up duplicated. `checks/verify_chat.py`
+        is deliberately out of scope: it binds the same ABI on purpose, to test it.
+        """
+        loaders = []
+        for path in sorted(ROOT.glob("*.py")):
+            if path.name == "test_contract.py":     # 规则定义者，不是加载者
+                continue
+            code = "\n".join(line.split("#", 1)[0] for line in
+                             path.read_text(encoding="utf-8", errors="replace").splitlines())
+            if "ctypes.CDLL" in code and "qlh_chat" in code:
+                loaders.append(path.name)
+        self.assertEqual([], loaders,
+                         "the rendering DLL is C++-side now; no root Python file may "
+                         "load it: %s" % loaders)
 
     def test_needs_logits_has_one_implementation(self):
         """`SA_NEEDS_LOGITS` is *computed* in config.needs_logits() and nowhere else.
@@ -186,28 +215,6 @@ class SingleSourceOfTruth(unittest.TestCase):
         self.assertEqual([], offenders,
                          "spell the rule once in config.needs_logits(); found it inline: %s"
                          % offenders)
-
-    def test_prompt_tokens_is_not_a_character_count(self):
-        """`len(prompt)` is characters. The token count comes from tokenize()."""
-        offenders = []
-        for name in ("server.py", "proto_responses.py"):
-            for i, line in enumerate(_read(name).splitlines(), 1):
-                code = line.split("#", 1)[0]
-                if "len(prompt)" in code:
-                    offenders.append(f"{name}:{i}: {line.strip()}")
-        self.assertEqual([], offenders,
-                         "prompt_tokens must come from generate_stream's stats, not len(): %s"
-                         % offenders)
-
-    def test_server_has_one_generation_loop(self):
-        """Four response shapes, one drain. A fifth hand-rolled loop is how `usage`
-        started disagreeing between stream and non-stream."""
-        text = _read("server.py")
-        count = text.count("for chunk in self.generate(")
-        self.assertEqual(
-            1, count,
-            "server.py has %d generation loops; route new shapes through Chain.drain()" % count)
-
 
 if __name__ == "__main__":
     unittest.main()

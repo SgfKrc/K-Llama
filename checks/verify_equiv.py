@@ -47,6 +47,51 @@ def _bits(arr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.float32).view(np.uint32)
 
 
+# ------------------------------------------------------------------- E0 prompt
+def run_prompt(args: argparse.Namespace) -> dict:
+    """E0: the rendered prompt string, byte for byte, against upstream's golden values.
+
+    Why this is stronger than a token sequence: the same tokens can come from different
+    prompt strings (BPE merges across a boundary), while an identical prompt necessarily
+    tokenizes identically. Why it needs no server: the reference is llama.cpp's own
+    `tests/test-chat.cpp` expectations for `Qwen3.5-4B.jinja` (cross-checked with an
+    independent jinja2 render, see `checks/verify_chat.py`), not llama-server's
+    `/apply-template`. Both sides run the same `common/chat.cpp`, so "same bytes" is the
+    claim, and it holds without a model or a listening port.
+
+    It also covers the wrapper: `chat.py` only moves JSON across the C ABI, so a prompt
+    that reaches the golden value proves the wrapper did not rewrite anything on the way.
+    """
+    sys.path.insert(0, str(HERE))
+    import verify_chat  # noqa: E402 - the golden values live there, one copy only
+
+    from chat import Chat  # noqa: E402
+
+    dll = config.find_chat_dll(args.chat_dll or None)
+    template_path = verify_chat.find_template(args.template, args.llama_root)
+    template = template_path.read_text(encoding="utf-8")
+    rows = []
+    with Chat(template, dll=dll) as renderer:
+        for name, req in verify_chat.cases().items():
+            rendered = renderer.render(req["messages"], tools=req.get("tools"),
+                                       thinking=req.get("enable_thinking", True))
+            want = verify_chat.GOLDEN[name]
+            rows.append({
+                "case": name,
+                "prompt_same": rendered.prompt == want["prompt"],
+                "generation_prompt_same":
+                    rendered.generation_prompt == want["generation_prompt"],
+                "format": rendered.format,
+                "prompt_len": len(rendered.prompt),
+                "prompt": rendered.prompt,
+                "expected": want["prompt"],
+            })
+    bad = [r["case"] for r in rows if not (r["prompt_same"]
+                                           and r["generation_prompt_same"])]
+    return {"mode": "prompt", "dll": str(dll), "template": str(template_path),
+            "cases": rows, "verdict": "PASS" if not bad else "FAIL: " + ", ".join(bad)}
+
+
 def _stage_ms(n: int) -> list[list[float]]:
     return [[] for _ in range(n)]
 
@@ -78,8 +123,12 @@ def run_chain(args: argparse.Namespace) -> dict:
 
         text = args.prompt_text
         if args.chat:
-            from chat import apply_chatml
-            text = apply_chatml([{"role": "user", "content": text}])
+            # 渲染只有一份实现：模型自己的模板，在 qlh_chat.dll 里跑。以前这里手写
+            # ChatML，2B 模板用 `thinking` 而手写版写 `thinking`，差一个 token。
+            from chat import Chat
+
+            with Chat.for_model(stages[0].model, dll=args.chat_dll or None) as renderer:
+                text = renderer.render([{"role": "user", "content": text}]).prompt
         prompt = clients[0].tokenize(text)
         if not prompt:
             raise SystemExit("prompt tokenized to nothing")
@@ -263,8 +312,9 @@ def run_slots(args: argparse.Namespace) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["chain", "hidden", "slots"], default="chain")
+    ap.add_argument("--mode", choices=["prompt", "chain", "hidden", "slots"], default="chain")
     ap.add_argument("--shim", default="", help="覆盖 SA_SHIM（见 config.find_shim）")
+    ap.add_argument("--chat-dll", default="", help="覆盖 SA_CHAT_DLL（见 config.find_chat_dll）")
     ap.add_argument("--topology", default="topology-local-32-8.toml")
     ap.add_argument("--prompt-text", default="def quicksort(arr):")
     ap.add_argument("--gen", type=int, default=16)
@@ -276,8 +326,20 @@ def main() -> int:
                     help='override the candidate LLAMA_LAYER_RANGE, e.g. "0:40"')
     ap.add_argument("--gpu-layers", type=int, default=4)
     ap.add_argument("--with-ref", action="store_true")
+    ap.add_argument("--template", default="",
+                    help="--mode prompt 的模板（默认找上游的 Qwen3.5-4B.jinja）")
+    ap.add_argument("--llama-root", default="", help="llama.cpp 源码根（找模板用）")
     ap.add_argument("--json-out", default="")
     args = ap.parse_args()
+
+    if args.mode == "prompt":
+        # 这一条不起服务、不加载模型，所以不需要 shim 也不需要拓扑。
+        result = run_prompt(args)
+        blob = json.dumps(result, ensure_ascii=False, indent=1)
+        print(blob)
+        if args.json_out:
+            Path(args.json_out).write_text(blob, encoding="utf-8")
+        return 0 if result["verdict"] == "PASS" else 1
 
     # One rule for finding the DLL: config.find_shim() (--shim > SA_SHIM > this
     # checkout's build). Every mode here loads the shim, so it is resolved up front.

@@ -460,6 +460,9 @@ def main() -> int:
             "role": args.role,
             "n_layer": int(engine.n_layer),
             "n_embd": int(engine.n_embd),
+            # The driver slices a long prompt into forward calls of at most this many
+            # tokens; larger than the stage allows and it refuses the whole batch.
+            "n_batch": int(engine.n_batch),
             "layer_range": os.environ.get("LLAMA_LAYER_RANGE", ""),
             "dtype": wire.current_dtype(),
             "model": model_path.name,

@@ -404,6 +404,16 @@ class StageClient:
         """The HELLO this stage answered with; empty until connect() succeeded."""
         return dict(self._identity)
 
+    @property
+    def n_batch(self) -> int:
+        """How many tokens one forward call may carry on this stage.
+
+        A worker that predates the HELLO field answers 512, which is what every stage
+        loads with anyway -- guessing the default is safe here, missing the ceiling is
+        not: one oversized batch fails the whole request with "batch too large".
+        """
+        return int(self._identity.get("n_batch") or 512)
+
     def _identity_problems(self, hello: dict) -> list[str]:
         """Everything about `hello` that disagrees with the topology.
 
@@ -711,7 +721,20 @@ class StageClient:
         return wire.decode(msg.blob, dtype, (n_tokens, n_embd))
 
     def tokenize(self, text: str) -> list[int]:
-        """Text -> ids via the stage's own vocabulary (every stage loads the same one)."""
+        """Text -> ids via the stage's own vocabulary (every stage loads the same one).
+
+        This doubles as the liveness probe on the reuse path: a session the worker dropped
+        for idling fails here first, and reconnecting is safe because tokenizing changes no
+        state. The reset path has the same recovery, but a request that continues an
+        existing KV must not reset, so it needs a probe that does not.
+        """
+        try:
+            return self._tokenize_once(text)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.reconnect()
+            return self._tokenize_once(text)
+
+    def _tokenize_once(self, text: str) -> list[int]:
         msg = self._forward({"op": "tokenize", "text": text})
         if "n_embd" in msg.meta:
             self._n_embd = int(msg.meta["n_embd"])
@@ -749,10 +772,34 @@ class StageClient:
         return dict(self._forward({"op": "clear_sampling"}).meta.get("sampling") or {})
 
     def reset(self) -> None:
+        """Clear this stage's KV, reconnecting first if the session had gone stale.
+
+        The worker drops a session after ``SESSION_IDLE_S`` of silence -- it is single
+        threaded ``accept → _session``, so a connection whose client vanished would
+        otherwise block the next one. The driver cannot see that happen and used to keep
+        writing into the closed socket: the first request after an idle spell failed with
+        ``ConnectionAbortedError``, and every request after it failed the same way until
+        the server was restarted (measured: idle 95 s → 500 forever).
+
+        Retrying here is safe where retrying a forward would not be: a reset is idempotent
+        and a fresh session starts empty, so nothing is replayed twice.
+        """
+        try:
+            self._reset_once()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.reconnect()
+            self._reset_once()
+
+    def _reset_once(self) -> None:
         protocol.send(self.sock, protocol.RESET)
         msg = protocol.read(self.sock)
         if msg.kind == protocol.ERROR:
             raise RuntimeError(f"stage {self.stage.index} reset failed: {msg.meta}")
+
+    def reconnect(self) -> None:
+        """Drop whatever socket we hold and handshake again."""
+        self.close()
+        self.connect()
 
     def close(self) -> None:
         if self._sock is None:
@@ -1134,10 +1181,35 @@ def _walk(clients: list[StageClient], tokens: list[int], n_past: int,
     raise RuntimeError("chain has no tail stage")
 
 
+def prefill_block(clients: list[StageClient]) -> int:
+    """The largest number of tokens one forward call may carry down this chain.
+
+    Every stage has to accept the batch, so the answer is the smallest ceiling. A stage
+    that never announced one is assumed to run the default, which is what it does.
+    """
+    sizes = [int(getattr(c, "n_batch", 0) or 0) for c in clients]
+    sizes = [s for s in sizes if s > 0]
+    return min(sizes) if sizes else 512
+
+
 def forward(clients: list[StageClient], tokens: list[int], n_past: int,
             stage_ms: list[list[float]]) -> int:
-    """Walk the chain once and return the next token."""
-    return _walk(clients, tokens, n_past, stage_ms, want_all=False)
+    """Walk the chain and return the next token, slicing long prompts into batches.
+
+    A prompt longer than the stages' ``n_batch`` cannot go down in one call: the head
+    refuses it with "batch too large" and the request dies before generating a token --
+    which is what a normal chat turned into the moment the transcript outgrew 512 tokens.
+    Slicing is the same arithmetic, only split: each slice continues from where the
+    previous one stopped, and only the last slice's answer is wanted.
+    """
+    block = prefill_block(clients)
+    if len(tokens) <= block:
+        return _walk(clients, tokens, n_past, stage_ms, want_all=False)
+    token = -1
+    for start in range(0, len(tokens), block):
+        token = _walk(clients, tokens[start:start + block], n_past + start,
+                      stage_ms, want_all=False)
+    return token
 
 
 def forward_batch(clients: list[StageClient], tokens: list[int], n_past: int,
@@ -1768,7 +1840,8 @@ def main() -> int:
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--chat", action="store_true",
-                    help="render --prompt-text as ChatML and parse special tokens")
+                    help="parse special tokens in --prompt-text (rendering moved into the "
+                         "C++ side; this only flips SA_PARSE_SPECIAL)")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--dry-run", action="store_true",
                     help="validate the topology and the memory budget, load no model")
@@ -1913,9 +1986,6 @@ def main() -> int:
         if report := vram_report(vram_after_load(stages, vram_before)):
             print("\n" + report)
 
-        if args.chat and args.prompt_text:
-            from chat import apply_chatml
-            args.prompt_text = apply_chatml([{"role": "user", "content": args.prompt_text}])
         _sampling = (dict(temperature=0.0) if args.greedy else
                      dict(temperature=args.temperature, top_k=args.top_k,
                           top_p=args.top_p, seed=args.seed))

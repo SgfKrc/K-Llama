@@ -1,0 +1,84 @@
+qlh_chat.dll vendored 源码树
+=============================
+
+来源：llama.cpp（本机检出 H:\llamacpp-c）
+commit : e0f142d5ddc1461ce721644d92af33db23545105
+date   : 2026-10-29 21:30:05 -0700
+subject: opencl: add initial q2_0 support (#31340)
+
+策略：零分叉（vendored，非子模块、非符号链接）
+------------------------------------------------
+本目录下的每个 .cpp/.h/.hpp 都是上游文件的**逐字副本**（`cmp` 校验全部一致），
+一字未改。上游更新时的刷新方式：
+
+    S=/h/llamacpp-c/common
+    cp $S/chat.cpp $S/chat.h $S/chat-peg-parser.* $S/peg-parser.* \
+       $S/chat-auto-parser.h $S/chat-auto-parser-generator.cpp \
+       $S/chat-auto-parser-helpers.* $S/chat-diff-analyzer.cpp \
+       $S/json.* $S/json-schema.* $S/json-schema-to-grammar.* \
+       $S/unicode.* $S/trie.* $S/log.* shim/chat/
+    cp $S/parsers/*.cpp $S/parsers/parsers.h shim/chat/parsers/
+    cp $S/jinja/*.cpp $S/jinja/*.h $S/jinja/README.md shim/chat/jinja/
+    cp /h/llamacpp-c/vendor/nlohmann/json.hpp shim/chat/vendor/nlohmann/
+
+目录布局是上游 `common/` 的镜像，这不是随意选择：`jinja/*.cpp` 内部用
+`#include "lexer.h"` / `"runtime.h"` / `"value.h"` / `"caps.h"` / `"parser.h"` /
+`"utils.h"` 这样的**同目录相对 include**，只有把这些文件留在 `jinja/` 子目录里，
+MSVC 才会在「包含该文件的目录」里找到它们。**绝对不要**加
+`-I shim/chat/jinja`（也不要加 `-I <llama>/common/jinja`）：`<string.h>` 会解析到
+`jinja/string.h`，报一屏 `memchr/strlen is not a member of the global namespace`。
+
+文件清单（59 个上游文件，23,093 行，不含第三方单头）
+----------------------------------------------------
+顶层（23 文件）
+  chat.cpp (1955)                     chat.h (502)
+  chat-peg-parser.cpp (1239)          chat-peg-parser.h (220)
+  peg-parser.cpp (1834)               peg-parser.h (566)
+  chat-auto-parser.h (453)            chat-auto-parser-generator.cpp (477)
+  chat-auto-parser-helpers.cpp (363)  chat-auto-parser-helpers.h (74)
+  chat-diff-analyzer.cpp (1635)       ← 上游没有 .h，只有 .cpp
+  json.cpp (433)                      json.h (356)
+  json-schema.cpp (538)               json-schema.h (198)
+  json-schema-to-grammar.cpp (1060)   json-schema-to-grammar.h (24)
+  unicode.cpp (129)                   unicode.h (30)
+  trie.cpp (123)                      trie.h (73)
+  log.cpp (566)                       log.h (148)
+
+parsers/（22 文件，全部 21 个 handler + 公共头）
+  parsers.cpp (26) / parsers.h (88)
+  cohere2moe.cpp deepseek.cpp functionary-v3-2.cpp gemma4.cpp gigachat-v3.cpp
+  gpt-oss.cpp harmony-xml.cpp k2-horizon.cpp kimi-k2.cpp kimi-k3.cpp lfm2.cpp
+  ling3.cpp llm-jp-harmony.cpp minicpm5.cpp minimax-m3.cpp ministral3.cpp
+  muse-glimmer.cpp muse-spark.cpp qwen3-coder.cpp translate-gemma.cpp
+
+jinja/（13 文件，上游自研纯 STL 实现，零第三方依赖）
+  caps.cpp (650) / caps.h (44)      lexer.cpp (361) / lexer.h (157)
+  parser.cpp (637) / parser.h (21)  runtime.cpp (1031) / runtime.h (782)
+  string.cpp (213) / string.h (61)  value.cpp (1751) / value.h (765)
+  utils.h (151)                     README.md
+
+vendor/（1 文件）
+  nlohmann/json.hpp (26367)  ← 单头版；json.cpp 用 `#include <nlohmann/json.hpp>`，
+                               所以编译时加 `-I shim/chat/vendor`
+
+总计 60 文件 / 49,460 行，其中上游自有代码 23,093 行，第三方单头 26,367 行。
+
+没有 vendored 的头（仍从上游树 -I 取）
+--------------------------------------
+  common.h / llama-cpp.h / llama.h / ggml.h / llama-abi.h
+chat.h 与 parsers/parsers.h 都 `#include "common.h"`，那是 common/ 里 ~1000 行、
+把 llama.h + ggml.h + llama-cpp.h 全拉进来的公共头。复制它没有意义（它本身就是
+llama 头的聚合器），所以编译时用 `-I <llama>/common -I <llama>/include
+-I <llama>/ggml/include` 直接指向上游树。这些是**头文件**依赖，不产生任何链接期
+依赖：最终 DLL 的导入表里没有 llama.dll / ggml.dll（见构建报告）。
+
+本目录里唯一不是上游的东西
+--------------------------
+  qlh_chat_compat.cpp  ← 本仓库新增，不是上游文件
+chat.cpp 从 common.cpp / sampling.cpp / llama.cpp 引用了一小批**非内联**符号
+（ggml_abort、string_replace_all/join/split/repeat、tty_*、common_tokenize、
+common_token_to_piece、common_sampling_add_*、几个 llama_* 查询函数），
+不把它们编译进来就只有链接错误。做法是：能逐字复制实现的一律从上游 common.cpp
+逐字复制（附来源行号），只有依赖 vocab 的那几个给最小桩——它们在
+`common_chat_templates_init(nullptr, ...)` 路径上永远不会被调用（chat.cpp:957 的
+`if (model)` 整块跳过）。详见该文件头部注释。

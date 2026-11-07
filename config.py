@@ -100,12 +100,51 @@ def find_shim(explicit: str | Path | None = None) -> Path:
         f"current DLL)")
 
 
+#: 渲染 DLL 的查找规则与 find_shim 同形，但**不是**同一个 DLL：find_shim 找的是带模型的
+#: 推理 shim（qlh_keep_head.dll），这里找的是只带 llama.cpp `common/chat` 的 qlh_chat.dll。
+#: 两个规则各写一份，因为混用的失败发生在加载时（缺符号），不是调用时（缺参数）。
+CHAT_DLL_ENV = "SA_CHAT_DLL"
+#: 第一期产物：shim/build_chat_msvc.ps1 落在 .qlh_tmp/chatout/（gitignored，构建输出）。
+CHAT_DLL_RELATIVE = Path(".qlh_tmp") / "chatout" / "qlh_chat.dll"
+CHAT_SO_RELATIVE = Path(".qlh_tmp") / "chatout" / "libqlh_chat.so"
+
+
+def find_chat_dll(explicit: str | Path | None = None) -> Path:
+    """The rendering DLL to load: ``--chat-dll`` > ``SA_CHAT_DLL`` > this checkout's build.
+
+    One rule for every entry point that renders a prompt. An explicit path must exist --
+    a typo'd ``--chat-dll`` that silently falls back to the build output is the same class
+    of bug the hardcoded ``SA_SHIM`` default used to be: a run that quietly loads a
+    different DLL than the one the operator named.
+    """
+    if explicit:
+        p = Path(str(explicit)).expanduser()
+        if not p.is_file():
+            raise ConfigError(f"--chat-dll does not point to a file: {p}")
+        return p
+    env = os.environ.get(CHAT_DLL_ENV, "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if not p.is_file():
+            raise ConfigError(f"{CHAT_DLL_ENV} does not point to a file: {p}")
+        return p
+    root = Path(__file__).resolve().parent
+    for rel in (CHAT_DLL_RELATIVE, CHAT_SO_RELATIVE):
+        p = root / rel
+        if p.is_file():
+            return p
+    raise ConfigError(
+        f"no chat DLL: neither {CHAT_DLL_ENV} nor --chat-dll is set, and this checkout "
+        f"has no build at {root / CHAT_DLL_RELATIVE} (build one with "
+        f"`powershell -File shim/build_chat_msvc.ps1 -LlamaRoot <llama.cpp>`, or point "
+        f"{CHAT_DLL_ENV} at the current DLL)")
+
+
 def load():
     """Parse and validate the topology. Imported lazily to keep cycles out."""
     import topology
 
     return topology.load(topology_path())
-
 
 #: Which roles need the output projection. Only the tail turns hidden into ids; every
 #: other stage otherwise makes the shim run `output.weight` over the whole 248,320-row
