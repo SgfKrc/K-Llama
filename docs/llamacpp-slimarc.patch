@@ -1,7 +1,7 @@
-diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index c9bc9ee40..41849c416 100644
---- a/src/CMakeLists.txt
-+++ b/src/CMakeLists.txt
+diff --git b/src/CMakeLists.txt a/src/CMakeLists.txt
+index 5f65c39dc..de56b0fee 100644
+--- b/src/CMakeLists.txt
++++ a/src/CMakeLists.txt
 @@ -47,9 +47,22 @@ set(LLAMA_CORE_SOURCES
      unicode.cpp
  )
@@ -25,19 +25,19 @@ index c9bc9ee40..41849c416 100644
              unicode.h
              ${LLAMA_MODELS_SOURCES}
              )
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fce6f769a..625312042 100644
---- a/src/llama-context.cpp
-+++ b/src/llama-context.cpp
+diff --git b/src/llama-context.cpp a/src/llama-context.cpp
+index f86137fc0..6a82c13a3 100644
+--- b/src/llama-context.cpp
++++ a/src/llama-context.cpp
 @@ -14,6 +14,7 @@
  #include "llama-ext.h"
  #include "llama-sampler.h"
  #include "llama.h"
 +#include "slim-arc-prefetch.h"
  
+ #include <algorithm>
  #include <cinttypes>
- #include <cmath>
-@@ -1609,7 +1610,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1774,7 +1775,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          res->reset();
  
          ggml_backend_sched_reset(sched.get());
@@ -57,7 +57,7 @@ index fce6f769a..625312042 100644
  
          //const auto t_start_us = ggml_time_us();
  
-@@ -1623,6 +1635,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1788,6 +1800,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -72,10 +72,10 @@ index fce6f769a..625312042 100644
          if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
-diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+diff --git b/src/llama-model-loader.cpp a/src/llama-model-loader.cpp
 index 65261767a..65828a348 100644
---- a/src/llama-model-loader.cpp
-+++ b/src/llama-model-loader.cpp
+--- b/src/llama-model-loader.cpp
++++ a/src/llama-model-loader.cpp
 @@ -5,6 +5,7 @@
  #include "gguf.h"
  #include "llama-hparams.h"
@@ -121,11 +121,11 @@ index 65261767a..65828a348 100644
  }
  
  using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
-diff --git a/src/slim-arc-expert-reclaim.cpp b/src/slim-arc-expert-reclaim.cpp
+diff --git b/src/slim-arc-expert-reclaim.cpp a/src/slim-arc-expert-reclaim.cpp
 new file mode 100644
 index 000000000..75ac945c7
 --- /dev/null
-+++ b/src/slim-arc-expert-reclaim.cpp
++++ a/src/slim-arc-expert-reclaim.cpp
 @@ -0,0 +1,121 @@
 +#include "slim-arc-expert-reclaim.h"
 +
@@ -248,11 +248,11 @@ index 000000000..75ac945c7
 +}
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-expert-reclaim.h b/src/slim-arc-expert-reclaim.h
+diff --git b/src/slim-arc-expert-reclaim.h a/src/slim-arc-expert-reclaim.h
 new file mode 100644
 index 000000000..f17cc76ca
 --- /dev/null
-+++ b/src/slim-arc-expert-reclaim.h
++++ a/src/slim-arc-expert-reclaim.h
 @@ -0,0 +1,38 @@
 +#pragma once
 +
@@ -292,11 +292,11 @@ index 000000000..f17cc76ca
 +    size_t page_size);
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-expert-residency.cpp b/src/slim-arc-expert-residency.cpp
+diff --git b/src/slim-arc-expert-residency.cpp a/src/slim-arc-expert-residency.cpp
 new file mode 100644
 index 000000000..2ef4aff29
 --- /dev/null
-+++ b/src/slim-arc-expert-residency.cpp
++++ a/src/slim-arc-expert-residency.cpp
 @@ -0,0 +1,256 @@
 +#include "slim-arc-expert-residency.h"
 +
@@ -554,11 +554,11 @@ index 000000000..2ef4aff29
 +}
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-expert-residency.h b/src/slim-arc-expert-residency.h
+diff --git b/src/slim-arc-expert-residency.h a/src/slim-arc-expert-residency.h
 new file mode 100644
 index 000000000..a40e6ea13
 --- /dev/null
-+++ b/src/slim-arc-expert-residency.h
++++ a/src/slim-arc-expert-residency.h
 @@ -0,0 +1,94 @@
 +#pragma once
 +
@@ -654,11 +654,11 @@ index 000000000..a40e6ea13
 +};
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-expert-transition.cpp b/src/slim-arc-expert-transition.cpp
+diff --git b/src/slim-arc-expert-transition.cpp a/src/slim-arc-expert-transition.cpp
 new file mode 100644
 index 000000000..dfd68f00b
 --- /dev/null
-+++ b/src/slim-arc-expert-transition.cpp
++++ a/src/slim-arc-expert-transition.cpp
 @@ -0,0 +1,174 @@
 +#include "slim-arc-expert-transition.h"
 +
@@ -834,11 +834,11 @@ index 000000000..dfd68f00b
 +}
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-expert-transition.h b/src/slim-arc-expert-transition.h
+diff --git b/src/slim-arc-expert-transition.h a/src/slim-arc-expert-transition.h
 new file mode 100644
 index 000000000..a00b543df
 --- /dev/null
-+++ b/src/slim-arc-expert-transition.h
++++ a/src/slim-arc-expert-transition.h
 @@ -0,0 +1,61 @@
 +#pragma once
 +
@@ -901,11 +901,11 @@ index 000000000..a00b543df
 +};
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-page-range.cpp b/src/slim-arc-page-range.cpp
+diff --git b/src/slim-arc-page-range.cpp a/src/slim-arc-page-range.cpp
 new file mode 100644
 index 000000000..f384682e0
 --- /dev/null
-+++ b/src/slim-arc-page-range.cpp
++++ a/src/slim-arc-page-range.cpp
 @@ -0,0 +1,118 @@
 +#include "slim-arc-page-range.h"
 +
@@ -1025,11 +1025,11 @@ index 000000000..f384682e0
 +}
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-page-range.h b/src/slim-arc-page-range.h
+diff --git b/src/slim-arc-page-range.h a/src/slim-arc-page-range.h
 new file mode 100644
 index 000000000..c740c4321
 --- /dev/null
-+++ b/src/slim-arc-page-range.h
++++ a/src/slim-arc-page-range.h
 @@ -0,0 +1,37 @@
 +#pragma once
 +
@@ -1068,11 +1068,11 @@ index 000000000..c740c4321
 +page_range_set coalesce_page_ranges(std::vector<page_range> ranges) noexcept;
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-prefetch.cpp b/src/slim-arc-prefetch.cpp
+diff --git b/src/slim-arc-prefetch.cpp a/src/slim-arc-prefetch.cpp
 new file mode 100644
 index 000000000..7c7d20f08
 --- /dev/null
-+++ b/src/slim-arc-prefetch.cpp
++++ a/src/slim-arc-prefetch.cpp
 @@ -0,0 +1,2085 @@
 +// SLIM-ARC: Tensor-level asynchronous prefetch scheduler
 +//
@@ -3159,11 +3159,11 @@ index 000000000..7c7d20f08
 +}
 +
 +} // namespace slim_arc
-diff --git a/src/slim-arc-prefetch.h b/src/slim-arc-prefetch.h
+diff --git b/src/slim-arc-prefetch.h a/src/slim-arc-prefetch.h
 new file mode 100644
 index 000000000..5988ff275
 --- /dev/null
-+++ b/src/slim-arc-prefetch.h
++++ a/src/slim-arc-prefetch.h
 @@ -0,0 +1,495 @@
 +#pragma once
 +

@@ -1,0 +1,36 @@
+{
+ "tag": "6l-k2-v1",
+ "n_predict": 64,
+ "rows": [
+  {
+   "name": "prose",
+   "prompt_tokens": 39,
+   "gen_tokens": 64,
+   "prompt_tps": 38.11679572622758,
+   "gen_tps": 16.74192115937007,
+   "gen_ms": 3763.009,
+   "text_head": "Here's a thinking process:  1.  **Understand User Request:**    - **Topic:** B-t",
+   "text": "Here's a thinking process:\n\n1.  **Understand User Request:**\n   - **Topic:** B-tree data structure\n   - **Key Aspects to Cover:**\n     - How a B-tree maintains balance during key insertion\n     - Why a large branching factor matters for disk I/O\n   -"
+  },
+  {
+   "name": "code",
+   "prompt_tokens": 38,
+   "gen_tokens": 64,
+   "prompt_tps": 36.49904958395886,
+   "gen_tps": 16.24235030418313,
+   "gen_ms": 3878.749,
+   "text_head": "Here's a thinking process:  1.  **Understand the User Request:**    - **Function",
+   "text": "Here's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Function Name:** `merge_intervals(intervals)`\n   - **Input:** A list of intervals (typically represented as lists/tuples of two integers: `[start, end]`)\n   - **Output:** A"
+  },
+  {
+   "name": "zh",
+   "prompt_tokens": 46,
+   "gen_tokens": 64,
+   "prompt_tps": 32.56734005542111,
+   "gen_tps": 13.170581186389228,
+   "gen_ms": 4783.388,
+   "text_head": "Here's a thinking process:  1.  **Deconstruct User Query:**    - **Topic:** Mixt",
+   "text": "Here's a thinking process:\n\n1.  **Deconstruct User Query:**\n   - **Topic:** Mixture of Experts (MoE) models vs. Dense models of the same total parameter count.\n   - **Question 1:** Why is MoE more computationally efficient during inference? (Explain"
+  }
+ ]
+}

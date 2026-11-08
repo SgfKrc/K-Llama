@@ -1,14 +1,17 @@
 # 分段改造的已知边界
 
 > 状态：**现行**
-> 更新日期：2026-11-08
+> 更新日期：2026-11-09
 
 这份文档记录的是**原型阶段有意接受、产品阶段要付代价处理**的限制。不是 TODO 列表，是边界说明：
 每条写清现象、根因、影响范围，以及修的时候要付什么代价。
 
-当前状态（2026-11-08，核对到 `H:\llamacpp-c` 的 `c5bd787b`）：上一版记为问题的六条，逐条核实后的现状见
+当前状态（2026-11-09，核对到 `H:\llamacpp-c` 的 `0c5c3bdd`，基底 `f477f795c`，52 文件 / +17831 −230）：上一版记为问题的六条，逐条核实后的现状见
 §1；§2 是仍然成立的边界。投机那一条（§2.2）翻过三次，现在是终态：远程链**能**投机，但收益中位
-约 +6%、随负载从 +8.4% 到 −1.2%，弱机器与回环上是负的；而且「投机 == 不投机」不能当判据。除
+约 +6%、随负载从 +8.4% 到 −1.2%，弱机器与回环上是负的；而且「投机 == 不投机」不能当判据。
+**2026-11-09 起 §2.2 还多了两个分句**：链上 MTP 的 0.688 是 nextn 通道的性质，DFlash / DSpark
+走 `layer_inp` tap、协议 v9 之后**远程链零损失**；markov 头（DSpark-6L）的红利是「可抄写性」
+而不是长距离依赖。除
 §2.2 的 batch invariance 一段（归因在上游 llama.cpp）与 §2.9 的 hybrid `seq_rm` 短路（上游缺陷，
 本仓只做「失败可见 + 调用方降级」）之外，下面每条的归因都在本仓。代码引用一律
 写符号（函数/字段名），不写会随改动漂 100–300 行的 `文件:行`。
@@ -21,6 +24,123 @@
 README 的六条边界与本文章节的对应：① 架构限定 → §2.1、② 远程链单序列 → §2.4、③ 远程链的投机
 能做但收益随负载走 → §2.2、⑤ 投机加速比随部署形态走 → §3.2；④ 多模态与 ⑥ 核显属输入/部署边界，
 分别在 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §7 末尾与 [`IGPU-SLOWDOWN.md`](IGPU-SLOWDOWN.md)。
+
+---
+
+## 0. 与上游的关系（2026-11-09 rebase 到 `f477f795c` 之后）
+
+一句话：这一轮把 fork 整体 rebase 到上游 193 个提交之后的 `f477f795c`，之后本仓「自己的」代码
+**少了 17 个文件**——那些文件现在与上游逐字节相同，`git diff f477f795c 0c5c3bdd` 里根本不再出现。
+这改变了本文好几条的性质：以前是「我们改了上游的 X」，现在是「上游改了 X，我们没改回去」。
+补丁的完整统计与 rebase 过程见 [`PATCHES.md`](PATCHES.md) 的「与上游 193 个提交的重合」。
+
+### 0.1 16 个文件与上游逐字节相同（`dflash.cpp` 这一轮重新进了变更集）
+
+| 类别 | 文件 | 为什么 |
+| --- | --- | --- |
+| 上一轮「两次对齐」手工适配过的 12 个 | `llama-kv-cache.{cpp,h}`、`llama-kv-cache-dsv4.{cpp,h}`、`deepseek32/4/41`、`dots3note`、`glm-dsa`、`minimax-m3`、`mistral-large4`、`qwen4exp` | 那些改动本来就是把上游的新 API 抄回来（per-layer rotation `fb5997274`、`llm_attn_mask` 去 `cnv` `ca8daad19`）；现在上游自己带着这些提交，我们那份适配没有存在理由 |
+| 只承载 `shifts` 机制的 4 个 | `llama-graph.h`、`llama-memory-recurrent.{cpp,h}`、`delta-net-base.cpp` | 删掉 `build_rs_shift_snapshots` 之后剩下的只有上游代码 |
+
+**`src/models/dflash.cpp` 是例外**：它在 rebase 那一版里与上游逐字节相同，这一轮又回来了——只多了
+device-buffer 崩溃的诊断输出（见 §0.4），不是功能改动。所以逐字节相同的文件是 16 个，52 文件的
+并集里包含它。
+
+其中被逐个核对过的 8 个（`llama-kv-cache.cpp` / `.h` / `llama-kv-cache-dsv4.h`、`deepseek4.cpp`、
+`delta-net-base.cpp`、`llama-graph.h`、`llama-memory-recurrent.cpp` / `.h`）是这一轮
+的判据样本：与匹配的上游文件**逐字节相同**，不是「差几行」。
+
+`src/llama-graph.cpp` 同理：去掉上游 `ca8daad19` 带去的那一大片之后，我们这一侧只剩
+`build_inp_embd` 的 **relay 段**（`tok_embd == nullptr` 时不建 `GET_ROWS`）。那是分段链真正需要的
+——relay / tail 段没有 token embedding，图里就不能有这条取值。
+
+### 0.2 删掉 `build_rs_shift_snapshots`：和上游是同一个问题的两种解法
+
+**我们原来的做法**：recurrent 快照按 ubatch 往前挪（shift）。新 ubatch 到来时先把上一批的快照
+整体上移 `n_tokens`，于是**跨 ubatch 的回退**也能读到对应位置的状态。
+
+**上游 `ab3768cdc` 的做法**：**拒绝**超出本 ubatch 快照的回退（`cell.rs_max = n_seq_tokens − 1`），
+并且 `split_equal()` 的 `n_keep_tail` 保证「整帧回退」落在同一个 ubatch 内。
+
+同一问题的两种解法，**互不相容**：shift 要求旧槽位保持旧内容，上游的槽位语义是按本 ubatch 的
+行号写。留着双套会让后来人以为 shift 在解决上游没解决的问题，而且两套语义会互相打架。所以整块
+删掉（`shifts` 字段、`can_reuse` 比较、`get_rs_shift()`、全部调用点）。
+
+**对本文的影响**：「跨 ubatch 回退」这一形态现在**由上游拒绝**，不是由我们支持。§2.9 的
+`seq_rm` 边界因此有一半变成了上游的设计选择，不再是本仓欠账。
+
+### 0.3 整帧回退在上游 `rs_max` 下永远不合法（这一轮真正的回归）
+
+换用上游 `rs_max` 之后露出来的，**旧上游不会出现**：
+
+```
+上游 ab3768c：cell.rs_max = n_seq_tokens − 1
+一个验证帧写 n_draft + 1 行 → rs_max = n_draft
+
+部分接受   删 n_draft 行       → 合法 ✓
+整帧放弃   删 n_draft + 1 行   → 永远必被拒 ✗
+```
+
+而 `frame_needs_ckpt = n_draft + 1 > n_rs_seq`（`n_rs_seq = n_max + 1`）在 `n_draft <= n_max` 内
+**恒假**，于是整帧回退永远落到 `seq_rm` → 被拒 → 请求 500。旧上游只有 `rollback <= n_rs_seq`
+一条判据，从来不会走到这里。修法是三个名字各司其职：
+
+| 名字 | 回答的问题 | 判据 |
+| --- | --- | --- |
+| `frame_needs_target_ckpt(slot, n_draft)` | **要不要捕获**（宽） | `FULL` → true；`RS` 且帧可能被整帧放弃（`has_grammar \|\| has_reasoning_budget`）→ true；`RS` 且 `n_draft + 1 > n_rs_seq` → true；其余 → false |
+| `partial_uses_ckpt` | **部分接受能不能不用 ckpt**（窄） | `FULL \|\| n_draft > n_rs_seq` |
+| `frame_has_ckpt = !slot.spec_ckpt.empty()` | **这一帧到底有没有捕获到**（运行时事实） | 整帧回退用它，不重新调用判定函数 |
+
+第三个是关键：整帧回退**不能重新求值**。两次求值一旦漂移就会走错路径，而走错 = `seq_rm` 被拒 =
+该请求 500（实测出现过）。配套：新帧开始时 `spec_ckpt.clear()`，于是 `empty()` 精确等于
+「本帧没捕获过」。
+
+**代价**：没有 grammar / reasoning budget 的请求保持**零捕获**的便宜路径——为一个不存在的整帧
+回退去付每次捕获的代价没有意义。
+
+**为什么它藏得住**：`verify.sh` 的组 8/9/10 都不走 grammar / reasoning budget，只有
+`verify_grammar_spec.sh` 与 `verify_rbudget_spec.sh` 会碰到整帧放弃。这是「验收组覆盖的是
+功能面，不是参数面」的一个具体后果。
+
+### 0.4 device-buffer 的可用性判定：谓词回答的问题不对
+
+上游 `2cbca389f`（dflash 走设备侧拷贝）之后，DFlash 的特征优先从 device 的 `layer_inp_src` 读。
+本仓的 `supports_embd_row()` 原来只回答「buffer 存不存在、读得到吗」，于是**分段链上它回答「支持」**，
+而 buffer 里其实只装了 head 那一段的 6 路 extract layer（12288 列），dflash 的 `fc` 要的是 8 路
+（16384 列）：
+
+```
+GGML_ASSERT(g.layer_inp_src != nullptr && g.layer_inp_src->ne[0] == n_embd_inp) failed
+```
+
+断言挂在**第二个合取项**——不是 nullptr。跨机和 loopback 都崩、整模不崩，因为整模的 buffer 宽度
+恰好等于 `target_layers × n_embd`。
+
+**可用的定义因此要写全**：
+
+```
+可用 = 存在（非 null）
+     且 宽度 == 我的 encoder 输入（ne[0] == n_embd_inp_enc()）
+     且 层顺序一致（build_layer_inp_dev 升序 + 构造期 ascending 检查）
+```
+
+上游没有分段链，隐含了「列数 = target_layers 数量」这个前提，**从未被检查过**。修法是把这个前提
+变成 `supports_embd_row()` 的显式合取项（`src/llama-context.cpp`），并让 `decode()` 准入、
+`graph_params()` 的 `layer_inp_src`、batch 构造、以及 `common/speculative.cpp` 的每帧判定问同一句
+谓词——单一事实源，两边每帧现算，不再有「构造期答案陈旧」的漂移。**断言原样保留**，只加直写
+stderr 的诊断（common 的 logger 是异步的，紧贴 abort 的 `LLAMA_LOG_ERROR` 会被丢）。
+
+反证这一条值得记：**如果真是 null，`decode()` 会更早返回 -1**，根本到不了图构建——「窄了」看起来
+像「存在」，正是它绕过所有准入检查的原因。细节与「为什么不按 `is_split_chain` 判」见
+[`PATCHES.md`](PATCHES.md) 的「device-buffer 在 split 链下的崩溃与修复」。
+
+**这一条的可验证性**：`verify.sh` 组 9/10 的 `tests/dflash-taps.cpp` 只 link `llama`、不 link
+`llama-common`，device 路径在验收里**零覆盖**；所以新增组 11 直接跑产品路径（server + 链 +
+`-md`），8 项钉住「整模仍走 device buffer / 链回退 host copies 且输出逐字节相同」。
+
+**一个已知未验证的边界**：宽度条件会**允许**「head 覆盖全部 extract layer」的切法（如 head `0:39`
++ tail `39:40`）走 device 路径，这是从代码推出来的——`supports_embd_row()` 只看宽度与顺序，
+这种切法下宽度恰好是 16384。**该情形没有实测过**（需要构造上面那种切法并确认 8 路 tap 全在 head
+段）。文档里凡是引用这一条的地方都按「未验证」对待。
 
 ---
 
@@ -85,6 +205,7 @@ README 的六条边界与本文章节的对应：① 架构限定 → §2.1、�
 | **v8 MTP draft** | `OP_MTP_DRAFT`（op 8）带一行 hidden 与 `mtp_req{token,pos,k}`，**k 步递归在 stage 内完成**（每步输入是上一步的输出，不能批处理）；`DECODE_FLAG_NEXTN_ROWS` / `RSP_FLAG_NEXTN_ROWS` 让 decode 回复追加 `n_rows × n_embd` 个 float；`stage_id.has_nextn` 占原 `_pad` 字节且**故意不参与身份比较**——「能力」不是「身份」 |
 | **grammar 兼容** | head 侧先做**单 token 自检**（`common_sampler_grammar_rejects()`：`llama_grammar_apply_impl` 只掩码不推进），被拒就返回 `LLAMA_TOKEN_NULL` → **整帧回退**（撤 KV + prompt + sampler，含 grammar 状态）→ `skip_draft_once` 防止同一条路径空转 |
 | **rbudget（reasoning budget）兼容** | `common_sampler_rbudget_rejects()` 走 `common_reasoning_budget_rejects()`，是**纯读谓词**（不调 `apply`，状态机在 `accept` 里推进）；预算耗尽不是放开而是**收紧**——整词表只剩 forced token |
+| **v9 layer_inp tap** | DFlash / DSpark 的 `layer_inp` tap 作为 decode 回复的**附带段**跨进程：请求末尾带 `n_taps` 个 **int32 源层号** + `{n_taps, n_embd}`，回复末尾追加 `n_taps` 个 id 与 `n_rows × n_taps × n_embd` 个 f32；`rsp_header._pad` 的一个字节改存 `n_taps`（尺寸仍 32，前四段解析与 v8 逐字相同）；`MAX_LAYER_INP_TAPS = 16`；tap 缺失只让**本请求**停投机，不 send_error、不算链死 |
 
 **ROG 实测（head `0:32` + tail `32:40`，35B，LAN，贪心）五类 prompt × 三配置，tok/s**：
 
@@ -125,7 +246,7 @@ README 的六条边界与本文章节的对应：① 架构限定 → §2.1、�
 250/244/249 字符）。所以这不是链算错了，是链上的草稿更差。
 
 根因是本仓自己加的两处，不是上游行为：`speculative::process()` 的 catch-up decode 条件是
-`!is_mem_shared && !is_chain && !is_remote`（上游 `e0f142d5d` 只有 `!is_mem_shared`，`&& !is_chain
+`!is_mem_shared && !is_chain && !is_remote`（上游 `f477f795c` 只有 `!is_mem_shared`，`&& !is_chain
 && !is_remote` 是 `c5bd787b` 新加的），而 `speculative::draft()` 在 chain 下每轮
 `llama_memory_clear` 草稿 KV。两处构成一个**自洽的循环依赖**：
 
@@ -136,6 +257,24 @@ README 的六条边界与本文章节的对应：① 架构限定 → §2.1、�
 
 在当前这套草稿 KV 策略下，catch-up 建出来的 prompt 历史**没有任何读者**，跳过它是正确且必要
 的。代价是把链上的接受率封在 0.688——**这是设计选择，不是接线错误。**
+
+**补（2026-11-09，协议 v9）：这条折扣只管 MTP，DFlash / DSpark 在远程链上已经零损失。**
+差别在通道：MTP 走 **nextn 通道**（`t_h_nextn` 那一行），被上面那个 `!is_chain` 分支压住；DFlash /
+DSpark 走 **`layer_inp` tap**（`target_layers` 每层导出一份 hidden），链上本来就不经过 catch-up。
+v9 之前远程链没有 tap 通道，所以远程链等于只买得到最差的那个；v9 把 tap 做成 decode 回复的附带段
+（源层号随请求走，于是同一请求可以发给链上每段），于是：
+
+| 配置 | 整模 | 本地链 | 远程链 |
+| --- | ---: | ---: | ---: |
+| MTP k=2 | 0.9098 / 2.81 | 0.6879 / 2.37 | 0.6879 |
+| DFlash k=2 | 0.8298 / 2.65 | 0.8298 / 2.65 | **0.8298 / 2.65** |
+| DSpark-5L k=2 | 0.7986 / 2.61 | 0.7986 / 2.61 | **0.7986 / 2.61** |
+
+验收判据是「远程链的 tap 与整模逐位相同」而不是「接受率差不多」：组 10 里 dflash 8/8、dspark
+5/5 路 tap 逐位、远程链 logits 9/9 个位置、续写 token 8/8。代价是 prefill 的传输量（512 行 ubatch
+= 8 MB / 4 MB）与回环下 0.2% 的总耗时，见
+[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §12。**这也说明「链上投机不行」这句话现在要带
+主语**：链上 MTP 的接受率被封在 0.688 是 nextn 通道的性质，不是链的性质。
 
 **它被小模型掩盖过**：`draft()` 那段注释自己写的是「2B 上接受率仍在 70–93%」，到 35B 掉到
 0.688 才暴露。qwen35moe 的 NextN 块**带 attention**（MTP 图里有 `cache_k_l8` / `FLASH_ATTN_EXT`），
@@ -226,9 +365,17 @@ Surface 实测：不投机 **7.41 → 7.67（+3.5%）**；MTP **5.12 → 5.48（
   `nextn_keep = (hi >= n_layer_src) ? nextn_all : 0`。硬挪中段只能反着数据流走（tail 算完 →
   下发 hidden → mid 跑 MTP → draft 上行 → tail 验证），k=2 实测每轮省 75.5 ms、而两次 RTT
   已 50 ms，**净负**；复制一份到每段是 856 MiB 起步，且 96% 是 MoE 专家。
-- **DFlash 在远程链上仍缺一块。** 8 路 tap 天然分布在两段，tail 那两路（33/38 层）要跨段的
-  `layer_inp`，协议还没有这个 op（`OP_LAYER_INP`，约 96 KB/轮下行）。不是「不做」，是「没有
-  做」：MTP 已经证明验证通道够用，DFlash 差的是取数通道。
+- **DFlash / DSpark 在远程链上不再缺块（v9 已补，2026-11-09）。** 8 路 tap 天然分布在两段，tail
+  那两路（33/38 层）要跨段的 `layer_inp`：v9 把它做成 **decode 回复的附带段**（`DECODE_FLAG_LAYER_INP`
+  / `RSP_FLAG_LAYER_INP`，请求带源层号、回复在最后追加 `n_rows × n_taps × n_embd` 个 f32），远程链
+  DFlash/DSpark **零损失**（逐 prompt 与整模、本地链逐字节相同，组 10 验收）。代价是 prefill 时的
+  传输量（一个 512 行 ubatch = 8 MB / 4 MB），回环下总耗时只差 0.2%，真跨机（~9.5 MB/s）约 +2.6 s
+  **未验**。注意这**不改变**上面那条固定折扣：MTP 走的是 nextn 通道，与 tap 不是同一条路。
+- **markov 头的收益是「可预测 / 可抄写」，不是「长距离依赖」。** k=8、`n=256` 上 DSpark-6L 比
+  DFlash 高 15.3 / 14.5 点（mid / long 档，prompt 1146 / 3154 token），但同长度档换成「要求中文
+  翻译改写」只剩 **+4.1** 点；**k=2 上完全没有优势**（−0.5 ~ −0.9 点，因为 markov 的价值从 pos2
+  才开始）。选型要按负载的「可抄写性」而不是 prompt 长度，口径坑见
+  [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13。
 - **异构弱网上张量并行是纯负收益**，不是「慢一点」：TP 每 token 要 960 KiB、80 次同步，本
   项目这种流水线只要 8–16 KiB、1–2 次——差 60–120 倍。TP 通信 ∝ 层×token，PP 通信 ∝
   段数×token，这个差别在 5 MB/s 上是 196.6 ms/token vs 1.6/3.3 ms。
@@ -333,7 +480,7 @@ tail 时置真（`tools/server/server-context.cpp` 的 `tail_params.split_range_
 状态是「全空」，空链只能从 0 写，所以「KV 空但接着算」不可能。实测只重启 stage：200、
 `prompt_n`=完整长度、`cache_n=0`、输出逐字节相同。
 
-**握手**（`OP_HELLO`，v4 引入；`PROTO_VER` 现在到 8）：重连必须重握手，接错的 stage 让重建失败；防接错不防恶意，
+**握手**（`OP_HELLO`，v4 引入；`PROTO_VER` 现在到 9）：重连必须重握手，接错的 stage 让重建失败；防接错不防恶意，
 也区分不了同形状不同权重的 GGUF——不做模型哈希的代价。
 
 ### 2.8 `can_shift=false`：对 qwen35 忠实，对本地纯 KV 链过度保守
@@ -460,6 +607,13 @@ head 自己的 tap 与整模的差可以有 4e-4（29 token / `n_ubatch=12`，`t
 的两份权重之间复用，仍然不能搬到 2B 上（见
 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11）。
 
+**k 还随「草稿源的结构」变，不只是随模型**。2026-11-09 在同一份 target 上比了 DSpark 的
+**markov 头**（6 层 / block 8）与 DFlash（6 层）：k=8、`n=256` 上 markov 在 mid/long 档高
+**+15.3 / +14.5 点**，但同一长度档换成「中文翻译改写」只剩 **+4.1 点**，而 **k=2 上它没有优势**
+（−0.5 ~ −0.9 点）——因为 markov 的红利从 pos2 才开始，k=2 只覆盖 pos0/pos1。所以「k=2 全局最甜」
+这条在 MTP 上成立，换到 markov 头就只对「短输出 + 可抄写 prompt」成立；矩阵与两个口径坑见
+[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13。
+
 但这里有个更重要的限制，比上面所有数字都强：**本机双进程测不出投机收益**。head 与 tail 跑在
 同一台机器上时，两者走内存与管道、**没有 25–30 ms 的跨机往返可省**（而削减往返正是投机唯一
 该拿的好处），同时两个进程抢同一套 CPU 与内存带宽，draft 的额外算力被全数计入——付出成本、
@@ -499,3 +653,22 @@ head 收到 0 行 → **draft 静默消失**：不报错、不变慢，只是不
 当成「请求失败就结束」，看起来更干净，却让 `try_rebuild` 唯一触发的那次 pos 0 decode 永远不
 发生——**失败处理本身把恢复路径关掉了**。所以新增一条失败分支时，除了问「失败后状态一致吗」，
 还要问「这个分支会不会跳过唯一能恢复的那条正常路径」。
+
+**第四个形状是「一帧只能带一种 payload，而两个消费者争同一个通道，两侧的优先级约定还不一致」**
+（2026-11-09，协议 v9 落地时撞到的）：decode 回复只能声明一个 `n_embd` 宽度，nextn 行（8 KB）与
+tap 段（prefill 时 8 MB）不能同发。stage 侧 verify / candidate 两个分支是 tap 优先，**只有 plain
+分支是 nextn 优先**；DFlash 链的 head 在 prefill 帧上同时请求两者，于是 **tap 被 nextn 吞掉**。
+后果是 draft 的 prompt KV 从来没被注入、接受率掉到 0.111——**能跑、能出接受率、只是低 13%，不崩**。
+教训有两层：（1）通道复用要先写死「谁优先」并且三处分支共用同一个判定，而不是各写一遍；
+（2）**如果当时统一成 nextn 优先，verify 帧也会掉 tap，draft 永远拿不到特征、直接崩**——那种
+「更严重但更容易发现」的失败反而更难留下这个 bug。凡是「A 与 B 抢一条通道」的地方，先问
+「两个都退还丢一个」时的表现是什么形状。
+
+**第五个形状是「谓词回答的问题不对——不是 null、不是 false，而是 buffer 存在但窄了」**
+（2026-11-09，device-buffer 回归）：`supports_embd_row()` 检查的是「buffer 在不在、读不读得到」，
+而调用方以为它回答的是「buffer 里装的是不是我要的输入」。整模上两者恰好等价（宽度 = 全部
+extract layer），分段链上 head 只装 6/8 路，于是**谓词说「支持」、宽度是 12288、fc 要 16384**，
+断言挂在合取项的第二个。这类 bug 的判别问题是：**这个谓词的名字在说「存在」，而它的使用者在
+假设「内容正确」**——修复要把假设写进谓词（宽度检查），并让所有入口问同一句；只加一个
+`!= nullptr` 的检查没有用，因为它本来就不为 null。原型里这一条还叠了第二个坑：构造期的答案可能
+变陈旧（buffer 被重分配 / 分配失败），所以判定必须在**每次使用时现算**，不能只算一次存起来。

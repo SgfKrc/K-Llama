@@ -1,8 +1,18 @@
 # ISSUE：recurrent 快照不跨 ubatch 滚动，跨 ubatch 回滚读到陈旧槽
 
-> 状态：**已实现**
-> 更新日期：2026-11-03
-> 适用范围：hybrid 模型（Qwen3.5/3.6 的 GDN + full attention 交替结构）上 recurrent 快照的跨 ubatch 回滚；读者为内核维护者。修复是 `H:\llamacpp-c` 的本地 patch，未提交上游。
+> 状态：**已退场**（2026-11-09）
+> 更新日期：2026-11-09
+>
+> **这一份的修复代码已经删掉了**：rebase 到上游 `f477f795c` 之后，上游 `ab3768cdc` 改成
+> **拒绝**超出「最后一个 ubatch」的快照回退（`cell.rs_max = n_seq_tokens − 1`），并由
+> `split_equal()` 的 `n_keep_tail` 保证整帧回退落在同一个 ubatch 内——和我们原来的解法
+> （`build_rs_shift_snapshots` 让快照按 ubatch 往前挪）是同一个问题的两种解法，而且槽位语义
+> 互斥。两套并存会让后来人以为 shift 在解决上游没解决的问题，所以 shift 整块删除，
+> `llama-graph.h` / `llama-memory-recurrent.{cpp,h}` / `delta-net-base.cpp` 因此变成与上游
+> 逐字节相同。本文保留的是**现象与判据**（怎么观测、怎么证明逐位相同），不是现行实现；
+> 整帧回退在 `rs_max` 下反而永远不合法，那个回归与修法见
+> [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §0。
+> 适用范围：hybrid 模型（Qwen3.5/3.6 的 GDN + full attention 交替结构）上 recurrent 快照的跨 ubatch 回滚；读者为内核维护者。修复曾是 `H:\llamacpp-c` 的本地 patch，未提交上游。
 > 相关：`ISSUE-dflash-kv-rollback.md`（同一 hybrid memory 的 `seq_rm` 路径）
 
 `llama_memory_seq_rm()` 把位置退掉之后，用相同输入重写同一位置，得到的 hidden 与从未写

@@ -50,14 +50,21 @@ plain 生成 2 个 token = 4.00 个单位
 | 方向 | 判定 | 依据 |
 | --- | --- | --- |
 | MTP（模型自带） | **代码场景实测 1.13–1.25×** | k=1 是 1.18×（含免费尾 token），k=2 是 1.25×；递归上限 2 |
-| DFlash（外挂 0.24 GB） | **唯一值得投入，实测 1.5×** | 代码场景接受 42-95%，远超 24.5% 盈亏线（§5） |
+| DFlash（外挂 0.24 GB） | **第一个可落地的外挂草稿，实测 1.5×** | 代码场景接受 42-95%，远超 24.5% 盈亏线（§5） |
 | PLD / n-gram | **真实负载 replay 已测不达标，停手**；影子统计未做 | 中文对话 m=1.05（无效），代码续写 m=2.56–3.37；判据见 `SPECULATION-MATRIX.md` §6 |
 | 浅层投机（前 k 层） | 不做 | 实测 α=0.00–0.08，E[accept]≈1.0 |
-| dSpark | 不做 | 开源权重只有 DeepSeek-V4 系，无 Qwen 版 |
+| dSpark（markov 头） | **有 Qwen3.6 版本了（2026-11-09），长上下文优于 DFlash 但只在「可抄写」负载上** | k=8、`n=256`：mid/long 档比 DFlash 高 **+15.3 / +14.5 点**，翻译改写档只剩 +4.1 点，k=2 上无优势；见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13 |
 
 **这张表的 MTP 与 DFlash 两行都测在旧权重上**（2026-10-31～11-02，蒸馏版或 `UD-Q4_K_XL`）。官方
 `UD-Q4_K_M` 的 MTP 接受率基线是 **k=2 的 0.910**，不是这里的 70%；DFlash **没有在新模型上重测**。
-两套数字不能并列比较，见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
+两套数字不能并列比较，见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。**dSpark 那一行是
+新权重（社区量化，基座是 `unsloth` 的 NVFP4 版本，不是官方 BF16）**，口径见
+[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13。
+
+> **2026-11-09 补一条口径**：这个文档里的「接受率」全部隐含两个参数——`n_predict` 与 **k**。
+> 换 `n_predict` 能让同一个草稿源的相对优劣翻号（DSpark-6L 对 DFlash：`n=64` 时 +0.59 点、
+> `n=256` 时 −0.94 点），换 k 能让方向性结论失效（markov 的红利从 pos2 才开始，k=2 上完全
+> 没有优势）。报数必须带这两个参数，见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13.4。
 
 ## 2. 前置条件：recurrent state 回滚
 
@@ -124,7 +131,7 @@ k=2 盈亏线是 **1.18 个草稿**，只有代码场景达标。第 3 层掉到
 `t_h_nextn`、`qlh_kh_mtp_draft` 用 `llama_batch_ext` 提交 `(token, hidden)` 并 argmax；
 loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP 层）。
 
-## 5. DFlash：唯一值得投入的方向
+## 5. DFlash：第一个可落地的外挂草稿
 
 权重可用：[z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash)
 （Q4_K_M 仅 0.24 GB，本机 `H:\qlh_models\dflash\`），llama.cpp 已支持。GGUF 关键参数：
@@ -155,6 +162,14 @@ loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP �
 `ctx_other` 借 target 的，跨段后没有任何一段同时持有两者，跑 draft 的机器要多背 1.03 GiB）；
 **③ k=16 是 1 anchor + 15 草稿**（`speculative.cpp` 把 `n_max` clamp 到 `block_size-1`）。
 
+> **2026-11-09 跨机实测（协议 v9 的层的 tap 通道）**：Tailscale → Surface，1102 token 的 prompt，
+> DFlash k=2 接受 **117/141 = 0.82979**，与整模**逐 prompt 相同**；DSpark k=2 **117/140 =
+> 0.83571**，同样与整模相同；对照 MTP k=2 只有 **108/157 = 0.68790**（nextn 通道的 0.688 上限）。
+> prefill 比 MTP 多约 **2.4 s**（32.1 s vs 29.7 s）。也就是说：**DFlash / DSpark 在真跨机链上
+> 不再有「跨机损失」这一项**——此前缺的正是把 8 路 tap 送到远端的通道；上文的 1.5× 是理想模型，
+> 它不是加速比的预测值，只是「DFlash 值得接」的判据。数据与口径见
+> [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §14。
+
 ## 6. PLD / n-gram：按负载开关
 
 llama.cpp 内置 5 种 n-gram 草稿策略，核心是 `common/ngram-map.cpp` 的
@@ -172,14 +187,21 @@ llama.cpp 内置 5 种 n-gram 草稿策略，核心是 `common/ngram-map.cpp` �
 E[accept]=1.00；对照组完整 24 层是 0.969 / 0.906（注入路径本身没问题）。未训练的截断层接上
 `output_norm` + `lm_head` 后分布错位——LayerSkip 那类效果来自训练时的 early-exit loss。
 
-**dSpark**：外挂草稿 + Markov 头 + 置信度调度。开源权重只有 DeepSeek-V4 系，无 Qwen 版本。
+**dSpark**：外挂草稿 + Markov 头 + 置信度调度。**2026-11-09 起有 Qwen3.6 版本**（社区量化
+`Danny-Dasilva/…-DSPARK-GGUF`，6 层 / block 8 / 8 个 `target_layers`，基座是 `unsloth` 的 NVFP4
+而不是官方 BF16）。整模实测：k=8、`n=256` 上 mid/long 档接受率 0.771 / 0.749，比 DFlash 的
+0.618 / 0.605 高 15 点上下；但同一长度档改成「中文翻译改写」只剩 +4.1 点，**k=2 上完全没有优势**。
+收益的性质是「预测会重复 / 结构化的内容」，不是长距离语义，矩阵与口径坑见
+[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13。
 
 ## 8. 落地顺序
 
 1. **MTP 递归 k=2**：已接入，跨机实测 **1.13×**（70% 接受，§10），按负载开关用。
 2. **n-gram / PLD**：真实负载 replay 已测不达标（`SPECULATION-MATRIX.md` §6），停手；
    影子统计仍未做。
-3. **DFlash**：k=5 已在盈利区间，是唯一值得投入完整工程的方向（§5、§11）。
+3. **DFlash**：k=5 已在盈利区间，是**第一个**值得投入完整工程的外挂草稿（§5、§11）；外挂草稿
+   现在多了 DSpark（markov 头）这个竞争者，选型按负载的「可抄写性」而不是 prompt 长度
+   （[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §13）。
 
 ## 9. 数值验证结论
 

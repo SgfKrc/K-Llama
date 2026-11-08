@@ -1,11 +1,12 @@
 # 分段链实测数据
 
 > 状态：**现行**
-> 更新日期：2026-11-08
-> 适用范围：`H:\llamacpp-c`（HEAD `c5bd787b`）的 `build-split`，2B 与 35B 两条分段链上这一周的
-> 全部数字。读者是调参、写文档、以及下一次要判断「这个数还成不成立」的人。
+> 更新日期：2026-11-09
+> 适用范围：`H:\llamacpp-c`（HEAD `0c5c3bdd`，基底 `f477f795c`，树 `982ccecd`）的 `build-split`，2B 与 35B 两条
+> 分段链上这一周的全部数字。读者是调参、写文档、以及下一次要判断「这个数还成不成立」的人。
 > 相关：[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md)（这些边界）、[`SPECULATION.md`](SPECULATION.md)
-> （投机判定）、[`PATCHES.md`](PATCHES.md)（第四代实现）。
+> （投机判定）、[`PATCHES.md`](PATCHES.md)（第四代实现）、[`SPECULATION-MATRIX.md`](SPECULATION-MATRIX.md)
+> （草稿源 × 段结构）。
 
 这份文档存在的理由：本周的性能数字一度只存在于某次对话里，`SEGMENTED-LIMITS.md` 引用了它们
 却没有出处。下面每一条都注明日志文件与时间戳；**日志里找不到的，一律进 §7 标成未复现，不在这里
@@ -30,6 +31,14 @@
   蒸馏版的 0.699 回到 **0.910**（mean len 2.39 → 2.81），k 甜点仍是 2。而**本地双段链上只有
   0.688**，比整模低 24%——根因是本仓新加的 `!is_chain` 跳 catch-up + 草稿 KV 每轮清空，这是
   自洽的设计选择，不是 bug（§11）。
+- **2026-11-09 协议 v9 补上远程链的 layer_inp tap**：DFlash / DSpark 在远程链上**零损失**（此前
+  在远程链上没有 tap 通道，等于只能用损失最大的 MTP）。tap 是「这一帧的附带品」，所以复用
+  decode 回复；大头是 **prefill（一个 512 行 ubatch = 8 MB / 4 MB）而不是 draft**，回环下总耗时
+  只差 **0.2%**（§12）。**真跨机也是零损失**：Tailscale → Surface、1102 token 上 DFlash 117/141、
+  DSpark 117/140 与整模逐 prompt 相同，prefill 只多 **2.4 s**（§14）。
+- **markov 头（DSpark-6L）的收益是「可预测 / 可抄写」，不是「长距离依赖」**：k=8、n=256 上比
+  DFlash 高 **+15.3 / +14.5 点**（mid / long 档），而同一长度档换成「要求中文翻译改写」就只剩
+  **+4.1 点**；k=2 上完全没有优势（因为 markov 的价值从 pos2 才开始）（§13）。
 
 ---
 
@@ -202,29 +211,41 @@ logits 行数 `n_outputs_max`（2048 → 1）。出处 `build-split/i2_tail_befo
 
 ## 6. 验收覆盖
 
-| 入口 | 覆盖 | 最近一次结果（2026-11-08，纯分段树 `b1646d6d`） |
+| 入口 | 覆盖 | 最近一次结果（2026-11-09，纯分段树 `d28e10df`） |
 | --- | --- | --- |
-| `bash build-split/verify.sh` | 九组 **25 项**（含一次三目标构建检查；只用 `--skip-build` 跑时是 24 项）：本地链逐位、N=1 直通、server 双段、跨进程、多 slot、三段链、远程 server、链上 MTP、DFlash 8 tap | **PASS=25 FAIL=0** |
+| `bash build-split/verify.sh` | 十一组：组 1–8 共 **22 项**（本地链逐位、N=1 直通、server 双段、跨进程、多 slot、三段链、远程 server、链上 MTP）、组 9 本地 DFlash tap **2 项**、组 10 远程 DFlash/DSpark **20 项**（两个草稿源各 10 项）、组 11 DFlash device-buffer **8 项**（整模仍走 device buffer / 链回退 host copies 且输出逐字节相同） | 十一组全跑 **52 / 0 / 0**（组 9/10/11 也跑了：可用内存 ≥ 闸门） |
 | `python build-split/verify_multislot.py --np 2` | 组 5 的一半 | 10/10 200，prefix cache 生效 |
 | `python build-split/verify_multislot.py --np 4` | 组 5 的另一半 | 10/10 200，prefix cache 生效 |
 | `.qlh_tmp/accept_np.py --np 2` | 串行 vs 并发四个输出的逐字节一致 | **ALL PASS**（并发墙钟 1.6 s） |
 | `bash .qlh_tmp/mtp_remeasure.sh` | §2.2 | 三个负载 ×（off / k=2）× 3 次，见 §2.2 |
-| `python build-split/verify_seq_rm_exact.py --expect-known-fail` | `seq_rm` 删尾部的精度（A/B/C 三形态，无 split 无 server） | **PASS=4 FAIL=2**，红的两条是 FULL 形态，退出 0；见 §10 |
+| `python build-split/verify_seq_rm_exact.py --expect-known-fail` | `seq_rm` 删尾部的精度（A/B/C 三形态，无 split 无 server） | **1 pass / 5 known-fail / 0 unexpected**，退出 0；5 条红都是已知基线（FULL 形态 A1/A2 + 逐 token 形状下 `rs_max=0` 的 B1/B2/B3），见 §10 |
 | `python build-split/verify_seq_rm_shared.py` | shared-prefix 下 `prompt_clear` 是否误伤另一个 slot | 两次各 2 条 completion 逐字节相同、`health` 均 200；`[INFO] injection never fired`（该形状不走 partial `seq_rm`） |
 
-`verify.sh` 的判据全部是**逐位/逐字节**（`split-smoke`、`split-rows`、`dflash-taps` 三个目标），
-不看生成文字；组 9 需要 35B + DFlash 权重。上表第一行的 `PASS=25 FAIL=0` 有两份 11-06 的完整
-记录：`.qlh_tmp/verify_after_comments.log`（06:52）与 `build-split/verify_run1.log`（10:37）；
-`--skip-build` 那 24 项的同一条结论见 `build-split/verify_final_hello.log`（15:15）。11-08 的
-25 项记录在 `.qlh_tmp/pure-split-acceptance/verify_pure_2026-11-08.log`（纯分段树，带构建）。
+`verify.sh` 的判据全部是**逐位/逐字节**（`split-smoke`、`split-rows`、`dflash-taps` 三个目标，
+组 11 直接跑产品路径），不看生成文字；组 9/10/11 需要 35B + DFlash 权重。历史上先后记过
+`PASS=25 FAIL=0`（11-06 的 `.qlh_tmp/verify_after_comments.log` 06:52 与
+`build-split/verify_run1.log` 10:37）以及 23 项、45 项这些口径——**项数以脚本逐项计数为准**：
+组 1–8 = 22 项，全十一组 = 52 项（44 + 组 11 的 8 项）。11-08 那份 25 项的同名日志已不在本机目录里。
 
-**纯分段树上的独立验收（2026-11-08）**：`e0f142d` + 主补丁 = 树 `b1646d6d`（45 文件，不含任何
-SLIM-ARC），`--clean-first` 全量构建后 `verify.sh` **PASS=25 FAIL=0**（九组全过，含组 6 的三段链
-checkpoint 往返与组 9 的 8 路 tap），`verify_chain_death.py` **PASS=36 FAIL=0**；同一棵树上的
-`seq_rm` 专项是 `PASS=4 FAIL=2`（红的两条都是 FULL 形态，§10）。这证明主补丁
-不依赖增量补丁：拆出来的两份补丁里，主补丁自己就是一条可编译、可验收的线。日志：
-`.qlh_tmp/pure-split-acceptance/{verify_pure,chain_death_pure,build_clean}_2026-11-08.log`
-（上一轮 55 文件 / tree `639d0157` 的那三份在 `_prev_55files/` 下，数字相同，树不同）。
+**纯分段树上的独立验收（2026-11-09，device-buffer 修复之后）**：`f477f795c` + 主补丁 = 树
+`d28e10df`（42 文件，不含任何 SLIM-ARC），`--clean-first` 全量构建（188 个目标）后：
+
+- `verify.sh` **全十一组 52 / 0 / 0**（组 1–8 22 项 + 组 9 2 项 + 组 10 20 项 + 组 11 8 项），
+  含组 6 的三段链 checkpoint 往返、组 8 的链上 MTP 逐位、组 10 的 dflash 8/8 路（wire 2 路、
+  245760 B）与 dspark 5/5 路（wire 1 路、122880 B）tap 全部与整模逐位相同、组 11 的整模 device
+  buffer 仍启用、链回退 host copies 后输出与整模逐字节相同；
+- `verify_chain_death.py` **36 / 0**；
+- 上一版树 `1dcbce39`（44 项）第一次跑出 `PASS=34 FAIL=10`，两处都是环境抖动：组 5 的 `-np 4`
+  启动瞬间死掉（日志 0 字节，20 个请求一个都没发出；同一命令单跑两次都过），组 10 的 dflash 撞
+  `dflash-taps.exe: Device or resource busy`。run2 同一份二进制、同一份模型 44/0。判据是「日志里
+  有没有数值不一致」，不是「这一趟绿不绿」。
+
+这证明主补丁不依赖增量补丁：拆出来的两份补丁里，主补丁自己就是一条可编译、可验收的线。日志：
+`.qlh_tmp/pure-split-acceptance/`（`build_2026-11-09_v52.log`、
+`verify_pure_2026-11-09_v52.log`、`chain_death_pure_2026-11-09_v52.log`）。
+更早几轮（51 文件 / tree `da1832e5`；55 文件 / tree `f455ed79`；58 文件 / tree `8a9e7b3c`，旧基底
+`e0f142d`）的记录在 `_prev_55files/`、`verify_pure_2026-11-09_newbase*.log` 与
+`verify_pure_2026-11-09.log`。
 
 ### 6.1 红的是环境还是代码：先看 93xx 上还有没有上一次的 stage
 
@@ -457,9 +478,10 @@ token**。
 内部递归 3 步的结果与「整模 + MTP」**逐个相同**（11751 / 13 / 271 三个 token 全中）。
 `verify_mtp_e2e.sh`：远程链三组（不投机 / ngram / MTP）输出**逐字节相同**。
 
-`verify.sh`（带构建）25 项（`--skip-build` 时 24 项）、`verify_chain_death.py` 36 项、
-`verify_seq_id.py` 7 项、`verify_mtp.sh` 6 项、`verify_mtp_e2e.sh` 6 项、`verify_grammar_spec.sh`
-22 项、`verify_rbudget_spec.sh` 36 项在 v8 之后全过；`seq_rm` 的两种形态另算，见 §10。
+`verify.sh` 十一组 **52 项**（组 1–8 共 22 项、组 9 本地 DFlash tap 2 项、组 10 远程 DFlash/DSpark
+20 项、组 11 DFlash device-buffer 8 项）、`verify_chain_death.py` 36 项、`verify_seq_id.py` 9 项、
+`verify_mtp.sh` 6 项、`verify_mtp_e2e.sh` 6 项、`verify_grammar_spec.sh` 23 项、
+`verify_rbudget_spec.sh` 36 项在 v9 之后全过；`seq_rm` 的两种形态另算，见 §10。
 
 ---
 
@@ -473,19 +495,35 @@ token**。
 **口径**：2B 整模（`qwen35-2b-Q4_K_M`）、纯 CPU、`n_threads=4`、p=29、batch 里 14 个 prompt
 token、vocab 248320；只用 llama API，**无 split、无 server、不占端口**。探针是
 `build-split/bin/seq_rm_exact.exe`（源 `.qlh_tmp/seq_rm_exact.cpp`）。日志：
-`.qlh_tmp/pure-split-acceptance/seq_rm_exact_2026-11-08.log`（在纯分段树 `b1646d6d` 上跑）。
+`.qlh_tmp/pure-split-acceptance/seq_rm_exact_2026-11-09_rebase.log`（rebase 到 `f477f795c` 之后
+重跑，**1 pass / 5 known-fail / 0 unexpected**）。
 
 | 形态 | `n_rs_seq` | k（回退量） | 结果 |
 |---|---:|---:|---|
 | A1 FULL | 0 | 1 | **红**：`seq_rm=false`，`pos_max 29 -> 29` |
 | A2 FULL | 0 | 3 | **红**：`seq_rm=false`，`pos_max 31 -> 31` |
-| B1 RS | 3 | 1 | 绿：`seq_rm=true`、`pos_max` 降到 28、重放 logits 逐位相同 |
-| B2 RS | 3 | 3，重放 1 行（投机回退的真实形状） | 绿，同上 |
-| B3 RS | 3 | 3，重放 3 行 | 绿，同上 |
+| B1 RS | 3 | 1 | **红**（rebase 后翻的，见下）：`seq_rm=false`、一行未删 |
+| B2 RS | 3 | 3，重放 1 行（投机回退的真实形状） | **红**，同上 |
+| B3 RS | 3 | 3，重放 3 行 | **红**，同上 |
 | C1 RS | 3 | 4 > 快照窗口 | 绿：**明确拒绝**（false） |
 
-`--expect-known-fail` 下是 `PASS=4 FAIL=2`、退出 0（它只承认「红的两条都是 FULL 形态」这一种
-红）；不带开关时退出 1。
+`--expect-known-fail` 下是 `1 pass / 5 known-fail / 0 unexpected`、退出 0；不带开关时退出 1。
+
+**B 组为什么从绿变红（这一轮唯一变差的一条）**：上游 `ab3768cdc` 把「允许回退多少」从
+`rollback <= n_rs_seq` 改成 `rollback <= cell.rs_max`，而 `rs_max = 本 ubatch 写入的快照数 − 1
+= n_seq_tokens − 1`。本 probe 是**逐 token decode**（`llama_batch_get_one(&t, 1)`），所以
+`rs_max = 0`，**任何回退都必须被拒**。这是上游「只保证最后一个 ubatch 的快照」的设计后果，
+不是本仓的缺陷。
+
+**没有改 probe**：让它用多 token 的 ubatch 确实能让 B 组变绿，但「重放 logits 逐位相同」这条
+判据会因 1 行 vs k+1 行的 kernel 差异（0.27 量级）失效——等于把可靠判据换成不可靠的。所以选择
+更新 known-fail 基线并把原因写进探针文件头。
+
+**产品形状下的回退仍然是被逐位证明的**：投机验证帧把 `n_draft + 1` 行放进**一个** ubatch，
+回退 `n_draft` 行落在 `rs_max` 之内——这条由 `verify_grammar_spec.sh`（4 组「带回退且逐字节
+相同」）与 `verify_rbudget_spec.sh`（整帧回退 `seq_rm` 到 tail 成功、回退 6 次仍逐字节相同）
+覆盖，两组全绿。整帧放弃那条路径的修复见
+[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §0.3。
 
 **FULL 形态的原始输出**（`seq_rm_exact.exe <model> 0 29 1 1`）：
 
@@ -500,10 +538,12 @@ token、vocab 248320；只用 llama API，**无 split、无 server、不占端�
 读法：`seq_rm` 返回 false 而 `pos_max` **一点没降**——尾部 KV 一行都没删（hybrid 的短路：
 recurrent 拒绝之后 attention 那半被整体跳过）。随后重放 `rc=-1`：decode 拒绝在「KV 比 prompt
 长」的位置上写，于是没有第二份 logits 可比（`second=-1`）。**红的是「删除」这一步，不是
-「重算」**——只要删除成功（B 组），重放就逐位相同。
+「重算」**——只要删除真的发生，重算就逐位相同（这一半在上游改动之前是 B 组直接证过的，
+现在只能由 grammar / rbudget 两组的回退形态间接证明）。
 
-B 组原始输出（`seq_rm_exact.exe <model> 3 29 3 1`）：`seq_rm=true pos_max 31 -> 28`、
-`replay rc=0 pos_max=29`、`argmax first=27 second=27`、`logits diff=0/248320`、`RESULT PASS`。
+B 组在 rebase 前的原始输出（`seq_rm_exact.exe <model> 3 29 3 1`，仅作历史对照）：
+`seq_rm=true pos_max 31 -> 28`、`replay rc=0 pos_max=29`、`argmax first=27 second=27`、
+`logits diff=0/248320`、`RESULT PASS`。rebase 之后同一命令给出 `seq_rm=false`、一行未删。
 
 **C 组为什么必须绿**：回退量超过快照窗口时，`seq_rm` 必须**明确拒绝**而不是删一半。删一半
 比拒绝更糟——调用方拿到 true，以为位置已经一致。
@@ -513,8 +553,9 @@ B 组原始输出（`seq_rm_exact.exe <model> 3 29 3 1`）：`seq_rm=true pos_ma
 已按场景降级，见 [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2.9。上游修好 FULL 缺陷后
 A 组转绿，脚本会提示把 `--expect-known-fail` 关掉。
 
-**shared-prefix 形态**（`verify_seq_rm_shared.py`，日志
-`.qlh_tmp/pure-split-acceptance/seq_rm_shared_2026-11-08.log`）：`n_cmpl=2` 让 parent 与 child
+**shared-prefix 形态**（`verify_seq_rm_shared.py`；11-08 的日志
+`.qlh_tmp/pure-split-acceptance/seq_rm_shared_2026-11-08.log` 已不在本机，重跑该脚本可复现）：
+`n_cmpl=2` 让 parent 与 child
 共享前缀，再注入 `QLH_FORCE_SEQ_RM_FAIL=1`，比较注入前后两份 completion。实测两次各 2 条、
 **逐字节相同**、`health` 都是 200；但日志里只有
 
@@ -680,15 +721,15 @@ per-position 接受率（k=8，`-lv 4` 日志里的 `acc per pos`，pos0..pos7�
 `text` 字段——三行两两相等、长度也相等。所以这不是「链上算错了」，只是「链上的草稿更差」。
 
 **根因在 `common/speculative.cpp` 的两处，而且两处都是本仓加的**（`H:\llamacpp-c` HEAD
-`c5bd787b`）：
+`0c5c3bdd`）：
 
 1. `speculative::process()` 的 catch-up decode 条件是
-   `if (!is_mem_shared && !is_chain && !is_remote)`（HEAD 里在 `L1796`）。上游 `e0f142d5d`
+   `if (!is_mem_shared && !is_chain && !is_remote)`（HEAD 里在 `L2025`）。上游 `f477f795c`
    只有 `if (!is_mem_shared)`——**`&& !is_chain && !is_remote` 是 `c5bd787b` 新加的**。
 2. `speculative::draft()` 在 chain 下每轮清空草稿 KV：`if (is_chain && !is_mem_shared)
-   llama_memory_clear(llama_get_memory(ctx_dft), true);`（`L1978`）。
+   llama_memory_clear(llama_get_memory(ctx_dft), true);`（`L2228`，注释在 `L2218–2227`）。
 
-`draft()` 里那段注释就是理由原文（`L1979–L1986`）：
+`draft()` 里那段注释就是理由原文（`L2152–L2159`）：
 
 > the draft never saw the prompt (process() skips the catch-up), so a round must not inherit
 > rows from whatever the previous round / previous request left at the same positions -- that is
@@ -795,3 +836,233 @@ MTP 验收只能走「本地双段链 `0:32+32:40` vs 整模、逐字节一致�
 
 **不要在两套数字之间做换算。** 能做的只有「同一模型、同一口径的 A/B」；跨模型只能比接受率
 本身，且要说清哪个模型。
+
+---
+
+## 12. 远程链的 layer_inp：协议 v9（2026-11-09）
+
+### 12.1 为什么需要这条通道
+
+三种草稿源在链上的损失完全不同（35B `UD-Q4_K_M`，k=2，`n_predict 64`，口径同 §11.2）：
+
+| draft | 整模 | 本地链 | 远程链（v9 之前） |
+| --- | --- | --- | --- |
+| MTP k=2 | 0.9098 / 2.81 | 0.6879 / 2.37 | 0.6879（与本地链同一条 `!is_chain` 分支） |
+| DFlash k=2 | 0.8298 / 2.65 | 0.8298 / 2.65 | **没有通道** |
+| DSpark-5L k=2 | 0.7986 / 2.61 | 0.7986 / 2.61 | **没有通道** |
+
+MTP 走 **nextn 通道**，被 `common/speculative.cpp` 里本仓自己加的 `!is_chain && !is_remote`
+压到 0.688——那是 §11.4 的自洽设计（草稿看不到 prompt 的 KV，所以每轮清空），不是接线错误。
+DFlash / DSpark 走 **`layer_inp` tap**（`dflash.target_layers = [2,7,12,17,23,28,33,38]`，每层
+导出一份 hidden），链上**本来零损失**：本地链与整模逐位相同。**但远程链原本没有 tap 通道**，
+于是这三种源里只有损失最大的那个能用。
+
+v9 补的就是这条通道：让 tap 也能跨进程。
+
+### 12.2 协议设计
+
+- `PROTO_VER = 9`；`DECODE_FLAG_LAYER_INP = 0x08`、`RSP_FLAG_LAYER_INP = 0x08`。
+- 请求体在所有现有段之后追加 `layer_inp_req{ n_taps, n_embd }` + `n_taps` 个 **int32 源模型层号**。
+- 回复体**最后**追加 `n_taps` 个 id + `n_rows × n_taps × n_embd` 个 f32。
+- `rsp_header` 把原 `_pad` 的一个字节改成 `n_taps`（**尺寸仍是 32**），所以前四段（ids /
+  h_nextn / cands / logits）的解析与 v8 **逐字相同**。
+- `MAX_LAYER_INP_TAPS = 16`。
+
+**三个设计理由**：
+
+1. **复用 decode 回复，而不是新开一个 op**。tap 是「这一帧的 tail 隐藏行的附带品」，语义上必须
+   和产生它的那一帧绑定；独立 op 要么逼 tail 缓存上一帧（多一份状态 + 一条错误路径），要么多
+   一个 round trip。
+2. **用源模型层号，而不是 stage 本地层号**。stage 自己用 `layer_lo` 减即可，于是**同一个请求可以
+   发给链上每个远程段**，head 不需要知道链在哪切——三段链（relay 拥有一部分 tap）自然成立。
+3. **必须升版本号**。`n_taps` 只挪了 padding，v8/v9 的帧长一样，唯一的防线是 `PROTO_VER` 的前置
+   检查。
+
+### 12.3 传输量：大头是 prefill，不是 draft
+
+| 帧 | DFlash（2 路远程 tap） | DSpark（1 路） |
+| --- | --- | --- |
+| 1 行 decode | 16 KB | 8 KB |
+| k=2 verify（3 行） | 48 KB | 24 KB |
+| prefill 一个 ubatch（512 行） | **8 MB** | **4 MB** |
+
+对照：一行 logits 是 993 KB。实测（本机回环，1192 token 的 prompt）：DFlash 远程 **33151 ms**
+vs MTP 远程 **33078 ms**，**相差 0.2%**——回环下 tap 开销可忽略。**真跨机是另一笔账**，2026-11-09
+第一次拿到实测（Tailscale → Surface，1102 token）：DFlash 远程 prefill **~32.1 s**、MTP **~29.7 s**，
+**多 2.4 s（7–8%）**，与按 9.5 MB/s 估的「25 MB ≈ 2.6 s」吻合；**没有 10 s 级低效**，说明 tap 是
+成批走的、不是逐 token 往返。全部数据、口径与两个已知边界见 §14。
+
+### 12.4 tap 缺失的退化：停投机，不碰链
+
+某帧 tap 缺失 / 行数不够 → **本请求停掉投机**（`dp.drafting = false`），不 `send_error`、不算链死。
+请求的 token 完全不变，只是回到无投机的速度。这与 v7 验证帧的 `spec_blocked` 是同一套哲学：
+**能力缺失降级成「不投机」，不是降级成「不可服务」**。
+
+### 12.5 验收：组 10
+
+`verify.sh` 新增 **组 10（DFlash / DSpark 远程链）**，两个草稿源各 10 项：整模 tap 落盘、tap 全部
+逐位、**wire 上那几路 tap** 逐位、远程链 logits 逐位、续写 token 逐 token、1 行帧的 tap 逐位、
+k=2 verify 帧（3 行）逐行 argmax、verify 帧的 3 行 tap 逐位、tap 传输字节数与预期一致、stage 收到
+layer-input 请求。组 1–8 共 **22 项**、组 9（本地 8 路 tap）2 项、组 10 两个草稿源各 10 项共 20 项、
+组 11（DFlash device-buffer）8 项，所以整轮 **52 项**（更早记的「45」把组 1–8 数成 23 项，脚本逐项
+计数是 22，以脚本为准）。
+
+实测（2026-11-09）：完整树 dflash **8/8 路 tap**、dspark **5/5 路 tap** 与整模逐位相同；远程链
+logits **9/9 个位置**、续写 token **8/8**；tap 字节数 **245760 B** 与预期一致。纯分段树
+`d28e10df`（基底 `f477f795c`）上重跑同一组也是 dflash 8/8（wire 2/2、245760 B）、dspark 5/5
+（wire 1/1、122880 B）；上一轮纯分段树 `1dcbce39` / `8a9e7b3c` 上同样 8/8 与 5/5。
+
+**跑这一组时的一个环境坑（2026-11-09 撞到）**：`dflash` 的 chain 那一趟出现过
+`dflash-taps.exe: Device or resource busy` —— 整模那一趟的进程刚退出、文件锁还没释放，新的 exec
+直接失败，日志里**只有这一行**。表现是组 10 的 dflash 十项全红、dspark 十项全绿（dspark 跑在后面，
+锁已释放）。**判据是看日志第一行**：如果是 `Device or resource busy` 而不是 `[FAIL]` 行，重跑这一
+半即可；不是数值问题。换基底后重导的纯分段验收（`verify_pure_2026-11-09_newbase.log`）又撞了
+一次：首趟 dflash 九条红、dspark 全绿，run2 同二进制 44/0。
+
+### 12.6 两个接线缺口（起不来的真正原因）
+
+**缺口一：`ctx_tail_remote` 只对 MTP 置位。** `tools/server/server-context.cpp` 里原来只有
+`if (spec_mtp && ctx_tail == nullptr)` 这一处置位。DFlash / DSpark 走的是 `has_draft` 路径，标志
+为 false，于是所有 tap 被解析到 **head** 上下文——而 DFlash 的源层 33/38 超过 head 的 32 层，
+直接断言：
+
+```
+src/llama-context.cpp:1425: GGML_ASSERT(lid <= model.hparams.n_layer()) failed
+```
+
+修法是加一条并列判断：`has_draft && ctx_tail == nullptr && llama_context_split_has_remote(ctx_tgt)`
+→ `ctx_tail_remote = true`。
+
+**缺口二：plain 帧的发送优先级反了（更隐蔽）。** `tools/split-stage/main.cpp` 的三种回复分支里，
+**verify 和 candidate 是 tap 优先，只有 plain 是 nextn 优先**：
+
+```cpp
+if (want_nextn) { ... } else if (tap_flag) { ... }   // 旧：plain 分支
+```
+
+一帧只能声明一个 `n_embd` 宽度，nextn 行（8 KB）和 tap 段（prefill 时 8 MB）不能同发。DFlash 链
+的 head 会**同时**请求两者，于是 **prefill 帧回了 nextn、把 tap 吞掉**。
+
+后果精确对应观察到的现象：prefill 帧掉 tap → prompt 的位置从未注入 draft KV → draft 从空 KV
+起跳 → **接受率掉到 0.111，而不是崩**。诊断日志一次定位：
+
+```
+head decode: n_tok=35 n_tap_ask=2 verify=0      ← prefill 帧，head 请求了
+rsp: flags=0x04 n_taps=0 n_bytes=1001472        ← 回复是 NEXTN_ROWS 形状，没有 tap 段
+tail tap: n_tok=35 ask=2 owned=2 ok=1 flag=0x08 ← tail 明明准备好发
+```
+
+修复后 plain 分支改成 **tap 优先、nextn 兜底**（`if (tap_flag) ... else if (want_nextn) ...`）。
+DFlash / DSpark 远程链因此**零损失**：逐 prompt 完全相同，`draft_n` 回到 141/144，输出与整模、
+本地链 6/6 逐字节相同。
+
+**这个 bug 的形状值得记**：一帧只能带一种 payload，两个消费者争同一个通道，而两侧的优先级约定
+不一致。如果当时统一成 nextn 优先，那连 verify 帧也会掉 tap，会直接崩（draft 永远拿不到特征），
+反而容易发现；现在它**能跑、能出接受率，只是低 13%**。
+
+---
+
+## 13. 投机选型的实测矩阵：markov 头的收益是「可抄写性」（2026-11-09）
+
+口径：35B `UD-Q4_K_M` 作 target，**整模**（不分段，纯 CPU），贪心（`temperature 0`），`-c 4096
+-b 512 -t 8 -ngl 0`；指标取 server 日志的 `draft acceptance = a/g` 与 `mean len`。**每一格的
+`n_predict` 与 k 都写在表头**——见 §13.4，这两个口径不能跨比。B 树 / 代码 / 中文三个 prompt 的
+原文在 `build-split/acc_test.py` 的 `PROMPTS`（同 §11.2）。
+
+### 13.1 短上下文（`n_predict 64`，k=2）
+
+| 配置 | accept_rate | mean len |
+| --- | ---: | ---: |
+| 整模 MTP k=2 | **0.9098** | 2.820 |
+| 整模 DSpark-6L k=2 | 0.8357 | 2.671 |
+| 整模 DFlash（6 层）k=2 | 0.8298 | 2.660 |
+| 整模 DSpark-5L k=2 | 0.7986 | 2.597 |
+
+**6 层 DSpark 的来源与混杂**：`Danny-Dasilva/Qwen3.6-35B-A3B-Aggressive-Q4_K_M-DSPARK-GGUF`，
+6 层 / block 8 / **8 个 `target_layers`**（`[2,7,12,17,23,28,33,38]`，与 DFlash 相同）。它的
+**base 是 `unsloth/Qwen3.6-35B-A3B-NVFP4`，不是官方 BF16**——所以「6L 比 DFlash 高」这一格
+不能排除混杂。GGUF 里缺 `sample_from_anchor` / `has_confidence_head` 字段，但代码默认
+`sample_from_anchor=true`（日志已确认），张量布局正确、能跑。
+
+### 13.2 k=8 长上下文矩阵（`n_predict 256`）——这一节的核心
+
+| 档 | prompt_n | DSpark-6L accept | DFlash accept | 6L − DF（百分点） |
+| --- | ---: | ---: | ---: | ---: |
+| short | ~40 | 0.3619 | 0.3327 | **+2.9** |
+| mid | 1146 | 0.7711 | 0.6181 | **+15.3** |
+| long | 3154 | 0.7491 | 0.6046 | **+14.5** |
+| **hard** | 1157 | 0.3760 | 0.3345 | **+4.1** |
+
+**mid 与 hard 的长度几乎相同（1146 vs 1157），差值却是 +15.3 vs +4.1。所以被放大的不是「长度」，
+是「可抄写性」**：hard 档是同一份文档 + 要求中文翻译改写（不能逐字抄），short/long 是原文续写。
+
+per-position 印证（同一批日志的 `acc per pos`）：
+
+- mid：pos6 **+20.2**、pos7 **+21.6**（抄写红利最大处）；
+- hard：pos0 **−0.3**、pos1 **−3.2**（近处 6L 反而略差）；
+- **k=2 完全没有优势**（−0.5 ~ −0.9 点）——k=2 只覆盖 pos0/pos1，而 **markov 的价值从 pos2 才
+  开始**。
+
+**结论**：`markov head` 的收益是「**预测会重复 / 结构化的内容**」，不是「长距离语义依赖」。这恰好
+是 agent 后端的负载特征（JSON 键名、代码签名、工具调用），而不是「长文档问答」的特征。
+
+### 13.3 文档问答档的高接受率是抄写红利，不是 markov 的功劳
+
+三个文档问答 prompt 的 accept 从 short 的 **0.71** 涨到 mid/long 的 **0.92**——**两种头都受益**
+（DFlash 从 0.33 到 0.62），所以这是「prompt 里有可抄的东西」的效果，不能记在 markov 头上。
+
+### 13.4 两个口径坑
+
+1. **`n_predict` 不可跨比**。6L vs DFlash 的差值：同「短档」`n=64` 时是 **+0.59 点**，`n=256`
+   时是 **−0.94 点**。所以报 accept 率必须带 `n_predict`，否则同一个结论可以有两个符号。
+2. **基座不是同一个 BF16**（6L DSpark 的 base 是 NVFP4 量化版）。同一份 target 上换草稿源，只
+   能说「这份文件比那份文件高」，不能说「6 层 markov 结构比 6 层 DFlash 结构高」。
+
+**这两个坑合起来的用法**：选型先看「负载是否可抄写」（hard 档那种改写任务，markov 的红利只剩
+4 点），再看 `n_predict` 与 k 是否落在这个头擅长的那一段（k≥6 才有 pos2 之后的收益），最后才
+比较具体权重文件。
+
+---
+
+## 14. 跨机实测：Tailscale → Surface，项目第一次拿到零损失（2026-11-09）
+
+口径：head 本机加载 `0:32`，tail 在 Surface 上 `32:40`，用
+`--split-layer-range 0:32 --split-remote <surface>:<port>`（`--split-remote` 与
+`--split-tail-range` 互斥，所以只能这么写）；target 是官方 `UD-Q4_K_M`
+（`22,663,387,424 B`，Surface 上这份是这一轮刚传的，与本地大小一致）；k=2、贪心；
+prompt 1102 token，三个 prompt 各跑一遍，三配置 A / B / C 共用同一份 target 与同一组 prompt。
+
+### 14.1 接受与输出：零损失
+
+| 配置 | 接受 | 与整模逐 prompt 比 |
+| --- | --- | --- |
+| A DFlash k=2 | **117/141 = 0.82979** | **相同** |
+| B DSpark k=2 | **117/140 = 0.83571** | **相同** |
+| C MTP k=2（对照） | 108/157 = 0.68790 | 对照（nextn 通道的 0.688 上限，见 §11.4） |
+
+三个 prompt 的输出 **3/3 逐字节 IDENTICAL**（250 / 244 / 249 字符）。这是本项目第一次在**真跨机**
+链上拿到「与整模逐 prompt 相同」的接受率——此前只在 loopback 上验过 tap 开销可忽略（§12.3），
+跨机验的是 wire 上 tap 逐位与回退后的输出（§12.5）。
+
+### 14.2 prefill 的 tap 代价（1102 token）
+
+| 配置 | prefill 耗时 |
+| --- | --- |
+| A DFlash | 32784 / 31506 ms → **~32.1 s** |
+| B DSpark | 32840 ms → **~32.8 s** |
+| C MTP | 27499 / 28212 / 29698 / 30783 ms → **~29.7 s** |
+
+**A − C ≈ +2.4 s**，与「25 MB ÷ 9.5 MB/s ≈ 2.6 s」吻合（§12.3 的传输量表：prefill 每个 512 行
+ubatch 是 8 MB，1102 token 约 3 个 ubatch 即 24 MB）。**没有 10 s 级的低效**——如果 tap 是逐 token
+往返，1102 个 token 会报出数量级更大的差；实测差值与带宽估算同量级，说明 tap 是**成批**走的。
+
+### 14.3 结论与两个已知边界
+
+- **accept 零损失**；长 prompt 多花 2–3 s 可接受（数千 token 的 prompt 会到 10 s 级）；收益排序
+  **DSpark ≥ DFlash > MTP**；长 prompt 用 DFlash 划算，短 prompt 上 tap 的固定开销占比变大。
+- 与 loopback 对照：1192 token 差 **0.2%**（§12.3）；跨机 1102 token 差 **~2.4 s（7–8%）**。
+- **边界一**：`--split-remote` 与 `--split-tail-range` **互斥**，远程链只能用
+  `--split-layer-range 0:32 --split-remote host:port`，不能同时指定同机尾段。
+- **边界二**：Surface 原本没有这份 21 GB（`22,663,387,424 B`）的 target——只有旧切分片
+  `6.85G` / `2.66G` 与 23.5G 的蒸馏版。这一轮传了官方 target，大小与本地一致；体积对不上时
+  跨机输出会直接分叉，所以必须先核对大小。

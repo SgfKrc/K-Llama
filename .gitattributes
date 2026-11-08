@@ -1,0 +1,4 @@
+# 补丁文件按字节保存：`core.autocrlf=true` 下若被转成 CRLF，`git apply` 仍会「成功」，
+# 但末尾 `\ No newline at end of file` 那一处会多出一个裸 CR，产出的树与文档里的 tree hash
+# 不再相等（实测：CRLF 版主补丁得到 d679f09b，正确是 1dcbce39）。所以 .patch 一律不做行尾转换。
+*.patch -text

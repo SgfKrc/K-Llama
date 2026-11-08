@@ -157,7 +157,10 @@ MoE 的权重分布是专家占 88%，而每个 token 只用到 8/256 个专家�
   「与不投机一致」当判据**——llama.cpp 在 CPU + 量化上不承诺 batch invariance，严格判据是
   「无回退时与**整模投机**逐字节相同」
   （[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2.2、[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §9）。
-  **DFlash 仍只在本地链**：它要 tail 段的两路 `layer_inp` 过协议，那个 op 还没有。
+  **DFlash / DSpark 在远程链上零损失（协议 v9）**：tails 那两路 `layer_inp` tap 作为 decode 回复
+  的附带段过网（请求带源层号，回复在最后追加一个 `n_rows × n_taps × n_embd` 的 f32 段），于是
+  链上不再只买得到被 `!is_chain` 压住的 MTP；代价是 prefill 时的传输量（512 行 ubatch = 8 MB /
+  4 MB），见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §12。
 - **qlh 的 Python 驱动链**：`chain_client.py` 的 `--spec-k` / `--dflash` / `--cascade-mtp`，
   验证由 `forward_batch` 一次绕链完成，只支持贪心。
 

@@ -101,13 +101,13 @@ Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两�
 
 ## 4. 已接的组件
 
-**llama.cpp fork（`H:\llamacpp-c`，相对上游 `e0f142d`，四代补丁；文件数与行数见 [`PATCHES.md`](PATCHES.md)）**
+**llama.cpp fork（`H:\llamacpp-c`，相对上游 `f477f795c`，四代补丁；文件数与行数见 [`PATCHES.md`](PATCHES.md)）**
 
 | 标记 | 内容 |
 | --- | --- |
 | `[C-scheme]` | `LLAMA_LAYER_RANGE=lo:hi` 层范围加载、`embeddings_pre_norm` 接力向量、lazy 全局张量、跳过 lm_head |
 | `[C-scheme]` | `qwen35` / `qwen35moe` 的 pre-norm tap；`extern "C"` 导出供 C 侧按名解析 |
-| `[TAG_RECURRENT_ROLLBACK_SPLITS]` | recurrent 快照按 ubatch 滚动，跨批回滚不再读到过期槽位 |
+| `[TAG_RECURRENT_ROLLBACK_SPLITS]` | ~~recurrent 快照按 ubatch 滚动~~（2026-11-09 删掉：上游 `ab3768cdc` 改成**拒绝**超出最后一个 ubatch 的回退，`ab3768cdc` + `split_equal` 的 `n_keep_tail` 覆盖同一件事，两套会互相打架） |
 | `[DFLASH-01]` | 末层输出挂 `t_layer_inp[n_layer]`、`llama_model_n_embd_inp_enc`、warmup 空跑越界修复 |
 | `[SLIM-ARC]` | prefetch 一级：`init_mappings` 注册 mmap 区间、`graph_compute` 通知当前层；win32 侧用 `PrefetchVirtualMemory` 等替代 madvise，默认关闭（`SLIM_ARC_PREFETCH=1`） |
 
