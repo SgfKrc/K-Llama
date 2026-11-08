@@ -6,6 +6,15 @@
 > 投机方向的判定与实测；读者为调参与后续实施者。未做部分：PLD 影子统计。
 > 相关：`SPECULATION-MATRIX.md`（草稿源 × 段结构）、`MOE-SPECULATION-ECONOMICS.md`（MoE 成本结构）
 
+> **2026-11-08 更新（换模型）：本文所有 35B 数字都是 v2 时期、旧权重上的数，不要当官方模型的基线。**
+> 旧权重是蒸馏版（`Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality`，见 §4）
+> 或更早的 `UD-Q4_K_XL`。主线自 2026-11-08 起换成官方的
+> `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` 的 `UD-Q4_K_M`：同一副代码、同一台机器上，**整模 MTP k=2 的
+> 接受率从 0.699 抬到 0.910**（mean len 2.39 → 2.81），k=8 从 0.321 抬到 0.567；**本地双段链上
+> k=2 只有 0.688**（比整模低 24%，是设计选择）。所以下文的「MTP 1.13–1.25×」「DFlash 1.5×」「接受 42–95%」
+> 都是旧模型 + 旧驱动链上的数。新基线（k=1..8 全表、per-position、链上 0.688、为什么低 24%）
+> 见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
+
 本文记录四种投机方案在本项目上的可行性判定，每条都带实测依据；没有实测的标注为估计。
 
 ---
@@ -45,6 +54,10 @@ plain 生成 2 个 token = 4.00 个单位
 | PLD / n-gram | **真实负载 replay 已测不达标，停手**；影子统计未做 | 中文对话 m=1.05（无效），代码续写 m=2.56–3.37；判据见 `SPECULATION-MATRIX.md` §6 |
 | 浅层投机（前 k 层） | 不做 | 实测 α=0.00–0.08，E[accept]≈1.0 |
 | dSpark | 不做 | 开源权重只有 DeepSeek-V4 系，无 Qwen 版 |
+
+**这张表的 MTP 与 DFlash 两行都测在旧权重上**（2026-10-31～11-02，蒸馏版或 `UD-Q4_K_XL`）。官方
+`UD-Q4_K_M` 的 MTP 接受率基线是 **k=2 的 0.910**，不是这里的 70%；DFlash **没有在新模型上重测**。
+两套数字不能并列比较，见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
 
 ## 2. 前置条件：recurrent state 回滚
 
@@ -102,6 +115,10 @@ k=2 盈亏线是 **1.18 个草稿**，只有代码场景达标。第 3 层掉到
 63.2%、`用一句话解释什么是层段推理` 13/15 = 86.7%、`def quicksort(arr):` 14/15 = 93.3%，
 合计 **39/49 = 79.6%**。代码类最高、对话居中偏上，与 Qwen 官方的 60-80% 一致。
 
+> **这一段是蒸馏版上的数。** 2026-11-08 同一副链换官方 `UD-Q4_K_M` 后：整模 k=2 是 0.910、本地
+> 双段链 k=2 是 0.688（低 24%），数值与整模逐字节相同。链上为什么低、要不要修，见
+> [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
+
 **部件已接通**：`qlh_kh_load` 在 `SA_MTP=1` 且模型带 NextN 时创建第二个 context
 （`ctx_type = LLAMA_CONTEXT_TYPE_MTP`），配套 `qlh_kh_last_hidden` 取主图
 `t_h_nextn`、`qlh_kh_mtp_draft` 用 `llama_batch_ext` 提交 `(token, hidden)` 并 argmax；
@@ -127,6 +144,11 @@ loader 侧的两个障碍也已修（`nextn` 保留、`n_layer_all` 减去 MTP �
 **盈亏线 24.5%**（成本 9.34 单位/轮、1+15α 前进）。**代码场景远超，对话在深 draft 下亏**——
 所以 DFlash 也要按负载选 `n_max`：代码 15、对话 3。**对比 MTP k=2 跨机实测 1.13×，DFlash
 代码场景 1.5×** —— 这才是本项目的大增量。
+
+> **这张表的模型口径**：2026-10-31 用 `llama-speculative-simple` 加完整 40 层 target 测的，target
+> **不是** 2026-11-08 的官方 `UD-Q4_K_M`（那时还没有这份权重）。换官方模型之后 DFlash **没有
+> 重测**，所以表里的 1.5× 与上面的 MTP 1.13× 都不该跟官方模型的 0.910 接受率并列。新基线见
+> [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
 
 三条已确认的事实：**① llama.cpp 零改动**（`embeddings_layer_inp` 本来就是 per-layer vector，
 可同时开 8 个槽）；**② 真正的障碍是词表**（DFlash GGUF 无 `tok_embd`/`output.weight`，靠
@@ -221,8 +243,9 @@ decode-only 口径（§11），两个数不能直接相减。
 ## 11. k 扫描：拐点是 k=5
 
 2026-10-31，`scripts/check_p4_cross.py`，32:40 跨机链路，prompt `def quicksort(arr):`，
-只计解码阶段（不含 prefill 与协议开销），同一 prompt 同一 worker；每个 k 单次运行，故不报分散度：
-
+只计解码阶段（不含 prefill 与协议开销），同一 prompt 同一 worker；每个 k 单次运行，故不报分散度。
+**口径（2026-11-08 补）**：这一节是旧权重 + v2 驱动链，不是官方 `UD-Q4_K_M` + v2.1 原生投机；
+官方模型上重扫的 k=1..8、甜点仍是 k=2，见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
 | k | 64 token：接受率 | token/轮 | ms/轮 | tok/s | 128 token：接受率 | token/轮 | ms/轮 | tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 3 | 98.0% | 3.94 | 232 | 17.0 | 74.2% | 3.23 | 263 | 12.2 |

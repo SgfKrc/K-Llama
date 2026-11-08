@@ -19,10 +19,14 @@ A llama.cpp engine built around **non-whole-model loading**. The full checkpoint
 is; each node reads only the layers it owns, and stages exchange nothing but a hidden state
 (`n_embd` float32 values, 8 KB).
 
-Qwen3.6-35B-A3B (MoE, 40 layers, 21.87 GiB) is split 32 + 8 across two machines: the laptop
-holds 32 layers with all attention and dense weights on the GPU, the remote box holds 8 layers
-on CPU. Decode phase reaches **20.9 tok/s** with DFlash at k=5, against 10.5 tok/s for the whole
-model on the laptop's GPU alone.
+Qwen3.6-35B-A3B (MoE, 40 layers, 21.87 GiB — the distilled APEX variant v2 was measured on) is
+split 32 + 8 across two machines: the laptop holds 32 layers with all attention and dense weights
+on the GPU, the remote box holds 8 layers on CPU. Decode phase reaches **20.9 tok/s** with DFlash
+at k=5, against 10.5 tok/s for the whole model on the laptop's GPU alone.
+
+Those numbers are **v2 + the distilled checkpoint**. Since 2026-11-08 the baseline runs the
+official `unsloth` `UD-Q4_K_M` (21.11 GiB): whole-model MTP k=2 accepts **0.910** (mean len 2.81),
+the split chain with an in-process tail **0.688** — see `docs/SPLIT-MEASUREMENTS.md` §11 (Chinese).
 
 **Why it works**: every node maps the same checkpoint, but only *creates* and *reads* the tensors
 of its own layer range — three mechanisms: layer-count override (`LLAMA_LAYER_RANGE`), name

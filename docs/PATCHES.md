@@ -237,6 +237,11 @@ memory 看到整条链，不需要知道段在哪台机器上。
 
 验证（Qwen3.5-2B，`0:20` + `20:24`，独立 `build-split`）：
 
+> **这一组测的是 2B 上的「代码没退化」，不是「35B 新模型能用」**——`verify.sh` 组 1 的断言与
+> `verify_mtp.sh` 的 `tail 20:24 == 末层` 都是按 24 层模型写的，对 40 层的 35B 结构上不成立。
+> 35B（官方 `UD-Q4_K_M`）的验收是另一件事：形状复位验 + 本地双段链 vs 整模逐字节一致，见
+> [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §11。
+
 - N=1 直通：默认 / `--split-layer-range 0:24` / `0:20` 三种配置输出与改动前逐字节相同
 - N=2 本地双段：head 输出与整模层 20 输入逐位相同；tail 单独跑与 baseline 相同；链路
   logits 逐位相同；`seq_rm` 广播后两段的 `pos_max` 同步下降

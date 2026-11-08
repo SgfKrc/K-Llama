@@ -50,6 +50,13 @@ v2.1 不给吞吐对标：本机的 `build-split` 是纯 CPU 构建（启动即�
 **+8.4% ~ −1.2%**）。口径：
 [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §1 / §8 / §9。
 
+**2026-11-08 换到官方 MTP 权重之后，又多了一个可比的数**：35B 整模 + MTP k=2 的接受率
+**0.910**（mean len 2.81；旧蒸馏版权重是 0.699），本地双段链上 k=2 是 **0.688**——低 24%，
+原因是链上跳过 catch-up、草稿 KV 每轮清空这对自洽的策略，是设计选择不是接线错误。换模型本身
+**零改代码**：形状（41 block、1 个 NextN 层、`ssm.inner_size 4096`、`full_attention_interval 4`、
+256 专家）与代码假设全部吻合，DFlash / DSpark / NextN 三个头还与官方文件逐字节比对过。全表、
+per-position 与根因见 [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §11。
+
 ---
 
 ## v2.1 的能力
@@ -175,8 +182,10 @@ tail 报不出 `has_nextn`（模型没有 NextN 块、范围不到末层、或 M
 6. **核显要用就全量 offload。** 单卡隔离后实测（Iris Xe、`GGML_VK_VISIBLE_DEVICES=0`、
    `-ngl 99`）：prefill 长 prompt **2.5–3.2×**、decode **+5~9%**；而 `-ngl 0`（加载了后端
    却一层不上）反而比纯 CPU 慢 41%，中间值也一律更差。**交叉点在 pp≈32–64**，短 prompt 的
-   prefill 是核显唯一输的地方。35B（20.8 GiB）装不进共享堆（~15.4 GiB），所以本项目 35B
-   主线仍只用纯 CPU；机制见 [`docs/IGPU-SLOWDOWN.md`](docs/IGPU-SLOWDOWN.md)。
+   prefill 是核显唯一输的地方。35B（`UD-Q4_K_XL` 那一份，20.8 GiB；2026-11-08 起的 MTP 基线
+   用的是官方 `UD-Q4_K_M`，21.11 GiB，见
+   [`docs/SPLIT-MEASUREMENTS.md`](docs/SPLIT-MEASUREMENTS.md) §11）装不进共享堆（~15.4 GiB），
+   所以本项目 35B 主线仍只用纯 CPU；机制见 [`docs/IGPU-SLOWDOWN.md`](docs/IGPU-SLOWDOWN.md)。
 
 完整版在 [`docs/SEGMENTED-LIMITS.md`](docs/SEGMENTED-LIMITS.md)，那里面写的是「为什么不修」和
 「修的时候要付什么代价」，不是 TODO。六条之外还有一条 2026-11-08 补的：上游 hybrid 的 partial
