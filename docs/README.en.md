@@ -1,253 +1,224 @@
-# K-Llama v2 (English)
+# K-Llama v2.1
 
 [中文](../README.md) | **English**
 
-> **Note**: this English version still describes **v2** (the Python-driven distributed chat engine).
-> The current generation is **v2.1**, which moves the split chain down into `llama_context` so that
-> `llama-server` drives it natively. See [README.md](../README.md) (Chinese) for v2.1.
+> Status: **Current**
+> Updated: 2026-11-09
+> Scope: the entry point for the split chain — what it is, what it can do, how to run it, the hard
+> constraints, the measurement baselines, and the documentation index. Mechanism lives in
+> [ARCHITECTURE.md]; boundary costs in [SEGMENTED-LIMITS.md]; patch composition in [PATCHES.md].
+> The Chinese README is the source of truth; this file mirrors it.
 
-> Status: **Usable** — three shapes are working and have been soak-tested: two machines at
-> 20.9 tok/s, two weak devices at 6.50, three-stage over the public internet at 5.00; the
-> three-stage form ran 60 rounds of `gen 256` with zero anomalies. The portable bundle deploys
-> from scratch and produces tokens in-bundle (verified by three independent walkthroughs). The
-> one shape never verified is a **clean Windows install** — see `DELIVERY.md` §1.2.
-> Last updated: 2026-11-04
-> Applies to: the engine as a whole — what it is, what has been measured, and what is still
-> missing; readers are integrators and reviewers.
+K-Llama runs llama.cpp across machines by layer. Every node maps the same GGUF but creates and reads
+only the tensors of its own layers; a segment hands the next one nothing but the hidden state —
+`n_embd` floats (`ctx_tail` in `src/llama-context.cpp`). The split lives inside `llama_context`, so
+`llama-server` is the chain driver: `/completion`, `/chat/completions`, slots and the prompt cache
+all take the stock code path, and clients never learn which machine holds which layers.
 
-A llama.cpp engine built around **non-whole-model loading**. The full checkpoint stays where it
-is; each node reads only the layers it owns, and stages exchange nothing but a hidden state
-(`n_embd` float32 values, 8 KB).
+Two generations share the name. v2 is the Python-driven chain (`chain_client.py`,
+`stage_worker.py`, `stream.py`; TUI entry `koakuma`) that spreads a model over several machines.
+v2.1 pushes that chain into `llama_context` so the exposed surface matches a whole model. The v2
+chain still works; its throughput numbers are in [MEASUREMENTS.md].
 
-Qwen3.6-35B-A3B (MoE, 40 layers, 21.87 GiB — the distilled APEX variant v2 was measured on) is
-split 32 + 8 across two machines: the laptop holds 32 layers with all attention and dense weights
-on the GPU, the remote box holds 8 layers on CPU. Decode phase reaches **20.9 tok/s** with DFlash
-at k=5, against 10.5 tok/s for the whole model on the laptop's GPU alone.
+## Capabilities
 
-Those numbers are **v2 + the distilled checkpoint**. Since 2026-11-08 the baseline runs the
-official `unsloth` `UD-Q4_K_M` (21.11 GiB): whole-model MTP k=2 accepts **0.910** (mean len 2.81),
-the split chain with an in-process tail **0.688** — see `docs/SPLIT-MEASUREMENTS.md` §11 (Chinese).
-
-**Why it works**: every node maps the same checkpoint, but only *creates* and *reads* the tensors
-of its own layer range — three mechanisms: layer-count override (`LLAMA_LAYER_RANGE`), name
-remapping (local `blk.i` → source `blk.lo+i`), and lazy global tensors. The relay vector is taken
-*before* `output_norm`, and only 8 KB of hidden state crosses the wire.
-See **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for the full account.
-
----
-
-## Relationship to SLIM-ARC
-
-The layer-segment relay here is our own; it is not the same layer of the stack as
-[SLIM-ARC](https://github.com/Nexa-Language/SLIM-ARC).
-
-SLIM-ARC (Sun Yat-sen University, 2026 National Collegiate Computer System Capability Competition,
-OS Design track Proj59) is a **MoE inference runtime for memory-constrained edge systems**:
-on-demand mmap loading, phase-aware page advice, expert prediction and reclamation,
-pressure-aware residency, a unified I/O budget, KV cache management. Its headline result fits
-Qwen3-Next-80B-A3B into an 8 GiB cgroup and moves decode from 0.08 to 0.43 tok/s.
-
-Two paths at the same problem:
-
-| | This project | SLIM-ARC |
+| Capability | Result and criterion | Details |
 | --- | --- | --- |
-| Strategy | **Scale out**: give layers to more machines | **Compress down**: swap pages in and out on one box |
-| Precondition | each node fits its own segment | no single box fits the model |
-| Cross-boundary cost | 8 KB hidden state over TCP | page faults from disk |
-| Shape | multiple processes + TCP | one process + page-level scheduling |
+| Local split | `--split-layer-range` + `--split-tail-range` serve from one process; `-np 4` output is byte-identical to serial | `verify.sh` group 5; [SPLIT-MEASUREMENTS.md] §4 |
+| Prefix reuse | A 3103-token history recomputes in 19847 ms; the second turn solves 38 new tokens in 714 ms (2B chain, `-c 8192 -np 1`) | [SPLIT-MEASUREMENTS.md] §1 |
+| Remote chain | Built by `llama_split_attach_remote()`; KV broadcast, chain-wide checkpoints, 120 s read timeout, a dead chain with a live process | `verify_chain_death.py`; [SEGMENTED-LIMITS.md] §2.7 |
+| Remote speculation | DFlash / DSpark `layer_inp` taps ride the decode reply across processes (protocol v9); acceptance matches the whole model prompt by prompt | table below; [SPLIT-MEASUREMENTS.md] §14 |
+| MTP speculation | The tail's NextN head is the draft; k steps recurse inside the stage | `verify.sh` group 8; [SPECULATION.md] §4 |
+| grammar / reasoning budget | Candidates self-check token by token, a rejection rolls back the whole frame; an exhausted budget only tightens | `common_sampler_grammar_rejects()`; [PATCHES.md] fourth generation |
+| Segment memory | Logits and pp graph buffers are sized by the rows actually read: tail 1710.76 → 3.79 MiB (1806-token ubatch, 2B chain, `-c 8192 -np 4 -b 2048`), remote `20:24` segment 2052.10 → 240.09 MiB (2B, `-c 4096 -b 2048`, 248320-token vocab) | [SPLIT-MEASUREMENTS.md] §5 |
+| `seq_rm` | Returns `bool`; five call sites degrade on their own; a stalled chain leaves the process alive | [SEGMENTED-LIMITS.md] §2.9 |
 
-We borrow only its **prefetch module** — layer-boundary readahead turning random page faults into
-sequential reads, compiled into `llama.dll` with a win32 port; expert residency, KV eviction, the I/O
-scheduler and the on-demand loader are not integrated. See
-[`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md), [`PATCHES.md`](PATCHES.md).
-
----
-
-## Sibling repository
-
-[K-sd.cpp](https://github.com/SgfKrc/K-sd.cpp) is the same relay on diffusion models (its upstream
-already runs one block per segment); boundaries carry 4–64 MiB against 8 KB here, and **neither side
-can pipeline within one sequence** — diffusion waits for every segment, LLM tokens are causal. The
-headroom is **many requests** (~2.6×, no latency gain), not supported yet; see `ARCHITECTURE.md` §11.
-
-## What the split buys
-
-Splitting pays off when one machine cannot hold the model: two machines' resources add up
-instead of sharing one GPU's memory.
-
-The split itself is a **net loss** — the same GPU memory is now shared by two segments. What
-makes the two-machine chain faster than one machine is speculative decoding, not the split:
-
-| Stage | Mechanism | Decode-phase throughput |
-| --- | --- | ---: |
-| No speculation | one token per step, one chain round trip | 12.2 |
-| MTP recursion | k=2 off the tail's NextN head | 1.13× |
-| **DFlash parallel block** | k=5, six candidates per round, one verify pass | **20.9** |
-
-Measured on the 32:40 chain with `def quicksort(arr):`, 64-token generations, decode phase only.
-At 128 tokens both acceptance and throughput drop — see
-[`SPECULATION.md`](SPECULATION.md) §11.
-
----
-
-## Scope
-
-- **Architectures**: Qwen 3.5 and newer (`qwen35` / `qwen35moe`). Other architectures need
-  tensor naming, RoPE variants and MTP position handling first.
-- **Quantisation**: below 8 bit (Q4_K and friends). This is also what makes float32 relay
-  sufficient: Q4_K's relative error is around 1e-2, far above float32 transport error, so
-  transport noise sits under the quantisation noise.
-- **Segments = nodes**. Splitting one machine into two segments is a design error: every extra
-  process duplicates global tensor reads, a compute buffer and a round of page contention.
-
-### Transport stays float32
-
-Compressing to 4 KB was tried, twice:
-
-| Transport dtype | Per-hop max\|diff\| | Greedy tokens identical |
-| --- | ---: | ---: |
-| float32 | 0 | 5/5 (baseline) |
-| float16 | 3.9e-3 | **4/5**, diverges at step 22 |
-| int16 fixed point | 2.2e-4 | **4/5**, diverges at step 16 |
-
-int16's quantisation step is 20× finer than float16 and still flips a token — the divergence
-points sit where the output is nearly tied, where 1e-4 is enough. The criterion is **bit-identical
-greedy tokens across every prompt**; "mostly identical" does not qualify.
-
----
+The 2B chain above is `qwen35-2b-Q4_K_M` (head `0:20` + tail `20:24`, CPU-only `build-split`); the
+full baseline is in [SPLIT-MEASUREMENTS.md] §0.
 
 ## Quick start
 
-```powershell
-koakuma                                    # TUI, one command
-koakuma --topology topology-cross.toml     # two-stage chain across machines
-
-# drive the chain directly (--spec-k defaults to -1: pick by prompt shape)
-python chain_client.py --topology topology-cross.toml --prompt-text "中国的首都是" --chat --gen 32
-
-# add DFlash parallel drafting (k=5 is the measured knee; requires --greedy)
-python chain_client.py --topology topology-cross.toml --greedy --dflash <dflash.gguf> \
-       --dflash-block 6 --prompt-text "def quicksort(arr):" --gen 64
+```bash
+# Local two-segment chain: the tail runs in the same process
+llama-server -m model.gguf --split-layer-range 0:32 --split-tail-range 32:40 -c 8192 -np 4
 ```
 
-Dependencies: `pip install numpy psutil gguf textual` (`gguf` only for cutting and provenance
-checks, `textual` only for the TUI).
-
-Manual steps: build the shim (`shim\build_shim_msvc.ps1`) → put the same checkpoint on every
-machine → `layer_range` in the topology decides who loads what. Remote workers are started by
-the topology's `start_cmd`. Full procedure in [`DEPLOYMENT.md`](DEPLOYMENT.md).
-
----
-
-## Layout
-
-```
-protocol.py           frame format and message codec
-wire.py               transport dtype for hidden state (float32 by default)
-topology.py           topology parsing + fail-closed validation
-keep_head.py          in-process shim wrapper
-keep_head_worker.py   subprocess wrapper (n_gpu_layers=0 needs a fresh process)
-engine.py             per-segment load and forward
-stage_worker.py       one segment as a TCP server
-chain_client.py       spawns workers, drives decode, both draft sources, memory/VRAM budget
-stream.py             streaming generation with UTF-8 reassembly
-server.py             /v1/chat/completions, /v1/models
-proto_responses.py    translation layer for /v1/responses
-koakuma.py            TUI and boot screen
-checks/               verification and diagnostic scripts (10 verify_*, the rest diagnostics/probes)
+```bash
+# Remote chain: one split-stage per box, the head lists them with --split-remote in chain order
+split-stage -m model.gguf --layer-range 24:32 --role relay --rs-seq 8 -c 8192 --host 0.0.0.0 --port 9331
+split-stage -m model.gguf --layer-range 32:40 --role tail  --rs-seq 8 -c 8192 --host 0.0.0.0 --port 9332
+llama-server -m model.gguf --split-layer-range 0:24 -c 8192 \
+  --split-remote 10.0.0.2:9331 --split-remote 10.0.0.3:9332
 ```
 
+```bash
+# Remote chain with DFlash k=2: the product path is -md plus --spec-type
+llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
+  --split-remote 10.0.0.3:9332 -md dflash.gguf --spec-type draft-dflash --spec-draft-n-max 2
+```
 
-## Four constraints worth knowing
+- `--split-layer-range` is the layer range this process loads, and the head is always one;
+  `--split-tail-range` is a same-box tail and is mutually exclusive with `--split-remote`;
+  `--split-remote` repeats in chain order.
+- `--role` and `--rs-seq` are mandatory for `split-stage`. The role used to be inferred by the
+  loader, and a wrong inference produced fluent but wrong output.
+- Raise `--split-rs-seq` when speculating: one round rolls back `n_max` positions. The tail has to
+  report `has_nextn` in `OP_HELLO`; otherwise the server logs a WARN and drops draft-MTP. On weak
+  machines set `-t 8` explicitly — it feeds both `n_threads` and `n_threads_batch`, and both default
+  to 4.
+- The current spelling is `--spec-draft-n-max`. Upstream removed `--draft-max` / `--draft-n`, and the
+  old names abort the process.
 
-**① Segments must tile the source model exactly.** A missing layer does not raise — it produces
-fluent but wrong Chinese. `topology.load()` validates contiguity, non-overlap and declared widths
-on every run.
+## Hard constraints
 
-**② VRAM oversubscription is silent.** WDDM lets an allocation exceed dedicated VRAM and backs
-it with system memory while llama.cpp still prints `offloaded N/N`. Budgets are checked before
-load and measured after (`VRAM_PER_BYTE` in `chain_client.py`).
+1. **Architecture.** A chain head has to export hidden state from before `output_norm`.
+   `split_arch_exports_pre_norm()` (`src/llama-context.cpp`) accepts `qwen35` and `qwen35moe`; any
+   other architecture aborts before context creation. The tail only produces logits, so its
+   architecture is free. The four M-RoPE sections cross segments (`split_expand_pos()` in
+   `src/llama-context.cpp`); the image path has no end-to-end run yet — see
+   [SPLIT-MEASUREMENTS.md] §7.
+2. **The remote chain is single-sequence.** `llama_split_attach_remote()` rejects `n_seq_max > 1`.
+   Concurrency means several servers on the head box, each with its own chain; inside one box use the
+   local chain. See [SEGMENTED-LIMITS.md] §2.4.
+3. **Pick the draft source by channel.** DFlash / DSpark travel as `layer_inp` taps (protocol v9) and
+   cost nothing on a remote chain. MTP travels the nextn channel and accepts less on a chain than on
+   a whole model; the cause is in the measurements section. See [SEGMENTED-LIMITS.md] §2.2.
+4. **`--split-layer-range` validity.** A range starts at 0; a range that ends mid-model needs
+   `--split-tail-range` or `--split-remote`. Both checks live in `common_init_from_params()`
+   (`common/common.cpp`) and read the range back from the model (`llama_model_layer_range()`), which
+   also covers the `LLAMA_LAYER_RANGE` entry point. Residual boundary: [SEGMENTED-LIMITS.md] §2.6.
+5. **iGPU: offload whole segments.** `-ngl 99` on every segment; intermediate splits are worse, the
+   crossover moves with prompt length, and 35B does not fit the shared heap, so the mainline runs on
+   CPU. See [IGPU-SLOWDOWN.md].
+6. **Hybrid partial `seq_rm`.** Upstream fails at the default `n_rs_seq = 0` and deletes no attention
+   KV rows (upstream #28007 / #31656); this repo returns `bool` and lets five call sites degrade. See
+   [SEGMENTED-LIMITS.md] §2.9.
 
-**③ Never pin cores.** A worker has 5+ live threads; binding them to the two hyperthreads of one
-physical core makes them fight.
+## Measurements: draft-source choice and the cross-machine run
 
-**④ Cut points and the tail's layer count must be multiples of `full_attention_interval` (=4).**
-qwen35moe derives layer type from the *local* layer index while that index is mapped back to a
-source index, so the two only agree modulo 4 when `lo` is a multiple of 4. A 6-layer split like
-`32:38` is rejected at parse time.
+Baseline: 35B `Qwen3.6-35B-A3B-UD-Q4_K_M` (`unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, 21.11 GiB), greedy,
+k=2, 2026-11-09. The three whole-model rows run on CPU (`-c 4096 -b 512 -t 8 -ngl 0`) with
+`n_predict 64` over three prompts (B-tree, code, Chinese). The three chain rows put the head `0:32`
+on this box and the tail `32:40` on a Surface (i5-1035G4 4C8T / 16 GB, Tailscale at 9.5 MB/s,
+RTT 10–12 ms), prompt 1102 tokens.
 
+| Shape | accept (a/g) | mean_len | vs whole model |
+| --- | ---: | ---: | --- |
+| whole + MTP k=2 | 0.9098 | 2.820 | — |
+| whole + DSpark-6L k=2 | 0.8357 | 2.671 | — |
+| whole + DFlash k=2 | 0.8298 | 2.660 | — |
+| chain + DFlash k=2 | 117/141 = 0.82979 | — | same prompt by prompt |
+| chain + DSpark k=2 | 117/140 = 0.83571 | — | same prompt by prompt |
+| chain + MTP k=2 | 108/157 = 0.68790 | — | −24% |
 
-## Measured
+MTP is the best short-context choice on a whole model. On a chain, DFlash and DSpark lose nothing —
+local and remote chains agree — and the outputs stay byte-identical 3/3 (250 / 244 / 249
+characters). The MTP gap comes from the two chain-side changes recorded in
+[SPLIT-MEASUREMENTS.md] §11.4: catch-up decode runs only when `!is_chain && !is_remote`, and
+`draft()` clears the draft KV every round under `is_chain`. Under the current draft-KV strategy the
+loop is self-consistent; an opt-in catch-up has to change both sites at once.
 
-Qwen3.6-35B-A3B (MoE, 40 layers, 21.87 GiB of weights), single sequence, greedy:
+Prefill tap cost: A 32.1 s, B 32.8 s, C 29.7 s, so A−C ≈ +2.4 s — in line with 25 MB ÷ 9.5 MB/s
+≈ 2.6 s. The taps cross the wire in 512-row ubatches; a per-token round trip would show a difference
+an order of magnitude larger.
 
-| Configuration | Throughput | Basis |
+The markov head (DSpark-6L) amplifies copyability, not context length. At k=8 and `n_predict 256` it
+beats DFlash by 15.3 points on mid (1146-token prompt), by 4.1 points on hard (1157 tokens, Chinese
+rewrite), and by 2.9 points on short. Mid and hard are nearly the same length, so the gap tracks how
+much of the prompt can be copied. Per-position numbers put the head's value from pos2 onward, which
+k=2 never reaches. Choose a source by how copyable the workload is (JSON keys, code signatures, tool
+calls), then by whether k and `n_predict` sit in the range the head covers.
+
+Measurement traps:
+
+- Acceptance rates do not compare across `n_predict`. The same pair of draft sources differs by
+  +0.59 points at `n=64` and by −0.94 points at `n=256`; report `n_predict` and k with every
+  acceptance figure.
+- `mean_len = 1 + accept × k`, so mean_len at different k is not comparable.
+- DSpark-6L is based on an NVFP4 quantisation rather than the official BF16, so the comparison holds
+  only between those two files.
+
+## Code and acceptance
+
+- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `0c5c3bdd4` on parent `f477f795c`
+  (current upstream, 193 commits later), tree `982ccecd`; against upstream, 52 files /
+  +17831 −230.
+- [llamacpp-split.patch]: 42 files / +14287 −229 / 16166 lines / 840.6 KiB. The pure split chain:
+  layer-range loading, local and remote segments, aggregated memory, checkpoints, protocol v7
+  verification channel / v8 remote MTP draft / v9 remote `layer_inp` taps, grammar and rbudget
+  paths, `seq_rm` failures made visible, device-buffer width predicate. No SLIM-ARC; it compiles and
+  passes the full acceptance run on its own.
+- [llamacpp-slimarc.patch]: 13 files / +3544 −1 / 3662 lines / 155.2 KiB. SLIM-ARC prefetch, off by
+  default, installed only with `SLIM_ARC_PREFETCH=1`. Prefetch is the only piece borrowed; expert
+  residency, KV eviction and the I/O scheduler stay out of scope — see [SLIM-ARC-接入计划.md].
+- Composition check: `f477f795c` + main patch → tree `d28e10df`; adding the increment → tree
+  `982ccecd`, identical to HEAD's tree (`git write-tree`).
+- Against upstream: 16 files are byte-identical to `f477f795c`, against zero before the rebase. The
+  changes removed from 17 files were lag rather than contribution — upstream already carries those
+  commits, so our adaptation is no longer needed. `src/models/dflash.cpp` re-entered the change set
+  with its device-buffer diagnostic. Inventory in the upstream-overlap section of [PATCHES.md].
+
+Every acceptance check compares bit- and byte-identical logits, not generated text; the table below
+records the 2026-11-09 run:
+
+| Suite | Result | Criterion |
 | --- | ---: | --- |
-| Whole model on the laptop, `-ngl 6` | 10.5 tok/s | end to end |
-| Two machines, 32:40, no speculation | 12.2 tok/s | decode phase, 128-token runs |
-| **Two machines + DFlash k=5** | **20.9 tok/s** | decode phase, 64-token runs |
-| Two weak devices, 24:40 (Surface + Y700, both CPU-only) | 6.50 tok/s | decode phase, 24-token runs |
-| Three-stage 0:24 / 24:32 / 32:40 over Tailscale | 5.00 tok/s | decode phase, 24-token runs |
+| `bash build-split/verify.sh` | 52 (eleven groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md` |
+| `verify_chain_death.py` | 36 | 120 s read timeout, dead chain with a live process, failures visible |
+| `verify_seq_id.py` | 9 | `seq_id` and positions across segments |
+| `verify_mtp.sh` / `verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |
+| `verify_grammar_spec.sh` / `verify_rbudget_spec.sh` | 23 / 36 | grammar whole-frame rollback, budget tightens only |
+| `verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
+| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `d28e10df` |
 
-Everything the two-machine chain gains over one machine comes from speculation; the split itself
-remains a net loss. Longer runs decay: the same configuration at 128 tokens gives lower acceptance
-and lower throughput — the full k=3/5/8/15 sweep and its two conclusions are in
-[`SPECULATION.md`](SPECULATION.md) §11. Per-segment time is U-shaped in `n_past`; see
-[`MEASUREMENT-PITFALLS.md`](MEASUREMENT-PITFALLS.md).
+The v2 chain is checked by `python checks/verify_*.py` and
+`python -m unittest test_topology test_contract`; per-script counts and the latest results are in
+[SPLIT-MEASUREMENTS.md] §6 and §9.7.
 
----
-
-## Not done (ordered by what this machine can verify)
-
-**1. Speculation with sampling.** Prerequisites are all in place — splitting introduces no error
-(2B over 16 positions, 35B over 12; logits bit-identical, top-8 coincident, TV=0 — see
-`DELIVERY.md` §1.1), and both logit return and the probe exist. What is missing is the acceptance
-test: today it compares token equality, while sampling needs rejection sampling, comparing two
-distributions.
-
-**2. SLIM-ARC's on-demand loader.** Only prefetch is integrated. Verifying the loader means
-manufacturing a segment that does not fit — the whole checkpoint sits in the page cache here, so
-`issued` stays at 0. On the weak devices the headroom is thin enough that it *could* fire, but the
-measured effect there is negative: 22 GB of model against 16 GB of RAM lands in the thrashing band.
-
-**3. Multi-sequence token sharing.** Needs `kv_unified` plus per-sequence positions in every
-segment; the server serialises behind one global lock, so demand is low for a single user. Doing it
-properly starts with isolating the 30 linear layers' recurrent state per sequence.
-
-**Done**: cutting tool retired, both draft sources integrated, DFlash k sweep, SLIM-ARC prefetch
-with its win32 port, speculation wired into the serving path, and a sampling switch for the TUI.
-
-The serving path holds no decode loop of its own: `stream.py` keeps only UTF-8 reassembly, timing
-and stop conditions, and delegates decoding to `chain_client`'s `forward` / `speculate` /
-`DFlashDriver`. Both the server and the TUI expose drafting flags, honoured only at
-`temperature=0` — measured: the same greedy request produces byte-identical output with drafting on
-and off. Details in [`PROGRESS.md`](PROGRESS.md).
-
----
-
-## Docs
-
-The Chinese README is the source of truth; this file mirrors it.
+## Documentation map
 
 | File | Contents |
 | --- | --- |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | **Core mechanism**: why non-whole-model loading works, hard constraints, criteria, RPC boundary |
-| [`DEPLOYMENT.md`](DEPLOYMENT.md) | What goes where, how to change the split |
-| [`MEASUREMENTS.md`](MEASUREMENTS.md) | All measurements |
-| [`MEASUREMENT-PITFALLS.md`](MEASUREMENT-PITFALLS.md) | Why per-segment timing lies |
-| [`MEMORY-LIMITS.md`](MEMORY-LIMITS.md) | Memory and VRAM arithmetic |
-| [`SPECULATION.md`](SPECULATION.md) | Speculative decoding: decisions, cost model, the k sweep (§11), measurements |
-| [`PATCHES.md`](PATCHES.md) | Three generations of patches, the full patch, RPC boundary |
-| [`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md) | When page-fault optimisation is worth enabling |
-| [`LILICORR-轻量头.md`](LILICORR-轻量头.md) | Block-consistency reranking for DFlash, and what training it costs |
-| [`ANDROID-SURFACE-段接入评估.md`](ANDROID-SURFACE-段接入评估.md) | Criteria for weak devices, Android constraints |
-| [`SAMPLING.md`](SAMPLING.md) · [`TUI.md`](TUI.md) | Sampling mapping · TUI design |
-| [`ISSUE-recurrent-snapshot-rollback.md`](ISSUE-recurrent-snapshot-rollback.md) | Hybrid-model rollback defect across ubatches |
-| [`PROGRESS.md`](PROGRESS.md) | Current capability snapshot and optimisations applied |
+| [ARCHITECTURE.md] | The three loading mechanisms, the handoff point, hard constraints, what counts as evidence, the native-RPC boundary |
+| [PATCHES.md] | Patch generations and their differences, the upstream rebase record, full patch text |
+| [SEGMENTED-LIMITS.md] | Every boundary: root cause, blast radius, what fixing it would cost |
+| [SPLIT-MEASUREMENTS.md] | v2.1 measurements: checkpoints, MTP, DFlash, protocol v9, the selection matrix, the zero-loss cross-machine run |
+| [MEASUREMENTS.md] | All v2 Python-chain measurements |
+| [SPECULATION.md] | Speculation criteria, cost model, k sweep, integration measurements |
+| [DEPLOYMENT.md] | What goes where, how to change the split, how to start remote workers |
+| [TESTING.md] | Test channels: what is measured, how to run it, what counts as a pass |
+| [MEASUREMENT-PITFALLS.md] | Why per-segment timing lies, and how to measure instead |
+| [MEMORY-LIMITS.md] | Memory and VRAM arithmetic, calibration constants, core-pinning discipline |
+| [IGPU-SLOWDOWN.md] | Why the iGPU loses, the `-ngl` sweep and where the crossover sits |
+| [PROGRESS.md] | Current capability snapshot and optimisations in place |
+| [SAMPLING.md] · [TUI.md] · [RESPONSES-API.md] | Sampling mapping · TUI pages and commands · `/v1/responses` translation layer |
+| [SLIM-ARC-接入计划.md] | When the remaining page-fault work pays off |
 
-Verification: `python checks/verify_*.py`, `python -m unittest test_topology test_contract`.
+Further topics (`LILICORR-轻量头.md`, `ANDROID-SURFACE-段接入评估.md`, `ISSUE-*.md`) live in
+`docs/`, with retired documents in `docs/archive/`. The same relay applied to diffusion models is
+[K-sd.cpp](https://github.com/SgfKrc/K-sd.cpp): a segment boundary carries MB-scale tensors there,
+both sides wait for every segment within one sequence, and the headroom sits in many requests.
 
 ## License
 
-MIT — see [`LICENSE`](../LICENSE). Upstream llama.cpp is MIT too; `PATCHES.md` ships under the
-same terms. Model weights are not bundled and keep their own license.
+MIT — see [LICENSE](../LICENSE). Upstream llama.cpp is MIT as well and this repo's patches ship under
+the same terms; model weights and other third-party artifacts keep their own licenses.
+
+[ARCHITECTURE.md]: ARCHITECTURE.md
+[PATCHES.md]: PATCHES.md
+[SEGMENTED-LIMITS.md]: SEGMENTED-LIMITS.md
+[SPLIT-MEASUREMENTS.md]: SPLIT-MEASUREMENTS.md
+[MEASUREMENTS.md]: MEASUREMENTS.md
+[SPECULATION.md]: SPECULATION.md
+[DEPLOYMENT.md]: DEPLOYMENT.md
+[TESTING.md]: TESTING.md
+[MEASUREMENT-PITFALLS.md]: MEASUREMENT-PITFALLS.md
+[MEMORY-LIMITS.md]: MEMORY-LIMITS.md
+[IGPU-SLOWDOWN.md]: IGPU-SLOWDOWN.md
+[PROGRESS.md]: PROGRESS.md
+[SAMPLING.md]: SAMPLING.md
+[TUI.md]: TUI.md
+[RESPONSES-API.md]: RESPONSES-API.md
+[SLIM-ARC-接入计划.md]: SLIM-ARC-接入计划.md
+[llamacpp-split.patch]: llamacpp-split.patch
+[llamacpp-slimarc.patch]: llamacpp-slimarc.patch
