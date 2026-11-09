@@ -186,6 +186,11 @@ The v2 chain is checked by `python checks/verify_*.py` and
 | [PATCHES.md] | Patch generations and their differences, the upstream rebase record, full patch text |
 | [SEGMENTED-LIMITS.md] | Every boundary: root cause, blast radius, what fixing it would cost |
 | [SPLIT-MEASUREMENTS.md] | v2.1 measurements: checkpoints, MTP, DFlash, protocol v9, the selection matrix, the zero-loss cross-machine run |
+| [SPECULATION-DATA.md] | Speculation data: per-prompt, k sweep, DFlash, selection matrix, unlogged numbers |
+| [MODEL-SWAP.md] | 35B model swap: both weight files, acceptance baselines, the 24% chain discount |
+| [PROTOCOL-V9.md] | Protocols v5/v7/v8/v9: candidate channel, verify rows, remote draft, taps, the `seq_rm` probe |
+| [CROSS-MACHINE.md] | Cross-machine runs: ROG, Surface, loopback, Tailscale → Surface |
+| [PATCHES-DETAIL.md] | Patch detail: the fourth-generation mechanism table, the device-buffer fix, upstream overlap |
 | [MEASUREMENTS.md] | All v2 Python-chain measurements |
 | [SPECULATION.md] | Speculation criteria, cost model, k sweep, integration measurements |
 | [DEPLOYMENT.md] | What goes where, how to change the split, how to start remote workers |
@@ -212,6 +217,11 @@ the same terms; model weights and other third-party artifacts keep their own lic
 [PATCHES.md]: PATCHES.md
 [SEGMENTED-LIMITS.md]: SEGMENTED-LIMITS.md
 [SPLIT-MEASUREMENTS.md]: SPLIT-MEASUREMENTS.md
+[SPECULATION-DATA.md]: SPECULATION-DATA.md
+[MODEL-SWAP.md]: MODEL-SWAP.md
+[PROTOCOL-V9.md]: PROTOCOL-V9.md
+[CROSS-MACHINE.md]: CROSS-MACHINE.md
+[PATCHES-DETAIL.md]: PATCHES-DETAIL.md
 [MEASUREMENTS.md]: MEASUREMENTS.md
 [SPECULATION.md]: SPECULATION.md
 [DEPLOYMENT.md]: DEPLOYMENT.md

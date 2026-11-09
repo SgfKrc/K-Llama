@@ -163,6 +163,11 @@ v2 驱动链的验收走 `python checks/verify_*.py` 与 `python -m unittest tes
 | [PATCHES] | 四代补丁的构成与代际差异、rebase 到上游的记录、补丁全文 |
 | [SEGMENTED-LIMITS] | 每条边界的根因、影响范围、修的时候要付的代价 |
 | [SPLIT-MEASUREMENTS] | v2.1 实测：checkpoint、MTP、DFlash、协议 v9、选型矩阵、跨机零损失 |
+| [SPECULATION-DATA] | 投机实测明细：逐 prompt、k 扫描、DFlash、选型矩阵、未落盘数字 |
+| [MODEL-SWAP] | 35B 换模型：两份权重、接受率基线、链上 24% 折扣 |
+| [PROTOCOL-V9] | 协议 v5/v7/v8/v9：候选通道、验证行、远程 draft、tap、`seq_rm` 探针 |
+| [CROSS-MACHINE] | 跨机实测：ROG、Surface、回环、Tailscale → Surface |
+| [PATCHES-DETAIL] | 补丁细节：第四代机制表、device-buffer 修复、与上游重合明细 |
 | [MEASUREMENTS] | v2 Python 驱动链的全部实测数据 |
 | [SPECULATION] | 投机判定、成本模型、k 扫描、接入实测 |
 | [DEPLOYMENT] | 每台放什么、怎么换分段、远端 worker 怎么起 |
@@ -189,6 +194,11 @@ MIT，见 [`LICENSE`](LICENSE)。上游 llama.cpp 同为 MIT，本仓库的补�
 [PATCHES]: docs/PATCHES.md
 [SEGMENTED-LIMITS]: docs/SEGMENTED-LIMITS.md
 [SPLIT-MEASUREMENTS]: docs/SPLIT-MEASUREMENTS.md
+[SPECULATION-DATA]: docs/SPECULATION-DATA.md
+[MODEL-SWAP]: docs/MODEL-SWAP.md
+[PROTOCOL-V9]: docs/PROTOCOL-V9.md
+[CROSS-MACHINE]: docs/CROSS-MACHINE.md
+[PATCHES-DETAIL]: docs/PATCHES-DETAIL.md
 [MEASUREMENTS]: docs/MEASUREMENTS.md
 [SPECULATION]: docs/SPECULATION.md
 [DEPLOYMENT]: docs/DEPLOYMENT.md
