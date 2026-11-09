@@ -29,6 +29,9 @@ slot、prompt cache 全部走原生实现，客户端不需要知道段在哪台
 | MTP 投机 | tail 的 NextN 头即 draft，k 步递归在 stage 内跑 | `verify.sh` 组 8；[SPECULATION] §4 |
 | grammar / reasoning budget | 候选逐 token 自检、被拒整帧回退；预算耗尽只收紧不放宽 | `common_sampler_grammar_rejects()`；[PATCHES] 第四代 |
 | 段的内存 | logits 与 pp 图缓冲按实际输出行数分配：tail 1710.76 → 3.79 MiB（1806-token ubatch，2B 链，`-c 8192 -np 4 -b 2048`），远程 20:24 段 2052.10 → 240.09 MiB（2B，`-c 4096 -b 2048`，词表 248320） | [SPLIT-MEASUREMENTS] §5 |
+| 段级 offload | `-ngl N` 数的是「本段最后 N 块」，不是整模层号（`src/llama-model.cpp` 的 `i_gpu_start` 按 `layer_range_active()` 分叉）；整模路径逐位不变，tail `32:40` 全量上卡段内 tg 35.7 → 1754.2 | [SEGMENT-OFFLOAD] §2、§3 |
+| MoE 缓存 | `--moe-cache-mib 1024` 命中率 82.2%，tg 18.05 → 31.99（纯 CPU 16.37） | [SEGMENT-OFFLOAD] §5 |
+| 显存预算 | 加载前预检 `VMEM: need ~X free Y`，ctx 建好后按 nvidia-smi 前后差后检；WDDM 的静默溢出变成一行日志 | [SEGMENT-OFFLOAD] §10 |
 | `seq_rm` | 失败返回 `bool`，五个调用点各自降级，链路停摆不杀进程 | [SEGMENTED-LIMITS] §2.9 |
 
 表中 2B 链指 `qwen35-2b-Q4_K_M`（head `0:20` + tail `20:24`，`build-split` 纯 CPU 构建），口径
@@ -122,16 +125,16 @@ markov 头（DSpark-6L）放大的是「可抄写性」：k=8、`n_predict 256` 
 
 ## 代码与验收
 
-- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `0c5c3bdd4`，父 `f477f795c`（上游最新，
-  193 个提交之后），树 `982ccecd`；相对上游 52 文件 / +17831 −230。
-- [llamacpp-split.patch]：42 文件 / +14287 −229 / 16166 行 / 840.6 KiB。纯分段链：层范围加载、
+- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `48dfb3ea8`，父 `f477f795c`（上游最新，
+  193 个提交之后），树 `e76601df`；相对上游 54 文件 / +18733 −240。
+- [llamacpp-split.patch]：44 文件 / +15189 −239 / 17149 行 / 891.0 KiB。纯分段链：层范围加载、
   本地 / 远程段、聚合 memory、checkpoint、协议 v7 验证通道 / v8 远程 MTP draft / v9 远程
-  `layer_inp` tap、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定；不含
-  SLIM-ARC，可单独编译、单独通过全部验收。
+  `layer_inp` tap、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定、段级
+  offload 与显存预算；不含 SLIM-ARC，可单独编译、单独通过全部验收。
 - [llamacpp-slimarc.patch]：13 文件 / +3544 −1 / 3662 行 / 155.2 KiB。SLIM-ARC prefetch，默认
   关闭，`SLIM_ARC_PREFETCH=1` 才装。借用的只有这一块：专家驻留、KV 驱逐、I/O 调度器未接，见
   [SLIM-ARC-接入计划]。
-- 叠加判据：`f477f795c` + 主补丁 → 树 `d28e10df`；再叠增量 → 树 `982ccecd`，与 HEAD 的树相同
+- 叠加判据：`f477f795c` + 主补丁 → 树 `2949267e`；再叠增量 → 树 `e76601df`，与 HEAD 的树相同
   （`git write-tree` 校验）。
 - 与上游：16 个文件与 `f477f795c` 逐字节相同（rebase 前 0 个）。这次 rebase 移除的 17 个文件改动
   本属落后于上游——上游已包含那些提交，本仓那份适配已无必要；`src/models/dflash.cpp` 因
@@ -147,7 +150,7 @@ markov 头（DSpark-6L）放大的是「可抄写性」：k=8、`n_predict 256` 
 | `verify_mtp.sh` / `verify_mtp_e2e.sh` | 6 / 6 | 链上 draft 与整模逐位、端到端逐字节 |
 | `verify_grammar_spec.sh` / `verify_rbudget_spec.sh` | 23 / 36 | grammar 整帧回退、预算只收紧 |
 | `verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | 5 条是上游 hybrid 的已知基线，作为对照保留 |
-| 纯分段版（只叠主补丁） | 52 + 36 | 树 `d28e10df` 上独立构建、独立跑过 |
+| 纯分段版（只叠主补丁） | 52 + 36 | 树 `2949267e` 上独立构建、独立跑过 |
 
 v2 驱动链的验收走 `python checks/verify_*.py` 与 `python -m unittest test_topology test_contract`；
 各脚本的项数与最近一次结果见 [SPLIT-MEASUREMENTS] §6 与 §9.7。

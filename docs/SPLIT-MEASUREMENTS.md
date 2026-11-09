@@ -2,8 +2,11 @@
 
 > 状态：**现行**
 > 更新日期：2026-11-09
-> 适用范围：`H:\llamacpp-c`（HEAD `0c5c3bdd`，基底 `f477f795c`，树 `982ccecd`）的 `build-split`，2B 与 35B 两条
-> 分段链上这一周的全部数字。读者是调参、写文档、以及下一次要判断「这个数还成不成立」的人。
+> 适用范围：`H:\llamacpp-c` 的 `build-split`，2B 与 35B 两条分段链上这一周的全部数字。**这些数是在
+> HEAD `0c5c3bdd`（基底 `f477f795c`，树 `982ccecd`）上测的**；现行 HEAD 是 `48dfb3ea8`（树
+> `e76601df`），那一版只增加了段级 offload、MoE 缓存默认值与显存预算，不改这里任何一条判据
+> （逐位/逐字节的等价性），但吞吐的部署含义、`-ngl` 的计数口径与显存开法见
+> [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md)。读者是调参、写文档、以及下一次要判断「这个数还成不成立」的人。
 > 相关：[`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md)（这些边界）、[`SPECULATION.md`](SPECULATION.md)
 > （投机判定）、[`PATCHES.md`](PATCHES.md)（第四代实现）、[`SPECULATION-MATRIX.md`](SPECULATION-MATRIX.md)
 > （草稿源 × 段结构）。
@@ -211,7 +214,7 @@ logits 行数 `n_outputs_max`（2048 → 1）。出处 `build-split/i2_tail_befo
 
 ## 6. 验收覆盖
 
-| 入口 | 覆盖 | 最近一次结果（2026-11-09，纯分段树 `d28e10df`） |
+| 入口 | 覆盖 | 最近一次结果（2026-11-09，纯分段树 `2949267e`） |
 | --- | --- | --- |
 | `bash build-split/verify.sh` | 十一组：组 1–8 共 **22 项**（本地链逐位、N=1 直通、server 双段、跨进程、多 slot、三段链、远程 server、链上 MTP）、组 9 本地 DFlash tap **2 项**、组 10 远程 DFlash/DSpark **20 项**（两个草稿源各 10 项）、组 11 DFlash device-buffer **8 项**（整模仍走 device buffer / 链回退 host copies 且输出逐字节相同） | 十一组全跑 **52 / 0 / 0**（组 9/10/11 也跑了：可用内存 ≥ 闸门） |
 | `python build-split/verify_multislot.py --np 2` | 组 5 的一半 | 10/10 200，prefix cache 生效 |
@@ -227,24 +230,28 @@ logits 行数 `n_outputs_max`（2048 → 1）。出处 `build-split/i2_tail_befo
 `build-split/verify_run1.log` 10:37）以及 23 项、45 项这些口径——**项数以脚本逐项计数为准**：
 组 1–8 = 22 项，全十一组 = 52 项（44 + 组 11 的 8 项）。11-08 那份 25 项的同名日志已不在本机目录里。
 
-**纯分段树上的独立验收（2026-11-09，device-buffer 修复之后）**：`f477f795c` + 主补丁 = 树
-`d28e10df`（42 文件，不含任何 SLIM-ARC），`--clean-first` 全量构建（188 个目标）后：
+**纯分段树上的独立验收（2026-11-09，段级 offload 与显存预算之后重跑）**：`f477f795c` + 主补丁 =
+树 `2949267e`（44 文件，不含任何 SLIM-ARC），`--clean-first` 全量构建（385 个编译单元）后：
 
 - `verify.sh` **全十一组 52 / 0 / 0**（组 1–8 22 项 + 组 9 2 项 + 组 10 20 项 + 组 11 8 项），
   含组 6 的三段链 checkpoint 往返、组 8 的链上 MTP 逐位、组 10 的 dflash 8/8 路（wire 2 路、
   245760 B）与 dspark 5/5 路（wire 1 路、122880 B）tap 全部与整模逐位相同、组 11 的整模 device
   buffer 仍启用、链回退 host copies 后输出与整模逐字节相同；
 - `verify_chain_death.py` **36 / 0**；
+- 计数口径：`verify.sh` 默认先跑一次增量构建，`PASS` 里会多出「三目标构建完成」这一项
+  （`PASS=53`）；`--skip-build` 跑出来的就是纯验收的 **52**。两种跑法的失败数都是 0，差别只在
+  那一行前置检查，别把它算进 52 项里；
 - 上一版树 `1dcbce39`（44 项）第一次跑出 `PASS=34 FAIL=10`，两处都是环境抖动：组 5 的 `-np 4`
   启动瞬间死掉（日志 0 字节，20 个请求一个都没发出；同一命令单跑两次都过），组 10 的 dflash 撞
   `dflash-taps.exe: Device or resource busy`。run2 同一份二进制、同一份模型 44/0。判据是「日志里
   有没有数值不一致」，不是「这一趟绿不绿」。
 
 这证明主补丁不依赖增量补丁：拆出来的两份补丁里，主补丁自己就是一条可编译、可验收的线。日志：
-`.qlh_tmp/pure-split-acceptance/`（`build_2026-11-09_v52.log`、
-`verify_pure_2026-11-09_v52.log`、`chain_death_pure_2026-11-09_v52.log`）。
+`.qlh_tmp/pure-split-acceptance/`（`build_2026-11-09_v3.log`、
+`verify_pure_2026-11-09_v54.log`、`chain_death_pure_2026-11-09_v54.log`）。
 更早几轮（51 文件 / tree `da1832e5`；55 文件 / tree `f455ed79`；58 文件 / tree `8a9e7b3c`，旧基底
-`e0f142d`）的记录在 `_prev_55files/`、`verify_pure_2026-11-09_newbase*.log` 与
+`e0f142d`；52 文件 / tree `d28e10df`，device-buffer 修复之后）的记录在 `_prev_55files/`、
+`verify_pure_2026-11-09_newbase*.log`、`verify_pure_2026-11-09_v52.log` 与
 `verify_pure_2026-11-09.log`。
 
 ### 6.1 红的是环境还是代码：先看 93xx 上还有没有上一次的 stage
@@ -721,7 +728,7 @@ per-position 接受率（k=8，`-lv 4` 日志里的 `acc per pos`，pos0..pos7�
 `text` 字段——三行两两相等、长度也相等。所以这不是「链上算错了」，只是「链上的草稿更差」。
 
 **根因在 `common/speculative.cpp` 的两处，而且两处都是本仓加的**（`H:\llamacpp-c` HEAD
-`0c5c3bdd`）：
+`48dfb3ea8`；这段代码与测量时的 `0c5c3bdd` 逐字节相同）：
 
 1. `speculative::process()` 的 catch-up decode 条件是
    `if (!is_mem_shared && !is_chain && !is_remote)`（HEAD 里在 `L2025`）。上游 `f477f795c`
@@ -909,8 +916,8 @@ layer-input 请求。组 1–8 共 **22 项**、组 9（本地 8 路 tap）2 项
 
 实测（2026-11-09）：完整树 dflash **8/8 路 tap**、dspark **5/5 路 tap** 与整模逐位相同；远程链
 logits **9/9 个位置**、续写 token **8/8**；tap 字节数 **245760 B** 与预期一致。纯分段树
-`d28e10df`（基底 `f477f795c`）上重跑同一组也是 dflash 8/8（wire 2/2、245760 B）、dspark 5/5
-（wire 1/1、122880 B）；上一轮纯分段树 `1dcbce39` / `8a9e7b3c` 上同样 8/8 与 5/5。
+`2949267e`（基底 `f477f795c`，本轮重跑）上也是 dflash 8/8（wire 2/2、245760 B）、dspark 5/5
+（wire 1/1、122880 B）；上一轮纯分段树 `d28e10df` / `1dcbce39` / `8a9e7b3c` 上同样 8/8 与 5/5。
 
 **跑这一组时的一个环境坑（2026-11-09 撞到）**：`dflash` 的 chain 那一趟出现过
 `dflash-taps.exe: Device or resource busy` —— 整模那一趟的进程刚退出、文件锁还没释放，新的 exec

@@ -31,6 +31,9 @@ chain still works; its throughput numbers are in [MEASUREMENTS.md].
 | MTP speculation | The tail's NextN head is the draft; k steps recurse inside the stage | `verify.sh` group 8; [SPECULATION.md] §4 |
 | grammar / reasoning budget | Candidates self-check token by token, a rejection rolls back the whole frame; an exhausted budget only tightens | `common_sampler_grammar_rejects()`; [PATCHES.md] fourth generation |
 | Segment memory | Logits and pp graph buffers are sized by the rows actually read: tail 1710.76 → 3.79 MiB (1806-token ubatch, 2B chain, `-c 8192 -np 4 -b 2048`), remote `20:24` segment 2052.10 → 240.09 MiB (2B, `-c 4096 -b 2048`, 248320-token vocab) | [SPLIT-MEASUREMENTS.md] §5 |
+| Segment-level offload | `-ngl N` means "the last N blocks **of this segment**", not whole-model layer indices (`i_gpu_start` forks on `layer_range_active()` in `src/llama-model.cpp`); the whole-model path is bit-identical, and a fully offloaded tail `32:40` goes from 35.7 to 1754.2 tg inside the segment | [SEGMENT-OFFLOAD.md] §2, §3 |
+| MoE cache | `--moe-cache-mib 1024` hits 82.2%, tg 18.05 → 31.99 (16.37 on pure CPU) | [SEGMENT-OFFLOAD.md] §5 |
+| VRAM budget | A pre-load check prints `VMEM: need ~X free Y`, a post-context check compares nvidia-smi `used`; WDDM's silent spill becomes one log line | [SEGMENT-OFFLOAD.md] §10 |
 | `seq_rm` | Returns `bool`; five call sites degrade on their own; a stalled chain leaves the process alive | [SEGMENTED-LIMITS.md] §2.9 |
 
 The 2B chain above is `qwen35-2b-Q4_K_M` (head `0:20` + tail `20:24`, CPU-only `build-split`); the
@@ -140,19 +143,19 @@ Measurement traps:
 
 ## Code and acceptance
 
-- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `0c5c3bdd4` on parent `f477f795c`
-  (current upstream, 193 commits later), tree `982ccecd`; against upstream, 52 files /
-  +17831 −230.
-- [llamacpp-split.patch]: 42 files / +14287 −229 / 16166 lines / 840.6 KiB. The pure split chain:
+- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `48dfb3ea8` on parent `f477f795c`
+  (current upstream, 193 commits later), tree `e76601df`; against upstream, 54 files /
+  +18733 −240.
+- [llamacpp-split.patch]: 44 files / +15189 −239 / 17149 lines / 891.0 KiB. The pure split chain:
   layer-range loading, local and remote segments, aggregated memory, checkpoints, protocol v7
   verification channel / v8 remote MTP draft / v9 remote `layer_inp` taps, grammar and rbudget
-  paths, `seq_rm` failures made visible, device-buffer width predicate. No SLIM-ARC; it compiles and
-  passes the full acceptance run on its own.
+  paths, `seq_rm` failures made visible, the device-buffer width predicate, segment-level offload
+  and the VRAM budget. No SLIM-ARC; it compiles and passes the full acceptance run on its own.
 - [llamacpp-slimarc.patch]: 13 files / +3544 −1 / 3662 lines / 155.2 KiB. SLIM-ARC prefetch, off by
   default, installed only with `SLIM_ARC_PREFETCH=1`. Prefetch is the only piece borrowed; expert
   residency, KV eviction and the I/O scheduler stay out of scope — see [SLIM-ARC-接入计划.md].
-- Composition check: `f477f795c` + main patch → tree `d28e10df`; adding the increment → tree
-  `982ccecd`, identical to HEAD's tree (`git write-tree`).
+- Composition check: `f477f795c` + main patch → tree `2949267e`; adding the increment → tree
+  `e76601df`, identical to HEAD's tree (`git write-tree`).
 - Against upstream: 16 files are byte-identical to `f477f795c`, against zero before the rebase. The
   changes removed from 17 files were lag rather than contribution — upstream already carries those
   commits, so our adaptation is no longer needed. `src/models/dflash.cpp` re-entered the change set
@@ -169,7 +172,7 @@ records the 2026-11-09 run:
 | `verify_mtp.sh` / `verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |
 | `verify_grammar_spec.sh` / `verify_rbudget_spec.sh` | 23 / 36 | grammar whole-frame rollback, budget tightens only |
 | `verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
-| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `d28e10df` |
+| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `2949267e` |
 
 The v2 chain is checked by `python checks/verify_*.py` and
 `python -m unittest test_topology test_contract`; per-script counts and the latest results are in

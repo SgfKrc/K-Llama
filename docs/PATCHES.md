@@ -1,27 +1,29 @@
 # 四代补丁，以及与原生 RPC 的分界
 
 > 状态：**现行**
-> 更新日期：2026-11-09（device-buffer 修复后重导：52 文件 / +17831 −230，tree `982ccecd`）
+> 更新日期：2026-11-09（段级 offload 与显存预算之后重导：54 文件 / +18733 −240，tree `e76601df`）
 > 适用范围：本项目对 `H:\llamacpp-c` 四代补丁的构成，以及与 llama.cpp 原生 RPC 的分界；读者为内核与部署维护者。
-> 相关：`SLIM-ARC-接入计划.md`（第三代第二级未接的理由）、`CUT-TOOL.md`（裁段工具退场）、`SEGMENTED-LIMITS.md`（第四代的已知边界）
+> 相关：`SLIM-ARC-接入计划.md`（第三代第二级未接的理由）、`CUT-TOOL.md`（裁段工具退场）、`SEGMENTED-LIMITS.md`（第四代的已知边界）、`SEGMENT-OFFLOAD.md`（段级 offload 的语义与显存花法，本轮的段级 offload / MoE 缓存 / 显存预算三行引自那里）
 
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在**模型怎么装进显存和内存**：
 第一代靠"裁好的层段工件"，第二代靠"整模 + 层范围"。llama.cpp 侧的补丁因此完全不同。
 
-**代码现状**：相对基提交 `f477f795c` 共 **52 文件 / +17831 −230**（`git diff --stat`，fork HEAD
-`0c5c3bdd`，树 `982ccecd`），覆盖本文第一代到第四代的全部改动。这 52 个文件拆成**两个可独立
+**代码现状**：相对基提交 `f477f795c` 共 **54 文件 / +18733 −240**（`git diff --stat`，fork HEAD
+`48dfb3ea8`，树 `e76601df`），覆盖本文第一代到第四代的全部改动。这 54 个文件拆成**两个可独立
 应用的补丁**：
 
 | 补丁 | 包含 | 统计 |
 | --- | --- | --- |
-| [`docs/llamacpp-split.patch`](llamacpp-split.patch)（主补丁） | 第一、二、四代：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7 验证通道 / v8 远程 MTP draft / v9 远程 layer_inp tap、grammar / rbudget 兼容路径、`seq_rm` 失败显式化。**不含任何 SLIM-ARC** | **42 文件** / +14287 −229 / 16166 行 / 840.6 KiB |
+| [`docs/llamacpp-split.patch`](llamacpp-split.patch)（主补丁） | 第一、二、四代：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7 验证通道 / v8 远程 MTP draft / v9 远程 layer_inp tap、grammar / rbudget 兼容路径、`seq_rm` 失败显式化、device-buffer 宽度判定、段级 offload、显存预算。**不含任何 SLIM-ARC** | **44 文件** / +15189 −239 / 17149 行 / 891.0 KiB |
 | [`docs/llamacpp-slimarc.patch`](llamacpp-slimarc.patch)（可选增量） | 第三代 SLIM-ARC prefetch：10 个源文件 + 3 个文件里的 6 处钩子（清单见第三代小节） | 13 文件 / +3544 −1 / 3662 行 / 155.2 KiB |
 
-两个补丁的文件数、行数、增删行**逐项相加等于 52 / +17831 −230**：42 + 13 里有 3 个文件重叠
+两个补丁的文件数、行数、增删行**逐项相加等于 54 / +18733 −240**：44 + 13 里有 3 个文件重叠
 （`src/CMakeLists.txt`、`src/llama-context.cpp`、`src/llama-model-loader.cpp` 在两边各出一份
-diff），所以并集仍是 52 个文件。这一项是拆分没漏东西的算术校验。**这一轮 `src/models/dflash.cpp`
-进了变更集**（上一版它与上游逐字节相同，现在多了一段诊断输出），所以文件数 51 → 52、主补丁
-41 → 42、增删行 +17775 −227 → +17831 −230。
+diff），所以并集仍是 54 个文件（57 − 3 = 54）。这一项是拆分没漏东西的算术校验：15189 + 3544 =
+18733、239 + 1 = 240。**这一轮相对上一版多了 2 个文件、+902 −10**：`src/qlh-vram-budget.h` 与
+`src/qlh-split-defaults.h` 是新增的 header-only 文件，另外 5 个文件（`common/arg.cpp`、
+`common/common.h`、`src/llama-model.cpp`、`tools/server/server-context.cpp`、`tools/split-stage/main.cpp`）
+被段级 offload、MoE 缓存默认值与显存预算三件事各动了几十行。
 
 **基提交为什么是 `f477f795c` 而不是更早的 `e0f142d`**：本轮把 fork 整体 rebase 到上游
 193 个提交之后的 `f477f795c`（细节见「与上游 193 个提交的重合」一节）。旧基线 `ec25cedda`
@@ -32,31 +34,33 @@ diff），所以并集仍是 52 个文件。这一项是拆分没漏东西的算
 ```bash
 git worktree add /tmp/v1 f477f795c && cd /tmp/v1
 git apply docs/llamacpp-split.patch        # 纯分段，无 SLIM-ARC
-git add -A && git write-tree               # 必须 = d28e10df（纯分段树）
+git add -A && git write-tree               # 必须 = 2949267e（纯分段树）
 git apply docs/llamacpp-slimarc.patch      # 再叠增量，回到完整功能
-git add -A && git write-tree               # 必须 = 982ccecd（完整树，= fork HEAD 的树）
+git add -A && git write-tree               # 必须 = e76601df（完整树，= fork HEAD 的树）
 ```
 
 **补丁文件必须按字节保存（仓根 `.gitattributes` 的 `*.patch -text`）**。`core.autocrlf=true`
 下把补丁转成 CRLF 之后**照样 apply 成功**——只有一堆 trailing-whitespace 警告——但文件末尾
 `\ No newline at end of file` 那一处会多出一个裸 CR，产出的树与文档里的 tree hash 不再相等。
 静默错，而且是「验收命令跑了、也过了、结果不对」那一类。这条是 rebase 那一轮实测撞到的
-（CRLF 版主补丁得到 `d679f09b`，正确是 `1dcbce39`）；这一轮的对应判据是「主补丁 → `d28e10df`，
-叠加 → `982ccecd`」，导出后已用 `grep -c $'\r'` 确认为 0 个 CR。
+（CRLF 版主补丁得到 `d679f09b`，正确是 `1dcbce39`）；这一轮的对应判据是「主补丁 → `2949267e`，
+叠加 → `e76601df`」，导出后已用 `grep -c $'\r'` 确认为 0 个 CR。
 
-- 只应用主补丁得到的树是 `d28e10df`：它能独立 `--clean-first` 全量编译（188 个目标，
-  `.qlh_tmp/build.bat --clean-first` 退出 0），并独立通过 `verify.sh` **全十一组 52 项
-  PASS=52 FAIL=0 SKIP=0** 与 `verify_chain_death.py` **PASS=36 FAIL=0**。没有 SLIM-ARC 不影响
-  分段链的任何一条验收。2026-11-09 在只有主补丁的工作树（`H:\pq-new`，基底 `f477f795c`）上实测，
-  日志见 `.qlh_tmp/pure-split-acceptance/verify_pure_2026-11-09_v52.log` 与
-  `chain_death_pure_2026-11-09_v52.log`。
+- 只应用主补丁得到的树是 `2949267e`（44 文件）：它能独立 `--clean-first` 全量编译（385 个编译
+  单元，`cmd //c '.qlh_tmp\vrambuild.bat build-split all --clean-first'` 退出 0，重建后
+  `dflash-taps.exe` / `split-smoke.exe` / `split-rows.exe` 等目标齐全），并独立通过 `verify.sh`
+  **十一组 52 项** 与 `verify_chain_death.py` **36 项**。没有 SLIM-ARC 不影响分段链的任何一条
+  验收。2026-11-09 在 `H:\llamacpp-c` 上把工作区切到纯分段树实测（基底 `f477f795c`；跑完切回
+  完整树，`git write-tree` 仍等于 `e76601df`、工作区干净），日志见 `.qlh_tmp/pure-split-acceptance/`
+  的 `build_2026-11-09_v3.log`、`verify_pure_2026-11-09_v54.log` 与
+  `chain_death_pure_2026-11-09_v54.log`。
 - 上一版（`1dcbce39`，44 项）的同一棵树上**第一次**跑出的是 `PASS=34 FAIL=10`，两处都是环境：
   ① 组 5 的 `-np 4` 在启动瞬间死掉，日志 0 字节（同一命令单跑两次都过，20 个请求一个都没发出，
   所以不是数值问题）；② 组 10 的 dflash 十项里九条红（只有「整模 tap 落盘」那条过），
   `taps_dflash_chain.log` 里只有 `dflash-taps.exe: Device or resource busy`——整模那趟刚退出、
   文件锁未释放。run2 用同一份二进制、同一份模型得到 44/0。判据永远是「日志里有没有数值不一致」，
   不是「这一趟绿不绿」。
-- 叠加两个补丁后 `git write-tree` = `982ccecd`（fork HEAD 的树），这是"拆分没有改动任何
+- 叠加两个补丁后 `git write-tree` = `e76601df`（fork HEAD 的树），这是"拆分没有改动任何
   内容"的唯一判据，比"能 apply"更强。
 - SLIM-ARC 与分段链零耦合：那 10 个文件只 include 彼此和上游 `ggml-backend.h`，不碰本 fork
   新增的任何头；6 处钩子摘掉后，`llama-context.cpp` / `llama-model-loader.cpp` 的对应片段与
@@ -65,8 +69,10 @@ git add -A && git write-tree               # 必须 = 982ccecd（完整树，= f
 **历史全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4014 行），基提交更早，
 只到第三代；保留它是为了对照第一/二代的实现，不能再正向应用。
 
-fork 侧的历史是**两个提交**：上游 `f477f795c` 加一个 `[QLH-SPLIT]`（`0c5c3bdd`，树 `982ccecd`；
-这一版比 `ed6f86b99` 多了 device-buffer 的崩溃修复与组 11，见第四节后的「device-buffer」小节）。
+fork 侧的历史是**两个提交**：上游 `f477f795c` 加一个 `[QLH-SPLIT]`（`48dfb3ea8`，树 `e76601df`；
+这一版比上一版 `0c5c3bdd` / 树 `982ccecd` 多了段级 offload、MoE 缓存默认值与显存预算，
+见第四节表格最后三行与 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md)；再往前那一版多了 device-buffer
+的崩溃修复与组 11，见第四节后的「device-buffer」小节）。
 旧的一对（`e0f142d` + `ec25cedda`，树 `e14b92c9`）保留在 `master` 分支上作为历史，不再用于生成
 补丁。开发期间的 wip 提交已经 squash 掉；更早记录的 squash 前后 tree 值是 `d628e2a8`，与那一代
 HEAD 的 `e14b92c9` 不同（差异来自 squash 之后又合入的修复与两次上游移植）。这项核对只能当历史
@@ -146,7 +152,7 @@ HEAD 的 `e14b92c9` 不同（差异来自 squash 之后又合入的修复与两�
 **这一代不在主补丁里**，只存在于 `docs/llamacpp-slimarc.patch`（13 文件 / +3544 −1），叠在
 `docs/llamacpp-split.patch` 之上才回到完整树。6 处钩子（下表按位置归并成 4 行）：
 
-| 文件:行（完整树 `982ccecd`） | 位置 | 作用 |
+| 文件:行（完整树 `48dfb3ea8`） | 位置 | 作用 |
 | --- | --- | --- |
 | `src/CMakeLists.txt:50-60` | `LLAMA_SLIMARC_SOURCES` | 注册 5 个 `.cpp`，并用 `SKIP_UNITY_BUILD_INCLUSION` 挡在 unity 批次外——这批文件带 `WIN32_LEAN_AND_MEAN` 和 POSIX 名字，混进 unity 会污染同批的翻译单元 |
 | `src/llama-model-loader.cpp:1587-1615` | `init_mappings()` 末尾 | 只有设了 `SLIM_ARC_PREFETCH` 才构造全局调度器，把每个权重的 `(mmap 基址 + 偏移, 大小, 层号)` 注册进去 |
@@ -160,9 +166,10 @@ HEAD 的 `e14b92c9` 不同（差异来自 squash 之后又合入的修复与两�
 单行 `ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);`，
 `src/llama-model-loader.cpp` 的 `init_mappings()` 末尾恢复成空行加 `}`——两处都与 `f477f795c` 逐字节相同。
 
-行号是 `0c5c3bdd`（完整树）上的。**换基底之后必须重新定位**：上游那些重构动过
-`process_ubatch()`，更早一轮这两块在 1613 / 1638，rebase 后到了 1762 / 1787，这一轮修
-`supports_embd_row()` 又往下推了 16 行，现在是 1778 / 1803。摘除脚本
+行号是 `48dfb3ea8`（完整树）上的，与上一版相同。**换基底之后必须重新定位**：上游那些重构动过
+`process_ubatch()`，更早一轮这两块在 1613 / 1638，rebase 后到了 1762 / 1787，修
+`supports_embd_row()` 又往下推了 16 行，现在是 1778 / 1803（本轮重导时逐个核对过，`strip_hooks.py`
+一字未改就精确命中）。摘除脚本
 （`.qlh_tmp/strip_hooks.py`）用的是**整块字符串精确匹配 + 「恰好出现一次」断言**，所以行号漂了
 不会静默摘错——对不上就直接失败，这是它唯一需要的健壮性。
 
@@ -240,6 +247,9 @@ memory 看到整条链，不需要知道段在哪台机器上。
 | tail 的 logits 缓冲按角色 | `common/common.cpp` 的 `n_outputs_max` | head 每 token 一行 hidden；tail 只为实际输出行（1 + k）分配 |
 | socket 超时 | `src/llama-split-net.h` 的 `set_timeout` | 每 send/recv 120 s，只兜"整体停摆"；stage 侧不设，靠对端关闭 |
 | 单独层范围的拒绝 | `common_init_from_params()`（`common/common.cpp`） | 范围结束早于末层、又没有后续段时，加载后立即报错；范围不从 0 开始且 `split_range_is_stage` 为假时同样拒绝 |
+| 段级 offload | `src/llama-model.cpp` 的 `load_tensors()`：`i_gpu_start` 按 `layer_range_active()` 分叉；`tools/split-stage` 的 `-ngl`（默认 0，不是 `-1`） | range 载入下 `-ngl N` 数**本段最后 N 块**（整模那条 `+1` 的 logits 槽，段里只有本段满块时才带），整模路径逐位不变；`-ngl == 本段块数` 时 `devices.at()` 越界的分配比例已钳到 `act-1`；tail 本地块数含 NextN（`32:40` 是 9 块）。语义与实测见 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md) §2、§3 |
+| MoE 缓存 | `tools/split-stage` 的 `--moe-cache-mib` / `--moe-cache-cpu-share`，实现走上游 `llama_moe_cache` | `-ngl 32 --n-cpu-moe 32 --moe-cache-mib 1024` 命中率 **82.2%**，tg 18.05 → **31.99**；`-ngl` / `-ncmoe` / `--moe-cache-mib` 缺一个就退化（缺 `-ncmoe` 专家跟着层上卡装不下、缺 `-ngl` 缓存条件不成立），三个条件写在 `src/llama-moe-cache.cpp` 的启用循环里，见 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md) §5 |
+| 显存预算 | `src/qlh-vram-budget.h`（新文件，625 行）、`src/qlh-split-defaults.h`（新文件，20 行）、`tools/server/server-context.cpp` 与 `tools/split-stage/main.cpp` 两处接入 | 加载前预检 `VMEM: need ~X GiB free Y GiB`（`want = 上卡字节 × 1.13 + 640 MiB`）、ctx 建好后按 nvidia-smi 前后差后检（`spill = landed < want × 0.85`）；WDDM 会静默 over-commit，所以**必须用 nvidia-smi**，查不到就跳过并说明；后检永不退出、预检默认只告警（`QLH_VRAM_STRICT=1` 才拒），`QLH_VRAM_DISABLE=1` 总开关。详细理由见 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md) §10 |
 
 六处语义值得单独记，都改过：
 
@@ -313,7 +323,7 @@ memory 看到整条链，不需要知道段在哪台机器上。
 约 12.56 MiB 过网、浅 `/health` 不反映链路状态（要问 `?deep=1`）、单独层范围的拒绝只覆盖一条
 加载路径）逐条记在 [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md) §2，那里写的是代价而不是 TODO。
 
-### device-buffer 在 split 链下的崩溃与修复（2026-11-09，52 文件那一版）
+### device-buffer 在 split 链下的崩溃与修复（2026-11-09，上一版的工作）
 
 **现象**：`llama-server` + 分段链 + `-md <DFlash 草稿>`，**跨机和 loopback 都崩**，整模不崩：
 
@@ -409,8 +419,8 @@ device 路径同样零覆盖。
 ## 与上游 193 个提交的重合（2026-11-09 rebase）
 
 这一节记的是**基底换掉之后**的事：fork 从 `e0f142d` 整体 rebase 到上游 193 个提交之后的
-`f477f795c`。旧基线 `ec25cedda` 留在 `master` 上，新基线在 `rebase-merge` 分支（`0c5c3bdd`，
-父提交 `f477f795c`）。
+`f477f795c`。旧基线 `ec25cedda` 留在 `master` 上，新基线在 `rebase-merge` 分支（`48dfb3ea8`，
+父提交 `f477f795c`；上一版是 `0c5c3bdd`）。
 
 ### 规模
 
@@ -428,9 +438,9 @@ device 路径同样零覆盖。
 | 干净应用 | **26** | 上游没碰，或只改了别处 |
 | 冲突块 | **12 个文件 / 29 个块** | 全部落在上游重构过的 `llama-context.cpp`、`llama-graph.cpp`、`server-context.cpp` 这一层 |
 
-rebase 之后相对上游只剩 **52 文件 / +17831 −230**：68 − **17**，再加这一轮 `src/models/dflash.cpp`
+rebase 之后相对上游只剩 **54 文件 / +18733 −240**（上一版的 52 加上段级 offload 的两个新头文件）：68 − **17**，再加 `src/models/dflash.cpp`
 因 device-buffer 诊断行重新进入变更集。这 17 个文件里 **16 个**现在与上游**逐字节
-相同**，也就是 `git diff f477f795c 0c5c3bdd` 里根本不再出现它们。少掉的是两类：
+相同**，也就是 `git diff f477f795c 48dfb3ea8` 里根本不再出现它们。少掉的是两类：
 
 | 类别 | 文件 | 为什么消失 |
 | --- | --- | --- |
@@ -545,6 +555,11 @@ known-fail 集合（A1 A2 B1 B2 B3 已知红、C1 绿）并把原因写进文件
 | `verify_mtp.sh` | **6 / 0** |
 | `verify_mtp_e2e.sh` | **6 / 0** |
 | `verify_seq_rm_exact.py --expect-known-fail` | **1 pass / 5 known-fail / 0 unexpected** |
+
+表里的 `verify.sh` 52 是完整树 `48dfb3ea8` 上的结果；`verify.sh` 52 与 `verify_chain_death.py` 36 在
+纯分段树 `2949267e` 上本轮也各自重跑过（[`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §6）。
+grammar / rbudget / seq_id / mtp 四套最近一次跑在上一版 `0c5c3bdd` 上——本轮的七文件改动（段级
+offload、MoE 缓存默认、显存预算）不在这四条路径上，没有重跑。
 
 ### 一个该记的疏漏：静默指向错的东西 + 绿
 

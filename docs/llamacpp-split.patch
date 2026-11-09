@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 69be4a61e..75895e4f8 100644
+index 69be4a61e..4d82ef912 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -31,6 +31,14 @@
@@ -206,6 +206,21 @@ index 69be4a61e..75895e4f8 100644
      GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
      add_opt(common_arg(
          {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
+@@ -2938,9 +3096,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+     add_opt(common_arg(
+         {"--op-offload"},
+         {"--no-op-offload"},
+-        string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
++        string_format("whether to offload host tensor operations to device (default: %s; a split "
++                      "stage runs with it off, see src/qlh-split-defaults.h)", params.no_op_offload ? "false" : "true"),
+         [](common_params & params, bool value) {
+             params.no_op_offload = !value;
++            // [QLH-SPLIT] v2.4: remember that this was given, so the split-stage default applied
++            // after parsing (tools/server/server-context.cpp) cannot overwrite an explicit flag.
++            params.no_op_offload_explicit = true;
+         }
+     ));
+     add_opt(common_arg(
 diff --git a/common/common.cpp b/common/common.cpp
 index 75fd39665..b3ed72492 100644
 --- a/common/common.cpp
@@ -661,7 +676,7 @@ index 75fd39665..b3ed72492 100644
  
  bool common_prompt_checkpoint::load_tgt(
 diff --git a/common/common.h b/common/common.h
-index 84abddc76..8194a8ffe 100644
+index 84abddc76..d1df56e2e 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -343,6 +343,21 @@ struct common_params_speculative_draft {
@@ -757,7 +772,19 @@ index 84abddc76..8194a8ffe 100644
      int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
      float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
      bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
-@@ -1071,8 +1141,17 @@ struct common_memory {
+@@ -588,6 +658,11 @@ struct common_params {
+     bool warmup            = true;  // warmup run
+     bool check_tensors     = false; // validate tensor data
+     bool no_op_offload     = false; // globally disable offload host tensor operations to device
++    // [QLH-SPLIT] v2.4: whether --op-offload / --no-op-offload was given explicitly. The default
++    // a split stage runs with is decided after parsing (src/qlh-split-defaults.h), so the flags
++    // have to be distinguishable from "not given" -- otherwise applying the stage default would
++    // silently overwrite an operator's --op-offload.
++    bool no_op_offload_explicit = false;
+     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+     bool load_mtp          = false; // load MTP/NextN layers
+@@ -1071,8 +1146,17 @@ struct common_memory {
  
      void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
  
@@ -777,7 +804,7 @@ index 84abddc76..8194a8ffe 100644
      void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
      void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
  };
-@@ -1330,12 +1409,17 @@ struct common_prompt_checkpoint {
+@@ -1330,12 +1414,17 @@ struct common_prompt_checkpoint {
              llama_pos pos_min,
              llama_pos pos_max);
  
@@ -6629,7 +6656,7 @@ index ed59079a4..d63cc15da 100644
      template<typename T>
      typename std::enable_if<std::is_integral<T>::value, bool>::type
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 7e845bc30..e41c4f578 100644
+index 7e845bc30..0746aac0b 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1489,6 +1489,21 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
@@ -6654,7 +6681,65 @@ index 7e845bc30..e41c4f578 100644
      ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
      std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
      ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
-@@ -1964,7 +1979,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1763,15 +1778,54 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
+     }
+ 
+-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
++    // [QLH-SPLIT] `-ngl N` counts inside the segment when this is a layer-range load.
++    //
++    // hparams.n_layer_all is already the range's *local* block count here (the loader overrides
++    // block_count before the hparams are read, see llama-model-loader.cpp), so the base is the
++    // segment's high bound and the formula below is literally "the last N blocks of this range"
++    // -- the v1/v2 behaviour the merge dropped when it turned a stage into a range of one
++    // process. The only thing that changes against upstream is the "+1":
++    //
++    //   whole model : i_gpu_start = n_layer_all + 1 - N   (N includes the output slot)
++    //   range load  : i_gpu_start = n_layer_all     - N   (N is this range's blocks only)
++    //
++    // Upstream counts the output layer in n_gpu_layers, which is right for a whole model: the
++    // logits layer is reachable only after every block, so it is the natural "last layer". In a
++    // range it is not: a head/relay has no output tensor at all, so reserving a slot for it
++    // would make "-ngl 8" offload 7 blocks and leave "give this segment 8 blocks of GPU"
++    // unexpressible. A tail *does* carry the output weight, and it gets it when N reaches the
++    // local block count (N == n_layer_all also offloads the output slot, see the `<=` in the
++    // get_layer_buft_list test), so "-ngl all" still means "this whole segment, logits included".
++    //
++    // The whole-model path is bit-for-bit unchanged: n_layer_all + 1 - N for a non-range load.
++    const int i_gpu_start = std::max((ml.layer_range_active() ? n_layer_all : n_layer_all + 1) - n_gpu_layers, 0);
+     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
++    // [QLH-SPLIT] The output slot is decided separately inside a range: upstream's single
++    // i_gpu_start sweep puts it on the GPU for any N > 0, which is what a whole model wants. A
++    // range wants it only when the *whole* segment is on the GPU (N >= local blocks); "-ngl 3"
++    // on a 9-block tail must not drag the logits layer along just because it is the last slot.
++    const bool offload_output = ml.layer_range_active()
++        ? (n_gpu_layers >= n_layer_all)
++        : (n_gpu_layers > 0);
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+-        if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
++        const bool on_gpu = !devices.empty() && (il < n_layer_all
++            ? (il >= i_gpu_start && il - i_gpu_start < act_gpu_layers)
++            : offload_output);
++        if (!on_gpu) {
+             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+             return {cpu_dev, &pimpl->cpu_buft_list};
+         }
+-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
++        // [QLH-SPLIT] The multi-device split ratio must stay in [0, 1). A range load can put the
++        // output slot on the GPU with il - i_gpu_start == act_gpu_layers (one *past* the last
++        // repeating layer), and 1.0 makes upper_bound return end() -- devices.at() then throws
++        // "invalid vector subscript" during load. Clamping to the last allocated layer gives the
++        // output slot the same device the last offloaded block got, which is what a single-device
++        // split does anyway and what the whole-model path already did for N <= n_layer_all.
++        const float ratio = act_gpu_layers > 0
++            ? float(std::min(il - i_gpu_start, act_gpu_layers - 1)) / act_gpu_layers
++            : 0.0f;
++        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), ratio) - splits.begin();
+         auto * dev = devices.at(layer_gpu).dev;
+         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+@@ -1964,7 +2018,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -6663,7 +6748,7 @@ index 7e845bc30..e41c4f578 100644
  
      if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
          LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
-@@ -1987,7 +2002,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1987,7 +2041,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      // per-tensor activation precision policy
      prec_policy.load(ml, *this);
  
@@ -6676,7 +6761,37 @@ index 7e845bc30..e41c4f578 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2131,6 +2150,59 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2096,19 +2154,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     }
+ 
+     if (llama_supports_gpu_offload()) {
+-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
+-
+-        int n_repeating = n_gpu;
+-        if (n_repeating > 0) {
++        // [QLH-SPLIT] Report what actually landed on the GPU, computed from the same
++        // i_gpu_start/act_gpu_layers/offload_output the assignment used, so a range printout says
++        // "8 of 33" for a head given -ngl 8 instead of the whole-model "8/33" that would hide
++        // which 8 blocks those are. The whole-model numbers are unchanged.
++        const int n_repeating = std::max(0, std::min(act_gpu_layers, n_layer_all - i_gpu_start));
++        if (offload_output) {
+             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
+-            n_repeating--;
+         }
+         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
+ 
+         const int max_backend_supported_layers = n_layer_all + 1;
+         const int max_offloadable_layers       = n_layer_all + 1;
+ 
+-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
++        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU (blocks [%d, %d) of this %s)\n", __func__,
++                n_repeating + (offload_output ? 1 : 0), max_backend_supported_layers,
++                i_gpu_start, i_gpu_start + n_repeating,
++                ml.layer_range_active() ? "range" : "model");
+     }
+ 
+     // print memory requirements per buffer type
+@@ -2131,6 +2193,59 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          });
      }
  
@@ -6736,7 +6851,7 @@ index 7e845bc30..e41c4f578 100644
      // load tensor data
      for (auto & [ctx, bufs] : ctx_bufs) {
          if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-@@ -3545,6 +3617,8 @@ llama_model_params llama_model_default_params() {
+@@ -3545,6 +3660,8 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -6745,7 +6860,7 @@ index 7e845bc30..e41c4f578 100644
      };
  
      return result;
-@@ -3574,6 +3648,12 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
+@@ -3574,6 +3691,12 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
      return model->hparams.n_embd_inp();
  }
  
@@ -6758,7 +6873,7 @@ index 7e845bc30..e41c4f578 100644
  int32_t llama_model_n_embd_out(const llama_model * model) {
      return model->hparams.n_embd_out();
  }
-@@ -3586,6 +3666,28 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
+@@ -3586,6 +3709,28 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
      return model->hparams.n_layer_nextn;
  }
  
@@ -9294,6 +9409,663 @@ index 0b06b1f5d..7bdec2001 100644
  }
  
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(
+diff --git a/src/qlh-split-defaults.h b/src/qlh-split-defaults.h
+new file mode 100644
+index 000000000..8196846b9
+--- /dev/null
++++ b/src/qlh-split-defaults.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++// [QLH-SPLIT] v2.4: the defaults a *stage* of a split chain needs, in one place.
++//
++// Why this header exists: op_offload is upstream's switch that lets the GPU take over the big
++// operators of tensors that live in host memory. It is ON upstream, and on a *range* load it is
++// the difference between a positive and a negative head stage: with it on, the CPU-resident
++// blocks' weights go into the pinned CUDA host buffer and the GPU runs their prefill matmuls,
++// which costs them ~31% of decode speed. Measured on the segment probe (2026-11-09, head 0:32,
++// same build): -ngl 0 tg 11.25 with it on vs 18.23 with it off; -ngl 8 tg 14.60 vs 22.25 (+36%).
++//
++// tools/split-stage has defaulted `no_op_offload = true` since v2.2. llama-server, which is the
++// *head* of every chain, was left on the upstream default instead -- so the same head measured
++// +36% on the segment probe and -10% through the server (E: 8.44 vs the all-CPU A 9.34), and no
++// line of log said which switch was on. Both entry points now read the default from here, so the
++// value cannot drift again; an explicit --op-offload / --no-op-offload still wins.
++//
++// Header-only and dependency-free on purpose: tools/split-stage links against `llama` and
++// nothing else (its CMakeLists says so), and this constant needs no more than that.
++static constexpr bool QLH_SPLIT_DEFAULT_NO_OP_OFFLOAD = true;
+diff --git a/src/qlh-vram-budget.h b/src/qlh-vram-budget.h
+new file mode 100644
+index 000000000..64081e101
+--- /dev/null
++++ b/src/qlh-vram-budget.h
+@@ -0,0 +1,625 @@
++#pragma once
++
++// [QLH-SPLIT] v2.3: VRAM budget pre-check + post-load spill check.
++//
++// Why this layer exists: the Windows display driver (WDDM) lets an allocation exceed
++// dedicated video memory and quietly backs the excess with system RAM. llama.cpp therefore
++// still prints "offloaded N/N layers", the process neither errors nor aborts -- it is
++// **merely slow**. Measured 2026-11-09 on an 8188 MiB RTX 4060 Laptop: `head -ngl 8` plus a
++// fully offloaded tail needs 8.4 GiB against 7.9 GiB free, and **not one line of log said
++// what happened**; tg fell from 10.76 to 0.343 t/s (27x slower).
++//
++// This is the project's recurring "silent wrong" family: no error, a plausible result (it
++// runs), just 27x slower. The one job of this layer is to **name the spill**.
++//
++// Two mechanisms, ported from the v2 implementation (chain_client.py + docs/MEMORY-LIMITS.md
++// section 3-4):
++//   1. pre-check, before the model is loaded: estimate ``want`` from the bytes this segment
++//      will actually touch, compare it with the currently free VRAM, and print
++//      ``VMEM: need ~X GiB  free Y GiB  of Z GiB``.
++//   2. post-check, after the model is loaded: compare the measured VRAM delta (``landed``)
++//      against the weights that were supposed to go there; ``landed < want x slack`` is a
++//      spill.
++//
++// **The post-check never exits the process.** The spill has already happened by then; the
++// only thing left to do is tell the operator why every step is slow. v2's conclusion stands:
++// "a spill warning does not mean the configuration is unusable -- the criterion is
++// throughput, not the warning" (a gpu_layers=6 tier was still spilling and was still the
++// fastest of four measured tiers). That is also why the pre-check only warns by default:
++// refusing would make "is this spilled tier actually faster?" untestable, and that question
++// is exactly what this warning exists to let people answer. QLH_VRAM_STRICT=1 restores
++// v2's refuse-to-start behaviour for CI and batch scripts; QLH_VRAM_ALLOW=1 forces a
++// start even then.
++//
++// CPU-only builds (GGML_CUDA=OFF, no GPU device at all) must skip the whole thing: "cannot
++// query VRAM" is not a reason to refuse to start, and treating it as one would break every
++// CPU deployment.
++//
++// Single source of truth: this header is included by both entry points that load a segment
++// on their own -- tools/split-stage (a stage, links only `llama`) and the llama-server head
++// (tools/server). It is header-only on purpose so the stage keeps its "links against llama
++// and nothing else" property; it needs only ggml/gguf and the standard library.
++
++#include "llama.h"
++#include "ggml-backend.h"
++#include "gguf.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <regex>
++#include <string>
++#include <vector>
++
++namespace qlh_vram {
++
++// --- constants, verbatim from v2 chain_client.py -------------------------------------------
++//
++// VRAM_PER_BYTE: measured on an 8188 MiB RTX 4060 Laptop. Two stages that fit both cost
++//   exactly 597 MiB on top of their file size (4640 MiB file -> 5237 MiB VRAM delta,
++//   4542 -> 5139, both 1.13x), so the cost is linear: file size times a fixed factor plus a
++//   fixed per-stage overhead. Both constants are rounded up from those measurements.
++// GPU_VRAM_OVERHEAD: the context + compute buffer, measured 597 MiB, rounded up.
++// VRAM_LANDED_SLACK: a stage that *fits* occupies MORE video memory than its weights (the
++//   compute buffer comes on top); a stage that *spilled* occupies LESS (the driver backed
++//   the remainder with system RAM). The driver's own reservations move a few percent either
++//   way (measured 5.44 GiB landed for 5.58 GiB of weights), so the comparison allows 15%.
++//   A real spill misses by a factor, not by 3%.
++inline constexpr double VRAM_PER_BYTE     = 1.13;
++inline constexpr size_t GPU_VRAM_OVERHEAD = (size_t) 640 << 20;
++inline constexpr double VRAM_LANDED_SLACK = 0.85;
++
++inline constexpr size_t MIB = (size_t) 1 << 20;
++inline constexpr size_t GIB = (size_t) 1 << 30;
++
++inline const char * ENV_STRICT  = "QLH_VRAM_STRICT";
++inline const char * ENV_ALLOW   = "QLH_VRAM_ALLOW";
++// Kill switch. A diagnostic layer that cannot be switched off is a layer that gets blamed for
++// every unexplained slowdown, so -- like every other check in this tree -- it can be turned off
++// without rebuilding: `QLH_VRAM_DISABLE=1` makes both halves print one line and do nothing.
++inline const char * ENV_DISABLE = "QLH_VRAM_DISABLE";
++
++inline bool env_flag(const char * name) {
++    const char * v = std::getenv(name);
++    if (v == nullptr || *v == '\0' || std::strcmp(v, "0") == 0) {
++        return false;
++    }
++    return std::strcmp(v, "false") != 0 && std::strcmp(v, "no") != 0;
++}
++
++inline void fmt_gib(char * buf, size_t n, size_t bytes) {
++    std::snprintf(buf, n, "%.2f", (double) bytes / (double) GIB);
++}
++
++// --- device memory -------------------------------------------------------------------------
++
++struct device_memory {
++    bool        ok    = false;
++    size_t      total = 0;
++    size_t      free  = 0;
++    std::string name;
++};
++
++// Does this build have a GPU backend at all?
++//
++// This is asked *before* anything reads a memory number, and it is what keeps a CPU-only build
++// (GGML_CUDA=OFF) working on a machine that happens to have a card: no offload device means
++// nothing can be offloaded, so "-ngl all" here is a no-op and there is no budget to check.
++// Reading nvidia-smi instead would compute a want for weights that will never leave the CPU and
++// then refuse to start a deployment that has no GPU in the first place.
++inline bool has_gpu_backend(std::string * name = nullptr) {
++    const size_t n = ggml_backend_dev_count();
++    for (size_t i = 0; i < n; ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (dev == nullptr) {
++            continue;
++        }
++        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
++        if (type == GGML_BACKEND_DEVICE_TYPE_GPU ||
++            type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
++            type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
++            if (name != nullptr) {
++                const char * nm = ggml_backend_dev_name(dev);
++                *name = nm != nullptr ? nm : "?";
++            }
++            return true;
++        }
++    }
++    return false;
++}
++
++// Free/total video memory as the *driver* sees it -- nvidia-smi, deliberately, and only.
++//
++// Read this before "simplifying" it to a CUDA API call.
++//
++// Windows lets an application allocate past dedicated video memory: the display driver (WDDM)
++// backs the excess with system RAM, so the allocation *succeeds*, llama.cpp still prints
++// "offloaded N/N layers", and the run merely crawls. That is the spill this whole header exists
++// to name. It also means every "how much VRAM is left" API answers the wrong question, because
++// they report what the driver is still willing to hand out -- over-commit budget included --
++// not what dedicated memory is actually still free. Measured here 2026-11-09, RTX 4060 Laptop
++// 8188 MiB, tail stage already resident with 5.2 GiB of weights:
++//
++//   nvidia-smi               memory.used 5440 MiB   memory.free 2517 MiB   <- the truth
++//   cudaMemGetInfo           a fresh process reports                     7106 MiB free
++//   (llama-server --list-devices, i.e. ggml_backend_dev_memory)
++//
++// 7106 MiB "free" on a card that has 2517 MiB left. A budget check built on that number
++// concluded the very configuration that spilled (8.4 GiB against 7.9 GiB) was safe -- the first
++// version of this file did exactly that and D failed silently in a different way.
++//
++// `ggml_backend_dev_memory` is the same trap (on NVIDIA it *is* cudaMemGetInfo), which is why it
++// is not used here at all -- see query_device(). nvidia-smi is the only source that reports
++// dedicated usage the driver has already committed, and committed is what decides the next
++// spill. v2 reached the same conclusion: "nvidia-smi is the only source that reflects
++// *dedicated* usage the driver has already committed" (chain_client.vram_info).
++//
++// MiB units on purpose: `nounits` + MiB is what nvidia-smi prints and what v2 parsed.
++inline device_memory query_nvidia_smi() {
++    device_memory m;
++#ifdef _WIN32
++    FILE * p = _popen("nvidia-smi --query-gpu=memory.total,memory.used "
++                      "--format=csv,noheader,nounits 2>nul", "r");
++#else
++    FILE * p = popen("nvidia-smi --query-gpu=memory.total,memory.used "
++                     "--format=csv,noheader,nounits 2>/dev/null", "r");
++#endif
++    if (p == nullptr) {
++        return m;
++    }
++    char line[256] = {0};
++    if (std::fgets(line, sizeof(line), p) != nullptr) {
++        long long total_mib = -1;
++        long long used_mib  = -1;
++        if (std::sscanf(line, "%lld, %lld", &total_mib, &used_mib) == 2 &&
++            total_mib > 0 && used_mib >= 0) {
++            m.ok    = true;
++            m.total = (size_t) total_mib * MIB;
++            m.free  = (size_t) std::max<long long>(total_mib - used_mib, 0) * MIB;
++        }
++    }
++#ifdef _WIN32
++    _pclose(p);
++#else
++    pclose(p);
++#endif
++    return m;
++}
++
++// The device with the most free memory, or ok == false when this build cannot offload at all.
++//
++// Two steps, and the second one is deliberately narrow:
++//   1. is there a GPU backend? A CPU-only build has nothing to offload, whatever card the
++//      machine happens to carry -- "-ngl all" there is a no-op and there is no budget to check.
++//   2. nvidia-smi, and nothing else. NOT `ggml_backend_dev_memory`: under an over-committing
++//      driver it answers with the over-commit budget (7106 MiB "free" on a card with 2517 MiB
++//      left), and a check built on it declares the spilling configuration safe. The whole
++//      point of query_nvidia_smi is that it is the one number that cannot be inflated that way.
++//      When nvidia-smi is absent (an AMD/Intel/Vulkan device) this returns ok == false and the
++//      caller skips with a stated reason -- "cannot read committed VRAM" is an honest answer;
++//      a wrong "it fits" is not.
++inline device_memory query_device() {
++    device_memory best;
++    std::string name;
++    if (!has_gpu_backend(&name)) {
++        // CPU-only build: nothing to check, and the caller must not treat this as a refusal
++        return best;
++    }
++    best = query_nvidia_smi();
++    if (!best.ok) {
++        // GPU backend present but no nvidia-smi: skip, do not guess (see above)
++        return best;
++    }
++    best.name = name;
++    return best;
++}
++
++// --- what a segment will touch -------------------------------------------------------------
++//
++// Read from the GGUF index rather than assumed from the file size. Two things made the naive
++// "file size x layer fraction" wrong:
++//   - a range load touches only its own blocks, and the block sizes differ (MoE layers carry
++//     ffn_*_exps, the MTP nextn block carries a slightly different set);
++//   - `-ncmoe N` keeps the expert tensors of N layers on the host, so a stage can be entirely
++//     "on the GPU" and still put only ~9% of its bytes there.
++//
++// The index walk is cheap (metadata only, no_alloc) and runs once per load.
++
++struct tensor_row {
++    std::string name;
++    size_t      bytes = 0;
++    int         blk   = -1; // -1 = a global tensor (token_embd / output / output_norm)
++    bool        exps  = false;
++};
++
++struct model_index {
++    bool                   ok      = false;
++    int                    max_blk = -1;
++    std::vector<tensor_row> tensors;
++};
++
++inline bool tensor_name_is_exps(const char * name) {
++    // v2's rule: "exps" in tensor.name -- it catches all four spellings llama.cpp knows
++    // (ffn_{up,down,gate,gate_up}_(ch|)exps) without hard-coding the architecture's names.
++    return std::strstr(name, "exps") != nullptr;
++}
++
++inline int tensor_name_block(const char * name) {
++    // "blk.<N>.<rest>" -- the one part of the naming every architecture shares, which is why
++    // this file never needs the architecture name or a block_count KV key.
++    if (std::strncmp(name, "blk.", 4) != 0) {
++        return -1;
++    }
++    char * end = nullptr;
++    const long v = std::strtol(name + 4, &end, 10);
++    if (end == name + 4 || end == nullptr || *end != '.') {
++        return -1;
++    }
++    return (int) v;
++}
++
++inline model_index read_model_index(const char * path) {
++    model_index idx;
++    if (path == nullptr || *path == '\0') {
++        return idx;
++    }
++    gguf_init_params params{};
++    params.no_alloc = true;  // metadata only: this runs before the model is loaded
++    params.ctx      = nullptr;
++    gguf_context * g = gguf_init_from_file(path, params);
++    if (g == nullptr) {
++        return idx;
++    }
++    const int64_t n = gguf_get_n_tensors(g);
++    idx.tensors.reserve((size_t) std::max<int64_t>(n, 0));
++    for (int64_t i = 0; i < n; ++i) {
++        const char * nm = gguf_get_tensor_name(g, i);
++        if (nm == nullptr) {
++            continue;
++        }
++        tensor_row row;
++        row.name  = nm;
++        row.bytes = gguf_get_tensor_size(g, i);
++        row.blk   = tensor_name_block(nm);
++        row.exps  = tensor_name_is_exps(nm);
++        if (row.blk > idx.max_blk) {
++            idx.max_blk = row.blk;
++        }
++        idx.tensors.push_back(std::move(row));
++    }
++    gguf_free(g);
++    idx.ok = idx.max_blk >= 0;
++    return idx;
++}
++
++// The blocks this process loads, in the order llama.cpp assigns its local layer indices.
++//
++// A range [lo, hi) covers blocks lo..hi-1 of the source. The MTP nextn block is the *largest*
++// block id and sits past the trunk, so the range that reaches the top of the model also
++// carries it -- observed directly in the stage log:
++//     `[C-scheme] layers [32, 40) of 40, block_count -> 9, nextn -> 1`
++// i.e. 8 trunk blocks plus the nextn block for `--layer-range 32:40`. Missing it would make
++// every tail estimate 1/40 low, and the tail is exactly the segment that spilled.
++inline std::vector<int> local_blocks(const model_index & idx, int32_t lo, int32_t hi) {
++    std::vector<int> out;
++    if (!idx.ok) {
++        return out;
++    }
++    if (lo < 0 || hi < 0) {
++        // whole model
++        for (const auto & t : idx.tensors) {
++            if (t.blk < 0) {
++                continue;
++            }
++            if (out.empty() || out.back() != t.blk) {
++                if (std::find(out.begin(), out.end(), t.blk) == out.end()) {
++                    out.push_back(t.blk);
++                }
++            }
++        }
++        std::sort(out.begin(), out.end());
++        return out;
++    }
++    for (int i = lo; i < hi && i <= idx.max_blk; ++i) {
++        out.push_back(i);
++    }
++    // nextn travels with the range that reaches the top of the source model
++    if (hi >= idx.max_blk && idx.max_blk >= lo &&
++        (out.empty() || out.back() != idx.max_blk)) {
++        out.push_back(idx.max_blk);
++    }
++    return out;
++}
++
++struct estimate_input {
++    const char * model_path   = nullptr;
++    int32_t      lo           = -1;  // -1/-1 = whole model
++    int32_t      hi           = -1;
++    int32_t      n_gpu_layers = 0;   // < 0 = every local block (+ the output slot)
++    // `-ncmoe` and friends arrive as tensor buffer-type overrides; the ones that send a
++    // tensor to the CPU take it off the card. Matching the patterns the same way the loader
++    // does is the only way a `-ncmoe 32` head is not charged for experts that never leave RAM.
++    const llama_model_tensor_buft_override * overrides = nullptr;
++    // `--moe-cache-mib N` puts N MiB of the *host-resident* experts on the card. It is real
++    // video memory and it is invisible to a weights-only estimate: a head with 1.19 GiB of
++    // weights and a 1024 MiB cache occupies ~2.4 GiB, which is the difference between "fits"
++    // and "spills" on a card where the tail already took 5.3 GiB.
++    size_t       moe_cache    = 0;
++};
++
++struct estimate {
++    bool        ok         = false; // false = nothing can be said (no GPU layers, or no index)
++    size_t      weights    = 0;     // bytes of weights that go to the card
++    size_t      want       = 0;     // weights x VRAM_PER_BYTE + per-segment overhead
++    int         n_local    = 0;     // blocks this process loads
++    int         n_gpu_blk  = 0;     // of those, how many go to the card
++    bool        output_gpu = false;
++    std::string why;                // human-readable reason when ok == false
++};
++
++// Replicates llama_model::load_tensors()' placement rules (src/llama-model.cpp):
++//
++//   i_gpu_start   = max((range ? n_layer_all : n_layer_all + 1) - n_gpu_layers, 0)
++//   act_gpu_layers= min(n_gpu_layers, n_layer_all + 1)
++//   offload_output= range ? (n_gpu_layers >= n_layer_all) : (n_gpu_layers > 0)
++//
++// and the input layer is always CPU ("there is very little benefit to offloading the input
++// layer, so always keep it on the CPU"), which is why token_embd is never charged to VRAM.
++inline estimate estimate_want(const estimate_input & in) {
++    estimate est;
++
++    if (in.n_gpu_layers == 0) {
++        est.why = "no layers offloaded";
++        return est;
++    }
++
++    const model_index idx = read_model_index(in.model_path);
++    if (!idx.ok) {
++        est.why = "GGUF index unreadable";
++        return est;
++    }
++
++    const bool    is_range = in.lo >= 0 && in.hi > in.lo;
++    const std::vector<int> blocks = local_blocks(idx, in.lo, in.hi);
++    if (blocks.empty()) {
++        est.why = "layer range selects no blocks";
++        return est;
++    }
++    const int n_local = (int) blocks.size();
++    est.n_local = n_local;
++
++    // llama_model::n_gpu_layers(): a negative request means "this range plus the output slot"
++    const int n_gpu_layers = in.n_gpu_layers >= 0 ? in.n_gpu_layers : n_local + 1;
++    const int i_gpu_start  = std::max((is_range ? n_local : n_local + 1) - n_gpu_layers, 0);
++    const int act_gpu      = std::min(n_gpu_layers, n_local + 1);
++    const bool offload_output = is_range ? (n_gpu_layers >= n_local) : (n_gpu_layers > 0);
++
++    est.output_gpu = offload_output;
++
++    // Which local layer indices end up on the card.
++    std::vector<bool> on_gpu((size_t) n_local, false);
++    int n_gpu_blk = 0;
++    for (int il = 0; il < n_local; ++il) {
++        const bool gpu = il >= i_gpu_start && il - i_gpu_start < act_gpu;
++        on_gpu[(size_t) il] = gpu;
++        if (gpu) {
++            ++n_gpu_blk;
++        }
++    }
++    est.n_gpu_blk = n_gpu_blk;
++
++    // compile the CPU-side override patterns once
++    std::vector<std::regex> cpu_patterns;
++    if (in.overrides != nullptr) {
++        for (const llama_model_tensor_buft_override * o = in.overrides; o->pattern != nullptr; ++o) {
++            if (o->buft == ggml_backend_cpu_buffer_type()) {
++                try {
++                    cpu_patterns.emplace_back(std::string(o->pattern), std::regex::ECMAScript);
++                } catch (const std::regex_error &) {
++                    // a pattern we cannot compile is a pattern we cannot second-guess
++                }
++            }
++        }
++    }
++
++    auto overridden_to_cpu = [&](const std::string & name) {
++        for (const auto & pat : cpu_patterns) {
++            if (std::regex_search(name, pat)) {
++                return true;
++            }
++        }
++        return false;
++    };
++
++    // global tensors that belong to this segment
++    const bool has_input  = !is_range || in.lo == 0;          // token_embd: head / whole model
++    const bool has_output = !is_range || in.hi >= idx.max_blk; // output: tail / whole model
++
++    size_t weights = 0;
++    for (const auto & t : idx.tensors) {
++        bool counted = false;
++        if (t.blk >= 0) {
++            const auto it = std::find(blocks.begin(), blocks.end(), t.blk);
++            if (it == blocks.end()) {
++                continue;
++            }
++            const int il = (int) std::distance(blocks.begin(), it);
++            counted = on_gpu[(size_t) il];
++        } else if (std::strcmp(t.name.c_str(), "output.weight") == 0 ||
++                   std::strcmp(t.name.c_str(), "output_norm.weight") == 0) {
++            counted = has_output && offload_output;
++        } else if (std::strcmp(t.name.c_str(), "token_embd.weight") == 0) {
++            // always CPU, see the comment above
++            counted = false;
++        } else {
++            // any other global tensor is small and stays with the loader's own decision
++            counted = has_input || has_output;
++        }
++        if (!counted) {
++            continue;
++        }
++        if (!cpu_patterns.empty() && overridden_to_cpu(t.name)) {
++            continue;
++        }
++        weights += t.bytes;
++    }
++
++    est.weights = weights;
++    // The expert cache is video memory too. Counted in `want` (what the card must hold) but not
++    // in `weights` (what the loader reports as offloaded), because the post-load check compares
++    // the driver's delta against the offloaded weights and the cache legitimately sits on top.
++    est.want    = (size_t) std::ceil((double) weights * VRAM_PER_BYTE) + GPU_VRAM_OVERHEAD
++                + in.moe_cache;
++    est.ok      = true;
++    return est;
++}
++
++// --- pre-check -----------------------------------------------------------------------------
++
++enum verdict {
++    VERDICT_OK = 0,          // fits (or nothing to check)
++    VERDICT_SPILL_EXPECTED,  // does not fit; warn and continue
++    VERDICT_REFUSED,         // does not fit and QLH_VRAM_STRICT asked to refuse
++    VERDICT_SKIPPED,         // no GPU device: CPU-only build, say so and continue
++};
++
++struct precheck_result {
++    verdict       v        = VERDICT_SKIPPED;
++    device_memory dev;
++    estimate      est;
++};
++
++// Prints the budget line and decides. `tag` names the caller ("split-stage", "head").
++inline precheck_result precheck(const estimate_input & in, const char * tag) {
++    precheck_result r;
++    if (env_flag(ENV_DISABLE)) {
++        std::fprintf(stderr, "VMEM: %s: check disabled by %s\n", tag, ENV_DISABLE);
++        r.v = VERDICT_SKIPPED;
++        return r;
++    }
++    r.dev = query_device();
++
++    if (!r.dev.ok) {
++        // Two different "cannot check" cases, and the operator needs to tell them apart:
++        // no offload device at all (CPU-only build -- mandatory to continue, or every CPU
++        // deployment breaks), versus a GPU backend whose committed usage is unreadable.
++        if (has_gpu_backend()) {
++            std::fprintf(stderr, "VMEM: %s: GPU backend present but no nvidia-smi, cannot read "
++                                 "committed VRAM; skipping budget check\n", tag);
++        } else if (in.n_gpu_layers != 0) {
++            std::fprintf(stderr, "VMEM: %s: no GPU device, skipping budget check\n", tag);
++        }
++        r.v = VERDICT_SKIPPED;
++        return r;
++    }
++
++    r.est = estimate_want(in);
++    if (!r.est.ok) {
++        if (in.n_gpu_layers != 0) {
++            std::fprintf(stderr, "VMEM: %s: cannot estimate offloaded weights (%s), skipping "
++                                 "budget check\n", tag, r.est.why.c_str());
++        }
++        r.v = VERDICT_SKIPPED;
++        return r;
++    }
++
++    char want_s[32], free_s[32], total_s[32], short_s[32];
++    fmt_gib(want_s,  sizeof(want_s),  r.est.want);
++    fmt_gib(free_s,  sizeof(free_s),  r.dev.free);
++    fmt_gib(total_s, sizeof(total_s), r.dev.total);
++
++    std::fprintf(stderr, "VMEM: %s: need ~%s GiB  free %s GiB  of %s GiB (%s; %d/%d blocks)\n",
++                 tag, want_s, free_s, total_s, r.dev.name.c_str(),
++                 r.est.n_gpu_blk, r.est.n_local);
++
++    if (r.est.want <= r.dev.free) {
++        r.v = VERDICT_OK;
++        return r;
++    }
++
++    fmt_gib(short_s, sizeof(short_s), r.est.want - r.dev.free);
++
++    // Does not fit. v2 refused here; we name it and continue unless asked to be strict,
++    // because a spilled tier is sometimes still the fastest one and refusing destroys the
++    // measurement that would show it.
++    const bool strict = env_flag(ENV_STRICT);
++    const bool allow  = env_flag(ENV_ALLOW);
++
++    if (strict && !allow) {
++        std::fprintf(stderr,
++            "refusing to start: GPU stages need an estimated %s GiB of video memory but only "
++            "%s GiB is free (short by %s GiB).\n"
++            "  Lower -ngl, or set %s=1 to start anyway.\n"
++            "  Windows does not refuse the allocation -- it spills to system RAM and runs "
++            "slower than pure CPU.\n",
++            want_s, free_s, short_s, ENV_ALLOW);
++        r.v = VERDICT_REFUSED;
++        return r;
++    }
++
++    std::fprintf(stderr,
++        "!! VMEM: expected spill at load: need ~%s GiB but only %s GiB is free (short by %s GiB).\n"
++        "   Windows will not refuse the allocation: WDDM backs the excess with system RAM, "
++        "llama.cpp will still print \"offloaded N/N\", and decode will be slower than pure CPU.\n"
++        "   The post-load check below will confirm it. Set %s=1 to refuse instead.\n",
++        want_s, free_s, short_s, ENV_STRICT);
++    r.v = VERDICT_SPILL_EXPECTED;
++    return r;
++}
++
++// --- post-check ----------------------------------------------------------------------------
++
++struct after_result {
++    bool   measurable = false;
++    size_t landed     = 0;
++    size_t want       = 0;
++    bool   spill      = false;
++};
++
++// Compare the VRAM delta against the weights that were supposed to land there.
++//
++// `before` must have been sampled before any model was loaded in this process (the delta is
++// then attributable to this run rather than to whatever else shares the card). The estimate
++// keeps a deliberately generous `want` for the budget line, so only a gross miss is caught
++// there; this catches the case the estimate got wrong, using the same weight number.
++inline after_result after_load(const estimate & est, const device_memory & before, const char * tag) {
++    after_result r;
++    if (!est.ok || !before.ok) {
++        return r;
++    }
++    const device_memory now = query_device();
++    if (!now.ok) {
++        return r;
++    }
++    r.measurable = true;
++    r.want       = est.weights;
++    // used-memory delta; a shrink (negative) is clamped to zero rather than wrapped
++    const long long delta = (long long) now.free - (long long) before.free;
++    r.landed = delta >= 0 ? 0 : (size_t) (-delta);
++    r.spill  = est.weights > 0 && r.landed < (size_t) (est.weights * VRAM_LANDED_SLACK);
++
++    char landed_s[32], want_s[32];
++    fmt_gib(landed_s, sizeof(landed_s), r.landed);
++    fmt_gib(want_s,   sizeof(want_s),   r.want);
++
++    if (!r.spill) {
++        std::fprintf(stderr, "VMEM verified: %s: %s GiB resident for %s GiB of GPU weights\n",
++                     tag, landed_s, want_s);
++        return r;
++    }
++
++    std::fprintf(stderr,
++        "!! VMEM spill detected after load (%s): %s GiB resident for %s GiB of GPU weights.\n"
++        "   %d of %d blocks did not fully fit on the card. Windows spilled the rest to system "
++        "RAM; llama.cpp reported them all as offloaded and decode will be slower than pure CPU.\n"
++        "   This is a warning, not a failure: a spilled configuration can still be the fastest "
++        "one measured -- judge it by throughput, not by this line.\n",
++        tag, landed_s, want_s, est.n_gpu_blk, est.n_local);
++    return r;
++}
++
++} // namespace qlh_vram
 diff --git a/tests/.gitignore b/tests/.gitignore
 index 6a6373101..1c09f4a01 100644
 --- a/tests/.gitignore
@@ -12110,10 +12882,10 @@ index 6a6592c7b..a060a1de6 100644
          add_subdirectory(rpc)
      endif()
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 78c8ef149..83a4b96cb 100644
+index 78c8ef149..a7e67d517 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -16,6 +16,10 @@
+@@ -16,6 +16,16 @@
  #include "common.h"
  #include "fit.h"
  #include "llama.h"
@@ -12121,10 +12893,16 @@ index 78c8ef149..83a4b96cb 100644
 +// says whether a remote chain is still trustworthy, so a failed decode can name the reason
 +// instead of only "Compute error.".
 +#include "../../src/llama-ext.h"
++// [QLH-SPLIT] v2.3: the VRAM budget check, shared with the split-stage tail so both ends of a
++// chain judge a segment the same way (see the header for why the check exists).
++#include "../../src/qlh-vram-budget.h"
++// [QLH-SPLIT] v2.4: the op_offload default a split stage runs with, shared with tools/split-stage
++// so the head and its stages cannot disagree about the switch (see the header for the measurement).
++#include "../../src/qlh-split-defaults.h"
  #include "log.h"
  #include "sampling.h"
  #include "speculative.h"
-@@ -25,6 +29,7 @@
+@@ -25,6 +35,7 @@
  
  #include <algorithm>
  #include <cstddef>
@@ -12132,7 +12910,7 @@ index 78c8ef149..83a4b96cb 100644
  #include <cinttypes>
  #include <deque>
  #include <exception>
-@@ -300,6 +305,17 @@ struct server_slot {
+@@ -300,6 +311,17 @@ struct server_slot {
      std::vector<int32_t> spec_i_batch;
      common_prompt_checkpoint spec_ckpt;
      bool spec_is_replay = false;
@@ -12150,7 +12928,7 @@ index 78c8ef149..83a4b96cb 100644
      std::mt19937 spec_synth_rng;
  
      // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
-@@ -350,6 +366,16 @@ struct server_slot {
+@@ -350,6 +372,16 @@ struct server_slot {
  
          const size_t cur_size = cur_size_tgt + cur_size_dft;
  
@@ -12167,7 +12945,7 @@ index 78c8ef149..83a4b96cb 100644
          SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                  (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
  
-@@ -394,6 +420,41 @@ struct server_slot {
+@@ -394,6 +426,41 @@ struct server_slot {
  
      common_sampler_ptr smpl;
  
@@ -12209,7 +12987,7 @@ index 78c8ef149..83a4b96cb 100644
      llama_token sampled; // in speculative mode, this is the last accepted token
  
      // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
-@@ -435,10 +496,14 @@ struct server_slot {
+@@ -435,10 +502,14 @@ struct server_slot {
          stopping_word  = "";
          n_sent_text    = 0;
  
@@ -12225,7 +13003,7 @@ index 78c8ef149..83a4b96cb 100644
          }
          generated_tokens.clear();
          generated_token_probs.clear();
-@@ -562,7 +627,9 @@ struct server_slot {
+@@ -562,7 +633,9 @@ struct server_slot {
      }
  
      bool can_speculate() const {
@@ -12236,7 +13014,7 @@ index 78c8ef149..83a4b96cb 100644
      }
  
      // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
-@@ -595,6 +662,13 @@ struct server_slot {
+@@ -595,6 +668,13 @@ struct server_slot {
              n_draft_max = std::min(n_draft_max, n_remaining() - 1);
          }
  
@@ -12250,7 +13028,7 @@ index 78c8ef149..83a4b96cb 100644
          SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
  
          return n_draft_max;
-@@ -1081,6 +1155,11 @@ private:
+@@ -1081,6 +1161,11 @@ private:
      // note: keep these alive - they determine the lifetime of the model, context, etc.
      common_init_result_ptr llama_init;
  
@@ -12262,7 +13040,38 @@ index 78c8ef149..83a4b96cb 100644
      llama_context * ctx_tgt = nullptr;
  
      server_batch batch;
-@@ -1215,6 +1294,15 @@ private:
+@@ -1211,10 +1296,46 @@ private:
+         const bool is_resume = sleeping;
+ 
+         params_base = params;
++
++        // [QLH-SPLIT] v2.4: a split head is a *stage*, and a stage defaults op_offload off.
++        //
++        // Upstream defaults it on, and on a range load that is a negative head: the CPU-resident
++        // blocks' weights move into the pinned CUDA host buffer and the GPU runs their matmuls,
++        // costing ~31% of decode speed (segment probe 2026-11-09: head 0:32 -ngl 8 tg 14.60 with
++        // it on vs 22.25 with it off, same build). tools/split-stage has defaulted it off since
++        // v2.2; this server, which is the head of every chain, kept upstream's default, so the
++        // same head measured +36% on the probe and -10% through the server (E 8.44 vs A 9.34).
++        //
++        // The condition is the same one common.cpp uses to turn on the relay output
++        // (embeddings + embeddings_pre_norm): "this process is a stage of a chain". An explicit
++        // --op-offload / --no-op-offload still wins, which is what no_op_offload_explicit is for
++        // -- without it this default would overwrite an operator's flag. The value itself lives
++        // in src/qlh-split-defaults.h so the head and its stages read one constant.
++        const bool split_role = !params_base.split_remote.empty() || params_base.split_tail_lo >= 0;
++        if (split_role) {
++            if (!params_base.no_op_offload_explicit) {
++                params_base.no_op_offload = QLH_SPLIT_DEFAULT_NO_OP_OFFLOAD;
++            }
++            SRV_INF("[split] op_offload = %s (%s)\n",
++                    params_base.no_op_offload ? "off" : "on",
++                    params_base.no_op_offload_explicit
++                            ? "explicit --op-offload/--no-op-offload"
++                            : "default for a split stage, see src/qlh-split-defaults.h");
++        }
++
+         const auto output_limits = server_output_limits(params_base);
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
@@ -12278,7 +13087,35 @@ index 78c8ef149..83a4b96cb 100644
          const bool has_mmproj = !params.mmproj.path.empty();
          const bool has_draft = params.speculative.has_dft();
          const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-@@ -1310,6 +1398,71 @@ private:
+@@ -1305,11 +1426,99 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        // [QLH-SPLIT] v2.3: VRAM budget pre-check for the segment this server loads.
++        //
++        // The head is the second process on the card in the configuration that spilled silently
++        // on 2026-11-09 (`head -ngl 8` + a fully offloaded tail: 8.4 GiB needed against 7.9 GiB
++        // free, tg 10.76 -> 0.343). By the time the head loads, the tail has usually taken its
++        // share already, so the free number read here is the one that decides -- which is why
++        // this check is per-process and not a chain-wide sum: each process reports what it can
++        // see, and the one that starts last sees the truth.
++        //
++        // -ngl 0 says nothing; a CPU-only build says one line and skips (see the header).
++        qlh_vram::estimate_input vram_in;
++        vram_in.model_path   = params_base.model.path.c_str();
++        vram_in.lo           = params_base.split_layer_lo;
++        vram_in.hi           = params_base.split_layer_hi;
++        vram_in.n_gpu_layers = params_base.n_gpu_layers;
++        vram_in.overrides    = params_base.tensor_buft_overrides.empty()
++                             ? nullptr : params_base.tensor_buft_overrides.data();
++        vram_in.moe_cache    = params_base.moe_cache_size;
++        const qlh_vram::precheck_result vram_pre = qlh_vram::precheck(vram_in, "llama-server");
++        if (vram_pre.v == qlh_vram::VERDICT_REFUSED) {
++            return false;
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
          model_tgt = llama_init->model();
          ctx_tgt   = llama_init->context();
  
@@ -12350,7 +13187,22 @@ index 78c8ef149..83a4b96cb 100644
          if (model_tgt == nullptr) {
              SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
              return false;
-@@ -1338,14 +1491,111 @@ private:
+@@ -1320,6 +1529,14 @@ private:
+             return false;
+         }
+ 
++        // [QLH-SPLIT] v2.3: post-load VRAM check, once every segment this process owns (the head
++        // and, with --split-tail-range, a local tail) has been loaded and attached.
++        //
++        // Warning only, never fatal: a spill has already happened by this point, and a spilled
++        // tier is sometimes the fastest one measured -- the criterion is throughput, not this
++        // line. What it buys is that a 27x slowdown stops looking like "the model is slow".
++        qlh_vram::after_load(vram_pre.est, vram_pre.dev, "llama-server");
++
+         vocab = llama_model_get_vocab(model_tgt);
+ 
+         try {
+@@ -1338,14 +1555,111 @@ private:
              load_progress_callback(0.0f, &load_progress_spec);
              load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
  
@@ -12464,7 +13316,7 @@ index 78c8ef149..83a4b96cb 100644
                  model_dft = spec_init->model();
                  ctx_dft   = spec_init->context();
  
-@@ -1354,13 +1604,21 @@ private:
+@@ -1354,13 +1668,21 @@ private:
                      return false;
                  }
  
@@ -12488,7 +13340,7 @@ index 78c8ef149..83a4b96cb 100644
              }
  
              load_progress_callback(1.0f, &load_progress_spec);
-@@ -1951,6 +2209,164 @@ private:
+@@ -1951,6 +2273,164 @@ private:
          return output;
      }
  
@@ -12653,7 +13505,7 @@ index 78c8ef149..83a4b96cb 100644
      bool launch_slot_with_task(server_slot & slot, server_task && task) {
          // process per-request lora adapters
          if (!task.params.lora.empty()) {
-@@ -2085,6 +2501,13 @@ private:
+@@ -2085,6 +2565,13 @@ private:
              SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
              SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
  
@@ -12667,7 +13519,7 @@ index 78c8ef149..83a4b96cb 100644
              if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                  const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                      ? std::random_device{}()
-@@ -2093,6 +2516,12 @@ private:
+@@ -2093,6 +2580,12 @@ private:
              }
          } else {
              slot.smpl.reset();
@@ -12680,7 +13532,7 @@ index 78c8ef149..83a4b96cb 100644
          }
  
          // the per-request limit takes priority over the global one
-@@ -2727,6 +3156,16 @@ private:
+@@ -2727,6 +3220,16 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -12697,7 +13549,7 @@ index 78c8ef149..83a4b96cb 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2780,8 +3219,18 @@ private:
+@@ -2780,8 +3283,18 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -12718,7 +13570,7 @@ index 78c8ef149..83a4b96cb 100644
          // stash the draft's speculative state with the checkpoint
          common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
  
-@@ -3821,7 +4270,21 @@ private:
+@@ -3821,7 +4334,21 @@ private:
  
                  SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
  
@@ -12741,7 +13593,7 @@ index 78c8ef149..83a4b96cb 100644
                  slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
  
                  // add generated tokens to cache
-@@ -3841,6 +4304,7 @@ private:
+@@ -3841,6 +4368,7 @@ private:
                  }
  
                  slot.truncated = true;
@@ -12749,7 +13601,7 @@ index 78c8ef149..83a4b96cb 100644
              }
          });
  
-@@ -3878,7 +4342,14 @@ private:
+@@ -3878,7 +4406,14 @@ private:
                  const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                  const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
  
@@ -12765,7 +13617,7 @@ index 78c8ef149..83a4b96cb 100644
  
                  if (n_draft_max > 0) {
                      GGML_ASSERT(slot.can_speculate());
-@@ -3894,13 +4365,27 @@ private:
+@@ -3894,13 +4429,27 @@ private:
                      } else {
                          GGML_ASSERT(slot.spec_i_batch.empty());
  
@@ -12794,7 +13646,7 @@ index 78c8ef149..83a4b96cb 100644
                          }
  
                          slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
-@@ -3948,14 +4433,20 @@ private:
+@@ -3948,14 +4497,20 @@ private:
                  }
  
                  if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -12818,7 +13670,7 @@ index 78c8ef149..83a4b96cb 100644
  
                  const bool use_ckpt_dft =
                     (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
-@@ -3963,7 +4454,33 @@ private:
+@@ -3963,7 +4518,33 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -12853,7 +13705,7 @@ index 78c8ef149..83a4b96cb 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -3975,7 +4492,14 @@ private:
+@@ -3975,7 +4556,14 @@ private:
                  }
  
                  if (use_ckpt_dft) {
@@ -12869,7 +13721,7 @@ index 78c8ef149..83a4b96cb 100644
                  }
              }
          });
-@@ -4180,7 +4704,23 @@ private:
+@@ -4180,7 +4768,23 @@ private:
  
                                              const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
  
@@ -12894,7 +13746,7 @@ index 78c8ef149..83a4b96cb 100644
                                              slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
  
                                              for (size_t i = 0; i < n_match; i++) {
-@@ -4290,14 +4830,66 @@ private:
+@@ -4290,14 +4894,66 @@ private:
                                          const auto & cur = **it;
  
                                          // restore the context checkpoint
@@ -12967,7 +13819,7 @@ index 78c8ef149..83a4b96cb 100644
                                          }
                                      }
  
-@@ -4377,7 +4969,54 @@ private:
+@@ -4377,7 +5033,54 @@ private:
  
                      SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
  
@@ -13023,7 +13875,7 @@ index 78c8ef149..83a4b96cb 100644
  
                      // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                      bool wait_shared = false;
-@@ -4678,6 +5317,294 @@ private:
+@@ -4678,6 +5381,294 @@ private:
  
      // returns true = success ; false = retry with smaller batch size
      // throw std::runtime_error on fatal error
@@ -13318,7 +14170,7 @@ index 78c8ef149..83a4b96cb 100644
      bool decode(int32_t & n_batch, int32_t off) {
          SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
  
-@@ -4712,6 +5639,15 @@ private:
+@@ -4712,6 +5703,15 @@ private:
          // yield to the queue, so we can still handle metrics tasks while decoding
          // note: the sync is done here too, so that the wait is also covered by the yield
          int ret = 0;
@@ -13334,7 +14186,7 @@ index 78c8ef149..83a4b96cb 100644
          queue_tasks.yield_to_queue([&]() {
              ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
              if (ret == 0 && has_output) {
-@@ -4736,6 +5672,19 @@ private:
+@@ -4736,6 +5736,19 @@ private:
                  if (ret < -1) {
                      // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                      err = "Compute error.";
@@ -13354,7 +14206,7 @@ index 78c8ef149..83a4b96cb 100644
                  }
  
                  // TODO: handle ret == 2 (abort) when we start aborting
-@@ -4817,6 +5766,41 @@ private:
+@@ -4817,6 +5830,41 @@ private:
          return true;
      }
  
@@ -13396,7 +14248,7 @@ index 78c8ef149..83a4b96cb 100644
      void post_decode(int32_t n_batch_tokens, int32_t off) {
          // for checking if a given batch index is inside the current sub-batch
          auto is_inside_view = [&](int32_t idx) {
-@@ -4896,7 +5880,7 @@ private:
+@@ -4896,7 +5944,7 @@ private:
              llama_token id;
              {
                  scoped_timer timer(t_sampl, n_sampl);
@@ -13405,7 +14257,7 @@ index 78c8ef149..83a4b96cb 100644
              }
  
              slot.i_batch = -1;
-@@ -4963,6 +5947,23 @@ private:
+@@ -4963,6 +6011,23 @@ private:
                  // drafters that fill no distribution fall back here
                  const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
  
@@ -13429,7 +14281,7 @@ index 78c8ef149..83a4b96cb 100644
                  std::vector<llama_token> accepted;
                  if (!synth_probs.empty()) {
                      // synthetic acceptance replaces verification entirely, so it comes first
-@@ -4977,15 +5978,32 @@ private:
+@@ -4977,15 +6042,32 @@ private:
                      accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                  }
  
@@ -13467,7 +14319,7 @@ index 78c8ef149..83a4b96cb 100644
                  // check for partial draft acceptance
                  if (n_rollback > 0) {
                      if (use_ckpt_tgt) {
-@@ -5007,7 +6025,27 @@ private:
+@@ -5007,7 +6089,27 @@ private:
                              GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                          }
  
@@ -13496,7 +14348,7 @@ index 78c8ef149..83a4b96cb 100644
  
                          slot.prompt.tokens.keep_first(ckpt.n_tokens);
                          common_sampler_copy(smpl_save.get(), slot.smpl.get());
-@@ -5054,7 +6092,17 @@ private:
+@@ -5054,7 +6156,17 @@ private:
              slot.sampled = ids.back(); // last accepted token
              SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
  
@@ -13515,7 +14367,7 @@ index 78c8ef149..83a4b96cb 100644
  
              for (size_t i = 0; i < ids.size(); ++i) {
                  completion_token_output result;
-@@ -5079,6 +6127,19 @@ private:
+@@ -5079,6 +6191,19 @@ private:
                  }
              }
  
@@ -13535,7 +14387,7 @@ index 78c8ef149..83a4b96cb 100644
              slot.print_timings_tg();
  
              SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
-@@ -5748,7 +6809,7 @@ void server_routes::init_routes() {
+@@ -5748,7 +6873,7 @@ void server_routes::init_routes() {
      // IMPORTANT: all lambda functions must start with create_response()
      // this is to ensure that the server_res_generator can handle sleeping case correctly
  
@@ -13544,7 +14396,7 @@ index 78c8ef149..83a4b96cb 100644
          // error and loading states are handled by middleware
          auto res = create_response(true);
  
-@@ -5757,8 +6818,145 @@ void server_routes::init_routes() {
+@@ -5757,8 +6882,145 @@ void server_routes::init_routes() {
          bool ctx_server; // do NOT delete this line
          GGML_UNUSED(ctx_server);
  
@@ -13762,10 +14614,10 @@ index 000000000..92dea90f3
 +install(TARGETS split-stage RUNTIME)
 diff --git a/tools/split-stage/main.cpp b/tools/split-stage/main.cpp
 new file mode 100644
-index 000000000..1e383e2fa
+index 000000000..6b587d305
 --- /dev/null
 +++ b/tools/split-stage/main.cpp
-@@ -0,0 +1,2398 @@
+@@ -0,0 +1,2529 @@
 +// [QLH-SPLIT] split-stage: serve ONE stage of a split chain over TCP.
 +//
 +// This process owns a single model range and nothing else. It listens, and for each connection
@@ -13783,6 +14635,12 @@ index 000000000..1e383e2fa
 +//    add a password flag here -- it would be the only credential in the tree and would rot.
 +//  - the wire format is fixed (see llama-split-proto.h); both ends come from the same build.
 +#include "llama.h"
++// [QLH-SPLIT] v2.3: the VRAM budget check, shared with the llama-server head so both ends of a
++// chain judge a segment the same way (see src/qlh-vram-budget.h for why the check exists).
++#include "qlh-vram-budget.h"
++// [QLH-SPLIT] v2.4: the op_offload default, shared with the llama-server head so a stage and the
++// head that drives it cannot disagree about the switch (see the header for the measurement).
++#include "qlh-split-defaults.h"
 +// [QLH-SPLIT] v8: the staging API. Only two declarations are needed here -- the MTP h_nextn
 +// channel (llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith), which has not moved into
 +// llama.h -- and they come from the same library this tool already links, exactly as
@@ -14238,6 +15096,34 @@ index 000000000..1e383e2fa
 +    // verify frame run one row at a time inside one frame -- the shape a plain decode has. That is
 +    // the only way to ask "does the *tail*'s batched compute account for the argmax flips, or does
 +    // the head's?" without writing a second decoding loop.
++    // [QLH-SPLIT] v2.2: -ngl, the whole point of a stage being a *range*: a segment can fit in
++    // VRAM even when the model cannot (tail 32:40 is ~4.2 GiB against 21.11 GiB, on an 8 GiB
++    // RTX 4060). The default is 0 and NOT llama.cpp's -1 ("all layers"): -1 is right for a tool
++    // that loads a model the user asked to run, and wrong for a stage, where the head is 16.9 GiB
++    // and silently trying to put it on an 8 GiB card is an OOM, not a request. A stage offloads
++    // only when the operator says so.
++    int32_t  n_gpu_layers = 0;   // -ngl N | all (-1)
++    // [QLH-SPLIT] v2.2: --no-host, the control for the host-buffer question. CUDA builds a pinned
++    // host buffer type too, and make_cpu_buft_list puts it ahead of the plain CPU one for every
++    // device, so "GPU backend loaded, -ngl 0" is measurable as a second CPU baseline. See
++    // docs/IGPU-SLOWDOWN.md §1.1 for the Vulkan measurement this exists to repeat on CUDA.
++    bool     no_host      = false;
++    // [QLH-SPLIT] v2.2: op_offload is the switch that decides whether the GPU may take over the
++    // *host* tensors' big operators. It is ON upstream, and on a range load it is the difference
++    // between a positive and a negative head stage: with it on, the CPU-resident blocks' weights
++    // go into the pinned CUDA host buffer and the GPU runs their prefill matmuls, which costs
++    // them ~31% of decode speed (measured: -ngl 0 tg 11.25 vs 18.23 with it off, same build).
++    // A stage already decides per block where it runs, so it wants the GPU for its offloaded
++    // blocks and the CPU's own kernels for the rest -- default off, --op-offload restores upstream.
++    bool     no_op_offload = QLH_SPLIT_DEFAULT_NO_OP_OFFLOAD;
++    // [QLH-SPLIT] v2.2: the MoE expert cache and the weight-repack switch, which only matter once
++    // a *part* of this segment is on the GPU: the experts of the CPU-resident blocks stay in host
++    // memory, and llama_moe_cache uploads the hot ones into a device budget (upstream e95426f1).
++    // On a fully offloaded stage both are no-ops by construction (there are no host experts left
++    // to cache), so the defaults change nothing for the CPU stages this tool has always served.
++    int32_t  moe_cache_mib = 0;      // --moe-cache-mib N (0 = disabled)
++    float    moe_cache_cpu_share = 0.0f; // --moe-cache-cpu-share F (0 = upload every miss)
++    bool     no_repack = false;      // -nr / --no-repack
 +    int32_t  n_ubatch        = 0;  // 0 = follow -b, as before
 +};
 +
@@ -14293,6 +15179,20 @@ index 000000000..1e383e2fa
 +        // stage that exits for the wrong stated reason is how the next person loses an hour.
 +        else if (a == "-t" || a == "--threads")         { o.n_threads = parse_int(next("-t"), "-t"); }
 +        else if (a == "-tb" || a == "--threads-batch")  { o.n_threads_batch = parse_int(next("-tb"), "-tb"); }
++        // [QLH-SPLIT] v2.2: -ngl, the same spelling common/arg.cpp uses. "all" maps to -1, which
++        // llama_model::n_gpu_layers() expands to "every block of this range + the output slot";
++        // an explicit N counts the last N blocks of *this range* (see load_tensors in
++        // src/llama-model.cpp for why that base is the range's high bound and not the whole model).
++        else if (a == "-ngl" || a == "--gpu-layers" || a == "--n-gpu-layers") {
++            const std::string v = next("-ngl");
++            o.n_gpu_layers = (v == "all") ? -1 : parse_int(v, "-ngl");
++        }
++        else if (a == "--no-host")                      { o.no_host = true; }
++        else if (a == "--moe-cache-mib")                { o.moe_cache_mib = parse_int(next("--moe-cache-mib"), "--moe-cache-mib"); }
++        else if (a == "--moe-cache-cpu-share")          { o.moe_cache_cpu_share = (float) std::atof(next("--moe-cache-cpu-share").c_str()); }
++        else if (a == "-nr" || a == "--no-repack")      { o.no_repack = true; }
++        else if (a == "--no-op-offload")                { o.no_op_offload = true; }
++        else if (a == "--op-offload")                   { o.no_op_offload = false; }
 +        else if (a == "--state-cache")                  { o.state_cache = (uint32_t) std::stoul(next("--state-cache")); }
 +        else {
 +            fprintf(stderr, "unknown argument: %s\n", a.c_str());
@@ -14325,6 +15225,7 @@ index 000000000..1e383e2fa
 +    if (o.model_path.empty() || !o.rs_seq_set) {
 +        fprintf(stderr, "usage: split-stage -m MODEL --layer-range lo:hi --role relay|tail --rs-seq N "
 +                        "[--host ADDR] [--port N] [-c N] [-b N] [-ub N] [-t N] [-tb N] "
++                        "[-ngl N|all] [--op-offload] [--no-host] [--moe-cache-mib N] [--moe-cache-cpu-share F] [-nr] "
 +                        "[--state-cache N] [-v]\n");
 +        return 1;
 +    }
@@ -14365,6 +15266,22 @@ index 000000000..1e383e2fa
 +    if (o.n_ubatch < 0 || (o.n_ubatch > 0 && o.n_ubatch > o.n_batch)) {
 +        fprintf(stderr, "-ub must be in 1..%d (the -b value) or 0 to follow -b (got %d)\n",
 +                o.n_batch, o.n_ubatch);
++        return 1;
++    }
++    // [QLH-SPLIT] v2.2: -ngl is either "all" (-1, expanded by llama_model_n_gpu_layers() to this
++    // range's block count + output slot) or a count of this range's last blocks. A negative value
++    // other than "all" is not a smaller number, it is a typo: llama.cpp would read every negative
++    // as "all" and the stage would try to put a 16.9 GiB head on an 8 GiB card.
++    if (o.n_gpu_layers < -1) {
++        fprintf(stderr, "-ngl expects N >= 0 or 'all' (got %d)\n", o.n_gpu_layers);
++        return 1;
++    }
++    if (o.moe_cache_mib < 0) {
++        fprintf(stderr, "--moe-cache-mib must be >= 0 (got %d)\n", o.moe_cache_mib);
++        return 1;
++    }
++    if (o.moe_cache_cpu_share < 0.0f || o.moe_cache_cpu_share > 1.0f) {
++        fprintf(stderr, "--moe-cache-cpu-share must be in [0, 1] (got %.3f)\n", (double) o.moe_cache_cpu_share);
 +        return 1;
 +    }
 +    // Say what is wrong with the range, not the whole usage line: this is the one argument an
@@ -14526,6 +15443,35 @@ index 000000000..1e383e2fa
 +    auto mparams = llama_model_default_params();
 +    mparams.split_layer_lo = opt.layer_lo;
 +    mparams.split_layer_hi = opt.layer_hi;
++    // [QLH-SPLIT] v2.2: the offload knobs. -1 ("all") is passed through: llama_model::n_gpu_layers()
++    // turns it into the local block count + 1, so "all" means the whole range without this tool
++    // having to know the range's depth before it loads the GGUF.
++    mparams.n_gpu_layers = opt.n_gpu_layers;
++    mparams.no_host      = opt.no_host;
++    mparams.use_extra_bufts = !opt.no_repack;
++
++    // [QLH-SPLIT] v2.3: VRAM budget pre-check, before a single weight is read.
++    //
++    // Here rather than after the load because the number that decides it -- how much VRAM is
++    // free -- is only meaningful while this stage has not taken any yet, and because a stage
++    // started second in a chain sees the first one's card already occupied: that is exactly the
++    // configuration that spilled silently on 2026-11-09 (`head -ngl 8` + fully offloaded tail,
++    // 8.4 GiB needed against 7.9 GiB free, tg 10.76 -> 0.343).
++    //
++    // WDDM does not fail an overshoot, it pages, and llama.cpp still prints "offloaded N/N" --
++    // so without this line the only symptom is a 27x slowdown. A segment with -ngl 0 has
++    // nothing to check and says nothing.
++    qlh_vram::estimate_input vram_in;
++    vram_in.model_path   = opt.model_path.c_str();
++    vram_in.lo           = opt.layer_lo;
++    vram_in.hi           = opt.layer_hi;
++    vram_in.n_gpu_layers = opt.n_gpu_layers;
++    vram_in.overrides    = mparams.tensor_buft_overrides;
++    vram_in.moe_cache    = (size_t) opt.moe_cache_mib * 1024 * 1024;
++    const qlh_vram::precheck_result vram_pre = qlh_vram::precheck(vram_in, "split-stage");
++    if (vram_pre.v == qlh_vram::VERDICT_REFUSED) {
++        return false;
++    }
 +
 +    s.model = llama_model_load_from_file(opt.model_path.c_str(), mparams);
 +    if (s.model == nullptr) {
@@ -14569,6 +15515,11 @@ index 000000000..1e383e2fa
 +    s.cparams.n_batch   = (uint32_t) opt.n_batch;
 +    s.cparams.n_ubatch  = (uint32_t) (opt.n_ubatch > 0 ? opt.n_ubatch : opt.n_batch);
 +    s.cparams.n_rs_seq  = opt.rs_seq;
++    // [QLH-SPLIT] v2.2: MoE 专家缓存（upstream e95426f1）。只有「本段有一部分留在 CPU」时才
++    // 有意义：留在 host 的专家权重由缓存放进设备预算，热专家上传、冷专家按 cpu_share 在 CPU 算。
++    s.cparams.moe_cache_size      = (size_t) opt.moe_cache_mib * 1024 * 1024;
++    s.cparams.moe_cache_cpu_share = opt.moe_cache_cpu_share;
++    s.cparams.op_offload          = !opt.no_op_offload;
 +
 +    // [QLH-SPLIT] v9: the thread counts, applied before the context exists (they are constructor
 +    // fields: n_threads_batch also decides how the threadpool is created, so setting them later
@@ -14765,6 +15716,28 @@ index 000000000..1e383e2fa
 +    fprintf(stderr, "[split-stage] layers [%d, %d) of %d, role=%s, n_embd=%u, n_rs_seq=%u, listening on %s:%d\n",
 +            opt.layer_lo, opt.layer_hi, s.n_layer_src, s.relay ? "relay" : "tail", s.n_embd,
 +            llama_n_rs_seq(s.ctx), opt.host.c_str(), opt.port);
++    // [QLH-SPLIT] v2.2: the offload plan, on one line. A range loads its own block count (tail
++    // includes the MTP block), so "-ngl 8" on the tail 32:40 offloads blocks 1..8 of 9 and *not*
++    // the whole segment -- a number this line is the only place to read without a verbose log.
++    // "all" is reported as the count it expands to so it can be compared against the block count
++    // printed next to it.
++    {
++        // n_layer counts trunk blocks only; a range's local block count includes the NextN
++        // head when this is the tail (block_count was overridden to (hi-lo)+nextn), and that is
++        // what -ngl counts. Without the +nextn this line said "last 8 of 8" for a 9-block tail.
++        const int n_local = llama_model_n_layer(s.model) + llama_model_n_layer_nextn(s.model);
++        const int n_eff   = opt.n_gpu_layers < 0 ? n_local : opt.n_gpu_layers;
++        fprintf(stderr, "[split-stage] offload: -ngl %s -> last %d of %d local block(s) on GPU%s%s\n",
++                opt.n_gpu_layers < 0 ? "all" : std::to_string(opt.n_gpu_layers).c_str(),
++                std::min(n_eff, n_local), n_local,
++                n_eff >= n_local ? " (+output slot)" : "",
++                opt.no_host ? ", host buffer bypassed (--no-host)" : "");
++        fprintf(stderr, "[split-stage] moe: cache=%d MiB cpu_share=%.2f repack=%s op_offload=%s "
++                        "(expert cache only acts on blocks left in host memory; op_offload makes the "
++                        "GPU take over host tensors)\n",
++                opt.moe_cache_mib, (double) opt.moe_cache_cpu_share, opt.no_repack ? "off" : "on",
++                opt.no_op_offload ? "off" : "on");
++    }
 +    fprintf(stderr, "[split-stage] identity: layers [%d, %d) of %d, n_embd_inp=%u, n_embd_out=%u, "
 +                    "n_vocab=%u, role=%s, has_nextn=%u (reported in OP_HELLO)\n",
 +            s.self.layer_lo, s.self.layer_hi, s.self.n_layer_src, s.self.n_embd_inp,
@@ -14802,6 +15775,16 @@ index 000000000..1e383e2fa
 +
 +    std::random_device snap_rd;
 +    s.snap_rng = std::mt19937_64(((uint64_t) snap_rd() << 32) ^ (uint64_t) snap_rd());
++
++    // [QLH-SPLIT] v2.3: post-load VRAM check, the last thing before this stage starts serving.
++    //
++    // The pre-check's estimate is deliberately generous, so it can only catch a gross miss; this
++    // compares the VRAM this load actually took against the weights that were supposed to land
++    // there and catches the case the estimate got wrong. It deliberately does NOT exit: the spill
++    // has already happened, and a warning is the only useful thing left. A spilled tier is
++    // sometimes still the fastest one measured -- the criterion is throughput, not this line.
++    qlh_vram::after_load(vram_pre.est, vram_pre.dev, "split-stage");
++
 +    return true;
 +}
 +

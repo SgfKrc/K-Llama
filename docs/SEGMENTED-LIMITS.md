@@ -6,7 +6,7 @@
 这份文档记录的是**原型阶段有意接受、产品阶段要付代价处理**的限制。不是 TODO 列表，是边界说明：
 每条写清现象、根因、影响范围，以及修的时候要付什么代价。
 
-当前状态（2026-11-09，核对到 `H:\llamacpp-c` 的 `0c5c3bdd`，基底 `f477f795c`，52 文件 / +17831 −230）：上一版记为问题的六条，逐条核实后的现状见
+当前状态（2026-11-09，核对到 `H:\llamacpp-c` 的 `48dfb3ea8`，基底 `f477f795c`，54 文件 / +18733 −240）：上一版记为问题的六条，逐条核实后的现状见
 §1；§2 是仍然成立的边界。投机那一条（§2.2）翻过三次，现在是终态：远程链**能**投机，但收益中位
 约 +6%、随负载从 +8.4% 到 −1.2%，弱机器与回环上是负的；而且「投机 == 不投机」不能当判据。
 **2026-11-09 起 §2.2 还多了两个分句**：链上 MTP 的 0.688 是 nextn 通道的性质，DFlash / DSpark
@@ -30,7 +30,7 @@ README 的六条边界与本文章节的对应：① 架构限定 → §2.1、�
 ## 0. 与上游的关系（2026-11-09 rebase 到 `f477f795c` 之后）
 
 一句话：这一轮把 fork 整体 rebase 到上游 193 个提交之后的 `f477f795c`，之后本仓「自己的」代码
-**少了 17 个文件**——那些文件现在与上游逐字节相同，`git diff f477f795c 0c5c3bdd` 里根本不再出现。
+**少了 17 个文件**——那些文件现在与上游逐字节相同，`git diff f477f795c 48dfb3ea8` 里根本不再出现。
 这改变了本文好几条的性质：以前是「我们改了上游的 X」，现在是「上游改了 X，我们没改回去」。
 补丁的完整统计与 rebase 过程见 [`PATCHES.md`](PATCHES.md) 的「与上游 193 个提交的重合」。
 
@@ -42,7 +42,7 @@ README 的六条边界与本文章节的对应：① 架构限定 → §2.1、�
 | 只承载 `shifts` 机制的 4 个 | `llama-graph.h`、`llama-memory-recurrent.{cpp,h}`、`delta-net-base.cpp` | 删掉 `build_rs_shift_snapshots` 之后剩下的只有上游代码 |
 
 **`src/models/dflash.cpp` 是例外**：它在 rebase 那一版里与上游逐字节相同，这一轮又回来了——只多了
-device-buffer 崩溃的诊断输出（见 §0.4），不是功能改动。所以逐字节相同的文件是 16 个，52 文件的
+device-buffer 崩溃的诊断输出（见 §0.4），不是功能改动。所以逐字节相同的文件是 16 个，54 文件的
 并集里包含它。
 
 其中被逐个核对过的 8 个（`llama-kv-cache.cpp` / `.h` / `llama-kv-cache-dsv4.h`、`deepseek4.cpp`、
@@ -144,7 +144,7 @@ stderr 的诊断（common 的 logger 是异步的，紧贴 abort 的 `LLAMA_LOG_
 
 ---
 
-## 1. 已实现：上一版记为问题的六条
+## 1. 已实现：上一版记为问题的六条，以及这一轮补上的两项
 
 | 上一版记的 | 现行实现 | 位置 |
 |---|---|---|
@@ -159,6 +159,36 @@ stderr 的诊断（common 的 logger 是异步的，紧贴 abort 的 `LLAMA_LOG_
 （原记「3137 token」，日志里是 3103 + 16 生成；两个数的出处、口径与「修复前的形态是报错
 而不是变慢」见 [`SPLIT-MEASUREMENTS.md`](SPLIT-MEASUREMENTS.md) §1）。修复前的表现是链首恢复了、
 尾段还停在旧位置，于是下一次截断式 `seq_rm` 在尾段失败。
+
+### 1.1 段级 offload 已恢复：`-ngl N` 数的是「本段最后 N 块」
+
+上一版把「段上要么整段上卡、要么一层不上」记成限制。现在不是限制：**`-ngl N` 在 range 载入下按段
+计数**，实现是 `src/llama-model.cpp` 的 `load_tensors()` 里 `i_gpu_start` 按 `layer_range_active()`
+分叉：
+
+```
+整模      : i_gpu_start = n_layer_all + 1 - N    （与上游逐位不变）
+range 载入: i_gpu_start = n_layer_all     - N    （N 是本段块数，输出槽不算）
+```
+
+输出槽单独判定：段内只有 `N >= 本段块数` 时才把 logits 槽带上卡，所以 `-ngl 3` 不会因为 logits
+是最后一个槽就把它拖上去。**tail 的本地块数含 NextN**（`32:40` 是 9 块），`-ngl 8` 只搬 33..40，
+整段上卡要 `-ngl 9` 或 `all`。
+
+**边界**：① 整模路径必须逐位不变，这条是验收项（`verify.sh` 组 2：`0:24` 单段与整模逐字节相同），
+不是「大致一致」；② `-ngl == 本段块数` 曾让 `devices.at()` 越界（`upper_bound` 返回 `end()`），
+分配比例已钳到 `act-1`——用满段时仍要按这条查。语义与实测（tail `32:40` 全量上卡，段内 tg 35.7 →
+1754.2）见 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md) §2、§3。
+
+### 1.2 每段独立 offload 是部署能力，不是限制
+
+`--split-remote` 的每一个端点都是一个独立的 `split-stage` 进程，各自带自己的 `--layer-range` 与
+`-ngl`；head 是 `llama-server`，用它自己的 `-ngl`。所以「哪一段上卡、上几块」是**逐段的部署参数**，
+四种摆法都合法：head CPU + tail 全上卡、head 部分上卡 + tail CPU、两段都上、两段都不上。
+
+**边界**在别处，而且都是可算的：显存与预算按段独立核算（预检只算本段要上卡的张量）；`op_offload`
+的默认值按角色给（split 角色默认关，见 [`IGPU-SLOWDOWN.md`](IGPU-SLOWDOWN.md) §⑤）；head 与 tail
+不在同一台机器上时，两边的 `-ngl` 只能各自按本机的显存上限定，没有全局最优解。
 
 ---
 
@@ -559,6 +589,25 @@ ERROR、不结束请求，让正常路径失败并释放 slot，下一个从 pos
   的 KV 后重放第 p 行，logits 必须逐位相同」。当前 **A（FULL 形态）两条红、B（RS 形态）三条绿、
   C 一条绿**，退出 0。上游修好 FULL 缺陷后它会变成「0 红」，那时把开关关掉。
 - `verify_seq_rm_shared.py`：shared-prefix 形态。
+
+---
+
+### 2.10 同机构造测不出 head offload 的收益：`-ngl 8` 的 plain 帧反而慢 5.6%
+
+**现象**：head + tail 摆在同一台机器上（`--split-tail-range`，或本机 + 回环的 `--split-remote`），
+给 head 加 `-ngl 8`，**head 自己的 plain 图帧反而更慢**：`QLH_SPLIT_TRACE` 逐帧分解是
+**80.30 ms vs 全 CPU 76.01 ms（慢 5.6%）**，抖动也大（52~160 vs 63~100 ms）；端到端 tg
+8.44 vs 9.34。而同一配置在段级 probe 上是 47.6 vs 63.7 ms，**快 25%**。
+
+**根因**：不是 offload 没生效，是**流水线形态不同**。probe 在单个 range 上连续 decode，GPU 的
+kernel launch / sync 能与 CPU 线程池跨步流水；server 每帧一次 decode 再等 TCP 往返，两端还争同一批
+CPU 线程，GPU 同步落在关键路径上，省下的那点计算抵不过同步与往返。
+
+**判据**：head offload 的收益**只能用部署形态测**——head 独占本机、tail 在另一台机器上（LAN）。
+那一档是 `-ngl 8` **+19.6%**（另一轮 +34%）、`-ncmoe` + `--moe-cache-mib 1024` **+40.9%**。同机构造
+的数字只能当压力 / 回归数据，**不能给 head offload 定生死，方向甚至会反**。这与 §3 的提醒同源：
+测的是「这一套部署下的这一条链」，不是「这个特性快不快」。实测与逐帧分解见
+[`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md) §7。
 
 ---
 
