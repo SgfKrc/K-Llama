@@ -190,6 +190,7 @@ The v2 chain is checked by `python checks/verify_*.py` and
 | [MEASUREMENT-PITFALLS.md] | Why per-segment timing lies, and how to measure instead |
 | [MEMORY-LIMITS.md] | Memory and VRAM arithmetic, calibration constants, core-pinning discipline |
 | [IGPU-SLOWDOWN.md] | Why the iGPU loses, the `-ngl` sweep and where the crossover sits |
+| [SEGMENT-OFFLOAD.md] | `-ngl` semantics under segmentation, per-stage and end-to-end numbers, MoE cache, VRAM budget |
 | [PROGRESS.md] | Current capability snapshot and optimisations in place |
 | [SAMPLING.md] · [TUI.md] · [RESPONSES-API.md] | Sampling mapping · TUI pages and commands · `/v1/responses` translation layer |
 | [SLIM-ARC-接入计划.md] | When the remaining page-fault work pays off |
@@ -215,6 +216,7 @@ the same terms; model weights and other third-party artifacts keep their own lic
 [MEASUREMENT-PITFALLS.md]: MEASUREMENT-PITFALLS.md
 [MEMORY-LIMITS.md]: MEMORY-LIMITS.md
 [IGPU-SLOWDOWN.md]: IGPU-SLOWDOWN.md
+[SEGMENT-OFFLOAD.md]: SEGMENT-OFFLOAD.md
 [PROGRESS.md]: PROGRESS.md
 [SAMPLING.md]: SAMPLING.md
 [TUI.md]: TUI.md

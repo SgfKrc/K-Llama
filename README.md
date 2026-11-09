@@ -167,6 +167,7 @@ v2 驱动链的验收走 `python checks/verify_*.py` 与 `python -m unittest tes
 | [MEASUREMENT-PITFALLS] | 段内计时为什么骗人，怎么量才有效 |
 | [MEMORY-LIMITS] | 内存与显存的账、校准常数、绑核纪律 |
 | [IGPU-SLOWDOWN] | 核显为什么拖慢、`-ngl` 扫描与交叉点 |
+| [SEGMENT-OFFLOAD] | 分段下 `-ngl` 的语义、段级与端到端实测、MoE 缓存、显存预算 |
 | [PROGRESS] | 当前能力快照与已做的优化 |
 | [SAMPLING] · [TUI] · [RESPONSES-API] | 采样映射 · TUI 页面与命令 · `/v1/responses` 翻译层 |
 | [SLIM-ARC-接入计划] | prefetch 之外的缺页优化在什么条件下才启用 |
@@ -192,6 +193,7 @@ MIT，见 [`LICENSE`](LICENSE)。上游 llama.cpp 同为 MIT，本仓库的补�
 [MEASUREMENT-PITFALLS]: docs/MEASUREMENT-PITFALLS.md
 [MEMORY-LIMITS]: docs/MEMORY-LIMITS.md
 [IGPU-SLOWDOWN]: docs/IGPU-SLOWDOWN.md
+[SEGMENT-OFFLOAD]: docs/SEGMENT-OFFLOAD.md
 [PROGRESS]: docs/PROGRESS.md
 [SAMPLING]: docs/SAMPLING.md
 [TUI]: docs/TUI.md
