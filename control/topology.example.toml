@@ -1,4 +1,4 @@
-# qlhctl 的拓扑（v2.1）。字段意义与部署步骤见 `docs/DEPLOYMENT.md` §2；
+# qlhctl 的拓扑（v2.1）。字段意义与部署步骤见 `docs/deploy/DEPLOYMENT.md` §2；
 # 这里只放一份**能真跑**的例子：2B 本机两段，端口 9461/9462，不与 verify.sh 的 93xx 重叠。
 #
 # 段按链序写：head 在前、tail 最后；控制面按反序启动（尾段先、链首最后）。

@@ -3,12 +3,12 @@
 > 状态：**待办（未实现）**
 > 更新日期：2026-11-11
 > 适用范围：**管**「已确认存在、判据成立、有意推迟处理」的代码与验收问题——每条带文件与符号，
-> 写清怎么改、为什么现在不动。**不管**：已修的缺陷（看 git 与 [`PATCHES.md`](PATCHES.md)、[`FIXES.md`](FIXES.md)）、
-> 产品需求与排期、单缺陷的定位过程（那类进 `docs/ISSUE-*.md`）。读者是下一个动这块代码的人：
+> 写清怎么改、为什么现在不动。**不管**：已修的缺陷（看 git 与 [`PATCHES.md`](deploy/PATCHES.md)、[`FIXES.md`](issues/FIXES.md)）、
+> 产品需求与排期、单缺陷的定位过程（那类进 `docs/issues/ISSUE-*.md`）。读者是下一个动这块代码的人：
 > 这份清单只服务一个目的：下一次改动之前先读到这里，避免同一处问题被重新发现、被当成已经修完。
 
-代码引用口径：`src/`、`tools/`、`common/` 指 `H:\llamacpp-c` 的 fork 树（HEAD `c0b5de5f4`，基底
-`f477f795c`），其余路径相对本仓库。行数按 `c0b5de5f4` 的函数边界统计，只作量级参考；符号名是稳定引用。
+代码引用口径：`src/`、`tools/`、`common/` 指 `H:\llamacpp-c` 的 fork 树（HEAD `1c4bda400`，基底
+`f477f795c`），其余路径相对本仓库。行数按 `1c4bda400` 的函数边界统计，只作量级参考；符号名是稳定引用。
 
 ## A. 结构性重构（改动面跨文件，单独一轮）
 
@@ -54,7 +54,7 @@
 - **位置**：`verify/verify.sh` 的 `kill_ours_tree()` / `cleanup_ours()`、`verify/ours_procs.ps1`、`verify/verify_dflash_dev_path.sh` 的第二份 `kill_ours_tree()` / `cleanup_ours()`、`verify/mtp_remeasure.sh` 的 `kill_ours()`、`verify/verify_grammar_spec.sh` 与 `verify/verify_rbudget_spec.sh` 的 `kill_ours()`、`verify/verify_chain_death.py` 的 `kill_93xx()`、`control/qlhctl.py` 的 `stop_pid()` / `_stop_entry()`。
 - **判据**：重复造轮子——六份判据分别是「按端口」「按映像名」「按 `$BIN` 路径」「按 93xx 号段」「按命令行 + 层范围」。
 - **建议**：统一到 `verify/_qlh_env.sh` 的 `qlh_kill_ours`，判据用「可执行文件在 `$BIN` 下」这一条（`verify.sh` 头部注释已论证过它覆盖最常见的三种残留），其余按需传参。`qlhctl.py` 保留自己的 `stop_pid()`：它是产品侧，要带端口与层范围做身份校验。
-- **为什么留**：`verify/` 正在并行改动，统一要等它稳定；且「杀谁」的判据本身要定——远程段的进程本机看不见（`docs/ANDROID-SURFACE-段接入评估.md` §1 记了安卓上 `ps`/`pgrep` 的失效）。
+- **为什么留**：`verify/` 正在并行改动，统一要等它稳定；且「杀谁」的判据本身要定——远程段的进程本机看不见（`docs/deploy/ANDROID-SURFACE-段接入评估.md` §1 记了安卓上 `ps`/`pgrep` 的失效）。
 
 ### A8. `wait_health` 六份 / 就绪等待八份 / 启动命令行手写三十余处 / 模型默认路径八处
 - **位置**：`wait_health()` 在 `verify/verify.sh`、`verify/mtp_remeasure.sh`、`verify/verify_dflash_dev_path.sh`、`verify/verify_grammar_spec.sh`、`verify/verify_mtp_e2e.sh`、`verify/verify_rbudget_spec.sh` 各一份，`verify/measure_state_bytes.py` 与 `verify/verify_chain_death.py` 再各一份；`llama-server` / `split-stage` 的命令行在 `verify/*.sh` 里手写三十余处；模型默认路径散在八处。
@@ -93,13 +93,13 @@
 - **位置**：`src/llama-context.cpp` 的 `split_attach()` 与 `split_attach_remote()`。远程版经 `identity_mismatch()`（`src/llama-split-remote.cpp`）比 `n_vocab` / `n_embd_inp` / `n_embd_out` / `n_layer_src` / `layer_lo` / `layer_hi` / `role`；本地版只比 `n_layer_src`、层连续性、arch、宽度与 embeddings，不验 `n_vocab`。
 - **判据**：正确性——两份校验已经漂移；`n_ctx` / `n_seq_max` / `n_rs_seq` 两端都没有，`stage_id`（`src/llama-split-proto.h`）里根本没有这三个字段。
 - **建议**：抽 `split_check_head(const llama_context &, const head_expect &)` 供两条路径共用；`stage_id` 若要加 `n_ctx` / `n_seq_max` / `n_rs_seq`，同一轮加。
-- **为什么留**：给 `stage_id` 加字段就是协议变更，要连 `static_assert(sizeof(stage_id) == 28)`、两端的版本检查与 [`PROTOCOL-V9.md`](PROTOCOL-V9.md) 一起改。
+- **为什么留**：给 `stage_id` 加字段就是协议变更，要连 `static_assert(sizeof(stage_id) == 28)`、两端的版本检查与 [`PROTOCOL-V9.md`](design/PROTOCOL-V9.md) 一起改。
 
 ### B6. M-RoPE 位置展开是逐字复制
 - **位置**：`src/llama-batch.cpp` 的 pos 展开循环（`pos[j*n_tok + i]`，`p = j < 3 ? tok.pos[0] : 0`）与 `src/llama-context.cpp` 的 `split_expand_pos()`（由 `split_remote_positions()` 调用）；`llama-batch.cpp` 的注释已经写明「两处必须一起改」。
 - **判据**：单一事实源——同步机制只有一条注释；`GGML_ASSERT(n_pos_per_embd <= GGML_MROPE_SECTIONS)` 只防越界，不防规则漂移。
 - **建议**：把展开提成 `llama_batch_ext` 的公开辅助函数（要动 `llama-batch.{h,cpp}`），两处都调。
-- **为什么留**：动的是上游文件，要在补丁里单列一处 diff 并进 [`PATCHES.md`](PATCHES.md)，与下一次重导一起做。
+- **为什么留**：动的是上游文件，要在补丁里单列一处 diff 并进 [`PATCHES.md`](deploy/PATCHES.md)，与下一次重导一起做。
 
 ### B7. `env_bool` / `env_int` 统一
 - **位置**：`src/slim-arc-prefetch.cpp`——六处各自写 `from_chars` + 范围检查 + `fprintf`（`parse_expert_hot_budget_bytes()`、`parse_expert_hot_admission_threshold()`、`parse_popularity_k()` 等）；另有六处运行期 `getenv`，其中 `SLIM_ARC_DYNAMIC_MADV` 在 `set_phase()` 与 `on_layer_boundary()` 各读一次，后者在每层边界热路径上。
@@ -113,11 +113,12 @@
 - **建议**：`common_speculative_init_result` 直接暴露 `draft_rs_seq` 与 `draft_is_remote`，server 不再读 `llama_n_rs_seq(ctx_dft)`；或给 remote draft 一个真实值。
 - **为什么留**：要定公开接口（谁拥有 draft 的 KV 能力），而 `common/` 是三个入口共用的头文件。
 
-### B9. `scripts/termux-install.sh` 整份面向已退场的 v2
-- **位置**：`scripts/termux-install.sh`（装 `stage_worker.py` / `stage_supervisor.py` / 生成的 `topology.toml` / shim），仍被 [`PACKAGING.md`](PACKAGING.md) 与 [`DELIVERY.md`](DELIVERY.md) 引用。
+### B9. `scripts/termux-install.sh` 整份面向已退场的 v2 —— **已标注（2026-11-11）**
+- **位置**：`scripts/termux-install.sh`（装 `stage_worker.py` / `stage_supervisor.py` / 生成的 `topology.toml` / shim），仍被 [`PACKAGING.md`](deploy/PACKAGING.md) 与 [`DELIVERY.md`](deploy/DELIVERY.md) 引用。
 - **判据**：单一事实源——文档指向已退场的实现。
 - **建议**：归档到 `_archive/`（本机工具通道），两篇文档改成「已退场」并指向 `slimarc/prototype`；若保留，改成装 v2.1 的 `split-stage` + `qlhctl`。
 - **为什么留**：要先定安卓交付形态（Termux 直接跑 `split-stage`，还是保留 shim 层），见 D3。
+- **怎么处理**：不删脚本（保留 v2 部署形态的记录），在脚本头加状态块写明「已退场、照它装会得到不存在的系统、v2.1 见哪两篇」；`PACKAGING.md` 的引用处加同样的提示并把命令标成「v2 口径」；`DELIVERY.md` 的引用处改成「v2 用 …（已退场），v2.1 见 …」。
 
 ## C. 低危 / 风格（攒着一起做）
 
@@ -131,7 +132,7 @@
 ### C2. ~~`docs/c-scheme-full.patch` 是死文件~~（已删，2026-11-11）
 - **位置**：原 `docs/c-scheme-full.patch`（14 文件，第一代 C-scheme），全仓零引用，已被现行主补丁取代，清理时删除。保留此条只为记录它存在过。
 - **判据**：单一事实源——第二份补丁快照，与 `llamacpp-split.patch` 的现行口径并存。
-- **建议**：删除，或移入 `docs/archive/` 并在归档索引登记一行。
+- **建议**：删除，或移入 `docs/legacy/` 并在归档索引登记一行。
 - **为什么留**：删除前要确认没有验证脚本把它当输入（当前 `grep` 零命中），归档通道一次做掉。
 
 ### C3. 路径规范化两份实现 —— **已修（2026-11-11）**
@@ -184,19 +185,19 @@
 ## D. 需要外部条件
 
 ### D1. GPU 路径的完整验收
-- **位置**：`verify/verify.sh` 的段级 offload 组（测量装置 `verify/probes/seg_probe.cpp`）与 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md) §3/§4/§5。
+- **位置**：`verify/verify.sh` 的段级 offload 组（测量装置 `verify/probes/seg_probe.cpp`）与 [`SEGMENT-OFFLOAD.md`](measure/SEGMENT-OFFLOAD.md) §3/§4/§5。
 - **判据**：正确性（验收覆盖）——自动组只覆盖一个小模型 + 少量 `-ngl` 层的段级 offload 正确性。
 - **建议**：自动验收覆盖 35B 的 head 段与 tail 段、`op_offload` 开关两侧、MoE 缓存命中率、显存预算的预检与后检。
 - **为什么留**：等外部条件——35B 整模装不下 8 GB，`op_offload` 的 +28%、MoE 缓存 +95% 与显存预算的数字只有手工 probe；一台机器的一张卡不构成结论。
 
 ### D2. SLIM-ARC 的 iGPU 形态
-- **位置**：[`SLIM-ARC-接入计划.md`](SLIM-ARC-接入计划.md) §6.3（iGPU 上装不上），§6.1/§6.2 的预取通路已在 2026-11-11 复核为已修。
+- **位置**：[`SLIM-ARC-接入计划.md`](design/SLIM-ARC-接入计划.md) §6.3（iGPU 上装不上），§6.1/§6.2 的预取通路已在 2026-11-11 复核为已修。
 - **判据**：正确性（形态未验证）。
-- **建议**：核显机器上重跑预取通路，记录 `issued` 与命中率；装不上就把结论并入 [`IGPU-SLOWDOWN.md`](IGPU-SLOWDOWN.md)。
+- **建议**：核显机器上重跑预取通路，记录 `issued` 与命中率；装不上就把结论并入 [`IGPU-SLOWDOWN.md`](measure/IGPU-SLOWDOWN.md)。
 - **为什么留**：等外部条件（需要一台核显机器 + 一次完整实测）。
 
 ### D3. 安卓 / ARM 的自动验收
-- **位置**：[`ANDROID-SURFACE-段接入评估.md`](ANDROID-SURFACE-段接入评估.md) §6「证据等级」与 §7「已完成 / 下一步」；相关 `scripts/termux-install.sh`（B9）。
+- **位置**：[`ANDROID-SURFACE-段接入评估.md`](deploy/ANDROID-SURFACE-段接入评估.md) §6「证据等级」与 §7「已完成 / 下一步」；相关 `scripts/termux-install.sh`（B9）。
 - **判据**：正确性（验收覆盖）——安卓结论全部来自手工实测，没有脚本支撑。
 - **建议**：把 §1「安卓侧怎么跑」做成脚本（起 `split-stage`、一条链、三问），进 `verify/` 的外部设备组；进程判据要换（§1 已记：安卓上 `ps`/`pgrep` 看不见别的进程）。
 - **为什么留**：等外部条件（需要一台安卓设备常驻）。

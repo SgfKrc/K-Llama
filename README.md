@@ -9,9 +9,9 @@
 > 状态：**现行**
 > 更新日期：2026-11-11
 > 适用范围：分段链的对外入口——定位、能力、快速开始、关键约束、实测口径与文档索引。机制归
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，边界代价归
-> [`docs/SEGMENTED-LIMITS.md`](docs/SEGMENTED-LIMITS.md)，补丁构成归
-> [`docs/PATCHES.md`](docs/PATCHES.md)。
+> [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)，边界代价归
+> [`docs/limits/SEGMENTED-LIMITS.md`](docs/limits/SEGMENTED-LIMITS.md)，补丁构成归
+> [`docs/deploy/PATCHES.md`](docs/deploy/PATCHES.md)。
 
 K-Llama 让 llama.cpp 按层分段运行：每台机器映射同一份 GGUF，只创建并读取自己那几层的张量，
 段间只传 `n_embd` 个 float 的隐藏态（`src/llama-context.cpp` 的 `ctx_tail`）。改造下沉在
@@ -164,14 +164,14 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 
 ## 代码与验收
 
-- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `c0b5de5f4`，父 `f477f795c`（上游最新，
-  193 个提交之后），树 `c73185193`；相对上游 55 文件 / +20313 −245。
-- [llamacpp-split.patch]：45 文件 / +16619 −244 / 18681 行 / 979.8 KiB。纯分段链的完整补丁（协议
+- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `1c4bda400`，父 `f477f795c`（上游最新，
+  193 个提交之后），树 `95291539a`；相对上游 55 文件 / +20345 −245。
+- [llamacpp-split.patch]：45 文件 / +16680 −244 / 18749 行 / 982.8 KiB。纯分段链的完整补丁（协议
   v7 / v8 / v9 都在其中），机制清单见 [PATCHES]；不含 SLIM-ARC，可单独编译、单独通过全部验收。
-- [llamacpp-slimarc.patch]：13 文件 / +3694 −1 / 3819 行 / 164.9 KiB。SLIM-ARC prefetch，默认
+- [llamacpp-slimarc.patch]：13 文件 / +3665 −1 / 3790 行 / 164.2 KiB。SLIM-ARC prefetch，默认
   关闭，`SLIM_ARC_PREFETCH=1` 才装。借用的只有这一块：专家驻留、KV 驱逐、I/O 调度器未接，见
   [SLIM-ARC-接入计划]。
-- 叠加判据：`f477f795c` + 主补丁 → 树 `328c5effd`；再叠增量 → 树 `c73185193`，与 HEAD 的树相同
+- 叠加判据：`f477f795c` + 主补丁 → 树 `5520f52cb`；再叠增量 → 树 `95291539a`，与 HEAD 的树相同
   （`git write-tree` 校验，见 `scripts/export_patches.sh`）。
 - 构建：[BUILD] 给出从 `f477f795c` + 补丁到二进制的实测命令、8 个 `build-*` 的开关矩阵与 CPU
   变体基线；改 `.h` 必须 `--clean-first`。
@@ -191,8 +191,8 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | 5 条是上游 hybrid 的已知基线，作为对照保留 |
 | 纯分段版（只叠主补丁） | 52 + 36 | 44 文件版（树 `0c307d82a`）独立构建并跑过；现行版见下 |
 
-**纯分段版的现行状态**：纯分段树 `328c5effd`（45 文件）在独立 worktree @ `f477f795c` + 主补丁
-（`git write-tree` = `328c5effd`）上 `--clean-first` 全量构建，`verify.sh` **52/0/0**、
+**纯分段版的现行状态**：纯分段树 `5520f52cb`（45 文件）在独立 worktree @ `f477f795c` + 主补丁
+（`git write-tree` = `5520f52cb`）上 `--clean-first` 全量构建，`verify.sh` **52/0/0**、
 `verify_chain_death.py` **36/0**（2026-11-11）。上一版 `0c307d82a`（44 文件，2026-11-09）为同一套
 验收。
 
@@ -202,6 +202,21 @@ v2 驱动链的验收（`python checks/verify_*.py` 与 `python -m unittest test
 [SPLIT-MEASUREMENTS] §6。
 
 ## 文档地图
+
+`docs/` 按主题分目录，根下只留入口文档：
+
+| 目录 | 装什么 |
+| --- | --- |
+| `docs/` | 入口：`QUICKSTART.md`（从零跑通一条链）、`REPORT.md`（结题总纲）、`OPEN-ISSUES.md`（遗留问题）、`README.en.md`（英文镜像） |
+| `docs/report/` | 结题六章：`01-背景与目标.md` … `06-局限与结论.md` |
+| `docs/design/` | 机制、协议与规范：ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC 接入（计划与障碍）/ LILICORR-轻量头 / EXLLAMAV3-GPU段候选 |
+| `docs/deploy/` | 构建、部署与交付：BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / DELIVERY / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
+| `docs/measure/` | 实测：SPLIT-MEASUREMENTS / MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN |
+| `docs/limits/` | 边界与代价：SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
+| `docs/issues/` | 缺陷：`ISSUE-*.md` 五篇（定位、根因、修复判据）与 `FIXES.md`（已修复登记） |
+| `docs/legacy/` | v2 时代已退场或已归档：ANTI-ROT / INVENTORY / PRIMA-ANALYSIS / PRIMA-LESSONS / TUI / CHAT-ENGINE / AUTO-ASSIGN-PLAN / BASELINE / PROGRESS / CUT-TOOL / RESPONSES-API / SAMPLING |
+
+最常查的几篇：
 
 | 文件 | 管什么 |
 | --- | --- |
@@ -227,38 +242,36 @@ v2 驱动链的验收（`python checks/verify_*.py` 与 `python -m unittest test
 | [SAMPLING] · [TUI] · [RESPONSES-API] | 采样映射 · TUI 页面与命令 · `/v1/responses` 翻译层 |
 | [SLIM-ARC-接入计划] | prefetch 之外的缺页优化在什么条件下才启用 |
 
-其余专题（`LILICORR-轻量头.md`、`ANDROID-SURFACE-段接入评估.md`、`ISSUE-*.md` 等）见 `docs/`
-目录，归档在 `docs/archive/`。同一套 relay 在扩散模型上的实现是
-[K-sd.cpp](https://github.com/SgfKrc/K-sd.cpp)：段间载荷是 MB 级张量，同一条序列内部两边都等所有
-段，吞吐空间在多请求。
+其余专题（`LILICORR-轻量头.md`、`ANDROID-SURFACE-段接入评估.md`、`ISSUE-*.md` 等）按上表落在对应
+子目录，已退场的 v2 文档在 `docs/legacy/`。
 
 ## 许可
 
 MIT，见 [`LICENSE`](LICENSE)。上游 llama.cpp 同为 MIT，本仓库的补丁按同一许可分发；模型权重等
 第三方产物随其各自来源。
 
-[ARCHITECTURE]: docs/ARCHITECTURE.md
-[PATCHES]: docs/PATCHES.md
-[BUILD]: docs/BUILD.md
-[SEGMENTED-LIMITS]: docs/SEGMENTED-LIMITS.md
-[SPLIT-MEASUREMENTS]: docs/SPLIT-MEASUREMENTS.md
-[SPECULATION-DATA]: docs/SPECULATION-DATA.md
-[MODEL-SWAP]: docs/MODEL-SWAP.md
-[PROTOCOL-V9]: docs/PROTOCOL-V9.md
-[CROSS-MACHINE]: docs/CROSS-MACHINE.md
-[PATCHES-DETAIL]: docs/PATCHES-DETAIL.md
-[MEASUREMENTS]: docs/MEASUREMENTS.md
-[SPECULATION]: docs/SPECULATION.md
-[DEPLOYMENT]: docs/DEPLOYMENT.md
-[TESTING]: docs/TESTING.md
-[MEASUREMENT-PITFALLS]: docs/MEASUREMENT-PITFALLS.md
-[MEMORY-LIMITS]: docs/MEMORY-LIMITS.md
-[IGPU-SLOWDOWN]: docs/IGPU-SLOWDOWN.md
-[SEGMENT-OFFLOAD]: docs/SEGMENT-OFFLOAD.md
-[PROGRESS]: docs/PROGRESS.md
-[SAMPLING]: docs/SAMPLING.md
-[TUI]: docs/TUI.md
-[RESPONSES-API]: docs/RESPONSES-API.md
-[SLIM-ARC-接入计划]: docs/SLIM-ARC-接入计划.md
+[ARCHITECTURE]: docs/design/ARCHITECTURE.md
+[PATCHES]: docs/deploy/PATCHES.md
+[BUILD]: docs/deploy/BUILD.md
+[SEGMENTED-LIMITS]: docs/limits/SEGMENTED-LIMITS.md
+[SPLIT-MEASUREMENTS]: docs/measure/SPLIT-MEASUREMENTS.md
+[SPECULATION-DATA]: docs/measure/SPECULATION-DATA.md
+[MODEL-SWAP]: docs/measure/MODEL-SWAP.md
+[PROTOCOL-V9]: docs/design/PROTOCOL-V9.md
+[CROSS-MACHINE]: docs/deploy/CROSS-MACHINE.md
+[PATCHES-DETAIL]: docs/deploy/PATCHES-DETAIL.md
+[MEASUREMENTS]: docs/measure/MEASUREMENTS.md
+[SPECULATION]: docs/measure/SPECULATION.md
+[DEPLOYMENT]: docs/deploy/DEPLOYMENT.md
+[TESTING]: docs/design/TESTING.md
+[MEASUREMENT-PITFALLS]: docs/measure/MEASUREMENT-PITFALLS.md
+[MEMORY-LIMITS]: docs/limits/MEMORY-LIMITS.md
+[IGPU-SLOWDOWN]: docs/measure/IGPU-SLOWDOWN.md
+[SEGMENT-OFFLOAD]: docs/measure/SEGMENT-OFFLOAD.md
+[PROGRESS]: docs/legacy/PROGRESS.md
+[SAMPLING]: docs/legacy/SAMPLING.md
+[TUI]: docs/legacy/TUI.md
+[RESPONSES-API]: docs/legacy/RESPONSES-API.md
+[SLIM-ARC-接入计划]: docs/design/SLIM-ARC-接入计划.md
 [llamacpp-split.patch]: docs/llamacpp-split.patch
 [llamacpp-slimarc.patch]: docs/llamacpp-slimarc.patch

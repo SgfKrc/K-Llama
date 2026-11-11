@@ -803,7 +803,7 @@ else
 fi
 
 hdr "结果"
-# 项数断言：「53 项」这个数字被 docs/BUILD.md、docs/PATCHES.md、docs/REPORT.md 引用，
+# 项数断言：「53 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
 # 但以前没有任何地方守它——某条判据因日志措辞改动而静默不匹配时，总数会变少，而
 # 「53 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1；
 # 不带 --skip-build 时另有「三目标构建完成」1 项（54）。

@@ -63,7 +63,7 @@ QLH_BUILD_DIR=/tmp-work QLH_SRC_DIR=H:/llamacpp-c bash verify/verify.sh --skip-b
 
 ## 3. 脚本清单
 
-判据数取自各脚本自己的 `PASS=`/`FAIL=` 合计，实测数字见 `docs/SPLIT-MEASUREMENTS.md`。
+判据数取自各脚本自己的 `PASS=`/`FAIL=` 合计，实测数字见 `docs/measure/SPLIT-MEASUREMENTS.md`。
 耗时是 2B、本机、无并发实验时的量级；35B 的组另算。
 
 | 脚本 | 测什么 | 需要 | 判据 | 耗时 |
@@ -152,8 +152,8 @@ CRLF 行尾：写成 LF 时 cmd 解析 vcvars 会失效，任何 `cl` 调用都�
 ## 9. 这套装置还没有覆盖的
 
 - **跨机**：所有脚本都是 `127.0.0.1`，没有一条真的跑两台机器。远程链的协议、断线重连、时钟
-  与 MTU 的影响没有实测覆盖（`docs/CROSS-MACHINE.md` 的结论来自手工实测，不可重跑）。
-- **Android / ARM**：`docs/ANDROID-SURFACE-段接入评估.md` 的结论没有任何脚本支撑，全靠人工。
+  与 MTU 的影响没有实测覆盖（`docs/deploy/CROSS-MACHINE.md` 的结论来自手工实测，不可重跑）。
+- **Android / ARM**：`docs/deploy/ANDROID-SURFACE-段接入评估.md` 的结论没有任何脚本支撑，全靠人工。
 - **并发验收**：没有「按端口/按 pid」的隔离；同一份 `bin/` 上跑别的实验时会被清理一起带走，
   只能靠 `QLH_BUILD_DIR` 指向 bin 副本（§2）绕开。日志也共用 `<仓库>/.qlh_tmp/verify/`，两个
   会话同时跑会互相覆盖。

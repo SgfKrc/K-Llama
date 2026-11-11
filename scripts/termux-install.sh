@@ -1,4 +1,17 @@
 #!/data/data/com.termux/files/usr/bin/bash
+#
+# ============================================================================
+# 状态：**已退场（面向 v2）**。本脚本装的是 v2 的工具链——`stage_worker.py` /
+# `stage_supervisor.py` / `shim/` / 由参数生成的 `topology.toml`，这些都已随 v2 归档在
+# `slimarc/prototype`，本仓库不再持有。**照它装会得到一个不存在的系统。**
+#
+# v2.1 的安卓部署见 [`docs/deploy/CROSS-MACHINE.md`](../docs/deploy/CROSS-MACHINE.md) §6（Y700 那台）与
+# [`docs/deploy/DEPLOYMENT.md`](../docs/deploy/DEPLOYMENT.md)：段进程是 `split-stage`（不是 `stage_worker.py`），
+# 拓扑由 `control/qlhctl.py` 读 TOML 驱动（不是参数生成 `topology.toml`）。
+#
+# 保留本文件只为记录 v2 的部署形态；下面命令与路径只作历史口径。
+# ============================================================================
+#
 # 把一台 Termux 设备准备成推理链的一段，然后后台常驻。
 #
 # 单段（调试用）：

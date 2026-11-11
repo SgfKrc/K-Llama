@@ -2,7 +2,7 @@
 
 > 状态：**现行**
 > 更新日期：2026-11-11
-> 适用范围：第一次接触本仓库的人，照着做到「一条分段链出了 token」。只讲操作与每步该看到什么；为什么这么设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，边界代价见 [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md)。
+> 适用范围：第一次接触本仓库的人，照着做到「一条分段链出了 token」。只讲操作与每步该看到什么；为什么这么设计见 [`ARCHITECTURE.md`](design/ARCHITECTURE.md)，边界代价见 [`SEGMENTED-LIMITS.md`](limits/SEGMENTED-LIMITS.md)。
 
 ## 1. 这是什么、能干什么
 K-Llama 让 llama.cpp 按层分段运行：几台机器各持同一份 GGUF，每台只加载自己那几层，段间只传一个隐藏态；对客户端它就是一个普通的 `llama-server`。
@@ -45,7 +45,7 @@ sha256sum <模型路径>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf        # 与项目组给
 `<模型路径>` 换成你放模型的目录。之后 `up` 自动比各段 `model` 的 size 与 mtime：size 不同拒绝启动，mtime 不同只警告（scp 会改）；`up --verify-weights` 另做完整 sha256（35B 几分钟）。这是启发式，不是密码学证明（`DEPLOYMENT.md` §4）。
 
 ## 4. 编译
-源码按 `BUILD.md` §2.2 取：上游 `ggml-org/llama.cpp` 的 `f477f795c` + `docs/llamacpp-split.patch` + `docs/llamacpp-slimarc.patch`，顺序不能反；叠完 `git write-tree` 应得 `c73185193e833860cc8f49040bad3c187d42daa9`（只叠主补丁是 `328c5effd`）。
+源码按 `BUILD.md` §2.2 取：上游 `ggml-org/llama.cpp` 的 `f477f795c` + `docs/llamacpp-split.patch` + `docs/llamacpp-slimarc.patch`，顺序不能反；叠完 `git write-tree` 应得 `95291539ae833860cc8f49040bad3c187d42daa9`（只叠主补丁是 `5520f52cb`）。
 
 **4.1 Windows（MSVC + Ninja）**：Ninja 必须在 `vcvars64` 环境里跑，Git Bash 里直接 `ninja` 会因缺 `INCLUDE`/`LIB` 报 `C1083: 无法打开包括文件: "stdbool.h"`。存成源码根的 `build-qlh.bat`：
 
@@ -67,7 +67,7 @@ cmake --build build-split --target split-stage llama-server llama-cli llama-benc
 **4.3 产物与冒烟**：`bin/` 里要有 `split-stage`、`llama-server` + `llama-server-impl.dll`、`llama-cli` / `llama-bench`、`split-smoke` / `split-rows` / `dflash-taps`（`BUILD.md` §6）。
 
 ```bash
-cd build-split/bin && ./llama-cli.exe --version   # 期望 version: 0.9.0-dev (build 195, commit c0b5de5f4)
+cd build-split/bin && ./llama-cli.exe --version   # 期望 version: 0.9.0-dev (build 195, commit 1c4bda400)
 ./split-stage.exe                                 # 期望打印 usage，退出码 0
 ```
 
@@ -247,6 +247,6 @@ exec "$BIN/split-stage" "$@"
 ## 下一步读什么
 | 想知道 | 读 |
 | --- | --- |
-| 机制与硬约束 / 每台放什么、拓扑与故障处置 | [`ARCHITECTURE.md`](ARCHITECTURE.md)、[`DEPLOYMENT.md`](DEPLOYMENT.md) |
-| 每条边界的根因与代价 / 判据与验收通道 | [`SEGMENTED-LIMITS.md`](SEGMENTED-LIMITS.md)、[`TESTING.md`](TESTING.md) |
-| 构建开关矩阵、CPU 变体、MSVC 坑 | [`BUILD.md`](BUILD.md) |
+| 机制与硬约束 / 每台放什么、拓扑与故障处置 | [`ARCHITECTURE.md`](design/ARCHITECTURE.md)、[`DEPLOYMENT.md`](deploy/DEPLOYMENT.md) |
+| 每条边界的根因与代价 / 判据与验收通道 | [`SEGMENTED-LIMITS.md`](limits/SEGMENTED-LIMITS.md)、[`TESTING.md`](design/TESTING.md) |
+| 构建开关矩阵、CPU 变体、MSVC 坑 | [`BUILD.md`](deploy/BUILD.md) |

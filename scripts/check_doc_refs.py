@@ -40,7 +40,7 @@ def headings(text: str) -> set[str]:
 
 
 def load() -> dict[str, str]:
-    return {p.name: p.read_text(encoding="utf-8") for p in sorted(DOCS.glob("*.md"))}
+    return {p.name: p.read_text(encoding="utf-8") for p in sorted(DOCS.rglob("*.md"))}
 
 
 def main() -> int:

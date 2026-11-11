@@ -1,5 +1,5 @@
 #!/bin/bash
-# 只读重测：2B 链上 MTP 的「每负载加速比」——docs/SPLIT-MEASUREMENTS.md 需要出处。
+# 只读重测：2B 链上 MTP 的「每负载加速比」——docs/measure/SPLIT-MEASUREMENTS.md 需要出处。
 # off 与 k=2 各 3 个 prompt × 3 次；贪心、-np 1、n_predict 192、三次取中位数。
 # 只用 93xx；跑完杀掉自己起的进程。路径约定见 _qlh_env.sh。
 set -u

@@ -101,13 +101,13 @@ pre-norm 隐藏态接力。
 
 ## 代码与验收摘要
 
-- **fork**：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `c0b5de5f4`，父 `f477f795c`（上游最新，193 个提交
-  之后），树 `c73185193`；相对上游 **55 文件 / +20313 −245**（`README.md` 代码与验收）。
+- **fork**：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `1c4bda400`，父 `f477f795c`（上游最新，193 个提交
+  之后），树 `95291539a`；相对上游 **55 文件 / +20345 −245**（`README.md` 代码与验收）。
 - **两个补丁**：
-  - 主补丁 [`docs/llamacpp-split.patch`](llamacpp-split.patch) **45 文件 / +16619 −244 / 18681 行 /
-    979.8 KiB**（纯分段链，可单独编译、单独验收）；
-  - 可选增量 [`docs/llamacpp-slimarc.patch`](llamacpp-slimarc.patch) **13 文件 / +3694 −1 / 3819 行 /
-    164.9 KiB**（SLIM-ARC prefetch，默认关闭）；
+  - 主补丁 [`docs/llamacpp-split.patch`](llamacpp-split.patch) **45 文件 / +16680 −244 / 18749 行 /
+    982.8 KiB**（纯分段链，可单独编译、单独验收）；
+  - 可选增量 [`docs/llamacpp-slimarc.patch`](llamacpp-slimarc.patch) **13 文件 / +3665 −1 / 3790 行 /
+    164.2 KiB**（SLIM-ARC prefetch，默认关闭）；
   - 叠加判据是 `git write-tree`：主补丁 → 纯分段树，再叠增量 → 与 fork HEAD 的树相同（`PATCHES.md`、
     `scripts/export_patches.sh`）。
 - **验收**：`verify/verify.sh` **53 项**（十二组：1–8 组 22 + 组 9 的 2 + 组 10 的 20 + 组 11 的 8 + 组 12 的 1）；

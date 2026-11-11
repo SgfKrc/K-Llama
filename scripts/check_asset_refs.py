@@ -49,7 +49,7 @@ def expand(line: str) -> list[str]:
 
 def doc_paths() -> list[Path]:
     paths = [BASE / "README.md"]
-    paths += sorted((BASE / "docs").glob("*.md"))
+    paths += sorted((BASE / "docs").rglob("*.md"))
     paths += sorted((BASE / "longctx").glob("*.md"))
     paths += [p for p in sorted(BASE.glob("*.md")) if p.name != "README.md"]
     seen: set[Path] = set()

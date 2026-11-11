@@ -1,0 +1,171 @@
+# 进展：当前能跑到什么程度
+
+> 状态：**已退场**（2026-11-10，v2 驱动链归档在 `slimarc/prototype`）
+> 更新日期：2026-11-06
+>
+> 适用范围：v2 驱动链的能力快照——能跑什么、做到过什么、还差什么。**本文数字与文件清单都是
+> v2 的，不作 v2.1 的判据**；v2.1 的能力与实测见 `README.md` 与 `docs/measure/SPLIT-MEASUREMENTS.md`。
+
+---
+
+## 1. 现在能跑什么
+
+两台机器、一个 35B-A3B MoE 模型、跨机层段接力 + DFlash 投机解码：
+
+```
+本机（i9-13900H + RTX 4060 Laptop 8 GiB）  head 0:32   -ngl 32 -ncmoe 24
+        ↕  TCP，每轮 8 KB hidden
+ROG（Ryzen 5 9600X，15.2 GiB）             tail 32:40  10 线程、纯 CPU
+```
+
+- **20.9 tok/s**（64-token 生成口径，`topology-cross-mtp.toml`，2026-10-31）；
+  k 扫描、接受率与每轮前进量见 [`SPECULATION.md`](../measure/SPECULATION.md) §11——生成越长接受率越低，
+  写满 128 token 时吞吐明显低于此值
+- 输出与**整模**的贪心解码逐位一致（对照的是整模，不是「不投机」：那份对照测的是 batch
+  invariance，v2 的探针 `probe_perfect_draft.py` 只覆盖 2 行 + 30 token，见
+  [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §2.2）
+- 对外是 OpenAI 兼容的 SSE 流式接口；TUI 与控制面在 Python 侧
+
+作为对照：同一个模型在本机单卡整模 `-ngl 6` 只有 **10.5 tok/s**，
+纯 CPU 是 7.1。跨机两段是这台机器上唯一超过单机的形态。
+
+> 上面两个吞吐都是**解码阶段**口径（`slimarc/prototype:scripts/check_p4_cross.py` 的 `t_gen`，
+> 不含 prefill 与协议开销），prompt 是 `def quicksort(arr):`。
+> 跨 prompt 比较要重测——接受率由文本可预测性决定，不由模型规模决定。
+
+### 1.1 另一种形态：两台弱设备（2026-11-03）
+
+同一模型切成 24 + 16 层，放在一台 Surface Pro 7（i5-1035G4，纯 CPU）与一台
+Y700 平板（8 Gen 3，Termux，纯 CPU）上，两端都持**完整整模** + `LLAMA_LAYER_RANGE`，
+零裁层工件：
+
+| 段 | 设备 | 层 | 每层耗时 |
+| --- | --- | ---: | ---: |
+| head `0:24` | Surface | 24 | 3.76 ms |
+| tail `24:40` | Y700 | 16 | 2.84 ms |
+
+- decode **6.50 tok/s**（153.4 ms/token，p90 165.1 ms，n=24，两次复测 6.50 / 6.52）
+- prefill 稳态 **22 tok/s**（N=256 要 11.7 秒；另有约 750 ms 首轮图 reserve 开销）
+
+这两台的核显都不参与（**只对这两台弱设备成立**；本机 Iris Xe 单卡隔离后全量 offload 是赢的，
+见 [`IGPU-SLOWDOWN.md`](../measure/IGPU-SLOWDOWN.md)）：Surface 的 Vulkan 后端一加载就把 CPU 侧权重塞进
+host buffer（head 245 → 112 ms），Y700 的 Adreno `-ngl 99` 比纯 CPU 慢。逐层拆解、带宽口径
+与切点约束见 [`ANDROID-SURFACE-段接入评估.md`](../deploy/ANDROID-SURFACE-段接入评估.md)。
+
+**部署形态（v2，已退场）**：`stage_supervisor.py` 常驻，读拓扑起本机段，崩了按退避重启；
+`slimarc/prototype:scripts/pack-portable.py` 出 96 MB 绿色目录；`scripts/termux-install.sh` 一条命令
+准备安卓侧并能从参数生成拓扑。三个脚本已归档在 `slimarc/prototype`，见 [`PACKAGING.md`](../deploy/PACKAGING.md)。
+
+**三段形态（2026-11-03）**：两段再拆开、本机也进来（本机 `0:24` + Surface `24:32` +
+Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两段慢 31%，换来
+两台弱设备各只背 8 层、离开内存边界。瓶颈是每段约 33–35 ms 的**固定开销**（与层数
+无关），不是网络。见 [`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md)。
+
+---
+
+## 2. 里程碑
+
+| 阶段 | 内容 | 结果 |
+| --- | --- | --- |
+| P0 | 单进程基线，`-ncmoe` 语义 | 28.02 ± 0.15 tok/s（旧 Q4_K_XL 20.82 GiB 模型） |
+| P1 | 多槽 `layer_inp` 打通 worker/engine/StageClient | 与单槽逐位相同 |
+| P2 | 两进程 + TCP 传输 | 段间 hidden 走 int16 定点，5 份拷贝降到 1 份 |
+| P3 | DFlash 草稿三件套（open/inject/block）+ rollback | 8 路注入、15 草稿、16 验证跑通 |
+| P4 | 六条定位修正后验收 | 98.0% 接受率（原生 `llama-speculative-simple` 94.1%），3.94 token/轮 |
+| P5 | 弱设备串两段 + 常驻 supervisor + 绿色包（2026-11-03） | 6.50 tok/s；kill 掉任一段的 worker 后 supervisor 自动重启、链路恢复 |
+
+`docs/deploy/PATCHES.md` 记的是四代补丁的分界，`docs/issues/ISSUE-*.md` 记的是 P3/P4 期间定位到的
+三个缺陷：warmup 越界、hybrid `seq_rm` 语义、recurrent 快照跨 ubatch 不滚动。
+
+---
+
+## 3. 已做的优化（按收益排）
+
+| 优化 | 手段 | 收益 |
+| --- | --- | --- |
+| 专家级 offload | `-ncmoe` 把专家放 GPU，而非整层 | 整层 11 层 10.11 → 专家 8 层 28.47 tok/s |
+| head 段混合切分 | `-ngl 32 -ncmoe 24`：注意力与 dense 上卡，前 24 层专家留 CPU、后 8 层专家上卡 | head 段单独 13.6 → 20.5 tok/s |
+| 草稿上 GPU | DFlash Q4_K_M 0.24 GB 放 4060 | 跨机 5.7 → 10.0 tok/s |
+| 释放远端内存 | 关掉 ROG 上的常驻浏览器 | `tail_fwd` 226 → 76 ms |
+| tail 线程数 | ROG 侧 10 线程 | 并入上面那档 |
+| 切点实验 | 32:40 → 36:40 | 17.0 → 17.7（+4%），**未采纳**，负载会压到笔记本 |
+| DFlash 草稿深度 | k=3 → **k=5** | 解码吞吐 17.0 → 20.9 tok/s（64 token）；k≥8 起崩塌。完整扫描见 `docs/measure/SPECULATION.md` §11 |
+| 投机按负载开关 | 代码类 k=2，其余 k=0；6 步后接受率 <35% 自动关 | 见 `docs/measure/SPECULATION.md` §10 |
+| n-gram 草稿 | 上游原生，优先级在 DFlash 之前 | 代码 prompt 10.4 vs 无投机 7.4 tok/s；对话自动落空 |
+
+已被实测排除的方向（各条口径见 `docs/measure/SPECULATION.md` 与 `local_docs/`）：
+`-fa on`、`-ub 64`、KV 量化 q8_0、CPU 绑核、`--load-mode mlock`、`--moe-cache-mib`、
+浅层投机（未训练的截断层接 `lm_head` 分布错位，α < 0.09）、k ≥ 5 的深草稿。
+
+---
+
+## 4. 已接的组件
+
+**llama.cpp fork（`H:\llamacpp-c`，相对上游 `f477f795c`，四代补丁；文件数与行数见 [`PATCHES.md`](../deploy/PATCHES.md)）**
+
+| 标记 | 内容 |
+| --- | --- |
+| `[C-scheme]` | `LLAMA_LAYER_RANGE=lo:hi` 层范围加载、`embeddings_pre_norm` 接力向量、lazy 全局张量、跳过 lm_head |
+| `[C-scheme]` | `qwen35` / `qwen35moe` 的 pre-norm tap；`extern "C"` 导出供 C 侧按名解析 |
+| `[TAG_RECURRENT_ROLLBACK_SPLITS]` | ~~recurrent 快照按 ubatch 滚动~~（2026-11-09 删掉：上游 `ab3768cdc` 改成**拒绝**超出最后一个 ubatch 的回退，`ab3768cdc` + `split_equal` 的 `n_keep_tail` 覆盖同一件事，两套会互相打架） |
+| `[DFLASH-01]` | 末层输出挂 `t_layer_inp[n_layer]`、`llama_model_n_embd_inp_enc`、warmup 空跑越界修复 |
+| `[SLIM-ARC]` | prefetch 一级：`init_mappings` 注册 mmap 区间、`graph_compute` 通知当前层；win32 侧用 `PrefetchVirtualMemory` 等替代 madvise，默认关闭（`SLIM_ARC_PREFETCH=1`） |
+
+**shim（`slimarc/prototype:shim/qlh_keep_head_gpu.c`，2026-11-01 时 2,083 行 C；已随 v2 删除）**
+
+把 llama 上下文包成 C ABI：多槽 `layer_inp`、DFlash `draft_open/inject/block/rollback/reset`、
+MTP 草稿、采样器、`seq_rm`。MSVC 导出的 C++ mangled 名用 `GetProcAddress` 运行时解析。
+
+**Python 侧（扁平布局，约 30 个模块；v2 已退场，下列文件全部归档在 `slimarc/prototype`）**
+
+| 文件 | 职责 |
+| --- | --- |
+| `topology.py` | TOML 拓扑解析，切分点按 `full_attention_interval` fail-closed |
+| `chain_client.py` | 绕链驱动、两个草稿源（MTP 递归 / DFlash 并行块）、按负载选 k、内存预检 |
+| `engine.py` / `keep_head.py` | shim 的 ctypes 绑定 |
+| `stage_worker.py` / `protocol.py` / `wire.py` | 段进程与帧协议 |
+| `server.py` / `stream.py` / `proto_responses.py` | OpenAI 兼容接口与 SSE；`stream.py` 只做 UTF-8 重组、计时与停止条件，解码交给 `chain_client` 的引擎（server 因此能跑投机） |
+| `koakuma.py` | TUI 与控制面 |
+
+**通用跨机驱动（`scripts/`，设备无关，可入库）**
+
+`check_p4_cross.py` 从拓扑读一切，target layer id 按切点动态算；远端拉起调用
+`chain_client.start_remote`（与正常 CLI 共用一份实现，此前两边各有一份且对"怎么脱离 ssh
+会话"的结论相反）；`tail-worker.cmd` 是远端启动模板；`topology-example.toml` 是占位模板。
+另有 8 个实验期探针从根目录迁入此目录（`perstage.py` / `breakdown.py` / `probe_hops.py` /
+`smoke.py` / `check_correct.py` / `dflash_probe.py` / `dflash_probe2.py` / `dflash_warmup_probe.py`），
+仅作历史测量记录，不是正式验收入口。
+站点配置（IP、账号、路径）全部在 `.gitignore` 的 `topology-*.toml` 里，不进版本库。
+
+---
+
+## 5. 未接 / 未做
+
+| 方向 | 状态 | 依据 |
+| --- | --- | --- |
+| SLIM-ARC | **只接 prefetch 一级**（默认关闭，`SLIM_ARC_PREFETCH=1` 开）；on-demand 加载器等其余未接，有触发条件 | `docs/design/SLIM-ARC-接入计划.md` |
+| 跨框架接力（llama.cpp ↔ torch） | 未做 | `README.md` 未做节 |
+| GPU 段引擎候选（ExLlamaV3） | 评估已写，未实施；先验证单机是否快过 llama.cpp CUDA，再谈切分 | `docs/design/EXLLAMAV3-GPU段候选.md` |
+| LiLiCorr 轻量重排头 | 方案已写，未实施 | `docs/design/LILICORR-轻量头.md` |
+| 弱设备（Y700 / Surface）接入 | **三段已跑通**（24/8/8，Tailscale 5 GHz 校园网，201.7 ms / 5.00 t/s）；延迟是负收益（比两段 +31%），收益在把两台弱设备从内存边界上拉下来 | `docs/deploy/THREE-SEGMENT.md` |
+| 多序列 token 共享 | 未做，对这类请求明确报错 | `README.md` |
+| n-gram 影子模式 | 未做（上游原生策略已可用） | `docs/measure/SPECULATION.md` §6 |
+
+---
+
+## 6. 复现
+
+> 本节命令全部指向已退场的 v2 文件（`chain_client.py`、`topology-*.toml`、
+> `slimarc/prototype:checks/verify_ranges.py`），只作存档；脚本本体在 `slimarc/prototype` 上。
+
+```powershell
+# 拓扑里写清两段的 model / host / port / layer_range / gpu_layers / cpu_moe
+# --spec-k 默认 -1，按负载自动选（代码类 k=2，其余 k=0）；要强制就写具体值
+python chain_client.py --topology topology-cross-mtp.toml
+
+# 逐位正确性：与 --spec-k 0 的输出比对
+# 段区间（sidecar 契约）。显存 guard 的校准数据绑在已下线的裁段工件上，
+# 那个脚本归档在 _archive/checks/verify_vram.py（本机保留，不入库）。
+# verify_ranges.py 在 slimarc/prototype:checks/ 上，git show 取出到当前目录后跑：
+python verify_ranges.py
+```

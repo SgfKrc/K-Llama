@@ -146,17 +146,17 @@ rather than official BF16, so the comparison holds only between those two files.
 
 ## Code and acceptance
 
-- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `c0b5de5f4` on parent `f477f795c`
-  (current upstream, 193 commits later), tree `c73185193`; against upstream, 55 files /
-  +20313 −245.
-- [llamacpp-split.patch]: 45 files / +16619 −244 / 18681 lines / 979.8 KiB. The complete pure split
+- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `1c4bda400` on parent `f477f795c`
+  (current upstream, 193 commits later), tree `95291539a`; against upstream, 55 files /
+  +20345 −245.
+- [llamacpp-split.patch]: 45 files / +16680 −244 / 18749 lines / 982.8 KiB. The complete pure split
   patch (protocols v7 / v8 / v9 included); the mechanism list is in [PATCHES.md]. No SLIM-ARC; it
   compiles and passes the full acceptance run on its own.
-- [llamacpp-slimarc.patch]: 13 files / +3694 −1 / 3819 lines / 164.9 KiB. SLIM-ARC prefetch, off by
+- [llamacpp-slimarc.patch]: 13 files / +3665 −1 / 3790 lines / 164.2 KiB. SLIM-ARC prefetch, off by
   default, installed only with `SLIM_ARC_PREFETCH=1`. Prefetch is the only piece borrowed; expert
   residency, KV eviction and the I/O scheduler stay out of scope — see [SLIM-ARC-接入计划.md].
-- Composition check: `f477f795c` + main patch → tree `328c5effd`; adding the increment → tree
-  `c73185193`, identical to HEAD's tree (`git write-tree`; see `scripts/export_patches.sh`).
+- Composition check: `f477f795c` + main patch → tree `5520f52cb`; adding the increment → tree
+  `95291539a`, identical to HEAD's tree (`git write-tree`; see `scripts/export_patches.sh`).
 - Build: [BUILD.md] gives the measured commands from `f477f795c` + patches to binaries and the build
   switch matrix; changing a `.h` requires `--clean-first`.
 - Against upstream: 16 files are byte-identical to `f477f795c`, against zero before the rebase. The
@@ -175,11 +175,11 @@ records the 2026-11-09 run:
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |
 | `verify/verify_grammar_spec.sh` / `verify/verify_rbudget_spec.sh` | 23 / 36 | grammar whole-frame rollback, budget tightens only |
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
-| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `328c5effd` |
+| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `5520f52cb` |
 
-**Current status of the pure split build**: the pure split tree `328c5effd` (45 files) was rebuilt
+**Current status of the pure split build**: the pure split tree `5520f52cb` (45 files) was rebuilt
 with `--clean-first` in an independent worktree @ `f477f795c` + main patch (`git write-tree` =
-`328c5effd`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
+`5520f52cb`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
 previous build `0c307d82a` (44 files, 2026-11-09) covers the same acceptance.
 
 The v2 chain was checked by `python checks/verify_*.py` and
@@ -187,6 +187,21 @@ The v2 chain was checked by `python checks/verify_*.py` and
 `slimarc/prototype`). Counts and latest results are in [SPLIT-MEASUREMENTS.md] §6.
 
 ## Documentation map
+
+`docs/` groups documents by topic; only entry points stay at the root:
+
+| Directory | Contents |
+| --- | --- |
+| `docs/` | Entry points: `QUICKSTART.md` (first working chain), `REPORT.md` (final report), `OPEN-ISSUES.md` (known open issues), `README.en.md` (this file) |
+| `docs/report/` | The six report chapters: `01-背景与目标.md` … `06-局限与结论.md` |
+| `docs/design/` | Mechanisms, protocols and conventions: ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC integration (plan and obstacles) / LILICORR-轻量头 / EXLLAMAV3-GPU段候选 |
+| `docs/deploy/` | Build, deployment and delivery: BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / DELIVERY / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
+| `docs/measure/` | Measurements: SPLIT-MEASUREMENTS / MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN |
+| `docs/limits/` | Boundaries and costs: SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
+| `docs/issues/` | Defects: the five `ISSUE-*.md` write-ups plus `FIXES.md` (fixed-defect register) |
+| `docs/legacy/` | Retired or archived v2 material: ANTI-ROT / INVENTORY / PRIMA-ANALYSIS / PRIMA-LESSONS / TUI / CHAT-ENGINE / AUTO-ASSIGN-PLAN / BASELINE / PROGRESS / CUT-TOOL / RESPONSES-API / SAMPLING |
+
+Most-queried documents:
 
 | File | Contents |
 | --- | --- |
@@ -212,38 +227,36 @@ The v2 chain was checked by `python checks/verify_*.py` and
 | [SAMPLING.md] · [TUI.md] · [RESPONSES-API.md] | Sampling mapping · TUI pages and commands · `/v1/responses` translation layer |
 | [SLIM-ARC-接入计划.md] | When the remaining page-fault work pays off |
 
-Further topics (`LILICORR-轻量头.md`, `ANDROID-SURFACE-段接入评估.md`, `ISSUE-*.md`) live in
-`docs/`, with retired documents in `docs/archive/`. The same relay applied to diffusion models is
-[K-sd.cpp](https://github.com/SgfKrc/K-sd.cpp): a segment boundary carries MB-scale tensors there,
-both sides wait for every segment within one sequence, and the headroom sits in many requests.
+Further topics (`LILICORR-轻量头.md`, `ANDROID-SURFACE-段接入评估.md`, `ISSUE-*.md`) sit in the
+subdirectory listed above; retired v2 documents are in `docs/legacy/`.
 
 ## License
 
 MIT — see [LICENSE](../LICENSE). Upstream llama.cpp is MIT as well and this repo's patches ship under
 the same terms; model weights and other third-party artifacts keep their own licenses.
 
-[ARCHITECTURE.md]: ARCHITECTURE.md
-[PATCHES.md]: PATCHES.md
-[BUILD.md]: BUILD.md
-[SEGMENTED-LIMITS.md]: SEGMENTED-LIMITS.md
-[SPLIT-MEASUREMENTS.md]: SPLIT-MEASUREMENTS.md
-[SPECULATION-DATA.md]: SPECULATION-DATA.md
-[MODEL-SWAP.md]: MODEL-SWAP.md
-[PROTOCOL-V9.md]: PROTOCOL-V9.md
-[CROSS-MACHINE.md]: CROSS-MACHINE.md
-[PATCHES-DETAIL.md]: PATCHES-DETAIL.md
-[MEASUREMENTS.md]: MEASUREMENTS.md
-[SPECULATION.md]: SPECULATION.md
-[DEPLOYMENT.md]: DEPLOYMENT.md
-[TESTING.md]: TESTING.md
-[MEASUREMENT-PITFALLS.md]: MEASUREMENT-PITFALLS.md
-[MEMORY-LIMITS.md]: MEMORY-LIMITS.md
-[IGPU-SLOWDOWN.md]: IGPU-SLOWDOWN.md
-[SEGMENT-OFFLOAD.md]: SEGMENT-OFFLOAD.md
-[PROGRESS.md]: PROGRESS.md
-[SAMPLING.md]: SAMPLING.md
-[TUI.md]: TUI.md
-[RESPONSES-API.md]: RESPONSES-API.md
-[SLIM-ARC-接入计划.md]: SLIM-ARC-接入计划.md
+[ARCHITECTURE.md]: design/ARCHITECTURE.md
+[PATCHES.md]: deploy/PATCHES.md
+[BUILD.md]: deploy/BUILD.md
+[SEGMENTED-LIMITS.md]: limits/SEGMENTED-LIMITS.md
+[SPLIT-MEASUREMENTS.md]: measure/SPLIT-MEASUREMENTS.md
+[SPECULATION-DATA.md]: measure/SPECULATION-DATA.md
+[MODEL-SWAP.md]: measure/MODEL-SWAP.md
+[PROTOCOL-V9.md]: design/PROTOCOL-V9.md
+[CROSS-MACHINE.md]: deploy/CROSS-MACHINE.md
+[PATCHES-DETAIL.md]: deploy/PATCHES-DETAIL.md
+[MEASUREMENTS.md]: measure/MEASUREMENTS.md
+[SPECULATION.md]: measure/SPECULATION.md
+[DEPLOYMENT.md]: deploy/DEPLOYMENT.md
+[TESTING.md]: design/TESTING.md
+[MEASUREMENT-PITFALLS.md]: measure/MEASUREMENT-PITFALLS.md
+[MEMORY-LIMITS.md]: limits/MEMORY-LIMITS.md
+[IGPU-SLOWDOWN.md]: measure/IGPU-SLOWDOWN.md
+[SEGMENT-OFFLOAD.md]: measure/SEGMENT-OFFLOAD.md
+[PROGRESS.md]: legacy/PROGRESS.md
+[SAMPLING.md]: legacy/SAMPLING.md
+[TUI.md]: legacy/TUI.md
+[RESPONSES-API.md]: legacy/RESPONSES-API.md
+[SLIM-ARC-接入计划.md]: design/SLIM-ARC-接入计划.md
 [llamacpp-split.patch]: llamacpp-split.patch
 [llamacpp-slimarc.patch]: llamacpp-slimarc.patch

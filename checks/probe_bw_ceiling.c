@@ -1,6 +1,6 @@
 /* What read bandwidth can this host actually deliver at n threads?
  *
- * `docs/MOE-SPECULATION-ECONOMICS.md` §6.6 quotes 8 threads moving only
+ * `docs/limits/MOE-SPECULATION-ECONOMICS.md` §6.6 quotes 8 threads moving only
  * 15.7 GB/s (~25 % of DDR5 dual-channel) through `mul_mat_id`, and infers a
  * 2--2.7x dispatch headroom from that.  That inference is only valid if the
  * machine can go faster *at all*.  This probe measures the ceiling with the

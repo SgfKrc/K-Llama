@@ -10,7 +10,7 @@
 本文件**不**做的事（写在这里，是因为「又有一个 Python 了」很容易被读成 v2 回来了）：
 不实现链协议（v9 在 `split-stage` 与 `llama_context` 里）、不碰 token、不理解层、不做
 采样、不校验层范围与切点（那些是 C++ 侧的事）、不做切分求解与动态重平衡
-（`docs/DEPLOYMENT.md` §7）。删掉本文件链照样能手工起，它省掉的只是「记住五条命令、
+（`docs/deploy/DEPLOYMENT.md` §7）。删掉本文件链照样能手工起，它省掉的只是「记住五条命令、
 盯五个日志、猜哪一段死了」。
 
 只依赖 Python 3.11+ 标准库（`tomllib`）。
@@ -259,7 +259,7 @@ def _stage_extra(raw: dict, label: str) -> list[str]:
 
     TOML 里写成 `extra = "--foo bar"`（单个字符串）时，`for a in extra` 会逐字符迭代，
     命令行静默变成一堆单字母参数——不报错，只是那一段起不来，日志里也看不出是配置写错了。
-    `docs/DEPLOYMENT.md` §2 记了这个坑；这里把它变成启动前的显式错误，而不是留给运行期。
+    `docs/deploy/DEPLOYMENT.md` §2 记了这个坑；这里把它变成启动前的显式错误，而不是留给运行期。
     """
     value = raw.get("extra")
     if value is None:

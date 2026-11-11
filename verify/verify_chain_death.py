@@ -7,7 +7,7 @@
 
     python verify/verify_chain_death.py
 
-验收内容（对应 docs/SEGMENTED-LIMITS.md §2.7 记的那一条）：
+验收内容（对应 docs/limits/SEGMENTED-LIMITS.md §2.7 记的那一条）：
   A. 挂起 stage 后：/completion 在 ~120 s 失败，但 head 进程活着、/health 仍 200
      （修改前是 GGML_ABORT，整个进程退出）
   B. 链被标记死之后：后续请求立即 500，不再等 120 s；/health?deep=1 立即 503
@@ -90,7 +90,7 @@ def check_lock():
     """与 verify.sh / verify_dflash_dev_path.sh 互斥。
 
     三方都用 93xx，而本脚本的 kill_93xx() 是按端口无差别清场：并发跑时会把对方正在用的
-    stage 当成自己的残留杀掉，两边各报一堆假失败（verify.sh 头注释与 docs/TESTING.md §6.1
+    stage 当成自己的残留杀掉，两边各报一堆假失败（verify.sh 头注释与 docs/design/TESTING.md §6.1
     都记了这个坑）。持锁方的 pid 还活着就拒绝启动；留下的是死锁文件则直接接管。
     """
     lock = os.path.join(TMP, ".verify.lock")
