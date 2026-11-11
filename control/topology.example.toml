@@ -1,0 +1,77 @@
+# qlhctl 的拓扑（v2.1）。字段意义与部署步骤见 `docs/DEPLOYMENT.md` §2；
+# 这里只放一份**能真跑**的例子：2B 本机两段，端口 9461/9462，不与 verify.sh 的 93xx 重叠。
+#
+# 段按链序写：head 在前、tail 最后；控制面按反序启动（尾段先、链首最后）。
+#
+# ⚠️ 下面这份（head + tail 都不带 ssh）起的是**回环 remote 链**，不是本地同进程链：
+#   控制面对 head 之后的每一段一律拼 --split-remote（control/qlhctl.py 的 build_argv），
+#   所以链首会去连 127.0.0.1:9462 上的一个独立 split-stage 进程。它和 --split-tail-range
+#   的同进程本地链不是一回事——remote 链单序列（-np 必须 1）、没有链上 catch-up
+#   （MTP 草稿跑在 stage 里，接受率落在 0.69 档而不是 0.91）、每次 decode 多一次回环 socket。
+#   这个形态的用处是**测远程代码路径**（verify/verify.sh 组 6/7 就这么用）。
+#
+#   要本地同进程链，只写一个 head stage，把 tail 范围放进 extra（控制面没有直接生成
+#   --split-tail-range 的字段）：
+#
+#     [[stage]]
+#     name = "head"
+#     role = "head"
+#     host = "127.0.0.1"
+#     port = 9461
+#     model = "H:/qlh_models/qwen3-5-2b-gguf/qwen35-2b-Q4_K_M.gguf"
+#     layers = "0:12"
+#     extra = ["--split-tail-range", "12:24"]
+#
+#   注意：写成两个都不带 ssh 的 stage **不会**得到本地链。
+
+[chain]
+name = "2b-local"            # run 目录与 state 的名字；同机跑多条链靠它区分
+bin_dir = "H:/llamacpp-c/build-split/bin"   # 里面有 llama-server(.exe) 与 split-stage(.exe)
+rs_seq = 8                   # 写进链首 --split-rs-seq 与各段 --rs-seq，两端必须一致
+ready_timeout = 240          # 单段 spawn 到打印 ready 的上限（秒）；35B 跨机要给足
+ctx = 4096                   # 各段 -c 的缺省值；段内可覆盖
+batch = 512                  # 各段 -b 的缺省值
+
+
+# 链首由 llama-server 承担（split-stage 要求 layer-lo > 0）：它加载 [0, N) 并用 --split-remote 连后面。
+[[stage]]
+name = "head"
+role = "head"
+host = "127.0.0.1"           # 该段在哪台机器；链首用它拼 --split-remote
+port = 9461                  # head 是 HTTP 端口（/v1/chat/completions、/health）
+model = "H:/qlh_models/qwen3-5-2b-gguf/qwen35-2b-Q4_K_M.gguf"
+layers = "0:12"              # 原样给 --split-layer-range；控制面不解析、不校验
+threads = 4                  # -t
+ngl = 0                      # -ngl；上卡写 N 或 "all"
+
+
+[[stage]]
+name = "tail"
+role = "tail"
+host = "127.0.0.1"
+port = 9462
+model = "H:/qlh_models/qwen3-5-2b-gguf/qwen35-2b-Q4_K_M.gguf"
+layers = "12:24"
+threads = 4
+ngl = 0
+
+
+# ---------------------------------------------------------------- 跨机
+# 把某段挪走：host 写那台机器，加 ssh = "user@host"（免密），bin_dir / model 写那台机器上的路径。
+#
+# 远端 shell 不用配：控制面探一次 `echo $0`，POSIX shell 走参数、Windows 的 cmd 走 stdin
+# 交给 Git Bash，并用 WMI 起进程（nohup 在那边会被 OpenSSH 的 Job object 收回去）。Git Bash
+# 默认按 C:/Program Files/Git/bin/bash.exe 找，装在别处用 remote_shell 指路。
+#
+# [[stage]]
+# name = "tail"
+# role = "tail"
+# host = "<tailscale-ip-surface>"                      # Tailscale / 局域网地址
+# ssh = "surface@<tailscale-ip-surface>"
+# port = 9462
+# model = "C:/Users/<user>/Documents/llamacpp-split/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+# layers = "32:40"
+# bin_dir = "C:/Users/<user>/Documents/llamacpp-split/bin"
+# workdir = "C:/Users/<user>/Documents/llamacpp-split/run"
+# threads = 6
+# remote_shell = "C:/Program Files/Git/bin/bash.exe"   # 仅当 Git 不在默认位置
