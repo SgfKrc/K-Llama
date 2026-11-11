@@ -208,10 +208,10 @@ head(p+1) ← t_{p+1}   ←── 只可能由 tail(p) 产出
 
 | 方向 | 结论 | 机制与代价 |
 | --- | --- | --- |
-| 段内批位置（已做） | 收益已被吃掉 | 投机一轮把 k+1 个位置打进同一个 batch，每段 33–35 ms 的固定开销只付一次，每多一行边际成本 0.178 个单行（[`SPECULATION.md`](../measure/SPECULATION.md) §0）。这是单序列上唯一能「让 token 并行」的形态，代价是接受率，代码场景 1.13–1.25× |
+| 段内批位置（已做） | 收益已被吃掉 | 投机一轮把 k+1 个位置打进同一个 batch，每段 33–35 ms 的固定开销只付一次（**v2 时代的实测**；v2.1 反推是 10–20 ms，见 [`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md) §5），每多一行边际成本 0.178 个单行（[`SPECULATION.md`](../measure/SPECULATION.md) §0）。这是单序列上唯一能「让 token 并行」的形态，代价是接受率，代码场景 1.13–1.25× |
 | 段内 offload | 另一个维度 | `-ncmoe`、专家预取只改每段耗时，不改依赖图与往返次数 |
 | 计算 ∥ 传输 | 不可行 | 8 KB 传输是亚毫秒级，每段真正付的是往返里**等待**的那一半（尾段 25–30 ms，[`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md) §4）；等待期没有别的工作可派，下游要的正是这一跳的载荷 |
 | 多请求 / 多序列 | 有条件可行，唯一的大块 | 不同序列互不依赖，三条同时在飞把合计吞吐从 `1/Σ` 推到 `1/max`：按 73.4/64.6/55.7 ms，上限 **13.6 t/s（2.6×）**，但每 token 延迟不降（约 0.2 s，排队时更差）。三件前置都还没有：`n_seq_max` 硬编码 1（v2 的 `keep_head_worker.py:249`，已退场）、协议与 token 通道的 `seq_id`、驱动侧并发。本体估 3–4 人天（[`ISSUE-multi-sequence.md`](../issues/ISSUE-multi-sequence.md)），驱动改排队另算 |
 | prefill ∥ decode | 多序列之后才谈得上 | prefill 现在是一次走完整链的大 batch，`server.py` 一把锁串行；要让第二个请求在别人 prefill 时 decode，得先有 seq 维度、再把 prefill 切块插入。买的是公平性，不是吞吐 |
 
-单序列的延迟只有三个旋钮：投机接受率、段数（每段 33–35 ms 串行叠加）、往返（星形拓扑，hidden 每段都回本机再发下一段）。吞吐那个旋钮叫多序列。见 [`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md) §4。
+单序列的延迟只有三个旋钮：投机接受率、段数（每段 33–35 ms 串行叠加，**v2 口径**）、往返（星形拓扑，hidden 每段都回本机再发下一段）。吞吐那个旋钮叫多序列。见 [`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md) §4。

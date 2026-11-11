@@ -196,6 +196,16 @@
 - **建议**：核显机器上重跑预取通路，记录 `issued` 与命中率；装不上就把结论并入 [`IGPU-SLOWDOWN.md`](measure/IGPU-SLOWDOWN.md)。
 - **为什么留**：等外部条件（需要一台核显机器 + 一次完整实测）。
 
+### D4. 三段链的切分参数没有落盘
+- **位置**：三段链那次运行的日志里只有 `[split] attached 2 remote stage(s): 100.100.52.106:9331,
+  100.99.211.13:9332`，**没有 `--split-layer-range` 的实际值**。本机 head `0:32`、Surface relay
+  `32:36`、Y700 tail `36:40` 是从启动命令推的，不在日志里。
+- **判据**：可复现性——`MODEL-SWAP.md` §11.8 的三段链 **9.09 t/s** 无法从日志复算。
+- **建议**：attach 成功时把 `split_layer_lo/hi` 与每个 `--split-remote` 打进一行无条件日志（像
+  `[split] attached N remote stage(s)` 那样）。
+- **为什么留**：要改 `src/llama-context.cpp` 的 attach 日志，且**重跑三段链需要 Surface 与 Y700
+  同时在线**（2026-11-12 两台都不可用）。不阻塞结题——`MODEL-SWAP.md` 已注明那是单次测量。
+
 ### D3. 安卓 / ARM 的自动验收
 - **位置**：[`ANDROID-SURFACE-段接入评估.md`](deploy/ANDROID-SURFACE-段接入评估.md) §6「证据等级」与 §7「已完成 / 下一步」；相关 `scripts/termux-install.sh`（B9）。
 - **判据**：正确性（验收覆盖）——安卓结论全部来自手工实测，没有脚本支撑。

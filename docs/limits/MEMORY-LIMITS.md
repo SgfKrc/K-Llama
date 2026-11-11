@@ -2,6 +2,12 @@
 
 > 状态：**已退场**（2026-11-10；预算实现 `chain_client`、拓扑文件与 `stage_worker` 已归档在
 > `slimarc/prototype`）
+>
+> **现行口径不在本篇**：35B 三份权重字节数的现行值是 `docs/measure/SPLIT-MEASUREMENTS.md` §0
+> （官方 `UD-Q4_K_M` **21.11 GiB**、head `0:32` **15.690 GiB**、tail `32:40` **4.90 GiB** 驻留），
+> 与 `docs/deploy/CROSS-MACHINE.md` §6（GGUF 头逐张量累加 **21.10 GiB**）。本篇的 **21.87**（蒸馏版）与
+> **20.82**（Q4_K_XL）是旧口径，**三份不能互换**——算 KVMem 的 `--kvmem-budget` 时按你实际加载的
+> 那个文件选。
 > 更新日期：2026-11-03
 > 适用范围：v2 驱动链启动前的内存/显存预算怎么算（`chain_client` 的校准常数与实测依据），以及不遵守时会出什么。硬约束，启动前的两项检查超预算即 `SystemExit`。逐段吞吐见 [`MEASUREMENTS.md`](../measure/MEASUREMENTS.md)。
 >
