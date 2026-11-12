@@ -4,6 +4,8 @@
 
 # K-Llama v2.1
 
+**Non-whole-model (segmented) loading · a customized llama.cpp engine · lightweight large-model inference across edge devices**
+
 [中文](../README.md) | **English**
 
 > Status: **Current**

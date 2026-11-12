@@ -4,6 +4,8 @@
 
 # K-Llama v2.1
 
+**面向非整模加载 · 基于定制化 llama.cpp 引擎 · 轻量化大模型分布式边缘推理优化系统**
+
 **中文** | [English](docs/README.en.md)
 
 > 状态：**现行**
