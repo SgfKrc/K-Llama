@@ -96,7 +96,37 @@ llama_memory_split
 
 **不能把 27B 的数字直接套到 35B 上**：35B 的权重（head 15.69 GiB）比 27B 大，KV 预算更小。
 
-## 9. 复现入口
+## 9. 验收判据（2026-11-12 修订）
+
+**不能用「与整模逐字相等」当判据**。KVMem 是**近似选块**：`budget < prompt` 时 GPU 只驻留
+`budget` 那部分行，被 stage_out 的 token **不参与 attention**，所以「答案逐字等于全量」**物理上
+做不到**——要求它等于要求 KVMem 不省显存。
+
+实测证据（2B，1802 token prompt，`temperature: 0`）：
+
+| 对照 | 结果 |
+| --- | --- |
+| `budget 1024`（驱逐）vs `8192`（不驱逐） | **DIFFERENT** |
+| `budget 2048`（不驱逐）vs `8192` | **EQUAL** |
+| `budget 1024` 跑两次 | **EQUAL**（确定性） |
+
+`1024` 那次的 mask 是 `keep=1002 holes=1 keep_pos=[0,1801]`——只有 1002/1802 行参与 attention。
+
+### 用什么判据
+
+**「关键信息保留」测试**：开头埋一个 secret code + 中间 1200 token 填充 + 结尾提问（共 1653 token），
+`budget 1024` 下（`keep=1013 holes=1`、驱逐 2 次）答案与 `budget 8192` **EQUAL**。它才是在测
+「驱逐有没有让模型看到错的前缀」。
+
+三条判据，按顺序：
+
+1. **能跑**：`budget < prompt` 时 HTTP 200（不是 500）
+2. **保留的 KV 是对的**：secret-code 测试答案与不驱逐时一致
+3. **确定性**：同配置跑两次输出一致
+
+**不要**再用「逐字等于全量」——它会永远失败，且失败不说明有问题。
+
+## 10. 复现入口
 
 验证副本在 `.qlh_tmp/kvmem-build/`（未入库，约 2.4 GB）：
 
