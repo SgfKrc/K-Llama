@@ -55,7 +55,7 @@ post-sampling logprobs、cache 复用两轮、400 token 长生成、10 组随机
 
 **验收**（`verify/verify_mtp.sh`）：同一行 h（先证明与整模 `h_nextn` 逐位相同）、同一 token、同一 pos，远程 tail 内部递归 3 步的结果与「整模 + MTP
 」**逐个相同**（11751 / 13 / 271 全中）；`verify/verify_mtp_e2e.sh`：远程链三组（不投机 / ngram / MTP）输出**逐字节相同**。
-`verify/verify.sh` 十二组 53 项、`verify/verify_chain_death.py` 36、`verify/verify_seq_id.py` 9、
+`verify/verify.sh` 十三组 57 项、`verify/verify_chain_death.py` 36、`verify/verify_seq_id.py` 9、
 `verify/verify_mtp.sh` 6、`verify/verify_mtp_e2e.sh` 6、`verify/verify_grammar_spec.sh` 23、
 `verify/verify_rbudget_spec.sh` 36 在 v9 之后全过。
 

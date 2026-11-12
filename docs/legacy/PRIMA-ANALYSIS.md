@@ -31,7 +31,7 @@
 | 层过滤 | 运行时：`for il < n_layer { if (!this_layer_is_mine) continue; }`（`11042-11054`） | 加载期：改写 `block_count` 与 `nextn`（`PATCHES.md` 第二代） |
 | 层号映射 | `map_layer_to_local_id(il)` → 本地 0..w-1（`3854-3883`） | `get_weight`：`blk.i` → `blk.lo+i`（`PATCHES.md` 第二代） |
 | 层区间表达 | **累积窗口数组** `n_layer_window[]`，按 rank 顺序累加（`3841-3852`） | **显式** `layer_range = "lo:hi"` |
-| 全局张量 | rank0 硬编码建 `tok_embd` / `output` | `needs_tok_embd()` / `needs_output()`，中段省 1030.62 MiB（`PATCHES.md` 第二代） |
+| 全局张量 | rank0 硬编码建 `tok_embd` / `output` | `needs_tok_embd()` / `needs_output()`，中段省 ~913 MiB（`PATCHES.md` 第二代） |
 | 接力取值 | subgraph 输出 `sub_gf_out`（`18528`） | `output_norm` **之前**（`embeddings_pre_norm`，`PATCHES.md` 第二代） |
 | 段间载荷 | float32 `n_embd` = 8 KB | float32 `n_embd` = 8 KB（`ARCHITECTURE.md` §4） |
 | 架构覆盖 | **2**（LLaMA / Qwen2，`17003` 断言） | 所有架构（`ARCHITECTURE.md` §2 为架构无关） |

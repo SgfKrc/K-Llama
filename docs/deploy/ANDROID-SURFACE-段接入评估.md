@@ -1,7 +1,7 @@
 # 弱 CPU + 16 GiB 设备跑 35B-A3B 的一段
 
 > 状态：**已验证**（结论仍成立；实现侧 `shim` 与 `chain_client` 已随 v2 退场，见下）
-> 更新日期：2026-11-11
+> 更新日期：2026-11-12
 > 适用范围：什么条件下该把弱设备接进链、接进来要付多少成本、安卓侧的硬约束；读者为
 > 做接入决策与维护这套部署的人。
 > 相关：`THREE-SEGMENT.md`（三段延伸）、`MEASUREMENT-PITFALLS.md`（测量口径）
@@ -13,13 +13,13 @@
 评估对象是 Y700 安卓平板（骁龙 8 Gen 3，16 GiB）与 Surface Pro 7（i5-1035G4，4C/8T，
 16 GiB），基准是主机链（本机 head `0:32` + ROG tail `32:40`）。
 
-**弱设备之间自己组一条链，实测 6.50 t/s**（Qwen3.6-35B-A3B Q6_K，21.87 GiB / 35.51 B）：
+**弱设备之间自己组一条链，实测 6.50 t/s**（Qwen3.6-35B-A3B，**IQ4_XS / Q6_K / Q5_K 混合量化 = 蒸馏版**，21.87 GiB / 35.51 B；官方 `UD-Q4_K_M` 是 21.11 GiB）：
 
 | 方案 | 每轮 | 吞吐 | 说明 |
 | --- | ---: | ---: | --- |
-| 主机链（本机 0:32 + ROG 32:40） | 236 ms | 16.7 t/s | 占着本机 |
+| 主机链（本机 0:32 + ROG 32:40） | ~59.9 ms | 16.7 t/s | 占着本机 |
 | **纯弱设备链（Surface 0:24 + Y700 24:40）** | **153 ms** | **6.50 t/s** | **不占本机** |
-| 单台 Surface 跑整模 | 363 ms | 2.75 t/s | 抖动区（22 GiB > 16 GiB） |
+| 单台 Surface 跑整模 | 363 ms | 2.75 t/s | 抖动区（21.87 GiB > 16 GiB） |
 
 - 比主机链慢 2.6 倍，但**换出整台主机**；
 - 比单台弱设备快 **2.4 倍**——单台 16 GiB 装不下整模，这条路本来跑不起来；
@@ -72,7 +72,7 @@ Linux 上同样是 Itanium mangled 名，必须 `dlsym` 解析。一分钟验证
    `ggml-cpu/arch/arm/repack.cpp` 的专职 kernel（`ggml_gemv_q6_K_8x4_q8_K`:1381 等）。
 3. **模型必须放 Termux 私有目录**，不能放 `/sdcard`——FUSE 上 mmap 极慢甚至失败；`run-as com.termux` 起的进程
    连 `/sdcard` 和 `/data/local/tmp` 都读不了（SELinux 拒绝），只有 Termux 自己的进程（sshd 等）有存储权限。
-4. **整模 21.87 GiB 要传到设备上**。实测 `adb push` 到 `/sdcard` 后 run-as 读不了，
+4. **整模 21.87 GiB（蒸馏版；官方 `UD-Q4_K_M` 21.11 GiB）要传到设备上**。实测 `adb push` 到 `/sdcard` 后 run-as 读不了，
    最终走 `adb forward tcp:18022 tcp:8022` + `scp`，**40 MB/s**（Tailscale 直传只有 0.57 MB/s）。
 5. **Android LMK**：编译时 `-j 6` 会被 SIGKILL，必须 `-j 1`；推理时 20 层（11 GiB）会 OOM，16 层（8.8 GiB）稳定。长时间无交互需要 wakelock。
 
@@ -156,7 +156,7 @@ dense 9B Q4_K_M 全模型（5.37 GiB）实测：Y700 7.82 t/s（45 GB/s 打满�
 **`-t 6` 最优**（24 层 90.3 ms）。上游已把 `--threads -1` 改成优先取物理核数
 （PR #31209），纯 SMT 没有 P/E 异构的绑核惩罚。
 
-**16 GiB 的实际可用量 8–9.5 GiB**（Windows 11 空闲占 4.5–5.5）。整模 21.87 GiB 靠 mmap
+**16 GiB 的实际可用量 8–9.5 GiB**（Windows 11 空闲占 4.5–5.5）。整模 21.87 GiB（蒸馏版）靠 mmap
 选择性加载后，head 24 层约 12.6 GiB 权重——**贴边**，这是 §2.1 里页缓存必须热的根本原因。
 
 风险：Windows 不因超内存拒绝分配，而是分页到 swap（`MEMORY-LIMITS.md` §1 的"黑屏"）。

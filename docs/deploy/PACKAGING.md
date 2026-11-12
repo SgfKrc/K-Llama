@@ -105,7 +105,7 @@ runtime\python.exe probe.py --head 127.0.0.1:9103 --tail 100.x.x.x:9106
 - **`launcher.py` 不用 `os.execve`**。它替换进程后，调用方的 ssh/shell 会认为本进程已结束、
   关闭连接，新进程随即被杀（Windows 上实测 exit 0 且没有 worker 存活）。用 `subprocess`
   保持前台阻塞。
-- **模型不进包**。21.87 GiB（23.48 GB），只能由用户自己放，`config.toml` 指过去。
+- **模型不进包**。21.87 GiB（23.48 GB，蒸馏版；官方 `UD-Q4_K_M` 为 21.11 GiB），只能由用户自己放，`config.toml` 指过去。
 - **两份整模**。`LLAMA_LAYER_RANGE` 要求每个节点持有完整文件，只 touch 自己那几层。
 
 ## 5. 已验证的边界
@@ -143,7 +143,7 @@ supervisor 形态不需要 `--range` / `--port`：本机是哪几段、切点在
 `setsid` + `termux-wake-lock` 后台起服务。幂等，重复跑只补缺的部分。
 
 **为什么不是 APK**：NDK 要重编（Termux 的 `libc++_shared.so` 和 bionic 不是一回事），
-python 栈要么塞解释器要么重写，21.87 GiB 模型还得让用户 SAF 选一次再复制。而一键脚本
+python 栈要么塞解释器要么重写，21.87 GiB（蒸馏版）模型还得让用户 SAF 选一次再复制。而一键脚本
 只要装个 Termux，成本差一个数量级，且是我们自己调研用的最佳形态。
 
 **三个写进脚本校验的约束**：

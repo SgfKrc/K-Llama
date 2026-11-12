@@ -95,7 +95,8 @@ CRLF。重导时把两条命令都套上 `git -c core.autocrlf=true`（`apply -R
 
 - 只应用主补丁得到的树是 `0c307d82a`（44 文件）：能独立 `--clean-first` 全量编译（385 个编译单元，
   `cmd //c '.qlh_tmp\vrambuild.bat build-split all --clean-first'` 退出 0，`dflash-taps.exe` /
-  `split-smoke.exe` / `split-rows.exe` 等目标齐全），并独立通过 `verify/verify.sh` **十二组 53 项**与
+  `split-smoke.exe` / `split-rows.exe` 等目标齐全），并独立通过 `verify/verify.sh` **十二组 53 项**（组 13 于
+  2026-11-12 加入，现行完整验收是 **57 项**，见 `INDEX.md` §5）与
   `verify/verify_chain_death.py` **36 项**。没有 SLIM-ARC 不影响分段链的任何一条验收。2026-11-09 在
   `H:\llamacpp-c` 上把工作区切到纯分段树实测，跑完切回完整树、`git write-tree` 仍等于
   `181edd82`，日志见 `.qlh_tmp/pure-split-acceptance/`。
@@ -151,7 +152,7 @@ head），接力首步就分叉。代价是这套改动要跟着每个架构走�
 四个关键机制：**`LLAMA_LAYER_RANGE=lo:hi`** 覆盖 `block_count` 与 `nextn`，让架构以为自己只有 `hi-lo` 层，`get_weight`
 把本地 `blk.i` 映射回 `blk.lo+i`；**`embeddings_pre_norm`** 把 tap 点前移到 `output_norm` 之前，替代第一代的
 `layer_inp` 槽位，只改 qwen35 / qwen35moe；**lazy 全局张量** （head 不需要 `output`、tail 不需要 `token_embd`、middle
-都不需要，middle 段因此省 1030.62 MiB）；**relay 末层不裁剪**——`qwen35moe.cpp` 的 `crop_before_nextn` 在 `n_outputs ==
+都不需要，middle 段因此省 ~913 MiB）；**relay 末层不裁剪**——`qwen35moe.cpp` 的 `crop_before_nextn` 在 `n_outputs ==
 0` 时会把末层裁成 `[n_embd, 0]`，而 `t_layer_inp[n_layer]` 登记的正是这条张量，于是 `extract_layer_inputs` 的
 `row_floats == n_embd` 断言失败；修法是 `qlh_keep_full_rows = embeddings_pre_norm ||
 embeddings_layer_inp[n_layer]`，为真时跳过裁剪并在 LM head 之前补回 `ggml_get_rows`。Windows 上不触发这条：编译宏

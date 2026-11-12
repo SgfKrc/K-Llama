@@ -9,7 +9,7 @@
 **中文** | [English](docs/README.en.md)
 
 > 状态：**现行**
-> 更新日期：2026-11-11
+> 更新日期：2026-11-12
 > 适用范围：分段链的对外入口——定位、能力、快速开始、关键约束、实测口径与文档索引。机制归
 > [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)，边界代价归
 > [`docs/limits/SEGMENTED-LIMITS.md`](docs/limits/SEGMENTED-LIMITS.md)，补丁构成归
@@ -181,11 +181,11 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
   上游——上游已含那些提交；`src/models/dflash.cpp` 因 device-buffer 诊断行重新进入变更集。清单见
   [PATCHES]「与上游 193 个提交的重合」。
 
-验收判据是逐位 / 逐字节的 logits，不比生成的文字；下表是 2026-11-09 的结果：
+验收判据是逐位 / 逐字节的 logits，不比生成的文字；下表是 2026-11-12 的结果：
 
 | 套件 | 结果 | 判据 |
 | --- | ---: | --- |
-| `bash verify/verify.sh` | 53（十二组：1–8 组 22 + 组 9 2 + 组 10 20 + 组 11 8 + 组 12 1） | 逐位 / 逐字节；组 11 直接跑 `llama-server + 链 + -md` 产品路径，组 12 用 CUDA 构建验段级 offload |
+| `bash verify/verify.sh` | 57（十三组：1–8 组 22 + 组 9 2 + 组 10 20 + 组 11 8 + 组 12 1 + 组 13 4） | 逐位 / 逐字节；组 11 直接跑 `llama-server + 链 + -md` 产品路径，组 12 用 CUDA 构建验段级 offload，组 13 用 KVMem 构建（`build-kvmem2`，`LLAMA_KVMEM=ON`）验 KV 虚拟化 |
 | `verify/verify_chain_death.py` | 36 | 120 s 读超时、链死而进程活、失败可见 |
 | `verify/verify_seq_id.py` | 9 | 跨段 `seq_id` 与位置 |
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | 链上 draft 与整模逐位、端到端逐字节 |

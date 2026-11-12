@@ -9,7 +9,7 @@
 [中文](../README.md) | **English**
 
 > Status: **Current**
-> Updated: 2026-11-11
+> Updated: 2026-11-12
 > Scope: the entry point for the split chain — what it is, what it can do, how to run it, the hard
 > constraints, the measurement baselines, and the documentation index. Mechanism lives in
 > [ARCHITECTURE.md]; boundary costs in [SEGMENTED-LIMITS.md]; patch composition in [PATCHES.md].
@@ -167,11 +167,11 @@ rather than official BF16, so the comparison holds only between those two files.
   the upstream-overlap section of [PATCHES.md].
 
 Every acceptance check compares bit- and byte-identical logits, not generated text; the table below
-records the 2026-11-09 run:
+records the 2026-11-12 run:
 
 | Suite | Result | Criterion |
 | --- | ---: | --- |
-| `bash verify/verify.sh` | 52 (eleven groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md` |
+| `bash verify/verify.sh` | 57 (thirteen groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11, 1 in 12, 4 in 13) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md`, group 12 checks segment-level offload with a CUDA build, group 13 checks KVMem KV virtualization with the `build-kvmem2` build (`LLAMA_KVMEM=ON`) |
 | `verify/verify_chain_death.py` | 36 | 120 s read timeout, dead chain with a live process, failures visible |
 | `verify/verify_seq_id.py` | 9 | `seq_id` and positions across segments |
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |

@@ -92,8 +92,8 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 ### 2.1 `embeddings_pre_norm` 只覆盖两个架构
 
 - **现象**：relay 段要过 `output_norm` 之前的末层 hidden，开关是 `llama_context_params::embeddings_pre_norm`，实现在 `src/models/qwen35.cpp` 与 `qwen35moe.cpp`
-  的 `embeddings_pre_norm` 分支——`src/models/` 171 个模型实现里的 2 个。
-- **根因**：出口逐架构手写，没有公共挂点。换到上游通用的 `t_layer_inp` 会丢掉「relay 段顺带不裁 LM head」这个好处（省一次近 515 MiB 的 `output` 张量），且第一代就走那个槽位、因要给 9 个架构各登记一次而放弃。
+  的 `embeddings_pre_norm` 分支——`src/models/` 176 个模型实现里的 2 个。
+- **根因**：出口逐架构手写，没有公共挂点。换到上游通用的 `t_layer_inp` 会丢掉「relay 段顺带不裁 LM head」这个好处（省一次近 398 MiB 的 `output` 张量），且第一代就走那个槽位、因要给 9 个架构各登记一次而放弃。
 - **影响**：失败方式从「静默数值偏移」变成「启动即拒」——`split_arch_exports_pre_norm()` 只认 `LLM_ARCH_QWEN35` / `LLM_ARCH_QWEN35MOE`，三处建链检查都 `return -1`；
   远程段的架构在链首看不见，`OP_HELLO` 只报 range / 宽度 / 层深。
 - **代价**：按模型补是机械工作，但要逐个验证 `output_norm` 位置与 norm 类型；改走 `t_layer_inp[n_layer]` 要每架构补一行登记并放弃裁 LM head。真正解法是抽到 `llm_graph_result` 层的公共出口，
@@ -107,13 +107,13 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 - **为什么负**：每帧两次 hop；MTP draft 不看 grammar / rbudget，接受率从 2.76 掉到 1.46–1.73 token/帧；回退率 9–19%（`toolcall.gbnf` 实测 11/16 帧被拒），每次回退 ≈ 一个普通 round；
   回环上 993 KB 只要约 1 ms，省带宽这个唯一好处不存在。
 
-**固定折扣：链上 MTP 接受率比整模低约 13%（512 档约 20%）**（官方 35B：整模 0.9098 / mean len 2.81，双段链**旧路径** 0.6879 /
+**固定折扣：链上 MTP 接受率比整模低——keep-KV 默认 64 档 13%、512 档 4%；旧路径 64 档 24%、512 档 23%**（官方 35B：整模 0.9098 / mean len 2.81，双段链**旧路径** 0.6879 /
 2.37，现行默认 0.7877（115/146），数值逐字节相同）。根因是本仓加的两处：`speculative::process()` 的 catch-up 条件是 `!is_mem_shared && !is_chain && !is_remote`（上游只有
 `!is_mem_shared`），`speculative::draft()` 在 chain 下每轮 `llama_memory_clear` 草稿 KV。两者构成自洽循环：不 catch-up → 草稿没有 prompt 的 KV →
 必须每轮清空 → 即使 catch-up 也读不到 → 跳过 catch-up 是对的。旧路径的代价是接受率封在 0.688。
 
 **现行路线**（`QLH_CHAIN_DRAFT_KEEP_KV=0` 关掉回到旧路径：请求开始时清一次 + 每轮按 target 的接受量 `seq_rm`，让草稿看到本次请求已生成的 token，而非 prompt），2026-11-10
-起是默认：35B 链上 64 档 0.688 → 0.788、512 档 0.582 → 0.724（默认比整模低 13% / 约 20%），生成文本逐字节不变（见 [`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.4）。
+起是默认：35B 链上 64 档 0.688 → 0.788、512 档 0.582 → 0.724（keep-KV 默认比整模低：64 档 13%、512 档 4%；旧路径 64 档 24%、512 档 23%），生成文本逐字节不变（见 [`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.4）。
 
 **判据**：llama.cpp 不承诺 batch invariance，CPU + 量化落在上游 `DETERMINISM.md`（llama.cpp 的 `docs/` 下）的覆盖空白里，所以判据是无回退时链上投机 == **整模投机**、逐字节相同（能过）；
 带回退时只保证到漂移翻掉的第一个近似并列处；「投机 == 不投机」降为 INFO。三个 ggml 分界、上游 PR / issue 与 bit-exact 的改造代价见 [`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §4。

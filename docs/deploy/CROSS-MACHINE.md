@@ -1,7 +1,7 @@
 # 跨机实测：ROG、Surface、Y700 安卓、回环与 Tailscale
 
 > 状态：**现行**
-> 更新日期：2026-11-11
+> 更新日期：2026-11-12
 > 适用范围：远程链投机在三种真实部署形态上的收益（LAN 强机、弱机、回环）、Tailscale →Surface 的首次真跨机零损失实测，以及安卓尾段（
 > Termux / arm64，Lenovo Y700）上 v2.1 跨机的吞吐、就绪与破坏性验收。逐 prompt 与 k 扫描归
 > [`SPECULATION-DATA.md`](../measure/SPECULATION-DATA.md)，MTP 链上折扣的根因归 [`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.4，协议与传输
@@ -79,7 +79,7 @@ loopback 上验过 tap 开销可忽略，跨机验的是 wire 上 tap 逐位与�
 
 **A − C ≈ +3.05 s**，与「25 MB ÷ 9.5 MB/s ≈ 2.6 s」同量级（[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §3.3：prefill 每个 512
 行 ubatch 是 8 MB，1102 token 约 3 个 ubatch 即 24 MB）。**没有 10 s 级的低效**——如果 tap 是逐 token 往返，1102 个 token 会报出数量
-级更大的差；实测差值与带宽估算同量级，说明 tap 是**成批**走的。与 loopback 对照：1192 token 差 **0.2%**；跨机 1102 token 差 **~2.4 s（7–8%）
+级更大的差；实测差值与带宽估算同量级，说明 tap 是**成批**走的。与 loopback 对照：1192 token 差 **0.2%**；跨机 1102 token 差 **~3.05 s（9–10%）
 **。
 
 ### 3.3 结论与两个边界
@@ -170,9 +170,9 @@ arm64-v8a，骁龙 8 Gen 3，15.6 GB RAM）在 Termux 里跑尾段 `split-stage`
 | --- | ---: | --- |
 | 48 token | **6.34 tok/s** | `prompt_ms` 3023.88，`predicted_ms` 7418.48 |
 | 96 token | **6.79 tok/s** | `prompt_n` 27 / `prompt_ms` 3605.68；`predicted_n` 96 / `predicted_ms` 13990.18 |
+| 26 token | **8.50 tok/s** | `prompt_n` 24；这一发另带了 `enable_thinking: false`（§6.4） |
 
 表里的 tok/s 取 llama.cpp 报的 `predicted_per_second`，与 `predicted_n ÷ predicted_ms` 差约 2%（分母口径不同，前者含最后一步的采样与收尾），只影响末位。
-| 26 token | **8.50 tok/s** | `prompt_n` 24；这一发另带了 `enable_thinking: false`（§6.4） |
 
 **35B 的尾段 `32:40`（8 层）压在这块平板上量到 6.3–8.5 tok/s，三次不是单调关系**：96 token（6.79）高于 48 token（6.34），26 token（8.50）最
 高。差值能拆开：26 token 那一发是**同一进程的第二个请求**（`graphs reused = 118`，图已建），prompt eval 是 1905.98 ms / 24 token，而第一个请
@@ -237,6 +237,10 @@ DSpark **+12.4% ~ +17.2%**、DFlash 持平到 −4.8%。差别有机制解释：
 `2 of 8 DFlash taps cross the wire`），DSpark 的 5 个里只有 **1 个**（`1 of 5`），所以 DSpark 的 tap 过网更少。**短 prompt 上
 不划算**：draft ctx 的固定建仓约 2.1 s，摊在 64 token 上就是 −25%（39–46 token 那批量到 DFlash 5.62 tok/s，而不投机是 8.63）。
 
+**口径标注（两批，别混用）**：本批是 **1522-token** 口径（DSpark accept **0.740**，37/50）；**941-token** 口径见
+[`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.8（accept **0.932**，+51%，**历史值**）。两批不可互相换算——prompt 长度
+变了，接受率跟着变。按 [`INDEX.md`](../measure/INDEX.md) 第二节，现行值取本批的 **+12~17%**。
+
 ### 7.2 三段（本机 head + Surface relay + Y700 tail）
 
 拓扑：本机 `0:20` + Surface `20:28`（`role=relay`）+ Y700 `28:40`（`role=tail`），三段同一份整模。ready 时间（两次）：tail **10.4
@@ -246,6 +250,10 @@ DSpark **+12.4% ~ +17.2%**、DFlash 持平到 −4.8%。差别有机制解释：
 9.07 s，日志 `.qlh_tmp/3seg_throughput.log`）；同 prompt 的两段链不投机是 7.42 / 8.71 tok/s（§7.1），**慢 12–20%**（两轮分别 −12.0% / −20.3%）。结构原因在
 `llama_context::decode_split()`：它对 `split_remotes` **逐个串行**调用、head 是中心，所以三段链的 hidden 过网 **4 次**（两段 2 次）、两
 个来回串行，checkpoint 每段一次往返（v6 起只传 8 字节 handle，`SEGMENTED-LIMITS.md` §2.5）。**三段只在单段装不下时才有意义。**
+
+**三套切分不是同一拓扑**：本批是 `0:20` / `20:28` / `28:40`（1522 token）；[`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.8 的
+**9.09 t/s** 是 `0:32` / `32:36` / `36:40`（941 token、`-t 14`）；2026-11-12 又测了第三套 `0:24` / `24:32` / `32:40`（`-t 8`），
+得 **5.85 t/s**，那是 [`INDEX.md`](../measure/INDEX.md) 第一节的现行值。三者不可互相换算。
 
 **两种死法都点名到段**（`?deep=1` 的 `chain` 字段按链序列出两段，`status` 两次都是 `2/3 段 ok`、退出码 1）：
 

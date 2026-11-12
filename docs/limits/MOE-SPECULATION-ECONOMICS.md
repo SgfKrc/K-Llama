@@ -33,7 +33,7 @@
 
 实测吻合（`topology-local-32-8.toml`，tail 段 8 层，本机 CPU）：
 
-    单行 37.6 ms = 8 层约 25.3 ms + lm_head 12.3 ms  →  lm_head 占 33%
+    单行 37.6 ms = 8 层约 25.6 ms + lm_head 12.0 ms  →  lm_head 占 31.9%
     （lm_head 由 `slimarc/prototype:checks/bench_lm_head.py`（v2，已退场）实测：M=1、q6_K、本机 6 线程、reps=15）
 
 ---

@@ -31,7 +31,7 @@
 主因」从 v2 的 host buffer 抢占改成了 `op_offload`（见 §⑤/§⑥）。**第一轮为什么测反了**：① 默认双设备枚举（Iris + 4060）
 走 `multi_device` 慢路径；② `llama-cli` 的短 prompt（~50 token）正好落在交叉点左侧；③ CPU 后端不同级（`GGML_CPU_ALL_VARIANTS`）。
 
-**35B 装不进**：20.82 GiB > Iris 共享堆 ~15.4 GiB，部分 offload 会落进 OOM 路径。**方法学**： `llama-bench` 的 `-ngl`
+**35B 装不进**：20.82 GiB（旧 `Q4_K_XL`；现行 `UD-Q4_K_M` 是 21.11 GiB）> Iris 共享堆**总量 15.82 GiB**（空闲 15.06 GiB），部分 offload 会落进 OOM 路径。**方法学**： `llama-bench` 的 `-ngl`
 不要一次传多个值（多值模式与单值能差 3 倍）；避免高负载（同一配置重复测能差 25%）；Vulkan 首轮要热身；
 **基线与测试构建必须同源** —— v2 踩的就是这条。
 
@@ -146,7 +146,7 @@ vs `-ngl 99` 74.3，−47%），「不要用中间值」对独显同样成立，
 −2.1% / −4.8%，**只剩「装不进共享堆」这条硬边界成立**。⑤ Vulkan 首次运行要编译 pipeline，第一次采样能差一个量级
 （第一轮 4060 `-ngl 99` 只有 9.5 t/s，热身两轮后 168.4）；§⑥ 的每组配置都跑了两轮、只取第二轮。
 
-**35B 没测**：35B-A3B（20.82 GiB）CPU 上约 1 t/s，48 token 要 40 秒以上，且 15.82 GiB 共享堆装不下，会落进 `#31538` 的
+**35B 没测**：35B-A3B（20.82 GiB，旧 `Q4_K_XL`；现行 `UD-Q4_K_M` 是 21.11 GiB）CPU 上约 1 t/s，48 token 要 40 秒以上，且 15.82 GiB 共享堆装不下，会落进 `#31538` 的
 OOM 路径而不是「慢」；2026-11-10 复测同样跳过（体积不变）。
 
 ## ④ 部署规则（2026-11-10 修订）
@@ -158,7 +158,7 @@ host buffer，所以 `-ngl 0` 不再像 v2 说的掉 41%，实测 9B dense 生�
 
 - **核显值不值得用**：**decode 基本持平（−4.8%），prefill pp≥48 大赢（1.9–2.4×），pp≤32 输（0.69×）**。值得用的场景是
   「长 prompt、decode 只占一小部分」：长文档 prefill、一次性大上下文、agent 读长文那一步。短 prompt 对话、长生成
-  （2k token 输出）用纯 CPU 更好。硬边界仍是体积：35B（20.82 GiB）装不进 ~15.4 GiB 共享堆。
+  （2k token 输出）用纯 CPU 更好。硬边界仍是体积：35B（20.82 GiB，旧 `Q4_K_XL`；现行 `UD-Q4_K_M` 21.11 GiB）装不进共享堆总量 15.82 GiB（空闲 15.06 GiB）。
 - **「全量或不用」仍成立**：`-ngl 16` tg 5.92（−19%）、`-ngl 0` 默认 6.19（−16%），中间态是负的。
 - **`--no-op-offload` 不是万能开关**：只在 `-ngl < 全部` 时有作用，且 pp256 上是负的（−42%）；只有 pp32 附近的小
   batch 是纯赚（+75%）。它能修的是「小 batch 被搬上 GPU」的浪费，治不了「全量 offload 的 decode 慢」。
@@ -198,7 +198,7 @@ head 在 probe 上是正收益、经 server 一度只剩 −10%。语义、显�
 
 ## ⑥ 2026-11-10 复测：当前代码上的核显
 
-**装置**：Iris Xe（`uma: 1`，16194 MiB / 15426 free），单卡隔离 `GGML_VK_VISIBLE_DEVICES=0`；构建三份：
+**装置**：Iris Xe（`uma: 1`，16194 MiB / 15426 free，即**总量 15.82 GiB、空闲 15.06 GiB**），单卡隔离 `GGML_VK_VISIBLE_DEVICES=0`；构建三份：
 `build-vulkan`（**571a9d0**，11-06）、`build-vulkan-new`（**19776b74e**，本轮现编，参数同 `build-vulkan`）、
 `H:\llamacpp-clean\build-vulkan`（**e0f142d**，v2 原始构建）。9B Q4_K_M，`-t 8`，llama-bench `-r 3` + 热身 1 轮、
 只取第二轮，llama-cli `-n 48 -st` 交叉验证；2B 同装置。

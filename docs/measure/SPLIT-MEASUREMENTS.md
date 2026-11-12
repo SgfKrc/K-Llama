@@ -19,8 +19,8 @@
   B**。
 - **`seq_rm`**：删尾部在上游 hybrid 默认 `n_rs_seq = 0` 下永远失败（上游 open PR #28007 / #31656），本仓改成失败可见。
 - **换模型（2026-11-08）**：官方 `UD-Q4_K_M` 后形状全部对得上、零改代码，整模 MTP k=2 接受率从 0.699 回到 **0.910**，链上旧路径 **0.688**（低
-  24%，设计选择）；2026-11-10 起草稿 KV 默认跨轮续写，链上默认 **0.788**（低 13%，512 档低约 20%）。
-- **协议 v9（2026-11-09）**：补上远程链的 `layer_inp` tap，DFlash / DSpark 在远程链上**零损失**，真跨机也零损失、prefill 只多 2.4 s。
+  24%，设计选择）；2026-11-10 起草稿 KV 默认跨轮续写，链上默认 **0.788**（低 13%）、512 档 **0.724**（低 4%；旧路径 0.582 是低 23%）。
+- **协议 v9（2026-11-09）**：补上远程链的 `layer_inp` tap，DFlash / DSpark 在远程链上**零损失**，真跨机也零损失、prefill 只多 3.05 s。
 - **markov 头**：收益是「可预测 / 可抄写」，不是「长距离依赖」。
 
 ## 0. 口径
@@ -105,13 +105,13 @@ ubatch 的 prefill 顺带快 27%，因为不再申请 / 清零那 1.7 GiB。
 
 | 入口 | 覆盖 | 最近一次结果（2026-11-09，纯分段树 `0c307d82a`） |
 | --- | --- | --- |
-| `bash verify/verify.sh` | 十二组：组 1–8 共 **22 项**、组 9 本地 DFlash tap **2 项**、组 10 远程 DFlash/DSpark **20 项**、组 11 DFlash device-buffer **8 项**、组 12 段级 offload（CUDA 构建）**1 项** | 2026-11-09 的十一组全跑 **52 / 0 / 0**（可用内存 ≥ 闸门）；组 12 于 2026-11-11 加入，需 CUDA 构建 |
+| `bash verify/verify.sh` | 十三组：组 1–8 共 **22 项**、组 9 本地 DFlash tap **2 项**、组 10 远程 DFlash/DSpark **20 项**、组 11 DFlash device-buffer **8 项**、组 12 段级 offload（CUDA 构建）**1 项**、组 13 KVMem 的 KV 虚拟化（`build-kvmem2` 构建）**4 项** | 2026-11-09 的十一组全跑 **52 / 0 / 0**（可用内存 ≥ 闸门）；组 12 于 2026-11-11 加入（需 CUDA 构建）、组 13 于 2026-11-12 加入（需 KVMem 构建），现行全跑是 **57 / 0 / 0** |
 | `verify/verify_multislot.py --np 2` / `--np 4`；`verify/accept_np.py --np 2` | 组 5 的两半；串行 vs 并发逐字节 | 各 10/10 200；**ALL PASS**（并发墙钟 1.6 s） |
 | `verify/mtp_remeasure.sh`；`verify/verify_seq_rm_exact.py --expect-known-fail`；`verify/verify_seq_rm_shared.py` | §2 的三负载；`seq_rm` 删尾部精度（A/B/C 三形态，无 split 无 server）；shared-prefix 误伤 | 三负载 ×（off / k=2）× 3 次；**1 pass / 5 known-fail / 0 unexpected**，退出 0；shared-prefix 两条 completion 逐字节相同、`[INFO] injection never fired` |
 
 判据全部是逐位 / 逐字节（`split-smoke`、`split-rows`、`dflash-taps` 三个目标，组 11 直接跑产品路径），不看生成文字；组 9/10/11 需要 35B +
-DFlash 权重。**项数以脚本逐项计数为准**：组 1–8 = 22 项，全十二组 = 53 项（44 + 组 11 的 8 项 + 组 12 的 1 项）。`verify/verify.sh` 默认先跑一次增量构建，`PASS`
-里会多出「三目标构建完成」这一项（`PASS=54`）；`--skip-build` 跑出来就是纯验收的 **53**，两种跑法的失败数都是 0，那一行不算进 53 项。
+DFlash 权重。**项数以脚本逐项计数为准**：组 1–8 = 22 项，全十三组 = 57 项（44 + 组 11 的 8 项 + 组 12 的 1 项 + 组 13 的 4 项，组 13 = KVMem 的 KV 虚拟化）。`verify/verify.sh` 默认先跑一次增量构建，`PASS`
+里会多出「三目标构建完成」这一项（`PASS=58`）；`--skip-build` 跑出来就是纯验收的 **57**，两种跑法的失败数都是 0，那一行不算进 57 项。
 
 **纯分段树上的独立验收**：`09338b85e` + 主补丁 = 树 `0c307d82a`（44 文件，不含 SLIM-ARC），`--clean-first` 全量构建（385 个编译单元）后
 `verify/verify.sh` **52 / 0 / 0**、`verify/verify_chain_death.py` **36 / 0**；组 6 的三段链 checkpoint 往返、组 8 的
@@ -175,7 +175,7 @@ v7 验证通道单帧回复 **993,312 B → 48 B（20,694×）**；v8 的 `OP_MT
 ### 9.7 正确性验收
 
 `verify/verify_mtp.sh`（6 项）：同一行 h 与整模 `h_nextn` 逐位相同、远程 tail 递归 3 步与「整模 + MTP」逐个相同（11751 / 13 / 271）；
-`verify/verify_mtp_e2e.sh`（6 项）：远程链三组输出逐字节相同。全套 `verify/verify.sh` 12 组 53 项、
+`verify/verify_mtp_e2e.sh`（6 项）：远程链三组输出逐字节相同。全套 `verify/verify.sh` 13 组 57 项、
 `verify/verify_chain_death.py` 36、`verify/verify_seq_id.py` 9、`verify/verify_grammar_spec.sh` 23、
 `verify/verify_rbudget_spec.sh` 36 在 v9 之后全过。
 
@@ -193,7 +193,7 @@ probe」见 [`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §5。
 
 官方整模 k=1..8 的甜点仍是 2：k=2 接受率 **0.9098**、mean len **2.81**、gen 10.54 tok/s；k=3 起接受率掉到 0.859、mean len 4.05
 只换来 0.79。官方 vs 蒸馏在 k=2 / 4 / 8 上提升 **+30% / +46% / +76%**；pos0 两边接近、pos1 起分叉——差的是 hidden 分布一致性，所以蒸馏版的接受率
-不能拿来做容量规划。代码回归用 2B（`verify/verify.sh` 24/24、`verify/verify_mtp.sh` 6/6；当时套件 24 项，现为 53 项），新模型验收走「本地双段链 vs 整模逐字节」。**口径提醒：35B
+不能拿来做容量规划。代码回归用 2B（`verify/verify.sh` 24/24、`verify/verify_mtp.sh` 6/6；当时套件 24 项，现为 57 项），新模型验收走「本地双段链 vs 整模逐字节」。**口径提醒：35B
 的「整模 0.910 / 链上 0.688」是官方版上的数，本文 §3 与 §9 的 35B 数字是旧蒸馏版上的数，两份权重不能混用。** 全部细节见
 [`MODEL-SWAP.md`](MODEL-SWAP.md)。
 
@@ -224,7 +224,7 @@ MTP 走 nextn 通道，链上被 `!is_chain` 压到 0.6879；DFlash（0.8298）�
 | k=2 verify（3 行） | 48 KB | 24 KB |
 | prefill 一个 512 行 ubatch | **8 MB** | **4 MB** |
 
-回环 1192 token 差 **0.2%**，真跨机 1102 token 多 **2.4 s**。
+回环 1192 token 差 **0.2%**，真跨机 1102 token 多 **3.05 s**。
 
 ### 12.4 容错与验收
 
@@ -274,5 +274,5 @@ pos2 才开始）。文档问答档的 accept 从 0.71 涨到 0.92，两种头�
 | DSpark | **117/140 = 0.83571** | **相同** |
 | MTP（对照） | 108/157 = 0.68790 | 对照 |
 
-输出 3/3 逐字节相同（250 / 244 / 249 字符）。prefill：A ~32.1 s / B ~32.8 s / C ~29.7 s，A−C ≈ +2.4 s。全表、两个边界（互斥参数、
+输出 3/3 逐字节相同（250 / 244 / 249 字符）。prefill：A ~32.1 s / B ~32.8 s / C ~29.05 s，A−C ≈ +3.05 s。全表、两个边界（互斥参数、
 target 体积必须一致）见 [`CROSS-MACHINE.md`](../deploy/CROSS-MACHINE.md) §3。

@@ -1,7 +1,7 @@
 # 投机实测数据：k 扫描、DFlash、选型矩阵与未落盘数字
 
 > 状态：**现行**
-> 更新日期：2026-11-11
+> 更新日期：2026-11-12
 > 适用范围：MTP / DFlash / DSpark 的逐项实测（2B 与 35B）、草稿源选型矩阵、投机的结构成本，以及「日志里找不到」的数字清单。跨机收
 > 益归 [`CROSS-MACHINE.md`](../deploy/CROSS-MACHINE.md)，换模型的接受率基线归 [`MODEL-SWAP.md`](MODEL-SWAP.md)，协议实现归
 > [`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md)。
@@ -154,7 +154,7 @@ per-position 印证：mid 档 pos6 **+20.2**、pos7 **+21.6**（抄写红利最�
 
 | 数字 | 谁在引用 | 现状 |
 | --- | --- | --- |
-| MTP k=2 **1.33× / 1.06× / 1.00×**（代码 / 混合 / 中文） | `ARCHITECTURE.md` 与 [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §3.2 | 日志里没有这三个数。重测是 **0.87× / 0.69× / 0.63×**；1.3× 只出现在 §1.1 那种复读 prompt 上（1.32×）。**需在真实负载上重测，不能当结论用** |
+| MTP k=2 **1.33× / 1.06× / 1.00×**（代码 / 混合 / 中文） | [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §3.2 | 日志里没有这三个数。重测是 **0.87× / 0.69× / 0.63×**；1.3× 只出现在 §1.1 那种复读 prompt 上（1.32×）。**需在真实负载上重测，不能当结论用** |
 | DFlash k=3 **+23.7%** | [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §3.2 | 日志复算是 **1.24×（+24.1%）**，差 0.4pp 在复现噪声内 |
 | 级联整块全接受 **42.5% / 2.8%**（k=3 / k=15） | [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §2.3、[`SPECULATION-MATRIX.md`](SPECULATION-MATRIX.md) §4 | 从 `.qlh_tmp/casc/srv_{k3,k15}.log` 数出：`3/3` 96/226 轮、`15/15` 5/177 轮。把 `1/1`、`2/2`、`4/4` 这类块尾也算上是 **43.4%（98/226）/ 4.5%（8/177；复算到 9 轮，多出的一轮是 `4/4`）**。两个口径不完全可比（那边数的是 Python 驱动的级联路径），k=15 只有 5–9 轮全接受，噪声很大 |
 | checkpoint **19.85 s → 0.71 s** | [`PATCHES.md`](../deploy/PATCHES.md) 第四代、[`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §1 | 两个数各自成立，但「修前第二轮 19.85 s」没有日志：19.85 s 是整段重算的成本，修前实测到的是**失败**（`kill_ckpt_9415/9416`） |

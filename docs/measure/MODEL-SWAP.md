@@ -1,7 +1,7 @@
 # 换模型：从蒸馏版到官方版（2026-11-08）
 
 > 状态：**现行**
-> 更新日期：2026-11-11
+> 更新日期：2026-11-12
 > 适用范围：35B target 从蒸馏版换到官方 `UD-Q4_K_M` 的全部结论——两份权重的 metadata、形状核对、接受率基线、官方 vs 蒸馏
 > 的差距、链上 13% 折扣的根因，以及「代码回归」与「新模型验收」的分界。`build-split/accept_baseline.md` 是原始记录，两份不一致时以日志为准（下文标出两处小出入）。投机矩
 > 阵与 k 扫描归 [`SPECULATION-DATA.md`](SPECULATION-DATA.md)，协议归[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md)。
@@ -11,7 +11,7 @@
 | | 旧（**已弃用**） | 新（**现行**） |
 | --- | --- | --- |
 | 文件 | `Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-MTP-I-Quality.gguf` | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` |
-| 来源 | lordx64 蒸馏 + **mudler 的 "apex" 工作流**做的混合量化（Q6_K 主 + Q8_0 nextn） | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` 的 `UD-Q4_K_M`（官方 MTP 仓） |
+| 来源 | lordx64 蒸馏 + **mudler 的 "apex" 工作流**做的混合量化（**模型卡说法**：Q6_K 主 + Q8_0 nextn；与逐张量清点不符，见下） | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` 的 `UD-Q4_K_M`（官方 MTP 仓） |
 | 体积 | 23.48 GB（21.87 GiB） | **21.11 GiB** |
 | 本机路径 | `H:/qlh_models/qwen3-6-35b-a3b-opus47-distill-apex-mtp/` | `H:/qlh_models/qwen3-6-35b-a3b-mtp-official/` |
 | `general.name` | **`Safetensors`**（转换时没传 `--model-name`） | `Qwen3.6-35B-A3B` |
@@ -22,7 +22,10 @@
 **21.86 GiB（5.29 BPW）**；上表的 21.11 / 21.87 与 `accept_baseline.md` 一致，是同一份文件的四舍五入差（0.01 GiB）。
 
 「Q6_K 主 + Q8_0 nextn」与 mudler 的 apex 工作流来自该 GGUF 的模型卡，不是日志——日志只能证到 `general.dataset.0` 指向 lordx64 的蒸馏仓、以及
-5.29 BPW 比官方的 5.10 BPW 更高（与「主权重放大到 Q6_K」一致）。
+5.29 BPW 比官方的 5.10 BPW 更高。**但「Q6_K 主」这个说法与逐张量清点不符**：按 `scripts/inspect_gguf_quant.py` 清点
+（[`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md) §2），蒸馏版最大的一块是 **IQ4_XS 8.367 GiB（38.3%）**，Q6_K 只有
+**7.294 GiB（33.4%）**、Q5_K **5.156 GiB（23.6%）**、Q8_0 0.960（4.4%）——是 **IQ4_XS / Q6_K / Q5_K 三档混合**，不是 Q6_K 主。
+所以「Q6_K」只能当模型卡标签用，不能拿它算每层重量或估算显存（**以逐张量清点为准**）。
 
 > **与 `accept_baseline.md` 的一处出入**：那份记录写 `quantize.imatrix.file = /home/mudder/autoresearch-quant/...`。日
 > 志里这是两条不同的 key——`imatrix.file` 指 `/home/ubuntu/work/apex/...`，`/home/mudler/autoresearch-quant/...` 是
@@ -190,7 +193,7 @@ mode 2 是 0.882），两次重跑逐位相同；`prompt_ms` mode 0 是 49–60 
 
 | 入口 | 测的是 | 结果 | 日志 |
 | --- | --- | --- | --- |
-| `bash verify/verify.sh --skip-build` | **代码没退化**（2B，24 层） | **52/52 PASS，exit 0** | `build-split/verify_catchup_default.log` |
+| `bash verify/verify.sh --skip-build` | **代码没退化**（2B，24 层） | **53/53 PASS，exit 0** | `build-split/verify_catchup_default.log` |
 | `bash verify/verify_mtp.sh` | 链上 MTP 机制（2B，tail `20:24`） | **6/6 PASS，exit 0** | `build-split/verify_mtp_catchup.log` |
 | 本地双段链 vs 整模（35B 官方） | **形状对得上 + 数值正确** | **逐字节相同**（4 配置 × 3 重跑，64/512 各 3 prompt） | §11.4 的 `acc_*.json` |
 | 形状复位验（split-stage tail `32:40`、整模 `--spec-type draft-mtp`） | 新模型的形状 | 通过 | `build-split/shape_tail.log`、`acc/official_k2.log` |
@@ -253,11 +256,19 @@ verify 的 logits 要走 `993 KB/轮`（整行）而不是候选通道的 `48 B/
 | --- | ---: | ---: | ---: |
 | 本机 → Surface（`0:32` + `32:40`） | 10.77 | 6.67（**−38%**） | **12.36（+15%）** |
 | 本机 → Y700（`0:32` + `32:40`） | 7.51 | 8.93（**+19%**） | **11.35（+51%）** |
-| 三段（本机 → Surface relay → Y700 tail） | 9.09 | 6.25（**−31%**） | 9.05（−0.4%） |
+| 三段（本机 `0:32` + Surface relay `32:36` + Y700 tail `36:40`） | 9.09 | 6.25（**−31%**） | 9.05（−0.4%） |
 
-接受率与拓扑无关：DFlash **0.848**（39/46，mean len 2.70）、DSpark **0.932**（41/44，mean len 2.86）。
-这一点本身是判据——它说明收敛后的 `chain_kind` 在三种链形态上给出了同一个答案，形态没有改变
-draft 的行为。DSpark 那 6 次重跑的接受率逐位相同（`0.93182 / 41 accepted / 44 generated`），
+**口径标注（两批，别混用）**：本表是 **941-token** 口径（DSpark accept **0.932**），Y700 那格给出 **+51%**（11.35 vs 7.51）；
+**1522-token** 口径见 [`CROSS-MACHINE.md`](../deploy/CROSS-MACHINE.md) §7.1（accept **0.740**，**+12.4% ~ +17.2%**）。
+两批的差异来自 prompt 长度导致的接受率差，不是代码差异。按 [`INDEX.md`](INDEX.md) 的现行值取 **1522-token 批的 +12~17%**，
+本表 941-token 批的 **+51% 是历史值**。三段那行的 9.09 是 `-t 14` 的旧测；2026-11-12 的现行值是 **5.85 t/s**
+（`0:24` / `24:32` / `32:40`、`-t 8`，见 [`INDEX.md`](INDEX.md) 第一节），与本节不是同一拓扑。**另一批测量**（1522 token、
+`0:20` / `20:28` / `28:40`）的三段链是 **6.53 / 6.94 t/s**，见 [`CROSS-MACHINE.md`](../deploy/CROSS-MACHINE.md) §7.2；
+它和本节的 9.09、5.85 都不可互相换算——prompt 长度与切点都不同。
+
+同一批测量里三种链形态给出的 `chain_kind` 一致：DFlash **0.848**（39/46，mean len 2.70）、DSpark **0.932**（41/44，mean len 2.86）。
+这一点本身是判据——它说明收敛后的 `chain_kind` 在三种链形态上给出了同一个答案。**接受率随 prompt 内容与长度变**
+（0.932 @941 token vs 0.740 @1522 token），不随拓扑变。DSpark 那 6 次重跑的接受率逐位相同（`0.93182 / 41 accepted / 44 generated`），
 所以下面的速度差不是「有时投机没生效」。
 
 **Surface 那格的 12.36 是 6 次重跑的中位数**（稳态 5 次：12.04 / 12.25 / 12.36 / 13.07 / 13.45，

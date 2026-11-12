@@ -41,7 +41,7 @@
 | `cpu-8-40.gguf` | `--k 8` | 16.81 GiB | 587 |
 | **合计** | | **21.84 GiB** | |
 
-整模是 20.82 GiB（= 22.36 GB），多出的部分是两段各自携带的全局张量：`token_embd` 与 `output` 各 515 MiB。工件与生成器都已退场，契约见 [`CUT-TOOL.md`](../legacy/CUT-TOOL.md)。
+整模是 20.82 GiB（= 22.36 GB），多出的部分是两段各自携带的全局张量：`token_embd`（515 MiB，Q8_0）与 `output`（398 MiB，Q6_K）。工件与生成器都已退场，契约见 [`CUT-TOOL.md`](../legacy/CUT-TOOL.md)。
 
 ---
 

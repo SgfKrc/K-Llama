@@ -18,7 +18,7 @@
 | 能力 | 结果 | 证据 |
 | --- | --- | --- |
 | 单机两段跨进程 + DFlash | 20.9 tok/s（64 token 口径） | [`SPECULATION.md`](../measure/SPECULATION.md) §11 |
-| 跨机两段，无投机 | 12.2 tok/s | [`MEASUREMENTS.md`](../measure/MEASUREMENTS.md) |
+| 跨机两段，无投机 | 12.2 tok/s（**128-token、decode-only 口径**） | [`SPECULATION.md`](../measure/SPECULATION.md) §11 |
 | 两台弱设备各持整模 | decode 6.50 tok/s，prefill 22 tok/s | [`PROGRESS.md`](../legacy/PROGRESS.md) §1.1 |
 | 多轮对话 | 35B 三轮 PASS（本机两段与 **Surface+Y700 弱设备链**各一次）；增量 KV 与从头重放逐位相同（23/23 token） | `slimarc/prototype:checks/verify_multiturn.py`（已退场） |
 | 非贪心采样 | 分段不引入误差（TV=0）；输出连贯 | `slimarc/prototype:checks/probe_logits_delta.py`（已退场） |
@@ -145,7 +145,7 @@ python probe.py --head 127.0.0.1:9103 --tail <另一台>:9106
 | 想法 | 理由 |
 | --- | --- |
 | 服务发现（mDNS / 注册中心） | 2–3 台机器，Tailscale 加手填 IP 够用；出问题时 `probe.py` 能立刻分出「连不上」与「连上了没发 HELLO」 |
-| Android APK | 要 NDK 重编（Termux 的 libc++ 与 bionic 不是一回事）、python 栈要么塞解释器要么重写、21.87 GiB（23.48 GB）的模型还得让用户 SAF 选一次。一键脚本成本低一个数量级 |
+| Android APK | 要 NDK 重编（Termux 的 libc++ 与 bionic 不是一回事）、python 栈要么塞解释器要么重写、21.87 GiB（23.48 GB，蒸馏版）的模型还得让用户 SAF 选一次。一键脚本成本低一个数量级 |
 | 单独的健康探测**服务** | 心跳已经内建在 worker 里（`_session` 每圈 touch 一个文件），supervisor 看 mtime 就够；再起一个独立探测进程就是给同一事实造第二份判断 |
 | 真并发混批（多序列换吞吐） | 8–12 人天，且一个 worker 一个 context、decode 仍串行。多序列的收益是会话共存与前缀复用，见 [`ISSUE-multi-sequence.md`](../issues/ISSUE-multi-sequence.md) |
 | 非贪心的 GPU 逐位等价 | head 段 6 层在 GPU 时 TV 0.0014–0.0299；要逐位就把 `gpu_layers` 设 0，代价是 32 层全走 CPU |

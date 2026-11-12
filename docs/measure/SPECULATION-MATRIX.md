@@ -19,7 +19,7 @@
 **② 出不了 token 的段等于没在投机。** 出 token 只需要词表投影。loader 的按需 lazy 判据是写死的：首段建 `token_embd`、末段建 `output`、中段两个都不建（
 `needs_tok_embd()` / `needs_output()`，`llama-model-loader.cpp`），**没有任何配置项能改**。
 
-想让非 tail 段独立起草，只有两条路：带一份自带词表的 draft（DFlash 的路子，+1.03 GiB），或者改 loader 给它加装 `output`（515 MiB，无开关）。
+想让非 tail 段独立起草，只有两条路：带一份自带词表的 draft（DFlash 的路子，+1.03 GiB），或者改 loader 给它加装 `output`（398 MiB，无开关）。
 
 **③ 一个段只能提供"它自己那几层的 hidden"。** `add_layer_inp` / `get_layer_inp` 按**本地 lid** 开槽（`qlh_kh_add_layer_inp` /
 `qlh_kh_get_layer_inp`，`slimarc/prototype:shim/qlh_keep_head_gpu.c`），`chain_client.dflash_split_layers`
