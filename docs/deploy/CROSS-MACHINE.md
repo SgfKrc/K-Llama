@@ -77,7 +77,7 @@ loopback 上验过 tap 开销可忽略，跨机验的是 wire 上 tap 逐位与�
 | B DSpark | 32840 ms → **~32.8 s** |
 | C MTP | 27499 / 28212 / 29698 / 30783 ms → **~29.05 s**（四次均值 29048 ms） |
 
-**A − C ≈ +3.05 s**，与「25 MB ÷ 9.5 MB/s ≈ 2.6 s」同量级（[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §3.3：prefill 每个 512
+**A − C ≈ +3.05 s**，与「25 MB ÷ 9.5 MB/s ≈ 2.6 s」同量级（9.5 MB/s 是旧口径；2026-11-13 用 `iperf3 -P 4` 实测三条路径都是 **100–106 Mbits/s ≈ 12.5 MB/s**，按新值应为 2.0 s——见 `INDEX.md` §6.5）（[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §3.3：prefill 每个 512
 行 ubatch 是 8 MB，1102 token 约 3 个 ubatch 即 24 MB）。**没有 10 s 级的低效**——如果 tap 是逐 token 往返，1102 个 token 会报出数量
 级更大的差；实测差值与带宽估算同量级，说明 tap 是**成批**走的。与 loopback 对照：1192 token 差 **0.2%**；跨机 1102 token 差 **~3.05 s（9–10%）
 **。
@@ -129,7 +129,7 @@ arm64-v8a，骁龙 8 Gen 3，15.6 GB RAM）在 Termux 里跑尾段 `split-stage`
 | 2B | `qwen35-2b-Q4_K_M.gguf`（1,312,164,672 B） | `0:12` / `12:24` | — |
 | 35B | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`（22,663,387,424 B） | `0:32` / `32:40` | 8 层，驻留约 4.90 GiB，`-t 8`、`ngl 0` |
 
-尾段权重读 GGUF 头逐张量累加（`gguf` python 包，753 个张量）：整模 **21.10 GiB** = head `0:32` 15.690 + tail `32:40` **4.022
+尾段权重读 GGUF 头逐张量累加（`gguf` python 包，753 个张量）：整模 **21.10 GiB** = head `0:32` **15.690（纯 blk；加 `token_embd` 0.503 后实际驻留 16.193）** + tail `32:40` **4.022
 ** + NextN（blk.40）0.493 + `output.weight` 0.389 + `token_embd.weight` 0.503。尾段是末段（`has_nextn=1`），NextN 层也
 在它这儿，所以实际驻留 **约 4.90 GiB**（= 4.022 + 0.493 + 0.389，`output_norm` 可忽略）。这与
 [`DEPLOYMENT.md`](DEPLOYMENT.md) §6.8 里 Q6_K 蒸馏版尾段的**5.99 GiB** 不是同一份权重（那一版 blk.32–39 是 4.76、NextN 是

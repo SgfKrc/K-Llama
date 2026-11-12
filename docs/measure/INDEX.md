@@ -52,6 +52,8 @@
 | 35B 整模（官方 UD-Q4_K_M） | **21.11 GiB** | `print_info` 口径；`block_count` 41、`nextn` 1、trunk 40 | `SPLIT-MEASUREMENTS.md` §0 | **21.10**（GGUF 头逐张量累加，同文件，舍入差）；**21.87**（蒸馏版）；**20.82**（`Q4_K_XL`） |
 | head `0:32` | **15.690 GiB** | 同上，逐张量累加 | `CROSS-MACHINE.md` §6 | — |
 | tail `32:40` | **4.90 GiB**（驻留） | 4.022 权重 + 0.493 + 0.389 缓冲 | `CROSS-MACHINE.md` §6 | — |
+| **head `0:24`** | **12.271 GiB** | blk 11.768 + `token_embd` 0.503（2026-11-13 逐张量实测） | 本表 §3 | 曾估「约 11.8」（漏了 token_embd） |
+| **relay `24:32`** | **3.923 GiB** | 纯 blk（同上实测） | 本表 §3 | 曾估「约 3.9」 |
 | `token_embd` | **515 MiB** | 248320×2048，**Q8_0** | `ARCHITECTURE.md:42` | — |
 | `output`（lm_head） | **398 MiB（0.389 GiB）** | 248320×2048，**Q6_K** | `CROSS-MACHINE.md:132` | **515 MiB**（错——那是 `token_embd` 的 Q8_0 尺寸；由此「中段省 1030.62 MiB」应为 **~913 MiB**） |
 | `src/models/` 实现数 | **176** | `ls src/models/*.cpp \| wc -l` | `report/02:101` | **171**（错，对不上任何口径）；`llm_arch` 条目 173/174（含 UNKNOWN） |
@@ -87,6 +89,111 @@
 
 **`tailscale ping` 的坑**：它可能回 `via DERP(tok)`，那是**控制面探测**，不代表数据面。判 direct/relay 一律以
 `tailscale status` 的 `CurAddr` 为准。
+
+## 六点五、带宽（iperf3 实测，2026-11-13）
+
+| 路径 | 带宽 | 换算 | 路径类型 |
+| --- | ---: | ---: | --- |
+| 本机 → Surface | **99.9 Mbits/s** | ≈12.5 MB/s | direct |
+| 本机 → Y700 | **99.1 Mbits/s** | ≈12.4 MB/s | direct |
+| Surface → Y700 | **106.0 Mbits/s** | ≈13.3 MB/s | direct |
+
+**三条几乎一样（100–106 Mbps），说明这是链路上限**，不是某一跳的问题。
+
+**它推翻了两个猜测**：
+
+1. **「`scp` 的 117 Mbps 是 SSH 加密开销」不成立**——`iperf3 -P 4` 是多流、无加密，仍然只有 100 Mbps。
+   所以那个 117 已经接近链路容量，加密不是瓶颈。
+2. **「同 AP 自干扰是主因」需要修正**——见 `MEASUREMENT-PITFALLS.md` §8：那次 `scp` 测到 117 Mbps，
+   当时归因为「两台都是 Wi-Fi、AP 转发两次」。iperf3 的 100 Mbps 与之接近，说明**瓶颈在 Wi-Fi 链路
+   本身（约 100 Mbps 量级）**，而不在加密或转发次数。
+
+**文档里旧的 9.5 MB/s 偏低 32%**（`CROSS-MACHINE.md:80` 用它算「25 MB ÷ 9.5 ≈ 2.6 s」）——
+按实测 12.5 MB/s 应为 **2.0 s**。用旧值时「A − C ≈ 3.05 s」与它「同量级」的结论仍成立，
+但那个 2.6 s 的参照值偏保守。
+
+**测法**：一端 `iperf3 -s -1`（服务一次就退），另一端 `iperf3 -c <ip> -t 10 -P 4`。
+**本机当 server 时 Windows 防火墙挡入站**（5201 监听正常但外部连不上），要反过来测——把对端当
+server、本机当 client（出站不受限）。
+
+## 六点六、接受率（2026-11-13，三段链 `0:24/24:32/32:40`，`-t 8`，direct）
+
+**同一个草稿源（DFlash）在三个 prompt 上：**
+
+| prompt | prompt_tokens | accept_rate | mean_len | DFlash t/s | 不投机 t/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prose | 941 | **0.8478**（39/46） | 2.70 | 6.99 | 6.56 |
+| code | 328 | **0.7917**（38/48） | 2.58 | 6.26 | 6.50 |
+| zh | 198 | **0.6667**（36/54） | 2.33 | 6.38 | 6.63 |
+
+**prose → zh 掉 21%**，`mean_len` 从 2.70 降到 2.33——**中文确实更难投机**。
+
+**「不随拓扑变」的直接证据**：本次三段链的 prose-DFlash = 39/46 = 0.84783，与 `DATA-PROTOCOL.md` §1.1
+里 A 组记录的 0.848（39/46，mean len 2.70）**逐位相同**；A 组的另两种链形态（两段→Surface、
+两段→Y700）也是 0.848。
+
+所以准确的表述是：**同一 prompt 下接受率不随拓扑变，但随 prompt 内容变**。「接受率与拓扑无关」
+这句话本身对，错在它被当成三拓扑通用值。
+
+**三组内部重复性极好**：每个 prompt 的 `draft_n/draft_n_accepted` 三次逐位相同，t/s 波动 <8%——
+所以接受率数字不是噪声。
+
+## 六点七、DSpark 有 5 层 / 6 层两种头，**不是降级**
+
+**同一个「DSpark」名字下有两个结构不同的头**，配错会得到完全不同的结果：
+
+| 头 | blocks | block_size | target_layers | 大小 |
+| --- | ---: | ---: | --- | ---: |
+| `dspark/Qwen3.6-35B-A3B-DSpark-Q4_K_M.gguf` | **5** | 8 | `[2, 10, 20, 30, 37]` | 569 MB |
+| `dspark/dspark_conf_high.gguf`、`dspark_markov_zero.gguf` | 5 | 8 | 同上（配置消融） | 569 MB |
+| **`dspark6/Qwen3.6-35B-A3B-DSPARK-6L.gguf`** | **6** | 8 | `[2, 7, 12, 17, 23, 28, 33, 38]` | 1.03 GB |
+
+**用户口径**：6 层是现行（5 层「稀烂」）。6 层虽然只有 6 blocks，但有 **8 个 taps**，所以启动日志是
+`3 of 8 DFlash taps cross the wire`。
+
+### 三段链实测（`0:24/24:32/32:40`，`-t 8`，direct，3 次取中位，三次 draft/accepted 逐位相同）
+
+| prompt | tokens | **6 层 accept** | mean_len | t/s | 5 层历史（@941） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prose | 941 | **0.9091**（40/44） | 2.82 | 6.398 | **0.932**（41/44） |
+| code | 328 | **0.8696**（40/46） | 2.74 | 5.596 | — |
+| zh | 198 | **0.6792**（36/53） | 2.36 | 4.763 | — |
+
+**6 层与 5 层在 prose 上只差 1 个 accepted token**——两个头基本等价。
+
+### 配错的代价（这 3 行已作废）
+
+用 **DFlash 的 6 层头**（`dflash/qwen36-35b-a3b-dflash-Q4_K_M.gguf`）去跑 `--spec-type draft-dspark`：
+
+| prompt | 错配 accept | 正确 accept | 差 |
+| --- | ---: | ---: | ---: |
+| prose | 0.1758 | 0.9091 | **5.2×** |
+| code | 0.2785 | 0.8696 | 3.1× |
+| zh | 0.1868 | 0.6792 | 3.6× |
+
+日志里会出现 `the remote tail answered no h_nextn rows; MTP drafting is unavailable on this chain`——
+**DFlash 头没有 Markov 头**，`draft-dspark` 的 MTP 通路接不上。**这不是 DSpark 的降级，是配错模型。**
+
+### 速度：6 层 DSpark 没赢过 DFlash
+
+| prompt | DSpark 6L | DFlash |
+| --- | ---: | ---: |
+| prose | 6.40 | **6.99** |
+| code | 5.60 | **6.26** |
+| zh | 4.76 | **6.38** |
+
+**6 blocks × 8 taps 的 draft 成本比 6 blocks × 8 taps 的 DFlash 高**——DSpark 多一个 Markov 头与置信度调度，
+但接受的 token 数并没有更多（mean_len 2.82 vs 2.70，差 4%）。
+
+**测这条时的坑**：Y700 连续跑会降频（prose 的 `prompt_ms` 从首跑 28.4 s 涨到 32.9 / 34.4 / 37.4 s），
+中位要取中间那次，且要在 notes 里记「第几次」。
+
+## 六点八、DFlash 在三段链上基本不划算
+
+三个 prompt 上 DFlash 与不投机基本打平（6.99 vs 6.56 / 6.26 vs 6.50 / 6.38 vs 6.63）。原因在日志里：
+`3 of 8 DFlash taps cross the wire`——**3/8 的 taps 要过网线**，省下的 decode 时间被传输吃掉。
+
+与 `MODEL-SWAP.md` §11.8 的结论一致：DFlash 在两段/三段上都是负收益，只有单机整模才划算。
 
 ## 七、引用纪律
 
