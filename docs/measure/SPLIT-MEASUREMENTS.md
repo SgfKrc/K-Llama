@@ -33,7 +33,7 @@
 | 采样 | 贪心（`temperature 0`、`top_k 1`）；`-np` 除注明外都是 1 |
 | 逐位对比 | 只在**单 ubatch 内**成立；跨 ubatch 的差异是浮点归约序（[`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §3.1） |
 | 日志根 | `H:\llamacpp-c\build-split\` 与 `H:\llamacpp-c\.qlh_tmp\`（下文只写相对路径） |
-| 代码版本 | 数字在 HEAD `0c5c3bdd`（树 `982ccecd`）上测；现行 HEAD `1c4bda400`（树 `95291539a`）只加段级 offload、MoE 缓存默认、显存预算、链上 MTP 的草稿 KV 续写（默认开）与 catch-up（默认关），不改逐位判据（吞吐的部署含义见 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md)） |
+| 代码版本 | 数字在 HEAD `0c5c3bdd`（树 `982ccecd`）上测；现行 HEAD `4acf03c8b`（树 `548c3dfb0`）只加段级 offload、MoE 缓存默认、显存预算、链上 MTP 的草稿 KV 续写（默认开）与 catch-up（默认关），不改逐位判据（吞吐的部署含义见 [`SEGMENT-OFFLOAD.md`](SEGMENT-OFFLOAD.md)） |
 
 **本机双进程测不出投机收益**：§2/§3 的投机数字都是「head 与 tail 跑在同一台机器上」——拿不到投机唯一该拿的好处（没有 25–30 ms 跨机往返可省），却放大了代价（两进程抢同一套
 CPU、L3 与带宽）。本机的负数不能外推；跨机的正确答案是「小幅正收益，随负载翻号」（[`CROSS-MACHINE.md`](../deploy/CROSS-MACHINE.md) §4）。
@@ -113,7 +113,7 @@ ubatch 的 prefill 顺带快 27%，因为不再申请 / 清零那 1.7 GiB。
 DFlash 权重。**项数以脚本逐项计数为准**：组 1–8 = 22 项，全十二组 = 53 项（44 + 组 11 的 8 项 + 组 12 的 1 项）。`verify/verify.sh` 默认先跑一次增量构建，`PASS`
 里会多出「三目标构建完成」这一项（`PASS=54`）；`--skip-build` 跑出来就是纯验收的 **53**，两种跑法的失败数都是 0，那一行不算进 53 项。
 
-**纯分段树上的独立验收**：`f477f795c` + 主补丁 = 树 `0c307d82a`（44 文件，不含 SLIM-ARC），`--clean-first` 全量构建（385 个编译单元）后
+**纯分段树上的独立验收**：`09338b85e` + 主补丁 = 树 `0c307d82a`（44 文件，不含 SLIM-ARC），`--clean-first` 全量构建（385 个编译单元）后
 `verify/verify.sh` **52 / 0 / 0**、`verify/verify_chain_death.py` **36 / 0**；组 6 的三段链 checkpoint 往返、组 8 的
 链上 MTP 逐位、组 10 的 dflash 8/8（wire 2 路、245760 B）与 dspark 5/5（wire 1 路、122880 B）tap 全部与整模逐位相同、组 11 的整模
 device buffer 仍启用。日志：`.qlh_tmp/pure-split-acceptance/`。这证明主补丁不依赖增量补丁。

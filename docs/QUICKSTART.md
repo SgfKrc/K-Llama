@@ -45,7 +45,7 @@ sha256sum <模型路径>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf        # 与项目组给
 `<模型路径>` 换成你放模型的目录。之后 `up` 自动比各段 `model` 的 size 与 mtime：size 不同拒绝启动，mtime 不同只警告（scp 会改）；`up --verify-weights` 另做完整 sha256（35B 几分钟）。这是启发式，不是密码学证明（`DEPLOYMENT.md` §4）。
 
 ## 4. 编译
-源码按 `BUILD.md` §2.2 取：上游 `ggml-org/llama.cpp` 的 `f477f795c` + `docs/llamacpp-split.patch` + `docs/llamacpp-slimarc.patch`，顺序不能反；叠完 `git write-tree` 应得 `95291539ae833860cc8f49040bad3c187d42daa9`（只叠主补丁是 `5520f52cb`）。
+源码按 `BUILD.md` §2.2 取：上游 `ggml-org/llama.cpp` 的 `09338b85e` + `docs/llamacpp-split.patch` + `docs/llamacpp-slimarc.patch`，顺序不能反；叠完 `git write-tree` 应得 `548c3dfb0e833860cc8f49040bad3c187d42daa9`（只叠主补丁是 `586a7e7a1`）。
 
 **4.1 Windows（MSVC + Ninja）**：Ninja 必须在 `vcvars64` 环境里跑，Git Bash 里直接 `ninja` 会因缺 `INCLUDE`/`LIB` 报 `C1083: 无法打开包括文件: "stdbool.h"`。存成源码根的 `build-qlh.bat`：
 
@@ -67,7 +67,7 @@ cmake --build build-split --target split-stage llama-server llama-cli llama-benc
 **4.3 产物与冒烟**：`bin/` 里要有 `split-stage`、`llama-server` + `llama-server-impl.dll`、`llama-cli` / `llama-bench`、`split-smoke` / `split-rows` / `dflash-taps`（`BUILD.md` §6）。
 
 ```bash
-cd build-split/bin && ./llama-cli.exe --version   # 期望 version: 0.9.0-dev (build 195, commit 1c4bda400)
+cd build-split/bin && ./llama-cli.exe --version   # 期望 version: 0.9.0-dev (build 195, commit 4acf03c8b)
 ./split-stage.exe                                 # 期望打印 usage，退出码 0
 ```
 

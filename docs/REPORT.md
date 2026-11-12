@@ -101,8 +101,8 @@ pre-norm 隐藏态接力。
 
 ## 代码与验收摘要
 
-- **fork**：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `1c4bda400`，父 `f477f795c`（上游最新，193 个提交
-  之后），树 `95291539a`；相对上游 **55 文件 / +20345 −245**（`README.md` 代码与验收）。
+- **fork**：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `4acf03c8b`，父 `09338b85e`（上游最新，193 个提交
+  之后），树 `548c3dfb0`；相对上游 **55 文件 / +20345 −245**（`README.md` 代码与验收）。
 - **两个补丁**：
   - 主补丁 [`docs/llamacpp-split.patch`](llamacpp-split.patch) **45 文件 / +16680 −244 / 18749 行 /
     982.8 KiB**（纯分段链，可单独编译、单独验收）；

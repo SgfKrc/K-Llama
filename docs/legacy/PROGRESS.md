@@ -101,7 +101,7 @@ Y700 `32:40`），跨公网 Tailscale 跑通，**201.7 ms / 5.00 t/s**。比两�
 
 ## 4. 已接的组件
 
-**llama.cpp fork（`H:\llamacpp-c`，相对上游 `f477f795c`，四代补丁；文件数与行数见 [`PATCHES.md`](../deploy/PATCHES.md)）**
+**llama.cpp fork（`H:\llamacpp-c`，相对上游 `09338b85e`，四代补丁；文件数与行数见 [`PATCHES.md`](../deploy/PATCHES.md)）**
 
 | 标记 | 内容 |
 | --- | --- |

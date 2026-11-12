@@ -6,7 +6,7 @@
 > 实测数据与逐位证据归 [`SPLIT-MEASUREMENTS.md`](../measure/SPLIT-MEASUREMENTS.md) 及四份专题：[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md)、
 > [`MODEL-SWAP.md`](../measure/MODEL-SWAP.md)、[`SPECULATION-DATA.md`](../measure/SPECULATION-DATA.md)、[`CROSS-MACHINE.md`](../deploy/CROSS-MACHINE.md)。
 
-代码核对到 `H:\llamacpp-c` 的 `1c4bda400`（基底 `f477f795c`，55 文件 / +20345 −245）。除 §2.2 的 batch invariance 一段（上游主体）与 §2.9 的 hybrid
+代码核对到 `H:\llamacpp-c` 的 `4acf03c8b`（基底 `09338b85e`，55 文件 / +20345 −245）。除 §2.2 的 batch invariance 一段（上游主体）与 §2.9 的 hybrid
 `seq_rm` 短路（上游缺陷，本仓只做「失败可见 + 调用方降级」）外，每条的归因都在本仓。代码引用写符号，不写会漂的 `文件:行`。
 
 **35B 的权重在 2026-11-08 换成官方 `UD-Q4_K_M`**：§2.2 的「整模 0.910 / 链上 0.688（旧路径；keep-KV 0.788；catch-up 每批 0.910）」是官方版的数，ROG / Surface / 回环收益与 §3.2 的
@@ -16,9 +16,9 @@ DFlash、MTP
 README 六条边界对应：① 架构 → §2.1，② 单序列 → §2.4，③ 链上投机 → §2.2，⑤ 加速比随部署形态走 → §3.2；④
 多模态与 ⑥ 核显属输入 / 部署边界，在 [`SPLIT-MEASUREMENTS.md`](../measure/SPLIT-MEASUREMENTS.md) §7 与 [`IGPU-SLOWDOWN.md`](../measure/IGPU-SLOWDOWN.md)。
 
-## 0. 与上游的关系（rebase 到 `f477f795c` 之后）
+## 0. 与上游的关系（rebase 到 `09338b85e` 之后）
 
-fork 整体 rebase 到上游 193 个提交之后的 `f477f795c`，本仓「自己的」代码少了 17 个文件——它们现在与上游逐字节相同，`git diff f477f795c 1c4bda400`
+fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自己的」代码少了 17 个文件——它们现在与上游逐字节相同，`git diff 09338b85e 4acf03c8b`
 里不再出现。补丁统计与明细见 [`PATCHES.md`](../deploy/PATCHES.md) 与 [`PATCHES-DETAIL.md`](../deploy/PATCHES-DETAIL.md)。
 
 ### 0.1 16 个文件与上游逐字节相同

@@ -3,7 +3,7 @@
 > 状态：**已退场**（2026-11-09）
 > 更新日期：2026-11-09
 >
-> **这一份的修复代码已经删掉了**：rebase 到上游 `f477f795c` 之后，上游 `ab3768cdc` 改成
+> **这一份的修复代码已经删掉了**：rebase 到上游 `09338b85e` 之后，上游 `ab3768cdc` 改成
 > **拒绝**超出「最后一个 ubatch」的快照回退（`cell.rs_max = n_seq_tokens − 1`），并由
 > `split_equal()` 的 `n_keep_tail` 保证整帧回退落在同一个 ubatch 内——和我们原来的解法
 > （`build_rs_shift_snapshots` 让快照按 ubatch 往前挪）是同一个问题的两种解法，而且槽位语义

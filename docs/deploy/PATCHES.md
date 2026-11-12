@@ -11,8 +11,8 @@
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在模型怎么装进显存和内存：第一代靠「裁好的层段工件」，第二代靠「整模
 + 层范围」。llama.cpp 侧的补丁因此完全不同。
 
-**代码现状**：相对基提交 `f477f795c` 共 **55 文件 / +20345 −245**（`git diff --stat`，fork HEAD `1c4bda400`，树
-`95291539a`），覆盖第一代到第四代的全部改动，拆成两个可独立应用的补丁：
+**代码现状**：相对基提交 `09338b85e` 共 **55 文件 / +20345 −245**（`git diff --stat`，fork HEAD `4acf03c8b`，树
+`548c3dfb0`），覆盖第一代到第四代的全部改动，拆成两个可独立应用的补丁：
 
 | 补丁 | 包含 | 统计 |
 | --- | --- | --- |
@@ -48,19 +48,19 @@ header-only 文件，另外 5 个文件（`common/arg.cpp`、`common/common.h`�
 主补丁 +15409 → +15669、总 +18953 → +19213，树 `b3cd73531` / `21bf46be9`；第二笔把开关改成
 **逐请求自适应**（`speculative.cpp` +166 −34、`server-context.cpp` +60，判定在 `batch_building`、
 经 `QLH_CHAIN_DRAFT_CATCHUP_AUTO` 交给 spec 层、接口零改动），主补丁 +15669 → +16680、
-总 +19213 → +20345，树 `5520f52cb` / `95291539a`。
+总 +19213 → +20345，树 `586a7e7a1` / `548c3dfb0`。
 
-**基提交是 `f477f795c`**：fork 整体 rebase 到上游 193 个提交之后（见「与上游的重合」）。旧基线 `ec25cedda`（树
+**基提交是 `09338b85e`**：fork 整体 rebase 到上游 193 个提交之后（见「与上游的重合」）。旧基线 `ec25cedda`（树
 `e14b92c9`，68 文件 / +18086 −504）留在 `master` 上，已不是补丁基底。
 
 两者是叠加关系，主补丁可单独用：
 
 ```bash
-git worktree add /tmp/v1 f477f795c && cd /tmp/v1
+git worktree add /tmp/v1 09338b85e && cd /tmp/v1
 git apply docs/llamacpp-split.patch        # 纯分段，无 SLIM-ARC
-git add -A && git write-tree               # 必须 = 5520f52cb（纯分段树）
+git add -A && git write-tree               # 必须 = 586a7e7a1（纯分段树）
 git apply docs/llamacpp-slimarc.patch      # 再叠增量，回到完整功能
-git add -A && git write-tree               # 必须 = 95291539a（= fork HEAD 的树）
+git add -A && git write-tree               # 必须 = 548c3dfb0（= fork HEAD 的树）
 ```
 
 上面这套叠加校验已经写成 `scripts/export_patches.sh`：它建临时 worktree 复算两棵树、断言 overlay，无参数时只打印统计，
@@ -69,7 +69,7 @@ git add -A && git write-tree               # 必须 = 95291539a（= fork HEAD �
 补丁文件必须按字节保存（仓根 `.gitattributes` 的 `*.patch -text`）。`core.autocrlf=true` 下把补丁转成 CRLF 之后照样
 apply 成功——只有 trailing-whitespace 警告——但文件末尾 `\ No newline at end of file` 会多出一个裸 CR，产出的树与文档里的
 tree hash 不再相等。静默错，属于「验收命令跑了、也过了、结果不对」那一类。rebase 时实测撞到过（CRLF 版主补丁
-得到 `d679f09b`，正确是 `1dcbce39`）；现行判据是「主补丁 → `5520f52cb`，叠加 → `95291539a`」，导出后 `grep -c $'\r'` = 0。
+得到 `d679f09b`，正确是 `1dcbce39`）；现行判据是「主补丁 → `586a7e7a1`，叠加 → `548c3dfb0`」，导出后 `grep -c $'\r'` = 0。
 
 **改源码后重导的第二处缺陷（2026-11-10）**：fork 的 `core.autocrlf` 在系统配置里是 `true`、仓内 `.git/config` 里显式设成
 `false`，而工作区历史上是混行的（上游文件 CRLF、后期手写的文件 LF）。这时 `git add` 会把 CRLF 原样存成 blob，patch
@@ -83,8 +83,8 @@ CRLF。重导时把两条命令都套上 `git -c core.autocrlf=true`（`apply -R
   `verify/verify_chain_death.py` **36 项**。没有 SLIM-ARC 不影响分段链的任何一条验收。2026-11-09 在
   `H:\llamacpp-c` 上把工作区切到纯分段树实测，跑完切回完整树、`git write-tree` 仍等于
   `181edd82`，日志见 `.qlh_tmp/pure-split-acceptance/`。
-- **现行主补丁（45 文件，树 `5520f52cb`）在 2026-11-11 重跑过这套独立验收**：独立 worktree @ `f477f795c`
-  + 主补丁 → `git write-tree` = `5520f52cb`、`--clean-first` 全量构建、`verify.sh` **52/0/0**、
+- **现行主补丁（45 文件，树 `586a7e7a1`）在 2026-11-11 重跑过这套独立验收**：独立 worktree @ `09338b85e`
+  + 主补丁 → `git write-tree` = `586a7e7a1`、`--clean-first` 全量构建、`verify.sh` **52/0/0**、
   `verify_chain_death.py` **36/0**，日志 `.qlh_tmp/pure_split_recheck.log`。前一版（`0c307d82a`，44 文件）
   2026-11-09 也跑过同一套；两版差 4 文件 / +605 −12（catch-up 两笔、`netdb.h`、`begin()` 时机）。
 - `1dcbce39`（44 项）有一趟跑出 `PASS=34 FAIL=10`，两处都是环境：组 5 的 `-np 4` 启动
@@ -92,16 +92,16 @@ CRLF。重导时把两条命令都套上 `git -c core.autocrlf=true`（`apply -R
   `taps_dflash_chain.log` 只有 `dflash-taps.exe: Device or resource busy`（整模那趟刚退出、文件锁
   未释放）。run2 同一份二进制、同一份模型得到 44/0。判据是「日志里有没有数值不一致」，不是
   「这一趟绿不绿」。
-- 叠加两个补丁后 `git write-tree` = `95291539a`（fork HEAD 的树），这是「拆分没有改动任何内容」的
+- 叠加两个补丁后 `git write-tree` = `548c3dfb0`（fork HEAD 的树），这是「拆分没有改动任何内容」的
   唯一判据，比「能 apply」更强。
 - SLIM-ARC 与分段链零耦合：那 10 个文件只 include 彼此和上游 `ggml-backend.h`，不碰本 fork 新增
   的任何头；6 处钩子摘掉后，`llama-context.cpp` / `llama-model-loader.cpp` 的对应片段与
-  `f477f795c` 逐字节相同（重导时用字符串精确匹配摘除，每处断言「恰好出现一次」）。
+  `09338b85e` 逐字节相同（重导时用字符串精确匹配摘除，每处断言「恰好出现一次」）。
 
 **历史全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4014 行），基提交更早，只到第三代；保留它为了对照第一 /
 二代的实现，不能正向应用。
 
-fork 侧历史是两个提交：上游 `f477f795c` 加一个 `[QLH-SPLIT]`（`1c4bda400`，树 `95291539a`；比前一版 `0c5c3bdd` / 树
+fork 侧历史是两个提交：上游 `09338b85e` 加一个 `[QLH-SPLIT]`（`4acf03c8b`，树 `548c3dfb0`；比前一版 `0c5c3bdd` / 树
 `982ccecd` 多了段级 offload、MoE 缓存默认值与显存预算）。旧的一对（`e0f142d` + `ec25cedda`，树 `e14b92c9`）留在
 `master` 作为历史，不再用于生成补丁。开发期的 wip 提交已 squash；更早记录的 squash 前后 tree 值是 `d628e2a8`，与那一代
 HEAD 的 `e14b92c9` 不同（差异来自 squash 之后又合入的修复与两次上游移植）。这项核对只作历史记录，不能重放。
@@ -156,7 +156,7 @@ embeddings_layer_inp[n_layer]`，为真时跳过裁剪并在 LM head 之前补�
 这一代不在主补丁里，只存在于 `docs/llamacpp-slimarc.patch`（13 文件 / +3665 −1），叠在 `docs/llamacpp-split.patch`
 之上才回到完整树。6 处钩子（归并成 4 行）：
 
-| 文件:行（完整树 `1c4bda400`） | 位置 | 作用 |
+| 文件:行（完整树 `4acf03c8b`） | 位置 | 作用 |
 | --- | --- | --- |
 | `src/CMakeLists.txt:50-60` | `LLAMA_SLIMARC_SOURCES` | 注册 5 个 `.cpp`，用 `SKIP_UNITY_BUILD_INCLUSION` 挡在 unity 批次外——这批文件带 `WIN32_LEAN_AND_MEAN` 和 POSIX 名字，混进 unity 会污染同批翻译单元 |
 | `src/llama-model-loader.cpp:1587-1615` | `init_mappings()` 末尾 | 只有设了 `SLIM_ARC_PREFETCH` 才构造全局调度器，把每个权重的 `(mmap 基址 + 偏移, 大小, 层号)` 注册进去 |
@@ -165,8 +165,8 @@ embeddings_layer_inp[n_layer]`，为真时跳过裁剪并在 LM head 之前补�
 
 表里 4 行覆盖 6 处：`set(LLAMA_SLIMARC_SOURCES ...)` 与 `add_library()` 里的 `${LLAMA_SLIMARC_SOURCES}`
 各一处，`src/llama-context.cpp:17` 与 `src/llama-model-loader.cpp:8` 的 `#include` 各一处，再加两个 `.cpp`
-里的代码块。摘掉后 `process_ubatch()` 恢复成 `f477f795c` 的单行
-`ggml_backend_sched_set_eval_callback(...)`，`init_mappings()` 末尾恢复成空行加 `}`，两处与 `f477f795c`
+里的代码块。摘掉后 `process_ubatch()` 恢复成 `09338b85e` 的单行
+`ggml_backend_sched_set_eval_callback(...)`，`init_mappings()` 末尾恢复成空行加 `}`，两处与 `09338b85e`
 逐字节相同。**换基底之后行号必须重新定位**：这两块在 `e0f142d` 基线是 1613 / 1638，rebase 后到 1762 / 1787，修
 `supports_embd_row()` 后再下推 16 行，现为 1778 / 1803（2026-11-11 重导时逐个核对过，`strip_hooks.py`
 一字未改就精确命中）。摘除脚本用整块字符串精确匹配 +「恰好出现一次」断言，对不上直接失败。
@@ -210,7 +210,7 @@ offload、MoE 缓存与显存预算三行同样在第四代里，语义见 [`SEG
 
 ## 与上游 193 个提交的重合（2026-11-09 rebase）
 
-fork 从 `e0f142d` 整体 rebase 到上游 193 个提交之后的 `f477f795c`（193 个提交 / 659 文件）。把我们的改动
+fork 从 `e0f142d` 整体 rebase 到上游 193 个提交之后的 `09338b85e`（193 个提交 / 659 文件）。把我们的改动
 `git apply --3way` 打到新基底之后，rebase 剩 54 文件 / +18773 −240（当次 `git diff --stat` 实测；其中 17 个
 文件因上游已含对应提交而退出变更集）
 因 device-buffer 诊断行重新进入变更集。17 个消失的文件里 16 个与上游逐字节相同；被逐个核对过的 8 个用

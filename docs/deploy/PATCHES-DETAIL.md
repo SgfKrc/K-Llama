@@ -125,10 +125,10 @@ n_layer())`。修法：组 11 只认 `QLH_DFDEV_MODEL` / `QLH_DFDEV_DRAFT`， `v
 | | 数字 |
 | --- | --- |
 | 我们的改动（相对旧基线 `e0f142d`） | 68 文件 / +18086 −504 |
-| 上游 `e0f142d..f477f795c` | **193 个提交 / 659 文件** |
+| 上游 `e0f142d..09338b85e` | **193 个提交 / 659 文件** |
 | 两边都碰过的文件 | **35 个** |
 
-把改动 `git apply --3way` 打到 `f477f795c`：新文件无冲突 **22**（分段链核心文件全是新建：
+把改动 `git apply --3way` 打到 `09338b85e`：新文件无冲突 **22**（分段链核心文件全是新建：
 `llama-split-*`、`llama-memory-split.*`、`tools/split-stage`、`tests/split-*`）、干净应用 **26**、冲突 **12 个文件 / 29
 个块**（全在 `llama-context.cpp`、`llama-graph.cpp`、`server-context.cpp` 这一层）。rebase 后剩 55 文件 / +18953
 −240；17 个消失文件里 16 个与上游逐字节相同。采用的上游提交：
@@ -154,7 +154,7 @@ n_layer())`。修法：组 11 只认 `QLH_DFDEV_MODEL` / `QLH_DFDEV_DRAFT`， `v
 `verify/verify_grammar_spec.sh` / `verify/verify_rbudget_spec.sh` 能发现（组 8/9/10 不走这两条路径）；修法是三个名字各司其职，见
 [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §0.3。
 
-**两处上游基线漂移**。其一：`verify/verify_rbudget_spec.sh` 判据 3 要求「不投机时链 == 整模逐字节」，纯上游 `f477f795c` 输出
+**两处上游基线漂移**。其一：`verify/verify_rbudget_spec.sh` 判据 3 要求「不投机时链 == 整模逐字节」，纯上游 `09338b85e` 输出
 `...with Paris as the city name...`（296 B），rebase 后本仓与纯上游逐字节相同，旧上游 `ec25cedda` 时期是 `...with the
 city parameter set to "Paris"...`（295 B），rebase 后
 本仓链与旧上游链逐字节相同——差异全部来自上游改了整模的数值路径。判据因此改成三档：逐字节相同 →
@@ -180,7 +180,7 @@ kernel 差异（0.27 量级）失效；所以更新 known-fail 集合（A1 A2 B1
 
 ## 5. 与上游版本的两次对齐（已整体吸收）
 
-逐行对比 `src/models/dflash.cpp` 与上游 `f477f795c` 时发现：两边只差 118 行，而且全部是「上游改了
+逐行对比 `src/models/dflash.cpp` 与上游 `09338b85e` 时发现：两边只差 118 行，而且全部是「上游改了
 API，我们没跟上」。两处都是上游提交：
 
 | 上游 | 内容 | 在我们这里的形态 |

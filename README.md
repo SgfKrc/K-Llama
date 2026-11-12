@@ -164,18 +164,18 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 
 ## 代码与验收
 
-- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `1c4bda400`，父 `f477f795c`（上游最新，
-  193 个提交之后），树 `95291539a`；相对上游 55 文件 / +20345 −245。
+- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `4acf03c8b`，父 `09338b85e`（上游最新，
+  193 个提交之后），树 `548c3dfb0`；相对上游 55 文件 / +20345 −245。
 - [llamacpp-split.patch]：45 文件 / +16680 −244 / 18749 行 / 982.8 KiB。纯分段链的完整补丁（协议
   v7 / v8 / v9 都在其中），机制清单见 [PATCHES]；不含 SLIM-ARC，可单独编译、单独通过全部验收。
 - [llamacpp-slimarc.patch]：13 文件 / +3665 −1 / 3790 行 / 164.2 KiB。SLIM-ARC prefetch，默认
   关闭，`SLIM_ARC_PREFETCH=1` 才装。借用的只有这一块：专家驻留、KV 驱逐、I/O 调度器未接，见
   [SLIM-ARC-接入计划]。
-- 叠加判据：`f477f795c` + 主补丁 → 树 `5520f52cb`；再叠增量 → 树 `95291539a`，与 HEAD 的树相同
+- 叠加判据：`09338b85e` + 主补丁 → 树 `586a7e7a1`；再叠增量 → 树 `548c3dfb0`，与 HEAD 的树相同
   （`git write-tree` 校验，见 `scripts/export_patches.sh`）。
-- 构建：[BUILD] 给出从 `f477f795c` + 补丁到二进制的实测命令、8 个 `build-*` 的开关矩阵与 CPU
+- 构建：[BUILD] 给出从 `09338b85e` + 补丁到二进制的实测命令、8 个 `build-*` 的开关矩阵与 CPU
   变体基线；改 `.h` 必须 `--clean-first`。
-- 与上游：16 个文件与 `f477f795c` 逐字节相同（rebase 前 0 个）。移除的 17 个文件改动属落后于
+- 与上游：16 个文件与 `09338b85e` 逐字节相同（rebase 前 0 个）。移除的 17 个文件改动属落后于
   上游——上游已含那些提交；`src/models/dflash.cpp` 因 device-buffer 诊断行重新进入变更集。清单见
   [PATCHES]「与上游 193 个提交的重合」。
 
@@ -191,8 +191,8 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | 5 条是上游 hybrid 的已知基线，作为对照保留 |
 | 纯分段版（只叠主补丁） | 52 + 36 | 44 文件版（树 `0c307d82a`）独立构建并跑过；现行版见下 |
 
-**纯分段版的现行状态**：纯分段树 `5520f52cb`（45 文件）在独立 worktree @ `f477f795c` + 主补丁
-（`git write-tree` = `5520f52cb`）上 `--clean-first` 全量构建，`verify.sh` **52/0/0**、
+**纯分段版的现行状态**：纯分段树 `586a7e7a1`（45 文件）在独立 worktree @ `09338b85e` + 主补丁
+（`git write-tree` = `586a7e7a1`）上 `--clean-first` 全量构建，`verify.sh` **52/0/0**、
 `verify_chain_death.py` **36/0**（2026-11-11）。上一版 `0c307d82a`（44 文件，2026-11-09）为同一套
 验收。
 

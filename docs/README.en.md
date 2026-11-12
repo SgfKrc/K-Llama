@@ -146,8 +146,8 @@ rather than official BF16, so the comparison holds only between those two files.
 
 ## Code and acceptance
 
-- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `1c4bda400` on parent `f477f795c`
-  (current upstream, 193 commits later), tree `95291539a`; against upstream, 55 files /
+- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `4acf03c8b` on parent `09338b85e`
+  (current upstream, 193 commits later), tree `548c3dfb0`; against upstream, 55 files /
   +20345 −245.
 - [llamacpp-split.patch]: 45 files / +16680 −244 / 18749 lines / 982.8 KiB. The complete pure split
   patch (protocols v7 / v8 / v9 included); the mechanism list is in [PATCHES.md]. No SLIM-ARC; it
@@ -155,11 +155,11 @@ rather than official BF16, so the comparison holds only between those two files.
 - [llamacpp-slimarc.patch]: 13 files / +3665 −1 / 3790 lines / 164.2 KiB. SLIM-ARC prefetch, off by
   default, installed only with `SLIM_ARC_PREFETCH=1`. Prefetch is the only piece borrowed; expert
   residency, KV eviction and the I/O scheduler stay out of scope — see [SLIM-ARC-接入计划.md].
-- Composition check: `f477f795c` + main patch → tree `5520f52cb`; adding the increment → tree
-  `95291539a`, identical to HEAD's tree (`git write-tree`; see `scripts/export_patches.sh`).
-- Build: [BUILD.md] gives the measured commands from `f477f795c` + patches to binaries and the build
+- Composition check: `09338b85e` + main patch → tree `586a7e7a1`; adding the increment → tree
+  `548c3dfb0`, identical to HEAD's tree (`git write-tree`; see `scripts/export_patches.sh`).
+- Build: [BUILD.md] gives the measured commands from `09338b85e` + patches to binaries and the build
   switch matrix; changing a `.h` requires `--clean-first`.
-- Against upstream: 16 files are byte-identical to `f477f795c`, against zero before the rebase. The
+- Against upstream: 16 files are byte-identical to `09338b85e`, against zero before the rebase. The
   17 file changes that dropped out were lag — upstream already carries those commits;
   `src/models/dflash.cpp` re-entered the change set with its device-buffer diagnostic. Inventory in
   the upstream-overlap section of [PATCHES.md].
@@ -175,11 +175,11 @@ records the 2026-11-09 run:
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |
 | `verify/verify_grammar_spec.sh` / `verify/verify_rbudget_spec.sh` | 23 / 36 | grammar whole-frame rollback, budget tightens only |
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
-| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `5520f52cb` |
+| Pure split build (main patch only) | 52 + 36 | built and run independently on tree `586a7e7a1` |
 
-**Current status of the pure split build**: the pure split tree `5520f52cb` (45 files) was rebuilt
-with `--clean-first` in an independent worktree @ `f477f795c` + main patch (`git write-tree` =
-`5520f52cb`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
+**Current status of the pure split build**: the pure split tree `586a7e7a1` (45 files) was rebuilt
+with `--clean-first` in an independent worktree @ `09338b85e` + main patch (`git write-tree` =
+`586a7e7a1`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
 previous build `0c307d82a` (44 files, 2026-11-09) covers the same acceptance.
 
 The v2 chain was checked by `python checks/verify_*.py` and

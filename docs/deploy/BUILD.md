@@ -26,12 +26,12 @@
 
 ### 2.2 取源码并叠补丁
 
-基底是上游 `ggml-org/llama.cpp` 的 `f477f795c`（fork HEAD `1c4bda400` 的父提交）。
+基底是上游 `ggml-org/llama.cpp` 的 `09338b85e`（fork HEAD `4acf03c8b` 的父提交）。
 
 本机 fork 的等价取法（不碰 fork 自己的 checkout）：
 
 ```bash
-git -C H:/llamacpp-c worktree add --detach H:/llamacpp-src f477f795c
+git -C H:/llamacpp-c worktree add --detach H:/llamacpp-src 09338b85e
 ```
 
 陌生人从上游取：
@@ -39,7 +39,7 @@ git -C H:/llamacpp-c worktree add --detach H:/llamacpp-src f477f795c
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git llamacpp
 cd llamacpp
-git checkout f477f795c
+git checkout 09338b85e
 ```
 
 叠补丁（顺序不能反；实测命令，`--whitespace=nowarn` 只是压掉行尾空白告警）：
@@ -49,15 +49,15 @@ git apply --whitespace=nowarn /path/to/K-Llama/docs/llamacpp-split.patch
 git apply --whitespace=nowarn /path/to/K-Llama/docs/llamacpp-slimarc.patch
 ```
 
-校验叠加结果（overlay 判据）：叠完的树必须等于 fork HEAD 的树 `95291539a`，不等就说明补丁
+校验叠加结果（overlay 判据）：叠完的树必须等于 fork HEAD 的树 `548c3dfb0`，不等就说明补丁
 被改过或顺序错了：
 
 ```bash
-git add -A -f && git write-tree      # 期望 95291539ae833860cc8f49040bad3c187d42daa9
+git add -A -f && git write-tree      # 期望 548c3dfb0e833860cc8f49040bad3c187d42daa9
 ```
 
-`scripts/export_patches.sh` 把这条判据脚本化：`f477f795c` + 主补丁 = 树 A（`5520f52cb`），
-再叠增量 = 树 B（`95291539a`）；B 与 HEAD 树不符时脚本 exit 1 且不写任何文件。
+`scripts/export_patches.sh` 把这条判据脚本化：`09338b85e` + 主补丁 = 树 A（`586a7e7a1`），
+再叠增量 = 树 B（`548c3dfb0`）；B 与 HEAD 树不符时脚本 exit 1 且不写任何文件。
 只叠主补丁会得到树 A（不含 SLIM-ARC）；本文的编译验证只对两个补丁都叠的树做过。
 
 ### 2.3 配置与编译
@@ -88,7 +88,7 @@ cmake --build build-split --target split-stage llama-server llama-cli llama-benc
 
 ```bash
 cd build-split/bin
-./llama-cli.exe --version      # version: 0.9.0-dev (build 195, commit 1c4bda400)
+./llama-cli.exe --version      # version: 0.9.0-dev (build 195, commit 4acf03c8b)
 ./split-stage.exe              # 打印 usage，退出码 0
 ```
 

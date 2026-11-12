@@ -50,7 +50,7 @@ llama_memory_split
 
 ## 4. patch 合并的实际规模
 
-`backends/patches/llamacpp-kvmem.patch`（50 文件 / 125 KB）打在 `f477f795c` 的 LF 干净树上：
+`backends/patches/llamacpp-kvmem.patch`（50 文件 / 125 KB）打在 `09338b85e` 的 LF 干净树上：
 
 - **42 个文件干净应用**
 - **8 个文件各 1 个 hunk 失败**，全部手工合：

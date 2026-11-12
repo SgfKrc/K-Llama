@@ -26,7 +26,7 @@ index 5f65c39dc..de56b0fee 100644
              ${LLAMA_MODELS_SOURCES}
              )
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index efcf8727c..594b0c6de 100644
+index c48111dd3..5de229b39 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -14,6 +14,7 @@
@@ -37,7 +37,7 @@ index efcf8727c..594b0c6de 100644
  
  #include <algorithm>
  #include <cinttypes>
-@@ -1755,6 +1756,14 @@ bool llama_context::set_adapter_cvec(
+@@ -1903,6 +1904,14 @@ bool llama_context::set_adapter_cvec(
  }
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -52,7 +52,7 @@ index efcf8727c..594b0c6de 100644
      if (mctx && !mctx->apply()) {
          LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
          ret = GGML_STATUS_FAILED;
-@@ -1784,7 +1793,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1932,7 +1941,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          res->reset();
  
          ggml_backend_sched_reset(sched.get());
@@ -70,7 +70,7 @@ index efcf8727c..594b0c6de 100644
  
          //const auto t_start_us = ggml_time_us();
  
-@@ -1798,6 +1816,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1946,6 +1964,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -85,7 +85,7 @@ index efcf8727c..594b0c6de 100644
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 65261767a..65828a348 100644
+index 53278ccec..2bf31cf97 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -5,6 +5,7 @@
@@ -96,7 +96,7 @@ index 65261767a..65828a348 100644
  
  #include <algorithm>
  #include <array>
-@@ -1582,6 +1583,36 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+@@ -1664,6 +1665,36 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
      for (const auto & it : weights_map) {
          size_data += ggml_nbytes(it.second.tensor);
      }
