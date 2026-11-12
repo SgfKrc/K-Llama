@@ -43,3 +43,6 @@ checks/_exp_shim/
 # v2 的 topology-*.toml 已随驱动链退场（归档在 slimarc/prototype）；规则留着，
 # 免得以后本地拓扑文件被误提交。
 topology-*.toml
+
+# 临时目录（agent 的验证日志等），不入库
+_kvmtp/

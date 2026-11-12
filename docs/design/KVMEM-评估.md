@@ -1,6 +1,6 @@
 # KVMem × 分段链：适配评估与硬前提验证
 
-> 状态：**已探明**（硬前提通过，完整方案未投入）
+> 状态：**已集成**（adapter 三条修复 + 集成分支 + 四条验收，2026-11-12）
 > 更新日期：2026-11-12
 > 适用范围：评估把 [KVMem](https://github.com/kvmem/kvmem) 的 KV 虚拟化接进本项目的分段链是否可行、
 > 成本多大、值不值得投入。读者是决定要不要开这条线的维护者。
@@ -8,7 +8,7 @@
 
 ## 1. 结论
 
-**有条件能，硬前提已验证通过，完整方案未投入。**
+**能，且已经做完**：adapter 修了三处、集成分支 rebase 到新主线、四条验收全过。见 §11 的收尾记录。
 
 接入点是**嵌套关系而非竞争关系**：KVMem 在 `llama_model::create_memory` 换掉整个 memory 实现，
 我们的 `llama_memory_split` 在 `llama_context::split_attach*` 把该 memory 包成 head。`llama_memory_split`
@@ -138,3 +138,63 @@ kvmem-root/build/bin/llama-kvmem-server.exe \
 ```
 
 证据日志：`kvmem-build/EVIDENCE.md`、`server.log`、`server2.log`。
+
+## 11. 收尾记录（2026-11-12）
+
+### adapter 的三条修复
+
+都在 `SgfKrc/kvmem` 的 `fix/seq-pos-min-max` 分支（HEAD `461b05c`），修的是三个不同层次的问题：
+
+| commit | 问题 | 层次 |
+| --- | --- | --- |
+| `f04053a` | prompt cache 完全失效、checkpoint 从不创建、有个 `GGML_ABORT` 悬着 | **契约**（`seq_pos_min/max` 只报原生 kv，而工作集在 store 里） |
+| `723d424` | 双 context 下 head 的 capture 全落到 tail 上，一触发驱逐就 500 | **绑定**（`kvmem_current_execution().memory` 是进程级单例，被后建的 tail 覆盖） |
+| `461b05c` | MTP follower 只在构造时 bind 一次 | **绑定**（同一类问题，另一半） |
+
+第三条顺手加了 `KVMEM_TRACE` 门控的诊断——**没有它，「实例一致」这件事没法证明**。
+
+### 集成分支
+
+`SgfKrc/llama.cpp` 的 **`kvmem/integration`**（`3f930466d`，父 `4acf03c8b`），基于新上游 `09338b85e`。
+rebase 时 7 处冲突全部「合并而非二选一」——那些是上游 4 天漂移，不是 KVMem 的语义错误。
+
+**一处硬性适配**：上游把 `gf_res_prev` / `gf_res_decode` 从值 vector 换成 `std::array<llm_graph_result_ptr, N>`
+（unique_ptr），KVMem 原来的 `res.reset()` 变成**置空指针**，紧接着的 `res->set_max_nodes()` 解引用空指针
+→ **启动即 SIGSEGV，连 `--no-kvmem` 都崩**。修复是 `if (res) res->reset();`——reset 指向的对象，
+不是指针本身。
+
+### 验收（2B qwen35，本地双段 `0:12+12:24`，`-np 1`，`-ngl 0`）
+
+| # | 项 | 结果 |
+| --- | --- | --- |
+| ① | MTP + KVMem（`budget 8192`） | 200，`draft acceptance = 0.86207 (50/58)`；head/tail 各 2 个 context、MTP follower 1 个 |
+| ② | 驱逐（`budget 1024` + 3638 token，pool = 3072） | 200，`need_offload=1` ×3、`KVMEM_PRESSURE` ×4 |
+| ③ | **secret-code 保留** | 200，`content: 'XK-7734-QP'`——驱逐后仍答对 |
+| ④ | 确定性 | 两次输出 **byte-identical**，sha256 相同 |
+
+**对照**：不带 `--kvmem` vs `--no-kvmem` 逐字节相同（主线没坏）；**KVMem（budget 8192，无驱逐）的
+输出也是同一个 sha256** → 无压力时 KVMem 对输出完全透明。
+
+### 两个必须跟着走的坑
+
+1. **`-lv 3` 下 KVMem 核心日志不可见**：这个 fork 的 server 在 `-lv 3` 下过滤 llama.cpp 核心 INFO，
+   只有 `srv`/`cmn` 前缀可见。验收必须 `-lv 10` 或 `KVMEM_TRACE=1`——否则会重演「以为没生效」的误判。
+2. **adapter 是 UNITY_BUILD 编进 llama 的**：ninja 的 depfile **不跟踪**这些外部源——改完 adapter 直接
+   `cmake --build` 会说 nothing to do、二进制不变。必须先
+   `touch build-kvmem2/src/CMakeFiles/llama.dir/Unity/unity_11_cxx.cxx` 再编。
+
+### 明确不做的
+
+- **多序列**：实测 `-np 2` 端到端是单序列的 **0.81×**（纯 decode 重叠有 1.12×，但并发 prefill 只有
+  0.70×，而真实请求的 prefill 会同时到达）。见 `ARCHITECTURE.md` §11。
+- **异步流水线**：单序列 token 间的依赖链是硬的，可重叠比例 = 0；prefill 块间在当前 24/8 切分下
+  `T_pipe = 34.5 s` > 串行 32.1 s。
+- **本地链 `-np > 1` + KVMem**：`kvmem_current_execution()` 是进程级单例，多 slot 会再次错位
+  （`server_context::spec` 是单例，`server_slot` 只持指针，当前靠「一进程一个 draft context」救）。
+
+### 未验证
+
+- **35B + KVMem**：全程 2B。35B 的硬前提（`qwen35moe` 能构造 hybrid adapter）在纯 CPU `-ngl 0` 下
+  验证过，但**没在 35B 上跑过驱逐与 secret-code**。
+- **remote tail + MTP**：MTP 在 head 侧、tail 是独立进程的情形没测。
+- **GPU offload**：全程 `-ngl 0`。KVMem 的 slot-pool 在 GPU 常驻时能否工作未验证。

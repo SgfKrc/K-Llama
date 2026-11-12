@@ -23,7 +23,8 @@
 #
 # 退出码 0 = 四组全过。
 #
-# 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）。组 11 的 8 项覆盖
+# 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）。
+# 组 13 的 4 项覆盖 **KVMem 的 KV 虚拟化**（本地双段 + MTP + 驱逐，见下）。组 11 的 8 项覆盖
 # **DFlash 投机的 device-buffer 注入路径**：组 9/10 用的 tests/dflash-taps.cpp 只 link `llama`，
 # 从不调 llama_set_embeddings_layer_inp_dev（ctx_tgt 没有 device buffer），batch 用
 # llama_batch_init 而不是 llama_batch_ext_add_embd_row（ubatch.embd_row 恒空，graph 走 host
@@ -44,6 +45,8 @@
 #   QLH_VERIFY_NO_LOCK=1        跳过「同一时间只允许一个 verify」的闸门（不推荐）
 #   QLH_CUDA_BUILD_DIR         组 12 的 CUDA 构建目录（默认 H:/llamacpp-c/build-cuda）
 #   QLH_VERIFY_NGL_PARTIAL     组 12 的 -ngl 层数（默认 4）
+#   QLH_KVMEM_BUILD_DIR        组 13 的 KVMem 构建目录（默认 H:/llamacpp-c/build-kvmem2）
+#   LLAMA_KVMEM_ROOT           组 13 的 KVMem 源码根（默认 .qlh_tmp/kvmem-probe）
 # 退出码：0 = 被测到的组全过（SKIP 不算失败，但会显著打印「没测到」）；1 = 有 FAIL；
 #         2 = 另一个 verify.sh 正在跑（并发跑会互抢 93xx、互相强杀，两边都会报假失败）。
 #
@@ -802,14 +805,56 @@ else
     cleanup_cuda 组12
 fi
 
+# ---------------------------------------------------------------- 组 13：KVMem 的 KV 虚拟化
+hdr "组 13  KVMem 的 KV 虚拟化（本地双段 + MTP + 驱逐）"
+# 为什么单独一组：组 1-12 全部跑在不带 `--kvmem` 的构建上。KVMem 把 KV 虚拟化到 host RAM、GPU 只留
+# 有界工作集，接在 `llama_model::create_memory`（与分段链是嵌套关系），所以「head 的 memory 换成
+# kvmem」这条路径在别处零覆盖。四项判据的理由见 verify/verify_kvmem.py 的模块 docstring。
+KVMEM_BUILD=${QLH_KVMEM_BUILD_DIR:-H:/llamacpp-c/build-kvmem2}
+KVMEM_ROOT=${LLAMA_KVMEM_ROOT:-$QLH_VERIFY_DIR/../.qlh_tmp/kvmem-probe}
+if [ ! -x "$KVMEM_BUILD/bin/llama-server.exe" ]; then
+    skip "组 13 没测：缺 $KVMEM_BUILD/bin/llama-server.exe（带 LLAMA_KVMEM=ON 的构建不存在）—— 这不是 PASS，KVMem 没有覆盖"
+elif [ ! -d "$KVMEM_ROOT" ]; then
+    skip "组 13 没测：LLAMA_KVMEM_ROOT 不存在（$KVMEM_ROOT）—— 这不是 PASS，KVMem 没有覆盖"
+else
+    KVMEM_LOG=$QLH_TMP/kvmem_group13.log
+    QLH_KVMEM_BUILD_DIR="$KVMEM_BUILD" LLAMA_KVMEM_ROOT="$KVMEM_ROOT" \
+    QLH_MODEL_2B="$MODEL" QLH_TMP="$QLH_TMP" \
+    QLH_VERIFY_PORT_KVMEM=${QLH_VERIFY_PORT_KVMEM:-9361} \
+    # run_limited 的签名是 <秒> <输出文件> <命令...>：输出文件必须在第二参数位，
+    # 否则它会把命令名当成输出文件（曾经写成 `run_limited 3600 python ...`，
+    # 结果创建了一个 0 字节的 `python` 文件、并直接执行 .py 得到 rc=49）。
+    run_limited 3600 "$KVMEM_LOG" python "$QLH_VERIFY_DIR/verify_kvmem.py" \
+        --build-dir "$KVMEM_BUILD" --model "$MODEL" --kvmem-root "$KVMEM_ROOT" \
+        --tmp "$QLH_TMP" --port ${QLH_VERIFY_PORT_KVMEM:-9361}
+    KVMEM_RC=$?
+    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 57
+    while IFS= read -r line; do
+        case "$line" in
+            *"[PASS]"*) ok "$(echo "$line" | sed 's/^ *\[PASS\] *//')" ;;
+            *"[FAIL]"*) bad "$(echo "$line" | sed 's/^ *\[FAIL\] *//')" ;;
+        esac
+    done < "$KVMEM_LOG"
+    # 防假绿：脚本必须真的打出 4 条 PASS/FAIL 记账，否则说明它中途崩了
+    KVMEM_LINES=$(grep -cE '\[(PASS|FAIL)\]' "$KVMEM_LOG" 2>/dev/null || echo 0)
+    if [ "$KVMEM_LINES" -eq 0 ]; then
+        bad "组 13：脚本没打出任何 [PASS]/[FAIL]（rc=$KVMEM_RC），见 .qlh_tmp/verify/kvmem_group13.log"
+        tail -8 "$KVMEM_LOG" | sed 's/^/    /'
+    elif [ "$KVMEM_RC" -ne 0 ] && [ "$(grep -c '\[FAIL\]' "$KVMEM_LOG")" -eq 0 ]; then
+        bad "组 13：脚本退出码 $KVMEM_RC 但没打出 [FAIL]（中途崩了）"
+        tail -8 "$KVMEM_LOG" | sed 's/^/    /'
+    fi
+    cleanup_cuda 组13
+fi
+
 hdr "结果"
-# 项数断言：「53 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
+# 项数断言：「57 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
 # 但以前没有任何地方守它——某条判据因日志措辞改动而静默不匹配时，总数会变少，而
-# 「53 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1；
-# 不带 --skip-build 时另有「三目标构建完成」1 项（54）。
+# 「57 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4；
+# 不带 --skip-build 时另有「三目标构建完成」1 项（58）。
 # 只在**没有 SKIP** 的完整跑上断言：SKIP 时少跑的是整组（组 9/10/11/12），
 # 与 skip() 记的 1 条不是一比一，硬算会误报。
-EXPECT_PASS=53
+EXPECT_PASS=57
 [ "$MODE" = "--skip-build" ] || EXPECT_PASS=$((EXPECT_PASS + 1))
 # 只在「全绿且无 SKIP」时断言：环境缺失（已 FAIL）时不再叠一条噪声；
 # 而「某组静默少跑」的特征恰好是 FAIL=0 且 PASS 变少，这条正是抓它的。

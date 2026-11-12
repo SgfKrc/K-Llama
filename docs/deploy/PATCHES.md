@@ -11,13 +11,17 @@
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在模型怎么装进显存和内存：第一代靠「裁好的层段工件」，第二代靠「整模
 + 层范围」。llama.cpp 侧的补丁因此完全不同。
 
-**代码现状**：相对基提交 `09338b85e` 共 **55 文件 / +20345 −245**（`git diff --stat`，fork HEAD `4acf03c8b`，树
-`548c3dfb0`），覆盖第一代到第四代的全部改动，拆成两个可独立应用的补丁：
+**代码现状**：相对基提交 `09338b85e` 共 **91 文件 / +21611 −376**（`git diff --stat 09338b85e kvmem/integration`，
+树 `192b2a3d0`），覆盖第一代到第五代的全部改动，拆成三个可独立应用的补丁。
+**不含 KVMem 时是 55 文件 / +20345 −241**（`09338b85e` → `rebase-merge`，树 `548c3dfb0`）——
+主补丁 + SLIM-ARC 增量两档；加上 KVMem 增量后是上面那一档。三个补丁的文件并集恰好 91 个，与
+`git diff 09338b85e kvmem/integration` 对得上：
 
 | 补丁 | 包含 | 统计 |
 | --- | --- | --- |
 | [`docs/llamacpp-split.patch`](../llamacpp-split.patch)（主补丁） | 第一、二、四代：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7/v8/v9、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定、段级 offload、显存预算。**不含 SLIM-ARC** | **45 文件** / +16680 −244 / 18749 行 / 982.8 KiB |
 | [`docs/llamacpp-slimarc.patch`](../llamacpp-slimarc.patch)（可选增量） | 第三代 SLIM-ARC prefetch：10 个源文件 + 3 个文件里的 6 处钩子 | 13 文件 / +3665 −1 / 3790 行 / 164.2 KiB |
+| [`docs/llamacpp-kvmem.patch`](../llamacpp-kvmem.patch)（可选增量） | 第五代 KVMem 虚拟化：memory factory hook、attn Q/K capture 钩子、KV cache 跳过空洞清理、CUDA stage-in、`--kvmem*` CLI、`llama-kvmem-bridge`。**adapter 主体在外部**（`LLAMA_KVMEM_ROOT` 指向 `SgfKrc/kvmem`），本补丁只含 fork 侧接线 | **52 文件** / +1266 −135 / 2941 行 / 130.6 KiB |
 
 两个补丁逐项相加等于 55 / +20345 −245：45 + 13 里有 3 个文件重叠（`src/CMakeLists.txt`、
 `src/llama-context.cpp`、`src/llama-model-loader.cpp` 各出一份 diff），并集仍是 55（58 − 3）。算术校验：
@@ -52,6 +56,18 @@ header-only 文件，另外 5 个文件（`common/arg.cpp`、`common/common.h`�
 
 **基提交是 `09338b85e`**：fork 整体 rebase 到上游 193 个提交之后（见「与上游的重合」）。旧基线 `ec25cedda`（树
 `e14b92c9`，68 文件 / +18086 −504）留在 `master` 上，已不是补丁基底。
+
+**三个补丁的叠加点不同，别叠错**：
+
+| 补丁 | 叠在什么之上 | 叠完的树 |
+| --- | --- | --- |
+| `llamacpp-split.patch`（主） | 直接叠在基提交 `09338b85e` 上 | `586a7e7a1` |
+| `llamacpp-slimarc.patch` | 叠在**主补丁之上**（不直接叠基提交） | `548c3dfb0` |
+| `llamacpp-kvmem.patch` | 叠在**`rebase-merge` 的树 `548c3dfb0` 之上**（即主 + SLIM-ARC 之后） | `192b2a3d0` |
+
+**顺序是硬性的**：主 → SLIM-ARC → KVMem。KVMem 的 `src/llama-context.cpp` 改动是相对**叠了
+SLIM-ARC 之后**的版本写的，直接叠在主补丁上会在 `src/llama-context.cpp:14` 冲突（已实测：
+`git apply --check` 失败）。「主 + KVMem」**不是**合法组合。
 
 两者是叠加关系，主补丁可单独用：
 
@@ -240,3 +256,70 @@ op。**本项目让每个节点当「一段模型」，没有中心**：整模�
 一句话：RPC 是把设备虚拟化，模型仍是一份；本项目是把模型分段，每段各自持有。前者适合「一台主机 +
 若干算力节点」，后者适合「几台都装不下整模的机器」。代价：本项目的段是黑盒，段内不能跨机器切分
 算子，每一段必须能单独装下；RPC 可以把任意 op 派到远端，粒度更细。
+
+## 第五代：KVMem KV 虚拟化（2026-11-12，可选增量）
+
+### 它解决什么
+
+分段链把「整模装不下」解决了，但**KV cache 仍然 ∝ `n_ctx`**：35B 的 head 段 15.69 GiB 权重之后，
+`-c` 只能开到 4096–8192 量级。而 agent 场景要的是 100K+ token 的工作区。
+
+KVMem 把 KV 虚拟化到 host RAM / SSD，GPU 只留有界工作集（`budget + gen_reserve`）。它通过
+`llama_memory_i` 接入 llama.cpp——**与分段链是嵌套关系而非竞争**：
+
+```
+llama_memory_split
+  ├── head  = llama_memory_kvmem   ← KVMem 的 hook 在这里生效
+  └── tails = 各 stage 的 memory
+```
+
+`llama_memory_split` 对 head 只走 `llama_memory_i` 接口（无具体类型假设），所以「head 换成 kvmem」
+不需要改 split 的接口。
+
+### 本补丁包含什么
+
+**52 文件 / +1266 −135**，分三类：
+
+| 类 | 内容 |
+| --- | --- |
+| **hook 点** | `llama_model::create_memory` 的 factory hook（`src/llama-kvmem-factory.h`）、`attn` 的 Q/K capture、KV cache 跳过空洞清理、CUDA stage-in、fused-node 注册 |
+| **fork 侧接线** | `--kvmem` / `--kvmem-budget` / `--kvmem-gen-reserve`（`common/arg.cpp`）、`src/llama-kvmem-bridge.cpp`、`common_init_result` 里的调用点 |
+| **上游漂移适配** | `ggml-rpc.h` 的 `RPC_PROTO_PATCH_VERSION`（MAJOR 8→9 后取 1）、`gf_res_prev` / `gf_res_decode` 从值 vector 改成 unique_ptr array 后的 `res->reset()` 修正 |
+
+**adapter 主体不在本补丁里**（那是 `SgfKrc/kvmem` 的源码，约 9.4 K 行），本补丁只含 fork 侧接线。
+
+### 依赖
+
+**必须配合 `SgfKrc/kvmem` 的 `fix/seq-pos-min-max` 分支**（HEAD `461b05c`）。那三条修复是硬性依赖：
+
+| commit | 修什么 |
+| --- | --- |
+| `f04053a` | `seq_pos_min/max` 报 store 的逻辑历史（否则 prompt cache 全废、checkpoint 从不创建、有个 `GGML_ABORT` 悬着） |
+| `723d424` | 每个 stage 在序列起点 rebind `memory`（否则双 context 下 head 的 capture 全落到 tail，一驱逐就 500） |
+| `461b05c` | MTP follower 也 rebind（否则 split + MTP 同进程时 capture 错位） |
+
+构建时 `-DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=<kvmem 仓库根>`。
+
+### 验收（2B qwen35，本地双段 `0:12+12:24`，`-np 1`，`-ngl 0`）
+
+| 项 | 结果 |
+| --- | --- |
+| MTP + KVMem（`budget 8192`） | 200，`draft acceptance = 0.86207 (50/58)` |
+| 驱逐（`budget 1024` + 3638 token，pool = 3072） | 200，`need_offload=1` ×3、`KVMEM_PRESSURE` ×4 |
+| **secret-code 保留** | 200，`content: 'XK-7734-QP'`——驱逐后仍答对 |
+| 确定性 | 两次输出 byte-identical，sha256 相同 |
+| 对照 | 不带 `--kvmem` vs `--no-kvmem` 逐字节相同；**无驱逐时 KVMem 输出也是同一 sha256**（对输出透明） |
+
+### 两个坑
+
+1. **`-lv 3` 下 KVMem 核心日志不可见**（这个 fork 的 server 在 `-lv 3` 下过滤 llama.cpp 核心 INFO），
+   验收必须 `-lv 10` 或 `KVMEM_TRACE=1`。
+2. **adapter 是 UNITY_BUILD 编进 llama 的**，ninja 的 depfile 不跟踪外部源——改完 adapter 直接
+   `cmake --build` 会说 nothing to do。必须先
+   `touch build-kvmem2/src/CMakeFiles/llama.dir/Unity/unity_11_cxx.cxx` 再编。
+
+### 明确不做
+
+多序列（实测 `-np 2` 是 0.81×）、异步流水线（单序列可重叠比例为 0）、本地链 `-np > 1` + KVMem
+（进程级单例会再错位）。详见 [`KVMEM-评估.md`](../design/KVMEM-评估.md) 与
+[`ARCHITECTURE.md`](../design/ARCHITECTURE.md) §11。
