@@ -32,9 +32,12 @@ MAGIC = 0x514C4853
 # Mirror of qlh_split::PROTO_VER (src/llama-split-proto.h). This script speaks the wire protocol
 # itself, so a bump has to be mirrored here -- that is the point: the stage refuses a frame whose
 # version it does not speak, and this is what proves the check is on the frame and not on the op.
-# v9 added the layer-input tap channel (DECODE_FLAG_LAYER_INP); the header layouts did not move
-# (rsp_header::n_taps rides in a padding byte), only the version this script has to claim.
-PROTO_VER = 9
+# v10 added the per-row seq_id records (the `rows` section at the end of an OP_DECODE frame), the
+# rsp_header::n_logits field (32 -> 36 bytes) and four chain-identity numbers in stage_id (28 -> 40
+# bytes). This script only speaks OP_HELLO / OP_SEQ_RM / OP_CLEAR / OP_BYE, so none of the *decode*
+# layout changes reach it -- but the two struct sizes it does parse moved, which is exactly what the
+# version bump is here to catch.
+PROTO_VER = 10
 
 OP_HELLO = 7
 OP_SEQ_RM = 2
@@ -44,15 +47,15 @@ OP_BYE = 6
 ST_OK = 0
 ST_BAD_REQ = 2
 
-STAGE_ID = 28
+STAGE_ID = 40
 # req_header: magic, version, op, flags, pad, n_tokens, n_embd, n_pos, seq_id, pos0, pos1, n_bytes
 REQ = struct.Struct("<IIBBHIIIiiiI")
-# rsp_header: magic, version, status, flags, (v9: n_taps + pad, read as one H), n_tokens,
-# n_embd, n_vocab, pos_max, n_bytes
-RSP = struct.Struct("<IIBBHIIIiI")
+# rsp_header: magic, version, status, flags, (n_taps + pad, read as one H), (v10: n_logits),
+# n_tokens, n_embd, n_vocab, pos_max, n_bytes
+RSP = struct.Struct("<IIBBHIIIIiI")
 
 assert REQ.size == 40, REQ.size
-assert RSP.size == 32, RSP.size
+assert RSP.size == 36, RSP.size
 
 
 def recv_exact(sock, n):
@@ -118,7 +121,7 @@ def send_req(sock, op, seq_id=0, pos0=0, pos1=-1, n_tokens=0, n_embd=0, n_pos=0,
 
 def read_rsp(sock):
     raw = recv_exact(sock, RSP.size)
-    magic, version, status, flags, _pad, n_tokens, n_embd, n_vocab, pos_max, n_bytes = \
+    magic, version, status, flags, _pad, _n_logits, n_tokens, n_embd, n_vocab, pos_max, n_bytes = \
         RSP.unpack(raw)
     assert magic == MAGIC, "bad reply magic 0x%08x" % magic
     assert version == PROTO_VER, "bad reply version %d" % version
@@ -128,7 +131,10 @@ def read_rsp(sock):
 def handshake(sock):
     # OP_HELLO expects one stage_id; the stage only logs it, so unpinned values are fine.
     send_req(sock, OP_HELLO, n_bytes=STAGE_ID)
-    sock.sendall(struct.pack("<iiiIIIB3x", -1, -1, 24, 0, 0, 0, 0))
+    # stage_id (v10, 40 B): layer_lo, layer_hi, n_layer_src, n_embd_inp, n_embd_out, n_vocab,
+    # role, has_nextn, n_seq_max, n_ctx_seq, n_rs_seq, n_verify_rows. The stage only logs the
+    # expectation, so unpinned values are fine.
+    sock.sendall(struct.pack("<iiiIIIBBHIII", -1, -1, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0))
     status, n_bytes, _n_vocab, _pm = read_rsp(sock)
     assert status == ST_OK, "hello answered status %d" % status
     body = recv_exact(sock, n_bytes)
