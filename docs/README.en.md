@@ -2,14 +2,14 @@
   <img src="assets/banner.svg" alt="K-Llama — Llama.cpp for Kircheis" width="100%">
 </p>
 
-# K-Llama v2.1
+# K-Llama v2.2
 
 **Non-whole-model (segmented) loading · a customized llama.cpp engine · lightweight large-model inference across edge devices**
 
 [中文](../README.md) | **English**
 
-> Status: **Current**
-> Updated: 2026-11-12
+> Status: **Current development version v2.2**; delivery version v2.1 (frozen)
+> Updated: 2026-11-13
 > Scope: the entry point for the split chain — what it is, what it can do, how to run it, the hard
 > constraints, the measurement baselines, and the documentation index. Mechanism lives in
 > [ARCHITECTURE.md]; boundary costs in [SEGMENTED-LIMITS.md]; patch composition in [PATCHES.md].
@@ -25,9 +25,39 @@ Two generations share the name. v2 is the Python-driven chain (`chain_client.py`
 `stage_worker.py`, `stream.py`; TUI entry `koakuma`) that spreads a model over several machines;
 v2.1 pushes that chain into `llama_context` so the exposed surface matches a whole model.
 
-**v2 is retired** — archived on `slimarc/prototype` — so this branch documents v2.1 only. Its
-throughput numbers stay in [MEASUREMENTS.md], v2.1 criteria live in [SPLIT-MEASUREMENTS.md]; do not
-mix them.
+**v2 is retired** — archived on `slimarc/prototype`. v2.1 is the delivery version and is frozen (repo
+tag `v2.1`); v2.2 is the current development version that tracks upstream. Its throughput numbers
+stay in [MEASUREMENTS.md]; this generation's (v2.1 / v2.2 shared) criteria live in
+[SPLIT-MEASUREMENTS.md]; do not mix them.
+
+## Upstream and versions
+
+On 2026-11-12 upstream advanced 31 commits past `09338b85e` (to `5676dfbe0`, tag `b12342`). The core
+one is PR #30565 "llama : prune" (preparing for the v1.0.0 release): 18 NextN / layer-input /
+embd-row / state-row APIs move from `src/llama-ext.h` (the staging header) into `include/llama.h`,
+and `llama_set_embd_state_src` becomes `llama_set_ctx_state_src`. For this project that is a
+**foundation promotion, not a capability change**: segmented passthrough is built on exactly those
+three channels (the head exports pre-norm hidden, relay / tail consume it through an embd row), so
+the patch no longer adds `extern "C"` to the staging header (`include/llama.h:52` already wraps it);
+the `split_*` protocol layer is ours, not upstream's, and does not move a line. Upstream's API
+targets in-process draft-head combinations and reaches other machines over RPC backend + RDMA, so it
+does not collide with this project's feature passthrough; `3bce8bd50` and `3ba1ce0e2` in the same
+batch also pay off directly.
+
+| Version | Base | Status and caliber |
+| --- | --- | --- |
+| v2.1 | `09338b85e` | **Delivery version, frozen**: code-side tags `v2.1` (`4acf03c8b`, tree `548c3dfb0`) and `v2.1-kvmem` (`3f930466d`, tree `192b2a3d0`); repo tag `v2.1` (`074dea49`, tree `83f31877`) |
+| v2.2 | `5676dfbe0` | **Current development version** (the next one, tracking upstream): capabilities, criteria and measurements carry over from v2.1 un-remeasured; whether it enters the delivery scope is undecided |
+
+v2.2's goal is to finish **separating prefill from decode**, in three parts: overturn the remote
+chain's single-sequence boundary (v2.1's stated reason was that the remote chain is not multi-tenant);
+introduce batching (`OP_DECODE` carries one `seq_id` per row, so prefill chunks and decode tokens mix
+in one batch); separate the prefill and decode scheduling. For reference, v2.1's multi-sequence run
+gave `-np 2` 0.81× end to end and 0.70× on concurrent prefill. Left for v3: multi-request batching
+(pack the hidden of N requests into one frame, dividing round trips by N) and chained topology (today
+a star, four network one-ways per decode; direct segment-to-segment links save one one-way, 12.5–15
+ms or about 6–7%, but `seq_rm` / checkpoints / error propagation must be redone along the chain,
+15–20 person-days).
 
 ## Capabilities
 
@@ -95,7 +125,7 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
    [SPLIT-MEASUREMENTS.md] §7.
 3. **The remote chain is single-sequence.** `llama_split_attach_remote()` rejects `n_seq_max > 1`.
    Concurrency means several servers on the head box, each with its own chain; inside one box use the
-   local chain. See [SEGMENTED-LIMITS.md] §2.4.
+   local chain (v2.2 aims to lift this). See [SEGMENTED-LIMITS.md] §2.4.
 4. **Pick the draft source by channel.** DFlash / DSpark travel as `layer_inp` taps (protocol v9) and
    cost nothing on a remote chain. MTP travels the nextn channel and accepts less on a chain than on
    a whole model; the cause is in the measurements section. See [SEGMENTED-LIMITS.md] §2.2.
@@ -148,9 +178,9 @@ rather than official BF16, so the comparison holds only between those two files.
 
 ## Code and acceptance
 
-- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `4acf03c8b` on parent `09338b85e`
-  (current upstream, 193 commits later), tree `548c3dfb0`; against upstream, 55 files /
-  +20345 −245.
+- Fork (v2.1 delivery): `H:\llamacpp-c`, branch `rebase-merge`, a single commit `4acf03c8b` on parent
+  `09338b85e` (upstream head at v2.1 delivery, 193 commits later), tree `548c3dfb0`; against
+  upstream, 55 files / +20345 −245.
 - [llamacpp-split.patch]: 45 files / +16680 −244 / 18749 lines / 982.8 KiB. The complete pure split
   patch (protocols v7 / v8 / v9 included); the mechanism list is in [PATCHES.md]. No SLIM-ARC; it
   compiles and passes the full acceptance run on its own.
@@ -167,7 +197,7 @@ rather than official BF16, so the comparison holds only between those two files.
   the upstream-overlap section of [PATCHES.md].
 
 Every acceptance check compares bit- and byte-identical logits, not generated text; the table below
-records the 2026-11-12 run:
+records the v2.1 delivery run (2026-11-12); v2.2 is un-remeasured:
 
 | Suite | Result | Criterion |
 | --- | ---: | --- |
@@ -179,14 +209,15 @@ records the 2026-11-12 run:
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
 | Pure split build (main patch only) | 52 + 36 | built and run independently on tree `586a7e7a1` |
 
-**Current status of the pure split build**: the pure split tree `586a7e7a1` (45 files) was rebuilt
+**Latest status of the pure split build**: the pure split tree `586a7e7a1` (45 files) was rebuilt
 with `--clean-first` in an independent worktree @ `09338b85e` + main patch (`git write-tree` =
 `586a7e7a1`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
 previous build `0c307d82a` (44 files, 2026-11-09) covers the same acceptance.
 
 The v2 chain was checked by `python checks/verify_*.py` and
 `python -m unittest test_topology test_contract`; those scripts left with v2 (now on
-`slimarc/prototype`). Counts and latest results are in [SPLIT-MEASUREMENTS.md] §6.
+`slimarc/prototype`); v2.1 acceptance lives in `verify/` and v2.2 reuses it. Counts and latest
+results are in [SPLIT-MEASUREMENTS.md] §6.
 
 ## Documentation map
 
@@ -211,7 +242,7 @@ Most-queried documents:
 | [PATCHES.md] | Patch generations and their differences, the upstream rebase record, full patch text |
 | [BUILD.md] | From patch to executable: measured commands, switch matrix, CPU variants and a fair baseline, MSVC traps, artifact list |
 | [SEGMENTED-LIMITS.md] | Every boundary: root cause, blast radius, what fixing it would cost |
-| [SPLIT-MEASUREMENTS.md] | v2.1 measurements: checkpoints, MTP, DFlash, protocol v9, the selection matrix, the zero-loss cross-machine run |
+| [SPLIT-MEASUREMENTS.md] | v2.1 measurements (reused by v2.2): checkpoints, MTP, DFlash, protocol v9, the selection matrix, the zero-loss cross-machine run |
 | [SPECULATION-DATA.md] | Speculation data: per-prompt, k sweep, DFlash, selection matrix, unlogged numbers |
 | [MODEL-SWAP.md] | 35B model swap: both weight files, acceptance baselines, the 13% chain discount |
 | [PROTOCOL-V9.md] | Protocols v5/v7/v8/v9: candidate channel, verify rows, remote draft, taps, the `seq_rm` probe |

@@ -2,14 +2,14 @@
   <img src="docs/assets/banner.svg" alt="K-Llama — Llama.cpp for Kircheis" width="100%">
 </p>
 
-# K-Llama v2.1
+# K-Llama v2.2
 
 **面向非整模加载 · 基于定制化 llama.cpp 引擎 · 轻量化大模型分布式边缘推理优化系统**
 
 **中文** | [English](docs/README.en.md)
 
-> 状态：**现行**
-> 更新日期：2026-11-12
+> 状态：**现行开发版 v2.2**；结题版本 v2.1（已冻结）
+> 更新日期：2026-11-13
 > 适用范围：分段链的对外入口——定位、能力、快速开始、关键约束、实测口径与文档索引。机制归
 > [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)，边界代价归
 > [`docs/limits/SEGMENTED-LIMITS.md`](docs/limits/SEGMENTED-LIMITS.md)，补丁构成归
@@ -24,8 +24,29 @@ slot、prompt cache 全部走原生实现，客户端不需要知道段在哪台
 `koakuma`），解决「模型怎么分到多台机器」；v2.1 把这条链下沉进 `llama_context`，解决「分段
 之后能力与整模对齐」。
 
-**v2 已退场**（归档在 `slimarc/prototype`），本分支只讲 v2.1。v2 的吞吐数据归 [MEASUREMENTS]，
-v2.1 的判据归 [SPLIT-MEASUREMENTS]，两者不可混用。
+**v2 已退场**（归档在 `slimarc/prototype`）；v2.1 是结题版本、已冻结（本仓 tag `v2.1`），v2.2 是现行
+开发版。v2 的吞吐数据归 [MEASUREMENTS]，本代（v2.1 / v2.2 共用）的判据归 [SPLIT-MEASUREMENTS]，不可混用。
+
+## 上游与版本
+
+2026-11-12，上游从 `09338b85e` 起更新 31 个提交（到 `5676dfbe0`，tag `b12342`）。核心是 PR #30565
+"llama : prune"（为 v1.0.0 发布准备）：18 个 NextN / layer-input / embd-row / state-row API 从
+`src/llama-ext.h`（staging header）转正进 `include/llama.h`，`llama_set_embd_state_src` 改名
+`llama_set_ctx_state_src`。这是**地基转正**，不是能力变更：分段透传正建立在这三条通道上（head 出
+pre-norm hidden，relay / tail 经 embd row 消费），补丁不必再往 staging header 补 `extern "C"`
+（`include/llama.h:52` 自带）；`split_*` 协议层上游没有，一行不动。上游这套 API 面向进程内的 draft 头组合，
+跨机走 RPC backend + RDMA，与本项目特征透传不撞车；同批 `3bce8bd50`、`3ba1ce0e2` 也直接受益。
+
+| 版本 | 基底 | 状态与口径 |
+| --- | --- | --- |
+| v2.1 | `09338b85e` | **结题版本，已冻结**：代码侧 tag `v2.1`（`4acf03c8b`，树 `548c3dfb0`）、`v2.1-kvmem`（`3f930466d`，树 `192b2a3d0`）；本仓 tag `v2.1`（`074dea49`，树 `83f31877`） |
+| v2.2 | `5676dfbe0` | **现行开发版**（跟随上游的下一版）：能力、判据、实测沿用 v2.1 未重测；是否纳入结题待定 |
+
+v2.2 的目标是把 **prefill / decode 分离**做完整，含三件：推翻远程链的单序列边界（v2.1 的理由是
+「远程链不是多租户」）；引入批处理（`OP_DECODE` 每行带 `seq_id`，prefill chunk 与 decode token 混在
+同一 batch）；prefill / decode 分离调度。v2.1 多序列实测 `-np 2` 端到端 0.81×、并发 prefill 0.70×。
+留到 v3：多请求批处理（N 个请求的 hidden 打包进一帧，往返除以 N）、链式拓扑（现为星形，一次 decode
+4 次跨网单程，段间直连省一次单程 12.5–15 ms、约 6–7%，但要沿链重做 `seq_rm` / checkpoint / 错误传播，约 15–20 人天）。
 
 ## 能力
 
@@ -117,7 +138,7 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 2. **多模态位置**：4 个 M-RoPE section 能跨段传（`src/llama-context.cpp` 的
    `split_expand_pos()`），端到端未跑，见 [SPLIT-MEASUREMENTS] §7。
 3. **远程链单序列**：`llama_split_attach_remote()` 拒绝 `n_seq_max > 1`。并发在 head 那台起多个
-   server、各走自己的链；单机内用本地链。见 [SEGMENTED-LIMITS] §2.4。
+   server、各走自己的链；单机内用本地链（v2.2 目标推翻此限）。见 [SEGMENTED-LIMITS] §2.4。
 4. **链上投机源按通道挑**：DFlash / DSpark 走 `layer_inp` tap（协议 v9），远程链零损失；MTP 走
    nextn 通道，链上接受率低于整模，成因见「实测」一节。见 [SEGMENTED-LIMITS] §2.2。
 5. **`--split-layer-range` 的合法性**：范围从 0 起；在模型中间结束时必须给 `--split-tail-range`
@@ -166,8 +187,8 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 
 ## 代码与验收
 
-- fork：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `4acf03c8b`，父 `09338b85e`（上游最新，
-  193 个提交之后），树 `548c3dfb0`；相对上游 55 文件 / +20345 −245。
+- fork（v2.1 结题版）：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `4acf03c8b`，父 `09338b85e`
+  （v2.1 结题时的上游最新，193 个提交之后），树 `548c3dfb0`；相对上游 55 文件 / +20345 −245。
 - [llamacpp-split.patch]：45 文件 / +16680 −244 / 18749 行 / 982.8 KiB。纯分段链的完整补丁（协议
   v7 / v8 / v9 都在其中），机制清单见 [PATCHES]；不含 SLIM-ARC，可单独编译、单独通过全部验收。
 - [llamacpp-slimarc.patch]：13 文件 / +3665 −1 / 3790 行 / 164.2 KiB。SLIM-ARC prefetch，默认
@@ -181,7 +202,7 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
   上游——上游已含那些提交；`src/models/dflash.cpp` 因 device-buffer 诊断行重新进入变更集。清单见
   [PATCHES]「与上游 193 个提交的重合」。
 
-验收判据是逐位 / 逐字节的 logits，不比生成的文字；下表是 2026-11-12 的结果：
+验收判据是逐位 / 逐字节的 logits，不比生成的文字；下表是 v2.1 结题的结果（2026-11-12），v2.2 未重测：
 
 | 套件 | 结果 | 判据 |
 | --- | ---: | --- |
@@ -191,16 +212,16 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | 链上 draft 与整模逐位、端到端逐字节 |
 | `verify/verify_grammar_spec.sh` / `verify/verify_rbudget_spec.sh` | 23 / 36 | grammar 整帧回退、预算只收紧 |
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | 5 条是上游 hybrid 的已知基线，作为对照保留 |
-| 纯分段版（只叠主补丁） | 52 + 36 | 44 文件版（树 `0c307d82a`）独立构建并跑过；现行版见下 |
+| 纯分段版（只叠主补丁） | 52 + 36 | 44 文件版（树 `0c307d82a`）独立构建并跑过；最新版见下 |
 
-**纯分段版的现行状态**：纯分段树 `586a7e7a1`（45 文件）在独立 worktree @ `09338b85e` + 主补丁
+**纯分段版的最新状态**：纯分段树 `586a7e7a1`（45 文件）在独立 worktree @ `09338b85e` + 主补丁
 （`git write-tree` = `586a7e7a1`）上 `--clean-first` 全量构建，`verify.sh` **52/0/0**、
 `verify_chain_death.py` **36/0**（2026-11-11）。上一版 `0c307d82a`（44 文件，2026-11-09）为同一套
 验收。
 
 v2 驱动链的验收（`python checks/verify_*.py` 与 `python -m unittest test_topology test_contract`）已随 v2
 退场到 `slimarc/prototype`，本分支不再持有。`checks/` 下只剩三个 v2 时代的工具（`inspect_disk.py`、
-`probe_bw_ceiling.c`、`verify_cli.py`），不是验收套件；v2.1 的验收在 `verify/`。条目与结果见
+`probe_bw_ceiling.c`、`verify_cli.py`），不是验收套件；v2.1 的验收在 `verify/`，v2.2 沿用。条目与结果见
 [SPLIT-MEASUREMENTS] §6。
 
 ## 文档地图
@@ -226,7 +247,7 @@ v2 驱动链的验收（`python checks/verify_*.py` 与 `python -m unittest test
 | [PATCHES] | 四代补丁的构成与代际差异、rebase 到上游的记录、补丁全文 |
 | [BUILD] | 从补丁到可执行文件：实测命令、开关矩阵、CPU 变体与公平基线、MSVC 坑、产物清单 |
 | [SEGMENTED-LIMITS] | 每条边界的根因、影响范围、修的时候要付的代价 |
-| [SPLIT-MEASUREMENTS] | v2.1 实测：checkpoint、MTP、DFlash、协议 v9、选型矩阵、跨机零损失 |
+| [SPLIT-MEASUREMENTS] | v2.1 实测（v2.2 沿用）：checkpoint、MTP、DFlash、协议 v9、选型矩阵、跨机零损失 |
 | [SPECULATION-DATA] | 投机实测明细：逐 prompt、k 扫描、DFlash、选型矩阵、未落盘数字 |
 | [MODEL-SWAP] | 35B 换模型：两份权重、接受率基线、链上 13% 折扣 |
 | [PROTOCOL-V9] | 协议 v5/v7/v8/v9：候选通道、验证行、远程 draft、tap、`seq_rm` 探针 |
