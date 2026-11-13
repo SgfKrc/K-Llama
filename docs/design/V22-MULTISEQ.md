@@ -130,7 +130,7 @@ v5/v7/v8/v9 各自 bump 的理由（`:27-78`）。v10 有两处布局变化：�
 ### 4.3 加什么、比什么
 
 - `stage_id` 加四个 `uint32_t`：`n_seq_max`、`n_ctx_seq`、`n_rs_seq`、`n_verify_rows`。`_pad[2]` 换成 `uint16 n_seq_max`（上限 256），三个 4 字节字段接在后面；`sizeof` 从 28 到 40（断言 `:214`）。
-- head 侧 `head_expect` 带这四个值，在 `identity_mismatch()` 里比较，消息写明「两端 `-np` / `--n-seq-max`、`-c`、`--split-rs-seq`、`--split-verify-rows` 必须一致」。
+- head 侧 `head_expect` 带这四个值，在 `identity_mismatch()` 里比：`n_seq_max` 必须**相等**（它切分 KV 池，偏大偏小都错）；其余三个只要求 **stage ≥ head**——失效方向单向，stage 偏小才是 `ST_NO_SPACE` / 回退被拒 / `output_reserve` abort，配大只是多占几个 cell。消息点名四个参数。
 - **不**比 `n_ctx` 原始值：两端 `n_ctx` 不同但每序列容量相同是合法的。
 - 四个字段同一理由：不一致的后果都是**硬故障**，不是性能差——`n_rs_seq` 偏小让回退被拒、偏大让 `rs_idx` 越界断言（[`V22-PERSEQ-SPEC.md`](V22-PERSEQ-SPEC.md) §4.3）；`n_verify_rows` 偏小让 tail 的 `output_reserve` abort（`split-stage/main.cpp:1036` 注释写明「cannot grow the graph later」）。
 - `n_rs_seq`（每序列回滚深度，可大于帧行数）与 `n_verify_rows`（帧总行数**上限**，§4.5）各司其职。比 `n_verify_rows` 比的是**上限**、不是实际行数——两端各自按自己的值分配 buffer，上限不同意味着一边可能装不下。
