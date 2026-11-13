@@ -1,6 +1,6 @@
 # 远程链多序列：四个投机通道的 per-seq 形态
 
-> 状态：**方案**（代码未实现）
+> 状态：**已实现**（v2.2）
 > 更新日期：2026-11-13
 >
 > 适用范围：v2.2 远程链在多序列帧上启用候选 / 验证 / h_nextn / tap 四个投机通道；读者为要落地这块改动的开发者。
@@ -199,7 +199,7 @@ n_rs_seq)`、`:1109` 的 `rs_idx[seq] > n_rs_seq` 检查），不需要新机制
 | `tools/split-stage/main.cpp` | `:2203`、`:2242`、`:2255` | `batch_guard(..., n_seq_max)`；逐行 `seq_id` 与 flags | 20–35 |
 | 同上 | `:2329`、`:2346-2366`、`:2382`、`:2520` | 候选按行循环；h_nextn 按行集；verify 按 flags；回复带行号表 | 45–70 |
 | `tools/server/server-context.cpp` | `:5482-5530`、`:5572-5580`、`:5590-5622` | 三个 arm 点从「挑一个 slot」变「逐 slot 置位」；去掉 `off != 0 → continue` | 35–55 |
-| 同上 | `:2365` | `spec_draft_cap = draft.n_max`（每序列 k；**不用** `n_rs_seq - 1`，后者会被 `--split-rs-seq` 抬高） | 10–15 |
+| 同上 | `:2365` | `spec_draft_cap = min(draft.n_max, n_verify_rows / n_seq_max - 1)`（每序列 k，且受帧总行数约束；**不用** `n_rs_seq - 1`，后者会被 `--split-rs-seq` 抬高） | 10–15 |
 | `common/speculative.cpp` | `:1252` 附近 | tap 行按 seq 分组注入；候选 / 验证的按 seq 取用 | 20–35 |
 
 合计**推断 295–465 行**（含注释）。加上主干文档的 290–495 行，v2.2 多序列 + per-seq 投机合计**推断 585–960 行**。两者都不含测试脚本（判据落地另计）。

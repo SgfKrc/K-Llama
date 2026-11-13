@@ -1,6 +1,6 @@
 # 远程链支持多序列：一条链承载 N 个序列的 prefill 与 decode
 
-> 状态：**方案**（代码未实现）
+> 状态：**已实现**（v2.2）
 > 更新日期：2026-11-13
 >
 > 适用范围：v2.2 远程链的多序列与 prefill/decode 同批；读者为要落地这块改动的开发者。
@@ -159,9 +159,8 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 | N=4、k=4 | 20 | 不够，要调大 |
 | N=4、k=16 | 68 | 不够，要调到 68（67.6 MB，对比 ubatch 2048 的 3.3 GB 约 2%） |
 
-所以 **tail 不需要知道 head 的 `draft.n_max`**：默认 17 在 `N ≤ 4`、`k ≤ 3` 时已经够用，`-np 4` 加默认投机可以什么都不配就跑。head 在 attach 时检查
-`n_verify_rows ≥ n_seq_max × (draft.n_max + 1)`，不满足就拒、消息给三个数（现值、需要值、「调大 `--split-verify-rows` 或调小 `--spec-draft-n-max` / `-np`」）；
-满足就放行，允许多余余量。buffer 仍是一份共享的（`n_outputs_max` 是 context 级单值）。
+所以 **tail 不需要知道 head 的 `draft.n_max`**：默认 17 在 `N ≤ 4`、`k ≤ 3` 时已经够用，`-np 4` 加默认投机可以什么都不配就跑。head 在启动时检查
+`n_verify_rows ≥ n_seq_max × (draft.n_max + 1)`：**不满足只 warn 不拒**——per-slot 的 draft 块被封顶到 `n_verify_rows / n_seq_max - 1`，帧因此必然装得下，请求照常服务（只是 draft 更短）；拒绝会把「k 太大」变成「起不来」。buffer 仍是一份共享的（`n_outputs_max` 是 context 级单值）。
 
 ## 5. 驱动改动清单
 
