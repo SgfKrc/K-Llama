@@ -38,6 +38,18 @@ import time
 import urllib.error
 import urllib.request
 
+# Windows 上 Python 的 stdout 默认是 GBK（cp936）：中文判据消息落进日志后，在 UTF-8 终端里
+# 回显全是乱码（verify.sh 的组 13 把本脚本输出逐行转记账，人读日志时中文全乱）。
+# 统一成 UTF-8 输出；日志文件由 verify.sh 重定向，因此也以 UTF-8 落盘。
+# 计数不受影响：[PASS]/[FAIL] 是 ASCII，verify.sh 只按这两个前缀记账。
+# 为什么放在脚本里而不是只靠 verify.sh 设 PYTHONIOENCODING：README §4 说单项脚本要能独立跑，
+# 只改调用点的话直接 `python verify/verify_kvmem.py` 仍然乱码。verify_perspec.py 同款。
+# Python 3.7+ 才有 reconfigure；更旧版本（或 stdout 已被换成非 TextIOWrapper）静默跳过。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 OK, BAD, SKIP = 0, 1, 2
 
 

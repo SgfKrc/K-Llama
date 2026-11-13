@@ -1,12 +1,12 @@
 #!/bin/bash
-# 分段链四组验收，一条命令跑完。
+# 分段链十四组验收，一条命令跑完。
 #
-# 为什么要这个：这四组验证之前只有"上一次某个人手工跑过"的口头结论，没人能重跑。
+# 为什么要这个：这些验证之前只有"上一次某个人手工跑过"的口头结论，没人能重跑。
 # 每次改完 llama.cpp 侧的分段代码，跑这一遍就是验收；任何一组退化都说明改坏了。
 #
 # 用法：
-#   bash verify/verify.sh              # 增量编译 + 全部四组
-#   bash verify/verify.sh --clean      # 全量重编 + 全部四组（改过头文件必须用这个）
+#   bash verify/verify.sh              # 增量编译 + 全部十四组
+#   bash verify/verify.sh --clean      # 全量重编 + 全部十四组（改过头文件必须用这个）
 #   bash verify/verify.sh --skip-build # 只跑验证
 #
 # 注意：上游构建目录的 ninja 依赖记录不可靠（多数对象 deps=0），改头文件不会触发重编，
@@ -21,7 +21,7 @@
 # 上下一个真实请求因此要重新算 prompt；一次两跳链上实测约 80 ms，代价在缓存不在时间。
 # deep=1 用于「已经在怀疑链路」或改完配置后各问一次。
 #
-# 退出码 0 = 四组全过。
+# 退出码 0 = 被测到的组全过（SKIP 不算失败，但也不算通过；逐条见下面「退出码」一节）。
 #
 # 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）
 #       -> 77（2026-11-13 加组 14：判据 7-11 的 per-seq 投机四通道，20 项）。
@@ -156,6 +156,29 @@ ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 skip() { echo "  [SKIP] $*"; SKIP=$((SKIP+1)); }
 hdr()  { echo; echo "=== $* ==="; }
+
+# ---------------------------------------------------------------- SKIP 扣减表（项数断言用）
+# 每个组「整组 SKIP 时少记多少项」。数字取自各组实际记账（见下面组 1-14 的 ok/bad 调用）：
+#   组 9 = 2、组 10 = 2 x 10 = 20、组 11 = 8 —— QLH_VERIFY_FAST=1 与内存闸门是**一次跳过这三组**，
+#   所以合起来是 30 项，不是只扣组 9/10 的 22 项；
+#   组 12 = 1、组 13 = 4、组 14 = 20。
+# 合计：77 = 组 1-8 的 22 + 30（9/10/11）+ 1（12）+ 4（13）+ 20（14）。
+# 为什么要这张表：v2.2 上组 13 永远 SKIP（KVMem 构建不在），旧的断言
+# `[ "$SKIP" -eq 0 ] && [ "$PASS" -ne "$EXPECT_PASS" ]` 因此**永不触发**——「某组静默少跑」
+# 在带 SKIP 的跑法里完全测不出来。SKIP 时按表扣减再比较，这条断言才真的守得住。
+SKIP_ITEMS_91011=30
+SKIP_ITEMS_12=1
+SKIP_ITEMS_13=4
+SKIP_ITEMS_14=20
+SKIPPED_ITEMS=0
+# 记一条 SKIP，并把它对应的项数记进 SKIPPED_ITEMS：skip_n <项数> <消息...>
+# 项数写错会立刻被结果段的断言抓到（PASS 比扣减后的期望多或少），不会变成假绿。
+skip_n() {
+    local n=${1:?skip_n 需要一个项数参数}
+    shift
+    SKIPPED_ITEMS=$((SKIPPED_ITEMS + n))
+    skip "$@"
+}
 
 # ---------------------------------------------------------------- 清理（第一件事，先于一切）
 # 旧的 kill_ours 只杀 93xx 上 LISTENING 的 PID，漏掉的恰好是最常见的三种残留：
@@ -584,16 +607,16 @@ cleanup_ours 组8
 # ---------------------------------------------------------------- 组 9：DFlash
 if [ "$SKIP_BIG" = "1" ]; then
     echo
-    echo "=== 组 9 / 组 10 / 组 11 没测：QLH_VERIFY_FAST=1 只跑 2B 的组（1-8 与 12）==="
-    echo "  [SKIP] 不计入 PASS、不算通过：这一轮没有测 35B 的 DFlash / DSpark 两组。"
-    skip "组 9/10 没测（QLH_VERIFY_FAST=1），不是 PASS"
+    echo "=== 组 9 / 组 10 / 组 11 没测：QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12 与 14）==="
+    echo "  [SKIP] 不计入 PASS、不算通过：这一轮没有测 35B 的 DFlash / DSpark / 产品路径三组。"
+    skip_n $SKIP_ITEMS_91011 "组 9/10/11 没测（QLH_VERIFY_FAST=1），不是 PASS"
 else
 AVAIL_GB=$(qlh_available_gb_settled)
 if [ "$AVAIL_GB" -lt "$MIN_FREE_GB" ]; then
     hdr "组 9 / 组 10 没测：可用内存不足"
-    skip "组 9/10 没测：可用 ${AVAIL_GB} GB < 闸门 ${MIN_FREE_GB} GB —— 这不是 PASS，这一轮没有测到 35B（DFlash / DSpark）"
+    skip_n $SKIP_ITEMS_91011 "组 9/10/11 没测：可用 ${AVAIL_GB} GB < 闸门 ${MIN_FREE_GB} GB —— 这不是 PASS，这一轮没有测到 35B（DFlash / DSpark）"
     echo "  想真测：关掉占内存的进程再跑；或按实际情况调 QLH_VERIFY_MIN_FREE_GB=${MIN_FREE_GB}。"
-    echo "  只想确认 2B 的组没有回归：QLH_VERIFY_FAST=1（组 1-8 与 12 照样全跑）。"
+    echo "  只想确认 2B 的组没有回归：QLH_VERIFY_FAST=1（组 1-8、12 与 14 照样全跑）。"
 else
 echo "  [mem] 可用 ${AVAIL_GB} GB ≥ ${MIN_FREE_GB} GB，组 9/10 照跑"
 hdr "组 9  DFlash 草稿模型（8 路 tap 跨两段 · 单 ubatch 逐位）"
@@ -768,7 +791,7 @@ hdr "组 12  段级 offload 正确性（CUDA 构建：整模 vs --split-layer-ra
 # 二进制必须来自 CUDA 构建；构建不存在、或构建在但设备不可用，都记 SKIP 并明说「这不是 PASS」。
 CUDA_SERVER=$CUDA_BIN/llama-server.exe
 if [ ! -x "$CUDA_SERVER" ]; then
-    skip "组 12 没测：缺 $CUDA_SERVER（CUDA 构建不存在，QLH_CUDA_BUILD_DIR=$CUDA_BUILD）—— 这不是 PASS，段级 offload 没有覆盖"
+    skip_n $SKIP_ITEMS_12 "组 12 没测：缺 $CUDA_SERVER（CUDA 构建不存在，QLH_CUDA_BUILD_DIR=$CUDA_BUILD）—— 这不是 PASS，段级 offload 没有覆盖"
 else
     CUDA_BIN_WIN=$(win_path "$CUDA_BIN")
     CUDA_LOG_W=$QLH_TMP/cuda_whole.log
@@ -799,7 +822,7 @@ else
     elif grep -qiE 'no CUDA-capable device|CUDA error|failed to initialize CUDA|no usable GPU|out of memory' \
             "$CUDA_LOG_W" "$CUDA_LOG_N1" 2>/dev/null; then
         # 构建在、但驱动/显存不允许：这是环境，不是代码，按 SKIP 记（照组 9/10 的写法，SKIP 不算通过）。
-        skip "组 12 没测：CUDA 构建在，但设备不可用（见 cuda_whole.log / cuda_split024.log）—— 这不是 PASS"
+        skip_n $SKIP_ITEMS_12 "组 12 没测：CUDA 构建在，但设备不可用（见 cuda_whole.log / cuda_split024.log）—— 这不是 PASS"
         grep -hiE 'no CUDA-capable device|CUDA error|failed to initialize CUDA|no usable GPU|out of memory' \
             "$CUDA_LOG_W" "$CUDA_LOG_N1" 2>/dev/null | head -2 | sed 's/^/    /'
     else
@@ -819,9 +842,9 @@ hdr "组 13  KVMem 的 KV 虚拟化（本地双段 + MTP + 驱逐）"
 KVMEM_BUILD=${QLH_KVMEM_BUILD_DIR:-H:/llamacpp-c/build-kvmem2}
 KVMEM_ROOT=${LLAMA_KVMEM_ROOT:-$QLH_VERIFY_DIR/../.qlh_tmp/kvmem-probe}
 if [ ! -x "$KVMEM_BUILD/bin/llama-server.exe" ]; then
-    skip "组 13 没测：缺 $KVMEM_BUILD/bin/llama-server.exe（带 LLAMA_KVMEM=ON 的构建不存在）—— 这不是 PASS，KVMem 没有覆盖"
+    skip_n $SKIP_ITEMS_13 "组 13 没测：缺 $KVMEM_BUILD/bin/llama-server.exe（带 LLAMA_KVMEM=ON 的构建不存在）—— 这不是 PASS，KVMem 没有覆盖"
 elif [ ! -d "$KVMEM_ROOT" ]; then
-    skip "组 13 没测：LLAMA_KVMEM_ROOT 不存在（$KVMEM_ROOT）—— 这不是 PASS，KVMem 没有覆盖"
+    skip_n $SKIP_ITEMS_13 "组 13 没测：LLAMA_KVMEM_ROOT 不存在（$KVMEM_ROOT）—— 这不是 PASS，KVMem 没有覆盖"
 else
     KVMEM_LOG=$QLH_TMP/kvmem_group13.log
     QLH_KVMEM_BUILD_DIR="$KVMEM_BUILD" LLAMA_KVMEM_ROOT="$KVMEM_ROOT" \
@@ -864,10 +887,14 @@ hdr "组 14  远程链 -np 2 的 per-seq 投机四通道（判据 7–11）"
 PESPEC_BASE=${QLH_VERIFY_PORT_PESPEC_BASE:-9380}
 PESPEC_LOG=$QLH_TMP/perspec_group14.log
 if [ ! -x "$BIN/split-stage.exe" ]; then
-    # 环境闸门（qlh_require_bins）通常已经先退出 3；这里兜住「$BIN 在半路被换掉」这类情况。
-    skip "组 14 没测：缺 $BIN/split-stage.exe —— 这不是 PASS，判据 7–11 没有覆盖"
+    # 这个分支保留是**防御性**的，不是死代码：开头的 qlh_require_bins 在正常情况下已经先
+    # exit 3（它检查的正是同一个 split-stage.exe），所以正常路径到不了这里；但如果 $BIN 在
+    # 跑的过程中被换掉（重编、切换构建目录、有人删了 bin/），这里就兜住了——比让它跑到组 14
+    # 内部再炸成一堆 traceback 干净。
+    # 它也不会制造假绿：skip_n 把组 14 的 20 项从期望里扣掉，结果段的项数断言照样对得上。
+    skip_n $SKIP_ITEMS_14 "组 14 没测：缺 $BIN/split-stage.exe —— 这不是 PASS，判据 7–11 没有覆盖"
 elif [ ! -f "$MODEL" ]; then
-    skip "组 14 没测：缺 MTP 模型（$MODEL，判据 7–11 靠它跑 draft-mtp）—— 这不是 PASS，判据 7–11 没有覆盖"
+    skip_n $SKIP_ITEMS_14 "组 14 没测：缺 MTP 模型（$MODEL，判据 7–11 靠它跑 draft-mtp）—— 这不是 PASS，判据 7–11 没有覆盖"
 else
     # run_limited 的签名是 <秒> <输出文件> <命令...>：输出文件必须在第二参数位。实测本组约 50 s，
     # 3600 是照组 13 留的余量（机器被挤时 stage 的 ready 会明显变慢）。
@@ -900,14 +927,19 @@ hdr "结果"
 # 但以前没有任何地方守它——某条判据因日志措辞改动而静默不匹配时，总数会变少，而
 # 「77 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4、
 # 组 14 = 20；不带 --skip-build 时另有「三目标构建完成」1 项（78）。
-# 只在**没有 SKIP** 的完整跑上断言：SKIP 时少跑的是整组（组 9/10/11/12/14），
-# 与 skip() 记的 1 条不是一比一，硬算会误报。
+#
+# SKIP 的处理（旧版在这里失效）：以前是 `[ "$SKIP" -eq 0 ] && ...`，而 v2.2 上组 13 永远 SKIP，
+# 所以这条断言**永不触发**——「某组静默少跑」在带 SKIP 的跑法里完全测不出来。
+# 现在 SKIP 时按上面的 SKIP 扣减表把整组的项数减掉，再比较：
+#   PASS 必须 == EXPECT_PASS - SKIPPED_ITEMS。
+# 例：完整验收里只有组 13 SKIP -> 期望 77-4 = 73；加 --skip-build 则是 74。
 EXPECT_PASS=77
 [ "$MODE" = "--skip-build" ] || EXPECT_PASS=$((EXPECT_PASS + 1))
-# 只在「全绿且无 SKIP」时断言：环境缺失（已 FAIL）时不再叠一条噪声；
+EXPECT_NOW=$((EXPECT_PASS - SKIPPED_ITEMS))
+# 只在 FAIL=0 时断言：已经有真失败时不再叠一条噪声（失败本身会让人去看日志）；
 # 而「某组静默少跑」的特征恰好是 FAIL=0 且 PASS 变少，这条正是抓它的。
-if [ "$SKIP" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$EXPECT_PASS" ]; then
-    bad "项数变了：PASS=$PASS，期望 $EXPECT_PASS（有判据漏跑，或被测日志的措辞改了）"
+if [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$EXPECT_NOW" ]; then
+    bad "项数变了：PASS=$PASS，期望 $EXPECT_NOW（= $EXPECT_PASS - SKIP 扣减 $SKIPPED_ITEMS；有判据漏跑，或被测日志的措辞改了）"
 fi
 echo "  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
 if [ "$SKIP" -gt 0 ]; then

@@ -15,12 +15,18 @@ QLH_BUILD_DIR=H:/llamacpp-c/build-split bash verify/verify.sh --skip-build
 ```
 
 退出码 0 = **被测到的**组全过。`--skip-build` 表示用现成二进制；去掉它会先跑一次
-`cmake --build`（见 §7）。全套含 35B 组（组 9/10/11），要独占内存；只想确认 2B 那些组（1-8 与 14）没有
+`cmake --build`（见 §7）。全套含 35B 组（组 9/10/11），要独占内存；只想确认 2B 那些组（1-8、12 与 14）没有
 回归就加 `QLH_VERIFY_FAST=1`：
 
 ```bash
-QLH_VERIFY_FAST=1 bash verify/verify.sh --skip-build    # 组 1-8 与 14，组 9/10/11 明确 SKIP
+QLH_VERIFY_FAST=1 bash verify/verify.sh --skip-build    # 组 1-8、12 与 14，组 9/10/11 明确 SKIP
 ```
+
+「77 项」不是口号，有两道项数断言守着它：`verify.sh` 结尾按
+`PASS == EXPECT_PASS - SKIP 扣减` 断言（组 9/10/11 = 30、组 12 = 1、组 13 = 4、组 14 = 20），
+`verify_perspec.py` 结尾断言 `PASS + FAIL == 20`。某条判据因日志措辞改动而静默不匹配、或
+某个条件分支忘了 `else: bad()` 时，PASS 会变少而 FAIL 仍是 0——这两条就是抓那种假绿的。
+SKIP 时按组扣减而不是跳过断言：v2.2 上组 13 永远 SKIP，旧版「只在 SKIP=0 时断言」等于永不触发。
 
 ## 2. 环境约定
 
@@ -126,6 +132,9 @@ bash   verify/verify_dflash_dev_path.sh                  # verify.sh 组 11 本�
    没有近似并列，不是链。
 2. **别用 `python -X utf8` 跑这里的 Python**：`verify_chain_death.py` 的判据里包含中文日志
    片段的匹配，`-X utf8` 会改变 stderr/stdout 的编码行为，历史上有过误判。
+   例外：`verify_perspec.py` 与 `verify_kvmem.py` 在脚本开头自己
+   `sys.stdout.reconfigure(encoding="utf-8")`（Windows 默认 GBK，中文判据消息落进日志后在
+   UTF-8 终端里回显全乱），编码已在脚本内定死，因此这两个既不需要 `-X utf8` 也不该加。
 
 ## 7. 构建（`--skip-build` 之外的路径）
 

@@ -38,6 +38,18 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _qlh_env import BIN, TMP, require   # noqa: E402
 
+# Windows 上 Python 的 stdout 默认是 GBK（cp936）：中文判据消息落进日志后，在 UTF-8 终端里
+# 回显全是乱码（verify.sh 的组 14 把本脚本输出逐行转记账，人读日志时中文全乱）。
+# 统一成 UTF-8 输出；日志文件由 verify.sh 重定向，因此也以 UTF-8 落盘。
+# 计数不受影响：[PASS]/[FAIL] 是 ASCII，verify.sh 只按这两个前缀记账。
+# 为什么放在脚本里而不是只靠 verify.sh 设 PYTHONIOENCODING：README §4 说单项脚本要能独立跑，
+# 只改调用点的话直接 `python verify/verify_perspec.py` 仍然乱码。verify_kvmem.py 同款。
+# Python 3.7+ 才有 reconfigure；更旧版本（或 stdout 已被换成非 TextIOWrapper）静默跳过。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 MODEL = os.environ.get("QLH_SPLIT_MODEL", r"H:/qlh_models/qwen3-5-2b-gguf/qwen35-2b-Q4_K_M.gguf")
 RS_SEQ = os.environ.get("QLH_RS_SEQ", "8")
 VERIFY_ROWS = 17
@@ -403,14 +415,14 @@ def main():
             if outA[1] > 0:
                 ok("判据 9: 同一批里 A 在投机（draft_n=%d），B 没有（普通 decode）" % outA[1])
             else:
-                bad("判据 9: A 没有 draft，投机序列没走投机路径")
+                bad("判据 9: A 没有 draft（draft_n=%d）—— 期望它在投机，实际走了普通 decode" % outA[1])
 
         log = srv2.text()
         m = [ln for ln in log.splitlines() if "verify channel armed for" in ln]
         if m:
             ok("判据 10: 验证通道真的被用上，且行号不是从 0 开始：%s" % m[0].strip())
         else:
-            bad("判据 10: 日志里没有 verify channel armed 的证据（通道可能被静默降级）")
+            bad("判据 10: 日志里没有 'verify channel armed for' —— 验证通道没被用上，行映射没验到")
 
         # 判据 8a：同一条 -np 2 链，关掉投机，两个并发请求用不同 top_k（走候选通道）
         print("  -- 判据 8a：非投机链上的逐行候选 --")
@@ -445,7 +457,7 @@ def main():
         if m:
             ok("判据 11: 启动日志有 per-slot 上限的 warn：%s" % m[0].strip())
         else:
-            bad("判据 11: 启动日志没有 per-slot 上限的 warn")
+            bad("判据 11: 启动日志没有 'per-slot draft cap' / 'exceeds what this chain' 的 warn —— 期望超限配置被点名降级，实际没有任何提示")
         try:
             got = run_concurrent(PORT_SRV_N2_NOMAX, [(PROMPT_A, 32, None, False),
                                                      (PROMPT_B, 32, None, False)])
@@ -473,6 +485,15 @@ def main():
         for p in list(procs):
             p.stop()
 
+    # 项数断言（防假绿的最后一道）：上面 7 处条件分支全是「应该发生但没发生」的形态，
+    # 每一处都带 else: bad()，所以 PASS+FAIL 恒为 20。将来有人再加条件分支却忘了 else，
+    # 检查会静默消失、FAIL 仍为 0、退出码仍是 0——这条就是抓那种假绿的。
+    # 只在真的漏输出时触发：任何一处 else: bad() 触发时 PASS+FAIL 仍是 20，不会误报。
+    # 放在汇总行之前：这样汇总行打印的是最终计数（含这条断言自己产生的 FAIL）。
+    EXPECT_CHECKS = 20   # 与 verify.sh 的 EXPECT_PASS 增量一致（组 14 = 20 项）
+    if PASS + FAIL != EXPECT_CHECKS:
+        bad("项数变了：%d PASS + %d FAIL = %d，期望 %d（有检查因条件不满足静默消失）"
+            % (PASS, FAIL, PASS + FAIL, EXPECT_CHECKS))
     print("\n== 判据 7–11：%d PASS / %d FAIL ==" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
 
