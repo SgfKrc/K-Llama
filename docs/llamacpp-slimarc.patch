@@ -26,7 +26,7 @@ index 5f65c39dc..de56b0fee 100644
              ${LLAMA_MODELS_SOURCES}
              )
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index c48111dd3..5de229b39 100644
+index 053920f2e..cd414afb5 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -14,6 +14,7 @@
@@ -37,7 +37,7 @@ index c48111dd3..5de229b39 100644
  
  #include <algorithm>
  #include <cinttypes>
-@@ -1903,6 +1904,14 @@ bool llama_context::set_adapter_cvec(
+@@ -1921,6 +1922,14 @@ bool llama_context::set_adapter_cvec(
  }
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -52,7 +52,7 @@ index c48111dd3..5de229b39 100644
      if (mctx && !mctx->apply()) {
          LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
          ret = GGML_STATUS_FAILED;
-@@ -1932,7 +1941,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1950,7 +1959,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          res->reset();
  
          ggml_backend_sched_reset(sched.get());
@@ -70,7 +70,7 @@ index c48111dd3..5de229b39 100644
  
          //const auto t_start_us = ggml_time_us();
  
-@@ -1946,6 +1964,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1964,6 +1982,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  

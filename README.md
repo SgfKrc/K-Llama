@@ -55,7 +55,7 @@ v2.2 的目标是把 **prefill / decode 分离**做完整，含三件：推翻�
 | 本地分段 | `--split-layer-range` + `--split-tail-range` 同进程出 token；`-np 4` 四并发输出与串行逐字节相同 | `verify/verify.sh` 组 5；[SPLIT-MEASUREMENTS] §4 |
 | 前缀复用 | 3103 token 历史整段重算 19847 ms，第二轮只解 38 个新 token 用 714 ms（2B 链，`-c 8192 -np 1`） | [SPLIT-MEASUREMENTS] §1 |
 | 远程链 | `llama_split_attach_remote()` 建链；KV 广播、checkpoint 覆盖全链、120 s 读超时、链死而进程活 | `verify/verify_chain_death.py`；[SEGMENTED-LIMITS] §2.7 |
-| 远程链投机 | DFlash / DSpark 的 `layer_inp` tap 随 decode 回复跨进程（协议 v9），接受率与整模逐 prompt 相同 | 下表；[SPLIT-MEASUREMENTS] §14 |
+| 远程链投机 | DFlash / DSpark 的 `layer_inp` tap 随 decode 回复跨进程（协议 v9/v10），接受率与整模逐 prompt 相同 | 下表；[SPLIT-MEASUREMENTS] §14 |
 | MTP 投机 | tail 的 NextN 头即 draft，k 步递归在 stage 内跑 | `verify/verify.sh` 组 8；[SPECULATION] §4 |
 | grammar / reasoning budget | 候选逐 token 自检、被拒整帧回退；预算耗尽只收紧不放宽 | `common_sampler_grammar_rejects()`；[PATCHES] 第四代 |
 | 段的内存 | logits 与 pp 图缓冲按实际输出行数分配：tail 1710.76 → 3.79 MiB（1806-token ubatch，2B 链，`-c 8192 -np 4 -b 2048`），远程 20:24 段 2052.10 → 240.09 MiB（2B，`-c 4096 -b 2048`，词表 248320） | [SPLIT-MEASUREMENTS] §5 |
@@ -139,7 +139,7 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
    `split_expand_pos()`），端到端未跑，见 [SPLIT-MEASUREMENTS] §7。
 3. **远程链单序列**：`llama_split_attach_remote()` 拒绝 `n_seq_max > 1`。并发在 head 那台起多个
    server、各走自己的链；单机内用本地链（v2.2 目标推翻此限）。见 [SEGMENTED-LIMITS] §2.4。
-4. **链上投机源按通道挑**：DFlash / DSpark 走 `layer_inp` tap（协议 v9），远程链零损失；MTP 走
+4. **链上投机源按通道挑**：DFlash / DSpark 走 `layer_inp` tap（协议 v9/v10），远程链零损失；MTP 走
    nextn 通道，链上接受率低于整模，成因见「实测」一节。见 [SEGMENTED-LIMITS] §2.2。
 5. **`--split-layer-range` 的合法性**：范围从 0 起；在模型中间结束时必须给 `--split-tail-range`
    或 `--split-remote`。两道检查都在 `common_init_from_params()`（`common/common.cpp`），读的是
@@ -187,18 +187,18 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 
 ## 代码与验收
 
-- fork（v2.1 结题版）：`H:\llamacpp-c`，分支 `rebase-merge`，单提交 `4acf03c8b`，父 `09338b85e`
-  （v2.1 结题时的上游最新，193 个提交之后），树 `548c3dfb0`；相对上游 55 文件 / +20345 −245。
-- [llamacpp-split.patch]：45 文件 / +16680 −244 / 18749 行 / 982.8 KiB。纯分段链的完整补丁（协议
-  v7 / v8 / v9 都在其中），机制清单见 [PATCHES]；不含 SLIM-ARC，可单独编译、单独通过全部验收。
+- fork（v2.2 现行版）：`H:\llamacpp-c`，分支 `slimarc/v2.2`，HEAD `6d0fa16c9`（基底 `5676dfbe0` 之后 7 个提交，
+  tag `b12342`），树 `61781c712`；相对基底 55 文件 / +21788 −238。
+- [llamacpp-split.patch]：45 文件 / +18123 −237 / 20238 行 / 1077.2 KiB。纯分段链的完整补丁（协议
+  v7 / v8 / v9 / v10 都在其中），机制清单见 [PATCHES]；不含 SLIM-ARC，可单独编译、单独通过全部验收。
 - [llamacpp-slimarc.patch]：13 文件 / +3665 −1 / 3790 行 / 164.2 KiB。SLIM-ARC prefetch，默认
   关闭，`SLIM_ARC_PREFETCH=1` 才装。借用的只有这一块：专家驻留、KV 驱逐、I/O 调度器未接，见
   [SLIM-ARC-接入计划]。
-- 叠加判据：`09338b85e` + 主补丁 → 树 `586a7e7a1`；再叠增量 → 树 `548c3dfb0`，与 HEAD 的树相同
+- 叠加判据：`5676dfbe0` + 主补丁 → 树 `2541c9d29`；再叠增量 → 树 `61781c712`，与 HEAD 的树相同
   （`git write-tree` 校验，见 `scripts/export_patches.sh`）。
-- 构建：[BUILD] 给出从 `09338b85e` + 补丁到二进制的实测命令、8 个 `build-*` 的开关矩阵与 CPU
+- 构建：[BUILD] 给出从 `5676dfbe0` + 补丁到二进制的实测命令、8 个 `build-*` 的开关矩阵与 CPU
   变体基线；改 `.h` 必须 `--clean-first`。
-- 与上游：16 个文件与 `09338b85e` 逐字节相同（rebase 前 0 个）。移除的 17 个文件改动属落后于
+- 与上游（v2.1 rebase 口径）：16 个文件与 `09338b85e` 逐字节相同（rebase 前 0 个）。移除的 17 个文件改动属落后于
   上游——上游已含那些提交；`src/models/dflash.cpp` 因 device-buffer 诊断行重新进入变更集。清单见
   [PATCHES]「与上游 193 个提交的重合」。
 

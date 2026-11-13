@@ -45,7 +45,7 @@ sha256sum <模型路径>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf        # 与项目组给
 `<模型路径>` 换成你放模型的目录。之后 `up` 自动比各段 `model` 的 size 与 mtime：size 不同拒绝启动，mtime 不同只警告（scp 会改）；`up --verify-weights` 另做完整 sha256（35B 几分钟）。这是启发式，不是密码学证明（`DEPLOYMENT.md` §4）。
 
 ## 4. 编译
-源码按 `BUILD.md` §2.2 取：上游 `ggml-org/llama.cpp` 的 `09338b85e` + `docs/llamacpp-split.patch` + `docs/llamacpp-slimarc.patch`，顺序不能反；叠完 `git write-tree` 应得 `548c3dfb0e833860cc8f49040bad3c187d42daa9`（只叠主补丁是 `586a7e7a1`）。
+源码按 `BUILD.md` §2.2 取：上游 `ggml-org/llama.cpp` 的 `5676dfbe0` + `docs/llamacpp-split.patch` + `docs/llamacpp-slimarc.patch`，顺序不能反；叠完 `git write-tree` 应得 `61781c7126be39f54d1499f83f782f2406612615`（只叠主补丁是 `2541c9d29`）。
 
 **4.1 Windows（MSVC + Ninja）**：Ninja 必须在 `vcvars64` 环境里跑，Git Bash 里直接 `ninja` 会因缺 `INCLUDE`/`LIB` 报 `C1083: 无法打开包括文件: "stdbool.h"`。存成源码根的 `build-qlh.bat`：
 

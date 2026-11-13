@@ -1,9 +1,9 @@
 # 补丁细节：第四代机制、device-buffer 修复与上游重合
 
 > 状态：**现行**
-> 更新日期：2026-11-11
+> 更新日期：2026-11-13
 > 适用范围：`docs/deploy/PATCHES.md` 的展开——第四代逐行机制表、六处语义、device-buffer 崩溃的完整修复
-> 与组 11、与上游 193 个提交的重合明细、两次对齐的历史记录、工具层参数校验。补丁构成与代际差异
+> 与组 11、与上游两次 rebase（193 / 31 个提交）的重合明细、两次对齐的历史记录、工具层参数校验。补丁构成与代际差异
 > 归 [`PATCHES.md`](PATCHES.md)；边界代价归 [`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md)。
 
 ## 1. 第四代机制表
@@ -120,7 +120,12 @@ n_layer())`。修法：组 11 只认 `QLH_DFDEV_MODEL` / `QLH_DFDEV_DRAFT`， `v
 `DFLASH_DRAFT`。两个加固：`wait_health` 带 pid（进程死了立刻返回，原来会干等满 150×2 s）；脚本默认 target 改成和
 `verify/verify.sh` 的 `MODEL_DFLASH` 同一文件。
 
-## 4. 与上游 193 个提交的重合明细
+## 4. 与上游 193 个提交的重合明细（v2.2 又对齐 31 个提交）
+
+**v2.2 的第二次对齐（2026-11-13）**：上游再进 31 个提交（`09338b85e` → `5676dfbe0`，tag `b12342`），把 18 个
+NextN / layer-input / embd-row / state-row API 从 staging header `src/llama-ext.h` 转正进 `include/llama.h`，
+并删掉了主补丁依赖的 `src/llama-ext.h:126` 那段。这次没有 `--3way` 冲突统计——走反向 apply 反推（见
+[`PATCHES.md`](PATCHES.md)「重导沿革」⑤）；改动面 +20345 → +21788，树 `2541c9d29` / `61781c712`。下表是 v2.1 那次：
 
 | | 数字 |
 | --- | --- |
