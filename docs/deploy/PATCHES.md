@@ -99,7 +99,7 @@ tree hash 不再相等。静默错，属于「验收命令跑了、也过了、�
   `0c307d82a`（44 文件，2026-11-09，`verify.sh` 十二组 53 项——组 13 于 2026-11-12 加入、组 14 于 2026-11-13 加入（20 项），
   现行完整验收 **77 项**，见 `INDEX.md` §5——+ chain_death 36 项，日志 `.qlh_tmp/pure-split-acceptance/`）与 `586a7e7a1`（45 文件，2026-11-11，
   `verify.sh` **52/0/0**、chain_death **36/0**，日志 `.qlh_tmp/pure_split_recheck.log`；两版差 4 文件 / +605 −12）。
-  **v2.2 的纯分段树 `2541c9d29` 未单独重跑这套**（待核）。
+  v2.2 的 `2541c9d29` 于 2026-11-14 独立验过（`H:/wt-mainonly` + `build-v22-mainonly`，`git write-tree` 逐字节等于目标树；`--clean-first` 191 步全过，`verify.sh` **72 PASS / 0 FAIL / 2 SKIP**——72 = 77 − 组 12 的 1 − 组 13 的 4，这两组依赖别的构建与补丁，不在「主补丁能独立编译」这句话的范围），日志 `.qlh_tmp/mainonly-verify.log`。
 - `1dcbce39`（44 项）有一趟 `PASS=34 FAIL=10`，两处都是环境：组 5 的 `-np 4` 启动瞬间死掉（日志 0 字节，
   单跑两次都过）；组 10 的 dflash 十项里九条红，`taps_dflash_chain.log` 只有 `dflash-taps.exe: Device or
   resource busy`（整模那趟刚退出、文件锁未释放）。run2 同一份二进制得到 44/0。判据是「日志里有没有数值

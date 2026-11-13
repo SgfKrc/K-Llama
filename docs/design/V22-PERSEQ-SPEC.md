@@ -110,15 +110,15 @@ per-seq 后改成逐行互斥（同一行不能既要候选又要 token id，不
 
 ### 3.4 tap：协议零改动，只有回传行的归属要按 seq 解释
 
-**「哪些层」是链级属性，与 seq 无关**——有代码直接支持：`split_tap_ids` 放在 `split_answer` **之外**，注释写明「a property of the
-chain, not of the frame, so it lives outside split_answer and survives begin_frame()」（`llama-context.h:597-601`）；
-`split_set_layer_inp` 的注释同样写明「*not* armed per frame」（`:362-370`），设置点只有一处：draft 模型自己的 `target_layers`
-（`common/speculative.cpp:1252`）。所以「问哪些层」不需要 per-seq。
+**「哪些层」是链级属性，与 seq 无关**——`split_tap_ids` 放在 `split_answer` **之外**，注释写明「a property of the chain, not of the frame, so it lives outside
+split_answer and survives begin_frame()」（`llama-context.h:597-601`）；`split_set_layer_inp` 的注释同样写明「*not* armed per frame」（`:362-370`），
+设置点只有一处：draft 模型自己的 `target_layers`（`common/speculative.cpp:1252`）。所以「问哪些层」不需要 per-seq。
 
-**要按 seq 解释的只有回传的 row 归属**：回传是 `[row][tap][n_embd]`（`split-stage/main.cpp:2329`），head 侧按 row 复制成每 tap 一块
-（`llama-context.cpp:3257-3268`）、`tap_rows = n_tok`。多序列下 draft 的 KV 注入是 per-seq 的（每个序列各一份 draft 上下文），
-head 必须知道第 r 行属于哪个序列才能注入对的那份。**这不需要协议改动**：v10 的 `rows` 段已逐行带 `seq_id`（[`V22-MULTISEQ.md`](V22-MULTISEQ.md) §3.1），
-head 从行记录就能推出每行的 seq。所以 tap 的改动全在**消费方**：`common/speculative.cpp` 的注入循环按行 seq 分组。
+**要按 seq 解释的只有回传的 row 归属**：回传是 `[row][tap][n_embd]`（`split-stage/main.cpp:2329`），head 侧按 row 复制成每 tap 一块（`llama-context.cpp:3257-3268`）、`tap_rows = n_tok`。
+多序列下 draft 的 KV 注入是 per-seq 的（每个序列各一份 draft 上下文），head 必须知道第 r 行属于哪个序列才能注入对的那份。
+**这不需要协议改动**：v10 的 `rows` 段已逐行带 `seq_id`（[`V22-MULTISEQ.md`](V22-MULTISEQ.md) §3.1），head 从行记录就能推出每行的 seq；所以 tap 的改动全在**消费方**（`common/speculative.cpp` 的注入循环按行 seq 分组）。
+
+**2026-11-14 端到端实证**：两段远程链（本机 head `0:32` + Y700 tail `32:40`，35B + DFlash）+ `-np 2`，两条并发请求的接受率与串行**完全相同**（13/19、14/18）、输出逐字节相同；head 日志 `verify channel armed for seq 0 rows [0..2], seq 1 rows [3..5] of a 6-row frame` 直接显示同一帧里两个序列的 tap 行分属不同行段。tap 行若串到另一序列，draft 的输入 hidden 就是错的，接受率必掉、T=0 输出必分叉——两者都没发生。
 
 ### 3.5 k 的上限：帧级总行数约束（放宽不等于取消）
 
