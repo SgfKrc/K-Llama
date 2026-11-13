@@ -47,7 +47,7 @@ batch also pay off directly.
 | Version | Base | Status and caliber |
 | --- | --- | --- |
 | v2.1 | `09338b85e` | **Delivery version, frozen**: code-side tags `v2.1` (`4acf03c8b`, tree `548c3dfb0`) and `v2.1-kvmem` (`3f930466d`, tree `192b2a3d0`); repo tag `v2.1` (`074dea49`, tree `83f31877`) |
-| v2.2 | `5676dfbe0` | **Current development version** (the next one, tracking upstream): capabilities, criteria and measurements carry over from v2.1 un-remeasured; whether it enters the delivery scope is undecided |
+| v2.2 | `5676dfbe0` | **Current development version** (the next one, tracking upstream): capabilities and criteria carry over from v2.1; throughput is un-remeasured, the acceptance suite has been re-run (73/0/1, see below); whether it enters the delivery scope is undecided |
 
 v2.2's goal is to finish **separating prefill from decode**, in three parts: overturn the remote
 chain's single-sequence boundary (v2.1's stated reason was that the remote chain is not multi-tenant);
@@ -200,7 +200,7 @@ records the v2.1 delivery run (2026-11-12); v2.2 is un-remeasured:
 
 | Suite | Result | Criterion |
 | --- | ---: | --- |
-| `bash verify/verify.sh` | 57 (thirteen groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11, 1 in 12, 4 in 13) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md`, group 12 checks segment-level offload with a CUDA build, group 13 checks KVMem KV virtualization with the `build-kvmem2` build (`LLAMA_KVMEM=ON`) |
+| `bash verify/verify.sh` | 77 (fourteen groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11, 1 in 12, 4 in 13, 20 in 14) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md`, group 12 checks segment-level offload with a CUDA build, group 13 checks KVMem KV virtualization with the `build-kvmem2` build (`LLAMA_KVMEM=ON`), group 14 checks the per-seq speculative channels of a remote chain with `-np 2` (criteria 7–11) |
 | `verify/verify_chain_death.py` | 36 | 120 s read timeout, dead chain with a live process, failures visible |
 | `verify/verify_seq_id.py` | 9 | `seq_id` and positions across segments |
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |

@@ -23,7 +23,8 @@
 #
 # 退出码 0 = 四组全过。
 #
-# 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）。
+# 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）
+#       -> 77（2026-11-13 加组 14：判据 7-11 的 per-seq 投机四通道，20 项）。
 # 组 13 的 4 项覆盖 **KVMem 的 KV 虚拟化**（本地双段 + MTP + 驱逐，见下）。组 11 的 8 项覆盖
 # **DFlash 投机的 device-buffer 注入路径**：组 9/10 用的 tests/dflash-taps.cpp 只 link `llama`，
 # 从不调 llama_set_embeddings_layer_inp_dev（ctx_tgt 没有 device buffer），batch 用
@@ -36,8 +37,12 @@
 # 忽略），所以「一段里的前 N 层放 GPU、其余留 CPU」从没被验收过。组 12 用 CUDA 构建跑
 # 「整模 vs --split-layer-range 0:24，都 -ngl 4」，判据是逐字节相同。CUDA 构建不存在时 SKIP。
 #
+# 组 14 的 20 项覆盖**远程链 -np 2 上的 per-seq 投机四通道**（判据 7-11，见 docs/design/V22-PERSEQ-SPEC.md §6）：
+# 组 7 跑远程链但从不给 -np（auto = 1），组 8 的 MTP 投机只跑单序列——「一帧里两个序列、各自的
+# 投机通道参数不同」此前零覆盖。判据逐条的理由见 verify/verify_perspec.py 的模块 docstring。
+#
 # 环境变量（都有默认值，一般不用管）：
-#   QLH_VERIFY_FAST=1           只跑 2B 的组（1-8 与 12），组 9/10/11 明确 SKIP（SKIP 不算通过）
+#   QLH_VERIFY_FAST=1           只跑 2B 的组（1-8、12 与 14），组 9/10/11 明确 SKIP（SKIP 不算通过）
 #   QLH_VERIFY_MIN_FREE_GB=20   组 9/10 的内存闸门（mmap 的模型不需要全占物理内存，见下文注释）
 #   QLH_VERIFY_SMOKE_TIMEOUT=900 单次 split-smoke / split-rows 的超时（秒）
 #   QLH_VERIFY_PY_TIMEOUT=1800  组 5 python 的超时（秒）
@@ -47,6 +52,7 @@
 #   QLH_VERIFY_NGL_PARTIAL     组 12 的 -ngl 层数（默认 4）
 #   QLH_KVMEM_BUILD_DIR        组 13 的 KVMem 构建目录（默认 H:/llamacpp-c/build-kvmem2）
 #   LLAMA_KVMEM_ROOT           组 13 的 KVMem 源码根（默认 .qlh_tmp/kvmem-probe）
+#   QLH_VERIFY_PORT_PESPEC_BASE 组 14 的端口基准（默认 9380 -> stage 9381-9383 / server 9391-9395）
 # 退出码：0 = 被测到的组全过（SKIP 不算失败，但会显著打印「没测到」）；1 = 有 FAIL；
 #         2 = 另一个 verify.sh 正在跑（并发跑会互抢 93xx、互相强杀，两边都会报假失败）。
 #
@@ -70,7 +76,7 @@ MODE=${1:-}
 
 # ---------------------------------------------------------------- 环境闸门（先于一切）
 # 缺二进制就点名退出（rc=3）。不这么做的话，指错目录会跑出几十条 FAIL，看起来像代码坏了；
-# 静默 skip 更糟——那会让「52 项全过」变成一句谎话。
+# 静默 skip 更糟——那会让「77 项全过」变成一句谎话。
 qlh_show_env
 qlh_require_bins split-smoke.exe split-stage.exe llama-server.exe
 for opt in split-rows.exe dflash-taps.exe; do
@@ -128,8 +134,8 @@ a=""
 n2=""
 
 # 组 9 / 组 10 要独占内存（整模 23.5 GB 起），机器上只要还有别的 35B 进程在跑，跑出来的结果不是失败
-# 就是没意义。QLH_VERIFY_FAST=1 只跑 2B 的组（1-8 与 12，组 12 用 CUDA 构建），用来在别人占着机器时先确认没有回归；
-# 正式验收必须不带这个变量跑完整的一遍。
+# 就是没意义。QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12 与 14；组 12 用 CUDA 构建，组 14 用 2B 的 MTP），
+# 用来在别人占着机器时先确认没有回归；正式验收必须不带这个变量跑完整的一遍。
 SKIP_BIG=${QLH_VERIFY_FAST:-0}
 
 # 组 9/10 之前要求的最小可用内存（GB）。不够就 SKIP，绝不硬跑：
@@ -847,14 +853,56 @@ else
     cleanup_cuda 组13
 fi
 
+# ---------------------------------------------------------------- 组 14：per-seq 投机四通道（判据 7–11）
+hdr "组 14  远程链 -np 2 的 per-seq 投机四通道（判据 7–11）"
+# 为什么单独一组：组 7 跑远程链但从不给 -np（auto = 1），组 8 的 MTP 投机只跑单序列。于是
+# 「一帧里两个序列、各自的投机通道参数不同」这一层从来没有被端到端跑过，而判据 7–11 正是它
+# （docs/design/V22-PERSEQ-SPEC.md §6 与 docs/design/V22-MULTISEQ.md §7.1）。逐条判据的理由见
+# verify/verify_perspec.py 的模块 docstring。
+# 端口用独立基准 9380（-> stage 9381-9383 / server 9391-9395）：脚本的默认 9361 与组 13 的 KVMem
+# 同号，串行跑虽然不撞，但独立跑本组时不该踩别人的端口。
+PESPEC_BASE=${QLH_VERIFY_PORT_PESPEC_BASE:-9380}
+PESPEC_LOG=$QLH_TMP/perspec_group14.log
+if [ ! -x "$BIN/split-stage.exe" ]; then
+    # 环境闸门（qlh_require_bins）通常已经先退出 3；这里兜住「$BIN 在半路被换掉」这类情况。
+    skip "组 14 没测：缺 $BIN/split-stage.exe —— 这不是 PASS，判据 7–11 没有覆盖"
+elif [ ! -f "$MODEL" ]; then
+    skip "组 14 没测：缺 MTP 模型（$MODEL，判据 7–11 靠它跑 draft-mtp）—— 这不是 PASS，判据 7–11 没有覆盖"
+else
+    # run_limited 的签名是 <秒> <输出文件> <命令...>：输出文件必须在第二参数位。实测本组约 50 s，
+    # 3600 是照组 13 留的余量（机器被挤时 stage 的 ready 会明显变慢）。
+    run_limited 3600 "$PESPEC_LOG" python "$QLH_VERIFY_DIR/verify_perspec.py" \
+        --model "$MODEL" --port-base "$PESPEC_BASE"
+    PESPEC_RC=$?
+    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 77
+    while IFS= read -r line; do
+        case "$line" in
+            *"[PASS]"*) ok "$(echo "$line" | sed 's/^ *\[PASS\] *//')" ;;
+            *"[FAIL]"*) bad "$(echo "$line" | sed 's/^ *\[FAIL\] *//')" ;;
+        esac
+    done < "$PESPEC_LOG"
+    # 防假绿：脚本必须真的打出 PASS/FAIL 记账，否则说明它中途崩了（起不来 stage/server 时是
+    # traceback + 非零 rc，一条记账都没有）。
+    PESPEC_LINES=$(grep -cE '\[(PASS|FAIL)\]' "$PESPEC_LOG" 2>/dev/null || true)
+    [ -n "$PESPEC_LINES" ] || PESPEC_LINES=0
+    if [ "$PESPEC_LINES" -eq 0 ]; then
+        bad "组 14：脚本没打出任何 [PASS]/[FAIL]（rc=$PESPEC_RC），见 .qlh_tmp/verify/perspec_group14.log"
+        tail -8 "$PESPEC_LOG" | sed 's/^/    /'
+    elif [ "$PESPEC_RC" -ne 0 ] && [ "$(grep -c '\[FAIL\]' "$PESPEC_LOG")" -eq 0 ]; then
+        bad "组 14：脚本退出码 $PESPEC_RC 但没打出 [FAIL]（中途崩了）"
+        tail -8 "$PESPEC_LOG" | sed 's/^/    /'
+    fi
+    cleanup_ours 组14
+fi
+
 hdr "结果"
-# 项数断言：「57 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
+# 项数断言：「77 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
 # 但以前没有任何地方守它——某条判据因日志措辞改动而静默不匹配时，总数会变少，而
-# 「57 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4；
-# 不带 --skip-build 时另有「三目标构建完成」1 项（58）。
-# 只在**没有 SKIP** 的完整跑上断言：SKIP 时少跑的是整组（组 9/10/11/12），
+# 「77 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4、
+# 组 14 = 20；不带 --skip-build 时另有「三目标构建完成」1 项（78）。
+# 只在**没有 SKIP** 的完整跑上断言：SKIP 时少跑的是整组（组 9/10/11/12/14），
 # 与 skip() 记的 1 条不是一比一，硬算会误报。
-EXPECT_PASS=57
+EXPECT_PASS=77
 [ "$MODE" = "--skip-build" ] || EXPECT_PASS=$((EXPECT_PASS + 1))
 # 只在「全绿且无 SKIP」时断言：环境缺失（已 FAIL）时不再叠一条噪声；
 # 而「某组静默少跑」的特征恰好是 FAIL=0 且 PASS 变少，这条正是抓它的。

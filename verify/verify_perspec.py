@@ -20,7 +20,10 @@ docs/design/V22-MULTISEQ.md §7.1。
 每序列容量约束：-c 4096 / -np 2 -> 每序列 2048，prompt <= 1024、max_tokens <= 256。
 
 用法：
-  QLH_BUILD_DIR=H:/llamacpp-c/build-v22 python verify/verify_perspec.py [--model PATH]
+  QLH_BUILD_DIR=H:/llamacpp-c/build-v22 python verify/verify_perspec.py [--model PATH] [--port-base 9360]
+
+  --port-base 只改端口（默认 9360 = stage 9361-9363 / server 9371-9375，与历史默认逐一对齐）；
+  verify.sh 的组 14 传 9380，避开组 13 的 KVMem 9361 与 verify.sh 主用的 9331/9332/9341-9343。
 """
 
 import argparse
@@ -41,14 +44,20 @@ VERIFY_ROWS = 17
 LAYER_LO, LAYER_HI = 0, 20     # head
 TAIL_LO, TAIL_HI = 20, 24      # tail stage
 
-PORT_STAGE_N2 = 9361
-PORT_STAGE_N1 = 9362
-PORT_STAGE_N2B = 9363
-PORT_SRV_N2 = 9371
-PORT_SRV_N1 = 9372
-PORT_SRV_N2_NOMAX = 9373
-PORT_SRV_N1_NOSPEC = 9374
-PORT_SRV_N2_NOSPEC = 9375
+# 端口全部由基准算出来：独立跑时默认 9360，于是 stage 拿 9361/9362/9363、server 拿 9371-9375，
+# 与历史默认逐一对齐，老命令行不受影响。verify.sh 的组 14 传 --port-base 9380（-> 9381-9383 与
+# 9391-9395），避开组 13 的 KVMem 9361 与 verify.sh 主用的 9331/9332/9341-9343。
+PORT_BASE = 9360
+
+
+def _port_set(base):
+    """基准 -> (stage_n2, stage_n1, stage_n2b, srv_n2, srv_n1, srv_n2_nomax, srv_n1_nospec, srv_n2_nospec)。"""
+    return (base + 1, base + 2, base + 3,
+            base + 11, base + 12, base + 13, base + 14, base + 15)
+
+
+(PORT_STAGE_N2, PORT_STAGE_N1, PORT_STAGE_N2B, PORT_SRV_N2,
+ PORT_SRV_N1, PORT_SRV_N2_NOMAX, PORT_SRV_N1_NOSPEC, PORT_SRV_N2_NOSPEC) = _port_set(PORT_BASE)
 
 PASS = 0
 FAIL = 0
@@ -284,14 +293,24 @@ def cmp_tokens(name, got, want):
 
 
 def main():
-    global MODEL
+    global MODEL, PORT_STAGE_N2, PORT_STAGE_N1, PORT_STAGE_N2B, PORT_SRV_N2, PORT_SRV_N1, \
+        PORT_SRV_N2_NOMAX, PORT_SRV_N1_NOSPEC, PORT_SRV_N2_NOSPEC
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--port-base", type=int, default=PORT_BASE,
+                    help="端口基准：stage 用 +1..+3、server 用 +11..+15（默认 9360）")
     args = ap.parse_args()
     MODEL = args.model
+    (PORT_STAGE_N2, PORT_STAGE_N1, PORT_STAGE_N2B, PORT_SRV_N2,
+     PORT_SRV_N1, PORT_SRV_N2_NOMAX, PORT_SRV_N1_NOSPEC,
+     PORT_SRV_N2_NOSPEC) = _port_set(args.port_base)
 
     require("llama-server.exe", "split-stage.exe")
     print("[env] model=%s\n       BIN=%s\n       TMP=%s" % (MODEL, BIN, TMP))
+    print("[env] port-base=%d\n       stage=%d/%d/%d\n       server=%d/%d/%d/%d/%d"
+          % (args.port_base, PORT_STAGE_N2, PORT_STAGE_N1, PORT_STAGE_N2B,
+             PORT_SRV_N2, PORT_SRV_N1, PORT_SRV_N2_NOMAX,
+             PORT_SRV_N1_NOSPEC, PORT_SRV_N2_NOSPEC))
 
     procs = []
     try:

@@ -172,7 +172,7 @@ llama.cpp 自己不做这个检查——`LLAMA_LAYER_RANGE` 只校验 `lo >= 0 &
 | 参考 | 吞吐、接受率（要带口径：模型、量化、生成长度、设备） |
 | 不算 | "输出看起来通顺"、单次运行、跨配置比较 |
 
-跨机同样验过逐位一致。判据脚本按这个标准写：v2.1 的在 `verify/`（57 项十三组），v2 时代的 24 个在
+跨机同样验过逐位一致。判据脚本按这个标准写：v2.1 的在 `verify/`（77 项十四组），v2 时代的 24 个在
 `slimarc/prototype`（已退场）。
 
 **投机要单独记一条**：它的硬判据是「链上投机与**整模投机**逐字节相同」，不是「与不投机逐字节相同」——后者测的是 batch invariance，而 llama.cpp 只对 RMSNorm（全 backend）与 CUDA 的 MatMul/Attention 承诺它，CPU + 量化不在覆盖范围内。带回退时只能保证到「漂移翻掉的第一个近似并列处」（[`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §2.2）。

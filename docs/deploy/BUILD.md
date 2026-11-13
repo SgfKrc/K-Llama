@@ -105,7 +105,7 @@ cd build-split/bin
 
 | 目录 | ALL_VARIANTS | NATIVE | CUDA | VULKAN | RPC | BACKEND_DL | OPENMP | TESTS | 用途 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `build-split` | OFF | ON | OFF | OFF | OFF | OFF | ON | ON | v2.1 CPU 验收（52 项；组 12 需 CUDA 构建，合计 53；组 13 需 KVMem 构建 `build-kvmem2`，合计 57） |
+| `build-split` | OFF | ON | OFF | OFF | OFF | OFF | ON | ON | v2.1 CPU 验收（52 项；组 12 需 CUDA 构建，合计 53；组 13 需 KVMem 构建 `build-kvmem2`，合计 57；组 14 只需 2B MTP 权重，合计 77） |
 | `build-cuda` | OFF | ON | ON | OFF | OFF | OFF | **OFF** | OFF | CUDA 实验；`CMAKE_CUDA_ARCHITECTURES=89` |
 | `build-vulkan` | ON | OFF | OFF | ON | OFF | **ON** | ON | ON | 核显实验：多 CPU 变体 + 动态后端 |
 | `build-vulkan-new` | ON | OFF | OFF | ON | OFF | ON | ON | ON | 与 `build-vulkan` 开关完全相同（cache 逐行 diff 只差目录名），重建副本 |
@@ -209,11 +209,11 @@ cmake --build build-split --clean-first -- -j 8                               # 
 
 ## 7. 验收
 
-验收脚本是 `bash verify/verify.sh`（十三组共 57 项），用 `QLH_BUILD_DIR` 指向构建目录：默认增量
+验收脚本是 `bash verify/verify.sh`（十四组共 77 项），用 `QLH_BUILD_DIR` 指向构建目录：默认增量
 编译后全跑，`--clean` 全量重编，`--skip-build` 只跑验证。组 9/10 需要 35B 与 DFlash 权重及显存/内存
 闸门；组 12 需要 CUDA 构建（`QLH_CUDA_BUILD_DIR`），组 13 需要 KVMem 构建（`QLH_KVMEM_BUILD_DIR`，
-默认 `H:/llamacpp-c/build-kvmem2`）与 KVMem 源码根（`LLAMA_KVMEM_ROOT`），缺任一条该组记 SKIP。
-脚本随仓库分发（`verify/README.md`），新编一个目录也能跑。
+默认 `H:/llamacpp-c/build-kvmem2`）与 KVMem 源码根（`LLAMA_KVMEM_ROOT`），组 14 需要 2B 的 MTP
+权重与 `split-stage.exe`，缺任一条该组记 SKIP。脚本随仓库分发（`verify/README.md`），新编一个目录也能跑。
 
 ## 8. 这份说明还缺什么
 

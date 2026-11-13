@@ -72,8 +72,8 @@
 
 | 指标 | **现行值** | 口径 | 出处 | 历史值（口径） |
 | --- | ---: | --- | --- | --- |
-| `verify.sh --skip-build` | **57 项** | 13 组；组 13 = KVMem | 2026-11-12（`verify_g13b.log`，`PASS=57 FAIL=0 SKIP=0`） | **53**（12 组，组 12 = 段级 offload，2026-11-11 `verify_final53.log`）；**52**（11 组，2026-11-09 `verify_full.log`） |
-| `verify.sh`（含构建） | **58 项** | 上面 57 + 「三目标构建完成」1 项 | 同上 | 54（12 组时代） |
+| `verify.sh --skip-build` | **77 项** | 14 组；组 13 = KVMem，组 14 = per-seq 投机（判据 7–11） | 2026-11-13（`verify_group14_full.log`，`PASS=73 FAIL=0 SKIP=1`——SKIP 的是组 13 的 4 项，组 13 齐备时 77/0/0） | **57**（13 组，组 13 = KVMem，2026-11-12 `verify_g13b.log`）；**53**（12 组，组 12 = 段级 offload，2026-11-11 `verify_final53.log`）；**52**（11 组，2026-11-09 `verify_full.log`） |
+| `verify.sh`（含构建） | **78 项** | 上面 77 + 「三目标构建完成」1 项 | 同上 | 58（13 组时代）；54（12 组时代） |
 | `verify_chain_death.py` | **36 项** | 独立脚本 | `report/04` §4 | — |
 
 **注意**：`README.md` 与 `docs/README.en.md` 的项数必须同步；英文镜像曾滞后（停在 52）。

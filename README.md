@@ -40,7 +40,7 @@ pre-norm hidden，relay / tail 经 embd row 消费），补丁不必再往 stagi
 | 版本 | 基底 | 状态与口径 |
 | --- | --- | --- |
 | v2.1 | `09338b85e` | **结题版本，已冻结**：代码侧 tag `v2.1`（`4acf03c8b`，树 `548c3dfb0`）、`v2.1-kvmem`（`3f930466d`，树 `192b2a3d0`）；本仓 tag `v2.1`（`074dea49`，树 `83f31877`） |
-| v2.2 | `5676dfbe0` | **现行开发版**（跟随上游的下一版）：能力、判据、实测沿用 v2.1 未重测；是否纳入结题待定 |
+| v2.2 | `5676dfbe0` | **现行开发版**（跟随上游的下一版）：能力与判据沿用 v2.1；实测未重测，验收已重跑（73/0/1，见下）；是否纳入结题待定 |
 
 v2.2 的目标是把 **prefill / decode 分离**做完整，含三件：推翻远程链的单序列边界（v2.1 的理由是
 「远程链不是多租户」）；引入批处理（`OP_DECODE` 每行带 `seq_id`，prefill chunk 与 decode token 混在
@@ -202,11 +202,11 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
   上游——上游已含那些提交；`src/models/dflash.cpp` 因 device-buffer 诊断行重新进入变更集。清单见
   [PATCHES]「与上游 193 个提交的重合」。
 
-验收判据是逐位 / 逐字节的 logits，不比生成的文字；下表是 v2.1 结题的结果（2026-11-12），v2.2 未重测：
+验收判据是逐位 / 逐字节的 logits，不比生成的文字；下表是 v2.1 结题的结果（2026-11-12）。**v2.2 已重跑**（2026-11-13）为 `PASS=73 FAIL=0 SKIP=1`——SKIP 的是组 13 的 4 项（KVMem 构建未随 v2.2 rebase），组 13 齐备时 77/0/0：
 
 | 套件 | 结果 | 判据 |
 | --- | ---: | --- |
-| `bash verify/verify.sh` | 57（十三组：1–8 组 22 + 组 9 2 + 组 10 20 + 组 11 8 + 组 12 1 + 组 13 4） | 逐位 / 逐字节；组 11 直接跑 `llama-server + 链 + -md` 产品路径，组 12 用 CUDA 构建验段级 offload，组 13 用 KVMem 构建（`build-kvmem2`，`LLAMA_KVMEM=ON`）验 KV 虚拟化 |
+| `bash verify/verify.sh` | 77（十四组：1–8 组 22 + 组 9 2 + 组 10 20 + 组 11 8 + 组 12 1 + 组 13 4 + 组 14 20） | 逐位 / 逐字节；组 11 直接跑 `llama-server + 链 + -md` 产品路径，组 12 用 CUDA 构建验段级 offload，组 13 用 KVMem 构建（`build-kvmem2`，`LLAMA_KVMEM=ON`）验 KV 虚拟化，组 14 验远程链 `-np 2` 的 per-seq 投机四通道（判据 7–11） |
 | `verify/verify_chain_death.py` | 36 | 120 s 读超时、链死而进程活、失败可见 |
 | `verify/verify_seq_id.py` | 9 | 跨段 `seq_id` 与位置 |
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | 链上 draft 与整模逐位、端到端逐字节 |

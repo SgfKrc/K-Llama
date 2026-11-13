@@ -96,8 +96,8 @@ tree hash 不再相等。静默错，属于「验收命令跑了、也过了、�
 - 只应用主补丁得到的纯分段树能独立 `--clean-first` 全量编译（385 个编译单元，`dflash-taps.exe` /
   `split-smoke.exe` / `split-rows.exe` 等目标齐全），并独立通过 `verify/verify.sh` 与
   `verify/verify_chain_death.py`；没有 SLIM-ARC 不影响分段链的任何一条验收。v2.1 实测过两版：
-  `0c307d82a`（44 文件，2026-11-09，`verify.sh` 十二组 53 项——组 13 于 2026-11-12 加入，现行完整验收 **57 项**，
-  见 `INDEX.md` §5——+ chain_death 36 项，日志 `.qlh_tmp/pure-split-acceptance/`）与 `586a7e7a1`（45 文件，2026-11-11，
+  `0c307d82a`（44 文件，2026-11-09，`verify.sh` 十二组 53 项——组 13 于 2026-11-12 加入、组 14 于 2026-11-13 加入（20 项），
+  现行完整验收 **77 项**，见 `INDEX.md` §5——+ chain_death 36 项，日志 `.qlh_tmp/pure-split-acceptance/`）与 `586a7e7a1`（45 文件，2026-11-11，
   `verify.sh` **52/0/0**、chain_death **36/0**，日志 `.qlh_tmp/pure_split_recheck.log`；两版差 4 文件 / +605 −12）。
   **v2.2 的纯分段树 `2541c9d29` 未单独重跑这套**（待核）。
 - `1dcbce39`（44 项）有一趟 `PASS=34 FAIL=10`，两处都是环境：组 5 的 `-np 4` 启动瞬间死掉（日志 0 字节，

@@ -15,11 +15,11 @@ QLH_BUILD_DIR=H:/llamacpp-c/build-split bash verify/verify.sh --skip-build
 ```
 
 退出码 0 = **被测到的**组全过。`--skip-build` 表示用现成二进制；去掉它会先跑一次
-`cmake --build`（见 §7）。全套含 35B 组（组 9/10/11），要独占内存；只想确认 2B 那八组没有
+`cmake --build`（见 §7）。全套含 35B 组（组 9/10/11），要独占内存；只想确认 2B 那些组（1-8 与 14）没有
 回归就加 `QLH_VERIFY_FAST=1`：
 
 ```bash
-QLH_VERIFY_FAST=1 bash verify/verify.sh --skip-build    # 组 1-8，组 9/10 明确 SKIP
+QLH_VERIFY_FAST=1 bash verify/verify.sh --skip-build    # 组 1-8 与 14，组 9/10/11 明确 SKIP
 ```
 
 ## 2. 环境约定
@@ -29,7 +29,7 @@ QLH_VERIFY_FAST=1 bash verify/verify.sh --skip-build    # 组 1-8，组 9/10 明
 | `QLH_BUILD_DIR` | `H:/llamacpp-c/build-split` | 上游构建目录，脚本只读它下面的 `bin/` |
 | `QLH_SRC_DIR` | `QLH_BUILD_DIR` 的父目录 | 上游源码根（stage/server 的 cwd、构建脚本的 cwd） |
 | `QLH_TMP` | `<本仓库>/.qlh_tmp/verify` | 日志、临时工件、锁（本机 `/tmp` 不可靠） |
-| `QLH_SPLIT_MODEL` | 2B 的 `Qwen3.5-2B Q4_K_M` | 组 1-8 与多数单项脚本的模型 |
+| `QLH_SPLIT_MODEL` | 2B 的 `Qwen3.5-2B Q4_K_M` | 组 1-8、组 14 与多数单项脚本的模型 |
 | `QLH_DFLASH_MODEL` / `QLH_DFLASH_DRAFT` | 35B target + DFlash 草稿 | 组 9/10/11 |
 
 `H:/x`、`H:\x`、`/h/x` 三种写法都收。缺二进制时脚本**点名退出 3**（不是静默 skip、也不是
@@ -42,8 +42,8 @@ QLH_VERIFY_FAST=1 bash verify/verify.sh --skip-build    # 组 1-8，组 9/10 明
     QLH_BUILD_DIR=H:/llamacpp-c/build-split bash verify/verify.sh --skip-build
 ```
 
-端口：全部在 93xx（`verify.sh` 用 9331/9332/9341-9343，组 11 用 9336-9338，链死验收用
-9330/9331/9335，其余见各脚本头部）。`verify_seq_rm_shared.py` 用 9487。**9103 / 9104 / 9106
+端口：全部在 93xx（`verify.sh` 用 9331/9332/9341-9343，组 11 用 9336-9338，组 13 用 9361，组 14 用
+9381-9383/9391-9395，链死验收用 9330/9331/9335，其余见各脚本头部）。`verify_seq_rm_shared.py` 用 9487。**9103 / 9104 / 9106
 上的服务一律不碰**。同一台机器同时只允许一个 `verify.sh`（`.verify.lock`，并发跑会互抢端口
 并互相强杀）。清理按「镜像名 + `$BIN` 路径」识别，不看端口（`ours_procs.ps1`）。
 
@@ -68,7 +68,7 @@ QLH_BUILD_DIR=/tmp-work QLH_SRC_DIR=H:/llamacpp-c bash verify/verify.sh --skip-b
 
 | 脚本 | 测什么 | 需要 | 判据 | 耗时 |
 |---|---|---|---|---|
-| `verify.sh` | 十一个组的总入口：本地链逐位、N=1 直通、经 server、跨进程 head+tail、多 slot、三段 relay、远程链经 server、MTP 投机、DFlash tap、DFlash/DSpark 远程 tap、DFlash 投机默认路径 | 五个目标全在 `bin/`；2B（组 1-8）+ 35B（组 9-11） | 52 | 组 1-8 实测 10-12 分钟（另有一个 2B 实验并行时也不慢于此）；加组 9-11 约 30-50 分钟 |
+| `verify.sh` | 十四个组的总入口：本地链逐位、N=1 直通、经 server、跨进程 head+tail、多 slot、三段 relay、远程链经 server、MTP 投机、DFlash tap、DFlash/DSpark 远程 tap、DFlash 投机默认路径、段级 offload、KVMem 的 KV 虚拟化、远程链 per-seq 投机 | 五个目标全在 `bin/`；2B（组 1-8、14）+ 35B（组 9-11）；组 12 需 CUDA 构建、组 13 需 KVMem 构建 | 77 | 组 1-8 实测 10-12 分钟；加组 9-11 约 30-50 分钟；组 12/13 另算，组 14 约 1 分钟 |
 | `verify_chain_death.py` | 远端 stage 消失：head 活着、失败是请求级的、链死后快速失败、只重启 stage 能自愈、deep health 三态、重连节流、`-np 2 + --split-remote` 被拒 | `split-stage` `llama-server`，2B | 36 | 4-5 分钟（实测 4 分钟，含两次 120 s 读超时） |
 | `verify_seq_id.py` | 越界 `seq_id` 回 `ST_BAD_REQ` 且连接可继续用；讲协议 v9 的帧 | `split-stage`，2B | 9 | 约 1 分钟 |
 | `verify_seq_rm_exact.py` | `seq_rm(p,-1)` 后重算第 p 行必须逐位相同（不 split、不起服务） | `bin/seq_rm_exact.exe`（缺则用 `probes/` 现场编），2B | 6 个用例 | 约 2 分钟 |
@@ -80,6 +80,7 @@ QLH_BUILD_DIR=/tmp-work QLH_SRC_DIR=H:/llamacpp-c bash verify/verify.sh --skip-b
 | `verify_grammar_spec.sh` | grammar 请求真在投机、分段不改变结果、被拒的行能回退、走逐行通道 | `llama-server` `split-stage` + `grm/toolcall_open.gbnf`，2B | 23 | 约 6 分钟（8 次服务启动） |
 | `verify_rbudget_spec.sh` | 真实 tools 请求不被 reasoning-budget 闸门挡掉；预算耗尽后强制段正确、回退不多扣 | `llama-server` `split-stage`，2B（thinking 模板） | 36 | 约 8 分钟（12 次服务启动） |
 | `verify_dflash_dev_path.sh` | DFlash 投机的**产品路径**：整模仍走 device buffer，链回退 host copies 且输出逐字节相同 | 35B target + DFlash 草稿 | 8 | 约 6 分钟（35B 加载慢） |
+| `verify_perspec.py` | 远程链 `-np 2` 的 per-seq 投机四通道（判据 7–11）：并发逐字节、`top_k`/`k` 互不污染、一投一普通 decode、验证帧行映射、`n_max` 超限降级 | `split-stage` `llama-server`，2B（需 NextN / MTP 层） | 20 | 约 1 分钟（实测 49 s，7 次 stage/server 启动） |
 | `measure_state_bytes.py` | 量每请求 tail 状态回传字节数（穿过计数代理，分 up/dn） | `split-stage` `llama-server`，2B | 度量，不计分 | 约 2 分钟 |
 | `acc_test.py` | 三个固定 prompt 的接受率 / tok/s 基线，写 JSON | 已在跑的服务（`--port`） | 度量 | 请求时长 |
 | `compare_out.py` | 两份 `acc_test.py` JSON 逐 prompt 逐字节比对 | 两个 JSON | 度量 | 秒级 |
@@ -112,7 +113,8 @@ bash   verify/verify_dflash_dev_path.sh                  # verify.sh 组 11 本�
   unexpected，退出 0）；不带这个开关时退出码非 0 是预期行为。产品形状的回退由
   `verify_grammar_spec.sh` 与 `verify_rbudget_spec.sh` 覆盖，那两组是全绿的。
 - 缺 35B 模型时组 9/10/11 会记 FAIL（不是 SKIP）；内存低于 `QLH_VERIFY_MIN_FREE_GB`（默认
-  20 GB）时组 9/10 记 SKIP 并在 `结果` 段显著提示。
+  20 GB）时组 9/10 记 SKIP 并在 `结果` 段显著提示。组 12 缺 CUDA 构建、组 13 缺 KVMem 构建或
+  源码根、组 14 缺 MTP 权重或 `split-stage.exe` 时记 SKIP，且都明说「这不是 PASS」。
 - `verify.sh` 里 `run_limited` 的超时提示用 `tee -a`；本机 MSYS 没有 `tee`，超时路径会退化
   成打到 stderr、日志里没有那一行。判据不受影响。
 
