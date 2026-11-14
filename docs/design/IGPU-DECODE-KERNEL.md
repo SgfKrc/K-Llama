@@ -1,6 +1,6 @@
 # Intel iGPU decode GEMV：独立 L3 kernel 设计
 
-> 状态：**方案（L1 已实测，L3 待实现）**
+> 状态：**L3 已实测否定（2026-11-14）**——四条判据里三条不达标、一条反向（tg −28%）。否定证据、被推翻的两个基础假设、以及剩余 19% 带宽差距的重新审视，见 `docs/measure/L3-GEMV-NEGATIVE.md`。本文保留作设计记录。
 > 更新日期：2026-11-14
 > 适用范围：Intel Gen12/Gen11 核显上 Vulkan 后端的 decode（n=1）GEMV 路径；不含 prefill/GEMM，不含 CPU 后端。
 
@@ -13,7 +13,7 @@
 1. **瓶颈是寄存器墙，不是 DRAM 并发度。** 每 EU 128 GRF，SIMD16 下 45–60 个活跃变量占 90–120 GRF，**每 EU 只能驻留 1 个 SIMD16 warp**，没有第二个 warp 能在等 load 时执行计算。五条假设的判定见 §2：b 的判定（每 EU 1 warp）成立，但 L1 实测（§2.2）把 in-flight 提到 2 倍只换来 +1.4%，直接反证了「in-flight 不足是主因」。
 2. **L3 目标 kernel 是两个**：`mul_mat_vec_q4_k`（decode 权重占比最大）与 `mul_mat_vec_q6_k`（单位字节最慢，且带 per-superblock barrier）。
 3. **L3 的核心不是重写归约，而是重排权重布局以减寄存器**：把 Q4_K 的 144 B superblock 转置成 lane-major，每 lane 一次 `uvec4` 读回多个 superblock、用 `dot` 一次算完，把活跃变量从 45–60 压到 15–20 → 每 warp ≤64 GRF → 每 EU 2 warp → 计算与 load 才能重叠。
-4. **预期 7.24 → 7.96–8.33 t/s（+10~15%）**；若 GEMV 部分完全达到纯读上限 48.9 GB/s，理论上限 8.79 t/s（+21%）。算式见 §3.5。
+4. ~~预期 7.24 → 7.96–8.33 t/s（+10~15%）~~ **实测 7.92 → 5.68（−28%），L3 不成立**。这个预期整条建立在「in-flight 不足」之上，而 L1 已反证该前提（§2.2），L3 又反证了「减寄存器可行」（`docs/measure/L3-GEMV-NEGATIVE.md`）。
 5. **L1 已实现并实测只有 +1.4%**（7.24 → 7.34 t/s，`6e5e95c7b`），因为预取本身就要寄存器（U=2 只预取 qs 已 +16 GRF，全预取 +48~96 GRF 直接退化），拿不到 L3 的减寄存器收益。旧的「L1 拿 70–80%」预期作废，增量拆分见 §4.1。
 
 ---
@@ -96,7 +96,7 @@
 Q[bg][lane][0..3]    uint32   // [0..1] = qs(block 2*bg) 的第 2*lane、2*lane+1 个 uint32；[2..3] = block 2*bg+1
 ```
 16 lane × 16 B = 256 B = 2 × 128 B，一次连续读，零冗余、零填充。
-scale 与 min 打进一个 16 B 的 `SCDM` 记录：3 个 `uint32` 装 8 个 12-bit 值 `scale | (min<<6)`（sub-block j 在 bit `12*j`），第 4 个 `uint32` 就是原始 `half2(d, dmin)` 原样。于是每 superblock 128 B(qs) + 16 B(SCDM) = **144 B，与原 block 严格相等，prepack 后每 token 的 DRAM 字节数不变**。kernel 侧每个 lane 需要 sub-block `2*(lane/4)` 和 `2*(lane/4)+1`，即 `SCDM` 里连续 24 bit；4 路位域选择（`sci==0 ? x&0xFFFFFF : sci==1 ? (x>>24)|(y<<8) : …`）在 16 lane 上 predicated，约 6 条 ALU。**这个交换是刻意的**：若按 `uint16` 存 `scm`，每块是 128 + 16 + 4 = 148 B（+2.78%），而判据 2 的 600 us 门槛只比 579 us 纯读下限高 3.6%，2.78% 的 DRAM 增量会吃掉几乎全部余量；6 条 ALU 则落在 §2.5 那 16% 的指令槽里。
+scale 与 min 打进一个 16 B 的 `SCDM` 记录：3 个 `uint32` 装 8 个 12-bit 值 `scale | (min<<6)`（sub-block j 在 bit `12*j`），第 4 个 `uint32` 就是原始 `half2(d, dmin)` 原样。于是每 superblock 128 B(qs) + 16 B(SCDM) = **144 B，与原 block 严格相等，prepack 后每 token 的 DRAM 字节数不变**。kernel 侧每个 lane 需要 sub-block `2*(lane/4)` 和 `2*(lane/4)+1`，即 `SCDM` 里连续 24 bit；4 路位域选择（`sci==0 ? x&0xFFFFFF : sci==1 ? (x>>24)|(y<<8) : …`）在 16 lane 上 predicated，约 6 条 ALU。**这个交换是刻意的**：若按 `uint16` 存 `scm`，每块是 128 + 16 + 4 = 148 B（+2.78%），而判据 2 的 600 us 门槛只比 579 us 纯读下限高 3.6%，2.78% 的 DRAM 增量会吃掉几乎全部余量；6 条 ALU 则落在 §2.5 那 16% 的指令槽里。**实现时的偏差**：最终版为了消除「16 lane 同址 16 B」的重复读，改成每 superblock 4 个 `uint32`（lane group g 读第 g 个 word）+ dm 独立 4 B，即 148 B；但对照实验显示**这并没有变快**，12-bit 零膨胀版与 4-word 版性能无差别（见 `L3-GEMV-NEGATIVE.md` §4）。
 
 落地位置 **[代码]**：在 `ggml_vk_create_tensor`（`ggml-vulkan.cpp`）的 buffer 分配处挂一个 `q4k_gemv` 附属 buffer，仅当 `ne0 % 256 == 0 && type == GGML_TYPE_Q4_K && 使用该 tensor 的 MUL_MAT 的 n <= mul_mat_vec_max_cols` 时生成；`ggml_vk_mul_mat_vec_q_f16`（`:7042`）在选 pipeline 前检查附属 buffer 是否存在，存在则走 L3 路径、否则走现有 `ggml_vk_get_dequantize_mul_mat_vec`（`:5853`）。prepack 本身用一次 `vkCmdCopyBuffer` 之后的小 compute shader 完成（一次 5 GB 量级搬运，见 §4.3）。
 
@@ -175,7 +175,7 @@ L3 版本：
 
 ### 3.5 预期收益
 
-**[实测] 基线已更新为 7.24 t/s**（HEAD `a2ef2d731`）：总 138.1 ms/token，CPU 9.5 ms，GPU 128.6 ms。旧文档全篇用的 6.31 t/s 来自 `build-vulkan-new` @ `48dfb3ea8`（11-09 快照），**14% 的差异未归因**（见 §5）。
+**[实测否定] 本节整条推导作废**：实测 tg 7.92 → 5.68（−28%），GRF 112~128 与对照组同档，判据 1 和 2 都不达标，见 `docs/measure/L3-GEMV-NEGATIVE.md`。**[实测] 基线**：`a2ef2d731` 时 7.24 t/s（总 138.1 ms/token，CPU 9.5 ms，GPU 128.6 ms），当前 HEAD 是 **7.92**（+9.4%，未归因）；旧文档全篇用的 6.31 t/s 来自 `build-vulkan-new` @ `48dfb3ea8`（11-09 快照），又差 14%，同样未归因（见 §5）。这是两笔独立的账。
 
 **[推算] 收益机制是减寄存器，不是提 in-flight**：lane-major 重排 + 每 lane 一个 `uvec4` + `dot` 把活跃变量从 45–60 压到 15–20 → 每 warp ≤64 GRF → 每 EU 2 warp → 计算与 load 重叠，才能吃到 579 us 那一档（纯读下限）。L1 已证明靠预取提 in-flight 走不通（+1.4%，§2.2）。
 
@@ -227,7 +227,7 @@ Adreno 的具体约束 **[代码+推断]**：
 
 1. **额外内存**：prepack 后的 Q4_K + Q6_K 约 5.1 GB（§3.2 的 144 B/块与原格式严格相等，不膨胀）。UMA 单 heap 上可行，但需在分配失败时回退到原 kernel（不能硬失败）。
 2. **加载时间**：一次性 5.1 GB 读 + 5.1 GB 写，理论 209 ms @48.9 GB/s（纯拷贝，memcpy 口径在此适用），实际约 1–2 s。对交互式加载可接受，需在日志里说明。
-3. **寄存器能否压到 64 无法从源码断定**：IGC 的活跃变量分配必须实测。若压不下去（>64 GRF），就仍是 1 warp/EU、计算无法与 load 重叠，预期收益打五折（8.33 → 7.5 左右，接近 L1）。这是首版必须实测确认的第一件事。
+3. ~~寄存器能否压到 64 无法从源码断定~~ **已实测：压不下去**。IGC 把 `k` 的 4 次迭代展开成 4 条背靠背 16 B load（偏移 0/16/128/144 B，32 GRF 同时 in flight），`[[dont_unroll]]` 与「运行期循环边界」两条路实测均被忽略，L3 始终 112~128 GRF、1 warp/EU；剥离版能到 48，说明源码可减但 IGC 会立刻换回 ILP。见 `L3-GEMV-NEGATIVE.md` §3。
 4. **不可上游**：新 buffer 类型 + prepack 步骤会改动 `ggml_vk_buffer` 与模型加载路径，与上游的量化格式抽象冲突，属于本地分叉，不要按可上游的 PR 组织。
 
 ---
