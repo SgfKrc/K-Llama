@@ -96,7 +96,7 @@
 Q[bg][lane][0..3]    uint32   // [0..1] = qs(block 2*bg) 的第 2*lane、2*lane+1 个 uint32；[2..3] = block 2*bg+1
 ```
 16 lane × 16 B = 256 B = 2 × 128 B，一次连续读，零冗余、零填充。
-scales 单独重排为每 superblock 8 个 `uint16`（`sc | m<<6`），每块 16 B，只让 lane 0..7 读，再用 `subgroupShuffle` 广播；相对原始 12 B 有 4 B 填充，但每块省下 2 条 load 指令且消除 16 路广播冗余，总字节 2×128 + 2×16 = 288 B，与原 2×144 = 288 B 相等，**不膨胀**。
+scales 单独重排为每 superblock 8 个 `uint16`（`sc | m<<6`，按 `get_scale_min_k4` 的规则从原始 12 B 解好），每块 16 B = 4 个 `uint32`。kernel 侧每个 lane 读**一个** `uint32`（`scm32[... + 2*(lane/4)]`），里面正好是 `(sc_lo, min_lo, sc_hi, min_hi)` 四个 6-bit 值——4 个 lane 同址，硬件 broadcast 合并，**1 条 load、零 shuffle**。相对原始 12 B 有 4 B 填充，但总字节 2×128 + 2×16 = 288 B，与原 2×144 = 288 B 相等，**不膨胀**。
 
 落地位置 **[代码]**：在 `ggml_vk_create_tensor`（`ggml-vulkan.cpp`）的 buffer 分配处挂一个 `q4k_gemv` 附属 buffer，仅当 `ne0 % 256 == 0 && type == GGML_TYPE_Q4_K && 使用该 tensor 的 MUL_MAT 的 n <= mul_mat_vec_max_cols` 时生成；`ggml_vk_mul_mat_vec_q_f16`（`:7042`）在选 pipeline 前检查附属 buffer 是否存在，存在则走 L3 路径、否则走现有 `ggml_vk_get_dequantize_mul_mat_vec`（`:5853`）。prepack 本身用一次 `vkCmdCopyBuffer` 之后的小 compute shader 完成（一次 5 GB 量级搬运，见 §4.3）。
 
@@ -106,15 +106,17 @@ scales 单独重排为每 superblock 8 个 `uint16`（`sc | m<<6`），每块 16
 layout(local_size_x = 16) in;                 // 1 个 SIMD16 subgroup，与 :3108 一致
 layout(constant_id = 0) const uint NUM_ROWS = 2;
 layout(binding = 0) readonly  buffer Q  { uvec4  qs4[]; };   // prepack: 2 个 superblock 交织
-layout(binding = 1) readonly  buffer SC { uint16_t scm[]; }; // prepack: sc | m<<6
+layout(binding = 1) readonly  buffer SC { uint   scm32[]; }; // prepack: 每 u16 = sc|min<<6，每 u32 两个
 layout(binding = 2) readonly  buffer B  { vec4    b4[];  };  // hidden，L2 命中
 layout(binding = 3) readonly  buffer DM { vec2    dm[];  };  // prepack: d, dmin
 layout(binding = 4) writeonly buffer D  { float   out[]; };
 
 void main() {
-    const uint lane = gl_SubgroupInvocationID;  // 0..15
-    const uint g    = lane / 2;                 // 子块组 0..7
-    const uint h    = lane % 2;                 // 组内 16 元素半
+    const uint lane = gl_SubgroupInvocationID;   // 0..15
+    // Q4_K 真实布局 [代码 ggml-quants.c:1551-1559]：32 B 的 qs 覆盖 64 个元素，
+    // 字节 m 的低 4 位 -> 元素 base+m，高 4 位 -> 元素 base+32+m。低/高 4 位相距 32，不是 16。
+    const uint base = 64u*(lane/4u) + 8u*(lane%4u);  // 本 lane 在 superblock 内的起始元素
+    const uint sc_i = 2u*(lane/4u);                  // 本 lane 用的 (scale,min) 对下标
     const uint row0 = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
     float acc[NUM_ROWS] = {0.0, 0.0};
 
@@ -123,19 +125,23 @@ void main() {
             const uvec4 q = qs4[(row0+r)*QB4 + bg*16 + lane];  // 1 条 16 B = 2 个 superblock
             const vec2  d = dm[(row0+r)*DB + bg*2];            // block 级，广播 load
             [[unroll]] for (uint j = 0; j < 2; ++j) {
-                const uint qw = j == 0 ? q.x : q.z;   // 每 u32 = 8 个 q 值
-                const uint qv = j == 0 ? q.y : q.w;
-                const uint kb = ((bg*2 + j) * 256 + g*32 + h*16) >> 2;  // vec4 索引
-                const vec4 b0 = b4[kb], b1 = b4[kb+1], b2 = b4[kb+2], b3 = b4[kb+3];
-                const vec4 lo0 = vec4(unpack8( qw      & 0x0F0F0F0F));
-                const vec4 hi0 = vec4(unpack8((qw >> 4) & 0x0F0F0F0F));
-                const vec4 lo1 = vec4(unpack8( qv      & 0x0F0F0F0F));
-                const vec4 hi1 = vec4(unpack8((qv >> 4) & 0x0F0F0F0F));
-                const uint s16 = subgroupShuffle(lane < 8 ? scm[(row0+r)*SB + (bg*2 + j)*8 + lane] : 0u, g);
-                const float sq = dot(b0,lo0) + dot(b1,hi0) + dot(b2,lo1) + dot(b3,hi1);
-                const float sb = dot(b0 + b1 + b2 + b3, vec4(1.0));
-                acc[r] = fma(d.x * float(s16 & 63u), sq, acc[r])
-                       - d.y * float((s16 >> 6) & 63u) * sb;
+                const uint qw = (j == 0) ? q.x : q.z;   // 字节 8*lane + 0..3
+                const uint qv = (j == 0) ? q.y : q.w;   // 字节 8*lane + 4..7
+                const uint e0 = ((bg*2u + j)*256u + base) >> 2;   // 低 4 位段的 vec4 索引
+                const uint e1 = e0 + 8u;                          // 高 4 位段 = base+32
+                const vec4 blo0 = b4[e0], blo1 = b4[e0+1u];
+                const vec4 bhi0 = b4[e1], bhi1 = b4[e1+1u];
+                const vec4 lo_a = vec4(unpack8( qw       & 0x0F0F0F0F));  // base+0..3
+                const vec4 lo_b = vec4(unpack8( qv       & 0x0F0F0F0F));  // base+4..7
+                const vec4 hi_a = vec4(unpack8((qw >> 4) & 0x0F0F0F0F));  // base+32..35
+                const vec4 hi_b = vec4(unpack8((qv >> 4) & 0x0F0F0F0F));  // base+36..39
+                const uint s32 = scm32[(row0+r)*SB4 + (bg*2u + j)*4u + sc_i];  // 4 lane 同址
+                const float sq_lo = dot(blo0, lo_a) + dot(blo1, lo_b);
+                const float sq_hi = dot(bhi0, hi_a) + dot(bhi1, hi_b);
+                const float sb_lo = dot(blo0 + blo1, vec4(1.0));   // base+0..7 的 b 之和
+                const float sb_hi = dot(bhi0 + bhi1, vec4(1.0));   // base+32..39 的 b 之和
+                acc[r] = fma(d.x, fma(float( s32        & 63u), sq_lo, float((s32 >> 16) & 63u) * sq_hi), acc[r])
+                       - d.y * (float((s32 >>  6) & 63u) * sb_lo + float((s32 >> 22) & 63u) * sb_hi);
             }
         }
     }
@@ -147,10 +153,12 @@ void main() {
 要点与理由：
 
 - **wg=16、单 SIMD16 subgroup**：与 `:3108` 的强制 16 一致——**不靠换 subgroup 宽度省寄存器**（实测 SIMD32 更差，§2.2）。归约退化为 4 步 `subgroupAdd`，**无 barrier、无 shared**。
-- **每 lane 一次 `uvec4` + `dot`**：DRAM 侧每迭代每 lane 一次 16 B load（原实现每 superblock 9 B 但要 6 条指令），b 落 L2 不占 DRAM。真正的目的是**减活跃变量**：`q`/`b0..b3`/`lo..hi` 都是一次性中间量，编译器可复用少数 GRF，把 45–60 压到 15–20 → 每 warp ≤64 GRF → 每 EU 2 warp。in-flight 顺带变成 96 EU × 2 × 16 lane × 32 B = 98 KB ≫ 24.5 KB，但这只是副产品，不是收益来源。
-- **`subgroupShuffle` 代替广播 load**：每 superblock 的 3 条 scale load 降为 1 条（8 lane 活跃）+ 1 条 shuffle，消除 §2.3 的 2.7× 冗余。
-- **累加顺序**：每个 (group, 16 元素) 内的 FMA 顺序与原 shader 一致，但跨 block 的累加顺序变为 bg-major；浮点结果与现有 kernel 不是 bit-exact，需按 §3.6 用容差校验。
-- **可选**：把 `sb = Σb` 预计算成 `bsum[384]`（12288/32），每 lane 省 3 条加法；收益小，首版不做。
+- **qs 的字节↔元素映射是「相距 32」，不是「相距 16」**：`dequantize_row_q4_K`（`ggml-quants.c:1551-1559`）按 32 B 一组解 64 个元素，字节 `m` 的低 4 位→元素 `base+m`、高 4 位→元素 `base+32+m`；`base ∈ {0,64,128,192}`。`mul_mat_vec_q4_k.comp` 的 `y2_idx = y1_idx + 128`、`by132 = b4[y1_idx/4 + 8]`（+8 个 vec4 = +32 元素）与之一致。**这一条错了整个 prepack 布局就失效**，且整模上只表现为「logits 全错」，建议先用单 superblock 对拍确认再上整模。
+- **每 lane 一次 `uvec4` + `dot`**：DRAM 侧每迭代每 lane 一次 16 B load（原实现每 superblock 9 B 但要 6 条指令），b 落 L2 不占 DRAM。真正的目的是**减活跃变量**：`q`/`blo0..bhi1`/`lo_a..hi_b` 都是一次性中间量，编译器可复用少数 GRF，把 45–60 压到 15–20 → 每 warp ≤64 GRF → 每 EU 2 warp。in-flight 顺带变成 96 EU × 2 × 16 lane × 32 B = 98 KB ≫ 24.5 KB，但这只是副产品，不是收益来源。
+- **scale 用 1 条 u32 load 代替 3 条广播 load**：4 个 lane 同址，硬件 broadcast 合并，消除 §2.3 的 2.7× 冗余，且不需要 `subgroupShuffle`。
+- **min 项必须分两段**：低 4 位段用 `min_lo`、高 4 位段用 `min_hi`，各自乘自己那段 8 个 b 之和（`sb_lo`/`sb_hi`）。合成一个 `Σb` 再乘单个 min 是错的——原 kernel 的 `smin` 用 `by10×min0 + by132×min1` 正是两段分开的证据。
+- **累加顺序**：每 lane 负责的 16 个元素内的 FMA 顺序与原 shader 一致，但跨 block 的累加顺序变为 bg-major；浮点结果与现有 kernel 不是 bit-exact，需按 §3.6 用容差校验。
+- **可选**：把 `sb_lo`/`sb_hi` 预计算成 `bsum[384]`（12288/32），每 lane 省 4 条加法；收益小，首版不做。
 
 **pipeline 注册与回退** **[代码]**：在 `ggml_vk_load_shaders`（`:1880`）里为 Q4_K/Q6_K 各加一个 L3 pipeline（`local_size_x=16`、无 shared、`required_subgroup_size=16` 与 `:3108` 保持一致），只注册 2 个实例，不进入 `DMMV_WG_SIZE_COUNT × mul_mat_vec_max_cols` 的组合爆炸；分派条件为 `n==1 && m>=2048 && k>=2048 && prepack 可用`，其余情形全部落回现有路径。这样 L3 是「加一条支路」，而不是替换现有 27 种量化的 16 个 pipeline 槽位。
 
