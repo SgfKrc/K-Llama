@@ -107,35 +107,49 @@ Q4_K 每参数 0.5625 B：decode **3.56 FLOP/byte**，prefill N=512 时 **1820**
 
 ---
 
-## 6 host buffer 通道：已证伪（2026-11-14）
+## 6 host buffer 通道：能承载，但带宽减半（2026-11-14）
 
-**结论：host buffer 不能承载超过 15.82 GiB 的模型，容量约束没有消失，而且原因是结构性的、不是带宽。**
+**结论：host buffer 可以作为权重池突破 15.82 GiB——实测 Q4_K_M 的 21.10 GiB 装下了（`Vulkan0 1921 MiB` + `Vulkan_Host 19177 MiB`，总 20.6 GiB > device 预算）。但带宽只有 device 的 49%（12.3–12.6 vs 24.8 GB/s），而且它只能通过 `-ncmoe` 的 per-tensor override 进入，不是「装不下就 fallback」。**
 
-原假设是「`a2ef2d731` 让 host buffer 用系统内存，顺带打开了突破 15.82 GiB 的容量通道」。**这个假设被实测证伪。**
+### 6.1 为什么「全量 host buffer」不存在
 
-**[代码]** `src/llama-model-loader.cpp:1459-1474`，注释写着 `// avoid using a host buffer: it is not a separate memory pool`：
+**[代码]** `src/llama-model.cpp:1304` 的 `make_gpu_buft_list()` **不把 host buffer 放进 GPU 的 buft 列表**（只放 split / device / extra）。host buft 只出现在 `make_cpu_buft_list()` 里，且排在 CPU buffer 之前。所以 `-ngl 99` 全量加载时权重找不到 host buft，装不下就直接 `ErrorOutOfDeviceMemory`。
 
-```cpp
-auto * buft_dev = ggml_backend_buft_get_device(buft);
-if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
-        (use_mmap || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-    buft = ggml_backend_dev_buffer_type(cpu_dev);   // iGPU 上 host buft 一律换成 CPU buft
-}
-```
+**[代码]** 还有第二道门：`src/llama-model-loader.cpp:1459-1474` 的 `// avoid using a host buffer: it is not a separate memory pool`，在 iGPU 上把 host buft 换成 CPU buft（来自上游 `e0f142d5d`，早于 `a2ef2d731`）。
 
-Iris Xe 的 device type 是 `IGPU`，条件恒真 → **iGPU 上 host buffer 永远不能存权重**。这段来自上游 `e0f142d5d`（2026-10-29），**早于** `a2ef2d731`；后者只改了 host malloc 路径，没有删它。
+### 6.2 但 `-ncmoe` 的 override 路径能进去
 
-**[实测]** 三条证据：
+加一个测量用开关（`GGML_ALLOW_HOST_WEIGHTS=1`，绕过 6.1 的第二道门）后，用 `-ncmoe 99` 把 expert 权重 override 到 `Vulkan_Host`：
 
-1. Q3_K_M（15.98 GiB，超出 device heap 175 MiB）以 `-ngl 99` 加载 → `ErrorOutOfDeviceMemory`，**没有任何 fallback**。
-2. Q2_K（装得下）的日志：`Vulkan_Host output buffer size = 0.95 MiB`、`compute buffer = 2.03 MiB` —— **host buffer 承载的权重为 0 字节**，只用于 logits 和中间状态。
-3. `-ncmoe 2` 先把 expert override 到 `Vulkan_Host`（日志确认选到了），最终仍落在 CPU buffer。
+| 配置 | 日志 | 结果 |
+|---|---|---|
+| Q3 `-ncmoe 99` + 开关 | `Vulkan0 1145.25 MiB` + **`Vulkan_Host 14832.40 MiB`** | 14.49 GiB 进 host buffer |
+| Q3 `-ncmoe 99` 无开关 | `CPU model buffer size = 3184.40 MiB` | 被重定向到 CPU buffer |
+| **Q4 `-ncmoe 99` + 开关** | `Vulkan0 1921 MiB` + **`Vulkan_Host 19177 MiB`** | **20.6 GiB 装下，tg 8.35** |
 
-**所以 `a2ef2d731` 的真实作用要重新定义**：它解决的是「CPU 层的中间状态占 device memory」（#31538 的 OOM），**不是权重通道**。v3 的容量上限仍然是 15.82 GiB，而实测在 ~15.4 GiB 处就会 OOM（驱动预留与切分碎片），15.82 是偏乐观的口径。
+**第三行是关键**：`Vulkan_Host` **不占 device-local 预算**，是独立池，所以容量上限确实能被突破。
 
-**要突破需要改代码**（未做，两处最小改动）：① `llama-model-loader.cpp:1471` 加开关让 iGPU 保留 host buft；② `load_tensors` 在 device 分配失败时 fallback 到 host buft。
+### 6.3 代价：带宽减半
 
-**而且即使改了也未必划算**（[推算]，未实测）：`a2ef2d731` 的路径明确不 import，让 copy path 去 stage，意味着每个 token 都要把权重从系统内存搬进 device buffer，带宽上限是系统内存带宽（~37 GB/s）再减 copy 开销，很可能低于 Q2 在 device buffer 上的 **24.8 GB/s**。**在花时间改代码之前，这个推算应该先被验证。**
+| 池 | 带宽 | 相对 device |
+|---|---|---|
+| device buffer | **24.8 GB/s** | 100% |
+| **host buffer** | **12.3–12.6 GB/s** | **49%** |
+
+**最小配额的对照更说明问题**：`Q3 -ncmoe 1`（只挪 1 层 expert 出去）开关 ON = **12.75 t/s**，OFF（走 CPU buffer）= **11.26 t/s**，**只差 7%**。少量溢出时 host buffer 只比 CPU buffer 好一点点，价值要到「大量溢出」才体现。
+
+### 6.4 对 v3 的含义
+
+**这是「装得下但慢一半」，不是「装得下且不掉速」**：
+
+- 对**装不下的模型**：从「跑不了」变成「能跑，12.3 GB/s」——可用性的质变。
+- 对**装得下的模型**：没必要用，device buffer 快一倍。
+
+**所以 v3 的容量规划应该按两层做**：热路径（当前活跃的专家/层）放 device，冷路径溢出到 host buffer，而不是「要么全进 device，要么跑不了」。
+
+**注意**：`a2ef2d731` 的真实作用仍是「CPU 层中间状态不占 device memory」（#31538 的 OOM），**不是**权重通道；权重通道是 `-ncmoe` 的 override 加上这里那个测量开关。
+
+**未做**：开关没有合并进主线（测量用逃生口，默认关闭）；`-ncmoe` 的最优配额（多少层溢出最划算）没有系统扫。
 
 ---
 
