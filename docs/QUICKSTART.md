@@ -104,7 +104,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 
 期望一个 JSON：`content` 非空、`finish_reason` 是 `stop`、`timings.prompt_n` / `prompt_ms` / `predicted_n` / `predicted_ms` 有数（`CROSS-MACHINE.md` §6.2）。
 
-**2B 与 35B 都是 thinking 模型**：不加 `enable_thinking: false` 时 token 全落在 `reasoning_content`、`content` 是空字符串（实测 2B 在 32 token 下就是空的）——那不是链坏了，是预算不够（§6.4）。
+**2B 与 35B 都是 thinking 模型**：不加 `enable_thinking: false` 时 token 全落在 `reasoning_content`、`content` 是空字符串（实测 2B 在 32 token 下就是空的）——那不是链坏了，是预算不够（`CROSS-MACHINE.md` §6.4）。
 
 ## 6. 用控制面起链
 手敲超过两段就不划算。`control/qlhctl.py` 读一份拓扑起停与探活，存成 `topology-2b.toml`（可直接抄，改三处：`bin_dir`、两个 `model`、端口别和别人撞）：
@@ -214,8 +214,8 @@ bin_dir = "C:/Users/<user>/Documents/llamacpp-split/bin"
 尾段跑在安卓上：原生 ARM64 ELF，在 Termux 里编，不走 NDK（`CROSS-MACHINE.md` §6）。五条实测的坑：
 
 1. **模型必须放 Termux 私有目录**，不能放 `/sdcard`：FUSE 上 mmap 极慢甚至失败，`run-as` 起的进程连 `/sdcard` 都读不了（SELinux 拒绝）；传模型走 `adb forward tcp:18022 tcp:8022` + `scp`，实测 40 MB/s（`ANDROID-SURFACE-段接入评估.md` §1.3 第 3、4 条）。
-2. **编译 `-j 1`**：`-j 6` 会被 Android LMK SIGKILL；推理时 20 层（11 GiB）会 OOM、16 层（8.8 GiB）稳定（同 §1.3 第 5 条）。那个水位是 v2 的 Q6_K worker 口径，不是 v2.1 的上限：v2.1 的 UD-Q4_K_M 尾段 `32:40` 是 8 层约 4.90 GiB。
-3. **`LD_LIBRARY_PATH` 没有槽位**：二进制要它才能找到同目录的 `libllama.so` / `libggml*.so`，而拓扑没有环境变量字段。写 wrapper 脚本、把 `bin_dir` 指向 wrapper 所在目录（§1.4）：
+2. **编译 `-j 1`**：`-j 6` 会被 Android LMK SIGKILL；推理时 20 层（11 GiB）会 OOM、16 层（8.8 GiB）稳定（同 `ANDROID-SURFACE-段接入评估.md` §1.3 第 5 条）。那个水位是 v2 的 Q6_K worker 口径，不是 v2.1 的上限：v2.1 的 UD-Q4_K_M 尾段 `32:40` 是 8 层约 4.90 GiB。
+3. **`LD_LIBRARY_PATH` 没有槽位**：二进制要它才能找到同目录的 `libllama.so` / `libggml*.so`，而拓扑没有环境变量字段。写 wrapper 脚本、把 `bin_dir` 指向 wrapper 所在目录（`ANDROID-SURFACE-段接入评估.md` §1.4）：
 
 ```sh
 #!/data/data/com.termux/files/usr/bin/sh
@@ -225,7 +225,7 @@ exec "$BIN/split-stage" "$@"
 ```
 
    wrapper 命名成 `split-stage` 放在独立目录（如 `~/qlh/binwrap/`），真二进制留在 `~/qlh/build/bin/` **不改名**——`exec` 之后命令行是真二进制，所以 `pkill -f split-stage` 杀得到、`pkill -f "binwrap/split-stage"` 杀不到。
-4. **`ps` / `pgrep` 看不见别的进程**：`ps -ef` 只列自己那条 ssh 会话，`pgrep -af split-stage` 在尾段活着时返回空。判断「那段还在吗」只能 `kill -0 <pid>`（控制面正是这么探的）或问端口 / 协议层（§1.4、`CROSS-MACHINE.md` §6.5）。
+4. **`ps` / `pgrep` 看不见别的进程**：`ps -ef` 只列自己那条 ssh 会话，`pgrep -af split-stage` 在尾段活着时返回空。判断「那段还在吗」只能 `kill -0 <pid>`（控制面正是这么探的）或问端口 / 协议层（`ANDROID-SURFACE-段接入评估.md` §1.4、`CROSS-MACHINE.md` §6.5）。
 5. **长命进程要脱离 ssh 会话**：`setsid nohup ./split-stage ... > run.log 2>&1 < /dev/null &`，否则 ssh 一结束进程就死（`CROSS-MACHINE.md` §6.5）。就绪行形如 `[split-stage] ready: layers [32, 40) of 40, role=tail, n_embd=2048, n_rs_seq=8`（同 §6.2）。
 
 ## 9. 故障排查
@@ -238,10 +238,10 @@ exec "$BIN/split-stage" "$@"
 | 编完随机崩溃或数值不对，但没有编译错 | 改过 `.h` 后没 `--clean-first`，新旧 obj 混链进同一个 dll | `cmake --build build-split --clean-first -- -j 8`（`BUILD.md` §5.1） |
 | 启动报「找不到指定的模块」 | 只拷了 exe，没拷 `llama.dll` / `llama-common.dll` / `ggml*.dll` / `mtmd.dll` | 整个 `bin/` 一起拷（`BUILD.md` §2.4） |
 | 起链被拒，说 `n_seq_max > 1` | 远程链单序列，`-np > 1` 不被支持 | `-np 1`；要多并发就在 head 起多个 server（`SEGMENTED-LIMITS.md` §2.4） |
-| 加载后、建上下文前报错（范围不从 0 起，或中间结束没给 tail/remote） | `--split-layer-range` 单独起 server 的两道检查 | 从 0 起；中间结束补 `--split-tail-range` 或 `--split-remote`（§2.6） |
+| 加载后、建上下文前报错（范围不从 0 起，或中间结束没给 tail/remote） | `--split-layer-range` 单独起 server 的两道检查 | 从 0 起；中间结束补 `--split-tail-range` 或 `--split-remote`（`SEGMENTED-LIMITS.md` §2.6） |
 | 浅 `/health` 一直 `200`，生成请求却 `500` | 链死了而进程活着（`/health` 是存活语义） | 问 `status` 或 `/health?deep=1`（`SEGMENTED-LIMITS.md` §2.7） |
 | 输出通顺但内容是错的 | 段读错了层，不报错 | 跑 `verify/verify.sh` 逐位验收（`SEGMENTED-LIMITS.md` §2.6 残留边界） |
-| 回退场景下同一位置算出不同 `h` | `seq_rm` 失败被静默忽略（上游 hybrid 的已知基线） | 本仓已改 `bool` 并降级；`verify_seq_rm_exact.py --expect-known-fail` 对照（§2.9） |
+| 回退场景下同一位置算出不同 `h` | `seq_rm` 失败被静默忽略（上游 hybrid 的已知基线） | 本仓已改 `bool` 并降级；`verify_seq_rm_exact.py --expect-known-fail` 对照（`SEGMENTED-LIMITS.md` §2.9） |
 | 安卓上的编译 OOM / 模型读不了 / `pgrep` 说进程没了 | Android LMK、`/sdcard` 的 FUSE+SELinux、Termux 的 `ps` 看不见别的进程 | 见 §8 的五条坑：`-j 1`、模型挪私有目录、`kill -0 <pid>` |
 
 ## 下一步读什么
