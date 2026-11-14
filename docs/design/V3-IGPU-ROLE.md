@@ -107,18 +107,35 @@ Q4_K 每参数 0.5625 B：decode **3.56 FLOP/byte**，prefill N=512 时 **1820**
 
 ---
 
-## 6 待验证：host buffer 通道
+## 6 host buffer 通道：已证伪（2026-11-14）
 
-容量是硬约束：35B MoE Q4 是 22.66 GB，装不进 15.82 GiB 的 Vulkan 堆，但**总内存 31.6 GB 装得下**。
+**结论：host buffer 不能承载超过 15.82 GiB 的模型，容量约束没有消失，而且原因是结构性的、不是带宽。**
 
-**[代码]** `a2ef2d731`（host buffer 出 device heap）让 host buffer 用 `portable_aligned_malloc` 拿系统内存、不占 device heap。当时修它是为了解 #31538 的 OOM，但它**同时打开了一条容量通道**：模型可以超过 15.82 GiB，用系统内存兜住。
+原假设是「`a2ef2d731` 让 host buffer 用系统内存，顺带打开了突破 15.82 GiB 的容量通道」。**这个假设被实测证伪。**
 
-**未知数**：核显读 host buffer 里的权重，带宽是多少？
+**[代码]** `src/llama-model-loader.cpp:1459-1474`，注释写着 `// avoid using a host buffer: it is not a separate memory pool`：
 
-- 若仍接近 40.2 GB/s → 22.66 GB 的 MoE Q4 能装下且不掉速，**v3 的容量问题直接消失**
-- 若掉到 PCIe 量级 → 这条路走不通，只能用 Q2/Q3
+```cpp
+auto * buft_dev = ggml_backend_buft_get_device(buft);
+if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+        (use_mmap || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+    buft = ggml_backend_dev_buffer_type(cpu_dev);   // iGPU 上 host buft 一律换成 CPU buft
+}
+```
 
-**这是 v3 可行性最关键的一个数**，比再优化 kernel 有价值。验证方法很便宜：拿 9B dense 的权重强制走 host buffer，测 decode 带宽，与正常 device buffer 对比。
+Iris Xe 的 device type 是 `IGPU`，条件恒真 → **iGPU 上 host buffer 永远不能存权重**。这段来自上游 `e0f142d5d`（2026-10-29），**早于** `a2ef2d731`；后者只改了 host malloc 路径，没有删它。
+
+**[实测]** 三条证据：
+
+1. Q3_K_M（15.98 GiB，超出 device heap 175 MiB）以 `-ngl 99` 加载 → `ErrorOutOfDeviceMemory`，**没有任何 fallback**。
+2. Q2_K（装得下）的日志：`Vulkan_Host output buffer size = 0.95 MiB`、`compute buffer = 2.03 MiB` —— **host buffer 承载的权重为 0 字节**，只用于 logits 和中间状态。
+3. `-ncmoe 2` 先把 expert override 到 `Vulkan_Host`（日志确认选到了），最终仍落在 CPU buffer。
+
+**所以 `a2ef2d731` 的真实作用要重新定义**：它解决的是「CPU 层的中间状态占 device memory」（#31538 的 OOM），**不是权重通道**。v3 的容量上限仍然是 15.82 GiB，而实测在 ~15.4 GiB 处就会 OOM（驱动预留与切分碎片），15.82 是偏乐观的口径。
+
+**要突破需要改代码**（未做，两处最小改动）：① `llama-model-loader.cpp:1471` 加开关让 iGPU 保留 host buft；② `load_tensors` 在 device 分配失败时 fallback 到 host buft。
+
+**而且即使改了也未必划算**（[推算]，未实测）：`a2ef2d731` 的路径明确不 import，让 copy path 去 stage，意味着每个 token 都要把权重从系统内存搬进 device buffer，带宽上限是系统内存带宽（~37 GB/s）再减 copy 开销，很可能低于 Q2 在 device buffer 上的 **24.8 GB/s**。**在花时间改代码之前，这个推算应该先被验证。**
 
 ---
 
@@ -150,7 +167,7 @@ Q4_K 每参数 0.5625 B：decode **3.56 FLOP/byte**，prefill N=512 时 **1820**
 
 ## 8 未做
 
-- **host buffer 读带宽未测**（§6）。这是 v3 容量模型的前提。
+- ~~host buffer 读带宽未测~~ **已证伪（§6）**：host buffer 在 iGPU 上被 loader 排除在权重存储之外（`llama-model-loader.cpp:1459-1474`），所以不是带宽问题，而是结构性限制。
 - **Gen11（Surface）上 MMVQ 对 Q2/Q3 是否同样受益未验证**。`d43316a0d` 对所有 Intel 放行 Q2/Q3，若 Gen11 上更慢即为回归。
 - **prefill 阶段的多设备混合未实测**（§5 的例外）。
 - **核显堆 15.82 GiB 是否可调**（BIOS UMA frame buffer）未查——若可调大，容量约束会松，但那是系统配置不是软件。
