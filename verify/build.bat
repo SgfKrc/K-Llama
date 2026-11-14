@@ -1,16 +1,28 @@
 @echo off
-REM verify/ 的构建入口：一次 cmake --build 覆盖验收要用的全部目标。
+REM Build entry point for verify/: one cmake --build covering every target the
+REM acceptance run needs.
 REM
-REM 用法: build.bat [--clean-first]
-REM   verify.sh 用 QLH_BUILD_BAT 指到这里（上游树没有自己的 .qlh_tmp/build.bat 时）。
+REM Usage: build.bat [--clean-first]
+REM   verify.sh points QLH_BUILD_BAT here when the upstream tree has no
+REM   .qlh_tmp/build.bat of its own.
 REM
-REM 路径来自环境变量，verify/_qlh_env.sh 会 export：
-REM   QLH_SRC_DIR    上游 llama.cpp 源码根（缺省 H:/llamacpp-c）
-REM   QLH_BUILD_DIR  构建目录，其下有 bin/（缺省 %QLH_SRC_DIR%/build-split）
-REM   QLH_VCVARS     vcvars64.bat 的路径（缺省用下面这一行，装到别处就自己设）
+REM Paths come from the environment, exported by verify/_qlh_env.sh:
+REM   QLH_SRC_DIR    upstream llama.cpp source root (default H:/llamacpp-c)
+REM   QLH_BUILD_DIR  build directory with bin/ under it (default %QLH_SRC_DIR%/build-split)
+REM   QLH_VCVARS     path to vcvars64.bat (default is the line below; override if
+REM                  installed elsewhere)
 REM
-REM 注意：这个文件必须保持 CRLF 行尾。写成 LF 时 cmd 解析下面那行 call 会让 vcvars 的
-REM INCLUDE 不生效，任何 cl 调用都报 C1083（打不开 <stdbool.h>）——实测 -j 4 和 -j 1 都报。
+REM KEEP THIS FILE ASCII-ONLY. cmd parses a batch file in the console code page,
+REM which here is GBK. UTF-8 Chinese bytes are not valid GBK pairs, so they shift
+REM and can yield '|' -- which splits a REM line into "REM ... | command" and makes
+REM cmd try to run the remainder. That is exactly how this file broke on
+REM 2026-11-14: the REM block above turned into a handful of "'...' is not
+REM recognized as an internal or external command" lines and the build never ran.
+REM Chinese belongs in the .sh and .md files, not here.
+REM
+REM KEEP CRLF LINE ENDINGS TOO. With LF, cmd's parse of the call below leaves
+REM vcvars' INCLUDE unset and every cl invocation fails with C1083 (cannot open
+REM <stdbool.h>); measured with both -j 4 and -j 1.
 setlocal
 if "%QLH_SRC_DIR%"=="" set "QLH_SRC_DIR=H:/llamacpp-c"
 if "%QLH_BUILD_DIR%"=="" set "QLH_BUILD_DIR=%QLH_SRC_DIR%/build-split"
