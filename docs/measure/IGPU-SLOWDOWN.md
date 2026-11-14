@@ -264,11 +264,18 @@ decode −2.1%）；`-ngl 0` 62.18 / 173.33 / 28.68（decode +10%，未重复确
 **所以核显的正确定位是「专用 prefill 引擎」**：prefill 交给 iGPU，decode 留给 CPU 或独显。这不是「核显弱所以少用」，
 而是「核显在计算密集段强、在带宽密集段弱，按段分配」。
 
-**v2.2 的 prefill/decode 分离让这个定位第一次可实施**：以前 llama.cpp 的 offload 粒度是「层」（`-ngl`），一层上了 GPU
-就 prefill 和 decode 都在 GPU 上，没法按阶段切；两阶段拆开之后，「prefill 走核显、decode 走 CPU」才成为一个配置而不是一个 fork。
+**这个定位需要 v3 才能落地**：以前 llama.cpp 的 offload 粒度是「层」（`-ngl`），一层上了 GPU 就 prefill 和 decode 都在 GPU 上，
+没法按阶段切。**v2.2 的「prefill/decode 分离」不是这个**——它指同一 batch 内一个序列 prefill、另一个 decode
+（`V22-MULTISEQ.md` §1.3），**不涉及按阶段分配设备**；后者需要 llama_context 层在两个 backend 之间切 graph，是 v3 的事
+（见 `docs/design/V3-IGPU-ROLE.md` §7）。本文早前写成「v2.2 让这个定位第一次可实施」是不准确的。
 
 **本轮已落地的近似**（`3d5937a74`）：`op_offload` 默认阈值 32 → 64（仅 iGPU），把阈值放在交叉点 pp≈32–48 的右侧——
 pp32 不再 offload（走 CPU，16.5 → 34.5 t/s，**+100~118%**），pp64+ 仍 offload（本来就在赢的那侧）；dGPU 保持 32。
+
+**但要注意适用范围**：`op_offload` 只在它开启时生效，而**分段链（head / stage）默认 `no_op_offload = true`**
+（`src/qlh-split-defaults.h:20`，`server-context.cpp:1316-1336`），所以**这个改动对分段链不生效**——上面那组 pp32 数字是在
+**普通（非分段）Vulkan 推理**上测的。要让它在链上起作用需要显式 `--op-offload`。这条区分是 2026-11-14 的只读评估指出来的，
+此前本文把它当成了 v2.2 的落地，措辞不准确。
 
 **还没做**：完整版需要 llama_context 层支持在两个 backend 之间切 graph，而不是靠 `op_offload` 的批大小阈值近似。
 阈值 64 是这个方向的**退化版**——它只在一个 backend 内部决定「这个算子给 GPU 还是 CPU」，不是「这个阶段整体给谁」。

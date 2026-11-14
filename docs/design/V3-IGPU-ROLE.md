@@ -146,7 +146,7 @@ Iris Xe 的 device type 是 `IGPU`，条件恒真 → **iGPU 上 host buffer 永
 | **混合批**（同一 batch 内一个序列 prefill、另一个 decode） | **组 15 正确性 18/0/0**；**性能实测核显快 CPU 1.91×**（`local_docs/bench-mixed/`） | v3 的并发形态已验证，但收益机制不是「资源分离」，见下 |
 | 分段链（layer-range 推理） | 已落地，组 1–14 覆盖 | v3 可按段分配设备 |
 | per-seq 投机四通道 | 组 14 实测通过 | decode 提高算术强度的现成手段 |
-| 零拷贝前提（UMA 上权重 CPU/GPU 都能读） | 已验证（`a2ef2d731`） | v3 可以「数据不动、切换算力」 |
+| 零拷贝前提（UMA 上权重 CPU/GPU 都能读） | **只证明了「可读」，没证明「带宽够」**：`415ac0096` 实测 CPU 直读未缓存的 host-visible 内存比走 copy engine **慢 65%**（3920 vs 1363 µs / 次） | v3 的「数据不动、切换算力」**前提尚未成立**——见 §6 |
 
 **混合批的性能实测（2026-11-14，9B Q4_K，`-c 8192 -np 2`）**：核显 wall time 比 CPU 快 **1.91×**（g1：长 A 1989 tok + 短 B 211 tok，47.8 s vs 91.5 s）。但**「prefill 算力 + decode 带宽在 96 EU 上并行」这个假设被证伪**：
 
