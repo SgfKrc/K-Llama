@@ -407,8 +407,14 @@ cleanup_ours 组1
 
 # ---------------------------------------------------------------- 组 2：N=1 直通
 hdr "组 2  N=1 直通（整模 vs --split-layer-range 0:24）"
-start_server $PORT_BASE
-start_server $PORT_N1 --split-layer-range 0:24
+# [QLH-SPLIT] 后端必须一致，否则「逐字节相同」比的是两个后端 kernel 的舍入差：
+# 整模 server 不是链（split_role=false），op_offload 用上游默认 on；0:24 单段同样是
+# split_role=false 也是 on；组 3 的双段链是 split_role=true，默认 off（见
+# src/qlh-split-defaults.h）。实测（2026-11-15，build-vulkan-new）：整模 on 与双段链 off
+# 生成 512 token 后在第 316 字符分叉（541 vs 529 字符），两个都钉 --no-op-offload 后逐字节相同。
+# 这里三处显式钉住，判据仍是「逐字节相同」，不放宽。
+start_server $PORT_BASE --no-op-offload
+start_server $PORT_N1 --split-layer-range 0:24 --no-op-offload
 if wait_health $PORT_BASE && wait_health $PORT_N1; then
     a=$(ask $PORT_BASE)
     n1=$(ask $PORT_N1)
