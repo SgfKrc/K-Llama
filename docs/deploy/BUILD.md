@@ -140,6 +140,30 @@ cd build-split/bin
 3. **核对 dll 清单**：两边 bin 里 `ggml-cpu*` 的文件名集合必须一致。`build-cpu` 只有
    `ggml-cpu.dll` 一个，`build-vulkan` 有 9 个 `ggml-cpu-*.dll`——这本身就是「不同级」的证据。
 
+### 4.1 `NATIVE` 与 `BACKEND_DL` 互斥，「多变体 + 原生优化」不存在
+
+`ggml-cpu/CMakeLists.txt:415` 在 `NATIVE=ON` 且 `BACKEND_DL=ON` 时直接
+`FATAL_ERROR`（"GGML_NATIVE is not compatible with GGML_BACKEND_DL, consider using
+GGML_CPU_ALL_VARIANTS"），而 `ALL_VARIANTS` 又要求 `BACKEND_DL=ON`
+（`ggml/src/CMakeLists.txt:491`）。所以只能这么组合：
+
+| 想开 | 必须同时 | 代价 |
+| --- | --- | --- |
+| `NATIVE=ON` | `BACKEND_DL=OFF` | 二进制不可移植（换 ISA 就 SIGILL） |
+| `ALL_VARIANTS=ON` | `BACKEND_DL=ON` | `NATIVE` 被挤掉，走固定特性变体 |
+
+**`NATIVE` 被挤掉不是无害的。** 2026-11-14 实测：`build-vulkan-new` 在
+`NATIVE=OFF + ALL_VARIANTS=ON` 下，组 11（DFlash 整模 vs 远程链）**整模 137 字符 /
+链 114 字符**，判据「逐字节相同」红；改成 `NATIVE=ON + BACKEND_DL=OFF` 后
+**137 / 137 一致**，组 11 恢复 8/0/0。变的不是整模（一直是 137），是链——多变体构建让
+「head 32 层 + stage 8 层」的双进程路径与单进程整模走了不同的向量化路径，浮点累加顺序
+不同，T=0 下 argmax 在临界 token 上翻转。
+
+**推论**：做**分段/多设备的数值一致性**验证时，构建必须是 `NATIVE=ON`；跨机交付再换
+`ALL_VARIANTS`，但那时「逐字节相同」这条判据要换成带容差的口径，否则会一直红。
+v2.1 从没暴露这个问题，因为它不碰 Vulkan、没必要开 `BACKEND_DL`，等于一直待在
+`NATIVE=ON` 的配置上。
+
 ## 5. Windows / MSVC 的构建边界
 
 ### 5.1 改过 `.h` 一律 `--clean-first`
