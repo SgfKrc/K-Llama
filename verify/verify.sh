@@ -1,12 +1,12 @@
 #!/bin/bash
-# 分段链十四组验收，一条命令跑完。
+# 分段链十五组验收，一条命令跑完。
 #
 # 为什么要这个：这些验证之前只有"上一次某个人手工跑过"的口头结论，没人能重跑。
 # 每次改完 llama.cpp 侧的分段代码，跑这一遍就是验收；任何一组退化都说明改坏了。
 #
 # 用法：
-#   bash verify/verify.sh              # 增量编译 + 全部十四组
-#   bash verify/verify.sh --clean      # 全量重编 + 全部十四组（改过头文件必须用这个）
+#   bash verify/verify.sh              # 增量编译 + 全部十五组
+#   bash verify/verify.sh --clean      # 全量重编 + 全部十五组（改过头文件必须用这个）
 #   bash verify/verify.sh --skip-build # 只跑验证
 #
 # 注意：上游构建目录的 ninja 依赖记录不可靠（多数对象 deps=0），改头文件不会触发重编，
@@ -24,7 +24,8 @@
 # 退出码 0 = 被测到的组全过（SKIP 不算失败，但也不算通过；逐条见下面「退出码」一节）。
 #
 # 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）
-#       -> 77（2026-11-13 加组 14：判据 7-11 的 per-seq 投机四通道，20 项）。
+#       -> 77（2026-11-13 加组 14：判据 7-11 的 per-seq 投机四通道，20 项）
+#       -> 95（2026-11-14 加组 15：判据 2-6 的多序列基础语义，18 项）。
 # 组 13 的 4 项覆盖 **KVMem 的 KV 虚拟化**（本地双段 + MTP + 驱逐，见下）。组 11 的 8 项覆盖
 # **DFlash 投机的 device-buffer 注入路径**：组 9/10 用的 tests/dflash-taps.cpp 只 link `llama`，
 # 从不调 llama_set_embeddings_layer_inp_dev（ctx_tgt 没有 device buffer），batch 用
@@ -41,8 +42,16 @@
 # 组 7 跑远程链但从不给 -np（auto = 1），组 8 的 MTP 投机只跑单序列——「一帧里两个序列、各自的
 # 投机通道参数不同」此前零覆盖。判据逐条的理由见 verify/verify_perspec.py 的模块 docstring。
 #
+# 组 15 的 18 项覆盖**远程链多序列的基础语义**（判据 2-6，见 docs/design/V22-MULTISEQ.md §7.1）：
+# 混合批（一个在 prefill、一个在 decode）、KV 隔离（对 A 做 seq_rm 不影响 B）、多序列下的
+# checkpoint save/restore、身份字段不一致必须干净报错、n_ctx 不被 n_seq_max 整除时可见。
+# 与组 14 分开放的原因：组 14 是 per-seq 的投机四通道（判据 7-11），组 15 是「多序列本身」的
+# 语义，不涉及投机——两者失败的排查方向完全不同，混在一组里会让「20 项里挂了 1 项」说不清是
+# 哪一层坏了。脚手架（端口/链启动/记账）照 verify_perspec.py 那一套写，但另起端口基准 9370。
+# 判据逐条的理由见 verify/verify_multiseq.py 的模块 docstring。
+#
 # 环境变量（都有默认值，一般不用管）：
-#   QLH_VERIFY_FAST=1           只跑 2B 的组（1-8、12 与 14），组 9/10/11 明确 SKIP（SKIP 不算通过）
+#   QLH_VERIFY_FAST=1           只跑 2B 的组（1-8、12、14 与 15），组 9/10/11 明确 SKIP（SKIP 不算通过）
 #   QLH_VERIFY_MIN_FREE_GB=20   组 9/10 的内存闸门（mmap 的模型不需要全占物理内存，见下文注释）
 #   QLH_VERIFY_SMOKE_TIMEOUT=900 单次 split-smoke / split-rows 的超时（秒）
 #   QLH_VERIFY_PY_TIMEOUT=1800  组 5 python 的超时（秒）
@@ -53,6 +62,7 @@
 #   QLH_KVMEM_BUILD_DIR        组 13 的 KVMem 构建目录（默认 H:/llamacpp-c/build-kvmem2）
 #   LLAMA_KVMEM_ROOT           组 13 的 KVMem 源码根（默认 .qlh_tmp/kvmem-probe）
 #   QLH_VERIFY_PORT_PESPEC_BASE 组 14 的端口基准（默认 9380 -> stage 9381-9383 / server 9391-9395）
+#   QLH_VERIFY_PORT_MULTISEQ_BASE 组 15 的端口基准（默认 9370 -> stage 9371-9374 / server 9375-9379）
 # 退出码：0 = 被测到的组全过（SKIP 不算失败，但会显著打印「没测到」）；1 = 有 FAIL；
 #         2 = 另一个 verify.sh 正在跑（并发跑会互抢 93xx、互相强杀，两边都会报假失败）。
 #
@@ -76,7 +86,7 @@ MODE=${1:-}
 
 # ---------------------------------------------------------------- 环境闸门（先于一切）
 # 缺二进制就点名退出（rc=3）。不这么做的话，指错目录会跑出几十条 FAIL，看起来像代码坏了；
-# 静默 skip 更糟——那会让「77 项全过」变成一句谎话。
+# 静默 skip 更糟——那会让「95 项全过」变成一句谎话。
 qlh_show_env
 qlh_require_bins split-smoke.exe split-stage.exe llama-server.exe
 for opt in split-rows.exe dflash-taps.exe; do
@@ -134,8 +144,9 @@ a=""
 n2=""
 
 # 组 9 / 组 10 要独占内存（整模 23.5 GB 起），机器上只要还有别的 35B 进程在跑，跑出来的结果不是失败
-# 就是没意义。QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12 与 14；组 12 用 CUDA 构建，组 14 用 2B 的 MTP），
-# 用来在别人占着机器时先确认没有回归；正式验收必须不带这个变量跑完整的一遍。
+# 就是没意义。QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12、14 与 15；组 12 用 CUDA 构建，组 14 用 2B 的
+# MTP，组 15 用 2B 跑多序列基础语义），用来在别人占着机器时先确认没有回归；
+# 正式验收必须不带这个变量跑完整的一遍。
 SKIP_BIG=${QLH_VERIFY_FAST:-0}
 
 # 组 9/10 之前要求的最小可用内存（GB）。不够就 SKIP，绝不硬跑：
@@ -158,11 +169,11 @@ skip() { echo "  [SKIP] $*"; SKIP=$((SKIP+1)); }
 hdr()  { echo; echo "=== $* ==="; }
 
 # ---------------------------------------------------------------- SKIP 扣减表（项数断言用）
-# 每个组「整组 SKIP 时少记多少项」。数字取自各组实际记账（见下面组 1-14 的 ok/bad 调用）：
+# 每个组「整组 SKIP 时少记多少项」。数字取自各组实际记账（见下面组 1-15 的 ok/bad 调用）：
 #   组 9 = 2、组 10 = 2 x 10 = 20、组 11 = 8 —— QLH_VERIFY_FAST=1 与内存闸门是**一次跳过这三组**，
 #   所以合起来是 30 项，不是只扣组 9/10 的 22 项；
-#   组 12 = 1、组 13 = 4、组 14 = 20。
-# 合计：77 = 组 1-8 的 22 + 30（9/10/11）+ 1（12）+ 4（13）+ 20（14）。
+#   组 12 = 1、组 13 = 4、组 14 = 20、组 15 = 18。
+# 合计：95 = 组 1-8 的 22 + 30（9/10/11）+ 1（12）+ 4（13）+ 20（14）+ 18（15）。
 # 为什么要这张表：v2.2 上组 13 永远 SKIP（KVMem 构建不在），旧的断言
 # `[ "$SKIP" -eq 0 ] && [ "$PASS" -ne "$EXPECT_PASS" ]` 因此**永不触发**——「某组静默少跑」
 # 在带 SKIP 的跑法里完全测不出来。SKIP 时按表扣减再比较，这条断言才真的守得住。
@@ -170,6 +181,7 @@ SKIP_ITEMS_91011=30
 SKIP_ITEMS_12=1
 SKIP_ITEMS_13=4
 SKIP_ITEMS_14=20
+SKIP_ITEMS_15=18
 SKIPPED_ITEMS=0
 # 记一条 SKIP，并把它对应的项数记进 SKIPPED_ITEMS：skip_n <项数> <消息...>
 # 项数写错会立刻被结果段的断言抓到（PASS 比扣减后的期望多或少），不会变成假绿。
@@ -607,7 +619,7 @@ cleanup_ours 组8
 # ---------------------------------------------------------------- 组 9：DFlash
 if [ "$SKIP_BIG" = "1" ]; then
     echo
-    echo "=== 组 9 / 组 10 / 组 11 没测：QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12 与 14）==="
+    echo "=== 组 9 / 组 10 / 组 11 没测：QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12、14 与 15）==="
     echo "  [SKIP] 不计入 PASS、不算通过：这一轮没有测 35B 的 DFlash / DSpark / 产品路径三组。"
     skip_n $SKIP_ITEMS_91011 "组 9/10/11 没测（QLH_VERIFY_FAST=1），不是 PASS"
 else
@@ -616,7 +628,7 @@ if [ "$AVAIL_GB" -lt "$MIN_FREE_GB" ]; then
     hdr "组 9 / 组 10 没测：可用内存不足"
     skip_n $SKIP_ITEMS_91011 "组 9/10/11 没测：可用 ${AVAIL_GB} GB < 闸门 ${MIN_FREE_GB} GB —— 这不是 PASS，这一轮没有测到 35B（DFlash / DSpark）"
     echo "  想真测：关掉占内存的进程再跑；或按实际情况调 QLH_VERIFY_MIN_FREE_GB=${MIN_FREE_GB}。"
-    echo "  只想确认 2B 的组没有回归：QLH_VERIFY_FAST=1（组 1-8、12 与 14 照样全跑）。"
+    echo "  只想确认 2B 的组没有回归：QLH_VERIFY_FAST=1（组 1-8、12、14 与 15 照样全跑）。"
 else
 echo "  [mem] 可用 ${AVAIL_GB} GB ≥ ${MIN_FREE_GB} GB，组 9/10 照跑"
 hdr "组 9  DFlash 草稿模型（8 路 tap 跨两段 · 单 ubatch 逐位）"
@@ -901,7 +913,7 @@ else
     run_limited 3600 "$PESPEC_LOG" python "$QLH_VERIFY_DIR/verify_perspec.py" \
         --model "$MODEL" --port-base "$PESPEC_BASE"
     PESPEC_RC=$?
-    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 77
+    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 95
     while IFS= read -r line; do
         case "$line" in
             *"[PASS]"*) ok "$(echo "$line" | sed 's/^ *\[PASS\] *//')" ;;
@@ -922,18 +934,63 @@ else
     cleanup_ours 组14
 fi
 
+# ---------------------------------------------------------------- 组 15：多序列基础语义（判据 2–6）
+hdr "组 15  远程链多序列的基础语义（判据 2–6）"
+# 为什么单独一组、不并进组 14：组 14 是「一帧里两个序列、各自的投机通道参数不同」（判据 7–11），
+# 组 15 是「多序列本身」的语义——混合批、KV 隔离、checkpoint、身份校验、n_ctx 取整，一条投机都
+# 不涉及。两者失败的排查方向完全不同，混在一组里「20 项挂 1 项」说不清是哪一层坏了。
+# 判据 1（两个请求并发与串行逐字节相同）2026-11-14 三机实测通过，不在本组里；判据 2–6 此前从未跑过
+# （docs/design/V22-MULTISEQ.md §7.1 的「#2–#6 未做」）。
+# 端口用独立基准 9370（-> stage 9371-9374 / server 9375-9379），避开组 13 的 KVMem 9361、组 14 的
+# 9381-9395、CUDA 组的 9357/9358 与主用的 9331/9332/9341-9343；全部落在 93xx 段内，所以
+# cleanup_ours 的 listen_93xx 兜底也能覆盖到。
+MULTISEQ_BASE=${QLH_VERIFY_PORT_MULTISEQ_BASE:-9370}
+MULTISEQ_LOG=$QLH_TMP/multiseq_group15.log
+if [ ! -x "$BIN/split-stage.exe" ]; then
+    # 与组 14 同一个理由：qlh_require_bins 正常情况下已经先 exit 3，这里是「跑的过程中 $BIN 被换掉」
+    # 的兜底。skip_n 把 18 项从期望里扣掉，结果段的项数断言照样对得上。
+    skip_n $SKIP_ITEMS_15 "组 15 没测：缺 $BIN/split-stage.exe —— 这不是 PASS，判据 2–6 没有覆盖"
+elif [ ! -f "$MODEL" ]; then
+    skip_n $SKIP_ITEMS_15 "组 15 没测：缺模型（$MODEL，判据 2–6 用它跑 -np 2 的远程链）—— 这不是 PASS，判据 2–6 没有覆盖"
+else
+    # run_limited 的签名是 <秒> <输出文件> <命令...>：输出文件必须在第二参数位。本组实测约 5 分钟
+    # （判据 4 要起三条链、每条链 4 个请求），3600 是照组 13/14 留的余量。
+    run_limited 3600 "$MULTISEQ_LOG" python "$QLH_VERIFY_DIR/verify_multiseq.py" \
+        --model "$MODEL" --port-base "$MULTISEQ_BASE"
+    MULTISEQ_RC=$?
+    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 95
+    while IFS= read -r line; do
+        case "$line" in
+            *"[PASS]"*) ok "$(echo "$line" | sed 's/^ *\[PASS\] *//')" ;;
+            *"[FAIL]"*) bad "$(echo "$line" | sed 's/^ *\[FAIL\] *//')" ;;
+        esac
+    done < "$MULTISEQ_LOG"
+    # 防假绿：脚本必须真的打出 PASS/FAIL 记账，否则说明它中途崩了（起不来 stage/server 时是
+    # traceback + 非零 rc，一条记账都没有）。
+    MULTISEQ_LINES=$(grep -cE '\[(PASS|FAIL)\]' "$MULTISEQ_LOG" 2>/dev/null || true)
+    [ -n "$MULTISEQ_LINES" ] || MULTISEQ_LINES=0
+    if [ "$MULTISEQ_LINES" -eq 0 ]; then
+        bad "组 15：脚本没打出任何 [PASS]/[FAIL]（rc=$MULTISEQ_RC），见 .qlh_tmp/verify/multiseq_group15.log"
+        tail -8 "$MULTISEQ_LOG" | sed 's/^/    /'
+    elif [ "$MULTISEQ_RC" -ne 0 ] && [ "$(grep -c '\[FAIL\]' "$MULTISEQ_LOG")" -eq 0 ]; then
+        bad "组 15：脚本退出码 $MULTISEQ_RC 但没打出 [FAIL]（中途崩了）"
+        tail -8 "$MULTISEQ_LOG" | sed 's/^/    /'
+    fi
+    cleanup_ours 组15
+fi
+
 hdr "结果"
-# 项数断言：「77 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
+# 项数断言：「95 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
 # 但以前没有任何地方守它——某条判据因日志措辞改动而静默不匹配时，总数会变少，而
-# 「77 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4、
-# 组 14 = 20；不带 --skip-build 时另有「三目标构建完成」1 项（78）。
+# 「95 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4、
+# 组 14 = 20、组 15 = 18；不带 --skip-build 时另有「三目标构建完成」1 项（96）。
 #
 # SKIP 的处理（旧版在这里失效）：以前是 `[ "$SKIP" -eq 0 ] && ...`，而 v2.2 上组 13 永远 SKIP，
 # 所以这条断言**永不触发**——「某组静默少跑」在带 SKIP 的跑法里完全测不出来。
 # 现在 SKIP 时按上面的 SKIP 扣减表把整组的项数减掉，再比较：
 #   PASS 必须 == EXPECT_PASS - SKIPPED_ITEMS。
-# 例：完整验收里只有组 13 SKIP -> 期望 77-4 = 73；加 --skip-build 则是 74。
-EXPECT_PASS=77
+# 例：完整验收里只有组 13 SKIP -> 期望 95-4 = 91；加 --skip-build 则是 92。
+EXPECT_PASS=95
 [ "$MODE" = "--skip-build" ] || EXPECT_PASS=$((EXPECT_PASS + 1))
 EXPECT_NOW=$((EXPECT_PASS - SKIPPED_ITEMS))
 # 只在 FAIL=0 时断言：已经有真失败时不再叠一条噪声（失败本身会让人去看日志）；
