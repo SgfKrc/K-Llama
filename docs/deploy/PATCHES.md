@@ -19,7 +19,8 @@
 
 | 补丁 | 包含 | 统计（基底） |
 | --- | --- | --- |
-| [`docs/llamacpp-split.patch`](../llamacpp-split.patch)（主补丁） | 第一、二、四代：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7/v8/v9/v10、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定、段级 offload、显存预算。**不含 SLIM-ARC** | **45 文件** / +18123 −237 / 20238 行 / 1077.2 KiB（`5676dfbe0`） |
+| [`docs/llamacpp-split.patch`](../llamacpp-split.patch)（主补丁） | 第一、二、四代 + v2.2 多序列：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7/v8/v9/v10（v10 支持远程链多序列）、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定、段级 offload、显存预算、per-seq 投机四通道。**不含 SLIM-ARC、不含核显修复** | **55 文件** / +21995 −331 / 24540 行 / 1240.9 KiB（`5676dfbe0`） |
+| [`docs/llamacpp-vulkan-igpu.patch`](../llamacpp-vulkan-igpu.patch)（v2.2 核显，与主补丁正交） | Intel 核显的四处修复与一处特化：host buffer 不占 device heap（#31538 的 UMA OOM）、UMA 读回走 copy engine、op_offload 阈值 32→64（仅 iGPU）、Q4_K decode GEMV 预取下一个 superblock、MMVQ 放行 Q2/Q3（XE1 上 q2_K 6.5 → 33.9 GB/s）。**Q4_K 预取原本属 SLIM-ARC 第五代**，因与核显修复同期落地，这里合并成一个正交补丁 | **4 文件** / +298 −139 / 461 行 / 29.0 KiB（`ebbfa2c79`） |
 | [`docs/llamacpp-slimarc.patch`](../llamacpp-slimarc.patch)（可选增量） | 第三代 SLIM-ARC prefetch：10 个源文件 + 3 个文件里的 6 处钩子 | 13 文件 / +3665 −1 / 3790 行 / 164.2 KiB（`5676dfbe0`，内容未变） |
 | [`docs/llamacpp-kvmem.patch`](../llamacpp-kvmem.patch)（可选增量） | 第五代 KVMem 虚拟化：memory factory hook、attn Q/K capture 钩子、KV cache 跳过空洞清理、CUDA stage-in、`--kvmem*` CLI、`llama-kvmem-bridge`。**adapter 主体在外部**（`LLAMA_KVMEM_ROOT` 指向 `SgfKrc/kvmem`），本补丁只含 fork 侧接线 | **52 文件** / +1266 −135 / 2941 行 / 130.6 KiB（**未随 v2.2 重导，仍绑 v2.1 基底 `09338b85e`**） |
 

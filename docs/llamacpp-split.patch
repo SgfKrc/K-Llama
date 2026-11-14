@@ -3737,7 +3737,7 @@ index 181d840a6..9256f190b 100644
      // Extended batch API
      //
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 426c48741..5f65c39dc 100644
+index 426c48741..de56b0fee 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -28,6 +28,9 @@ set(LLAMA_CORE_SOURCES
@@ -3750,6 +3750,29 @@ index 426c48741..5f65c39dc 100644
      llama-moe-cache.cpp
      llama-memory-hybrid.cpp
      llama-memory-hybrid-iswa.cpp
+@@ -44,9 +47,22 @@ set(LLAMA_CORE_SOURCES
+     unicode.cpp
+ )
+ 
++# [QLH] SLIM-ARC prefetch layer (upstream: patches/llama-upstream/slim-arc-integration.patch).
++# Compiled outside the unity batches: the port carries platform macros (WIN32_LEAN_AND_MEAN)
++# and POSIX names that must not leak into neighbouring translation units.
++set(LLAMA_SLIMARC_SOURCES
++    slim-arc-prefetch.cpp
++    slim-arc-page-range.cpp
++    slim-arc-expert-reclaim.cpp
++    slim-arc-expert-residency.cpp
++    slim-arc-expert-transition.cpp
++)
++set_source_files_properties(${LLAMA_SLIMARC_SOURCES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++
+ add_library(llama
+             ../include/llama.h
+             ${LLAMA_CORE_SOURCES}
++            ${LLAMA_SLIMARC_SOURCES}
+             unicode.h
+             ${LLAMA_MODELS_SOURCES}
+             )
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
 index 7fce6624f..dd6aa2972 100644
 --- a/src/llama-batch.cpp
@@ -3769,10 +3792,10 @@ index 7fce6624f..dd6aa2972 100644
      pos.resize((size_t) n_tok*n_pos_per_embd);
      for (int32_t i = 0; i < n_tok; ++i) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9066e061e..053920f2e 100644
+index 9066e061e..cd414afb5 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -7,6 +7,7 @@
+@@ -7,18 +7,22 @@
  #include "llama-batch.h"
  #include "llama-io.h"
  #include "llama-memory.h"
@@ -3780,7 +3803,12 @@ index 9066e061e..053920f2e 100644
  #include "llama-mmap.h"
  #include "llama-model.h"
  #include "llama-moe-cache.h"
-@@ -18,7 +19,9 @@
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
++#include "slim-arc-prefetch.h"
+ 
+ #include <algorithm>
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
@@ -3790,7 +3818,7 @@ index 9066e061e..053920f2e 100644
  #include <stdexcept>
  #include <string>
  #include <unordered_map>
-@@ -355,6 +358,15 @@ llama_context::llama_context(
+@@ -355,6 +359,15 @@ llama_context::llama_context(
      cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
  
@@ -3806,7 +3834,7 @@ index 9066e061e..053920f2e 100644
      // Initialize backend samplers here so they are part of the sampling graph
      // before the reserve passes run later in this function. This avoids a later
      // re-reserve when graph nodes change.
-@@ -391,6 +403,7 @@ llama_context::llama_context(
+@@ -391,6 +404,7 @@ llama_context::llama_context(
              cparams.auto_fkvr = false;
          }
      }
@@ -3814,7 +3842,7 @@ index 9066e061e..053920f2e 100644
  
      // initialized later
      cparams.pipeline_parallel = false;
-@@ -432,6 +445,7 @@ llama_context::llama_context(
+@@ -432,6 +446,7 @@ llama_context::llama_context(
      LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
      LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
      LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -3822,7 +3850,7 @@ index 9066e061e..053920f2e 100644
      LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
      LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
      LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
-@@ -1027,6 +1041,12 @@ uint32_t llama_context::n_threads_batch() const {
+@@ -1027,6 +1042,12 @@ uint32_t llama_context::n_threads_batch() const {
  }
  
  llama_memory_t llama_context::get_memory() const {
@@ -3835,7 +3863,7 @@ index 9066e061e..053920f2e 100644
      return memory.get();
  }
  
-@@ -1093,6 +1113,13 @@ enum llama_pooling_type llama_context::pooling_type() const {
+@@ -1093,6 +1114,13 @@ enum llama_pooling_type llama_context::pooling_type() const {
  }
  
  float * llama_context::get_logits() {
@@ -3849,7 +3877,7 @@ index 9066e061e..053920f2e 100644
      output_reorder();
  
      return logits.data;
-@@ -1128,6 +1155,49 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
+@@ -1128,6 +1156,49 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
  }
  
  float * llama_context::get_logits_ith(int32_t i) {
@@ -3899,7 +3927,7 @@ index 9066e061e..053920f2e 100644
      output_reorder();
  
      try {
-@@ -1405,6 +1475,26 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
+@@ -1405,6 +1476,26 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
  void llama_context::set_embeddings(bool value) {
      LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
  
@@ -3926,7 +3954,7 @@ index 9066e061e..053920f2e 100644
      // the toggle changes the graph shape (pooled: logits only; pooling NONE: the reserve graph outputs all tokens,
      // which crashed ggml_gallocr on the first /completion), so re-reserve on every toggle
      if (cparams.embeddings != value) {
-@@ -1470,6 +1560,22 @@ bool llama_context::supports_embd_row() const {
+@@ -1470,6 +1561,22 @@ bool llama_context::supports_embd_row() const {
          return false;
      }
  
@@ -3949,7 +3977,54 @@ index 9066e061e..053920f2e 100644
      // one of our backends must be able to read the buffer, e.g. not a draft on another GPU than the target output
      ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
      for (const auto & backend : backends) {
-@@ -2138,6 +2244,1349 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1815,6 +1922,14 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // [QLH] SLIM-ARC: resolved once per call. The prefetcher is a process-wide singleton and the
++    // two uses below -- install the per-node eval callback, then scan the freshly built graph --
++    // have to agree on whether it is armed; asking twice is what lets a future edit change one of
++    // them and leave the other behind. CPU only: the callback path splits the graph at every
++    // observed node and synchronizes there, which would break GPU pipelining.
++    slim_arc::prefetch_scheduler * sched_arc =
++            model.n_gpu_layers() == 0 ? slim_arc::get_global_prefetch_scheduler() : nullptr;
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -1844,7 +1959,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        // [QLH] SLIM-ARC 2026-11-02: when the layer-ahead prefetcher is armed, the "which layer
++        // is running" signal comes from the per-node eval callback -- the whole graph is
++        // submitted at once, so nothing in graph_compute() can know the current layer. The user
++        // callback is chained inside eval_cb(). See the resolution at the top of this function.
++        if (sched_arc != nullptr) {
++            sched_arc->attach_user_callback(cparams.cb_eval, cparams.cb_eval_user_data);
++            ggml_backend_sched_set_eval_callback(sched.get(), slim_arc::prefetch_scheduler::eval_cb, sched_arc);
++        } else {
++            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        }
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+@@ -1858,6 +1982,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        // [QLH] SLIM-ARC 2026-11-02: scan the freshly built graph for the first node of every
++        // layer. Has to run after build_graph() -- the per-tensor names that carry the layer
++        // index are assigned by graph_get_cb() while the graph is being built.
++        if (sched_arc != nullptr) {
++            sched_arc->prepare_graph(gf);
++        }
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+@@ -2138,6 +2269,1349 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
  }
  
  int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -5299,7 +5374,7 @@ index 9066e061e..053920f2e 100644
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
-@@ -2705,6 +4154,19 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2705,6 +4179,19 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
              return 0;
          }
          ggml_backend_buffer_clear(buf_output.get(), 0);
@@ -5319,7 +5394,7 @@ index 9066e061e..053920f2e 100644
      }
  
      float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
-@@ -3266,32 +4728,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
+@@ -3266,32 +4753,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
  // state save/load
  //
  
@@ -5352,7 +5427,7 @@ index 9066e061e..053920f2e 100644
  class llama_io_write_host : public llama_io_write_i {
  public:
      llama_io_write_host(
-@@ -3805,7 +5241,49 @@ private:
+@@ -3805,7 +5266,49 @@ private:
      const llama_memory_buffers & mbufs;
  };
  
@@ -5402,7 +5477,7 @@ index 9066e061e..053920f2e 100644
      llama_io_write_dummy io(false);
      try {
          return state_write_data(io);
-@@ -3839,11 +5317,24 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+@@ -3839,11 +5342,24 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
  static constexpr uint32_t io_magic = 0xaf143cd8;
  
  size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -5427,7 +5502,7 @@ index 9066e061e..053920f2e 100644
          return state_seq_write_data(io, seq_id, flags);
      } catch (const std::exception & err) {
          LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
-@@ -4045,6 +5536,13 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
+@@ -4045,6 +5561,13 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
  }
  
  size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -5441,7 +5516,7 @@ index 9066e061e..053920f2e 100644
      LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
  
      // write model info
-@@ -4056,9 +5554,13 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
+@@ -4056,9 +5579,13 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
          // TODO: add more model-specific info which should prevent loading the session file if not identical
      }
  
@@ -5457,7 +5532,7 @@ index 9066e061e..053920f2e 100644
      }
  
      return io.n_bytes();
-@@ -4081,26 +5583,42 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
+@@ -4081,26 +5608,42 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
          // TODO: add more info which needs to be identical but which is not verified otherwise
      }
  
@@ -5506,7 +5581,7 @@ index 9066e061e..053920f2e 100644
      }
  
      return io.n_bytes();
-@@ -4421,6 +5939,7 @@ llama_context_params llama_context_default_params() {
+@@ -4421,6 +5964,7 @@ llama_context_params llama_context_default_params() {
          /*.n_rs_seq                    =*/ 0,
          /*.n_outputs_max               =*/ 0,
          /*.n_outputs_max_per_seq       =*/ 1,
@@ -5514,7 +5589,7 @@ index 9066e061e..053920f2e 100644
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
          /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
-@@ -4449,6 +5968,7 @@ llama_context_params llama_context_default_params() {
+@@ -4449,6 +5993,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -5522,7 +5597,7 @@ index 9066e061e..053920f2e 100644
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
-@@ -4720,6 +6240,8 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+@@ -4720,6 +6265,8 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
      return ctx->get_embeddings_seq(seq_id);
  }
  
@@ -5531,7 +5606,7 @@ index 9066e061e..053920f2e 100644
  void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
      ctx->set_embeddings_nextn(value, masked);
  }
-@@ -5076,6 +6598,488 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -5076,6 +6623,488 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
  ///
  
@@ -7687,10 +7762,16 @@ index 000000000..d2b5be014
 +    void reject_remote(const char * op);
 +};
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 2cbee61d4..53278ccec 100644
+index 2cbee61d4..2bf31cf97 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -10,6 +10,8 @@
+@@ -5,11 +5,14 @@
+ #include "gguf.h"
+ #include "llama-hparams.h"
+ #include "llama.h"
++#include "slim-arc-prefetch.h"
+ 
+ #include <algorithm>
  #include <array>
  #include <cinttypes>
  #include <cstdint>
@@ -7699,7 +7780,7 @@ index 2cbee61d4..53278ccec 100644
  #include <cstring>
  #include <future>
  #include <regex>
-@@ -546,7 +548,9 @@ llama_model_loader::llama_model_loader(
+@@ -546,7 +549,9 @@ llama_model_loader::llama_model_loader(
          bool no_alloc,
          bool load_mtp,
          const llama_model_kv_override * param_overrides_p,
@@ -7710,7 +7791,7 @@ index 2cbee61d4..53278ccec 100644
          : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
      int trace = 0;
      if (getenv("LLAMA_TRACE")) {
-@@ -801,6 +805,73 @@ llama_model_loader::llama_model_loader(
+@@ -801,6 +806,73 @@ llama_model_loader::llama_model_loader(
          llm_kv = LLM_KV(llm_arch_from_string(arch_name));
      }
  
@@ -7784,7 +7865,7 @@ index 2cbee61d4..53278ccec 100644
      n_kv      = gguf_get_n_kv(metadata);
      n_tensors = weights_map.size();
  
-@@ -921,7 +992,14 @@ llama_model_loader::llama_model_loader(
+@@ -921,7 +993,14 @@ llama_model_loader::llama_model_loader(
  
      this->check_tensors = check_tensors;
      this->no_alloc = no_alloc;
@@ -7800,7 +7881,7 @@ index 2cbee61d4..53278ccec 100644
  }
  
  std::string llama_model_loader::get_arch_name() const {
-@@ -933,6 +1011,22 @@ enum llm_arch llama_model_loader::get_arch() const {
+@@ -933,6 +1012,22 @@ enum llm_arch llama_model_loader::get_arch() const {
  }
  
  const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
@@ -7823,7 +7904,7 @@ index 2cbee61d4..53278ccec 100644
      auto pos = weights_map.find(name);
      if (pos != weights_map.end()) {
          return &pos->second;
-@@ -1187,7 +1281,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+@@ -1187,7 +1282,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
  
      // do not lazy-read small tensors, it has significant overhead and is not worth it
      constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
@@ -7832,7 +7913,7 @@ index 2cbee61d4..53278ccec 100644
          return false;
      }
  
-@@ -1361,9 +1455,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1361,9 +1456,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              }
          }
  
@@ -7856,7 +7937,7 @@ index 2cbee61d4..53278ccec 100644
              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
              if (!cpu_dev) {
                  throw std::runtime_error("no CPU backend found");
-@@ -1434,7 +1540,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1434,7 +1541,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -7881,7 +7962,7 @@ index 2cbee61d4..53278ccec 100644
          // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
          is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
      }
-@@ -1473,7 +1595,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1473,7 +1596,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      const bool duplicated = flags & TENSOR_DUPLICATED;
  
      struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
@@ -7893,7 +7974,44 @@ index 2cbee61d4..53278ccec 100644
  
      if (duplicated) {
          size_data += ggml_nbytes(&t_meta);
-@@ -1794,6 +1919,17 @@ bool llama_model_loader::load_all_data(
+@@ -1539,6 +1665,36 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+     for (const auto & it : weights_map) {
+         size_data += ggml_nbytes(it.second.tensor);
+     }
++
++    // [QLH] SLIM-ARC prefetch: hand every weight's mmap extent to the layer-ahead scheduler.
++    // Each tensor lives at (mapping base + offset), and its name carries the layer index, so
++    // graph_compute can later ask for "everything in layers N+1..N+window" without knowing the
++    // architecture. Installed only when mmap actually backs the weights: with --no-mmap there
++    // is no mapping to advise and the scheduler would be idle.
++    // Enabled by default only when SLIM_ARC_PREFETCH is set, so an existing run keeps the
++    // exact upstream behaviour (and the extra thread pair) unless asked for.
++    if (use_mmap && !mappings.empty() && std::getenv("SLIM_ARC_PREFETCH") != nullptr) {
++        static slim_arc::prefetch_scheduler s_slim_arc_scheduler(2 /*n_threads*/, 3 /*window*/);
++        slim_arc::set_global_prefetch_scheduler(&s_slim_arc_scheduler);
++        size_t registered = 0;
++        for (const auto & it : weights_map) {
++            const auto & w = it.second;
++            if (w.idx >= mappings.size()) {
++                continue;
++            }
++            void * base = mappings[w.idx]->addr();
++            if (base == nullptr) {
++                continue;
++            }
++            void * tensor_addr = (uint8_t *) base + w.offs;
++            const int layer = slim_arc::tensor_layer_from_name(it.first.c_str());
++            s_slim_arc_scheduler.register_tensor(it.first.c_str(), tensor_addr,
++                                                 ggml_nbytes(w.tensor), layer);
++            ++registered;
++        }
++        LLAMA_LOG_INFO("%s: SLIM-ARC prefetch armed: %zu tensors over %zu mappings\n",
++                __func__, registered, mappings.size());
++    }
+ }
+ 
+ using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
+@@ -1794,6 +1950,17 @@ bool llama_model_loader::load_all_data(
  
          const bool from_mapping = use_mmap || lazy.has(cur);
  
@@ -7911,7 +8029,7 @@ index 2cbee61d4..53278ccec 100644
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
              uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
-@@ -1814,6 +1950,14 @@ bool llama_model_loader::load_all_data(
+@@ -1814,6 +1981,14 @@ bool llama_model_loader::load_all_data(
                  }));
              }
  
@@ -7926,7 +8044,7 @@ index 2cbee61d4..53278ccec 100644
              GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
              if (buf_mmap && cur->data == nullptr) {
                  ggml_backend_tensor_alloc(buf_mmap, cur, data);
-@@ -1950,6 +2094,38 @@ bool llama_model_loader::load_all_data(
+@@ -1950,6 +2125,38 @@ bool llama_model_loader::load_all_data(
  
      // check if this is the last call and do final cleanup
      if (size_done >= size_data) {
@@ -12191,6 +12309,3661 @@ index 000000000..64081e101
 +}
 +
 +} // namespace qlh_vram
+diff --git a/src/slim-arc-expert-reclaim.cpp b/src/slim-arc-expert-reclaim.cpp
+new file mode 100644
+index 000000000..75ac945c7
+--- /dev/null
++++ b/src/slim-arc-expert-reclaim.cpp
+@@ -0,0 +1,121 @@
++#include "slim-arc-expert-reclaim.h"
++
++#include "slim-arc-page-range.h"
++
++#include <limits>
++
++namespace slim_arc {
++
++namespace {
++
++bool contains_id(const std::vector<int> & ids, int candidate) noexcept {
++    for (const int id : ids) {
++        if (id == candidate) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool checked_add(uintptr_t address, size_t length, uintptr_t * result) noexcept {
++    const uintptr_t maximum = std::numeric_limits<uintptr_t>::max();
++    if (length > maximum - address) {
++        return false;
++    }
++    *result = address + static_cast<uintptr_t>(length);
++    return true;
++}
++
++bool checked_multiply(size_t left, size_t right, size_t * result) noexcept {
++    const size_t maximum = std::numeric_limits<size_t>::max();
++    if (left != 0 && right > maximum / left) {
++        return false;
++    }
++    *result = left * right;
++    return true;
++}
++
++void saturating_add(uint64_t * total, uint64_t increment) noexcept {
++    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
++    *total = increment > maximum - *total ? maximum : *total + increment;
++}
++
++} // namespace
++
++std::vector<int> wasted_expert_ids(
++    const std::vector<int> & prefetched,
++    const std::vector<int> & selected) {
++    std::vector<int> wasted;
++    wasted.reserve(prefetched.size());
++    for (const int expert_id : prefetched) {
++        if (!contains_id(selected, expert_id) && !contains_id(wasted, expert_id)) {
++            wasted.push_back(expert_id);
++        }
++    }
++    return wasted;
++}
++
++expert_reclaim_plan build_expert_reclaim_plan(
++    const std::vector<expert_tensor_view> & tensors,
++    const std::vector<int> & wasted_ids,
++    size_t page_size) {
++    expert_reclaim_plan plan;
++
++    for (const expert_tensor_view & tensor : tensors) {
++        if (tensor.expert_count <= 0) {
++            saturating_add(&plan.invalid_layouts, 1);
++            continue;
++        }
++
++        const size_t expert_count = static_cast<size_t>(tensor.expert_count);
++        if (tensor.total_bytes % expert_count != 0) {
++            saturating_add(&plan.invalid_layouts, 1);
++            continue;
++        }
++
++        uintptr_t tensor_end{0};
++        if (!checked_add(tensor.address, tensor.total_bytes, &tensor_end)) {
++            saturating_add(&plan.invalid_layouts, 1);
++            continue;
++        }
++        (void) tensor_end;
++
++        const size_t expert_bytes = tensor.total_bytes / expert_count;
++        for (const int expert_id : wasted_ids) {
++            if (expert_id < 0 || static_cast<size_t>(expert_id) >= expert_count) {
++                saturating_add(&plan.invalid_ids, 1);
++                continue;
++            }
++
++            size_t offset{0};
++            if (!checked_multiply(static_cast<size_t>(expert_id), expert_bytes, &offset)) {
++                saturating_add(&plan.invalid_layouts, 1);
++                continue;
++            }
++
++            uintptr_t slice_address{0};
++            uintptr_t slice_end{0};
++            if (!checked_add(tensor.address, offset, &slice_address)
++                || !checked_add(slice_address, expert_bytes, &slice_end)) {
++                saturating_add(&plan.invalid_layouts, 1);
++                continue;
++            }
++            (void) slice_end;
++
++            const page_range range = interior_page_range(slice_address, expert_bytes, page_size);
++            if (!range.valid) {
++                saturating_add(&plan.invalid_layouts, 1);
++                continue;
++            }
++
++            saturating_add(&plan.skipped_bytes, static_cast<uint64_t>(range.skipped_bytes));
++            if (range.length == 0) {
++                continue;
++            }
++            plan.items.push_back({expert_id, range.address, range.length, range.skipped_bytes});
++        }
++    }
++    return plan;
++}
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-expert-reclaim.h b/src/slim-arc-expert-reclaim.h
+new file mode 100644
+index 000000000..f17cc76ca
+--- /dev/null
++++ b/src/slim-arc-expert-reclaim.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace slim_arc {
++
++struct expert_tensor_view {
++    uintptr_t address{0};
++    size_t total_bytes{0};
++    int expert_count{0};
++};
++
++struct expert_reclaim_item {
++    int expert_id{-1};
++    uintptr_t address{0};
++    size_t length{0};
++    size_t skipped_bytes{0};
++};
++
++struct expert_reclaim_plan {
++    std::vector<expert_reclaim_item> items;
++    uint64_t invalid_layouts{0};
++    uint64_t invalid_ids{0};
++    uint64_t skipped_bytes{0};
++};
++
++std::vector<int> wasted_expert_ids(
++    const std::vector<int> & prefetched,
++    const std::vector<int> & selected);
++
++expert_reclaim_plan build_expert_reclaim_plan(
++    const std::vector<expert_tensor_view> & tensors,
++    const std::vector<int> & wasted_ids,
++    size_t page_size);
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-expert-residency.cpp b/src/slim-arc-expert-residency.cpp
+new file mode 100644
+index 000000000..2ef4aff29
+--- /dev/null
++++ b/src/slim-arc-expert-residency.cpp
+@@ -0,0 +1,256 @@
++#include "slim-arc-expert-residency.h"
++
++#include <limits>
++
++namespace slim_arc {
++namespace {
++
++constexpr uint64_t basis_points_denominator{10000};
++constexpr uint32_t high_pressure_basis_points{8500};
++constexpr uint32_t critical_pressure_basis_points{9500};
++constexpr uint32_t critical_recovery_basis_points{9000};
++constexpr uint32_t high_recovery_basis_points{7500};
++constexpr uint32_t waste_ratio_limit{1000};
++constexpr uint32_t high_waste_ratio_milli{600};
++constexpr uint32_t waste_recovery_ratio_milli{400};
++constexpr uint8_t recovery_sample_requirement{2};
++constexpr uint8_t popularity_decay_interval{64};
++
++void saturating_add(uint64_t * total, uint64_t increment) noexcept {
++    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
++    *total = increment > maximum - *total ? maximum : *total + increment;
++}
++
++bool contains_id(const std::vector<int> & ids, int expert_id) noexcept {
++    for (const int existing_id : ids) {
++        if (existing_id == expert_id) {
++            return true;
++        }
++    }
++    return false;
++}
++
++uint64_t scaled_threshold(uint64_t maximum, uint32_t basis_points, bool round_up) noexcept {
++    const uint64_t whole = (maximum / basis_points_denominator) * basis_points;
++    const uint64_t remainder_product = (maximum % basis_points_denominator) * basis_points;
++    const uint64_t fraction = (remainder_product + (round_up ? basis_points_denominator - 1 : 0)) / basis_points_denominator;
++    return whole + fraction;
++}
++
++bool ratio_at_least(uint64_t current, uint64_t maximum, uint32_t basis_points) noexcept {
++    return current >= scaled_threshold(maximum, basis_points, true);
++}
++
++bool ratio_at_most(uint64_t current, uint64_t maximum, uint32_t basis_points) noexcept {
++    return current <= scaled_threshold(maximum, basis_points, false);
++}
++
++bool normal_waste_restricted(const expert_residency_input & input) noexcept {
++    return input.pressure == expert_pressure_state::normal
++        && (input.waste_restricted || input.waste_ratio_milli >= high_waste_ratio_milli);
++}
++
++enum class candidate_category { stable, temporal, hot };
++
++candidate_category category_for(const expert_candidate & candidate) noexcept {
++    if (candidate.stable) {
++        return candidate_category::stable;
++    }
++    return candidate.temporal ? candidate_category::temporal : candidate_category::hot;
++}
++
++void skip_candidate(expert_residency_decision * decision, uint64_t bytes) noexcept {
++    saturating_add(&decision->skipped_bytes, bytes);
++}
++
++void increment(uint64_t * counter) noexcept {
++    saturating_add(counter, 1);
++}
++
++void consider_candidate(
++    const expert_candidate & candidate,
++    const expert_residency_input & input,
++    expert_residency_decision * decision) noexcept {
++    if (decision->expert_ids.size() >= input.max_experts) {
++        increment(&decision->reasons.count_rejected_candidates);
++        skip_candidate(decision, candidate.bytes);
++        return;
++    }
++    if (candidate.bytes > input.budget_bytes - decision->admitted_bytes) {
++        increment(&decision->reasons.budget_rejected_candidates);
++        skip_candidate(decision, candidate.bytes);
++        return;
++    }
++    decision->expert_ids.push_back(candidate.expert_id);
++    saturating_add(&decision->admitted_bytes, candidate.bytes);
++}
++
++} // namespace
++
++expert_pressure_state expert_pressure_controller::update(const expert_pressure_sample & sample) noexcept {
++    if (!sample.valid || sample.maximum_bytes == 0 || sample.current_bytes > sample.maximum_bytes) {
++        state_ = expert_pressure_state::missing;
++        recovery_samples_ = 0;
++        return state_;
++    }
++
++    if (state_ == expert_pressure_state::critical) {
++        if (ratio_at_most(sample.current_bytes, sample.maximum_bytes, critical_recovery_basis_points)) {
++            ++recovery_samples_;
++            if (recovery_samples_ == recovery_sample_requirement) {
++                state_ = expert_pressure_state::high;
++                recovery_samples_ = 0;
++            }
++        } else {
++            recovery_samples_ = 0;
++        }
++        return state_;
++    }
++
++    if (ratio_at_least(sample.current_bytes, sample.maximum_bytes, critical_pressure_basis_points)) {
++        state_ = expert_pressure_state::critical;
++        recovery_samples_ = 0;
++        return state_;
++    }
++
++    if (state_ == expert_pressure_state::high) {
++        if (ratio_at_most(sample.current_bytes, sample.maximum_bytes, high_recovery_basis_points)) {
++            ++recovery_samples_;
++            if (recovery_samples_ == recovery_sample_requirement) {
++                state_ = expert_pressure_state::normal;
++                recovery_samples_ = 0;
++            }
++        } else {
++            recovery_samples_ = 0;
++        }
++        return state_;
++    }
++
++    state_ = ratio_at_least(sample.current_bytes, sample.maximum_bytes, high_pressure_basis_points)
++        ? expert_pressure_state::high
++        : expert_pressure_state::normal;
++    recovery_samples_ = 0;
++    return state_;
++}
++
++uint32_t update_waste_ewma_milli(uint32_t previous_milli, uint32_t sample_milli, bool initialized) noexcept {
++    const uint32_t sample = sample_milli > waste_ratio_limit ? waste_ratio_limit : sample_milli;
++    if (!initialized) {
++        return sample;
++    }
++    const uint32_t previous = previous_milli > waste_ratio_limit ? waste_ratio_limit : previous_milli;
++    return (3 * previous + sample) / 4;
++}
++
++bool expert_waste_controller::update(uint32_t waste_ratio_milli) noexcept {
++    const uint32_t ratio = waste_ratio_milli > waste_ratio_limit ? waste_ratio_limit : waste_ratio_milli;
++    if (!high_waste_) {
++        if (ratio >= high_waste_ratio_milli) {
++            high_waste_ = true;
++        }
++        return high_waste_;
++    }
++
++    if (ratio < waste_recovery_ratio_milli) {
++        ++recovery_samples_;
++        if (recovery_samples_ == recovery_sample_requirement) {
++            high_waste_ = false;
++            recovery_samples_ = 0;
++        }
++    } else {
++        recovery_samples_ = 0;
++    }
++    return high_waste_;
++}
++
++expert_residency_decision expert_residency_controller::select(const expert_residency_input & input) {
++    expert_residency_input effective_input = input;
++    effective_input.waste_restricted = input.waste_restricted || waste_controller_.update(input.waste_ratio_milli);
++    return select_resident_experts(effective_input);
++}
++
++uint32_t saturating_increment_popularity(uint32_t count) noexcept {
++    return count == std::numeric_limits<uint32_t>::max() ? count : count + 1;
++}
++
++bool expert_popularity_decay_controller::observe_valid_router_sample(std::vector<uint32_t> & counts) noexcept {
++    ++samples_since_decay_;
++    if (samples_since_decay_ != popularity_decay_interval) {
++        return false;
++    }
++    samples_since_decay_ = 0;
++    for (uint32_t & count : counts) {
++        count /= 2;
++    }
++    return true;
++}
++
++expert_residency_decision select_resident_experts(const expert_residency_input & input) {
++    expert_residency_decision decision;
++    std::vector<int> seen_ids;
++    std::vector<expert_candidate> valid_candidates;
++    seen_ids.reserve(input.candidates.size());
++    valid_candidates.reserve(input.candidates.size());
++
++    for (const expert_candidate & candidate : input.candidates) {
++        saturating_add(&decision.requested_bytes, candidate.bytes);
++        if (candidate.expert_id < 0) {
++            increment(&decision.reasons.invalid_candidates);
++            skip_candidate(&decision, candidate.bytes);
++            continue;
++        }
++        if (contains_id(seen_ids, candidate.expert_id)) {
++            increment(&decision.reasons.duplicate_candidates);
++            skip_candidate(&decision, candidate.bytes);
++            continue;
++        }
++        seen_ids.push_back(candidate.expert_id);
++        if (candidate.bytes == 0) {
++            increment(&decision.reasons.invalid_candidates);
++            continue;
++        }
++        valid_candidates.push_back(candidate);
++    }
++
++    if (input.pressure == expert_pressure_state::missing) {
++        decision.fallback = true;
++        increment(&decision.reasons.fallback_decisions);
++        for (const expert_candidate & candidate : valid_candidates) {
++            consider_candidate(candidate, input, &decision);
++        }
++        return decision;
++    }
++
++    if (input.pressure == expert_pressure_state::critical) {
++        for (const expert_candidate & candidate : valid_candidates) {
++            increment(&decision.reasons.pressure_filtered_candidates);
++            skip_candidate(&decision, candidate.bytes);
++        }
++        return decision;
++    }
++
++    const bool waste_restricted = normal_waste_restricted(input);
++    decision.waste_restricted = waste_restricted;
++
++    for (const candidate_category category : {candidate_category::stable, candidate_category::temporal, candidate_category::hot}) {
++        for (const expert_candidate & candidate : valid_candidates) {
++            if (category_for(candidate) != category) {
++                continue;
++            }
++            if (input.pressure == expert_pressure_state::high && category != candidate_category::stable) {
++                increment(&decision.reasons.pressure_filtered_candidates);
++                skip_candidate(&decision, candidate.bytes);
++                continue;
++            }
++            if (waste_restricted && category != candidate_category::stable) {
++                increment(&decision.reasons.waste_filtered_candidates);
++                skip_candidate(&decision, candidate.bytes);
++                continue;
++            }
++            consider_candidate(candidate, input, &decision);
++        }
++    }
++    return decision;
++}
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-expert-residency.h b/src/slim-arc-expert-residency.h
+new file mode 100644
+index 000000000..a40e6ea13
+--- /dev/null
++++ b/src/slim-arc-expert-residency.h
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace slim_arc {
++
++enum class expert_pressure_state { missing, normal, high, critical };
++
++struct expert_candidate {
++    int expert_id{-1};
++    uint64_t bytes{0};
++    uint32_t popularity{0};
++    bool stable{false};
++    bool temporal{false};
++};
++
++struct expert_residency_input {
++    expert_pressure_state pressure{expert_pressure_state::missing};
++    uint64_t budget_bytes{0};
++    size_t max_experts{0};
++    uint32_t waste_ratio_milli{0};
++    std::vector<expert_candidate> candidates;
++    bool waste_restricted{false};
++};
++
++struct expert_residency_reasons {
++    uint64_t invalid_candidates{0};
++    uint64_t duplicate_candidates{0};
++    uint64_t pressure_filtered_candidates{0};
++    uint64_t waste_filtered_candidates{0};
++    uint64_t budget_rejected_candidates{0};
++    uint64_t count_rejected_candidates{0};
++    uint64_t fallback_decisions{0};
++};
++
++struct expert_residency_decision {
++    std::vector<int> expert_ids;
++    uint64_t requested_bytes{0};
++    uint64_t admitted_bytes{0};
++    uint64_t skipped_bytes{0};
++    bool fallback{false};
++    bool waste_restricted{false};
++    expert_residency_reasons reasons{};
++};
++
++expert_residency_decision select_resident_experts(const expert_residency_input & input);
++
++struct expert_pressure_sample {
++    bool valid{false};
++    uint64_t current_bytes{0};
++    uint64_t maximum_bytes{0};
++};
++
++class expert_pressure_controller {
++  public:
++    expert_pressure_state update(const expert_pressure_sample & sample) noexcept;
++
++  private:
++    expert_pressure_state state_{expert_pressure_state::missing};
++    uint8_t recovery_samples_{0};
++};
++
++uint32_t update_waste_ewma_milli(uint32_t previous_milli, uint32_t sample_milli, bool initialized) noexcept;
++
++class expert_waste_controller {
++  public:
++    bool update(uint32_t waste_ratio_milli) noexcept;
++
++  private:
++    bool high_waste_{false};
++    uint8_t recovery_samples_{0};
++};
++
++class expert_residency_controller {
++  public:
++    expert_residency_decision select(const expert_residency_input & input);
++
++  private:
++    expert_waste_controller waste_controller_;
++};
++
++uint32_t saturating_increment_popularity(uint32_t count) noexcept;
++
++class expert_popularity_decay_controller {
++  public:
++    bool observe_valid_router_sample(std::vector<uint32_t> & counts) noexcept;
++
++  private:
++    uint8_t samples_since_decay_{0};
++};
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-expert-transition.cpp b/src/slim-arc-expert-transition.cpp
+new file mode 100644
+index 000000000..dfd68f00b
+--- /dev/null
++++ b/src/slim-arc-expert-transition.cpp
+@@ -0,0 +1,174 @@
++#include "slim-arc-expert-transition.h"
++
++#include <algorithm>
++#include <limits>
++#include <utility>
++
++namespace slim_arc {
++namespace {
++
++uint64_t saturating_add_u64(uint64_t left, uint64_t right) {
++    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
++    return right > maximum - left ? maximum : left + right;
++}
++
++uint32_t saturating_add_u32(uint32_t left, uint32_t right) {
++    const uint32_t maximum = std::numeric_limits<uint32_t>::max();
++    return right > maximum - left ? maximum : left + right;
++}
++
++uint16_t saturating_increment_u16(uint16_t value) {
++    return value == std::numeric_limits<uint16_t>::max() ? value : static_cast<uint16_t>(value + 1);
++}
++
++} // namespace
++
++bool expert_transition_table::register_layer(int layer, int n_experts) {
++    if (layer < 0 || n_experts <= 0 || n_experts > static_cast<int>(invalid_expert)) return false;
++    if (static_cast<size_t>(layer) >= layers_.size()) layers_.resize(static_cast<size_t>(layer) + 1);
++    layer_state & state = layers_[static_cast<size_t>(layer)];
++    if (state.n_experts != 0) return state.n_experts == n_experts;
++    state.n_experts = n_experts;
++    state.rows.resize(static_cast<size_t>(n_experts));
++    return true;
++}
++
++std::vector<int> expert_transition_table::normalize_ids(const int * ids, int n, int n_experts) {
++    std::vector<int> normalized;
++    if (ids == nullptr || n <= 0 || n_experts <= 0) return normalized;
++    normalized.reserve(static_cast<size_t>(std::min(n, n_experts)));
++    for (int index = 0; index < n; ++index) {
++        const int expert_id = ids[index];
++        if (expert_id < 0 || expert_id >= n_experts) continue;
++        if (std::find(normalized.begin(), normalized.end(), expert_id) == normalized.end()) {
++            normalized.push_back(expert_id);
++        }
++    }
++    std::sort(normalized.begin(), normalized.end());
++    return normalized;
++}
++
++void expert_transition_table::update_row(transition_row & row, int target_id) {
++    for (transition_slot & slot : row.slots) {
++        if (slot.expert_id == target_id) {
++            slot.count = saturating_increment_u16(slot.count);
++            return;
++        }
++    }
++    for (transition_slot & slot : row.slots) {
++        if (slot.expert_id == invalid_expert) {
++            slot.expert_id = static_cast<uint16_t>(target_id);
++            slot.count = 1;
++            return;
++        }
++    }
++
++    size_t replacement = 0;
++    for (size_t index = 1; index < row.slots.size(); ++index) {
++        const transition_slot & candidate = row.slots[index];
++        const transition_slot & selected = row.slots[replacement];
++        if (candidate.count < selected.count ||
++            (candidate.count == selected.count && candidate.expert_id > selected.expert_id)) {
++            replacement = index;
++        }
++    }
++    transition_slot & slot = row.slots[replacement];
++    slot.count = saturating_increment_u16(slot.count);
++    slot.expert_id = static_cast<uint16_t>(target_id);
++}
++
++void expert_transition_table::decay_layer(layer_state & layer) {
++    for (transition_row & row : layer.rows) {
++        for (transition_slot & slot : row.slots) {
++            if (slot.expert_id == invalid_expert || slot.count == 0) continue;
++            slot.count = static_cast<uint16_t>(std::max<uint16_t>(1, slot.count >> 1));
++        }
++    }
++    stats_.decays = saturating_add_u64(stats_.decays, 1);
++}
++
++void expert_transition_table::observe(
++    int layer,
++    const int * source_ids,
++    int source_n,
++    const int * target_ids,
++    int target_n) {
++    if (layer < 0 || static_cast<size_t>(layer) >= layers_.size()) return;
++    layer_state & state = layers_[static_cast<size_t>(layer)];
++    if (state.n_experts <= 0) return;
++    const std::vector<int> sources = normalize_ids(source_ids, source_n, state.n_experts);
++    const std::vector<int> targets = normalize_ids(target_ids, target_n, state.n_experts);
++    if (sources.empty() || targets.empty()) return;
++
++    for (const int source_id : sources) {
++        transition_row & row = state.rows[static_cast<size_t>(source_id)];
++        for (const int target_id : targets) update_row(row, target_id);
++    }
++    stats_.updates = saturating_add_u64(stats_.updates, 1);
++    state.observations = saturating_add_u64(state.observations, 1);
++    if (state.observations % decay_interval == 0) decay_layer(state);
++}
++
++std::vector<int> expert_transition_table::predict(
++    int layer, const int * source_ids, int source_n, int top_k) {
++    std::vector<int> prediction;
++    if (layer < 0 || static_cast<size_t>(layer) >= layers_.size() || top_k <= 0) return prediction;
++    const layer_state & state = layers_[static_cast<size_t>(layer)];
++    if (state.n_experts <= 0) return prediction;
++    const std::vector<int> sources = normalize_ids(source_ids, source_n, state.n_experts);
++    if (sources.empty()) return prediction;
++    stats_.prediction_rounds = saturating_add_u64(stats_.prediction_rounds, 1);
++
++    std::vector<uint32_t> scores(static_cast<size_t>(state.n_experts), 0);
++    for (const int source_id : sources) {
++        const transition_row & row = state.rows[static_cast<size_t>(source_id)];
++        for (const transition_slot & slot : row.slots) {
++            if (slot.expert_id == invalid_expert || slot.expert_id >= state.n_experts) continue;
++            uint32_t & score = scores[slot.expert_id];
++            score = saturating_add_u32(score, slot.count);
++        }
++    }
++
++    std::vector<std::pair<int, uint32_t>> ranked;
++    for (int expert_id = 0; expert_id < state.n_experts; ++expert_id) {
++        const uint32_t score = scores[static_cast<size_t>(expert_id)];
++        if (score > 0) ranked.emplace_back(expert_id, score);
++    }
++    std::sort(ranked.begin(), ranked.end(), [](const auto & left, const auto & right) {
++        if (left.second != right.second) return left.second > right.second;
++        return left.first < right.first;
++    });
++    if (ranked.empty()) {
++        stats_.empty_rounds = saturating_add_u64(stats_.empty_rounds, 1);
++        return prediction;
++    }
++
++    const size_t count = std::min(ranked.size(), static_cast<size_t>(std::min(top_k, state.n_experts)));
++    prediction.reserve(count);
++    for (size_t index = 0; index < count; ++index) prediction.push_back(ranked[index].first);
++    stats_.predicted_experts = saturating_add_u64(stats_.predicted_experts, prediction.size());
++    return prediction;
++}
++
++void expert_transition_table::record_result(
++    const int * predicted, int predicted_n, const int * actual, int actual_n) {
++    const std::vector<int> predicted_ids = normalize_ids(predicted, predicted_n, invalid_expert);
++    const std::vector<int> actual_ids = normalize_ids(actual, actual_n, invalid_expert);
++    uint64_t matches = 0;
++    for (const int expert_id : predicted_ids) {
++        if (std::binary_search(actual_ids.begin(), actual_ids.end(), expert_id)) ++matches;
++    }
++    stats_.matched_experts = saturating_add_u64(stats_.matched_experts, matches);
++}
++
++size_t expert_transition_table::allocated_bytes() const noexcept {
++    size_t bytes = layers_.capacity() * sizeof(layer_state);
++    for (const layer_state & layer : layers_) {
++        const size_t rows = layer.rows.capacity() * sizeof(transition_row);
++        if (rows > std::numeric_limits<size_t>::max() - bytes) return std::numeric_limits<size_t>::max();
++        bytes += rows;
++    }
++    return bytes;
++}
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-expert-transition.h b/src/slim-arc-expert-transition.h
+new file mode 100644
+index 000000000..a00b543df
+--- /dev/null
++++ b/src/slim-arc-expert-transition.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace slim_arc {
++
++struct expert_transition_stats {
++    uint64_t updates{0};
++    uint64_t prediction_rounds{0};
++    uint64_t empty_rounds{0};
++    uint64_t predicted_experts{0};
++    uint64_t matched_experts{0};
++    uint64_t decays{0};
++};
++
++class expert_transition_table {
++  public:
++    bool register_layer(int layer, int n_experts);
++    void observe(
++        int layer,
++        const int * source_ids,
++        int source_n,
++        const int * target_ids,
++        int target_n);
++    std::vector<int> predict(int layer, const int * source_ids, int source_n, int top_k);
++    void record_result(const int * predicted, int predicted_n, const int * actual, int actual_n);
++    expert_transition_stats statistics() const noexcept { return stats_; }
++    size_t allocated_bytes() const noexcept;
++
++  private:
++    static constexpr size_t transition_slots = 4;
++    static constexpr uint64_t decay_interval = 64;
++    static constexpr uint16_t invalid_expert = UINT16_MAX;
++
++    struct transition_slot {
++        uint16_t expert_id{invalid_expert};
++        uint16_t count{0};
++    };
++
++    struct transition_row {
++        std::array<transition_slot, transition_slots> slots{};
++    };
++
++    struct layer_state {
++        int n_experts{0};
++        uint64_t observations{0};
++        std::vector<transition_row> rows;
++    };
++
++    static std::vector<int> normalize_ids(const int * ids, int n, int n_experts);
++    static void update_row(transition_row & row, int target_id);
++    void decay_layer(layer_state & layer);
++
++    std::vector<layer_state> layers_;
++    expert_transition_stats stats_;
++};
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-page-range.cpp b/src/slim-arc-page-range.cpp
+new file mode 100644
+index 000000000..f384682e0
+--- /dev/null
++++ b/src/slim-arc-page-range.cpp
+@@ -0,0 +1,118 @@
++#include "slim-arc-page-range.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++
++namespace slim_arc {
++
++page_range interior_page_range(uintptr_t address, size_t length, size_t page_size) noexcept {
++    if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
++        return {};
++    }
++    if (length > UINTPTR_MAX - address) {
++        return {};
++    }
++
++    const uintptr_t end = address + length;
++    const uintptr_t page_mask = static_cast<uintptr_t>(page_size - 1);
++    const uintptr_t misalignment = address & page_mask;
++    uintptr_t first_page = address;
++
++    if (misalignment != 0) {
++        const uintptr_t advance = static_cast<uintptr_t>(page_size) - misalignment;
++        if (advance > end - address) {
++            return {end, 0, length, true};
++        }
++        first_page = address + advance;
++    }
++
++    const uintptr_t last_page_end = end & ~page_mask;
++    if (first_page > last_page_end) {
++        return {end, 0, length, true};
++    }
++
++    const size_t interior_length = static_cast<size_t>(last_page_end - first_page);
++    const size_t skipped_bytes = length - interior_length;
++    return {first_page, interior_length, skipped_bytes, true};
++}
++
++page_range covering_page_range(uintptr_t address, size_t length, size_t page_size) noexcept {
++    if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
++        return {};
++    }
++    if (length == 0) {
++        return {address, 0, 0, true, 0};
++    }
++    if (length > UINTPTR_MAX - address) {
++        return {};
++    }
++
++    const uintptr_t page_mask = static_cast<uintptr_t>(page_size - 1);
++    const uintptr_t first_page = address & ~page_mask;
++    const uintptr_t end = address + length;
++    uintptr_t last_page_end = end;
++    const uintptr_t end_misalignment = end & page_mask;
++    if (end_misalignment != 0) {
++        const uintptr_t advance = static_cast<uintptr_t>(page_size) - end_misalignment;
++        if (advance > UINTPTR_MAX - end) {
++            return {};
++        }
++        last_page_end = end + advance;
++    }
++    if (last_page_end < first_page) {
++        return {};
++    }
++
++    const uintptr_t covered = last_page_end - first_page;
++    if (covered > std::numeric_limits<size_t>::max()) {
++        return {};
++    }
++    const size_t covered_length = static_cast<size_t>(covered);
++    if (covered_length < length) {
++        return {};
++    }
++    return {first_page, covered_length, 0, true, covered_length - length};
++}
++
++page_range_set coalesce_page_ranges(std::vector<page_range> ranges) noexcept {
++    const size_t input_ranges = ranges.size();
++    std::vector<page_range> nonempty;
++    nonempty.reserve(ranges.size());
++    for (const page_range & range : ranges) {
++        if (!range.valid || range.length > UINTPTR_MAX - range.address) {
++            return {{}, input_ranges, false};
++        }
++        if (range.length == 0) {
++            continue;
++        }
++        nonempty.push_back({range.address, range.length, 0, true, 0});
++    }
++
++    std::sort(nonempty.begin(), nonempty.end(), [](const page_range & left, const page_range & right) {
++        if (left.address != right.address) return left.address < right.address;
++        return left.length < right.length;
++    });
++
++    std::vector<page_range> merged;
++    merged.reserve(nonempty.size());
++    for (const page_range & range : nonempty) {
++        if (merged.empty()) {
++            merged.push_back(range);
++            continue;
++        }
++        page_range & previous = merged.back();
++        const uintptr_t previous_end = previous.address + previous.length;
++        if (range.address > previous_end) {
++            merged.push_back(range);
++            continue;
++        }
++        const uintptr_t range_end = range.address + range.length;
++        if (range_end > previous_end) {
++            previous.length = static_cast<size_t>(range_end - previous.address);
++        }
++    }
++    return {std::move(merged), input_ranges, true};
++}
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-page-range.h b/src/slim-arc-page-range.h
+new file mode 100644
+index 000000000..c740c4321
+--- /dev/null
++++ b/src/slim-arc-page-range.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace slim_arc {
++
++struct page_range {
++    uintptr_t address{0};
++    size_t length{0};
++    size_t skipped_bytes{0};
++    bool valid{false};
++    // Bytes covered outside the requested interval. Only used by
++    // covering_page_range; interior ranges leave this at zero.
++    size_t extra_bytes{0};
++};
++
++struct page_range_set {
++    std::vector<page_range> ranges;
++    size_t input_ranges{0};
++    bool valid{false};
++};
++
++page_range interior_page_range(
++    uintptr_t address,
++    size_t length,
++    size_t page_size) noexcept;
++
++page_range covering_page_range(
++    uintptr_t address,
++    size_t length,
++    size_t page_size) noexcept;
++
++page_range_set coalesce_page_ranges(std::vector<page_range> ranges) noexcept;
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-prefetch.cpp b/src/slim-arc-prefetch.cpp
+new file mode 100644
+index 000000000..f682bdcbf
+--- /dev/null
++++ b/src/slim-arc-prefetch.cpp
+@@ -0,0 +1,2188 @@
++// SLIM-ARC: Tensor-level asynchronous prefetch scheduler
++//
++// Implements layer-ahead prefetch on top of upstream llama.cpp's mmap.
++// When computing layer N, async madvise(WILLNEED) for layers N+1..N+window.
++
++#include "slim-arc-prefetch.h"
++
++#include "slim-arc-expert-reclaim.h"
++#include "slim-arc-page-range.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <charconv>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <string_view>
++#include <system_error>
++// [QLH port] The upstream patch targets Linux. Windows has no madvise/mincore/sysconf, so the
++// three call sites below get a win32 implementation:
++//   MADV_WILLNEED  -> PrefetchVirtualMemory (Win8+), which is the same hint to the memory
++//                     manager: bring these pages resident now.
++//   MADV_DONTNEED  -> DiscardVirtualMemory (Win8.1+), the closest equivalent (contents become
++//                     undefined and the pages are dropped).
++//   MADV_* others  -> no-op; they only steer the kernel readahead heuristic, which Windows
++//                     does not expose.
++//   mincore        -> unsupported; the only consumer is the expert hot-lock LRU, which treats
++//                     an unknown residency as "skip this range".
++#if defined(_WIN32)
++#  ifndef WIN32_LEAN_AND_MEAN
++#    define WIN32_LEAN_AND_MEAN
++#  endif
++#  ifndef NOMINMAX
++#    define NOMINMAX   // windows.h defines max/min as macros and breaks std::max / ::max()
++#  endif
++#  include <windows.h>
++#  include <memoryapi.h>
++#  include <sysinfoapi.h>
++// The scheduler passes POSIX_MADV_* through its advice callback; define the same names with
++// distinct values so the win32 branch can switch on them.
++enum : int {
++    POSIX_MADV_NORMAL     = 0,
++    POSIX_MADV_RANDOM     = 1,
++    POSIX_MADV_SEQUENTIAL = 2,
++    POSIX_MADV_WILLNEED   = 3,
++    POSIX_MADV_DONTNEED   = 4,
++};
++#else
++#  include <sys/mman.h>
++#  include <unistd.h>
++#endif
++#if defined(__linux__)
++#include <fcntl.h>
++#endif
++
++namespace slim_arc {
++
++namespace {
++// [QLH port] mlock/munlock wrap VirtualLock/VirtualUnlock. The scheduler locks hot expert
++// ranges so the memory manager keeps them resident; the win32 call takes the same
++// (address, length) pair and fails the same way, so the call sites need no changes.
++#if defined(_WIN32)
++int mlock(const void * addr, size_t length) {
++    return VirtualLock(const_cast<void *>(addr), length) ? 0 : -1;
++}
++
++int munlock(const void * addr, size_t length) {
++    return VirtualUnlock(const_cast<void *>(addr), length) ? 0 : -1;
++}
++
++// 64x64 -> 128 multiply for the LFRU score. MSVC has no __int128, so the product is kept as
++// a (high, low) pair; only comparison and equality are used.
++struct wide_uint {
++    uint64_t hi{0};
++    uint64_t lo{0};
++
++    bool operator==(const wide_uint & other) const { return hi == other.hi && lo == other.lo; }
++    bool operator!=(const wide_uint & other) const { return !(*this == other); }
++    bool operator<(const wide_uint & other) const {
++        return hi < other.hi || (hi == other.hi && lo < other.lo);
++    }
++};
++
++wide_uint wide_mul(uint64_t a, uint64_t b) {
++    uint64_t hi = 0;
++    const uint64_t lo = _umul128(a, b, &hi);
++    return wide_uint{hi, lo};
++}
++#else
++using wide_uint = unsigned __int128;
++
++wide_uint wide_mul(uint64_t a, uint64_t b) {
++    return static_cast<wide_uint>(a) * static_cast<wide_uint>(b);
++}
++#endif
++
++template <typename T>
++T saturating_add(T left, T right) noexcept {
++    const T maximum = std::numeric_limits<T>::max();
++    return right > maximum - left ? maximum : left + right;
++}
++
++template <typename T>
++void atomic_saturating_add(std::atomic<T> & target, T increment) noexcept {
++    T current = target.load();
++    while (!target.compare_exchange_weak(current, saturating_add(current, increment))) {
++    }
++}
++
++// [QLH] expert_hot_locked_bytes_ is unsigned, and both places that maintain it subtract from it.
++// A bookkeeping slip (an entry counted twice, or an eviction after a partially failed mlock) must
++// not wrap the counter around: the wrapped value is huge, so the headroom below turns into "no
++// room at all, ever", the eviction loop stops running, and the hot cache silently stops admitting
++// experts for the rest of the process. Both operations go through these two helpers instead.
++uint64_t hot_cache_release(uint64_t locked, uint64_t bytes) noexcept {
++    return locked > bytes ? locked - bytes : 0;
++}
++
++uint64_t hot_cache_headroom(uint64_t budget, uint64_t locked) noexcept {
++    return locked < budget ? budget - locked : 0;
++}
++
++void append_unique_nonnegative(std::vector<int> & ids, int id) {
++    if (id >= 0 && std::find(ids.begin(), ids.end(), id) == ids.end()) {
++        ids.push_back(id);
++    }
++}
++
++// [QLH] The SLIM_ARC_* switches, parsed in one place.
++//
++// Six call sites used to spell out the same steps (getenv, from_chars with a full-string check, a
++// range check, an fprintf, a default), and two of them had already drifted in what they did with an
++// empty value. Both helpers keep the behaviour every site had: an unset variable is silent and
++// returns the default, a malformed one is reported on stderr and returns the default.
++//
++// env_bool only treats "1" as true. The switches have always been exact-match, so "true" / "yes"
++// stay off; that is deliberate, not an oversight to be fixed by making this smarter.
++//
++// An empty value is malformed and reports one stderr line, like every other malformed value here.
++// That is a visible difference for exactly one switch: SLIM_ARC_EXPERT_POP used to return 0
++// silently and now logs before returning 0. The value is unchanged; the extra line is this
++// consolidation showing through, not a new fault.
++bool env_bool(const char * name, bool def) noexcept {
++    const char * const raw = std::getenv(name);
++    if (raw == nullptr) return def;
++    return std::strcmp(raw, "1") == 0;
++}
++
++int64_t env_int(const char * name, int64_t def, int64_t lo, int64_t hi) noexcept {
++    const char * const raw = std::getenv(name);
++    if (raw == nullptr) return def;
++    const std::string_view value{raw};
++    int64_t parsed{0};
++    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
++    if (value.empty() || result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
++        parsed < lo || parsed > hi) {
++        std::fprintf(stderr, "SLIM-ARC: invalid %s; expected an integer in [%lld,%lld]\n", name,
++                     static_cast<long long>(lo), static_cast<long long>(hi));
++        return def;
++    }
++    return parsed;
++}
++
++struct resident_range_result {
++    std::vector<page_range> ranges;
++    uint64_t nonresident_bytes{0};
++    bool valid{false};
++};
++
++resident_range_result resident_page_ranges(const page_range & range, size_t page_size) {
++    if (!range.valid || range.length == 0 || page_size == 0 || range.length % page_size != 0) return {};
++    const size_t page_count = range.length / page_size;
++#if defined(__APPLE__)
++    std::vector<char> residency(page_count);
++#else
++    std::vector<unsigned char> residency(page_count);
++#endif
++#if defined(_WIN32)
++    // No mincore equivalent that answers "is this page resident" for a file mapping without
++    // touching it. Returning an invalid result makes the sole caller (expert hot-lock LRU)
++    // skip the range and count a lock failure instead of prefetching blindly.
++    (void) residency;
++    return {};
++#else
++    if (mincore(reinterpret_cast<void *>(range.address), range.length, residency.data()) != 0) return {};
++#endif
++
++    resident_range_result result;
++    result.valid = true;
++    size_t run_start = page_count;
++    for (size_t page = 0; page <= page_count; ++page) {
++        const bool resident = page < page_count && (residency[page] & 1) != 0;
++        if (resident && run_start == page_count) run_start = page;
++        if ((!resident || page == page_count) && run_start != page_count) {
++            const size_t run_pages = page - run_start;
++            result.ranges.push_back({
++                range.address + run_start * page_size,
++                run_pages * page_size,
++                0,
++                true,
++                0});
++            run_start = page_count;
++        }
++        if (page < page_count && !resident) {
++            result.nonresident_bytes = saturating_add(result.nonresident_bytes, static_cast<uint64_t>(page_size));
++        }
++    }
++    return result;
++}
++
++int system_advice(void * address, size_t length, int advice) {
++#if defined(_WIN32)
++    if (address == nullptr || length == 0) {
++        return EINVAL;
++    }
++    if (advice == POSIX_MADV_WILLNEED) {
++        WIN32_MEMORY_RANGE_ENTRY entry{ address, length };
++        if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0)) {
++            return static_cast<int>(GetLastError());
++        }
++        return 0;
++    }
++    if (advice == POSIX_MADV_DONTNEED) {
++        // DiscardVirtualMemory wants a page-aligned range; the scheduler already hands us
++        // tensor extents, which land on page boundaries inside the mapping.
++        const DWORD rc = DiscardVirtualMemory(address, length);
++        return rc == ERROR_SUCCESS ? 0 : static_cast<int>(rc);
++    }
++    // NORMAL / RANDOM / SEQUENTIAL only steer Linux readahead; nothing to map them onto.
++    return 0;
++#else
++    return posix_madvise(address, length, advice);
++#endif
++}
++
++int system_file_advice(int file_id, uint64_t offset, size_t length) {
++#if defined(__linux__)
++    if (file_id < 0 || length == 0 ||
++        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
++        length > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
++        return EINVAL;
++    }
++    return posix_fadvise(
++        file_id,
++        static_cast<off_t>(offset),
++        static_cast<off_t>(length),
++        POSIX_FADV_WILLNEED);
++#else
++    (void) file_id;
++    (void) offset;
++    (void) length;
++    return ENOTSUP;
++#endif
++}
++
++long system_page_size() {
++#if defined(_WIN32)
++    SYSTEM_INFO info{};
++    GetSystemInfo(&info);
++    return static_cast<long>(info.dwPageSize);
++#else
++    return sysconf(_SC_PAGESIZE);
++#endif
++}
++
++// [QLH] Free physical memory right now. The layer-ahead budget is derived from this because the
++// number that matters is how much room the kernel still has for read-ahead pages, not the model
++// size or a constant.
++size_t available_physical_bytes() noexcept {
++#if defined(_WIN32)
++    MEMORYSTATUSEX status{};
++    status.dwLength = sizeof(status);
++    if (GlobalMemoryStatusEx(&status) == 0) return 0;
++    return static_cast<size_t>(status.ullAvailPhys);
++#else
++    const long pages = sysconf(_SC_AVPHYS_PAGES);
++    const long page_size = sysconf(_SC_PAGESIZE);
++    if (pages <= 0 || page_size <= 0) return 0;
++    return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
++#endif
++}
++
++// [QLH] Ceiling for one prefetch request, in bytes.
++//
++// The budget is a *per-request* ceiling: worker_loop() spends it on the ranges of the request
++// (layers current+1 .. current+window) and skips whatever does not fit. Deriving it from free
++// physical memory rather than from a constant keeps the behaviour sane on both a 32 GiB desktop
++// and a 4 GiB SBC:
++//   - cap it at 1/8 of free RAM, so a burst of read-ahead cannot evict the pages the model is
++//     actively using;
++//   - floor at 64 MiB, else on a tight machine the floor rounds to zero pages and the scheduler
++//     goes back to issuing nothing;
++//   - ceiling at 1 GiB, because the ceiling is only a safety net: plan_request() then lowers the
++//     per-request budget again to one layer's worth of registered weights, which is what actually
++//     bounds the traffic.
++// SLIM_ARC_BUDGET_MB overrides all of it for experiments.
++size_t default_prefetch_budget_bytes() noexcept {
++    // -1 is "not set, or not usable": an unset variable is silent, a malformed one is reported by
++    // env_int(), and both fall through to the derived budget. 0 is a valid value (it disables the
++    // read-ahead) and is not confused with the sentinel.
++    const int64_t mb = env_int("SLIM_ARC_BUDGET_MB", -1, 0, 65536);
++    if (mb >= 0) {
++        return static_cast<size_t>(mb) * (1ULL << 20);
++    }
++    const size_t available = available_physical_bytes();
++    if (available == 0) {
++        return 128ULL << 20;
++    }
++    constexpr size_t budget_min = 64ULL << 20;
++    constexpr size_t budget_max = 1024ULL << 20;
++    const size_t share = available / 8;
++    return std::min(std::max(share, budget_min), budget_max);
++}
++
++int parse_cross_layer_transition_topk() noexcept {
++    if (!env_bool("SLIM_ARC_CROSS_LAYER_TRANSITION", false)) return 0;
++    // Two variables, so the "required" check has to stay separate: env_int() answers the default
++    // for an unset variable, which would hide the one case this switch is supposed to report.
++    if (std::getenv("SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK") == nullptr) {
++        std::fprintf(
++            stderr,
++            "SLIM-ARC: SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK is required when transition is enabled\n");
++        return 0;
++    }
++    return static_cast<int>(env_int("SLIM_ARC_CROSS_LAYER_TRANSITION_TOPK", 0, 1, 64));
++}
++
++void update_atomic_peak(std::atomic<uint64_t> & peak, uint64_t candidate) noexcept {
++    uint64_t current = peak.load();
++    while (current < candidate && !peak.compare_exchange_weak(current, candidate)) {
++    }
++}
++
++uint32_t ratio_permille(uint64_t numerator, uint64_t denominator) noexcept {
++    if (denominator == 0 || numerator == 0) return 0;
++    if (numerator >= denominator) return 1000;
++    uint32_t low = 0;
++    uint32_t high = 1000;
++    while (low < high) {
++        const uint32_t middle = low + (high - low + 1) / 2;
++        const uint64_t whole = (denominator / 1000) * middle;
++        const uint64_t remainder_product = (denominator % 1000) * middle;
++        const uint64_t threshold = whole + (remainder_product + 999) / 1000;
++        if (numerator >= threshold) {
++            low = middle;
++        } else {
++            high = middle - 1;
++        }
++    }
++    return low;
++}
++
++struct expert_page_candidate {
++    int expert_id;
++    page_range range;
++};
++
++struct expert_page_owner {
++    uintptr_t address;
++    size_t length;
++    int expert_id;
++};
++
++std::vector<expert_page_owner> assign_page_owners(
++    const std::vector<expert_page_candidate> & candidates) {
++    struct event {
++        uintptr_t position;
++        int expert_id;
++        int delta;
++    };
++    std::vector<event> events;
++    events.reserve(candidates.size() * 2);
++    for (const expert_page_candidate & candidate : candidates) {
++        events.push_back({candidate.range.address, candidate.expert_id, 1});
++        events.push_back({
++            candidate.range.address + candidate.range.length,
++            candidate.expert_id,
++            -1});
++    }
++    std::sort(events.begin(), events.end(), [](const event & left, const event & right) {
++        if (left.position != right.position) return left.position < right.position;
++        if (left.expert_id != right.expert_id) return left.expert_id < right.expert_id;
++        return left.delta < right.delta;
++    });
++
++    std::vector<expert_page_owner> owners;
++    if (events.empty()) return owners;
++    std::map<int, size_t> active;
++    uintptr_t previous = events.front().position;
++    size_t index = 0;
++    while (index < events.size()) {
++        const uintptr_t position = events[index].position;
++        if (position > previous && !active.empty()) {
++            const int owner = active.begin()->first;
++            const size_t length = static_cast<size_t>(position - previous);
++            if (!owners.empty() &&
++                owners.back().expert_id == owner &&
++                owners.back().address + owners.back().length == previous) {
++                owners.back().length += length;
++            } else {
++                owners.push_back({previous, length, owner});
++            }
++        }
++        while (index < events.size() && events[index].position == position) {
++            const event & current = events[index];
++            if (current.delta > 0) {
++                ++active[current.expert_id];
++            } else {
++                const auto found = active.find(current.expert_id);
++                if (found != active.end() && --found->second == 0) active.erase(found);
++            }
++            ++index;
++        }
++        previous = position;
++    }
++    return owners;
++}
++}
++
++std::vector<size_t> select_prefetch_items(
++    const std::vector<size_t> & item_sizes,
++    uint64_t budget_bytes,
++    uint64_t * requested_bytes,
++    uint64_t * skipped_bytes) {
++    uint64_t requested{0};
++    uint64_t skipped{0};
++    uint64_t remaining = budget_bytes;
++    std::vector<size_t> selected;
++    selected.reserve(item_sizes.size());
++    for (size_t index = 0; index < item_sizes.size(); ++index) {
++        const uint64_t size = item_sizes[index];
++        requested = saturating_add(requested, size);
++        if (size > 0 && size <= remaining) {
++            selected.push_back(index);
++            remaining -= size;
++        } else {
++            skipped = saturating_add(skipped, size);
++        }
++    }
++    if (requested_bytes != nullptr) {
++        *requested_bytes = requested;
++    }
++    if (skipped_bytes != nullptr) {
++        *skipped_bytes = skipped;
++    }
++    return selected;
++}
++
++void prefetch_scheduler::set_phase(compute_phase phase) {
++    if (stop_.load()) return;
++    phase_.store(phase);
++    const char * dyn = getenv("SLIM_ARC_DYNAMIC_MADV");
++    if (dyn != nullptr && std::strcmp(dyn, "0") == 0) return;
++    int advice = POSIX_MADV_SEQUENTIAL;
++    if (phase == compute_phase::DECODE) {
++        // SLIM-ARC FIX 2026-08-07: the decode-phase advice is configurable (ablation
++        // result: at the extreme RK3588 ratio of 45GB/8GB, RANDOM actually made decode
++        // 5.4x slower, so the default is SEQUENTIAL -- keeping the kernel's sequential
++        // readahead to use the SSD's sequential bandwidth; SLIM_ARC_DECODE_MADV=
++        // RANDOM/NORMAL overrides it. RANDOM only suits a machine with memory to spare,
++        // where the model can stay partly resident).
++        const char * dec = getenv("SLIM_ARC_DECODE_MADV");
++        if (dec != nullptr && std::strcmp(dec, "RANDOM") == 0) {
++            advice = POSIX_MADV_RANDOM;
++        } else if (dec != nullptr && std::strcmp(dec, "NORMAL") == 0) {
++            advice = POSIX_MADV_NORMAL;
++        }
++    }
++    std::vector<std::pair<void *, size_t>> regions;
++    {
++        std::lock_guard<std::mutex> lock(mtx_);
++        regions.reserve(mmap_regions_.size());
++        for (const mmap_region_info & region : mmap_regions_) {
++            regions.emplace_back(region.addr, region.size);
++        }
++    }
++    for (const auto & region : regions) {
++        (void) advice_(region.first, region.second, advice);
++    }
++    if (phase == compute_phase::DECODE && (expert_random_madv_enabled_ || expert_normal_madv_enabled_)) {
++        std::vector<page_range> expert_ranges;
++        {
++            std::lock_guard<std::mutex> lock(expert_state_mtx_);
++            expert_ranges = expert_madv_ranges_;
++        }
++        const int expert_advice = expert_random_madv_enabled_ ? POSIX_MADV_RANDOM : POSIX_MADV_NORMAL;
++        for (const page_range & range : expert_ranges) {
++            atomic_saturating_add(expert_madv_advice_calls_, uint64_t{1});
++            if (advice_(reinterpret_cast<void *>(range.address), range.length, expert_advice) == 0) {
++                atomic_saturating_add(
++                    expert_madv_advice_bytes_,
++                    static_cast<uint64_t>(range.length));
++            } else {
++                atomic_saturating_add(expert_madv_advice_failures_, uint64_t{1});
++            }
++        }
++    }
++}
++
++int tensor_layer_from_name(const char * name) {
++    if (!name) return -1;
++    // match "blk.%d." prefix
++    if (std::strncmp(name, "blk.", 4) != 0) return -1;    const char * p = name + 4;
++    if (*p < '0' || *p > '9') return -1;
++    int layer = 0;
++    while (*p >= '0' && *p <= '9') {
++        layer = layer * 10 + (*p - '0');
++        ++p;
++    }
++    if (*p != '.') return -1;
++    return layer;
++}
++
++// [QLH] SLIM-ARC 2026-11-02: graph node names carry their layer as a trailing "-N" suffix --
++// llama_context::graph_get_cb() renames every tensor produced inside a layer with
++// ggml_format_name(cur, "%s-%d", name, il), e.g. "ffn_out-12". Weight names
++// ("blk.7.attn_norm.weight") have no such suffix and are rejected, and the fallback names that
++// ggml_build_forward_expand() assigns ("node_123", "leaf_7") contain no dash at all, so they are
++// rejected too. Only the trailing "-<digits>" form is accepted: the prefix must be non-empty and
++// every character after the last dash must be a digit.
++static int tensor_layer_from_suffix(const char * name) {
++    if (name == nullptr || name[0] == '\0') return -1;
++    const char * dash = std::strrchr(name, '-');
++    if (dash == nullptr || dash == name) return -1;
++    const char * p = dash + 1;
++    if (*p < '0' || *p > '9') return -1;
++    int layer = 0;
++    for (; *p != '\0'; ++p) {
++        if (*p < '0' || *p > '9') return -1;
++        layer = layer * 10 + (*p - '0');
++        if (layer > 4096) return -1; // implausible layer index: not one of our names
++    }
++    return layer;
++}
++
++prefetch_scheduler::prefetch_scheduler(
++    int n_threads,
++    int window,
++    std::function<void()> request_claim_hook,
++    advice_fn advice,
++    page_size_query_fn page_size_query,
++    file_advice_fn file_advice)
++    : slow_storage_enabled_(env_bool("SLIM_ARC_SLOW_STORAGE", false))
++    , router_prefetch_enabled_(env_bool("SLIM_ARC_ROUTER_PREFETCH", false))
++    , router_mlock_enabled_(env_bool("SLIM_ARC_ROUTER_MLOCK", false))
++    , shared_mlock_enabled_(env_bool("SLIM_ARC_SHARED_MLOCK", false))
++    , small_mlock_enabled_(env_bool("SLIM_ARC_SMALL_MLOCK", false))
++    , expert_hot_budget_bytes_(
++          static_cast<size_t>(env_int("SLIM_ARC_EXPERT_HOT_MB", 0, 1, 1024)) << 20)
++    , expert_hot_lru_enabled_(env_bool("SLIM_ARC_EXPERT_HOT_LRU", false))
++    , expert_hot_lfru_enabled_(expert_hot_lru_enabled_ && env_bool("SLIM_ARC_EXPERT_HOT_LFRU", false))
++    , expert_hot_admission_threshold_(
++          static_cast<uint32_t>(env_int("SLIM_ARC_EXPERT_HOT_ADMIT_HITS", 1, 1, 64)))
++    , expert_prefetch_disabled_(env_bool("SLIM_ARC_NO_EXPERT_PREFETCH", false))
++    , expert_file_advice_enabled_(env_bool("SLIM_ARC_EXPERT_FADVISE", false))
++    , expert_random_madv_enabled_(env_bool("SLIM_ARC_EXPERT_MADV_RANDOM", false))
++    , expert_normal_madv_enabled_(env_bool("SLIM_ARC_EXPERT_MADV_NORMAL", false))
++    , cross_layer_transition_topk_(parse_cross_layer_transition_topk())
++    , cross_layer_transition_enabled_(cross_layer_transition_topk_ > 0)
++    , n_threads_(slow_storage_enabled_ ? 1 : std::max(1, n_threads))
++    , window_(slow_storage_enabled_ ? 1 : std::max(1, window))
++    , request_claim_hook_(std::move(request_claim_hook))
++    , advice_(advice ? std::move(advice) : advice_fn{system_advice})
++    , page_size_query_(page_size_query ? std::move(page_size_query) : page_size_query_fn{system_page_size})
++    , file_advice_(file_advice ? std::move(file_advice) : file_advice_fn{system_file_advice})
++    , reclaim_waste_enabled_(env_bool("SLIM_ARC_EXPERT_RECLAIM_WASTE", false))
++    , expert_residency_enabled_(env_bool("SLIM_ARC_EXPERT_RESIDENCY", false)) {
++    conf_gating_ = env_bool("SLIM_ARC_EXPERT_CONF", false);
++    pop_k_ = static_cast<int>(env_int("SLIM_ARC_EXPERT_POP", 0, 0, 64));
++    // [QLH] See default_prefetch_budget_bytes(): the budget used to stay 0 because the module
++    // that called set_memory_budget() (unified_io_scheduler) was never ported.
++    memory_budget_.store(default_prefetch_budget_bytes());
++    workers_.reserve(n_threads_);
++    for (int i = 0; i < n_threads_; ++i) {
++        workers_.emplace_back([this] { worker_loop(); });
++    }
++}
++
++prefetch_scheduler::~prefetch_scheduler() {
++    shutdown();
++    dump_metrics();
++    std::vector<page_range> locked;
++    std::vector<page_range> shared_locked;
++    std::vector<page_range> small_locked;
++    std::vector<page_range> expert_hot_locked;
++    {
++        std::lock_guard<std::mutex> lock(mtx_);
++        locked.swap(router_locked_ranges_);
++        shared_locked.swap(shared_locked_ranges_);
++        small_locked.swap(small_locked_ranges_);
++    }
++    {
++        std::lock_guard<std::mutex> lock(expert_hot_mtx_);
++        for (const expert_hot_entry & entry : expert_hot_entries_) {
++            expert_hot_locked.insert(expert_hot_locked.end(), entry.ranges.begin(), entry.ranges.end());
++        }
++        expert_hot_entries_.clear();
++        expert_hot_locked_bytes_ = 0;
++    }
++    for (const page_range & range : locked) {
++        (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++    }
++    for (const page_range & range : shared_locked) {
++        (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++    }
++    for (const page_range & range : small_locked) {
++        (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++    }
++    for (const page_range & range : expert_hot_locked) {
++        (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++    }
++}
++
++void prefetch_scheduler::shutdown() noexcept {
++    std::lock_guard<std::mutex> shutdown_lock(shutdown_mtx_);
++    {
++        std::lock_guard<std::mutex> lk(mtx_);
++        if (stop_.load()) return;
++        enabled_.store(false);
++        stop_.store(true);
++        pending_requests_.clear();
++    }
++    cv_.notify_all();
++    for (auto & t : workers_) {
++        if (t.joinable()) t.join();
++    }
++}
++
++void prefetch_scheduler::register_tensor(const char * name, void * addr, size_t size, int layer) {
++    if (layer < 0 || addr == nullptr || size == 0) return;
++    if (stop_.load()) return;
++
++    // [QLH] Every decision that needs the page size, and every mlock() syscall, is taken before
++    // mtx_ is acquired: mlock can block on a page fault, and mtx_ is also taken by eval_cb() on
++    // the compute thread, so holding it across the syscall would park inference behind a model
++    // load. Only the bookkeeping below runs under the lock.
++    const bool lock_shared = shared_mlock_enabled_ && name != nullptr &&
++        std::strstr(name, "_shexp") != nullptr;
++    const bool lock_small = small_mlock_enabled_ && name != nullptr && size <= (1ULL << 20) &&
++        std::strstr(name, "_exps") == nullptr && std::strstr(name, "_shexp") == nullptr &&
++        std::strstr(name, "ffn_gate_inp") == nullptr;
++    // router 张量走独立的两张表，不进 tensors_by_layer_；但 return 只能在 is_router 时执行——
++    // 早先写成「开了 router_prefetch 或 router_mlock 就整块 return」，于是单独开
++    // SLIM_ARC_ROUTER_MLOCK=1 会把所有非 router 张量一起吞掉，tensors_by_layer_ 永远为空、
++    // 层预取一条都不发，而日志里没有任何错。
++    //
++    // [QLH] The gate is `router_mode && is_router`, not just `is_router`. With both router
++    // switches off (the default configuration) the router weight is an ordinary layer tensor and
++    // must stay in tensors_by_layer_: an unconditional `if (is_router) return;` would silently
++    // drop it from layer-ahead prefetch exactly when the router path is switched *off*. Do not
++    // "simplify" this back -- the only case that may return early is the one where the tensor was
++    // actually recorded in router_tensors_ / router_locked_ranges_ above.
++    const bool router_mode = router_prefetch_enabled_ || router_mlock_enabled_;
++    const bool is_router = name != nullptr && std::strstr(name, ".ffn_gate_inp") != nullptr &&
++        std::strstr(name, ".weight") != nullptr;
++    const bool lock_router = router_mode && is_router && router_mlock_enabled_;
++
++    const long   raw_page_size = (lock_shared || lock_small || lock_router) ? page_size_query_() : 0;
++    const size_t page_size = raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0;
++
++    page_range shared_range;
++    page_range small_range;
++    page_range router_range;
++    bool shared_locked = false;
++    bool small_locked  = false;
++    bool router_locked = false;
++    if (lock_shared) {
++        shared_range  = covering_page_range(reinterpret_cast<uintptr_t>(addr), size, page_size);
++        shared_locked = shared_range.valid &&
++            mlock(reinterpret_cast<void *>(shared_range.address), shared_range.length) == 0;
++    }
++    if (lock_small) {
++        small_range  = covering_page_range(reinterpret_cast<uintptr_t>(addr), size, page_size);
++        small_locked = small_range.valid &&
++            mlock(reinterpret_cast<void *>(small_range.address), small_range.length) == 0;
++    }
++    if (lock_router) {
++        router_range  = covering_page_range(reinterpret_cast<uintptr_t>(addr), size, page_size);
++        router_locked = router_range.valid &&
++            mlock(reinterpret_cast<void *>(router_range.address), router_range.length) == 0;
++    }
++
++    std::lock_guard<std::mutex> lock(mtx_);
++    if (stop_.load()) {
++        // Shut down between the mlock above and this lock. These pages are not in any of the
++        // tables the destructor sweeps, so they have to be released here or they stay locked for
++        // the rest of the process.
++        if (shared_locked) {
++            (void) munlock(reinterpret_cast<void *>(shared_range.address), shared_range.length);
++        }
++        if (small_locked) {
++            (void) munlock(reinterpret_cast<void *>(small_range.address), small_range.length);
++        }
++        if (router_locked) {
++            (void) munlock(reinterpret_cast<void *>(router_range.address), router_range.length);
++        }
++        return;
++    }
++    if (lock_shared) {
++        if (shared_locked) {
++            shared_locked_ranges_.push_back(shared_range);
++            atomic_saturating_add(shared_locked_bytes_, static_cast<uint64_t>(shared_range.length));
++        } else {
++            atomic_saturating_add(shared_lock_failures_, uint64_t{1});
++        }
++    }
++    if (lock_small) {
++        if (small_locked) {
++            small_locked_ranges_.push_back(small_range);
++            atomic_saturating_add(small_locked_bytes_, static_cast<uint64_t>(small_range.length));
++        } else {
++            atomic_saturating_add(small_lock_failures_, uint64_t{1});
++        }
++    }
++    if (router_mode && is_router) {
++        if (router_prefetch_enabled_) {
++            router_tensors_.push_back({addr, size, layer, 0});
++        }
++        if (router_mlock_enabled_) {
++            if (router_locked) {
++                router_locked_ranges_.push_back(router_range);
++                atomic_saturating_add(router_locked_bytes_, static_cast<uint64_t>(router_range.length));
++            } else {
++                atomic_saturating_add(router_lock_failures_, uint64_t{1});
++            }
++        }
++        return;
++    }
++    if ((size_t)layer >= tensors_by_layer_.size()) {
++        tensors_by_layer_.resize(layer + 1);
++    }
++    tensors_by_layer_[layer].push_back({addr, size, layer, 0});
++}
++
++bool prefetch_scheduler::register_mapping(void * addr, size_t size, int file_id) {
++    if (addr == nullptr || size == 0) return false;
++    {
++        std::lock_guard<std::mutex> lock(mtx_);
++        if (stop_.load()) return false;
++        mmap_regions_.push_back({addr, size, file_id});
++    }
++    const char * dyn = std::getenv("SLIM_ARC_DYNAMIC_MADV");
++    if (dyn == nullptr || std::strcmp(dyn, "0") != 0) {
++        (void) advice_(addr, size, POSIX_MADV_SEQUENTIAL);
++    }
++    return true;
++}
++
++void prefetch_scheduler::attach_user_callback(ggml_backend_sched_eval_callback cb, void * user_data) {
++    std::lock_guard<std::mutex> lock(mtx_);
++    user_cb_      = cb;
++    user_cb_data_ = user_data;
++}
++
++void prefetch_scheduler::prepare_graph(const ggml_cgraph * gf) {
++    if (gf == nullptr) return;
++
++    std::lock_guard<std::mutex> lock(mtx_);
++
++    // the graph-reuse path calls this again for the very same graph; the tables cannot have
++    // changed because the tensors were not rebuilt. [QLH] The idempotency check is inside the
++    // lock: eval_cb() reads prepared_gf_'s consequences (observe_/observe_layer_) on the compute
++    // thread, so the whole "is it the same graph" decision belongs to the same critical section
++    // that publishes the tables.
++    if (prepared_gf_ == gf) return;
++
++    prepared_gf_ = gf;
++    observe_.clear();
++    observe_layer_.clear();
++    last_notified_.store(-1, std::memory_order_relaxed);
++    graph_signalling_disabled_ = false;
++
++    auto * graph = const_cast<ggml_cgraph *>(gf);
++    const int n_nodes = ggml_graph_n_nodes(graph);
++    int32_t current = -1;
++    for (int i = 0; i < n_nodes; ++i) {
++        const ggml_tensor * t = ggml_graph_node(graph, i);
++        if (t == nullptr) continue;
++        int32_t layer = tensor_layer_from_suffix(t->name);
++        // a layer index that goes backwards is a name that merely ends in "-<digits>";
++        // the graph is built layer by layer, so the real sequence never decreases
++        if (layer >= 0 && current >= 0 && layer < current) layer = -1;
++        if (layer < 0) layer = current; // carry the previous layer over unnamed/leaf nodes
++        if (layer < 0) continue;        // still before the first layer (embeddings etc.)
++        if (layer != current) {
++            observe_.push_back(t);
++            observe_layer_.push_back(layer);
++            current = layer;
++        }
++    }
++
++    if (observe_.size() < 2) {
++        // nothing usable: stay out of the way instead of guessing
++        graph_signalling_disabled_ = true;
++        observe_.clear();
++        observe_layer_.clear();
++        std::fprintf(stderr, "[SLIM-ARC-PREFETCH] layer signalling disabled: no layer boundaries "
++                "recovered from %d graph nodes\n", n_nodes);
++        return;
++    }
++
++    // std::binary_search / std::lower_bound below compare the tensors by pointer value, so the
++    // table has to be in pointer order. Layer order is *not* pointer order (the graph is built
++    // layer by layer, the allocations are not), hence the explicit sort -- both tables move
++    // together so that observe_layer_[i] still describes observe_[i].
++    {
++        std::vector<size_t> order(observe_.size());
++        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
++        std::sort(order.begin(), order.end(),
++                  [this](size_t a, size_t b) { return observe_[a] < observe_[b]; });
++        std::vector<const ggml_tensor *> nodes;
++        std::vector<int32_t>             layers;
++        nodes.reserve(order.size());
++        layers.reserve(order.size());
++        for (const size_t i : order) {
++            nodes.push_back(observe_[i]);
++            layers.push_back(observe_layer_[i]);
++        }
++        observe_.swap(nodes);
++        observe_layer_.swap(layers);
++    }
++
++    std::fprintf(stderr, "[SLIM-ARC-PREFETCH] layer signalling armed: %zu boundaries over %d "
++            "graph nodes, layers %d..%d\n", observe_.size(), n_nodes,
++            *std::min_element(observe_layer_.begin(), observe_layer_.end()),
++            *std::max_element(observe_layer_.begin(), observe_layer_.end()));
++}
++
++void prefetch_scheduler::on_layer_boundary(int32_t layer) {
++    if (layer < 0) return;
++    // [QLH] last_notified_ is written here (compute thread) and reset by prepare_graph()
++    // (context thread), so it is atomic. Relaxed is enough: the value only suppresses a duplicate
++    // advice for a layer already covered by the previous request, it publishes nothing else.
++    int32_t previous = last_notified_.load(std::memory_order_relaxed);
++    // the layer counter wraps at the start of every token
++    if (previous >= 0 && layer < previous) {
++        previous = -1;
++    }
++    // the request issued for `previous` already covers [previous+1, previous+window]; issuing
++    // another one for a layer inside that window would advise the same pages twice
++    if (previous >= 0 && layer - previous < window_) return;
++    last_notified_.store(layer, std::memory_order_relaxed);
++    notify_layer_compute(layer);
++}
++
++bool prefetch_scheduler::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
++    auto * sched = static_cast<prefetch_scheduler *>(user_data);
++    if (sched == nullptr || t == nullptr) return true;
++
++    // [QLH] The chained user callback (attach_user_callback) and the layer-boundary tables
++    // (prepare_graph) are both owned by the context thread, while this callback runs on the
++    // compute thread: a graph rebuild would otherwise clear/swap observe_ under the reader.
++    // Everything is therefore *read* under mtx_, and the lock is dropped before either the user
++    // callback runs or on_layer_boundary() is entered -- both may re-enter this class, and
++    // notify_layer_compute() takes mtx_ again, so holding it across the call would deadlock on a
++    // non-recursive mutex.
++    ggml_backend_sched_eval_callback user_cb      = nullptr;
++    void *                          user_cb_data = nullptr;
++    int32_t                         boundary_layer = -1;
++    bool                            signalling_disabled = false;
++    {
++        std::lock_guard<std::mutex> lock(sched->mtx_);
++        user_cb      = sched->user_cb_;
++        user_cb_data = sched->user_cb_data_;
++        signalling_disabled = sched->graph_signalling_disabled_;
++        if (!signalling_disabled) {
++            const auto it = std::lower_bound(sched->observe_.begin(), sched->observe_.end(),
++                                             static_cast<const ggml_tensor *>(t));
++            if (it != sched->observe_.end() && *it == t) {
++                boundary_layer =
++                    sched->observe_layer_[static_cast<size_t>(it - sched->observe_.begin())];
++            }
++        }
++    }
++
++    const bool has_user = user_cb != nullptr;
++    const bool user_ret = has_user && user_cb(t, ask, user_cb_data);
++
++    if (ask) {
++        // returning true makes the scheduler stop at this node to hand it back with ask == false
++        if (user_ret) return true;
++        if (signalling_disabled) return false;
++        return boundary_layer >= 0;
++    }
++
++    if (boundary_layer >= 0) {
++        sched->on_layer_boundary(boundary_layer);
++    }
++
++    // keep the user's cancel semantics; without a user callback the compute always continues
++    return has_user ? user_ret : true;
++}
++
++void prefetch_scheduler::notify_layer_compute(int current_layer) {
++    if (!enabled_.load()) return;
++    // [QLH] 2026-11-02 A/B: SLIM_ARC_NOOP=1 keeps the eval callback installed and keeps the
++    // graph splitting it causes, but issues no PrefetchVirtualMemory at all. This separates the
++    // cost of "callback + 40 split submits" from the cost of "actually advising pages".
++    if (std::getenv("SLIM_ARC_NOOP") != nullptr) return;
++    // [QLH] 2026-11-02 A/B: SLIM_ARC_MAX_CALLS=N bounds how many prefetch requests a process
++    // issues in total. After the cap nothing is advised, which separates two explanations for
++    // the 2.5x slowdown: "the call itself is expensive" (a small cap is already slow) from
++    // "steady-state prefetch keeps the page cache thrashing" (a small cap is fast).
++    static std::atomic<uint64_t> issued_notifications{0};
++    if (const char * cap_env = std::getenv("SLIM_ARC_MAX_CALLS")) {
++        const uint64_t cap = std::strtoull(cap_env, nullptr, 10);
++        if (issued_notifications.fetch_add(1, std::memory_order_relaxed) >= cap) {
++            return;
++        }
++    }
++    prefetch_request request = plan_request(current_layer);
++    {
++        std::lock_guard<std::mutex> lk(mtx_);
++        if (stop_.load()) return;
++        if (next_request_generation_ == std::numeric_limits<uint64_t>::max()) {
++            atomic_saturating_add(dropped_requests_, uint64_t{1});
++            return;
++        }
++        if (slow_storage_enabled_) {
++            if (!pending_requests_.empty() && pending_requests_.back().layer == current_layer) {
++                return;
++            }
++            for (const prefetch_request & stale : pending_requests_) {
++                atomic_saturating_add(budget_stale_requests_, uint64_t{1});
++                atomic_saturating_add(budget_stale_bytes_, stale.covered_bytes);
++            }
++            pending_requests_.clear();
++        } else if (pending_requests_.size() == max_pending_requests) {
++            pending_requests_.pop_front();
++            atomic_saturating_add(dropped_requests_, uint64_t{1});
++        }
++        request.generation = ++next_request_generation_;
++        pending_requests_.push_back(std::move(request));
++    }
++    cv_.notify_one();
++}
++
++prefetch_scheduler::prefetch_request prefetch_scheduler::plan_request(int current_layer) {
++    prefetch_request request;
++    request.layer = current_layer;
++    request.memory_budget = memory_budget_.load();
++    std::vector<tensor_prefetch_info> items;
++    int window_layers = 0;
++    {
++        std::lock_guard<std::mutex> lock(mtx_);
++        if (stop_.load()) return request;
++        if (router_prefetch_enabled_) {
++            items = router_tensors_;
++        } else {
++            for (int offset = 1; offset <= window_; ++offset) {
++                const int layer = current_layer + offset;
++                if (layer < 0 || static_cast<size_t>(layer) >= tensors_by_layer_.size()) continue;
++                const std::vector<tensor_prefetch_info> & layer_tensors = tensors_by_layer_[layer];
++                if (!layer_tensors.empty()) ++window_layers;
++                for (const tensor_prefetch_info & tensor : layer_tensors) {
++                    if (tensor.addr != nullptr && tensor.size > 0) items.push_back(tensor);
++                }
++            }
++        }
++    }
++
++    for (const tensor_prefetch_info & item : items) {
++        request.requested_bytes = saturating_add(
++            request.requested_bytes,
++            static_cast<uint64_t>(item.size));
++    }
++    request.advice_requests = static_cast<uint64_t>(items.size());
++    // [QLH] Per-request ceiling, part 2: never advise more than one layer's worth of weights in a
++    // single request. The window covers `window_` layers, so the request sizes are derived from
++    // the actual bytes registered per layer rather than from a constant -- a dense 70B and a
++    // small MoE get correctly different budgets. Workers still walk the ranges in order, so
++    // "one layer" means the nearest one, which is the one the next step needs first.
++    // [QLH] SLIM-ARC 2026-11-02: with per-layer signalling (on_layer_boundary()) the next
++    // notification is a whole window further along, so clipping every request to a single layer
++    // would leave layers 2..window of each window prefetched never. The request may spend the
++    // whole window; the free-memory ceiling in memory_budget_ still caps it.
++    if (window_layers > 0) {
++        const uint64_t per_layer = request.requested_bytes / static_cast<uint64_t>(window_layers);
++        // [QLH] 2026-11-02 A/B: cap the request to ONE layer, not to the whole window.
++        // The window-sized budget made every token advise ~17 GB on a 16 GB machine
++        // (40 layers / window 3 notifications, x 3 layers each), which evicted the hot
++        // working set and measured 2.2x slower than prefetch-off. One layer per request
++        // cuts the volume by window_layers and keeps the layer ordering intact.
++        if (per_layer > 0 && per_layer < request.memory_budget) {
++            request.memory_budget = per_layer;
++        }
++    }
++    const long raw_page_size = page_size_query_();
++    if (raw_page_size <= 0) {
++        request.invalid_ranges = request.advice_requests;
++        return request;
++    }
++    request.page_size = static_cast<size_t>(raw_page_size);
++    std::vector<page_range> planned_ranges;
++    planned_ranges.reserve(items.size());
++    for (const tensor_prefetch_info & item : items) {
++        const page_range range = covering_page_range(
++            reinterpret_cast<uintptr_t>(item.addr),
++            item.size,
++            request.page_size);
++        if (!range.valid) {
++            request.invalid_ranges = saturating_add(request.invalid_ranges, uint64_t{1});
++            continue;
++        }
++        planned_ranges.push_back(range);
++    }
++    page_range_set coalesced = coalesce_page_ranges(std::move(planned_ranges));
++    if (!coalesced.valid) {
++        request.invalid_ranges = saturating_add(
++            request.invalid_ranges,
++            static_cast<uint64_t>(coalesced.input_ranges));
++        return request;
++    }
++    request.ranges = std::move(coalesced.ranges);
++    for (const page_range & range : request.ranges) {
++        request.covered_bytes = saturating_add(
++            request.covered_bytes,
++            static_cast<uint64_t>(range.length));
++    }
++    return request;
++}
++
++size_t prefetch_scheduler::pending_request_count() const {
++    std::lock_guard<std::mutex> lock(mtx_);
++    return pending_requests_.size();
++}
++
++prefetch_budget_stats prefetch_scheduler::budget_stats() const {
++    return {
++        budget_requested_bytes_.load(),
++        budget_issued_bytes_.load(),
++        budget_skipped_bytes_.load(),
++        budget_rounds_throttled_.load(),
++        budget_madvise_failures_.load(),
++        budget_advice_requests_.load(),
++        budget_coalesced_ranges_.load(),
++        budget_covered_bytes_.load(),
++        budget_invalid_ranges_.load(),
++        budget_stale_requests_.load(),
++        budget_stale_bytes_.load(),
++        budget_inflight_peak_bytes_.load(),
++    };
++}
++
++void prefetch_scheduler::worker_loop() {
++    while (true) {
++        prefetch_request request;
++        {
++            std::unique_lock<std::mutex> lk(mtx_);
++            cv_.wait(lk, [this] { return stop_.load() || !pending_requests_.empty(); });
++            if (stop_) return;
++            request = std::move(pending_requests_.front());
++            pending_requests_.pop_front();
++        }
++        if (request_claim_hook_) request_claim_hook_();
++
++        std::vector<page_range> selected;
++        selected.reserve(request.ranges.size());
++        uint64_t skipped{0};
++        uint64_t selected_bytes{0};
++        uint64_t remaining = request.memory_budget;
++        for (const page_range & range : request.ranges) {
++            const uint64_t available = std::min<uint64_t>(remaining, range.length);
++            const uint64_t admitted = request.page_size == 0 ? 0 : available - available % request.page_size;
++            if (admitted > 0) {
++                selected.push_back({range.address, static_cast<size_t>(admitted), 0, true, 0});
++                remaining -= admitted;
++                selected_bytes = saturating_add(selected_bytes, admitted);
++            }
++            skipped = saturating_add(skipped, static_cast<uint64_t>(range.length) - admitted);
++        }
++
++        const uint64_t inflight = budget_inflight_bytes_.fetch_add(selected_bytes) + selected_bytes;
++        update_atomic_peak(budget_inflight_peak_bytes_, inflight);
++        uint64_t issued{0};
++        uint64_t failures = request.invalid_ranges;
++        for (const page_range & range : selected) {
++            if (advice_(reinterpret_cast<void *>(range.address), range.length, POSIX_MADV_WILLNEED) == 0) {
++                issued = saturating_add(issued, static_cast<uint64_t>(range.length));
++            } else {
++                failures = saturating_add(failures, uint64_t{1});
++            }
++        }
++        budget_inflight_bytes_.fetch_sub(selected_bytes);
++
++        atomic_saturating_add(budget_requested_bytes_, request.requested_bytes);
++        atomic_saturating_add(budget_issued_bytes_, issued);
++        atomic_saturating_add(budget_skipped_bytes_, skipped);
++        atomic_saturating_add(budget_madvise_failures_, failures);
++        atomic_saturating_add(budget_advice_requests_, request.advice_requests);
++        atomic_saturating_add(
++            budget_coalesced_ranges_,
++            static_cast<uint64_t>(request.ranges.size()));
++        atomic_saturating_add(budget_covered_bytes_, request.covered_bytes);
++        atomic_saturating_add(budget_invalid_ranges_, request.invalid_ranges);
++        if (skipped > 0) {
++            atomic_saturating_add(budget_rounds_throttled_, uint64_t{1});
++        }
++        total_bytes_.fetch_add(static_cast<size_t>(issued));
++        total_calls_.fetch_add(1);
++    }
++}
++
++// ============================================================================================
++// [QLH] NOT WIRED UP -- kept for future work, not for current behaviour.
++//
++// WHAT THIS IS: the complete MoE expert path -- expert tensor registration, router observation,
++// cross-layer transition prediction, hot-expert residency (mlock), page reclaim, popularity /
++// confidence gating and the residency budget. It was ported along with SLIM-ARC so that a later
++// change can switch it on without re-deriving any of it.
++//
++// CURRENT STATE: nothing in this repository calls it. Every entry point below has exactly zero
++// external references in src/, tools/, common/ and examples/:
++//     register_expert_tensor   cache_router_experts   prefetch_experts   cancel_expert_prefetch
++//     set_expert_residency_pressure   set_expert_budget   reset_expert_budget_usage
++//     budget_stats   expert_*_statistics
++// All three consequences are silent:
++//   - the expert counters printed by dump_metrics() ([SLIM-ARC-METRICS], [SLIM-ARC-HOT],
++//     [SLIM-ARC-TRANSITION], [SLIM-ARC-EXPERT-MADV]) are always zero, so the summary cannot
++//     distinguish "not wired" from "wired and idle";
++//   - expert_pressure_ only ever changes through set_expert_residency_pressure(), which is also
++//     never called, so it stays expert_pressure_state::missing; select_resident_experts() then
++//     takes its "no pressure signal" path and admits every candidate that fits the budget, i.e.
++//     the residency policy degenerates to pass-through even with SLIM_ARC_EXPERT_RESIDENCY=1;
++//   - SLIM_ARC_EXPERT_HOT_MB has no effect, because update_expert_hot_cache() is only reachable
++//     from cache_router_experts().
++//
++// HOW TO WIRE IT (in this order):
++//   1. llama-model-loader: next to the existing register_tensor() call, call
++//      register_expert_tensor(name, addr, ggml_nbytes(t), layer, n_experts = ne[2]) for every
++//      merged *_exps tensor, and register_mapping() for the mapping it lives in (the file-offset
++//      advice path needs the file id).
++//   2. Feed a real pressure source: sample expert-page residency (mincore() on POSIX,
++//      QueryWorkingSetEx() on Windows) into an expert_pressure_sample and drive
++//      expert_pressure_controller::update(). That controller is NOT a member of
++//      prefetch_scheduler yet -- set_expert_residency_pressure() currently takes the state as a
++//      parameter, so the controller has to be added here and its return value passed instead.
++//   3. On the layer boundary that already exists (on_layer_boundary / notify_layer_compute),
++//      call prefetch_experts(layer, ids, n) with the router's selection, then settle the same
++//      generation with cache_router_experts(layer, ids, n, generation).
++// Until all three exist, treat everything below as unreachable and do not read its counters as
++// evidence about a run.
++// ============================================================================================
++// ---- SLIM-ARC FIX 2026-08-05: Phase 2a MoE expert prefetch ----
++void prefetch_scheduler::register_expert_tensor(const char *, void * addr, size_t size, int layer, int n_experts) {
++    if (addr == nullptr || size == 0 || n_experts < 1 || layer < 0) return;
++    if (size % static_cast<size_t>(n_experts) != 0) return;
++    page_range random_range;
++    if (expert_random_madv_enabled_ || expert_normal_madv_enabled_) {
++        const long raw_page_size = page_size_query_();
++        random_range = covering_page_range(
++            reinterpret_cast<uintptr_t>(addr),
++            size,
++            raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0);
++    }
++    if (cross_layer_transition_enabled_) {
++        std::lock_guard<std::mutex> transition_lock(expert_transition_mtx_);
++        (void) expert_transition_table_.register_layer(layer, n_experts);
++    }
++    int file_id = -1;
++    uint64_t file_offset = 0;
++    if (expert_file_advice_enabled_) {
++        const uintptr_t tensor_start = reinterpret_cast<uintptr_t>(addr);
++        std::lock_guard<std::mutex> mapping_lock(mtx_);
++        for (const mmap_region_info & mapping : mmap_regions_) {
++            const uintptr_t mapping_start = reinterpret_cast<uintptr_t>(mapping.addr);
++            if (mapping_start == 0 || tensor_start < mapping_start ||
++                tensor_start - mapping_start > mapping.size ||
++                size > mapping.size - (tensor_start - mapping_start)) {
++                continue;
++            }
++            file_id = mapping.file_id;
++            file_offset = static_cast<uint64_t>(tensor_start - mapping_start);
++            break;
++        }
++    }
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    if ((size_t)layer >= experts_by_layer_.size()) {
++        experts_by_layer_.resize(layer + 1);
++    }
++    experts_by_layer_[layer].push_back({addr, size, n_experts, file_id, file_offset});
++    if (random_range.valid) expert_madv_ranges_.push_back(random_range);
++}
++
++void prefetch_scheduler::observe_expert_transition(
++    int layer,
++    const std::vector<int> & source,
++    const std::vector<int> & target) {
++    if (!cross_layer_transition_enabled_ || source.empty() || target.empty()) return;
++    std::lock_guard<std::mutex> lock(expert_transition_mtx_);
++    expert_transition_table_.observe(
++        layer,
++        source.data(),
++        static_cast<int>(source.size()),
++        target.data(),
++        static_cast<int>(target.size()));
++}
++
++std::vector<int> prefetch_scheduler::predict_expert_transition(
++    int layer, const std::vector<int> & source) {
++    if (!cross_layer_transition_enabled_ || source.empty()) return {};
++    std::lock_guard<std::mutex> lock(expert_transition_mtx_);
++    return expert_transition_table_.predict(
++        layer,
++        source.data(),
++        static_cast<int>(source.size()),
++        cross_layer_transition_topk_);
++}
++
++void prefetch_scheduler::record_expert_transition_result(
++    const std::vector<int> & predicted,
++    const std::vector<int> & actual) {
++    if (!cross_layer_transition_enabled_ || predicted.empty() || actual.empty()) return;
++    std::lock_guard<std::mutex> lock(expert_transition_mtx_);
++    expert_transition_table_.record_result(
++        predicted.data(),
++        static_cast<int>(predicted.size()),
++        actual.data(),
++        static_cast<int>(actual.size()));
++}
++
++expert_transition_stats prefetch_scheduler::expert_transition_statistics() const noexcept {
++    std::lock_guard<std::mutex> lock(expert_transition_mtx_);
++    return expert_transition_table_.statistics();
++}
++
++void prefetch_scheduler::cache_router_experts(int layer, const int * expert_ids, int n) {
++    cache_router_experts(layer, expert_ids, n, 0);
++}
++
++void prefetch_scheduler::cache_router_experts(
++    int layer, const int * expert_ids, int n, uint64_t generation) {
++    if (layer < 0 || expert_ids == nullptr || n <= 0) return;
++    if (stop_.load()) return;
++    std::vector<int> current;
++    current.reserve(static_cast<size_t>(n));
++    for (int i = 0; i < n; ++i) {
++        append_unique_nonnegative(current, expert_ids[i]);
++    }
++
++    std::vector<int> prefetched;
++    std::vector<expert_tensor_info> reclaim_tensors;
++    std::vector<int> stable_experts;
++    std::vector<expert_tensor_info> hot_tensors;
++    std::vector<expert_tensor_info> file_tensors;
++    {
++        std::lock_guard<std::mutex> lock(expert_state_mtx_);
++        if ((size_t)layer >= cached_router_experts_.size()) {
++            cached_router_experts_.resize(layer + 1);
++        }
++        if (expert_hot_budget_bytes_ > 0) {
++            for (const int expert_id : current) {
++                if (std::find(
++                        cached_router_experts_[layer].begin(),
++                        cached_router_experts_[layer].end(),
++                        expert_id) != cached_router_experts_[layer].end()) {
++                    stable_experts.push_back(expert_id);
++                }
++            }
++            if (!stable_experts.empty() && static_cast<size_t>(layer) < experts_by_layer_.size()) {
++                hot_tensors = experts_by_layer_[layer];
++            }
++        }
++        if (expert_file_advice_enabled_ && !current.empty() &&
++            static_cast<size_t>(layer) < experts_by_layer_.size()) {
++            file_tensors = experts_by_layer_[layer];
++        }
++        // Each router observation can only settle the exact prefetch generation the
++        // caller carries; token 0 merely updates the predictor.
++        if (generation != 0 && static_cast<size_t>(layer) < pending_expert_prefetches_.size()) {
++            std::vector<expert_prefetch_record> & pending = pending_expert_prefetches_[layer];
++            const auto it = std::find_if(pending.begin(), pending.end(), [generation](const auto & record) {
++                return record.generation == generation;
++            });
++            if (it != pending.end()) {
++                size_t hit_bytes = 0;
++                size_t waste_bytes = 0;
++                for (size_t index = 0; index < it->expert_ids.size(); ++index) {
++                    if (std::find(current.begin(), current.end(), it->expert_ids[index]) != current.end()) {
++                        hit_bytes = saturating_add(hit_bytes, it->issued_bytes[index]);
++                    } else {
++                        waste_bytes = saturating_add(waste_bytes, it->issued_bytes[index]);
++                    }
++                }
++                if (reclaim_waste_enabled_ && enabled_.load()) {
++                    prefetched = it->expert_ids;
++                    if (static_cast<size_t>(layer) < experts_by_layer_.size()) {
++                        reclaim_tensors = experts_by_layer_[layer];
++                    }
++                }
++                atomic_saturating_add(expert_hit_bytes_, hit_bytes);
++                atomic_saturating_add(expert_waste_bytes_, waste_bytes);
++                const uint64_t accounted = saturating_add(
++                    static_cast<uint64_t>(hit_bytes), static_cast<uint64_t>(waste_bytes));
++                if (accounted > 0) {
++                    const uint32_t sample_milli = ratio_permille(static_cast<uint64_t>(waste_bytes), accounted);
++                    expert_waste_ewma_milli_ = update_waste_ewma_milli(
++                        expert_waste_ewma_milli_, sample_milli, expert_waste_ewma_initialized_);
++                    expert_waste_ewma_initialized_ = true;
++                    expert_waste_samples_ = saturating_add(expert_waste_samples_, uint64_t{1});
++                    expert_waste_restricted_ = expert_waste_controller_.update(sample_milli);
++                }
++                pending.erase(it);
++            } else {
++                atomic_saturating_add(expert_unmatched_generations_, uint64_t{1});
++            }
++        } else if (generation != 0) {
++            atomic_saturating_add(expert_unmatched_generations_, uint64_t{1});
++        }
++        atomic_saturating_add(router_samples_, uint64_t{1});
++        // SLIM-ARC FIX 2026-08-09: 2-token history sliding (used by the improvement-2
++        // gate). prev = old cached (t-2), cached = new routing (t-1)
++        if ((size_t)layer >= prev_router_experts_.size()) {
++            prev_router_experts_.resize(cached_router_experts_.size());
++        }
++        prev_router_experts_[layer] = cached_router_experts_[layer];
++        // SLIM-ARC FIX 2026-08-09: accumulate hot-expert frequencies (improvement 4)
++        if ((size_t)layer >= expert_pop_counts_.size()) {
++            expert_pop_counts_.resize(cached_router_experts_.size());
++        }
++        int n_experts = 0;
++        if ((size_t)layer < experts_by_layer_.size()) {
++            for (const auto & e : experts_by_layer_[layer]) {
++                n_experts = std::max(n_experts, e.n_experts);
++            }
++        }
++        if ((int)expert_pop_counts_[layer].size() < n_experts) {
++            expert_pop_counts_[layer].resize(n_experts, 0);
++        }
++        for (int eid : current) {
++            if (eid >= 0 && eid < (int)expert_pop_counts_[layer].size()) {
++                expert_pop_counts_[layer][eid] = saturating_increment_popularity(expert_pop_counts_[layer][eid]);
++            }
++        }
++        if (expert_residency_enabled_ && !current.empty()) ++popularity_samples_since_decay_;
++        if (expert_residency_enabled_ && popularity_samples_since_decay_ == 64) {
++            popularity_samples_since_decay_ = 0;
++            for (auto & layer_counts : expert_pop_counts_) {
++                for (uint32_t & count : layer_counts) count /= 2;
++            }
++            atomic_saturating_add(popularity_decay_count_, uint64_t{1});
++        }
++        cached_router_experts_[layer] = current;
++    }
++    if (!prefetched.empty()) {
++        reclaim_wrong_expert_pages(prefetched, current, reclaim_tensors);
++    }
++    if (!file_tensors.empty()) {
++        advise_selected_expert_files(current, file_tensors);
++    }
++    if (!stable_experts.empty() && !hot_tensors.empty()) {
++        update_expert_hot_cache(layer, stable_experts, hot_tensors);
++    }
++}
++
++void prefetch_scheduler::cancel_expert_prefetch(int layer, uint64_t generation) {
++    if (generation == 0) return;
++
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    if (layer < 0 || static_cast<size_t>(layer) >= pending_expert_prefetches_.size()) {
++        atomic_saturating_add(expert_unmatched_generations_, uint64_t{1});
++        return;
++    }
++
++    std::vector<expert_prefetch_record> & pending = pending_expert_prefetches_[layer];
++    const auto it = std::find_if(pending.begin(), pending.end(), [generation](const auto & record) {
++        return record.generation == generation;
++    });
++    if (it == pending.end()) {
++        atomic_saturating_add(expert_unmatched_generations_, uint64_t{1});
++        return;
++    }
++
++    size_t waste_bytes = 0;
++    for (size_t issued_bytes : it->issued_bytes) {
++        waste_bytes = saturating_add(waste_bytes, issued_bytes);
++    }
++    atomic_saturating_add(expert_waste_bytes_, waste_bytes);
++    pending.erase(it);
++}
++
++std::vector<int> prefetch_scheduler::cached_experts_snapshot(int layer) const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    if (layer < 0 || static_cast<size_t>(layer) >= cached_router_experts_.size()) {
++        return {};
++    }
++    return cached_router_experts_[layer];
++}
++
++size_t prefetch_scheduler::pending_expert_records(int layer) const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    if (layer < 0 || static_cast<size_t>(layer) >= pending_expert_prefetches_.size()) {
++        return 0;
++    }
++    return pending_expert_prefetches_[layer].size();
++}
++
++expert_reclaim_stats prefetch_scheduler::expert_reclaim_statistics() const {
++    return {
++        reclaim_candidate_experts_.load(),
++        reclaim_calls_.load(),
++        reclaim_reclaimed_bytes_.load(),
++        reclaim_skipped_bytes_.load(),
++        reclaim_madvise_failures_.load(),
++        reclaim_invalid_layouts_.load(),
++        reclaim_invalid_ids_.load(),
++    };
++}
++
++void prefetch_scheduler::set_expert_residency_pressure(
++    expert_pressure_state pressure, size_t budget_bytes) {
++    if (!expert_residency_enabled_) return;
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    expert_residency_budget_ = budget_bytes;
++    expert_pressure_ = pressure;
++    expert_residency_snapshot_set_ = true;
++}
++
++expert_pressure_state prefetch_scheduler::current_expert_pressure() const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    return expert_pressure_;
++}
++
++expert_residency_runtime_stats prefetch_scheduler::expert_residency_statistics() const noexcept {
++    return {
++        residency_samples_.load(),
++        residency_admitted_experts_.load(),
++        residency_admitted_bytes_.load(),
++        residency_skipped_bytes_.load(),
++        residency_fallbacks_.load(),
++        residency_pressure_missing_.load(),
++        residency_pressure_normal_.load(),
++        residency_pressure_high_.load(),
++        residency_pressure_critical_.load(),
++    };
++}
++
++expert_runtime_metrics prefetch_scheduler::expert_runtime_statistics() const noexcept {
++    return {
++        router_samples_.load(),
++        static_cast<uint64_t>(expert_prefetch_bytes_.load()),
++        static_cast<uint64_t>(expert_hit_bytes_.load()),
++        static_cast<uint64_t>(expert_waste_bytes_.load()),
++        expert_advice_requests_.load(),
++        expert_coalesced_ranges_.load(),
++        expert_covered_bytes_.load(),
++        expert_advice_failures_.load(),
++        expert_invalid_ranges_.load(),
++    };
++}
++
++std::vector<uint32_t> prefetch_scheduler::expert_popularity_snapshot(int layer) const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    if (layer < 0 || static_cast<size_t>(layer) >= expert_pop_counts_.size()) return {};
++    return expert_pop_counts_[layer];
++}
++
++uint32_t prefetch_scheduler::expert_waste_ewma_milli() const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    return expert_waste_ewma_milli_;
++}
++
++uint64_t prefetch_scheduler::expert_waste_sample_count() const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    return expert_waste_samples_;
++}
++
++bool prefetch_scheduler::expert_waste_restricted() const {
++    std::lock_guard<std::mutex> lock(expert_state_mtx_);
++    return expert_waste_restricted_;
++}
++
++expert_hot_cache_stats prefetch_scheduler::expert_hot_cache_statistics() const noexcept {
++    std::lock_guard<std::mutex> lock(expert_hot_mtx_);
++    return {
++        static_cast<uint64_t>(expert_hot_budget_bytes_),
++        expert_hot_locked_bytes_,
++        expert_hot_admissions_,
++        expert_hot_hits_,
++        expert_hot_evictions_,
++        expert_hot_budget_rejections_,
++        expert_hot_nonresident_bytes_,
++        expert_hot_lock_failures_,
++        static_cast<uint64_t>(expert_hot_entries_.size()),
++        expert_hot_admission_skips_,
++        expert_hot_admission_threshold_};
++}
++
++expert_file_advice_stats prefetch_scheduler::expert_file_advice_statistics() const noexcept {
++    return {
++        expert_file_advice_calls_.load(),
++        expert_file_advice_bytes_.load(),
++        expert_file_advice_failures_.load(),
++        expert_file_advice_invalid_ranges_.load()};
++}
++
++void prefetch_scheduler::advise_selected_expert_files(
++    const std::vector<int> & selected,
++    const std::vector<expert_tensor_info> & tensors) {
++    if (!expert_file_advice_enabled_ || selected.empty() || stop_.load()) return;
++    for (const expert_tensor_info & tensor : tensors) {
++        if (tensor.file_id < 0 || tensor.size == 0 || tensor.n_experts < 1 ||
++            tensor.size % static_cast<size_t>(tensor.n_experts) != 0) {
++            atomic_saturating_add(expert_file_advice_invalid_ranges_, uint64_t{1});
++            continue;
++        }
++        const size_t expert_bytes = tensor.size / static_cast<size_t>(tensor.n_experts);
++        for (const int expert_id : selected) {
++            if (expert_id < 0 || expert_id >= tensor.n_experts ||
++                static_cast<uint64_t>(expert_id) >
++                    (std::numeric_limits<uint64_t>::max() - tensor.file_offset) / expert_bytes) {
++                atomic_saturating_add(expert_file_advice_invalid_ranges_, uint64_t{1});
++                continue;
++            }
++            const uint64_t offset = tensor.file_offset + static_cast<uint64_t>(expert_id) * expert_bytes;
++            atomic_saturating_add(expert_file_advice_calls_, uint64_t{1});
++            if (file_advice_(tensor.file_id, offset, expert_bytes) == 0) {
++                atomic_saturating_add(expert_file_advice_bytes_, static_cast<uint64_t>(expert_bytes));
++            } else {
++                atomic_saturating_add(expert_file_advice_failures_, uint64_t{1});
++            }
++        }
++    }
++}
++
++void prefetch_scheduler::update_expert_hot_cache(
++    int layer,
++    const std::vector<int> & stable_experts,
++    const std::vector<expert_tensor_info> & tensors) {
++    if (expert_hot_budget_bytes_ == 0 || stable_experts.empty() || tensors.empty() || stop_.load()) return;
++    const long raw_page_size = page_size_query_();
++    if (raw_page_size <= 0) return;
++    const size_t page_size = static_cast<size_t>(raw_page_size);
++
++    std::vector<expert_tensor_view> tensor_views;
++    tensor_views.reserve(tensors.size());
++    for (const expert_tensor_info & tensor : tensors) {
++        tensor_views.push_back({reinterpret_cast<uintptr_t>(tensor.addr), tensor.size, tensor.n_experts});
++    }
++
++    std::lock_guard<std::mutex> lock(expert_hot_mtx_);
++    const uint64_t admission_headroom = std::max<uint64_t>(
++        static_cast<uint64_t>(expert_hot_budget_bytes_) / 100, uint64_t{1});
++    const bool filter_saturated_admission = expert_hot_admission_threshold_ > 1 &&
++        expert_hot_locked_bytes_ >= static_cast<uint64_t>(expert_hot_budget_bytes_) - admission_headroom;
++    if (filter_saturated_admission) {
++        int n_experts = 0;
++        for (const expert_tensor_info & tensor : tensors) {
++            n_experts = std::max(n_experts, tensor.n_experts);
++        }
++        if (static_cast<size_t>(layer) >= expert_hot_admission_counts_.size()) {
++            expert_hot_admission_counts_.resize(static_cast<size_t>(layer) + 1);
++        }
++        if (n_experts > 0 && expert_hot_admission_counts_[layer].size() < static_cast<size_t>(n_experts)) {
++            expert_hot_admission_counts_[layer].resize(static_cast<size_t>(n_experts), 0);
++        }
++    }
++    if (!expert_hot_lru_enabled_) {
++        auto entry = expert_hot_entries_.begin();
++        while (entry != expert_hot_entries_.end()) {
++            if (entry->layer != layer ||
++                std::find(stable_experts.begin(), stable_experts.end(), entry->expert_id) != stable_experts.end()) {
++                ++entry;
++                continue;
++            }
++            for (const page_range & range : entry->ranges) {
++                (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++            }
++            expert_hot_locked_bytes_ = hot_cache_release(expert_hot_locked_bytes_, entry->locked_bytes);
++            expert_hot_evictions_ = saturating_add(expert_hot_evictions_, uint64_t{1});
++            entry = expert_hot_entries_.erase(entry);
++        }
++    }
++
++    for (const int expert_id : stable_experts) {
++        uint32_t admission_count = expert_hot_admission_threshold_;
++        if (filter_saturated_admission) {
++            if (expert_id < 0 || static_cast<size_t>(expert_id) >= expert_hot_admission_counts_[layer].size()) {
++                continue;
++            }
++            uint32_t & observed = expert_hot_admission_counts_[layer][expert_id];
++            observed = saturating_add(observed, uint32_t{1});
++            admission_count = observed;
++        }
++        const auto existing = std::find_if(
++            expert_hot_entries_.begin(), expert_hot_entries_.end(), [layer, expert_id](const expert_hot_entry & item) {
++                return item.layer == layer && item.expert_id == expert_id;
++            });
++        if (existing != expert_hot_entries_.end()) {
++            expert_hot_hits_ = saturating_add(expert_hot_hits_, uint64_t{1});
++            existing->frequency = saturating_add(existing->frequency, uint64_t{1});
++            if (expert_hot_touch_clock_ != std::numeric_limits<uint64_t>::max()) ++expert_hot_touch_clock_;
++            existing->last_touch = expert_hot_touch_clock_;
++            continue;
++        }
++        if (filter_saturated_admission && admission_count < expert_hot_admission_threshold_) {
++            expert_hot_admission_skips_ = saturating_add(expert_hot_admission_skips_, uint64_t{1});
++            continue;
++        }
++
++        const expert_reclaim_plan plan = build_expert_reclaim_plan(tensor_views, {expert_id}, page_size);
++        std::vector<page_range> resident_ranges;
++        uint64_t candidate_bytes{0};
++        bool valid = !plan.items.empty();
++        for (const expert_reclaim_item & item : plan.items) {
++            const resident_range_result resident = resident_page_ranges(
++                {item.address, item.length, 0, true, 0}, page_size);
++            if (!resident.valid) {
++                valid = false;
++                break;
++            }
++            expert_hot_nonresident_bytes_ = saturating_add(
++                expert_hot_nonresident_bytes_, resident.nonresident_bytes);
++            for (const page_range & range : resident.ranges) {
++                candidate_bytes = saturating_add(candidate_bytes, static_cast<uint64_t>(range.length));
++                resident_ranges.push_back(range);
++            }
++        }
++        if (!valid || resident_ranges.empty()) {
++            expert_hot_lock_failures_ = saturating_add(expert_hot_lock_failures_, uint64_t{1});
++            continue;
++        }
++        if (candidate_bytes > static_cast<uint64_t>(expert_hot_budget_bytes_)) {
++            expert_hot_budget_rejections_ = saturating_add(expert_hot_budget_rejections_, uint64_t{1});
++            continue;
++        }
++        if (expert_hot_lru_enabled_) {
++            while (candidate_bytes > hot_cache_headroom(
++                       static_cast<uint64_t>(expert_hot_budget_bytes_), expert_hot_locked_bytes_)) {
++                auto victim = expert_hot_entries_.end();
++                for (auto entry = expert_hot_entries_.begin(); entry != expert_hot_entries_.end(); ++entry) {
++                    const bool selected_now = entry->layer == layer && std::find(
++                        stable_experts.begin(), stable_experts.end(), entry->expert_id) != stable_experts.end();
++                    if (selected_now) continue;
++                    const auto lower_lfru_score = [this](
++                                                        const expert_hot_entry & candidate,
++                                                        const expert_hot_entry & incumbent) {
++                        const uint64_t candidate_age = saturating_add(
++                            expert_hot_touch_clock_ - candidate.last_touch, uint64_t{1});
++                        const uint64_t incumbent_age = saturating_add(
++                            expert_hot_touch_clock_ - incumbent.last_touch, uint64_t{1});
++                        const wide_uint candidate_score =
++                            wide_mul(candidate.frequency, incumbent_age);
++                        const wide_uint incumbent_score =
++                            wide_mul(incumbent.frequency, candidate_age);
++                        if (candidate_score != incumbent_score) return candidate_score < incumbent_score;
++                        if (candidate.last_touch != incumbent.last_touch) {
++                            return candidate.last_touch < incumbent.last_touch;
++                        }
++                        if (candidate.layer != incumbent.layer) return candidate.layer < incumbent.layer;
++                        return candidate.expert_id < incumbent.expert_id;
++                    };
++                    const bool replace_victim = victim == expert_hot_entries_.end() ||
++                        (expert_hot_lfru_enabled_
++                             ? lower_lfru_score(*entry, *victim)
++                             : entry->last_touch < victim->last_touch);
++                    if (replace_victim) {
++                        victim = entry;
++                    }
++                }
++                if (victim == expert_hot_entries_.end()) break;
++                for (const page_range & range : victim->ranges) {
++                    (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++                }
++                expert_hot_locked_bytes_ = hot_cache_release(expert_hot_locked_bytes_, victim->locked_bytes);
++                expert_hot_evictions_ = saturating_add(expert_hot_evictions_, uint64_t{1});
++                expert_hot_entries_.erase(victim);
++            }
++        }
++        if (candidate_bytes > hot_cache_headroom(
++                static_cast<uint64_t>(expert_hot_budget_bytes_), expert_hot_locked_bytes_)) {
++            expert_hot_budget_rejections_ = saturating_add(expert_hot_budget_rejections_, uint64_t{1});
++            continue;
++        }
++
++        std::vector<page_range> locked_ranges;
++        bool lock_failed = false;
++        for (const page_range & range : resident_ranges) {
++            if (mlock(reinterpret_cast<void *>(range.address), range.length) != 0) {
++                expert_hot_lock_failures_ = saturating_add(expert_hot_lock_failures_, uint64_t{1});
++                lock_failed = true;
++                break;
++            }
++            locked_ranges.push_back(range);
++        }
++        if (lock_failed) {
++            for (const page_range & range : locked_ranges) {
++                (void) munlock(reinterpret_cast<void *>(range.address), range.length);
++            }
++            continue;
++        }
++        if (expert_hot_touch_clock_ != std::numeric_limits<uint64_t>::max()) ++expert_hot_touch_clock_;
++        expert_hot_entries_.push_back(
++            {layer, expert_id, std::move(locked_ranges), candidate_bytes, expert_hot_touch_clock_, 1});
++        expert_hot_locked_bytes_ = saturating_add(expert_hot_locked_bytes_, candidate_bytes);
++        expert_hot_admissions_ = saturating_add(expert_hot_admissions_, uint64_t{1});
++    }
++}
++
++void prefetch_scheduler::reclaim_wrong_expert_pages(
++    const std::vector<int> & prefetched,
++    const std::vector<int> & selected,
++    const std::vector<expert_tensor_info> & tensors) {
++    if (!reclaim_waste_enabled_ || !enabled_.load()) return;
++
++    const std::vector<int> wasted = wasted_expert_ids(prefetched, selected);
++    atomic_saturating_add(reclaim_candidate_experts_, static_cast<uint64_t>(wasted.size()));
++    if (wasted.empty()) return;
++
++    const long raw_page_size = page_size_query_();
++    if (raw_page_size <= 0) {
++        atomic_saturating_add(reclaim_invalid_layouts_, uint64_t{1});
++        return;
++    }
++
++    std::vector<expert_tensor_view> tensor_views;
++    tensor_views.reserve(tensors.size());
++    for (const expert_tensor_info & tensor : tensors) {
++        tensor_views.push_back({reinterpret_cast<uintptr_t>(tensor.addr), tensor.size, tensor.n_experts});
++    }
++    const expert_reclaim_plan plan = build_expert_reclaim_plan(
++        tensor_views, wasted, static_cast<size_t>(raw_page_size));
++    atomic_saturating_add(reclaim_skipped_bytes_, plan.skipped_bytes);
++    atomic_saturating_add(reclaim_invalid_layouts_, plan.invalid_layouts);
++    atomic_saturating_add(reclaim_invalid_ids_, plan.invalid_ids);
++
++    for (const expert_reclaim_item & item : plan.items) {
++        if (!enabled_.load()) return;
++        if (item.length == 0) continue;
++        atomic_saturating_add(reclaim_calls_, uint64_t{1});
++        if (advice_(reinterpret_cast<void *>(item.address), item.length, POSIX_MADV_DONTNEED) == 0) {
++            atomic_saturating_add(reclaim_reclaimed_bytes_, static_cast<uint64_t>(item.length));
++        } else {
++            atomic_saturating_add(reclaim_madvise_failures_, uint64_t{1});
++        }
++    }
++}
++
++uint64_t prefetch_scheduler::prefetch_experts(int layer, const int * expert_ids, int n) {
++    if (expert_prefetch_disabled_) return 0;
++    return issue_expert_willneed(layer, expert_ids, n);
++}
++
++uint64_t prefetch_scheduler::issue_expert_willneed(int layer, const int * expert_ids, int n) {
++    if (!enabled_.load()) return 0;
++    if (layer < 0 || expert_ids == nullptr || n <= 0) return 0;
++
++    std::vector<int> requested;
++    requested.reserve(static_cast<size_t>(n));
++    for (int i = 0; i < n; ++i) {
++        append_unique_nonnegative(requested, expert_ids[i]);
++    }
++    if (requested.empty()) return 0;
++
++    std::vector<expert_tensor_info> exps;
++    std::vector<int> prev;
++    std::vector<uint32_t> population;
++    expert_pressure_state pressure = expert_pressure_state::missing;
++    uint64_t policy_budget = std::numeric_limits<uint64_t>::max();
++    bool residency_snapshot_set = false;
++    uint32_t waste_ewma = 0;
++    bool waste_restricted = false;
++    {
++        std::lock_guard<std::mutex> lock(expert_state_mtx_);
++        if (static_cast<size_t>(layer) >= experts_by_layer_.size()) return 0;
++        exps = experts_by_layer_[layer];
++        if (static_cast<size_t>(layer) < prev_router_experts_.size()) {
++            prev = prev_router_experts_[layer];
++        }
++        if (static_cast<size_t>(layer) < expert_pop_counts_.size()) {
++            population = expert_pop_counts_[layer];
++        }
++        pressure = expert_pressure_;
++        residency_snapshot_set = expert_residency_snapshot_set_;
++        if (residency_snapshot_set) policy_budget = expert_residency_budget_;
++        waste_ewma = expert_waste_ewma_milli_;
++        waste_restricted = expert_waste_restricted_;
++    }
++    if (exps.empty()) return 0;
++
++    // SLIM-ARC FIX 2026-08-09: build the "actual prefetch target set" first.
++    // Improvement 2 (confidence gating, from CommitMoE/DALI): with
++    // SLIM_ARC_EXPERT_CONF=1, prefetch only the stable experts active in both of the
++    // last two tokens (A_t ∩ A_{t-1}); low-confidence experts do not waste WILLNEED and
++    // rely on demand paging instead, which cuts useless I/O.
++    std::vector<int> target;
++    target.reserve(requested.size());
++    if (conf_gating_ && !prev.empty()) {
++        for (int eid : requested) {
++            if (std::find(prev.begin(), prev.end(), eid) != prev.end()) {
++                append_unique_nonnegative(target, eid);
++            }
++        }
++    } else {
++        for (int eid : requested) {
++            append_unique_nonnegative(target, eid);
++        }
++    }
++    // SLIM-ARC FIX 2026-08-09: improvement 4 -- union in the top-K hot experts (from
++    // ReMoE/DALI locality). Wider coverage and fewer misses; enabled by
++    // SLIM_ARC_EXPERT_POP=K.
++    if (pop_k_ > 0 && !population.empty()) {
++        std::vector<std::pair<int, uint32_t>> rank;
++        for (int eid = 0; eid < static_cast<int>(population.size()); ++eid) {
++            if (population[eid] > 0) rank.emplace_back(eid, population[eid]);
++        }
++        std::sort(rank.begin(), rank.end(),
++                  [](const auto & a, const auto & b) { return a.second > b.second; });
++        int added = 0;
++        for (const auto & pr : rank) {
++            if (added >= pop_k_) break;
++            int eid = pr.first;
++            if (std::find(target.begin(), target.end(), eid) == target.end()) {
++                target.push_back(eid);
++                ++added;
++            }
++        }
++    }
++    target.erase(std::remove_if(target.begin(), target.end(), [&exps](int eid) {
++        return std::none_of(exps.begin(), exps.end(), [eid](const expert_tensor_info & expert) {
++            return expert.addr != nullptr && expert.n_experts > 0 &&
++                   expert.size % static_cast<size_t>(expert.n_experts) == 0 &&
++                   eid < expert.n_experts && expert.size / static_cast<size_t>(expert.n_experts) > 0;
++        });
++    }), target.end());
++
++    if (expert_residency_enabled_) {
++        if (!residency_snapshot_set && expert_budget_enabled_.load()) {
++            policy_budget = expert_budget_.load();
++        }
++
++        std::vector<int> candidate_ids = target;
++        if (pressure != expert_pressure_state::missing) {
++            candidate_ids = requested;
++            std::vector<std::pair<int, uint32_t>> rank;
++            for (int eid = 0; eid < static_cast<int>(population.size()); ++eid) {
++                if (population[eid] > 0) rank.emplace_back(eid, population[eid]);
++            }
++            std::stable_sort(rank.begin(), rank.end(), [](const auto & left, const auto & right) {
++                return left.second > right.second;
++            });
++            for (const auto & [eid, unused] : rank) {
++                (void) unused;
++                append_unique_nonnegative(candidate_ids, eid);
++            }
++        }
++
++        size_t available_experts = 0;
++        std::vector<expert_candidate> candidates;
++        candidates.reserve(candidate_ids.size());
++        uint64_t minimum_bytes = std::numeric_limits<uint64_t>::max();
++        for (const expert_tensor_info & expert : exps) {
++            if (expert.addr != nullptr && expert.n_experts > 0 &&
++                expert.size % static_cast<size_t>(expert.n_experts) == 0) {
++                available_experts = std::max(available_experts, static_cast<size_t>(expert.n_experts));
++            }
++        }
++        for (const int eid : candidate_ids) {
++            uint64_t bytes = 0;
++            for (const expert_tensor_info & expert : exps) {
++                if (expert.addr == nullptr || expert.n_experts <= 0 || eid >= expert.n_experts ||
++                    expert.size % static_cast<size_t>(expert.n_experts) != 0) continue;
++                bytes = saturating_add(bytes, static_cast<uint64_t>(
++                    expert.size / static_cast<size_t>(expert.n_experts)));
++            }
++            if (bytes > 0) minimum_bytes = std::min(minimum_bytes, bytes);
++            const uint32_t popularity = eid >= 0 && static_cast<size_t>(eid) < population.size()
++                ? population[static_cast<size_t>(eid)] : 0;
++            candidates.push_back({
++                eid,
++                bytes,
++                popularity,
++                std::find(requested.begin(), requested.end(), eid) != requested.end() &&
++                    std::find(prev.begin(), prev.end(), eid) != prev.end(),
++                std::find(requested.begin(), requested.end(), eid) != requested.end(),
++            });
++        }
++
++        size_t max_experts = pressure == expert_pressure_state::missing ? target.size() : candidates.size();
++        max_experts = std::min(max_experts, available_experts);
++        max_experts = std::min(max_experts, candidates.size());
++        if (minimum_bytes == std::numeric_limits<uint64_t>::max() || minimum_bytes == 0) {
++            max_experts = 0;
++        } else {
++            const uint64_t budget_count = policy_budget / minimum_bytes;
++            max_experts = std::min<uint64_t>(max_experts, budget_count);
++        }
++
++        const expert_residency_decision decision = select_resident_experts({
++            pressure,
++            policy_budget,
++            max_experts,
++            waste_ewma,
++            std::move(candidates),
++            waste_restricted,
++        });
++        atomic_saturating_add(residency_samples_, uint64_t{1});
++        atomic_saturating_add(residency_admitted_experts_, static_cast<uint64_t>(decision.expert_ids.size()));
++        atomic_saturating_add(residency_admitted_bytes_, decision.admitted_bytes);
++        atomic_saturating_add(residency_skipped_bytes_, decision.skipped_bytes);
++        if (decision.fallback) atomic_saturating_add(residency_fallbacks_, uint64_t{1});
++        switch (pressure) {
++            case expert_pressure_state::missing:
++                atomic_saturating_add(residency_pressure_missing_, uint64_t{1});
++                break;
++            case expert_pressure_state::normal:
++                atomic_saturating_add(residency_pressure_normal_, uint64_t{1});
++                break;
++            case expert_pressure_state::high:
++                atomic_saturating_add(residency_pressure_high_, uint64_t{1});
++                break;
++            case expert_pressure_state::critical:
++                atomic_saturating_add(residency_pressure_critical_, uint64_t{1});
++                break;
++        }
++        target = std::move(decision.expert_ids);
++    }
++    if (target.empty()) return 0;
++
++    const long raw_page_size = page_size_query_();
++    const size_t page_size = raw_page_size > 0 ? static_cast<size_t>(raw_page_size) : 0;
++    uint64_t advice_requests = 0;
++    uint64_t invalid_ranges = 0;
++    std::vector<expert_page_candidate> page_candidates;
++    page_candidates.reserve(target.size() * exps.size());
++    for (const int eid : target) {
++        for (const expert_tensor_info & expert : exps) {
++            if (expert.addr == nullptr || expert.n_experts <= 0 || eid >= expert.n_experts ||
++                expert.size % static_cast<size_t>(expert.n_experts) != 0) continue;
++            const size_t per_expert = expert.size / static_cast<size_t>(expert.n_experts);
++            if (per_expert == 0) continue;
++            advice_requests = saturating_add(advice_requests, uint64_t{1});
++            if (static_cast<size_t>(eid) > std::numeric_limits<size_t>::max() / per_expert) {
++                invalid_ranges = saturating_add(invalid_ranges, uint64_t{1});
++                continue;
++            }
++            const size_t offset = static_cast<size_t>(eid) * per_expert;
++            const uintptr_t base = reinterpret_cast<uintptr_t>(expert.addr);
++            if (offset > std::numeric_limits<uintptr_t>::max() - base) {
++                invalid_ranges = saturating_add(invalid_ranges, uint64_t{1});
++                continue;
++            }
++            const page_range range = covering_page_range(base + offset, per_expert, page_size);
++            if (!range.valid) {
++                invalid_ranges = saturating_add(invalid_ranges, uint64_t{1});
++                continue;
++            }
++            page_candidates.push_back({eid, range});
++        }
++    }
++
++    std::vector<page_range> candidate_ranges;
++    candidate_ranges.reserve(page_candidates.size());
++    for (const expert_page_candidate & candidate : page_candidates) {
++        candidate_ranges.push_back(candidate.range);
++    }
++    page_range_set coalesced = coalesce_page_ranges(std::move(candidate_ranges));
++    if (!coalesced.valid) {
++        invalid_ranges = saturating_add(
++            invalid_ranges,
++            static_cast<uint64_t>(coalesced.input_ranges));
++        coalesced.ranges.clear();
++        page_candidates.clear();
++    }
++    uint64_t covered_bytes = 0;
++    for (const page_range & range : coalesced.ranges) {
++        covered_bytes = saturating_add(covered_bytes, static_cast<uint64_t>(range.length));
++    }
++    atomic_saturating_add(expert_advice_requests_, advice_requests);
++    atomic_saturating_add(
++        expert_coalesced_ranges_,
++        static_cast<uint64_t>(coalesced.ranges.size()));
++    atomic_saturating_add(expert_covered_bytes_, covered_bytes);
++    atomic_saturating_add(expert_invalid_ranges_, invalid_ranges);
++    atomic_saturating_add(expert_advice_failures_, invalid_ranges);
++    if (coalesced.ranges.empty()) return 0;
++
++    uint64_t generation = 0;
++    {
++        std::lock_guard<std::mutex> lock(expert_state_mtx_);
++        if (next_expert_generation_ == 0 ||
++            next_expert_generation_ == std::numeric_limits<uint64_t>::max()) {
++            return 0;
++        }
++        if (static_cast<size_t>(layer) >= pending_expert_prefetches_.size()) {
++            pending_expert_prefetches_.resize(static_cast<size_t>(layer) + 1);
++        }
++        std::vector<expert_prefetch_record> & pending = pending_expert_prefetches_[layer];
++        if (pending.size() >= max_pending_expert_records_) {
++            atomic_saturating_add(expert_pending_rejected_generations_, uint64_t{1});
++            return 0;
++        }
++        if (expert_budget_enabled_.load()) {
++            const size_t budget = expert_budget_.load();
++            if (budget == 0 || covered_bytes > std::numeric_limits<size_t>::max()) return 0;
++            const size_t reservation = static_cast<size_t>(covered_bytes);
++            size_t used = expert_budget_used_.load();
++            while (true) {
++                if (used > budget || reservation > budget - used) return 0;
++                if (expert_budget_used_.compare_exchange_weak(used, used + reservation)) break;
++            }
++        }
++        generation = next_expert_generation_++;
++        pending.push_back({generation, {}, {}});
++    }
++
++    const std::vector<expert_page_owner> owners = assign_page_owners(page_candidates);
++    std::vector<bool> successful_ranges(coalesced.ranges.size(), false);
++    size_t bytes = 0;
++    uint64_t callback_failures = 0;
++    for (size_t index = 0; index < coalesced.ranges.size(); ++index) {
++        const page_range & range = coalesced.ranges[index];
++        if (advice_(reinterpret_cast<void *>(range.address), range.length, POSIX_MADV_WILLNEED) == 0) {
++            successful_ranges[index] = true;
++            bytes = saturating_add(bytes, range.length);
++        } else {
++            callback_failures = saturating_add(callback_failures, uint64_t{1});
++        }
++    }
++    atomic_saturating_add(expert_advice_failures_, callback_failures);
++
++    std::map<int, size_t> bytes_by_expert;
++    size_t range_index = 0;
++    for (const expert_page_owner & owner : owners) {
++        while (range_index < coalesced.ranges.size() &&
++               coalesced.ranges[range_index].address + coalesced.ranges[range_index].length <= owner.address) {
++            ++range_index;
++        }
++        if (range_index >= coalesced.ranges.size() || !successful_ranges[range_index]) continue;
++        const page_range & range = coalesced.ranges[range_index];
++        if (owner.address < range.address || owner.length >
++            range.address + range.length - owner.address) continue;
++        bytes_by_expert[owner.expert_id] = saturating_add(
++            bytes_by_expert[owner.expert_id],
++            owner.length);
++    }
++
++    std::vector<int> issued_experts;
++    std::vector<size_t> issued_expert_bytes;
++    issued_experts.reserve(target.size());
++    issued_expert_bytes.reserve(target.size());
++    for (const int eid : target) {
++        const auto found = bytes_by_expert.find(eid);
++        if (found == bytes_by_expert.end() || found->second == 0) continue;
++        issued_experts.push_back(eid);
++        issued_expert_bytes.push_back(found->second);
++    }
++    {
++        std::lock_guard<std::mutex> lock(expert_state_mtx_);
++        std::vector<expert_prefetch_record> & pending = pending_expert_prefetches_[layer];
++        const auto it = std::find_if(pending.begin(), pending.end(), [generation](const auto & record) {
++            return record.generation == generation;
++        });
++        if (it == pending.end()) {
++            atomic_saturating_add(expert_unmatched_generations_, uint64_t{1});
++            return 0;
++        }
++        if (issued_experts.empty()) {
++            pending.erase(it);
++            return 0;
++        }
++        it->expert_ids = std::move(issued_experts);
++        it->issued_bytes = std::move(issued_expert_bytes);
++    }
++
++    if (bytes > 0) {
++        atomic_saturating_add(total_bytes_, bytes);
++        atomic_saturating_add(expert_prefetch_bytes_, bytes);
++    }
++    return generation;
++}
++
++// SLIM-ARC FIX 2026-08-09: summary of the expert-prefetch observability metrics
++// (improvement 1). issued = bytes actually handed to WILLNEED (issue side); hit/waste =
++// hit/wasted bytes (cache side, checked against the prefetch set with the actual
++// routing). Hit rate = hit/(hit+waste). The two accountings may differ slightly because
++// the prefetch and cache passes do not cover exactly the same layers; the hit rate is
++// not affected.
++void prefetch_scheduler::dump_metrics() const {
++    // [QLH] The upstream dump only reports the expert-side counters, which stay at zero unless
++    // the expert prefetcher is switched on. Without this line a plain layer-ahead run is
++    // indistinguishable from a scheduler that never fired at all.
++    std::fprintf(stderr,
++            "[SLIM-ARC-PREFETCH] calls=%llu issued=%.1fMB window=%d threads=%d "
++            "requested=%.1fMB advice_requests=%llu coalesced=%llu invalid=%llu covered=%.1fMB\n",
++            static_cast<unsigned long long>(total_calls_.load()),
++            static_cast<double>(total_bytes_.load()) / 1048576.0,
++            effective_window(),
++            n_threads_,
++            static_cast<double>(budget_requested_bytes_.load()) / 1048576.0,
++            static_cast<unsigned long long>(budget_advice_requests_.load()),
++            static_cast<unsigned long long>(budget_coalesced_ranges_.load()),
++            static_cast<unsigned long long>(budget_invalid_ranges_.load()),
++            static_cast<double>(budget_covered_bytes_.load()) / 1048576.0);
++    size_t issued = expert_prefetch_bytes_.load();
++    size_t hit    = expert_hit_bytes_.load();
++    size_t waste  = expert_waste_bytes_.load();
++    size_t total  = saturating_add(hit, waste);
++    double hr = total > 0 ? 100.0 * (double) hit / (double) total : 0.0;
++    fprintf(stderr,
++            "[SLIM-ARC-METRICS] expert prefetch: samples=%llu issued=%.1fMB "
++            "hit=%.1fMB waste=%.1fMB hit_rate=%.2f%% (accounted %.1fMB)\n",
++            static_cast<unsigned long long>(router_samples_.load()),
++            issued / 1048576.0, hit / 1048576.0, waste / 1048576.0, hr,
++            total / 1048576.0);
++    if (cross_layer_transition_enabled_) {
++        const expert_transition_stats transition = expert_transition_statistics();
++        std::fprintf(
++            stderr,
++            "[SLIM-ARC-TRANSITION] schema=1 updates=%llu prediction_rounds=%llu "
++            "empty_rounds=%llu predicted_experts=%llu matched_experts=%llu decays=%llu\n",
++            static_cast<unsigned long long>(transition.updates),
++            static_cast<unsigned long long>(transition.prediction_rounds),
++            static_cast<unsigned long long>(transition.empty_rounds),
++            static_cast<unsigned long long>(transition.predicted_experts),
++            static_cast<unsigned long long>(transition.matched_experts),
++            static_cast<unsigned long long>(transition.decays));
++    }
++    if (router_mlock_enabled_) {
++        std::fprintf(
++            stderr,
++            "[SLIM-ARC-ROUTER] locked_bytes=%llu lock_failures=%llu\n",
++            static_cast<unsigned long long>(router_locked_bytes_.load()),
++            static_cast<unsigned long long>(router_lock_failures_.load()));
++    }
++    if (shared_mlock_enabled_) {
++        std::fprintf(
++            stderr,
++            "[SLIM-ARC-SHARED] locked_bytes=%llu lock_failures=%llu\n",
++            static_cast<unsigned long long>(shared_locked_bytes_.load()),
++            static_cast<unsigned long long>(shared_lock_failures_.load()));
++    }
++    if (small_mlock_enabled_) {
++        std::fprintf(
++            stderr,
++            "[SLIM-ARC-SMALL] locked_bytes=%llu lock_failures=%llu\n",
++            static_cast<unsigned long long>(small_locked_bytes_.load()),
++            static_cast<unsigned long long>(small_lock_failures_.load()));
++    }
++    if (expert_hot_budget_bytes_ > 0) {
++        const expert_hot_cache_stats stats = expert_hot_cache_statistics();
++        std::fprintf(
++            stderr,
++            "[SLIM-ARC-HOT] budget_bytes=%llu locked_bytes=%llu admissions=%llu hits=%llu "
++            "evictions=%llu budget_rejections=%llu nonresident_bytes=%llu lock_failures=%llu "
++            "entries=%llu admission_skips=%llu admission_threshold=%llu lru=%d lfru=%d\n",
++            static_cast<unsigned long long>(stats.budget_bytes),
++            static_cast<unsigned long long>(stats.locked_bytes),
++            static_cast<unsigned long long>(stats.admissions),
++            static_cast<unsigned long long>(stats.hits),
++            static_cast<unsigned long long>(stats.evictions),
++            static_cast<unsigned long long>(stats.budget_rejections),
++            static_cast<unsigned long long>(stats.nonresident_bytes),
++            static_cast<unsigned long long>(stats.lock_failures),
++            static_cast<unsigned long long>(stats.entries),
++            static_cast<unsigned long long>(stats.admission_skips),
++            static_cast<unsigned long long>(stats.admission_threshold),
++            expert_hot_lru_enabled_ ? 1 : 0,
++            expert_hot_lfru_enabled_ ? 1 : 0);
++    }
++    if (expert_random_madv_enabled_ || expert_normal_madv_enabled_) {
++        std::fprintf(
++            stderr,
++            "[SLIM-ARC-EXPERT-MADV] mode=%s calls=%llu bytes=%llu failures=%llu\n",
++            expert_random_madv_enabled_ ? "RANDOM" : "NORMAL",
++            static_cast<unsigned long long>(expert_madv_advice_calls_.load()),
++            static_cast<unsigned long long>(expert_madv_advice_bytes_.load()),
++            static_cast<unsigned long long>(expert_madv_advice_failures_.load()));
++    }
++}
++
++// [QLH port] See slim-arc-prefetch.h. The loader installs the instance while init_mappings is
++// running, the context reads it back on every graph_compute. A raw pointer is enough: the
++// scheduler outlives the process (function-local static in the loader), and clearing it is
++// never needed because the only writer runs once per model load.
++static prefetch_scheduler * g_prefetch_scheduler = nullptr;
++
++prefetch_scheduler * get_global_prefetch_scheduler() {
++    return g_prefetch_scheduler;
++}
++
++void set_global_prefetch_scheduler(prefetch_scheduler * scheduler) {
++    g_prefetch_scheduler = scheduler;
++}
++
++} // namespace slim_arc
+diff --git a/src/slim-arc-prefetch.h b/src/slim-arc-prefetch.h
+new file mode 100644
+index 000000000..fb5ab2ebf
+--- /dev/null
++++ b/src/slim-arc-prefetch.h
+@@ -0,0 +1,508 @@
++#pragma once
++
++#include "slim-arc-expert-residency.h"
++#include "slim-arc-expert-transition.h"
++#include "slim-arc-page-range.h"
++
++#include "ggml-backend.h"
++
++// SLIM-ARC: Tensor-level asynchronous prefetch scheduler
++//
++// This module implements layer-ahead prefetch on top of upstream llama.cpp's
++// mmap infrastructure. When computing layer N, it asynchronously issues
++// posix_madvise(WILLNEED) for tensors in layers N+1..N+window, allowing the
++// kernel to overlap I/O with computation.
++
++#include <atomic>
++#include <climits>  // SLIM-ARC FIX 2026-08-05: guard against cascading INT_MAX errors
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <utility>
++#include <vector>
++
++namespace slim_arc {
++
++// SLIM-ARC FIX 2026-08-05: compute-phase enum, consumed by set_phase() in graph_compute.
++// When unified_io_scheduler is not enabled, prefetch_scheduler uses this phase info on
++// its own.
++enum class compute_phase {
++    PREFILL,
++    DECODE,
++};
++
++struct tensor_prefetch_info {
++    void *   addr;      // mmap address of tensor data
++    size_t   size;      // tensor data size in bytes
++    int      layer;     // layer index (or -1 for non-layer tensors)
++    uint64_t signature; // monotonic counter to detect graph changes
++};
++
++// SLIM-ARC FIX 2026-08-05: MoE expert tensor registration info (merged 3D tensor
++// *_exps). addr points at the whole 3D tensor data, n_experts = ne[2], and each expert
++// is size/n_experts bytes.
++struct expert_tensor_info {
++    void * addr;        // mmap address of the merged 3D expert tensor
++    size_t size;        // total bytes of the merged tensor
++    int    n_experts;   // number of experts (ne[2])
++    int    file_id{-1};
++    uint64_t file_offset{0};
++};
++
++struct expert_file_advice_stats {
++    uint64_t calls{0};
++    uint64_t issued_bytes{0};
++    uint64_t failures{0};
++    uint64_t invalid_ranges{0};
++};
++
++struct prefetch_budget_stats {
++    uint64_t requested_bytes{0};
++    uint64_t issued_bytes{0};
++    uint64_t skipped_bytes{0};
++    uint64_t rounds_throttled{0};
++    uint64_t madvise_failures{0};
++    uint64_t advice_requests{0};
++    uint64_t coalesced_ranges{0};
++    uint64_t covered_bytes{0};
++    uint64_t invalid_ranges{0};
++    uint64_t stale_requests{0};
++    uint64_t stale_bytes{0};
++    uint64_t inflight_peak_bytes{0};
++};
++
++struct expert_reclaim_stats {
++    uint64_t candidate_experts{0};
++    uint64_t calls{0};
++    uint64_t reclaimed_bytes{0};
++    uint64_t skipped_bytes{0};
++    uint64_t madvise_failures{0};
++    uint64_t invalid_layouts{0};
++    uint64_t invalid_ids{0};
++};
++
++struct expert_residency_runtime_stats {
++    uint64_t samples{0};
++    uint64_t admitted_experts{0};
++    uint64_t admitted_bytes{0};
++    uint64_t skipped_bytes{0};
++    uint64_t fallbacks{0};
++    uint64_t pressure_missing{0};
++    uint64_t pressure_normal{0};
++    uint64_t pressure_high{0};
++    uint64_t pressure_critical{0};
++};
++
++struct expert_runtime_metrics {
++    uint64_t samples{0};
++    uint64_t issued_bytes{0};
++    uint64_t hit_bytes{0};
++    uint64_t waste_bytes{0};
++    uint64_t advice_requests{0};
++    uint64_t coalesced_ranges{0};
++    uint64_t covered_bytes{0};
++    uint64_t advice_failures{0};
++    uint64_t invalid_ranges{0};
++};
++
++struct expert_hot_cache_stats {
++    uint64_t budget_bytes{0};
++    uint64_t locked_bytes{0};
++    uint64_t admissions{0};
++    uint64_t hits{0};
++    uint64_t evictions{0};
++    uint64_t budget_rejections{0};
++    uint64_t nonresident_bytes{0};
++    uint64_t lock_failures{0};
++    uint64_t entries{0};
++    uint64_t admission_skips{0};
++    uint64_t admission_threshold{1};
++};
++
++std::vector<size_t> select_prefetch_items(
++    const std::vector<size_t> & item_sizes,
++    uint64_t budget_bytes,
++    uint64_t * requested_bytes,
++    uint64_t * skipped_bytes);
++
++class prefetch_scheduler {
++  public:
++    using advice_fn = std::function<int(void *, size_t, int)>;
++    using page_size_query_fn = std::function<long()>;
++    using file_advice_fn = std::function<int(int, uint64_t, size_t)>;
++
++    explicit prefetch_scheduler(
++        int n_threads = 2,
++        int window = 3,
++        std::function<void()> request_claim_hook = {},
++        advice_fn advice = {},
++        page_size_query_fn page_size_query = {},
++        file_advice_fn file_advice = {});
++    ~prefetch_scheduler();
++    prefetch_scheduler(const prefetch_scheduler &) = delete;
++    prefetch_scheduler & operator=(const prefetch_scheduler &) = delete;
++    void shutdown() noexcept;
++
++    // Register a tensor for potential prefetch. Called during model load.
++    void register_tensor(const char * name, void * addr, size_t size, int layer);
++    bool register_mapping(void * addr, size_t size, int file_id = -1);
++
++    // Notify that we are about to compute layer `current_layer`.
++    // This triggers async madvise(WILLNEED) for layers
++    // [current_layer+1, current_layer+window].
++    void notify_layer_compute(int current_layer);
++
++    // ---- SLIM-ARC 2026-11-02: real per-layer signalling ----
++    // The graph is submitted to ggml_backend_sched as a whole (~3.8k nodes covering all layers),
++    // so llama_context::graph_compute has no "we are now computing layer N" moment. The signal
++    // is taken from the per-node eval callback instead: prepare_graph() scans the built graph
++    // once and remembers the first node of every layer, eval_cb() then fires
++    // notify_layer_compute() for the layers it observes.
++    //
++    // Call after the graph is built (the layer index lives in the tensor name, which
++    // llama_context::graph_get_cb() assigns while building). Idempotent for the same graph.
++    void prepare_graph(const ggml_cgraph * gf);
++
++    // Chain the user callback (llama_context_params::cb_eval) so that installing eval_cb does
++    // not disable it. Must be called before the callback is handed to the scheduler.
++    void attach_user_callback(ggml_backend_sched_eval_callback cb, void * user_data);
++
++    // ggml_backend_sched_eval_callback body. user_data must be a prefetch_scheduler *.
++    static bool eval_cb(ggml_tensor * t, bool ask, void * user_data);
++
++    // Disable prefetch (e.g., when memory budget exceeded).
++    void set_enabled(bool enabled) { enabled_.store(enabled); }
++
++    // Collect statistics
++    size_t total_prefetched_bytes() const { return total_bytes_.load(); }
++    int    total_prefetch_calls()   const { return total_calls_.load(); }
++
++    // ---- SLIM-ARC FIX 2026-08-05: interfaces the Pi5-side fix needs ----
++    // Set the compute phase (prefill / decode).
++    // SLIM-ARC FIX 2026-08-07: triggers the dynamic MADV switch (PREFILL->SEQUENTIAL /
++    // DECODE->RANDOM).
++    void set_phase(compute_phase phase);
++    // Current prefetch window size (used by graph_compute to compute the layer range to
++    // prefetch).
++    int  effective_window() const { return window_; }
++    // Memory budget (used by unified_io_scheduler to apportion the weight-prefetch quota).
++    void set_memory_budget(size_t bytes) { memory_budget_.store(bytes); }
++    prefetch_budget_stats budget_stats() const;
++
++    // ========================================================================================
++    // [QLH] NOT WIRED UP. Every expert-path method declared from here to the end of the class
++    // has zero callers in this repository (see the long note at the top of the implementation in
++    // slim-arc-prefetch.cpp, "NOT WIRED UP"). They are kept for future integration, not because
++    // anything runs them: register_expert_tensor / cache_router_experts / prefetch_experts /
++    // cancel_expert_prefetch / set_expert_residency_pressure / set_expert_budget /
++    // reset_expert_budget_usage / budget_stats / expert_*_statistics are all unreachable today,
++    // so their counters stay zero and SLIM_ARC_EXPERT_* have no effect. Do not read a declaration
++    // here as "this is active".
++    // ========================================================================================
++    // Phase 2a: register MoE expert tensors (merged 3D tensor *_exps)  [NOT WIRED]
++    void register_expert_tensor(const char * name, void * addr, size_t size, int layer, int n_experts);
++    // Cache the expert IDs the router selected for this layer (for cross-layer prediction)
++    void cache_router_experts(int layer, const int * expert_ids, int n);
++    // Settle the given prefetch generation; generation 0 only updates the predictor and
++    // settles no metrics.
++    void cache_router_experts(int layer, const int * expert_ids, int n, uint64_t generation);
++    // Abort the given prefetch generation and count its successfully issued bytes as
++    // waste in one go.
++    void cancel_expert_prefetch(int layer, uint64_t generation);
++    // Get an independent copy of the router expert IDs most recently cached for a layer.
++    std::vector<int> cached_experts_snapshot(int layer) const;
++    // Issue WILLNEED prefetch for the given experts of the specified layer and return a
++    // generation that must not be reused. 0 means there was no successful prefetch to
++    // settle.
++    uint64_t prefetch_experts(int layer, const int * expert_ids, int n);
++
++    // ---- SLIM-ARC FIX 2026-08-09: expert-prefetch observability metrics (improvement 1:
++    // make it observable before optimizing) ----
++    // Print the hit-rate / wasted-bytes summary (called from the destructor)
++    void dump_metrics() const;
++    size_t expert_prefetch_bytes() const { return expert_prefetch_bytes_.load(); }
++    size_t expert_hit_bytes()     const { return expert_hit_bytes_.load(); }
++    size_t expert_waste_bytes()   const { return expert_waste_bytes_.load(); }
++    size_t pending_expert_records(int layer) const;
++    expert_reclaim_stats expert_reclaim_statistics() const;
++    bool expert_residency_enabled() const noexcept { return expert_residency_enabled_; }
++    void set_expert_residency_pressure(expert_pressure_state pressure, size_t budget_bytes);
++    expert_pressure_state current_expert_pressure() const;
++    expert_residency_runtime_stats expert_residency_statistics() const noexcept;
++    expert_runtime_metrics expert_runtime_statistics() const noexcept;
++    expert_hot_cache_stats expert_hot_cache_statistics() const noexcept;
++    expert_file_advice_stats expert_file_advice_statistics() const noexcept;
++    bool expert_hot_lfru_enabled() const noexcept { return expert_hot_lfru_enabled_; }
++    std::vector<uint32_t> expert_popularity_snapshot(int layer) const;
++    uint64_t popularity_decay_count() const noexcept { return popularity_decay_count_.load(); }
++    uint32_t expert_waste_ewma_milli() const;
++    uint64_t expert_waste_sample_count() const;
++    bool expert_waste_restricted() const;
++    size_t pending_request_count() const;
++    uint64_t dropped_request_count() const { return dropped_requests_.load(); }
++    bool confidence_gating_enabled() const { return conf_gating_; }
++    int popularity_k() const { return pop_k_; }
++    bool cross_layer_transition_enabled() const noexcept { return cross_layer_transition_enabled_; }
++    int cross_layer_transition_topk() const noexcept { return cross_layer_transition_topk_; }
++    void observe_expert_transition(
++        int layer,
++        const std::vector<int> & source,
++        const std::vector<int> & target);
++    std::vector<int> predict_expert_transition(int layer, const std::vector<int> & source);
++    void record_expert_transition_result(
++        const std::vector<int> & predicted,
++        const std::vector<int> & actual);
++    expert_transition_stats expert_transition_statistics() const noexcept;
++    // Unified I/O budget issue and per-step reset (improvement 3, called from
++    // unified_io_scheduler::tick)
++    void set_expert_budget(size_t bytes) {
++        expert_budget_.store(bytes);
++        expert_budget_enabled_.store(true);
++    }
++    void reset_expert_budget_usage() { expert_budget_used_.store(0); }
++
++  private:
++    void worker_loop();
++    uint64_t issue_expert_willneed(int layer, const int * expert_ids, int n);
++    void reclaim_wrong_expert_pages(
++        const std::vector<int> & prefetched,
++        const std::vector<int> & selected,
++        const std::vector<expert_tensor_info> & tensors);
++    void update_expert_hot_cache(
++        int layer,
++        const std::vector<int> & stable_experts,
++        const std::vector<expert_tensor_info> & tensors);
++    void advise_selected_expert_files(
++        const std::vector<int> & selected,
++        const std::vector<expert_tensor_info> & tensors);
++
++    const bool slow_storage_enabled_;
++    const bool router_prefetch_enabled_;
++    const bool router_mlock_enabled_;
++    const bool shared_mlock_enabled_;
++    const bool small_mlock_enabled_;
++    const size_t expert_hot_budget_bytes_;
++    const bool expert_hot_lru_enabled_;
++    const bool expert_hot_lfru_enabled_;
++    const uint32_t expert_hot_admission_threshold_;
++    const bool expert_prefetch_disabled_;
++    const bool expert_file_advice_enabled_;
++    const bool expert_random_madv_enabled_;
++    const bool expert_normal_madv_enabled_;
++    const int cross_layer_transition_topk_;
++    const bool cross_layer_transition_enabled_;
++    int n_threads_;
++    int window_;
++    std::atomic<compute_phase> phase_{compute_phase::DECODE};
++    // [QLH] unified_io_scheduler (the module that used to hand this scheduler its byte budget)
++    // is not ported, so nothing calls set_memory_budget() and the upstream default of 0 truncated
++    // every request to zero bytes. The constructor now derives a ceiling from the free physical
++    // memory, and plan_request() additionally caps each request at one layer of weights.
++    // SLIM_ARC_BUDGET_MB overrides the ceiling; set_memory_budget() still wins if a caller shows up.
++    std::atomic<size_t> memory_budget_{0};
++    std::atomic<bool>       enabled_{true};
++    std::atomic<bool>       stop_{false};
++    std::atomic<size_t>     total_bytes_{0};
++    std::atomic<int>        total_calls_{0};
++    std::atomic<uint64_t>   budget_requested_bytes_{0};
++    std::atomic<uint64_t>   budget_issued_bytes_{0};
++    std::atomic<uint64_t>   budget_skipped_bytes_{0};
++    std::atomic<uint64_t>   budget_rounds_throttled_{0};
++    std::atomic<uint64_t>   budget_madvise_failures_{0};
++    std::atomic<uint64_t>   budget_advice_requests_{0};
++    std::atomic<uint64_t>   budget_coalesced_ranges_{0};
++    std::atomic<uint64_t>   budget_covered_bytes_{0};
++    std::atomic<uint64_t>   budget_invalid_ranges_{0};
++    std::atomic<uint64_t>   budget_stale_requests_{0};
++    std::atomic<uint64_t>   budget_stale_bytes_{0};
++    std::atomic<uint64_t>   budget_inflight_bytes_{0};
++    std::atomic<uint64_t>   budget_inflight_peak_bytes_{0};
++
++    // ---- SLIM-ARC FIX 2026-08-09: expert-prefetch observability metrics (improvement 1) ----
++    std::atomic<size_t>     expert_prefetch_bytes_{0};  // bytes actually issued as WILLNEED
++    std::atomic<size_t>     expert_hit_bytes_{0};       // prefetched bytes used by the next token
++    std::atomic<size_t>     expert_waste_bytes_{0};     // prefetched bytes never used
++    std::atomic<uint64_t>   router_samples_{0};         // number of samples
++    std::atomic<uint64_t>   expert_advice_requests_{0};
++    std::atomic<uint64_t>   expert_coalesced_ranges_{0};
++    std::atomic<uint64_t>   expert_covered_bytes_{0};
++    std::atomic<uint64_t>   expert_advice_failures_{0};
++    std::atomic<uint64_t>   expert_invalid_ranges_{0};
++
++    std::vector<std::thread>          workers_;
++    std::function<void()>             request_claim_hook_;
++    const advice_fn                   advice_;
++    const page_size_query_fn          page_size_query_;
++    const file_advice_fn              file_advice_;
++    const bool                        reclaim_waste_enabled_;
++    const bool                        expert_residency_enabled_;
++    std::mutex                        shutdown_mtx_;
++    mutable std::mutex                mtx_;
++    std::condition_variable           cv_;
++    struct prefetch_request {
++        uint64_t generation{0};
++        int layer{-1};
++        uint64_t memory_budget{0};
++        uint64_t requested_bytes{0};
++        uint64_t advice_requests{0};
++        uint64_t invalid_ranges{0};
++        uint64_t covered_bytes{0};
++        size_t page_size{0};
++        std::vector<page_range> ranges;
++    };
++    prefetch_request plan_request(int current_layer);
++    std::deque<prefetch_request>      pending_requests_;
++    uint64_t                          next_request_generation_{0};
++    static constexpr size_t           max_pending_requests{64};
++    std::atomic<uint64_t>             dropped_requests_{0};
++
++    // tensor registry indexed by layer
++    std::vector<std::vector<tensor_prefetch_info>> tensors_by_layer_;
++    // Small, always-used MoE router path. Kept separate from speculative weights.
++    std::vector<tensor_prefetch_info>              router_tensors_;
++    std::vector<page_range>                        router_locked_ranges_;
++    std::atomic<uint64_t>                          router_locked_bytes_{0};
++    std::atomic<uint64_t>                          router_lock_failures_{0};
++    std::vector<page_range>                        shared_locked_ranges_;
++    std::atomic<uint64_t>                          shared_locked_bytes_{0};
++    std::atomic<uint64_t>                          shared_lock_failures_{0};
++    std::vector<page_range>                        small_locked_ranges_;
++    std::atomic<uint64_t>                          small_locked_bytes_{0};
++    std::atomic<uint64_t>                          small_lock_failures_{0};
++    struct expert_hot_entry {
++        int layer{-1};
++        int expert_id{-1};
++        std::vector<page_range> ranges;
++        uint64_t locked_bytes{0};
++        uint64_t last_touch{0};
++        uint64_t frequency{1};
++    };
++    mutable std::mutex                              expert_hot_mtx_;
++    std::vector<expert_hot_entry>                  expert_hot_entries_;
++    uint64_t                                        expert_hot_locked_bytes_{0};
++    uint64_t                                        expert_hot_admissions_{0};
++    uint64_t                                        expert_hot_hits_{0};
++    uint64_t                                        expert_hot_evictions_{0};
++    uint64_t                                        expert_hot_budget_rejections_{0};
++    uint64_t                                        expert_hot_nonresident_bytes_{0};
++    uint64_t                                        expert_hot_lock_failures_{0};
++    uint64_t                                        expert_hot_touch_clock_{0};
++    uint64_t                                        expert_hot_admission_skips_{0};
++    std::vector<std::vector<uint32_t>>              expert_hot_admission_counts_;
++    struct mmap_region_info {
++        void * addr;
++        size_t size;
++        int file_id;
++    };
++    std::vector<mmap_region_info>                  mmap_regions_;
++    std::vector<page_range>                        expert_madv_ranges_;
++    std::atomic<uint64_t>                          expert_madv_advice_calls_{0};
++    std::atomic<uint64_t>                          expert_madv_advice_bytes_{0};
++    std::atomic<uint64_t>                          expert_madv_advice_failures_{0};
++    std::atomic<uint64_t>                          expert_file_advice_calls_{0};
++    std::atomic<uint64_t>                          expert_file_advice_bytes_{0};
++    std::atomic<uint64_t>                          expert_file_advice_failures_{0};
++    std::atomic<uint64_t>                          expert_file_advice_invalid_ranges_{0};
++    // MoE expert registry indexed by layer
++    std::vector<std::vector<expert_tensor_info>>   experts_by_layer_;
++    // Guards the expert registry and router predictor/accounting state.
++    mutable std::mutex                              expert_state_mtx_;
++    mutable std::mutex                              expert_transition_mtx_;
++    expert_transition_table                        expert_transition_table_;
++    // Router-selected expert IDs per layer (for next-layer prediction)
++    std::vector<std::vector<int>>                  cached_router_experts_;
++    struct expert_prefetch_record {
++        uint64_t generation;
++        std::vector<int> expert_ids;
++        std::vector<size_t> issued_bytes;
++    };
++    // Per layer, bounded unsettled prefetch records keyed by generation (a placeholder
++    // until the advice is issued).
++    std::vector<std::vector<expert_prefetch_record>> pending_expert_prefetches_;
++    uint64_t                                        next_expert_generation_{1};
++    static constexpr size_t                         max_pending_expert_records_{64};
++    std::atomic<uint64_t>                           expert_pending_rejected_generations_{0};
++    std::atomic<uint64_t>                           expert_unmatched_generations_{0};
++    std::atomic<uint64_t>                           reclaim_candidate_experts_{0};
++    std::atomic<uint64_t>                           reclaim_calls_{0};
++    std::atomic<uint64_t>                           reclaim_reclaimed_bytes_{0};
++    std::atomic<uint64_t>                           reclaim_skipped_bytes_{0};
++    std::atomic<uint64_t>                           reclaim_madvise_failures_{0};
++    std::atomic<uint64_t>                           reclaim_invalid_layouts_{0};
++    std::atomic<uint64_t>                           reclaim_invalid_ids_{0};
++    // ---- SLIM-ARC FIX 2026-08-09: confidence gating (improvement 2) ----
++    // Routing of the previous step (t-2), used for the "stable across two consecutive
++    // tokens" high-confidence filter
++    std::vector<std::vector<int>>                  prev_router_experts_;
++    // Enable the 2-token stability gate when SLIM_ARC_EXPERT_CONF=1
++    bool                                           conf_gating_ = false;
++
++    // ---- SLIM-ARC FIX 2026-08-09: unified I/O budget limiting (improvement 3, following
++    // admission control) ----
++    // Once set_expert_budget() has been called the budget is enforced strictly; 0
++    // disables expert prefetch for this step.
++    std::atomic<size_t>                            expert_budget_{0};
++    std::atomic<bool>                              expert_budget_enabled_{false};
++    // Expert budget used in this step (reset by the unified tick on every graph_compute)
++    std::atomic<size_t>                            expert_budget_used_{0};
++
++    // ---- SLIM-ARC FIX 2026-08-09: combined predictor (improvement 4, following
++    // ReMoE/DALI locality) ----
++    // SLIM_ARC_EXPERT_POP=K: prefetch the temporal set unioned with the top-K hot experts
++    int                                            pop_k_ = 0;
++    // Per-layer expert activation-frequency counts (recent window)
++    std::vector<std::vector<uint32_t>>             expert_pop_counts_;
++    uint8_t                                         popularity_samples_since_decay_{0};
++    std::atomic<uint64_t>                           popularity_decay_count_{0};
++    uint32_t                                        expert_waste_ewma_milli_{0};
++    bool                                            expert_waste_ewma_initialized_{false};
++    uint64_t                                        expert_waste_samples_{0};
++    expert_pressure_state                           expert_pressure_{expert_pressure_state::missing};
++    size_t                                          expert_residency_budget_{0};
++    bool                                            expert_residency_snapshot_set_{false};
++    expert_waste_controller                         expert_waste_controller_;
++    bool                                            expert_waste_restricted_{false};
++    std::atomic<uint64_t>                           residency_samples_{0};
++    std::atomic<uint64_t>                           residency_admitted_experts_{0};
++    std::atomic<uint64_t>                           residency_admitted_bytes_{0};
++    std::atomic<uint64_t>                           residency_skipped_bytes_{0};
++    std::atomic<uint64_t>                           residency_fallbacks_{0};
++    std::atomic<uint64_t>                           residency_pressure_missing_{0};
++    std::atomic<uint64_t>                           residency_pressure_normal_{0};
++    std::atomic<uint64_t>                           residency_pressure_high_{0};
++    std::atomic<uint64_t>                           residency_pressure_critical_{0};
++
++    // ---- SLIM-ARC 2026-11-02: per-layer signalling state ----
++    void on_layer_boundary(int32_t layer);
++    // first node of every layer, sorted by pointer value -- searched with binary_search
++    std::vector<const ggml_tensor *>                observe_;
++    // layer index of the matching observe_ entry (not sorted: it follows observe_)
++    std::vector<int32_t>                            observe_layer_;
++    // last layer we issued a request for; reset when the layer counter wraps (= new token).
++    // [QLH] Atomic: written by on_layer_boundary() on the compute thread and reset by
++    // prepare_graph() on the context thread (the other two tables above are protected by mtx_,
++    // this one is a single word and does not need the lock on the hot path).
++    std::atomic<int32_t>                            last_notified_{-1};
++    // graph the tables above were built from, for idempotency across the graph-reuse path
++    const ggml_cgraph *                             prepared_gf_ = nullptr;
++    // set when the scan could not recover layer boundaries; eval_cb then degrades to the user cb
++    bool                                            graph_signalling_disabled_ = false;
++    ggml_backend_sched_eval_callback                user_cb_ = nullptr;
++    void *                                          user_cb_data_ = nullptr;
++};
++
++// Helper: extract layer index from tensor name (blk.%d.*)
++int tensor_layer_from_name(const char * name);
++
++// [QLH port] Process-global scheduler handle. The upstream integration patch calls these two
++// accessors, but the published sources do not define them -- the loader owns the instance and
++// the context reads it back during graph_compute. Kept as a pair of free functions so the two
++// translation units do not have to share a header-level static.
++prefetch_scheduler * get_global_prefetch_scheduler();
++void set_global_prefetch_scheduler(prefetch_scheduler * scheduler);
++
++} // namespace slim_arc
 diff --git a/tests/.gitignore b/tests/.gitignore
 index 6a6373101..1c09f4a01 100644
 --- a/tests/.gitignore
