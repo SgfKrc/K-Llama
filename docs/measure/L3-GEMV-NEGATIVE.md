@@ -124,9 +124,9 @@ L116: send.dc1 (16|M0)  r36  r34  ...   // 地址 +144 B
 
 1. **sector 对齐浪费（最具体）**。Q4_K block 是 144 B，起始地址是 `block_idx × 144`，不是 32 B 的整数倍。[推算] 起始偏移在 0~31 B 均匀分布时，144 B 平均跨 `(144 + 15.5)/32 = 4.98` 个 32 B sector，即实际读 **160 B 取 144 B，浪费 11%**。48.9 GB/s × (144/160) = **44.0 GB/s**，正好把 39.6 的解释力推高一大截。**修法是让 prepack 后的每块对齐到 32 B 的整数倍（128 B 或 160 B），而不是 L3 那种「重排成 lane-major」。**
 2. **`send.dc1` 走 L1 data cache 的 miss 代价**。ISA 里 load 是 `send.dc1 ... untyped surface read`，走 data cache 1。权重每 token 只读一遍，命中率≈0，每次都是 miss。[未实测] 这条路径的 miss 代价是否高于 direct global load（`send.ugm`），不知道。
-3. **CPU 侧 9.5 ms/token（占 6.9%）**。其中 logits 读回在 Intel UMA 上走 `ggml_vk_buffer_host_read_direct()` 的 uncached memcpy（~120 MiB/s，[实测] 反向推算），每 token 约 607 KB → 约 4.8 ms。**这是一块独立、便宜、可验证的肉**，与 kernel 无关。
+3. **CPU 侧 9.5 ms/token（占 6.9%）—— 归因已排除读回**。原以为其中 logits 读回占 4.8 ms（按 607 KB @ ~100 MiB/s 推），**实测否定**：decode 的 logits 走 `get_tensor_async` → `ggml_vk_buffer_read_2d_async`，**不经过** `ggml_vk_buffer_host_read_direct()` 的判据；Iris Xe 的 `support_async = true`，该路径本身已是 GPU copy → cached staging → memcpy。把判据换成上游 #32024 的「只排除 NVIDIA」后（`415ac0096`），同步路径读回从 **3.92 ms 降到 1.36 ms（−65%）**，但 **tg 完全不动（7.947 → 7.953 t/s）**。所以 9.5 ms 的构成仍未查清，读回不是它。
 
-**方向建议（未验证，供决策）**：如果还要在核显 decode 上继续，优先顺序应该是 **3 → 1 → 2**，而不是继续在 kernel 里找寄存器。理由：3 有明确的代码位置和量级；1 有 11% 的算术支撑且不改变 kernel 结构（只改数据布局的对齐，保留 stock 的 4-subgroup 并行度）；2 需要工具才能证伪。
+**方向建议（未验证，供决策）**：优先顺序应该是 **1 → 2 → 9.5 ms 的构成**。1 有 11% 的算术支撑，且不改变 kernel 结构（只改数据布局的对齐，保留 stock 的 4-subgroup 并行度）；2 需要工具才能证伪；读回这条已被实测排除，不要再往那里投入。
 
 ---
 
