@@ -96,7 +96,7 @@
 Q[bg][lane][0..3]    uint32   // [0..1] = qs(block 2*bg) 的第 2*lane、2*lane+1 个 uint32；[2..3] = block 2*bg+1
 ```
 16 lane × 16 B = 256 B = 2 × 128 B，一次连续读，零冗余、零填充。
-scales 单独重排为每 superblock 8 个 `uint16`（`sc | m<<6`，按 `get_scale_min_k4` 的规则从原始 12 B 解好），每块 16 B = 4 个 `uint32`。kernel 侧每个 lane 读**一个** `uint32`（`scm32[... + 2*(lane/4)]`），里面正好是 `(sc_lo, min_lo, sc_hi, min_hi)` 四个 6-bit 值——4 个 lane 同址，硬件 broadcast 合并，**1 条 load、零 shuffle**。相对原始 12 B 有 4 B 填充，但总字节 2×128 + 2×16 = 288 B，与原 2×144 = 288 B 相等，**不膨胀**。
+scale 与 min 打进一个 16 B 的 `SCDM` 记录：3 个 `uint32` 装 8 个 12-bit 值 `scale | (min<<6)`（sub-block j 在 bit `12*j`），第 4 个 `uint32` 就是原始 `half2(d, dmin)` 原样。于是每 superblock 128 B(qs) + 16 B(SCDM) = **144 B，与原 block 严格相等，prepack 后每 token 的 DRAM 字节数不变**。kernel 侧每个 lane 需要 sub-block `2*(lane/4)` 和 `2*(lane/4)+1`，即 `SCDM` 里连续 24 bit；4 路位域选择（`sci==0 ? x&0xFFFFFF : sci==1 ? (x>>24)|(y<<8) : …`）在 16 lane 上 predicated，约 6 条 ALU。**这个交换是刻意的**：若按 `uint16` 存 `scm`，每块是 128 + 16 + 4 = 148 B（+2.78%），而判据 2 的 600 us 门槛只比 579 us 纯读下限高 3.6%，2.78% 的 DRAM 增量会吃掉几乎全部余量；6 条 ALU 则落在 §2.5 那 16% 的指令槽里。
 
 落地位置 **[代码]**：在 `ggml_vk_create_tensor`（`ggml-vulkan.cpp`）的 buffer 分配处挂一个 `q4k_gemv` 附属 buffer，仅当 `ne0 % 256 == 0 && type == GGML_TYPE_Q4_K && 使用该 tensor 的 MUL_MAT 的 n <= mul_mat_vec_max_cols` 时生成；`ggml_vk_mul_mat_vec_q_f16`（`:7042`）在选 pipeline 前检查附属 buffer 是否存在，存在则走 L3 路径、否则走现有 `ggml_vk_get_dequantize_mul_mat_vec`（`:5853`）。prepack 本身用一次 `vkCmdCopyBuffer` 之后的小 compute shader 完成（一次 5 GB 量级搬运，见 §4.3）。
 
@@ -225,7 +225,7 @@ Adreno 的具体约束 **[代码+推断]**：
 
 ### 4.3 风险
 
-1. **额外内存**：prepack 后的 Q4_K + Q6_K 约 5.1 GB。UMA 单 heap 上可行，但需在分配失败时回退到原 kernel（不能硬失败）。
+1. **额外内存**：prepack 后的 Q4_K + Q6_K 约 5.1 GB（§3.2 的 144 B/块与原格式严格相等，不膨胀）。UMA 单 heap 上可行，但需在分配失败时回退到原 kernel（不能硬失败）。
 2. **加载时间**：一次性 5.1 GB 读 + 5.1 GB 写，理论 209 ms @48.9 GB/s（纯拷贝，memcpy 口径在此适用），实际约 1–2 s。对交互式加载可接受，需在日志里说明。
 3. **寄存器能否压到 64 无法从源码断定**：IGC 的活跃变量分配必须实测。若压不下去（>64 GRF），就仍是 1 warp/EU、计算无法与 load 重叠，预期收益打五折（8.33 → 7.5 左右，接近 L1）。这是首版必须实测确认的第一件事。
 4. **不可上游**：新 buffer 类型 + prepack 步骤会改动 `ggml_vk_buffer` 与模型加载路径，与上游的量化格式抽象冲突，属于本地分叉，不要按可上游的 PR 组织。
