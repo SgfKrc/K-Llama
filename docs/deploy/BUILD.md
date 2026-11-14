@@ -209,11 +209,17 @@ cmake --build build-split --clean-first -- -j 8                               # 
 
 ## 7. 验收
 
-验收脚本是 `bash verify/verify.sh`（十四组共 77 项），用 `QLH_BUILD_DIR` 指向构建目录：默认增量
+验收脚本是 `bash verify/verify.sh`（十五组共 95 项），用 `QLH_BUILD_DIR` 指向构建目录：默认增量
 编译后全跑，`--clean` 全量重编，`--skip-build` 只跑验证。组 9/10 需要 35B 与 DFlash 权重及显存/内存
 闸门；组 12 需要 CUDA 构建（`QLH_CUDA_BUILD_DIR`），组 13 需要 KVMem 构建（`QLH_KVMEM_BUILD_DIR`，
 默认 `H:/llamacpp-c/build-kvmem2`）与 KVMem 源码根（`LLAMA_KVMEM_ROOT`），组 14 需要 2B 的 MTP
-权重与 `split-stage.exe`，缺任一条该组记 SKIP。脚本随仓库分发（`verify/README.md`），新编一个目录也能跑。
+权重与 `split-stage.exe`，组 15（判据 2–6 的多序列基础语义）只需要 2B 与 `split-stage.exe`，
+缺任一条该组记 SKIP。脚本随仓库分发（`verify/README.md`），新编一个目录也能跑。
+
+项数与端口：`EXPECT_PASS=95` = 组 1–8 的 22 + 组 9/10/11 的 30 + 组 12 的 1 + 组 13 的 4 +
+组 14 的 20 + 组 15 的 18；每组整组 SKIP 时按 `SKIP_ITEMS_*` 从期望里扣掉再断言。
+端口基准：组 14 用 `QLH_VERIFY_PORT_PESPEC_BASE`（默认 9380），组 15 用
+`QLH_VERIFY_PORT_MULTISEQ_BASE`（默认 9370），其余组用 `QLH_VERIFY_PORT_*`。
 
 ## 8. 这份说明还缺什么
 

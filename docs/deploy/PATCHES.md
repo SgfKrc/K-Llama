@@ -97,7 +97,7 @@ tree hash 不再相等。静默错，属于「验收命令跑了、也过了、�
   `split-smoke.exe` / `split-rows.exe` 等目标齐全），并独立通过 `verify/verify.sh` 与
   `verify/verify_chain_death.py`；没有 SLIM-ARC 不影响分段链的任何一条验收。v2.1 实测过两版：
   `0c307d82a`（44 文件，2026-11-09，`verify.sh` 十二组 53 项——组 13 于 2026-11-12 加入、组 14 于 2026-11-13 加入（20 项），
-  现行完整验收 **77 项**，见 `INDEX.md` §5——+ chain_death 36 项，日志 `.qlh_tmp/pure-split-acceptance/`）与 `586a7e7a1`（45 文件，2026-11-11，
+  现行完整验收 **95 项**，见 `INDEX.md` §5——+ chain_death 36 项，日志 `.qlh_tmp/pure-split-acceptance/`）与 `586a7e7a1`（45 文件，2026-11-11，
   `verify.sh` **52/0/0**、chain_death **36/0**，日志 `.qlh_tmp/pure_split_recheck.log`；两版差 4 文件 / +605 −12）。
   v2.2 的 `2541c9d29` 于 2026-11-14 独立验过（`H:/wt-mainonly` + `build-v22-mainonly`，`git write-tree` 逐字节等于目标树；`--clean-first` 191 步全过，`verify.sh` **72 PASS / 0 FAIL / 2 SKIP**——72 = 77 − 组 12 的 1 − 组 13 的 4，这两组依赖别的构建与补丁，不在「主补丁能独立编译」这句话的范围），日志 `.qlh_tmp/mainonly-verify.log`。
 - `1dcbce39`（44 项）有一趟 `PASS=34 FAIL=10`，两处都是环境：组 5 的 `-np 4` 启动瞬间死掉（日志 0 字节，

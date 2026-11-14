@@ -197,9 +197,11 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 
 ## 7. 判据
 
-### 7.1 组 14：远程链多序列（2026-11-13 落地 20 项：下表 #7–#9；#1 于 2026-11-14 三机实测通过；#2–#6 未做）
+### 7.1 远程链多序列（组 14 = 判据 7–11 共 20 项，2026-11-13 落地；组 15 = 判据 2–6 共 18 项，2026-11-14 落地并**实测通过**：18 PASS / 0 FAIL）
 
 组 7 跑远程链但没给 `-np`（auto = 1），组 5 跑 `-np 2/4` 但走本地链；远程链 `-np 2` 因 `:2379` 从未跑过。
+判据 1 于 2026-11-14 三机实测通过（不在 `verify.sh` 里，它是三机拓扑项）；下表 #2–#6 由组 15
+（`verify/verify_multiseq.py`）覆盖，#7–#9 由组 14（`verify/verify_perspec.py`）覆盖（per-seq 判据 7–11）。
 
 | # | 判据 | 怎么判 |
 | --- | --- | --- |
@@ -214,6 +216,15 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 | 9 | 一个序列在投机、另一个在普通 decode 时两条都正确 | A 带投机、B 不带。B 的输出与「B 单独跑」逐字节相同；A 的接受 token 数与「A 单独带投机跑」相同 |
 
 判据 1–4 的「逐字节相同」是本项目既有口径（组 1/3/6/7 同型），不是为这一版新发明的强判据。判据 7–9 的细化（行映射、k 降级）在 [`V22-PERSEQ-SPEC.md`](V22-PERSEQ-SPEC.md) §6。
+
+**判据 4 说的 checkpoint 是 llama-server 的 context checkpoint，不是 `/slots` 的 save/restore**。后者导出的是
+**完整** sequence state，而远程链设计上不导出它（`split_state_unavailable()`，`llama-context.cpp:5281`：只有
+recurrent-only 的 checkpoint flavour 带 `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` 时可用，启动日志里有一行
+「this chain has remote stages, so only the checkpoint flavour ... is exported」）。所以 `--slot-save-path`
+在远程链上 save 写出 0 字节 state（只剩 context checkpoint 的 appendix），restore 必然失败——这是**设计边界**，
+不是 bug，组 15 因此不测它。判据 4 走 `--ctx-checkpoints`（默认 32/slot）那条路径：每个 slot 在 prompt 分
+chunk 时建 checkpoint（段侧 mint 一个 8 字节 handle），续写请求命中前缀时用 checkpoint 恢复（段侧
+`OP_STATE_LOAD -> ok`）；`--state-cache 1` 制造 handle 失效，段答 `ST_STALE`、head 重算。
 
 **每序列容量约束（对全部判据生效）**：多序列下每序列容量是 `n_ctx / n_seq_max`（`llama-context.cpp:414-431`，**代码**），判据里每条 prompt + `max_tokens` 必须小于它，否则撞上下文墙而不是判语义。本表按 `-c 4096` / `-np 2`（每序列 2048）写，prompt ≤ 1024、`max_tokens` ≤ 256。
 
@@ -240,4 +251,4 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 
 1. `stage_id` 四个字段的宽度（`uint16 n_seq_max` 塞原 `_pad[2]` + 三个 `uint32` = 40 字节，推荐；四个都用 `uint32` = 44 字节），以及 `n_logits` 的落点（`rsp_header` 加宽 4 字节，推荐；或借 `pos_max`）。
 2. `row_req` 是否需要第 2 个 flag 位（例如「这行是 prefill」）——stage 目前不需要，但调试与日志有用。
-3. v2.2 已把组 14（`verify/verify_perspec.py`，判据 7–11 / 下表 #7–#9，20 项）纳入 `verify.sh` 结题口径（全套 77 项十四组）；#1–#6 仍未做。
+3. v2.2 已把组 14（`verify/verify_perspec.py`，判据 7–11 / 下表 #7–#9，20 项）与组 15（`verify/verify_multiseq.py`，判据 2–6，18 项）纳入 `verify.sh` 结题口径（全套 95 项十五组）。判据 1 是三机拓扑项，靠 `docs/design/V22-MULTISEQ.md` §7.1 的实测记录，不在 `verify.sh` 里。

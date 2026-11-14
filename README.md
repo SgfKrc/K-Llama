@@ -206,7 +206,7 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
 
 | 套件 | 结果 | 判据 |
 | --- | ---: | --- |
-| `bash verify/verify.sh` | 77（十四组：1–8 组 22 + 组 9 2 + 组 10 20 + 组 11 8 + 组 12 1 + 组 13 4 + 组 14 20） | 逐位 / 逐字节；组 11 直接跑 `llama-server + 链 + -md` 产品路径，组 12 用 CUDA 构建验段级 offload，组 13 用 KVMem 构建（`build-kvmem2`，`LLAMA_KVMEM=ON`）验 KV 虚拟化，组 14 验远程链 `-np 2` 的 per-seq 投机四通道（判据 7–11） |
+| `bash verify/verify.sh` | 95（十五组：1–8 组 22 + 组 9 2 + 组 10 20 + 组 11 8 + 组 12 1 + 组 13 4 + 组 14 20 + 组 15 18） | 逐位 / 逐字节；组 11 直接跑 `llama-server + 链 + -md` 产品路径，组 12 用 CUDA 构建验段级 offload，组 13 用 KVMem 构建（`build-kvmem2`，`LLAMA_KVMEM=ON`）验 KV 虚拟化，组 14 验远程链 `-np 2` 的 per-seq 投机四通道（判据 7–11），组 15 验远程链多序列的基础语义（判据 2–6） |
 | `verify/verify_chain_death.py` | 36 | 120 s 读超时、链死而进程活、失败可见 |
 | `verify/verify_seq_id.py` | 9 | 跨段 `seq_id` 与位置 |
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | 链上 draft 与整模逐位、端到端逐字节 |

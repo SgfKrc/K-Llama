@@ -25,7 +25,7 @@
 改造落在两个补丁上：主补丁把分段链、远程段、协议 v9、投机接线与段级 offload 一起带进来，可单独编译、
 单独验收；SLIM-ARC 预取是可选增量，默认关闭。控制面只做三件事——读拓扑、起停进程、探活。
 
-结果：`verify/verify.sh` **77 项**与 `verify/verify_chain_death.py` **36 项**全过；DFlash / DSpark 在真跨机
+结果：`verify/verify.sh` **95 项**与 `verify/verify_chain_death.py` **36 项**全过；DFlash / DSpark 在真跨机
 上**零损失**（117/141 = 0.82979，与整模逐 prompt 相同）；MTP 的 catch-up mode 2 把链上接受率追平整模
 **0.9098**（121/133）；3103 token 历史整段重算 19847 ms，第二轮只解 38 个新 token 用 **714 ms**。安卓平板
 （Y700 / Termux / arm64）作为尾段入链：35B 的 8 层段驻留约 **4.90 GiB**，量到 **6.34–8.50 tok/s**。
@@ -40,7 +40,7 @@
 | [01-背景与目标](report/01-背景与目标.md) | 问题（装不下 / 算得慢）、既有做法的代价、判据立场（逐位而不是「看着对」）、v2 → v2.1 的沿革 |
 | [02-总体设计](report/02-总体设计.md) | 七个决策，每个写「选了什么 / 为什么 / 代价是什么」，以及这套形状主动放弃了什么 |
 | [03-实现](report/03-实现.md) | 具体做了什么：补丁构成、关键符号与调用路径、协议版本、控制面 |
-| [04-验证](report/04-验证.md) | 77 项十四组逐组「测什么 / 判据 / 为什么存在」，七个专项脚本，纯分段版独立验收，跨机与安卓的五步破坏性验收 |
+| [04-验证](report/04-验证.md) | 95 项十五组逐组「测什么 / 判据 / 为什么存在」，七个专项脚本，纯分段版独立验收，跨机与安卓的五步破坏性验收 |
 | [05-结果](report/05-结果.md) | 分段 vs 整模的吞吐、投机接受率、跨机三形态、内存、段级 offload 与 MoE 缓存、tap 代价、三种「这样比是错的」 |
 | [06-局限与结论](report/06-局限与结论.md) | 十条边界（现象 / 根因 / 影响 / 代价）、主动不做的分页 KV、已知未做、结论与后续方向 |
 
@@ -71,8 +71,8 @@
 | 算子融合 | **本项目零代码**，用的是上游能力：ggml 计算图与算子融合（llama.cpp 自带），不是 `torch.compile`。`src/llama-graph.cpp` 在本仓只有 relay 段 `GET_ROWS` 一处改动 | 已实现，但**借用上游**（本项目只做选型与验收） |
 | K 缓存优化 / 分页 KV | **没有 PagedAttention**。等价物是三件：prompt cache 前缀复用、checkpoint 序列状态导出 / 导入、`--moe-cache-mib` 专家 LRU（数字见 [05](report/05-结果.md) §4、§5） | **部分完成：换了机制**。差在「分页 / 页表 / copy-on-write」这一层不存在——`llama.cpp` 的 KV 是启动时按 `n_ctx` 预分配的定长 slot；量化论据见 [06](report/06-局限与结论.md) §2 |
 | 多终端协同 | 兑现且更强：跨机 ROG（LAN）/ Surface（4C8T 弱机）+ 安卓 Y700（Termux / arm64）入链，2B 与 35B 都走完五步破坏性验收（[04](report/04-验证.md) §6） | 超额完成 |
-| 模型分层拆分 | 核心就是它：层范围加载 + 段间只传 8 KB hidden；链 == 整模逐位（77 项） | 完全兑现 |
-| 可演示可部署 | `control/qlhctl.py`（944 行）+ 拓扑（56 行）+ 一键 `up` / `status` / `down` + 77 项验收 | 完全兑现 |
+| 模型分层拆分 | 核心就是它：层范围加载 + 段间只传 8 KB hidden；链 == 整模逐位（95 项） | 完全兑现 |
+| 可演示可部署 | `control/qlhctl.py`（944 行）+ 拓扑（56 行）+ 一键 `up` / `status` / `down` + 95 项验收 | 完全兑现 |
 
 ### 表二：原方案的技术组件 → v2.1 的对应物或退场原因
 
@@ -87,7 +87,7 @@
 | `src/api_server.py`（1073 行，FastAPI） | **换实现**：`llama-server` 原生 HTTP（`/completion`、`/chat/completions`），slot 与 prompt cache 走原生路径 |
 | `src/web_ui.py`（253 行，Streamlit）+ `frontend/`（14 个文件，React + Vite） | **退场**。服务面就是 `llama-server` 的 HTTP；控制面是 CLI（`qlhctl.py up/status/down`），可视化平台对「逐位一致」这条判据没有贡献 |
 | `src/device_profiler.py`（1073 行） | **换实现**：显存预算预检 / 后检（`src/qlh-vram-budget.h`），`VMEM: need ~X free Y` 把 WDDM 的静默溢出变成一行日志 |
-| `scripts/quantize_model.py` 等 | **换实现**：llama.cpp 自带量化（IQ4_XS / Q5_K / Q6_K）+ `verify/` 的 77 项验收装置 |
+| `scripts/quantize_model.py` 等 | **换实现**：llama.cpp 自带量化（IQ4_XS / Q5_K / Q6_K）+ `verify/` 的 95 项验收装置 |
 
 **相对原方案，v2.1 在四个维度上抬高了**：
 
@@ -110,7 +110,7 @@ pre-norm 隐藏态接力。
     164.2 KiB**（SLIM-ARC prefetch，默认关闭）；
   - 叠加判据是 `git write-tree`：主补丁 → 纯分段树，再叠增量 → 与 fork HEAD 的树相同（`PATCHES.md`、
     `scripts/export_patches.sh`）。
-- **验收**：`verify/verify.sh` **77 项**（十四组：1–8 组 22 + 组 9 的 2 + 组 10 的 20 + 组 11 的 8 + 组 12 的 1 + 组 13 的 4 + 组 14 的 20；组 13 = KVMem 的 KV 虚拟化，需 `build-kvmem2` 构建；组 14 = 远程链 `-np 2` 的 per-seq 投机，判据 7–11）；
+- **验收**：`verify/verify.sh` **95 项**（十五组：1–8 组 22 + 组 9 的 2 + 组 10 的 20 + 组 11 的 8 + 组 12 的 1 + 组 13 的 4 + 组 14 的 20 + 组 15 的 18；组 13 = KVMem 的 KV 虚拟化，需 `build-kvmem2` 构建；组 14 = 远程链 `-np 2` 的 per-seq 投机，判据 7–11；组 15 = 多序列基础语义，判据 2–6）；
   `verify/verify_chain_death.py` 36、`verify/verify_seq_id.py` 9、`verify/verify_mtp.sh` / `verify_mtp_e2e.sh`
   6 / 6、`verify/verify_grammar_spec.sh` / `verify_rbudget_spec.sh` 23 / 36、
   `verify/verify_seq_rm_exact.py --expect-known-fail` 1 pass / 5 known-fail（5 条是上游 hybrid 的已知基线）。
