@@ -47,29 +47,44 @@ Vulkan 连**自己的** host buft 都不认：`Vulkan_Host` 的 `get_name` 是 `
 
 [代码] KV cache 走同一条规则，且归属与 sched 无关：`llama-kv-cache.cpp:214-221`，`offload_kqv` 为真时 `buft = dev_buffer_type(model.dev_layer(il))`，否则 CPU buffer。`llama-graph.cpp:2697` 的注释把后果写死了：「the device of the cache must compute the matmul, else the scheduler copies the cache to another backend」。
 
-### 1.4 唯一零拷贝通道存在，被一行条件关掉
+### 1.4 零拷贝的门不是 import，是权重归属（2026-11-14 修正）
 
-[代码] Vulkan 在 UMA 上有 import 路径：`ggml_vk_tensor_subbuffer` 先试 `ggml_vk_host_get`（`ggml-vulkan.cpp:6055-6057`），拿到 buffer 就直接当 `vk_buffer` 用；`:6059` 的断言写着「host tensors must not reach dispatch」，即非 import 的 host tensor 不该到 dispatch。
+> **本节原先把门认错了。** E0 实测：改 `ggml-vulkan-buffers.cpp:382` 的 `!multi_device` **零差异**
+> （heap 峰值 1.32 → 1.320 GiB），import 分支**一次都没执行**。原因：Iris Xe 上 `ggml_vk_host_malloc`
+> 走非 portable 分支，分配时就把 `views[dev0]` 填好了，所以那条 import 分支**永远不可达**——
+> `multi_device` 在不在都一样，它是**死代码路径**。
 
-[代码] `ggml_vk_host_get` 在单设备上直接 return（`ggml-vulkan-buffers.cpp:382`）：
+[代码] 真正的门是 `src/llama-model-loader.cpp:1472`：
 
-```c
-if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || ...) return;
+```cpp
+if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+        (use_mmap || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+    buft = ggml_backend_dev_buffer_type(cpu_dev);   // iGPU 上无条件回退
+}
 ```
 
-理由在同段注释：import 会让驱动把这块内存记进 device heap（「measured heapUsage +276 MiB on Iris Xe」），破坏 `#31538` 想省的容量。本机单 iGPU 的 `multi_device` 恒为假（`:5788`），所以 `Vulkan_Host` 的权重永远走 staging 拷贝。
+权重本来要进 `Vulkan_Host`，被这行强制退回 CPU buft。日志证据：
+`tensor 'token_embd.weight' (q4_K) (and 426 others) cannot be used with preferred buffer type Vulkan_Host, using CPU instead`。
 
-**这是 v3 的岔路口**：启用它 → 权重/KV 一份、CPU 与 iGPU 都直接读；代价是这块内存计入 15.82 GiB 核显堆。不启用 → 保持 v2.2 的「每 split 拷贝」。
+[实测] **临时打开 1472**（配 `-lm none`）：
+
+| 配置 | pp512 | heap 峰值 |
+|---|---|---|
+| 改前（权重 CPU buft） | 74.04 | 1.32 GiB |
+| 1472 打开（9B） | **89.15 ± 4.77（+20%）** | 5.61 GiB |
+| **1472 打开（35B-A3B Q2_K）** | **pp64 21.78（改前 13.95，+56%）** | **12.84 GiB（< 15.82，装得下）** |
+
+**所以 v3 的岔路口不是「import 开不开」，是「权重放哪」**：放 `Vulkan_Host` → 权重一份、
+CPU 与 iGPU 都能读，pp +20%/+56%，代价是整份计入 device heap（35B 仍装得下，余 3 GiB）。
+放 CPU buft → 保持今天的行为。
 
 ### 1.5 v2.2 的阈值是算术强度的离散化
 
-[文档] `V3-IGPU-ROLE.md` §7 把 v2.2 的 op_offload 阈值称作「退化版」。该判断在**语义**上成立（per-op 而非 per-stage），在**物理**上需要修正。
+[文档] `V3-IGPU-ROLE.md` §7 称阈值 64 为「退化版」——语义上成立（per-op 而非 per-stage），物理上需修正。
 
-[代码] 阈值判据是 `ggml_vk_get_op_batch_size(op) >= op_offload_min_batch_size`（`ggml-vulkan.cpp:16639-16643`）：m 取 `MUL_MAT` 的 `ne[1]`、`MUL_MAT_ID`/`ROPE` 的 `ne[2]`、其余 `ggml_nrows`（`ggml-vulkan-debug.cpp:821-834`）；默认 iGPU 64、dGPU 32（`:5246-5248`），`GGML_OP_OFFLOAD_MIN_BATCH` 可覆盖（`:16777`）。
+[代码] 判据是 `ggml_vk_get_op_batch_size(op) >= op_offload_min_batch_size`（`ggml-vulkan.cpp:16639-16643`），m 取 `MUL_MAT` 的 `ne[1]` / `MUL_MAT_ID`·`ROPE` 的 `ne[2]` / 其余 `ggml_nrows`；默认 iGPU 64、dGPU 32，`GGML_OP_OFFLOAD_MIN_BATCH` 可覆盖。而 `V3-IGPU-ROLE.md` §2 的平衡点是 111 FLOP/byte、折合 **m ≈ 31**——**64 是这个物理判据的保守离散化**（`:5241-5244`：pp32 核显慢 26%、pp64 快 28%）。
 
-[文档] `V3-IGPU-ROLE.md` §2 的算术强度判据给出 Q4_K 核显平衡点 111 FLOP/byte，折合 m ≈ 31。**64 是这个物理判据的保守离散化**，保守的原因写在 `:5241-5244`：pp32 核显慢 26%、pp64 快 28%。
-
-**推论：把「阶段 = 全给 GPU」当作目标在物理上是错的**——prefill 的 tail chunk（m < 32）按算术强度该留 CPU。阶段只能做**准入**，不能做**指派**。这一条决定了 §3 的推荐形态，也决定了 §2 里 D 的取舍。
+**推论：「阶段 = 全给 GPU」在物理上是错的**——prefill 的 tail chunk（m < 32）按算术强度该留 CPU。阶段只能做**准入**，不能做**指派**。这决定了 §3 的形态与 §2 里 D 的取舍。
 
 ## 2 四种切法
 
@@ -80,27 +95,27 @@ if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->
 | **C 阶段门控** | 每 ubatch | 一次字段写 + 一次 gallocr 布局重算 | 不涉及 | 不变 | 70–120 行 |
 | **D 钉全图** | 每 ubatch | 遍历 n_nodes 调 setter | 不涉及 | 不变 | ~40 行，纯 llama 侧 |
 
-**A 的「KV 怎么共享」是伪问题**。[代码] KV buffer 由 memory 模块持有（`llama-kv-cache.cpp:214-221`），不属于任何 sched；graph 里它是 leaf tensor，两个 sched 都能通过 `backend_from_buffer`（`ggml-backend.cpp:1305-1325`）解析到它。A 的真代价在别处：两份 compute buffer（`llama-context.cpp:934-945` 打印的量级）、两套 `gf_res_prev`（`:827`，graph 的 tensor 分配在 sched 的 buffer 里，换 sched 即失效）、`resolve_fused_ops`（`:672-753`）要各判一次、`moe_cache` 绑 `backend_ptrs`（`:625`）、`graph_params.sched`（`:4563`）要跟着换。
+**A 的「KV 怎么共享」是伪问题**：[代码] KV buffer 由 memory 模块持有（`llama-kv-cache.cpp:214-221`），不属于任何 sched，两个 sched 都能通过 `backend_from_buffer`（`ggml-backend.cpp:1305-1325`）解析到它。A 的真代价是两份 compute buffer、两套 `gf_res_prev`（`:827`，换 sched 即失效）、`resolve_fused_ops` 各判一次、`moe_cache` 绑 `backend_ptrs`（`:625`）、`graph_params.sched` 跟着换。
 
-**A 也不解决 §1.3**：权重 buffer 属于 model，不属于 sched，两个 sched 不能让同一份权重「两边都可读」。**B 出局**：`ggml_backend_sched_reserve`（`:2430`）先 `synchronize`（`:2434`）再 `gallocr_reserve_n`；若 sched 参数变（`can_reuse` 含 `op_offload`，`llama-context.h:568-572`）还会 `sched_new` 重建 sched，丢掉全部 buffer。每 token 一次不可接受。
+**A 也不解决 §1.3**：权重 buffer 属于 model，不属于 sched，两个 sched 不能让同一份权重「两边都可读」。**B 出局**：`sched_reserve`（`:2430`）先 `synchronize`（`:2434`）再 `gallocr_reserve_n`，若参数变（`can_reuse` 含 `op_offload`）还会 `sched_new` 重建、丢掉全部 buffer——每 token 一次不可接受。
 
-**D 是现成 API**：`ggml_backend_sched_set_tensor_backend`（`:2555-2562`），`split_graph` 的 pass 1 不覆盖用户赋值（`:1509`、`:1518`）；`llama-graph.cpp:2716`、`:3221` 已在用。但它是**指派**：钉死全部 node 会让 prefill tail 违反 §1.5，且钉到不支持的 backend 直接崩（要逐 node `supports_op`）。只适合当过渡验证。
+**D 是现成 API**：`ggml_backend_sched_set_tensor_backend`（`:2555-2562`），`split_graph` 的 pass 1 不覆盖用户赋值，`llama-graph.cpp:2716`、`:3221` 已在用。但它是**指派**：钉死全部 node 会让 prefill tail 违反 §1.5，且钉到不支持的 backend 直接崩。只适合当过渡验证。
 
-## 3 推荐方案与理由
+## 3 推荐方案与理由（E0/E1 之后修订）
 
-**推荐 C（阶段门控）作为接口，D 作为验证手段，并把 E0/E1 两个测量排在实现之前。**
+**E1 已证明 C 的性能增量是零，E0 已证明真正的杠杆是权重归属。所以顺序反过来：先做「权重放 `Vulkan_Host`」的策略化，C 留作「可声明」的第二层。**
 
 判据（按权重排序）：
 
 1. **切换频率**：阶段边界是每 ubatch ≤ 1 次（continuous batching 下 prefill chunk 与 decode 交错）。只有零分配切换可行 → B 出局。
-2. **reserve 代价**：C 复用 `sched_reserve` 的既有预留（pp/tg 都预留过），不新增 malloc。阶段变化使 `backend_ids_changed`（`ggml-backend.cpp:2032-2046`）→ `gallocr_reserve_n`（`:2078`），但 `ggml-alloc.c:895-930` 只在 `new_chunk_size > cur_chunk_size` 时 malloc，否则只重算布局。**[推断]** 成本 = O(n_nodes) 布局重算 + 一次全 backend 同步，量级 10²–10³ µs；未实测，见 §7 G4。
-3. **KV**：四种切法都不改 KV 归属（§1.3），所以它不是方案判据。真约束是另一条：**decode 用 CPU ⇒ KV 必须在 CPU 可读池**（`-ngl 0` 或 `--no-kv-offload`）。KV 在 `Vulkan0` 时 CPU 后端 `supports_buft` 为假，每 token 要拷整个 KV——**这条路物理上走不通**，不是优化空间问题。
-4. **权重**：四种切法都不改权重归属。真约束是 §1.4 的岔路口，与切法正交。
-5. **改动面**：C ~100 行 < D ~40 行 < A 400–700 行。D 更小，但它的语义是错的（§1.5）。
+2. **reserve 代价**：C 复用 `sched_reserve` 的既有预留（pp/tg 都预留过），不新增 malloc。阶段变化使 `backend_ids_changed`（`ggml-backend.cpp:2032-2046`）→ `gallocr_reserve_n`（`:2078`），但 `ggml-alloc.c:895-930` 只在 `new_chunk_size > cur_chunk_size` 时 malloc，否则只重算布局。**[推断]** 成本 = O(n_nodes) 布局重算 + 一次全 backend 同步，量级 10²–10³ µs；未实测，见 §7 G3。
+3. **KV**：四种切法都不改 KV 归属（§1.3）。真约束是：**decode 用 CPU ⇒ KV 必须在 CPU 可读池**（`-ngl 0` 或 `--no-kv-offload`）。KV 在 `Vulkan0` 时 CPU 后端 `supports_buft` 为假，每 token 要拷整个 KV——**代价是 12%（§6 第 6 条已重算），不是「走不通」**。
+4. **权重**：四种切法都不改权重归属。真约束是 §1.4 的岔路口，**与切法正交，且它才是性能杠杆**。
+5. **改动面**：C ~63 行 < D ~40 行 < A 400–700 行。D 更小，但语义是错的（§1.5）。
 
-**C 的性能增量可能接近零**：§1.5 的阈值 64 已经让「prefill chunk 上 GPU、decode 留 CPU」成立；decode 的 m ≥ 64 只在 `n_seq_max ≥ 64` 或投机 `k ≥ 63` 时出现，两个都不现实。C 的真实价值是**可声明、可观测、可回退**——今天这个行为由硬件默认值与 env 隐式决定，`qlh-split-defaults.h:20` 还要在分段链上把它关掉（`server-context.cpp:1330-1340`），日志里只有一行 debug。
+**C 的价值是「可声明、可观测、可回退」，不是性能**——今天这个行为由硬件默认值与 env 隐式决定，`qlh-split-defaults.h:20` 还要在分段链上把它关掉（`server-context.cpp:1330-1340`），日志里只有一行 debug。
 
-**所以先把 E1 做掉**（§7）：如果 `-ngl 0 --op-offload` 的端到端已经等于 `T = N/pp_gpu + M/tg_cpu`，那 C 就是「给既有行为命名」，应当按命名需求排期，而不是按性能需求排期。E0（§1.4 的 import 通道）决定「数据不动」这条前提是否成立，优先级高于 C。
+**所以 v3 的第一刀是 §1.4 的权重归属策略**：`llama-model-loader.cpp:1472` 改成可声明（`auto` / `host` / `device`），默认行为不变，收益 9B +20%、35B +56%。它不改 sched、不改协议、不改分段链，是「可声明」最基础的落点。
 
 ## 4 接口草案
 
@@ -188,7 +203,7 @@ void llama_context::sched_set_stage(llama_stage stage) {
 3. **混合批无法在单 graph 内分离**：一个 ubatch 里 prefill 行与 decode 行共用同一个 `MUL_MAT`，设备只能选一个。要分离必须拆成两个 graph 各 alloc/compute，那是另一个量级的改动（v3.1）。
 4. **`gallocr_reserve_n` 的实际成本未实测**：`ggml-alloc.c:895-930` 的 realloc 条件是逐 chunk 比大小，若 prefill 的 GPU buffer 需求大于 decode，来回切会反复 reserve（不 malloc，但每次同步全部 backend）。
 5. **分段链**：head 与 stage 是两个进程、两个 `llama_context`、两个 sched，各自按本进程的 ubatch 判定阶段，**不需要协议字段**（同一帧的 `n_tokens` 两端相同）。但若 stage 在无 iGPU 的机器上，它的 PREFILL 准入等于全 CPU，两端日志的 stage 相同而设备不同——排查时要看每端的 split 数，不能只看 stage。
-6. **`offload_kqv` 与阶段门控冲突**：KV 在 `Vulkan0` 时 decode 阶段被门控到 CPU，会每 token 拷整个 KV。必须把 `-ngl 0`（或 `--no-kv-offload`）写成阶段门控的**前置条件**并在启动时校验，否则症状是「能跑但慢一到两个数量级」（**[推断]**：每 token 拷数 GB 的 KV，按 20 GB/s 算是数十至数百 ms/token，对照 decode 的 140 ms/token）。
+6. **`offload_kqv` 与阶段门控冲突，但代价被高估了**：KV 在 `Vulkan0` 时 decode 阶段被门控到 CPU，会每 token 拷整个 KV。按 `-c 4096`、`head_count_kv=2`、`key_length=value_length=256`、40 层算，每 token 的 KV 是 **2 KB × 4096 × 40 ≈ 336 MB**，按 20 GB/s 是 **17 ms**，对照 decode 的 140 ms 是 **+12%**——不是原文说的「数 GB / 数十至数百 ms」（那是按 `n_ctx = 262144` 算的，实际不会开那么大）。**所以这不是「物理上走不通」，是 12% 的代价**，长 prompt 场景下 prefill 的 2.51× 远大于它。启动校验仍值得做，但判据应改成「按 context 长度估算拷贝占比，超过阈值才警告」。
 
 ## 7 验证方案
 
@@ -200,10 +215,7 @@ void llama_context::sched_set_stage(llama_stage stage) {
 
 | # | 判据 | 怎么判 |
 |---|---|---|
-| G1 | 门控不改变正确性 | `temp 0`、固定 prompt 与 seed，`GGML_SCHED_STAGE_*` 关/开两跑，输出逐字节相同。**基线必须是同配置**（`V3-IGPU-ROLE.md` §7 已记录混合批与串行差一个字，跨配置比对不成立） |
-| G2 | 阶段可观测 | 每 ubatch 一行 INFO：`stage`、`n_tokens/n_seqs`、`n_splits`。prefill 的 split 数含 GPU split，decode 的 split 数 == 1 |
-| G3 | 门控确实生效 | decode ubatch 的 `n_splits == 1`（无 MoE cache / layer-inp 等额外 host-weight split 时），且无 `#Vulkan0#` 命名的 copy 张量（`ggml-backend.cpp:1798` 的命名规则） |
-| G4 | 切换成本 | 给 `sched_graph_realloc`（`llama-context.cpp:4591`）加计时，统计每次阶段切换的 `gallocr_reserve_n` 耗时。判据 < 1 ms/次，否则改为「阶段变化时置 `sched_need_reserve`」的慢路径 |
-| G5 | 混合批行为 | 一个 prefill + 一个 decode 同批，记录 `T` 与 `n_splits`，确认与今天一致（不承诺改善） |
-| G6 | 分段链两端一致 | head/stage 各自打印 stage，同一帧两端 stage 相同；`n_splits` 各自不同是正常的 |
-| G7 | 前置条件被拦住 | `--offload-kqv` + 阶段门控时启动即拒（或强 warn），消息点名 `-ngl 0` / `--no-kv-offload` |
+| G1 | 门控不改变正确性 | `temp 0` 固定 prompt/seed，门控关/开两跑输出逐字节相同。**基线必须同配置**（跨配置比对不成立） |
+| G2 | 阶段可观测且确实生效 | 每 ubatch 一行 INFO：`stage`、`n_tokens/n_seqs`、`n_splits`。prefill 的 split 含 GPU、decode 的 `n_splits == 1`，且无 `#Vulkan0#` 命名的 copy 张量 |
+| G3 | 切换成本 | 给 `sched_graph_realloc` 加计时，`gallocr_reserve_n` < 1 ms/次；否则改为阶段变化时置 `sched_need_reserve` 的慢路径 |
+| G4 | 前置条件被拦住 | `--offload-kqv` + 阶段门控时启动即拒或强 warn，消息点名 `-ngl 0` / `--no-kv-offload` |
