@@ -388,12 +388,12 @@ else
     SMOKE_OUT=$QLH_TMP/smoke_group1.log
     if run_limited "$SMOKE_TIMEOUT" "$SMOKE_OUT" "$SMOKE"; then
         out=$(cat "$SMOKE_OUT")
-        echo "$out" | grep -q "=== ARGMAX 一致 ===" && ok "双段 argmax 一致" || bad "双段 argmax 不一致"
-        echo "$out" | grep -q "\[A\] vs \[B\] hidden 2048 维逐位相同" && ok "head hidden 与整模层输入逐位相同" || bad "head hidden 与基线不同"
-        echo "$out" | grep -q "广播生效" && ok "seq_rm 广播到两段" || bad "seq_rm 未广播"
-        echo "$out" | grep -q "\[E\] 三段链与整模 logits 逐位相同" && ok "三段链逐位相同" || bad "三段链不一致"
+        echo "$out" | grep -q "=== ARGMAX match ===" && ok "双段 argmax 一致" || bad "双段 argmax 不一致"
+        echo "$out" | grep -q "\[A\] vs \[B\] hidden 2048 dims bit-identical" && ok "head hidden 与整模层输入逐位相同" || bad "head hidden 与基线不同"
+        echo "$out" | grep -q "broadcast applied" && ok "seq_rm 广播到两段" || bad "seq_rm 未广播"
+        echo "$out" | grep -q "\[E\] 3-stage chain and whole-model logits bit-identical" && ok "三段链逐位相同" || bad "三段链不一致"
         echo "$out" | grep -q "\[F\] n_stages after rejected attaches = 0" && ok "不衔接的链被拒（-1）" || bad "衔接校验没生效"
-        if [ -s "$SMOKE_OUT" ] && ! grep -q "=== ARGMAX 一致 ===" "$SMOKE_OUT"; then
+        if [ -s "$SMOKE_OUT" ] && ! grep -q "=== ARGMAX match ===" "$SMOKE_OUT"; then
             echo "  （smoke 输出尾部，见 .qlh_tmp/verify/smoke_group1.log）"
             tail -8 "$SMOKE_OUT" | sed 's/^/    /'
         fi
@@ -523,8 +523,8 @@ SMOKE6=$QLH_TMP/smoke_group6.log
 if run_limited "$SMOKE_TIMEOUT" "$SMOKE6" \
         env QLH_SPLIT_REMOTE2=127.0.0.1:$PORT_RELAY,127.0.0.1:$PORT_TAIL "$SMOKE"; then
     out6=$(cat "$SMOKE6")
-    if echo "$out6" | grep -q "logits 全 .* 维: 逐位相同"; then
-        ok "三段链全 vocab 逐位相同（$(echo "$out6" | grep -o 'logits 全 [0-9]* 维' | head -1)）"
+    if echo "$out6" | grep -q "logits all .* dims: bit-identical"; then
+        ok "三段链全 vocab 逐位相同（$(echo "$out6" | grep -o 'logits all [0-9]* dims' | head -1)）"
     else
         bad "三段链不一致"
         echo "$out6" | grep -E "^\[G\]" | head -5
@@ -540,9 +540,9 @@ if run_limited "$SMOKE_TIMEOUT" "$SMOKE6" \
 
     # [G2]：checkpoint 往返（只在 QLH_SPLIT_REMOTE2 下跑）。这一组比 [E]/[G] 的 1~3 token
     # 更重要——它跑 20+ token，而 1 token 的逐位对比曾经掩盖过 M-RoPE 位置分叉（p>0 才暴露）。
-    echo "$out6" | grep -qE "\[G2\] local: .*逐位相同" && ok "本地链 checkpoint save→restore→重算逐位相同" || bad "本地链 checkpoint 往返不一致"
-    echo "$out6" | grep -qE "\[G2\] whole: .*逐位相同" && ok "整模 checkpoint 往返逐位相同（对照）" || bad "整模 checkpoint 往返不一致"
-    echo "$out6" | grep -q "remote chain vs whole after checkpoint restore: 逐位相同" && ok "远程链 checkpoint 恢复后与整模逐位相同" || bad "远程链 checkpoint 恢复后与整模不同"
+    echo "$out6" | grep -qE "\[G2\] local: .*bit-identical" && ok "本地链 checkpoint save→restore→重算逐位相同" || bad "本地链 checkpoint 往返不一致"
+    echo "$out6" | grep -qE "\[G2\] whole: .*bit-identical" && ok "整模 checkpoint 往返逐位相同（对照）" || bad "整模 checkpoint 往返不一致"
+    echo "$out6" | grep -q "remote chain vs whole after checkpoint restore: bit-identical" && ok "远程链 checkpoint 恢复后与整模逐位相同" || bad "远程链 checkpoint 恢复后与整模不同"
     echo "$out6" | grep -q "restore a .* -> 0 (expect 0)" && ok "清空后恢复被拒（漂移检测）" || bad "漂移检测没生效"
 else
     # 超时/崩溃时输出是残缺的，逐个 grep 会刷出 8 条假 FAIL。报一条、贴尾巴。
@@ -605,8 +605,8 @@ hdr "组 8  MTP 投机（链上投机 · 链上 MTP 与整模 MTP 逐位）"
 if [ -x "$BIN/split-rows.exe" ]; then
     if run_limited "$SMOKE_TIMEOUT" "$QLH_TMP/smoke_group8.log" "$BIN/split-rows.exe"; then
         out8=$(cat "$QLH_TMP/smoke_group8.log")
-        echo "$out8" | grep -q "链上每一行 logits 与整模逐位相同" && ok "链上逐行 logits 与整模逐位相同" || bad "链上逐行 logits 与整模不同"
-        echo "$out8" | grep -q "链上 MTP draft 与整模 MTP 逐位相同" && ok "链上 MTP draft 与整模 MTP 逐位相同" || bad "链上 MTP draft 与整模 MTP 不同"
+        echo "$out8" | grep -q "every chain logits row matches the whole model bit for bit" && ok "链上逐行 logits 与整模逐位相同" || bad "链上逐行 logits 与整模不同"
+        echo "$out8" | grep -q "chain MTP draft matches whole-model MTP bit for bit" && ok "链上 MTP draft 与整模 MTP 逐位相同" || bad "链上 MTP draft 与整模 MTP 不同"
     else
         bad "split-rows 没跑完（rc=$?），见 .qlh_tmp/verify/smoke_group8.log"
         tail -6 "$QLH_TMP/smoke_group8.log" | sed 's/^/    /'
@@ -719,29 +719,29 @@ remote_tap_group() {
     GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_c" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" --draft "$draft" \
         --remote-compare "$dump" --endpoint "127.0.0.1:$PORT_STAGE"
     rc=$?
-    grep -q "^\[PASS\] $taps 路 tap 全部与整模逐位相同" "$log_c" \
-        && ok "$name: $taps 路 tap 全部与整模逐位相同（$(sed -n 's/.*(\([0-9]*\/[0-9]*\)；.*/\1/p' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] $taps taps all bit-identical to the whole model" "$log_c" \
+        && ok "$name: $taps 路 tap 全部与整模逐位相同（$(sed -n 's/.*(\([0-9]*\/[0-9]*\);.*/\1/p' "$log_c" | head -1)）" \
         || bad "$name: tap 拼接与整模不同，见 $(basename "$log_c")"
-    grep -q "^\[PASS\] wire 上的 $wire 路 tap 与整模逐位相同" "$log_c" \
+    grep -q "^\[PASS\] $wire taps over the wire bit-identical to the whole model" "$log_c" \
         && ok "$name: $wire 路 tap 经 wire 取回后与整模逐位相同" \
         || bad "$name: wire 上的 tap 与整模不同"
-    grep -q "^\[PASS\] 远程链 vs 整模 logits 逐位相同" "$log_c" \
-        && ok "$name: 远程链 logits 与整模逐位相同（$(grep -o '([0-9]*/[0-9]* 个位置)' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] remote chain vs whole-model logits bit-identical" "$log_c" \
+        && ok "$name: 远程链 logits 与整模逐位相同（$(grep -o '([0-9]*/[0-9]* positions)' "$log_c" | head -1)）" \
         || bad "$name: 远程链 logits 与整模不同"
-    grep -q "^\[PASS\] 远程链续写 token 与整模逐 token 相同" "$log_c" \
+    grep -q "^\[PASS\] remote chain continuation tokens match the whole model token by token" "$log_c" \
         && ok "$name: 远程链续写 token 与整模逐 token 相同（$(grep -o '([0-9]*/[0-9]*)' "$log_c" | tail -1)）" \
         || bad "$name: 远程链续写 token 与整模不同"
-    grep -q "^\[PASS\] 续写每一步的" "$log_c" \
-        && ok "$name: 1 行帧的 tap 也与整模逐位相同（$(sed -n 's/.*逐位相同 (\([0-9]*\) 步)/\1 步/p' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] every continuation step's" "$log_c" \
+        && ok "$name: 1 行帧的 tap 也与整模逐位相同（$(sed -n 's/.* (\([0-9]*\) steps)/\1 steps/p' "$log_c" | head -1)）" \
         || bad "$name: 1 行帧的 tap 与整模不同"
-    grep -q "^\[PASS\] verify 形状帧（" "$log_c" \
+    grep -q "^\[PASS\] verify-shaped frame (" "$log_c" \
         && ok "$name: k=2 verify 帧（3 行）逐行 argmax 与整模相同" \
         || bad "$name: verify 形状帧的逐行 argmax 与整模不同"
-    grep -q "^\[PASS\] verify 形状帧的 3 行 x" "$log_c" \
+    grep -q "^\[PASS\] verify-shaped frame's 3 rows x" "$log_c" \
         && ok "$name: k=2 verify 帧的 3 行 x $taps 路 tap 逐位相同" \
         || bad "$name: verify 形状帧的 tap 与整模不同"
-    grep -q "^\[PASS\] tap 传输量" "$log_c" \
-        && ok "$name: tap 传输字节数与预期一致（$(grep -o '[0-9]* B，实测 [0-9]* B' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] tap bytes" "$log_c" \
+        && ok "$name: tap 传输字节数与预期一致（$(grep -o '[0-9]* B, measured [0-9]* B' "$log_c" | head -1)）" \
         || bad "$name: tap 传输字节数不符"
     grep -q "layer-input request" "$log_s" \
         && ok "$name: stage 收到了 layer-input 请求（$(grep -o '[0-9]* ids, [0-9]* owned' "$log_s" | head -1)）" \
