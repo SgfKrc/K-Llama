@@ -48,7 +48,7 @@
 
 ---
 
-## 3. 方案 B 的归因纠正（原方案 §2.2 / §4）
+## 3. 方案 B 的归因纠正（见 `MOE-搬运与计算优化.md` §2.2 / §4）
 
 原方案的因果链是：`6.5 GB/s`（gather 慢）→「地址惩罚≈0」→「并行度喂不饱」→ 批处理（250–500 行）→ 4 倍。
 
@@ -79,7 +79,7 @@
 - `cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly)`（`:5980`），失败清错 + DEBUG + `return false`
 - **零 in-tree 调用者**
 
-要新写的只有原方案 §3.2 第 1 步那个「按真实 OS 页对齐并合并」——`llama_moe_cache` 里有 `groups`/`layers`/`host_bytes`，但**没有任何按地址排序、合并、页对齐的结构**。落点：`src/llama-moe-cache.cpp` 的 `impl` ctor 尾部（约 655，`groups`/`layers` 已定型）注册，`impl` dtor（682）注销。
+要新写的只有 `MOE-搬运与计算优化.md` §3.2 第 1 步那个「按真实 OS 页对齐并合并」——`llama_moe_cache` 里有 `groups`/`layers`/`host_bytes`，但**没有任何按地址排序、合并、页对齐的结构**。落点：`src/llama-moe-cache.cpp` 的 `impl` ctor 尾部（约 655，`groups`/`layers` 已定型）注册，`impl` dtor（682）注销。
 
 **估行数 80–150**（原方案 100–200 合理）。
 
@@ -93,13 +93,13 @@
 | --- | --- | --- |
 | §1 表·单机整模纯 CPU | 8.23，标「941 + 64」 | `DESIGN.md:25` 是 **tg256**；`INDEX.md` 现行 941 口径是 **9.09**（`-t 14`） |
 | §1 表·三段链 | 5.85，标「`-ngl 0`」 | `INDEX.md:27` 无 `-ngl 0`；64 gen 是 **1522** 口径的数，941 口径没记 |
-| §1 成本表·固定开销 | 3 × 14.78 ms | `14.78` 全仓库无出处；`INDEX.md` §4 的每段固定开销是 10–20 ms |
+| `MOE-搬运与计算优化.md` §1 成本表·固定开销 | 3 × 14.78 ms | `14.78` 全仓库无出处；`INDEX.md` §四 的每段固定开销是 10–20 ms |
 | §1 成本表·hidden 传输 | 8 KB / **2 ms** / 1% | 8 KB ÷ 100 Mbps = **0.66 ms**；`ARCHITECTURE.md:213` 明说「亚毫秒级」 |
 | §1 成本表·占比 | 26+43+31+1% | 加总 **101%**；44.3+73+54+2 = 173.3 ≠ 170.9（2 ms 与 54 ms 重复计） |
 | §0 | 合计 400–800 行 | 100–200 + 250–500 = **350–700** |
-| §2.2 | 8 次独立的 **1.72 MB** GEMV | 1.72 MiB 是 gate_up+down **合计**；单次 `mul_mat_id` 的 gate_up 是 **1.125 MiB**，且 decode 每层有 **2 次**（gate_up + down） |
-| §4.4 t/s 列 | 8.5 / 11.8 / 20.0 | 只有把**整链 40 层**都按缩放后的每层 ms 算才复现（`1000/(40×ms+17.5)`）；按「只缩 Surface 24 层」得 **8.22 / 9.79 / 12.09**，后两行低 17–40% |
-| §4.4 方法 | 用 6.5 GB/s 缩放 3.76 ms/层 | 3.76 × 6.5 = **24.4 MB/层**，而 8 专家实际 ≈ 14.4 MB——只有 59% 的 3.76 ms 能归给 gather；且 6.5 测于**本机核显**，3.76 测于 **Surface i5-1035G4** |
+| `MOE-搬运与计算优化.md` §2.2 | 8 次独立的 **1.72 MB** GEMV | 1.72 MiB 是 gate_up+down **合计**；单次 `mul_mat_id` 的 gate_up 是 **1.125 MiB**，且 decode 每层有 **2 次**（gate_up + down） |
+| `MOE-搬运与计算优化.md` §4.4 t/s 列 | 8.5 / 11.8 / 20.0 | 只有把**整链 40 层**都按缩放后的每层 ms 算才复现（`1000/(40×ms+17.5)`）；按「只缩 Surface 24 层」得 **8.22 / 9.79 / 12.09**，后两行低 17–40% |
+| `MOE-搬运与计算优化.md` §4.4 方法 | 用 6.5 GB/s 缩放 3.76 ms/层 | 3.76 × 6.5 = **24.4 MB/层**，而 8 专家实际 ≈ 14.4 MB——只有 59% 的 3.76 ms 能归给 gather；且 6.5 测于**本机核显**，3.76 测于 **Surface i5-1035G4** |
 | §6 第 4 条 | 读 Strata `Memory/LEDGER.md` L9 | **该文件在 Strata 仓库里不存在**（全树 find 无）；42.55 GB/s 只能从 `pool.hpp:3-7` 的注释得到 |
 | §8 | `sycl/` 114,290 行 | `.cpp` 实测 **114,743**（差 0.4%）；含头文件共 161,384 |
 
@@ -229,7 +229,7 @@
 ### 9.3 因此
 
 - **方案 A 在本机（Windows + mmap）不成立**：不是实现问题，是驱动语义差异。上游的 `Portable|ReadOnly` 在 Windows 直接不支持，退到无 ReadOnly 又变成复制。
-- 唯一可能的替代是 `--load-mode none`（loader 自己分配 pinned host buffer，不经过 `cudaHostRegister`），代价是 21.86 GiB 加载慢 + 锁定——这正是上游 §2.1 表里「`--load-mode none`：279.1 pp / 32.3 tg」那条，它在 pageable 之上确实快，但加载时间不可接受。
+- 唯一可能的替代是 `--load-mode none`（loader 自己分配 pinned host buffer，不经过 `cudaHostRegister`），代价是 21.86 GiB 加载慢 + 锁定——这正是 `MOE-搬运与计算优化.md` §2.1 表里「`--load-mode none`：279.1 pp / 32.3 tg」那条，它在 pageable 之上确实快，但加载时间不可接受。
 - **`ggml-cuda.cu` 的 ReadOnly fallback 值得保留**：它把一个真实的 Windows 平台差异变成「多一次调用」，失败时仍然 fail soft；对上游是一个独立可提交的小修复。
 - **pin 实现本身保留**：它在 Linux 上是对的（上游机制），本机只是跑不到。
 

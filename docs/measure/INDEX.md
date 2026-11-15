@@ -43,7 +43,7 @@
 | 三段链，DFlash | **−31%** | 941 token | `MODEL-SWAP.md` §11.8 | — |
 
 **「接受率与拓扑无关」这句话不成立**：同一草稿源在 Surface（1102 token）是 0.8357、Y700（1522 token）是 0.7400、
-§11.8 那批（941 token）是 0.93182。**接受率随 prompt 内容与长度变**，不随拓扑变——两件事要分开说。
+11.8 那批（941 token）是 0.93182。**接受率随 prompt 内容与长度变**，不随拓扑变——两件事要分开说。
 
 ## 三、模型与权重
 
@@ -52,8 +52,8 @@
 | 35B 整模（官方 UD-Q4_K_M） | **21.11 GiB** | `print_info` 口径；`block_count` 41、`nextn` 1、trunk 40 | `SPLIT-MEASUREMENTS.md` §0 | **21.10**（GGUF 头逐张量累加，同文件，舍入差）；**21.87**（蒸馏版）；**20.82**（`Q4_K_XL`） |
 | head `0:32` | **15.690 GiB** | 同上，逐张量累加 | `CROSS-MACHINE.md` §6 | — |
 | tail `32:40` | **4.90 GiB**（驻留） | 4.022 权重 + 0.493 + 0.389 缓冲 | `CROSS-MACHINE.md` §6 | — |
-| **head `0:24`** | **12.271 GiB** | blk 11.768 + `token_embd` 0.503（2026-11-13 逐张量实测） | 本表 §3 | 曾估「约 11.8」（漏了 token_embd） |
-| **relay `24:32`** | **3.923 GiB** | 纯 blk（同上实测） | 本表 §3 | 曾估「约 3.9」 |
+| **head `0:24`** | **12.271 GiB** | blk 11.768 + `token_embd` 0.503（2026-11-13 逐张量实测） | 本表 §三 | 曾估「约 11.8」（漏了 token_embd） |
+| **relay `24:32`** | **3.923 GiB** | 纯 blk（同上实测） | 本表 §三 | 曾估「约 3.9」 |
 | `token_embd` | **515 MiB** | 248320×2048，**Q8_0** | `ARCHITECTURE.md:42` | — |
 | `output`（lm_head） | **398 MiB（0.389 GiB）** | 248320×2048，**Q6_K** | `CROSS-MACHINE.md:132` | **515 MiB**（错——那是 `token_embd` 的 Q8_0 尺寸；由此「中段省 1030.62 MiB」应为 **~913 MiB**） |
 | `src/models/` 实现数 | **176** | `ls src/models/*.cpp \| wc -l` | `report/02:101` | **171**（错，对不上任何口径）；`llm_arch` 条目 173/174（含 UNKNOWN） |
@@ -74,7 +74,7 @@
 | --- | ---: | --- | --- | --- |
 | `verify.sh --skip-build` | **95 项** | 15 组；组 13 = KVMem，组 14 = per-seq 投机（判据 7–11），组 15 = 多序列基础语义（判据 2–6） | 2026-11-14（组 15 加入后的记账验证：`QLH_VERIFY_FAST=1` + `--skip-build`，`PASS=60 FAIL=0 SKIP=3`，60 = 95 − (30+1+4) 对上；组 15 单独跑 18/0） | **57**（13 组，组 13 = KVMem，2026-11-12 `verify_g13b.log`）；**53**（12 组，组 12 = 段级 offload，2026-11-11 `verify_final53.log`）；**52**（11 组，2026-11-09 `verify_full.log`） |
 | `verify.sh`（含构建） | **96 项** | 上面 95 + 「三目标构建完成」1 项 | 同上 | 58（13 组时代）；54（12 组时代） |
-| `verify_chain_death.py` | **36 项** | 独立脚本 | `report/04` §4 | — |
+| `verify_chain_death.py` | **36 项** | 独立脚本 | `report/04-验证.md` §4 | — |
 
 **注意**：`README.md` 与 `docs/README.en.md` 的项数必须同步；英文镜像曾滞后（停在 52）。
 

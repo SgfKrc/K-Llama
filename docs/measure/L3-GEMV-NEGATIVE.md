@@ -21,7 +21,7 @@
 
 假设 ① 被推翻时，L3 的收益机制其实已经失去落脚点——「2 warp/EU 的价值」全部来自「让计算与 load 重叠」，而重叠能省的上限是计算占比本身：**108.5 us / 687.5 us = 15.8%**（§2.2）。在 in-flight 已经够用的前提下，这 15.8% 是 L3 唯一能碰到的天花板，而它还要先付出 prepack 的代价。
 
-**教训**：L1 的 +1.4% 当时被读成「L1 不够深」，正确的读法应该是「in-flight 已经不是瓶颈，这条路上没有肉」。设计文档 §3.5 在 L1 之后仍然保留 +10~15% 的预期，是把一个已被反证的前提继续当了基础。
+**教训**：L1 的 +1.4% 当时被读成「L1 不够深」，正确的读法应该是「in-flight 已经不是瓶颈，这条路上没有肉」。`IGPU-DECODE-KERNEL.md` §3.5 在 L1 之后仍然保留 +10~15% 的预期，是把一个已被反证的前提继续当了基础。
 
 ---
 
@@ -59,7 +59,7 @@
 
 走 L3 的算子带宽 **23 GB/s**，stock 是 **39~53 GB/s**。
 
-**判据 2 本身有口径问题**：9B 模型的 perf log 里 `q4_K m=4096 n=1 k=12288` **只以 `MUL_MAT_ADD + MUL_MAT_VEC` 融合形式出现**（16 次采样无 unfused 条目）。所以设计文档 §3.1 的 687.5 us 实际是**融合后**的算子，而 §3.3 的骨架没有 bias 融合——照抄骨架实现，根本跑不到判据点名的那个算子上。最终版补了 bias 融合才真正走进去。
+**判据 2 本身有口径问题**：9B 模型的 perf log 里 `q4_K m=4096 n=1 k=12288` **只以 `MUL_MAT_ADD + MUL_MAT_VEC` 融合形式出现**（16 次采样无 unfused 条目）。所以 `IGPU-DECODE-KERNEL.md` §3.1 的 687.5 us 实际是**融合后**的算子，而 `IGPU-DECODE-KERNEL.md` §3.3 的骨架没有 bias 融合——照抄骨架实现，根本跑不到判据点名的那个算子上。最终版补了 bias 融合才真正走进去。
 
 ### 2.3 判据 3：tg ≥7.96 —— 不达标
 
@@ -134,9 +134,9 @@ L116: send.dc1 (16|M0)  r36  r34  ...   // 地址 +144 B
 
 `docs/design/IGPU-DECODE-KERNEL.md` 有三处硬伤，本轮已修：
 
-1. **§3.2 字节账**：`2×128 + 2×16 = 288 B` 里那个 288 已经等于 `2×144`（含 dm），漏算了 dm。按 `uint16` 存 scm 实际是 **296 B（+2.78%）**；要真做到零膨胀必须把 8 个 12-bit 打进 12 B 或并入同一 16 B 记录。
-2. **§3.3 缺 bias 融合**，而判据点名的算子恰好是融合算子（见 §2.2）。
-3. **§3.3 lane↔元素映射**：低/高 4 位对应的元素相距 **32** 不是 16（`dequantize_row_q4_K`，`ggml-quants.c:1551-1559`），骨架里的 `hi0` 配 `b1`、`g*32 + h*16` 都是按 16 写的，会让 prepack 布局整体失效且整模上只表现为「logits 全错」。
+1. **`IGPU-DECODE-KERNEL.md` §3.2 字节账**：`2×128 + 2×16 = 288 B` 里那个 288 已经等于 `2×144`（含 dm），漏算了 dm。按 `uint16` 存 scm 实际是 **296 B（+2.78%）**；要真做到零膨胀必须把 8 个 12-bit 打进 12 B 或并入同一 16 B 记录。
+2. **`IGPU-DECODE-KERNEL.md` §3.3 缺 bias 融合**，而判据点名的算子恰好是融合算子（见 §2.2）。
+3. **`IGPU-DECODE-KERNEL.md` §3.3 lane↔元素映射**：低/高 4 位对应的元素相距 **32** 不是 16（`dequantize_row_q4_K`，`ggml-quants.c:1551-1559`），骨架里的 `hi0` 配 `b1`、`g*32 + h*16` 都是按 16 写的，会让 prepack 布局整体失效且整模上只表现为「logits 全错」。
 
 ---
 
@@ -147,7 +147,7 @@ L116: send.dc1 (16|M0)  r36  r34  ...   // 地址 +144 B
 cmd //c "H:\llamacpp-c\.qlh_tmp\l3\build_l3.bat"
 
 # 判据 1：GRF（不需要 igc-probe，见 verify/tools/grf）
-bash verify/tools/grf/grf.sh mul_mat_vec_q4_k_l3.comp 16 1 1
+bash slimarc/prototype:verify/tools/grf/grf.sh mul_mat_vec_q4_k_l3.comp 16 1 1
 
 # 判据 2 / 3 / 4
 bash .qlh_tmp/l3/perf_kernel.sh 1 l3      # perf logger
@@ -162,7 +162,7 @@ L3 全部改动默认关闭：`GGML_VK_L3_GEMV` 未设置时连两条 pipeline �
 
 ## 8 未做
 
-- **sector 对齐浪费没有实测**（§5.1 的 11% 是推算）。验证方法：用 `VK_EXT_memory_budget` 或 DRAM 计数器测实际读字节数，或直接做「128 B 对齐 prepack + 保留 stock kernel 结构」的对照。
+- **sector 对齐浪费没有实测**（本文件 §5 的 11% 是推算）。验证方法：用 `VK_EXT_memory_budget` 或 DRAM 计数器测实际读字节数，或直接做「128 B 对齐 prepack + 保留 stock kernel 结构」的对照。
 - **`send.dc1` vs `send.ugm` 的代价没测**。
 - **判据 2 的「慢 2 倍」未定因**（§4），只在判据 1 的框架下被当作下游。
 - **stock 基线 7.24 → 7.92 的 +9.4% 未归因**，与设计文档 §5 记的「6.31 → 7.24 的 14% 未归因」是两笔独立的账。

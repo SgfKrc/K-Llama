@@ -87,7 +87,7 @@
 | `src/api_server.py`（1073 行，FastAPI） | **换实现**：`llama-server` 原生 HTTP（`/completion`、`/chat/completions`），slot 与 prompt cache 走原生路径 |
 | `src/web_ui.py`（253 行，Streamlit）+ `frontend/`（14 个文件，React + Vite） | **退场**。服务面就是 `llama-server` 的 HTTP；控制面是 CLI（`qlhctl.py up/status/down`），可视化平台对「逐位一致」这条判据没有贡献 |
 | `src/device_profiler.py`（1073 行） | **换实现**：显存预算预检 / 后检（`src/qlh-vram-budget.h`），`VMEM: need ~X free Y` 把 WDDM 的静默溢出变成一行日志 |
-| `scripts/quantize_model.py` 等 | **换实现**：llama.cpp 自带量化（IQ4_XS / Q5_K / Q6_K）+ `verify/` 的 95 项验收装置 |
+| `slimarc/prototype:scripts/quantize_model.py` 等 | **换实现**：llama.cpp 自带量化（IQ4_XS / Q5_K / Q6_K）+ `verify/` 的 95 项验收装置 |
 
 **相对原方案，v2.1 在四个维度上抬高了**：
 

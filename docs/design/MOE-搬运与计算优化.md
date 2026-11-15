@@ -4,12 +4,12 @@
 > 更新日期：2026-11-15
 > 适用范围：Qwen3.6-35B-A3B Q4 下 **head 段**（本机 GPU+CPU 混合，29 层专家留 CPU）的 MoE 路径；
 > 读者为实现者与验收者。分段结构、协议、网络、量化档位不在本文范围。
-> 相关：`DESIGN.md` §1（专家上 GPU 的实测与显存边界）、`IGPU-SLOWDOWN.md` §5/§⑦（`op_offload` 与
+> 相关：`DESIGN.md` §1（专家上 GPU 的实测与显存边界）、`IGPU-SLOWDOWN.md` §⑤/§⑦（`op_offload` 与
 > 带宽结论）、`SEGMENT-OFFLOAD.md`、`MEASUREMENTS.md` §3、`THREE-SEGMENT.md` §4（段耗时的成本结构）。
 >
 > **引用约定**：本仓库只有文档；代码路径分属三处——`H:\llamacpp-c`（llama.cpp fork，本文的
 > `repack.cpp` / `ggml-cpu.c` / `llama-moe-cache.cpp` / `common.h` / `split-stage/main.cpp` 都在这里）、
-> `H:\sgfd9\Strata`（本文的 `include/strata/kernels/cpu/pool.hpp`、`docs/QWEN36.md`、`docs/INTEL.md`）、
+> `H:\sgfd9\Strata`（本文的 `include/strata/kernels/cpu/pool.hpp`、`Strata:docs/QWEN36.md`、`Strata:docs/INTEL.md`）、
 > 上游 `ggml-org/llama.cpp`（PR 编号）。
 
 ---
@@ -29,7 +29,7 @@ memcpy（PCIe x8 上约减半），CPU 侧的 8 专家 gather 只有 6.5 GB/s �
 
 | 形态 | 口径 | t/s | 出处 |
 | --- | --- | ---: | --- |
-| 三段链（本机 head + Surface relay + Y700 tail） | 941 prompt / 64 gen / `-t 8` / `-ngl 0` | **5.85** | `INDEX.md` §1（原始记录 `20261112-D1`） |
+| 三段链（本机 head + Surface relay + Y700 tail） | 941 prompt / 64 gen / `-t 8` / `-ngl 0` | **5.85** | `INDEX.md` §一（原始记录 `20261112-D1`） |
 | 两段链（本机 `0:32` + Y700 `32:40`） | 同上 | 7.46 | `20261112-D2` |
 | 弱设备链（Surface `0:24` + Y700 `24:40`） | n=24 / IQ4_XS 蒸馏版 / 21.87 GiB | 6.50 | `ANDROID-SURFACE-段接入评估.md` §0 |
 | 单机整模纯 CPU | 941 + 64 | 8.23 | `DESIGN.md:25` |
@@ -51,7 +51,7 @@ memcpy（PCIe x8 上约减半），CPU 侧的 8 专家 gather 只有 6.5 GB/s �
 
 **结论：通信数据量不是瓶颈（1%）。RTT 与每段固定开销占 69%，段内计算占 31%。** 本文只处理那 31%
 里 head 段的部分——因为 RTT 是网络物理属性，每段固定开销在 `ARCHITECTURE.md` §11（串行叠加）
-与 `INDEX.md` §4（10–20 ms）已单独讨论。
+与 `INDEX.md` §四（10–20 ms）已单独讨论。
 
 ## 2. 两处瓶颈的定位
 
@@ -267,12 +267,12 @@ decode 时每个 expert 只有 1 行，于是变成 **8 次独立的 1.72 MB GEM
 
 | 不做 | 理由 |
 | --- | --- |
-| **改造 Strata 成分段引擎** | Strata 的 Qwen3.6 路径（`src/qwen35`，5,378 行）**只在 CUDA/HIP**（`docs/QWEN36.md:8`）；Surface（Iris Xe）与 Y700（Adreno）是 Vulkan/OpenCL，跑不了 |
-| **移植 SYCL/Vulkan** | `sycl/` 有 114,290 行基础设施但缺 `qwen35`；且 `docs/INTEL.md:9` 说 Intel Arc 上 llama.cpp SYCL 只有 Strata CUDA 的 1/3 |
+| **改造 Strata 成分段引擎** | Strata 的 Qwen3.6 路径（`src/qwen35`，5,378 行）**只在 CUDA/HIP**（`Strata:docs/QWEN36.md:8`）；Surface（Iris Xe）与 Y700（Adreno）是 Vulkan/OpenCL，跑不了 |
+| **移植 SYCL/Vulkan** | `sycl/` 有 114,290 行基础设施但缺 `qwen35`；且 `Strata:docs/INTEL.md:9` 说 Intel Arc 上 llama.cpp SYCL 只有 Strata CUDA 的 1/3 |
 | **纯 CPU 跑 Strata** | `src/kernels/cpu/` 只有专家与量化 kernel，attention/KV/GDN/QSA（~15,149 行）没有 CPU 版 |
 | **改分段结构 / 协议 / 网络** | 通信数据量只占 1%（§1）；RTT 是物理属性 |
 | **换量化** | Q4 是质量目标；Q2/Q3 的容量优势是另一个取舍 |
-| **动 `op_offload` 默认值** | `IGPU-SLOWDOWN.md` §5 已归因，且分段链默认 `no_op_offload = true`，改了也不生效 |
+| **动 `op_offload` 默认值** | `IGPU-SLOWDOWN.md` §⑤ 已归因，且分段链默认 `no_op_offload = true`，改了也不生效 |
 
 ## 9. 与 K-Strata 立项的关系
 

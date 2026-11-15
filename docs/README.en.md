@@ -163,8 +163,7 @@ Short prompts therefore lose (the draft context costs ~2.1 s to build, which is 
 long prompts plus DSpark win (fewer taps: 1 of 5 in the head vs 2 of 8 for DFlash).
 
 **Splitting locally is a pure loss** (2B is 26% slower): there is no cross-machine round trip to
-save, and the two processes fight over the same CPU and memory bus. Mechanism: [SPECULATION-DATA.md]
-§4.
+save, and the two processes fight over the same CPU and memory bus. Mechanism: [SPECULATION-DATA.md] §4.
 
 Chain acceptance (local two-stage, `n_predict 64`, 3 prompts, [MODEL-SWAP.md] §11.4): keep-KV
 **0.78767** (115/146), catch-up mode 2 **0.9098** (121/133, bit-identical to the whole model);

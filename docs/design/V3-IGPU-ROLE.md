@@ -1,8 +1,8 @@
 # 核显的阶段化定位
 > 面向 Qwen3.5 系列 · 基于算术强度归因 · 产出 v3 的 prefill/decode 分离输入
 
-> 状态：**设计输入（2026-11-14）**，不是实现方案
-> 依据：`docs/measure/IGPU-SLOWDOWN.md` §7、`docs/measure/L3-GEMV-NEGATIVE.md`、`.qlh_tmp/igpu-moe/`（D-OP-PROFILE / FIX-REPORT）
+> 状态：**方案**（待定项：2026-11-14 的设计输入，尚未实现）
+> 依据：`docs/measure/IGPU-SLOWDOWN.md` §⑦、`docs/measure/L3-GEMV-NEGATIVE.md`、`.qlh_tmp/igpu-moe/`（D-OP-PROFILE / FIX-REPORT）
 > 平台：Intel Iris Xe（Gen12 / XE1）+ i9-13900H + DDR5-4800 双通道（实测 76.8 GB/s 理论、连续读 55.7 GB/s）
 
 标注约定：**[实测]** 本机带 bracket 对照测出；**[代码]** 由源码读出；**[推算]** 公式算出，假设写在旁边。

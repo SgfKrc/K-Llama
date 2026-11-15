@@ -91,7 +91,7 @@ cd build-split/bin
   --split-layer-range 0:32 --split-tail-range 32:40 -c 4096 -np 1 -t 8 -ngl 0 --port 8080
 ```
 
-上面两条依次是 2B（24 层，切点 20，`README.md`「快速开始」口径）与 35B（40 层，切点 32，纯 CPU，`MODEL-SWAP.md` §11.2 口径）。`<模型路径>` 换成 §3 的目录；`--split-layer-range` 是本进程加载的层（从 0 起），`--split-tail-range` 是同机尾段，两者与 `--split-remote` 互斥。
+上面两条依次是 2B（24 层，切点 20，`README.md`「快速开始」口径）与 35B（40 层，切点 32，纯 CPU，`MODEL-SWAP.md` §11.2 口径）。`<模型路径>` 换成第三节的目录；`--split-layer-range` 是本进程加载的层（从 0 起），`--split-tail-range` 是同机尾段，两者与 `--split-remote` 互斥。
 
 **应该看到什么**：加载完之后一行 `listening on http://127.0.0.1:8080`（`DEPLOYMENT.md` §3）。另开一个终端验证：
 
