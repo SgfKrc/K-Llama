@@ -191,3 +191,52 @@
 | 原方案的基线 30.45 | 不可复现 | 模型不同（Q4_K_XL vs IQ4_XS）+ `-ncmoe 29` spill（§8.3） |
 
 **下一步只有一条路**：接线方案 A，在 `-ncmoe 34` 下做 `--moe-cache-mib {0,1024,2048,3072}` 的 A/B，看 pinning 后 cache 是否从 −39%~−57% 翻成正收益。如果是，head 段就拿到上游那 +11%~+30%；如果不是，本机的 PCIe x8 + WDDM 组合不适合 GPU 专家缓存，方案 A 也只剩「H2D 拷贝更快」这一层收益（上游 pp +27%~+44% 的那部分）。
+
+---
+
+## 9. 方案 A 的实现与本机结论（2026-11-15 深夜）
+
+### 9.1 实现（`H:\llamacpp-c`，未提交）
+
+- `src/llama-moe-cache.cpp`：`impl::pin()`（约 126 行）——env gate（`GGML_CUDA_REGISTER_HOST`）→ cap（`ggml_backend_dev_memory(cpu)/4`，`LLAMA_MOE_PIN_MIB` 覆盖，≤0 禁用）→ 遍历 `groups` 收集 host 专家 range → 排序/合并/页对齐 → 逐 range `ggml_backend_register_host_buffer`（proc address，名字不带 cuda 前缀）→ `pinned` 记录 `(ptr, unregister)`，dtor 注销。
+- `src/llama-moe-cache.h`：`void pin();`
+- `src/llama-context.cpp`：`sched_reserve()` 之后 `if (moe_cache) moe_cache->pin();`
+- `ggml/src/ggml-cuda/ggml-cuda.cu`：`cudaHostRegisterReadOnly` 返回 `cudaErrorNotSupported` 时去掉 ReadOnly 重试。
+
+**关键修正**：`pin()` 必须放在 `sched_reserve()` 之后。放在 ctor 里时 `ranges = 0`——`no_alloc` 模式下 model tensor 的 `data` 和 `buffer->base` 都是 null；移到 `sched_reserve()` 之后 `ranges = 102`。
+
+### 9.2 本机结论：WDDM 不支持大范围 file-backed pin
+
+三层错误链，逐层排除：
+
+| 层 | 现象 | 排除方式 | 结论 |
+|---|---|---|---|
+| 1 | ctor 里 `ranges = 0` | 移到 `sched_reserve()` 后 | 已解决，`ranges = 102` |
+| 2 | `cudaHostRegister(Portable\|ReadOnly)` → `801 operation not supported` | ctypes 直调 cudart 对照 | **ReadOnly 在本机驱动上不支持**（匿名与 file-backed 一样） |
+| 3 | 去掉 ReadOnly（Portable 或 0）→ `2 out of memory` | 注册前按页 fault-in（touch 每一页） | **仍 out of memory** |
+
+**ctypes 对照**（`cudart64_12.dll`）：
+
+| 内存 | flags | 结果 |
+|---|---|---|
+| 匿名 1 MiB | `Portable\|ReadOnly` | 801 |
+| 匿名 1 MiB | `Portable` / `0` | 0 ✓ |
+| file-backed 1 MiB | `ReadOnly` / `P\|RO` | 801 |
+| file-backed 1 MiB | `Portable` / `0` | 0 ✓ |
+
+**1 MiB 能 pin，210 MiB 不能**，且 fault-in 无效——说明不是「页未 resident」，是 WDDM 对大范围注册的限制：Windows 的 `cudaHostRegister` 不带 ReadOnly 时把范围**复制进 pinned 池**（池大小受 WDDM 约束），而 Linux 的同一调用是**锁定原页**（零拷贝）。上游 #31122 的收益建立在后者上。
+
+### 9.3 因此
+
+- **方案 A 在本机（Windows + mmap）不成立**：不是实现问题，是驱动语义差异。上游的 `Portable|ReadOnly` 在 Windows 直接不支持，退到无 ReadOnly 又变成复制。
+- 唯一可能的替代是 `--load-mode none`（loader 自己分配 pinned host buffer，不经过 `cudaHostRegister`），代价是 21.86 GiB 加载慢 + 锁定——这正是上游 §2.1 表里「`--load-mode none`：279.1 pp / 32.3 tg」那条，它在 pageable 之上确实快，但加载时间不可接受。
+- **`ggml-cuda.cu` 的 ReadOnly fallback 值得保留**：它把一个真实的 Windows 平台差异变成「多一次调用」，失败时仍然 fail soft；对上游是一个独立可提交的小修复。
+- **pin 实现本身保留**：它在 Linux 上是对的（上游机制），本机只是跑不到。
+
+### 9.4 对 §8.1 的最终修正
+
+§8.1 的 cache 曲线（23.39 → 14.19 / 17.88 / 10.13）**不能归因于 pageable 上传**——本机的 pinning 从未成功注册过任何范围。那条曲线的成因是「cache 占 VRAM → `-ncmoe 34` 从 0 spill 变成 1.36 GiB spill → decode 变慢」，与 §8.3 的 ncmoe 单峰是同一个机制的两个侧面。
+
+**所以「先 pinning 再开 cache」这条实施顺序在本机不成立**：pinning 不可用，cache 的负收益又主要来自 VRAM 抢占，那么 cache 在本机 8 GB VRAM 上就**没有可用配置**（除了把 `-ncmoe` 再调大、让出 VRAM，但那时 cache 的命中收益也随之消失）。
+
+**方案 A 判定：在本机不成立，需 Linux + 足够 VRAM 的机器才能验证上游那组 +11%~+30%。**
