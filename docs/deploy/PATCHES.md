@@ -11,7 +11,7 @@
 本项目是 K-Llama 的第二代。两代的差别不在协议层，而在模型怎么装进显存和内存：第一代靠「裁好的层段工件」，第二代靠「整模
 + 层范围」。llama.cpp 侧的补丁因此完全不同。
 
-**代码现状（v2.2）**：主补丁 + SLIM-ARC 相对基提交 `5676dfbe0` 共 **55 文件 / +21788 −238**
+**代码现状（v2.2）**：主补丁 + 核显 + MoE pin 相对基提交 `a956a852c` 共 **58 文件 / +20169 −337**
 （`5676dfbe0` → `slimarc/v2.2`，树 `61781c712`），覆盖第一代到第五代的全部改动，拆成三个可独立应用的补丁。
 **含 KVMem 的那一档是 v2.1 口径**：`09338b85e` → `kvmem/integration` 共 **91 文件 / +21611 −376**
 （树 `192b2a3d0`）——KVMem 补丁**未随 v2.2 重导**（`kvmem/integration` 尚未 rebase），仍绑 v2.1 基底，
@@ -19,12 +19,12 @@
 
 | 补丁 | 包含 | 统计（基底） |
 | --- | --- | --- |
-| [`docs/llamacpp-split.patch`](../llamacpp-split.patch)（主补丁） | 第一、二、四代 + v2.2 多序列：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7/v8/v9/v10（v10 支持远程链多序列）、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定、段级 offload、显存预算、per-seq 投机四通道。**不含 SLIM-ARC、不含核显修复** | **55 文件** / +21995 −331 / 24540 行 / 1240.9 KiB（`5676dfbe0`） |
-| [`docs/llamacpp-vulkan-igpu.patch`](../llamacpp-vulkan-igpu.patch)（v2.2 核显，与主补丁正交） | Intel 核显的四处修复与一处特化：host buffer 不占 device heap（#31538 的 UMA OOM）、UMA 读回走 copy engine、op_offload 阈值 32→64（仅 iGPU）、Q4_K decode GEMV 预取下一个 superblock、MMVQ 放行 Q2/Q3（XE1 上 q2_K 6.5 → 33.9 GB/s）。**Q4_K 预取原本属 SLIM-ARC 第五代**，因与核显修复同期落地，这里合并成一个正交补丁 | **4 文件** / +298 −139 / 461 行 / 29.0 KiB（`ebbfa2c79`） |
-| [`docs/llamacpp-slimarc.patch`](../llamacpp-slimarc.patch)（可选增量） | 第三代 SLIM-ARC prefetch：10 个源文件 + 3 个文件里的 6 处钩子 | 13 文件 / +3665 −1 / 3790 行 / 164.2 KiB（`5676dfbe0`，内容未变） |
+| [`docs/llamacpp-split.patch`](../llamacpp-split.patch)（主补丁） | 第一、二、四代 + v2.2 多序列 + 权重 buffer 策略：层范围加载、分段链、远程段、聚合 memory、checkpoint、server/MTP/DFlash/DSpark 接线、协议 v7/v8/v9/v10（v10 支持远程链多序列）、grammar / rbudget 兼容、`seq_rm` 失败显式化、device-buffer 宽度判定、段级 offload、显存预算、per-seq 投机四通道、SLIM-ARC prefetch（含删掉三个不可达 expert 单元）、`QLH_WEIGHT_BUFT` 显式策略。**不含核显修复、不含 MoE pin** | **51 文件** / +19768 −248 / 21988 行 / 1141.6 KiB（`a956a852c`） |
+| [`docs/llamacpp-vulkan-igpu.patch`](../llamacpp-vulkan-igpu.patch)（v2.2 核显，与主补丁正交） | Intel 核显四处修复：host buffer 在单堆 UMA 上不 import（#31538 的 UMA OOM）、op_offload 阈值 32→64、MMVQ 放行 Q2/Q3（XE1 上 q2_K 6.5 → 33.9 GB/s）、Q4_K decode GEMV 的预取尾组越界（编译期行数 vs 运行期行数） | **4 文件** / +210 −88 / 454 行 / 28.8 KiB（`a956a852c`） |
+| [`docs/llamacpp-moe-pin.patch`](../llamacpp-moe-pin.patch)（可选，Linux 才生效） | MoE cache 的 host 专家页 pinning：按 OS 页对齐合并 range、cap 默认 RAM/4、`LLAMA_MOE_PIN_MIB` 覆盖、teardown 注销、`ggml-cuda` 的 ReadOnly fallback。**依赖主补丁**（`llama_context` 的调用点在主补丁里）。Windows WDDM 拒绝大范围 file-backed pin，本机 pinned 0/102 | **3 文件** / +191 −1 / 269 行 / 12.1 KiB（`a956a852c`） |
 | [`docs/llamacpp-kvmem.patch`](../llamacpp-kvmem.patch)（可选增量） | 第五代 KVMem 虚拟化：memory factory hook、attn Q/K capture 钩子、KV cache 跳过空洞清理、CUDA stage-in、`--kvmem*` CLI、`llama-kvmem-bridge`。**adapter 主体在外部**（`LLAMA_KVMEM_ROOT` 指向 `SgfKrc/kvmem`），本补丁只含 fork 侧接线 | **52 文件** / +1266 −135 / 2941 行 / 130.6 KiB（**未随 v2.2 重导，仍绑 v2.1 基底 `09338b85e`**） |
 
-前两个补丁逐项相加等于 55 / +21788 −238：45 + 13 里有 3 个文件重叠（`src/CMakeLists.txt`、
+三个补丁逐项相加等于 58 / +20169 −337（51 + 4 + 3，无文件重叠）：三个补丁之间只有 `src/CMakeLists.txt` 被主补丁改、核显与 pin 不碰它；
 `src/llama-context.cpp`、`src/llama-model-loader.cpp` 各出一份 diff），并集仍是 55（58 − 3）。算术校验：
 18123 + 3665 = 21788、237 + 1 = 238。KVMem 那档（91 文件）是 v2.1 时 55 + 52 − 16 个重叠的结果，数字保持不变。
 
@@ -63,9 +63,10 @@ SLIM-ARC 补丁得 main-only 树 A，再正向生成两个 `git diff`。结果�
 
 | 补丁 | 叠在什么之上 | 叠完的树 |
 | --- | --- | --- |
-| `llamacpp-split.patch`（主） | 直接叠在基提交 `5676dfbe0` 上 | `2541c9d29` |
-| `llamacpp-slimarc.patch` | 叠在**主补丁之上**（不直接叠基提交） | `61781c712` |
-| `llamacpp-kvmem.patch` | 叠在 **v2.1 的 `548c3dfb0` 之上**（主 + SLIM-ARC 之后；**未随 v2.2 重导**，对 v2.2 树 apply 会冲突） | `192b2a3d0` |
+| `llamacpp-split.patch`（主） | 直接叠在基提交 `a956a852c` 上 | `e7c23b4f` |
+| `llamacpp-vulkan-igpu.patch` | 叠在**主补丁之上**（与主补丁正交，也可单独 apply 到基提交） | `c03241ca` |
+| `llamacpp-moe-pin.patch` | 叠在**主补丁之上**（`llama_context` 的调用点在主补丁里） | `b68d6a6b`（= HEAD） |
+| `llamacpp-kvmem.patch` | 叠在 **v2.1 的 `548c3dfb0` 之上**（**未随 v2.2 重导**，对 v2.2 树 apply 会冲突） | `192b2a3d0` |
 
 **顺序是硬性的**：主 → SLIM-ARC → KVMem。KVMem 的 `src/llama-context.cpp` 改动相对**叠了 SLIM-ARC 之后**的版本写，
 直接叠在主补丁上会在 `src/llama-context.cpp:14` 冲突（已实测 `git apply --check` 失败）。「主 + KVMem」**不是**合法组合。

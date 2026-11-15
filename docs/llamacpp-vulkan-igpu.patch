@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-index 9c6edb569..38fec2d43 100644
+index 9c6edb569..f790db60a 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-@@ -284,8 +284,15 @@ void * ggml_vk_host_malloc(size_t size) {
+@@ -284,8 +284,16 @@ void * ggml_vk_host_malloc(size_t size) {
  
      ggml_vk_instance_init();
  
@@ -10,8 +10,9 @@ index 9c6edb569..38fec2d43 100644
 -        const size_t align      = std::max<size_t>(vk_instance.host_import_alignment, TENSOR_ALIGNMENT);
 +    vk_device dev0 = ggml_vk_get_device(0);
 +
-+    // A single-heap iGPU has no separate host pool: a Vulkan host buffer is charged to the
-+    // device heap, so CPU layers eat VRAM (#31538). Use system memory there instead.
++    // A single-heap iGPU has no separate host pool: a Vulkan host buffer there is charged to
++    // the device heap, so CPU layers eat VRAM. Use system memory instead. There the GPU has no
++    // view of it, so a tensor in it is CPU-only and a copy has to stage it.
 +    const bool portable = vk_instance.multi_device || dev0->host_visible_is_device_local;
 +    if (portable) {
 +        const size_t align      = std::max({vk_instance.host_import_alignment,
@@ -20,7 +21,7 @@ index 9c6edb569..38fec2d43 100644
          const size_t alloc_size = (size + align - 1) / align * align;
  
          void * ptr = portable_aligned_malloc(align, alloc_size);
-@@ -293,15 +300,15 @@ void * ggml_vk_host_malloc(size_t size) {
+@@ -293,15 +301,15 @@ void * ggml_vk_host_malloc(size_t size) {
              return nullptr;
          }
          vk_host_allocation entry;
@@ -39,7 +40,7 @@ index 9c6edb569..38fec2d43 100644
      vk_buffer buf;
      try {
          buf = ggml_vk_create_buffer(dev0, size,
-@@ -348,7 +355,8 @@ void ggml_vk_host_free(void * ptr) {
+@@ -348,7 +356,8 @@ void ggml_vk_host_free(void * ptr) {
      for (auto & view : entry.views) {
          ggml_vk_destroy_buffer(view);
      }
@@ -49,18 +50,19 @@ index 9c6edb569..38fec2d43 100644
          portable_aligned_free(entry.base);
      }
  }
-@@ -367,6 +375,10 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
+@@ -367,6 +376,11 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
  
      if (entry.views[device->idx] == nullptr) {
          const uint32_t bit = 1u << device->idx;
-+        // Not entry.portable: importing a host allocation makes the driver charge it to the
-+        // device heap exactly like a native allocation (measured heapUsage +276 MiB on Iris Xe),
-+        // which defeats moving it out of that heap (#31538). Keep it as system memory and let
-+        // the copy path stage it -- slower per copy, but the only form that frees the memory.
++        // The gate below is not entry.portable. A single-heap iGPU is not multi_device,
++        // so it returns here and keeps the allocation as system memory: importing it
++        // would charge it to the device heap like a native allocation (measured
++        // heapUsage +276 MiB on Iris Xe) and defeat the point of the portable allocation. Under
++        // multi_device a portable allocation is imported when the driver allows it.
          if (!vk_instance.multi_device || !vk_instance.device_host_buffer_import[device->idx] || (vk_instance.host_import_failed & bit)) {
              return;
          }
-@@ -712,8 +724,11 @@ static bool ggml_vk_buffer_host_read_direct(const vk_buffer & buf) {
+@@ -712,8 +726,11 @@ static bool ggml_vk_buffer_host_read_direct(const vk_buffer & buf) {
      // If the device is not an UMA device the memory is host-accessible through rebar. While writing
      // through PCIe is sufficient fast reading back data from PCIe is slower than going through
      // the HW device to host copy path.
@@ -75,7 +77,7 @@ index 9c6edb569..38fec2d43 100644
      return (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && buf->device->uma && !slow_host_read;
  }
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
-index 81fd5b8a8..7d7d837cb 100644
+index e72afc6ae..592c40754 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 @@ -723,6 +723,7 @@ struct vk_device_struct {
@@ -86,7 +88,7 @@ index 81fd5b8a8..7d7d837cb 100644
      bool prefer_host_memory;
      bool float_controls_rte_fp16;
      bool float_controls_denorm_preserve_fp16;
-@@ -1369,6 +1370,7 @@ struct ggml_backend_vk_buffer_context {
+@@ -1375,6 +1376,7 @@ struct ggml_backend_vk_buffer_context {
  struct vk_host_allocation {
      void *    base = nullptr;
      size_t    size = 0;
@@ -95,15 +97,15 @@ index 81fd5b8a8..7d7d837cb 100644
  };
  
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 22641f5fb..faab84a59 100644
+index bb5aec365..6555e11c9 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -4237,6 +4237,26 @@ static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
-     return false;
- }
+@@ -4243,6 +4243,26 @@ static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
+ 
+ static void ggml_vk_device_start_keepalive(vk_device& device);
  
 +// True when every HOST_VISIBLE memory type also lives in a DEVICE_LOCAL heap: a single-heap
-+// iGPU, where a Vulkan host buffer is charged to the same heap as the weights (#31538).
++// iGPU, where a Vulkan host buffer is charged to the same heap as the weights.
 +static bool ggml_vk_host_visible_is_device_local(const vk::PhysicalDevice & physical_device) {
 +    const vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
 +    bool any_host_visible = false;
@@ -125,7 +127,7 @@ index 22641f5fb..faab84a59 100644
  vk_device ggml_vk_get_device(size_t idx) {
      VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
  
-@@ -4477,6 +4497,7 @@ vk_device ggml_vk_get_device(size_t idx) {
+@@ -4483,6 +4503,7 @@ vk_device ggml_vk_get_device(size_t idx) {
          device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
          device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
          device->rebar = ggml_vk_has_rebar(device->physical_device);
@@ -133,7 +135,7 @@ index 22641f5fb..faab84a59 100644
          if (sm_builtins) {
              device->shader_core_count = sm_props.shaderSMCount;
          } else if (amd_shader_core_properties2) {
-@@ -5214,6 +5235,18 @@ vk_device ggml_vk_get_device(size_t idx) {
+@@ -5220,6 +5241,18 @@ vk_device ggml_vk_get_device(size_t idx) {
      return vk_instance.devices[idx];
  }
  
@@ -152,7 +154,7 @@ index 22641f5fb..faab84a59 100644
  static void ggml_vk_print_gpu_info(size_t idx) {
      GGML_ASSERT(idx < vk_instance.device_indices.size());
      size_t dev_num = vk_instance.device_indices[idx];
-@@ -5406,6 +5439,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
+@@ -5412,6 +5445,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
      const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
      const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
      const bool rebar = ggml_vk_has_rebar(physical_device);
@@ -160,7 +162,7 @@ index 22641f5fb..faab84a59 100644
  
      integer_dot_product = integer_dot_product
                         && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated
-@@ -5452,10 +5486,18 @@ static void ggml_vk_print_gpu_info(size_t idx) {
+@@ -5458,8 +5492,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
  #endif
  
      std::string device_name = props2.properties.deviceName.data();
@@ -170,67 +172,45 @@ index 22641f5fb..faab84a59 100644
 +              idx, device_name.c_str(), driver_props.driverName.data(), uma, rebar, single_heap, fp16_str, bf16, fp4, subgroup_size,
                props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
  
-+    {
-+        const bool is_integrated_gpu = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
-+        const char * min_batch_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
-+        const int min_batch = min_batch_env ? atoi(min_batch_env) : ggml_vk_op_offload_min_batch_default(is_integrated_gpu);
-+        GGML_LOG_DEBUG("ggml_vulkan: %s: op_offload min batch = %d (%s)\n", device_name.c_str(), min_batch,
-+                  min_batch_env ? "GGML_OP_OFFLOAD_MIN_BATCH" : (is_integrated_gpu ? "iGPU default" : "dGPU default"));
-+    }
-+
      if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
-         GGML_LOG_DEBUG("ggml_vulkan: Warning: Device type is CPU. This is probably not the device you want.\n");
-     }
-@@ -6014,6 +6056,7 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6020,6 +6054,13 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
      }
      if (!buffer) {
-+        GGML_ASSERT(ggml_backend_buffer_is_vk(tensor->buffer));  // host tensors must not reach dispatch
++        // Only a Vulkan device buffer has a view the GPU can bind. A host tensor lands
++        // here when its memory cannot be imported (single-heap iGPU, ggml_vk_host_malloc);
++        // staging would copy it on every dispatch, so refuse and name the cause.
++        if (!ggml_backend_buffer_is_vk(tensor->buffer)) {
++            GGML_ABORT("ggml_vulkan: %s: tensor %s is in %s, which the GPU cannot read\n",
++                ctx->device->name.c_str(), tensor->name, ggml_backend_buffer_name(tensor->buffer));
++        }
          auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
          buffer = buf_ctx->dev_buffer;
          offset = vk_tensor_offset(tensor) + tensor->view_offs;
-@@ -6981,14 +7024,27 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
+@@ -6987,6 +7028,15 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
              return true;
          }
      case VK_VENDOR_ID_INTEL:
--        if (device->architecture == vk_device_architecture::INTEL_XE2) {
--            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
--                return true;
--            }
-+        // MMVQ is a win for Q2/Q3 on Intel: measured on Iris Xe (XE1) with the
-+        // Windows proprietary driver, the q2_K mat-vec goes from 6.5 to 33.0 GB/s
-+        // and a 35B-A3B MoE decode from 10.7 to ~16 t/s. Q6_K is the exception on
-+        // XE1 (17% slower through MMVQ: 41.2 -> 35.1 GB/s on a 9B dense model),
-+        // so it keeps the non-MMVQ path below. Q2_0 is grouped with Q2_K (same
-+        // 2-bit family; the models measured here do not contain it).
-+        if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K ||
-+            src0_type == GGML_TYPE_Q3_K) {
-+            return true;
++        // MMVQ is a win for Q2/Q3 on Iris Xe (XE1): q2_K mat-vec 6.5 -> 33.0 GB/s, a
++        // 35B-A3B MoE decode 10.7 -> ~16 t/s. Q6_K is slower there (41.2 -> 35.1 GB/s
++        // on a 9B dense model), so only Q2/Q3 are let through.
++        if (device->architecture == vk_device_architecture::INTEL_XE1) {
++            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K) {
++                return true;
++            }
 +        }
 +
-+        // Q6_K keeps MMVQ on XE2 because that is what this code did there before, and
-+        // there is no XE1/XE2 comparison to justify changing it. Only the XE1 measurement
-+        // above says MMVQ loses for Q6_K, so only XE1 falls through to the paths below.
-+        if (device->architecture == vk_device_architecture::INTEL_XE2 && src0_type == GGML_TYPE_Q6_K) {
-+            return true;
-         }
- 
-         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
--            // Intel Windows proprietary driver MMVQ performance for !Q2/Q3/Q6 is worse than fp16,
-+            // Intel Windows proprietary driver MMVQ performance for the remaining
-+            // types is worse than fp16,
-             // see https://github.com/ggml-org/llama.cpp/issues/17628 and
-             // https://github.com/ggml-org/llama.cpp/pull/23056
-             return false;
-@@ -15889,6 +15945,22 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
+         if (device->architecture == vk_device_architecture::INTEL_XE2) {
+             if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+                 return true;
+@@ -15967,6 +16017,21 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
  static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
      UNUSED(params);
      ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
 +
-+    // Log the effective op_offload threshold once per device. ggml_vk_print_gpu_info()
-+    // also logs it, but that runs while the backend registers during process start,
-+    // before the log system is ready, so it is dropped; this is the first point where
-+    // it is actually visible (e.g. with -v).
++    // Log the effective op_offload threshold once per device. This is the only place it is
++    // logged: ggml_vk_print_gpu_info() runs while the backend registers during process
++    // start, before the log system is ready, so a line there is dropped.
 +    {
 +        static std::mutex log_mutex;
 +        static std::set<int> logged_devices;
@@ -245,7 +225,7 @@ index 22641f5fb..faab84a59 100644
      return ggml_backend_vk_init(ctx->device);
  }
  
-@@ -16702,7 +16774,7 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
+@@ -16804,7 +16869,7 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
          static std::mutex mutex;
          std::lock_guard<std::mutex> lock(mutex);
          if (!initialized) {
@@ -254,7 +234,7 @@ index 22641f5fb..faab84a59 100644
              for (int i = 0; i < ggml_backend_vk_get_device_count(); i++) {
                  ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
                  char desc[256];
-@@ -16712,7 +16784,9 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
+@@ -16814,7 +16879,9 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
                  ctx->description = desc;
                  ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
                  ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
@@ -266,10 +246,10 @@ index 22641f5fb..faab84a59 100644
                      /* .iface   = */ ggml_backend_vk_device_i,
                      /* .reg     = */ reg,
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
-index 93fbacc62..fc9170988 100644
+index 93fbacc62..13057afd2 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
-@@ -8,81 +8,95 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+@@ -8,81 +8,108 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
  
  FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
  
@@ -353,13 +333,26 @@ index 93fbacc62..fc9170988 100644
 +// weight loads without materialising a second superblock's worth of dequantized values:
 +// the prefetch stage costs 2 slots x 2 rows x 2 words and nothing else. Larger depths or
 +// prefetching dm/scales as well both spill and lose more than they gain.
++//
++// This shader is compiled for every Vulkan device, so the change is not Intel-only: it
++// also runs the AMD GCN variant with NUM_ROWS=4, which has not been measured. The iGPU
++// numbers above are the only evidence for it.
 +uint32_t pf_qs[2][NUM_ROWS][2];
 +
-+#define Q4K_LOAD_QS(U, II)                                                                     \
-+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {                                           \
++#define Q4K_LOAD_QS_ROWS(U, II, ROWS)                                                          \
++    [[unroll]] for (uint n = 0; n < (ROWS); ++n) {                                             \
 +        const uint ib = a_offset + (first_row + n) * num_blocks_per_row + (II);                \
 +        pf_qs[U][n][0] = data_a_packed32[ib].qs[q_offset / 4];                                 \
 +        pf_qs[U][n][1] = data_a_packed32[ib].qs[q_offset / 4 + 16];                            \
++    }
++
++// the tail workgroup of a row range can hold fewer than NUM_ROWS rows; prefetch only the rows
++// that exist (the calc loop already stops at num_rows)
++#define Q4K_LOAD_QS(U, II)                                                                     \
++    if (num_rows == NUM_ROWS) {                                                                \
++        Q4K_LOAD_QS_ROWS(U, II, NUM_ROWS)                                                      \
++    } else {                                                                                   \
++        Q4K_LOAD_QS_ROWS(U, II, num_rows)                                                      \
 +    }
 +
 +#define Q4K_CALC(U, II)                                                                        \
@@ -439,7 +432,7 @@ index 93fbacc62..fc9170988 100644
  
  void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
      uint a_offset, b_offset, d_offset;
-@@ -113,8 +127,17 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+@@ -113,8 +140,17 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
          }
      }
  
