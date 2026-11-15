@@ -226,7 +226,7 @@ results are in [SPLIT-MEASUREMENTS.md] §6.
 | --- | --- |
 | `docs/` | Entry points: `QUICKSTART.md` (first working chain), `REPORT.md` (final report), `OPEN-ISSUES.md` (known open issues), `README.en.md` (this file) |
 | `docs/report/` | The six report chapters: `01-背景与目标.md` … `06-局限与结论.md` |
-| `docs/design/` | Mechanisms, protocols and conventions: ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC integration (plan and obstacles) / LILICORR-轻量头 / EXLLAMAV3-GPU段候选 |
+| `docs/design/` | Mechanisms, protocols and conventions: ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC integration (plan and obstacles) / LILICORR-轻量头 / EXLLAMAV3-GPU段候选 / MOE transfer and compute |
 | `docs/deploy/` | Build, deployment and delivery: BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / DELIVERY / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
 | `docs/measure/` | Measurements: SPLIT-MEASUREMENTS / MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN |
 | `docs/limits/` | Boundaries and costs: SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
