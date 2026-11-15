@@ -240,3 +240,19 @@
 **所以「先 pinning 再开 cache」这条实施顺序在本机不成立**：pinning 不可用，cache 的负收益又主要来自 VRAM 抢占，那么 cache 在本机 8 GB VRAM 上就**没有可用配置**（除了把 `-ncmoe` 再调大、让出 VRAM，但那时 cache 的命中收益也随之消失）。
 
 **方案 A 判定：在本机不成立，需 Linux + 足够 VRAM 的机器才能验证上游那组 +11%~+30%。**
+
+### 9.5 `--load-mode none` 对照（全 pinned，绕过 cudaHostRegister）
+
+既然 `cudaHostRegister` 走不通，用 `-lm none`（loader 自己分配 pinned host buffer，21.86 GiB 全锁定）验证「pinned 后 cache 是否翻正」：
+
+| cache | tg（两次） |
+| ---: | --- |
+| 0 | 23.29 / 24.03 |
+| 2048 | 23.20 / 24.56 |
+
+**两条结论**：
+
+1. **cache 的负收益确实是 pageable 上传造成的**：pageable 下 cache 2048 是 17.88（−24%），pinned 下是 23.20（±0%）——上传代价消失。
+2. **但 pinned 后也没有正收益**（23.29 → 23.20，噪声内）。本机 8 GB VRAM 在 `-ncmoe 34` 下已经用掉 7.3 GiB，cache 再占 2 GiB 就把 `-ncmoe 34` 推入 spill（§8.1 已测：need 9.30 / free 7.93）。命中省下的上传被 spill 抵消。
+
+**所以方案 A 在本机不可行是双重原因**：WDDM 不支持 `cudaHostRegister` 的大范围 file-backed 注册，而即使绕开它（`-lm none`），8 GB VRAM 也没有空间让 cache 净收益为正。上游那组 +11%~+30% 需要「pinned + VRAM 有余量」两个条件同时成立。
