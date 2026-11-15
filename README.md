@@ -232,7 +232,7 @@ v2 驱动链的验收（`python checks/verify_*.py` 与 `python -m unittest test
 | --- | --- |
 | `docs/` | 入口：`QUICKSTART.md`（从零跑通一条链）、`REPORT.md`（结题总纲）、`OPEN-ISSUES.md`（遗留问题）、`README.en.md`（英文镜像） |
 | `docs/report/` | 结题六章：`01-背景与目标.md` … `06-局限与结论.md` |
-| `docs/design/` | 机制、协议与规范：ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC 接入（计划与障碍）/ LILICORR-轻量头 / EXLLAMAV3-GPU段候选 |
+| `docs/design/` | 机制、协议与规范：ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC 接入（计划与障碍）/ LILICORR-轻量头 / EXLLAMAV3-GPU段候选 / MOE-搬运与计算优化（+ 验证） |
 | `docs/deploy/` | 构建、部署与交付：BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / DELIVERY / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
 | `docs/measure/` | 实测：SPLIT-MEASUREMENTS / MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN |
 | `docs/limits/` | 边界与代价：SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
