@@ -169,8 +169,6 @@ Chain acceptance (local two-stage, `n_predict 64`, 3 prompts, [MODEL-SWAP.md] §
 **0.78767** (115/146), catch-up mode 2 **0.9098** (121/133, bit-identical to the whole model);
 DFlash / DSpark on a remote chain match the whole model prompt by prompt (117/141, 117/140).
 
-**The same `--spec-type draft-mtp` takes two different paths on the whole model and on a chain.**
-
 Caliber traps: acceptance flips sign across `n_predict` (same draft pair: +0.59 pts at n=64, −0.94 at
 n=256); `mean_len = 1 + accept × k`, so it is not comparable across k; DSpark-6L's base is NVFP4
 rather than official BF16, so the comparison holds only between those two files.
@@ -207,19 +205,12 @@ records the v2.1 delivery run (2026-11-12); v2.2 is un-remeasured:
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
 | Pure split build (main patch only) | 52 + 36 | built and run independently on tree `586a7e7a1` |
 
-**Latest status of the pure split build**: the pure split tree `586a7e7a1` (45 files) was rebuilt
-with `--clean-first` in an independent worktree @ `09338b85e` + main patch (`git write-tree` =
-`586a7e7a1`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
-previous build `0c307d82a` (44 files, 2026-11-09) covers the same acceptance.
-
 The v2 chain was checked by `python checks/verify_*.py` and
 `python -m unittest test_topology test_contract`; those scripts left with v2 (now on
 `slimarc/prototype`); v2.1 acceptance lives in `verify/` and v2.2 reuses it. Counts and latest
 results are in [SPLIT-MEASUREMENTS.md] §6.
 
 ## Documentation map
-
-`docs/` groups documents by topic; only entry points stay at the root:
 
 | Directory | Contents |
 | --- | --- |
@@ -231,35 +222,6 @@ results are in [SPLIT-MEASUREMENTS.md] §6.
 | `docs/limits/` | Boundaries and costs: SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
 | `docs/issues/` | Defects: the five `ISSUE-*.md` write-ups plus `FIXES.md` (fixed-defect register) |
 | `docs/legacy/` | Retired or archived v2 material: ANTI-ROT / INVENTORY / PRIMA-ANALYSIS / PRIMA-LESSONS / TUI / CHAT-ENGINE / AUTO-ASSIGN-PLAN / BASELINE / PROGRESS / CUT-TOOL / RESPONSES-API / SAMPLING |
-
-Most-queried documents:
-
-| File | Contents |
-| --- | --- |
-| [ARCHITECTURE.md] | The three loading mechanisms, the handoff point, hard constraints, what counts as evidence, the native-RPC boundary |
-| [PATCHES.md] | Patch generations and their differences, the upstream rebase record, full patch text |
-| [BUILD.md] | From patch to executable: measured commands, switch matrix, CPU variants and a fair baseline, MSVC traps, artifact list |
-| [SEGMENTED-LIMITS.md] | Every boundary: root cause, blast radius, what fixing it would cost |
-| [SPLIT-MEASUREMENTS.md] | v2.1 measurements (reused by v2.2): checkpoints, MTP, DFlash, protocol v9, the selection matrix, the zero-loss cross-machine run |
-| [SPECULATION-DATA.md] | Speculation data: per-prompt, k sweep, DFlash, selection matrix, unlogged numbers |
-| [MODEL-SWAP.md] | 35B model swap: both weight files, acceptance baselines, the 13% chain discount |
-| [PROTOCOL-V9.md] | Protocols v5/v7/v8/v9: candidate channel, verify rows, remote draft, taps, the `seq_rm` probe |
-| [CROSS-MACHINE.md] | Cross-machine runs: ROG, Surface, loopback, Tailscale → Surface |
-| [PATCHES-DETAIL.md] | Patch detail: the fourth-generation mechanism table, the device-buffer fix, upstream overlap |
-| [MEASUREMENTS.md] | v2 Python-chain measurements (toolchain retired; cite the method when reused) |
-| [SPECULATION.md] | Speculation criteria, cost model, k sweep, integration measurements |
-| [DEPLOYMENT.md] | What goes where, how to change the split, how to start remote workers |
-| [TESTING.md] | Test channels: what is measured, how to run it, what counts as a pass |
-| [MEASUREMENT-PITFALLS.md] | Why per-segment timing lies, and how to measure instead |
-| [MEMORY-LIMITS.md] | Memory and VRAM arithmetic, calibration constants, core-pinning discipline |
-| [IGPU-SLOWDOWN.md] | Why the iGPU loses, the `-ngl` sweep and where the crossover sits |
-| [SEGMENT-OFFLOAD.md] | `-ngl` semantics under segmentation, per-stage and end-to-end numbers, MoE cache, VRAM budget |
-| [PROGRESS.md] | Current capability snapshot and optimisations in place |
-| [SAMPLING.md] · [TUI.md] · [RESPONSES-API.md] | Sampling mapping · TUI pages and commands · `/v1/responses` translation layer |
-| [SLIM-ARC-接入计划.md] | When the remaining page-fault work pays off |
-
-Further topics (`LILICORR-轻量头.md`, `ANDROID-SURFACE-段接入评估.md`, `ISSUE-*.md`) sit in the
-subdirectory listed above; retired v2 documents are in `docs/legacy/`.
 
 ## License
 
@@ -273,21 +235,11 @@ the same terms; model weights and other third-party artifacts keep their own lic
 [SPLIT-MEASUREMENTS.md]: measure/SPLIT-MEASUREMENTS.md
 [SPECULATION-DATA.md]: measure/SPECULATION-DATA.md
 [MODEL-SWAP.md]: measure/MODEL-SWAP.md
-[PROTOCOL-V9.md]: design/PROTOCOL-V9.md
-[CROSS-MACHINE.md]: deploy/CROSS-MACHINE.md
-[PATCHES-DETAIL.md]: deploy/PATCHES-DETAIL.md
-[MEASUREMENTS.md]: measure/MEASUREMENTS.md
+[MEASUREMENTS.md]: legacy/MEASUREMENTS.md
 [SPECULATION.md]: measure/SPECULATION.md
 [DEPLOYMENT.md]: deploy/DEPLOYMENT.md
-[TESTING.md]: design/TESTING.md
-[MEASUREMENT-PITFALLS.md]: measure/MEASUREMENT-PITFALLS.md
-[MEMORY-LIMITS.md]: limits/MEMORY-LIMITS.md
 [IGPU-SLOWDOWN.md]: measure/IGPU-SLOWDOWN.md
 [SEGMENT-OFFLOAD.md]: measure/SEGMENT-OFFLOAD.md
-[PROGRESS.md]: legacy/PROGRESS.md
-[SAMPLING.md]: legacy/SAMPLING.md
-[TUI.md]: legacy/TUI.md
-[RESPONSES-API.md]: legacy/RESPONSES-API.md
 [SLIM-ARC-接入计划.md]: design/SLIM-ARC-接入计划.md
 [llamacpp-split.patch]: llamacpp-split.patch
 [llamacpp-slimarc.patch]: llamacpp-slimarc.patch

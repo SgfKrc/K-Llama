@@ -233,11 +233,11 @@ v2 驱动链的验收（`python checks/verify_*.py` 与 `python -m unittest test
 | `docs/` | 入口：`QUICKSTART.md`（从零跑通一条链）、`REPORT.md`（结题总纲）、`OPEN-ISSUES.md`（遗留问题）、`README.en.md`（英文镜像） |
 | `docs/report/` | 结题六章：`01-背景与目标.md` … `06-局限与结论.md` |
 | `docs/design/` | 机制、协议与规范：ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC 接入（计划与障碍）/ LILICORR-轻量头 / EXLLAMAV3-GPU段候选 / MOE-搬运与计算优化（+ 验证） |
-| `docs/deploy/` | 构建、部署与交付：BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / DELIVERY / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
-| `docs/measure/` | 实测：SPLIT-MEASUREMENTS / MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN |
-| `docs/limits/` | 边界与代价：SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
-| `docs/issues/` | 缺陷：`ISSUE-*.md` 五篇（定位、根因、修复判据）与 `FIXES.md`（已修复登记） |
-| `docs/legacy/` | v2 时代已退场或已归档：ANTI-ROT / INVENTORY / PRIMA-ANALYSIS / PRIMA-LESSONS / TUI / CHAT-ENGINE / AUTO-ASSIGN-PLAN / BASELINE / PROGRESS / CUT-TOOL / RESPONSES-API / SAMPLING |
+| `docs/deploy/` | 构建、部署与交付：BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
+| `docs/measure/` | 实测：SPLIT-MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN / INDEX |
+| `docs/limits/` | 边界与代价：SEGMENTED-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
+| `docs/issues/` | 缺陷：`ISSUE-*.md` 四篇（定位、根因、修复判据）与 `FIXES.md`（已修复登记） |
+| `docs/legacy/` | 已退场或已归档：ANTI-ROT / INVENTORY / PRIMA-ANALYSIS / PRIMA-LESSONS / TUI / CHAT-ENGINE / AUTO-ASSIGN-PLAN / BASELINE / PROGRESS / CUT-TOOL / RESPONSES-API / SAMPLING / DELIVERY / MEMORY-LIMITS / MEASUREMENTS / ISSUE-recurrent-snapshot-rollback |
 
 最常查的几篇：
 
@@ -283,12 +283,12 @@ MIT，见 [`LICENSE`](LICENSE)。上游 llama.cpp 同为 MIT，本仓库的补�
 [PROTOCOL-V9]: docs/design/PROTOCOL-V9.md
 [CROSS-MACHINE]: docs/deploy/CROSS-MACHINE.md
 [PATCHES-DETAIL]: docs/deploy/PATCHES-DETAIL.md
-[MEASUREMENTS]: docs/measure/MEASUREMENTS.md
+[MEASUREMENTS]: docs/legacy/MEASUREMENTS.md
 [SPECULATION]: docs/measure/SPECULATION.md
 [DEPLOYMENT]: docs/deploy/DEPLOYMENT.md
 [TESTING]: docs/design/TESTING.md
 [MEASUREMENT-PITFALLS]: docs/measure/MEASUREMENT-PITFALLS.md
-[MEMORY-LIMITS]: docs/limits/MEMORY-LIMITS.md
+[MEMORY-LIMITS]: docs/legacy/MEMORY-LIMITS.md
 [IGPU-SLOWDOWN]: docs/measure/IGPU-SLOWDOWN.md
 [SEGMENT-OFFLOAD]: docs/measure/SEGMENT-OFFLOAD.md
 [PROGRESS]: docs/legacy/PROGRESS.md

@@ -21,9 +21,7 @@
 
 ### 1.1 本版的起点
 
-v2.2 已 rebase 到新基底 `5676dfbe0` 并通过本机验收（**实测**：53 PASS / 0 FAIL / 1 SKIP，SKIP 是尚未 rebase 的 KVMem 组）。上游把 18 个
-NextN / layer-input / embd-row / state-row API 从 `src/llama-ext.h` 转正进 `include/llama.h`，并把 `llama_set_embd_state_src` 改名
-`llama_set_ctx_state_src`；这些不触碰本文档要动的三层。
+v2.2 已 rebase 到新基底 `5676dfbe0` 并通过本机验收（**实测**：53 PASS / 0 FAIL / 1 SKIP，SKIP 是尚未 rebase 的 KVMem 组）。上游把 18 个 NextN / layer-input / embd-row / state-row API 从 `src/llama-ext.h` 转正进 `include/llama.h`，并把 `llama_set_embd_state_src` 改名 `llama_set_ctx_state_src`；这些不触碰本文档要动的三层。
 
 ### 1.2 三层的改动边界
 
@@ -50,9 +48,7 @@ NextN / layer-input / embd-row / state-row API 从 `src/llama-ext.h` 转正进 `
 
 ### 2.2 本地链已经走过这条路径（代码 + 实测）
 
-`split_admit_batch()` 的注释写明本地链「a batch may mix sequences」，并记下「两个 seq 各一行、per-seq logits 与单序列逐位相同」的验证
-（`:3012-3019`，**代码**，注释口径，脚本本次未复核）；`split_add_hop_row()` 逐行搬运 `tok.seq_ids`（`:2818-2874`）；`split_logit_plan`
-已从 `token::output` 算出「尾段欠哪几行 logits」（`:2770-2810`）。组 5（`-np 2` / `-np 4`，十个不同长度请求全 200、进程存活、prefix cache 生效）是**实测**通过项，不是性能项。
+`split_admit_batch()` 的注释写明本地链「a batch may mix sequences」，并记下「两个 seq 各一行、per-seq logits 与单序列逐位相同」的验证（`:3012-3019`，**代码**，注释口径，脚本本次未复核）；`split_add_hop_row()` 逐行搬运 `tok.seq_ids`（`:2818-2874`）；`split_logit_plan` 已从 `token::output` 算出「尾段欠哪几行 logits」（`:2770-2810`）。组 5（`-np 2` / `-np 4`，十个不同长度请求全 200、进程存活、prefix cache 生效）是**实测**通过项，不是性能项。
 
 ### 2.3 远程链缺的正好是三件（代码）
 
@@ -100,10 +96,7 @@ v5/v7/v8 的 flag 都表示**能力或通道选择**，布局由 `PROTO_VER` 保
 
 ### 3.5 为什么必须是版本 bump
 
-`PROTO_VER` 的规则写在文件里：「Bumped whenever a frame layout or an op number changes. There is no negotiation」（`:25-27`）。v9 的 stage
-读完 positions 与 hidden 就会 `llama_decode` 并回复，多出来的 `n_tokens*8` 字节会留在 socket 里，被当成**下一帧的头**——这正是
-v5/v7/v8/v9 各自 bump 的理由（`:27-78`）。v10 有两处布局变化：帧尾多了 `rows` 段；`rsp_header` 多 4 字节且 `n_logits > 1` 时 body 变长。
-`9 → 10`，两端不一致在首帧干净报错。
+`PROTO_VER` 的规则写在文件里：「Bumped whenever a frame layout or an op number changes. There is no negotiation」（`:25-27`）。v9 的 stage 读完 positions 与 hidden 就会 `llama_decode` 并回复，多出来的 `n_tokens*8` 字节会留在 socket 里，被当成**下一帧的头**——这正是 v5/v7/v8/v9 各自 bump 的理由（`:27-78`）。v10 有两处布局变化：帧尾多了 `rows` 段；`rsp_header` 多 4 字节且 `n_logits > 1` 时 body 变长。`9 → 10`，两端不一致在首帧干净报错。
 
 ### 3.6 被否决的替代：按 seq 拆帧
 
@@ -141,16 +134,13 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 
 ### 4.5 `n_verify_rows` 从常量变启动参数
 
-`MAX_VERIFY_ROWS = 17`（`:101`）与 `MAX_MTP_DRAFT = 16`（`:109`）改成 `--split-verify-rows N`（stage 侧参数，默认 17），后者变运行时的
-`draft.n_max`（每序列的 k，**不是**帧总量 `n_verify_rows - 1`，也不是 `n_rs_seq - 1`——`--split-rs-seq` 会把 `n_rs_seq` 抬高而帧行数不变；
-`OP_MTP_DRAFT` 的 `k` 校验跟着改，`:395`）。生效路径不新造：`n_outputs_max` 本来就是 context 参数（`llama-context.cpp:358`，`params.n_outputs_max == 0` 时取 `n_batch`），`split-stage/main.cpp:1040` 改成 `max(n_verify_rows, n_seq_max)`，`output_reserve()` 按它一次分配（`:3924`）。使用点逐个换：`llama-context.cpp:3220`、`server-context.cpp:2365`/`:5578`、`split-stage/main.cpp:1040`/`:2215`/`:2522`。
+`MAX_VERIFY_ROWS = 17`（`:101`）与 `MAX_MTP_DRAFT = 16`（`:109`）改成 `--split-verify-rows N`（stage 侧参数，默认 17），后者变运行时的 `draft.n_max`（每序列的 k，**不是**帧总量 `n_verify_rows - 1`，也不是 `n_rs_seq - 1`——`--split-rs-seq` 会把 `n_rs_seq` 抬高而帧行数不变；`OP_MTP_DRAFT` 的 `k` 校验跟着改，`:395`）。生效路径不新造：`n_outputs_max` 本来就是 context 参数（`llama-context.cpp:358`，`params.n_outputs_max == 0` 时取 `n_batch`），`split-stage/main.cpp:1040` 改成 `max(n_verify_rows, n_seq_max)`，`output_reserve()` 按它一次分配（`:3924`）。使用点逐个换：`llama-context.cpp:3220`、`server-context.cpp:2365`/`:5578`、`split-stage/main.cpp:1040`/`:2215`/`:2522`。
 
 **`n_verify_rows` 是上限，不是精确值**——它决定 buffer 大小，够用即可：
 
     n_verify_rows ≥ n_seq_max × (draft.n_max + 1)
 
-两个量分工：`n_verify_rows` ← 每序列**实际帧行数**（`draft.n_max + 1`）× 序列数，是 buffer 大小的唯一依据，**多出的余量只是浪费、不是错误**；
-`n_rs_seq` ← 每序列**能回滚多深**（`max(draft.n_max + 1, split_rs_seq)`，`common/common.cpp:1947`），是回滚校验的依据，可大于帧行数、**不参与 buffer 计算**。
+两个量分工：`n_verify_rows` ← 每序列**实际帧行数**（`draft.n_max + 1`）× 序列数，是 buffer 大小的唯一依据，**多出的余量只是浪费、不是错误**；`n_rs_seq` ← 每序列**能回滚多深**（`max(draft.n_max + 1, split_rs_seq)`，`common/common.cpp:1947`），是回滚校验的依据，可大于帧行数、**不参与 buffer 计算**。
 
 | 配置 | 需要的行数 | 默认 17 够吗 |
 |---|---:|---|
@@ -159,8 +149,7 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 | N=4、k=4 | 20 | 不够，要调大 |
 | N=4、k=16 | 68 | 不够，要调到 68（67.6 MB，对比 ubatch 2048 的 3.3 GB 约 2%） |
 
-所以 **tail 不需要知道 head 的 `draft.n_max`**：默认 17 在 `N ≤ 4`、`k ≤ 3` 时已经够用，`-np 4` 加默认投机可以什么都不配就跑。head 在启动时检查
-`n_verify_rows ≥ n_seq_max × (draft.n_max + 1)`：**不满足只 warn 不拒**——per-slot 的 draft 块被封顶到 `n_verify_rows / n_seq_max - 1`，帧因此必然装得下，请求照常服务（只是 draft 更短）；拒绝会把「k 太大」变成「起不来」。buffer 仍是一份共享的（`n_outputs_max` 是 context 级单值）。
+所以 **tail 不需要知道 head 的 `draft.n_max`**：默认 17 在 `N ≤ 4`、`k ≤ 3` 时已经够用，`-np 4` 加默认投机可以什么都不配就跑。head 在启动时检查 `n_verify_rows ≥ n_seq_max × (draft.n_max + 1)`：**不满足只 warn 不拒**——per-slot 的 draft 块被封顶到 `n_verify_rows / n_seq_max - 1`，帧因此必然装得下，请求照常服务（只是 draft 更短）；拒绝会把「k 太大」变成「起不来」。buffer 仍是一份共享的（`n_outputs_max` 是 context 级单值）。
 
 ## 5. 驱动改动清单
 
@@ -177,7 +166,7 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 | `tools/server/server.cpp` | `:129-158` | auto 保持 1 但改文案；显式 `-np N` 放行 + 要求 `--no-kv-unified`；透传 `--split-verify-rows` | 25–40 |
 | `verify/verify_seq_id.py` | `:37` | `PROTO_VER = 10`；若脚本发 `OP_DECODE` 则补帧尾段 | 5–10 |
 
-合计**推断 290–495 行**（含注释），协议与 stage 占一半以上。「105 行」只覆盖请求侧：逐行 seq 本身。
+合计**推断 290–495 行**（含注释），协议与 stage 占一半以上。
 
 删掉的两道拒绝留下三处文案（`llama-context.cpp:2380`、`server.cpp:152`、`split_admit_batch()` 的 `-3` 消息）。它们描述的失效模式不再存在，随检查一起删除，**不**改写成别的场景：新的「不一致」只剩四处配置对不上，由 §4.3 的 HELLO 消息负责。
 
@@ -199,9 +188,7 @@ v2.1 的已知坑：`n_ctx` 必须各段一致，否则位置边界静默错位�
 
 ### 7.1 远程链多序列（组 14 = 判据 7–11 共 20 项，2026-11-13 落地；组 15 = 判据 2–6 共 18 项，2026-11-14 落地并**实测通过**：18 PASS / 0 FAIL）
 
-组 7 跑远程链但没给 `-np`（auto = 1），组 5 跑 `-np 2/4` 但走本地链；远程链 `-np 2` 因 `:2379` 从未跑过。
-判据 1 于 2026-11-14 三机实测通过（不在 `verify.sh` 里，它是三机拓扑项）；下表 #2–#6 由组 15
-（`verify/verify_multiseq.py`）覆盖，#7–#9 由组 14（`verify/verify_perspec.py`）覆盖（per-seq 判据 7–11）。
+组 7 跑远程链但没给 `-np`（auto = 1），组 5 跑 `-np 2/4` 但走本地链；远程链 `-np 2` 因 `:2379` 从未跑过。判据 1 于 2026-11-14 三机实测通过（不在 `verify.sh` 里，它是三机拓扑项）；下表 #2–#6 由组 15（`verify/verify_multiseq.py`）覆盖，#7–#9 由组 14（`verify/verify_perspec.py`）覆盖（per-seq 判据 7–11）。
 
 | # | 判据 | 怎么判 |
 | --- | --- | --- |

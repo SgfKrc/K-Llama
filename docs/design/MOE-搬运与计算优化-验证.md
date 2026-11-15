@@ -50,11 +50,7 @@
 
 ## 3. 方案 B 的归因纠正（见 `MOE-搬运与计算优化.md` §2.2 / §4）
 
-原方案的因果链是：`6.5 GB/s`（gather 慢）→「地址惩罚≈0」→「并行度喂不饱」→ 批处理（250–500 行）→ 4 倍。
-
-**三处断裂**：
-
-1. **6.5 GB/s 不是 CPU 的数**。它来自 `IGPU-SLOWDOWN.md:287`，是 Vulkan 核显上 `MUL_MAT_ID_VEC q2_K` 的 GPU 侧测量。CPU 侧 MoE 的带宽**从未被单独测过**；`IGPU-MOE-MMVQ.md` 只有「整 token 平均 25.8 GB/s」（1.49 GB/token × 17.33 t/s），扣掉非专家段后 MoE 段落在 12–30 GB/s 的宽区间，误差 2–3 倍。
+1. **6.5 GB/s 不是 CPU 的数**。它来自 `IGPU-SLOWDOWN.md` §⑦，是 Vulkan 核显上 `MUL_MAT_ID_VEC q2_K` 的 GPU 侧测量。CPU 侧 MoE 的带宽**从未被单独测过**；`IGPU-MOE-MMVQ.md` 只有「整 token 平均 25.8 GB/s」（1.49 GB/token × 17.33 t/s），扣掉非专家段后 MoE 段落在 12–30 GB/s 的宽区间，误差 2–3 倍。
 2. **静态切分在 decode 下不空转**。`repack.cpp:4886-4897`：`ne01=1024`、`nth=8` → 每线程 128 行；`NB_COLS=8`（`q4_K_8x8_q8_K`）整除，`return`（`:4896`，注意是 `return` 不是 `continue`）不触发。**真正的隐患是那个 `return`**——若 `nth` 增大到使 `ne01/nth < NB_COLS`，某线程会静默丢掉后续所有 expert。这是正确性隐患，不是性能瓶颈。
 3. **claim 与非 claim 在 decode 下等价**。`ggml-cpu.c:1710-1724`：`nr1==1` → `chunk_size=64` → `nchunk0=16` → 因 `16 < nth*4=32` 强制 `nchunk0=nth=8`，每线程恰好 1 个 128 行 chunk，无竞争、无 steal，与 repack 的 `(ith*ne01)/nth` 逐字节等价。**把 repack 改成同文件 dense 路径（4747-4780）的 claim 模板，decode 时产出相同划分，收益 = 0，外加 atomic 开销。**
 
@@ -121,11 +117,7 @@
 
 ## 7. 与 V3 收尾的关系
 
-这份验证**没有推翻**原方案的方向（head 段的搬运与计算确实值得修），但**重排了优先级**：
-
-- **方案 A 仍是唯一低风险、可量化的收益点**，且本机已经具备全部前提（API 在位、零调用者、cap 机制清楚）。
-- **方案 B 需要先证伪「并行度喂不饱」**，否则 500 行换 0–12% 是亏的。
-- **基线必须先钉住**：`-ncmoe 34`（tg 24.37）而不是原方案的 29（spill，15.07）。
+这份验证**没有推翻**原方案的方向（head 段的搬运与计算确实值得修），但**重排了优先级**：方案 A 是低风险、可量化的收益点（本机已具备全部前提：API 在位、零调用者、cap 机制清楚）；方案 B 要先证伪「并行度喂不饱」，否则 500 行换 0–12% 是亏的；基线必须先钉住 `-ncmoe 34`（tg 24.37）而不是原方案的 29（spill，15.07）。
 
 如果按 §6 的 1→2→5 走完，head 段的 tg 从 24.37 提到 pinning 后的量级（上游 +19% 对应约 29），链上 5.85 的 31% 段内计算部分相应下降——**这是可以宣布 V3 收尾的量级**，而方案 B 不是。
 
@@ -203,11 +195,7 @@
 - `src/llama-context.cpp`：`sched_reserve()` 之后 `if (moe_cache) moe_cache->pin();`
 - `ggml/src/ggml-cuda/ggml-cuda.cu`：`cudaHostRegisterReadOnly` 返回 `cudaErrorNotSupported` 时去掉 ReadOnly 重试。
 
-**关键修正**：`pin()` 必须放在 `sched_reserve()` 之后。放在 ctor 里时 `ranges = 0`——`no_alloc` 模式下 model tensor 的 `data` 和 `buffer->base` 都是 null；移到 `sched_reserve()` 之后 `ranges = 102`。
-
 ### 9.2 本机结论：WDDM 不支持大范围 file-backed pin
-
-三层错误链，逐层排除：
 
 | 层 | 现象 | 排除方式 | 结论 |
 |---|---|---|---|
@@ -228,7 +216,6 @@
 
 ### 9.3 因此
 
-- **方案 A 在本机（Windows + mmap）不成立**：不是实现问题，是驱动语义差异。上游的 `Portable|ReadOnly` 在 Windows 直接不支持，退到无 ReadOnly 又变成复制。
 - 唯一可能的替代是 `--load-mode none`（loader 自己分配 pinned host buffer，不经过 `cudaHostRegister`），代价是 21.86 GiB 加载慢 + 锁定——这正是 `MOE-搬运与计算优化.md` §2.1 表里「`--load-mode none`：279.1 pp / 32.3 tg」那条，它在 pageable 之上确实快，但加载时间不可接受。
 - **`ggml-cuda.cu` 的 ReadOnly fallback 值得保留**：它把一个真实的 Windows 平台差异变成「多一次调用」，失败时仍然 fail soft；对上游是一个独立可提交的小修复。
 - **pin 实现本身保留**：它在 Linux 上是对的（上游机制），本机只是跑不到。

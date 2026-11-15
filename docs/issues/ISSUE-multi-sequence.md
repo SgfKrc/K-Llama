@@ -82,7 +82,7 @@ KV 总量不随 seq 数增长（非 unified 时 ctx 被切分，unified 时池�
 | 路径 | 做法 | 改动面 | 代价 | 人天（推算） |
 | --- | --- | --- | --- | --- |
 | **A 单连接多 seq** | 装载放开 `n_seq_max=2`；shim 加 token 通道多 seq 前向；协议 meta 加 `seq_id`；客户端按 seq 记位置 | `keep_head_worker.py` 2 行、shim +40 行 C、`keep_head/engine/stage_worker` 约 30 行、`chain_client` 约 60 行、`server.py` 会话→seq 映射约 80 行 | 显存 +63 MiB/seq（不投机）；decode 仍串行，收益只在前缀复用 | **3~4** |
-| **B 每 seq 一个 context** | 每段起 N 个 worker，一条连接绑一个 context | 内核零改动，但拓扑、启动、预算、端口全要扩；权重靠 OS 页缓存共享 | 每 seq 多一份 compute buffer + RS + KV：`docs/limits/MEMORY-LIMITS.md` §2 的每段固定开销 640 MiB 会乘 N | **4~6** |
+| **B 每 seq 一个 context** | 每段起 N 个 worker，一条连接绑一个 context | 内核零改动，但拓扑、启动、预算、端口全要扩；权重靠 OS 页缓存共享 | 每 seq 多一份 compute buffer + RS + KV：`docs/legacy/MEMORY-LIMITS.md` §2 的每段固定开销 640 MiB 会乘 N | **4~6** |
 | **C state 存盘/重放** | 导出 `llama_state_seq_get_data/set_data`（`include/llama.h:900-915`），切换时整体换 state | shim +60 行（4 个导出）；Python 侧只用 seq 0 | 每次切换 memcpy 约 140 MiB（4096 ctx，全模），几十 ms；对每步 48 ms 的链路是可感知的抖动 | **2~3** |
 
 真并发混批（多 seq 的 token 进同一个 ubatch 换吞吐）不建议：要同时满足 `equal_seqs`、batch 内 seq 递增（`src/llama-batch.cpp:648`）、kq_mask 按 `n_stream` 分块（`src/llama-graph.cpp:37`）、per-seq 采样；而且 DFlash 的 draft context 固定 `n_seq_max=1`（`slimarc/prototype:shim/qlh_keep_head_gpu.c`），混批后它按行取 `layer_inp` 会对不上 seq。**8~12 人天（推算）**，且收益是吞吐不是延迟。

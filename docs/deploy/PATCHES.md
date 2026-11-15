@@ -70,8 +70,6 @@ SLIM-ARC 补丁得 main-only 树 A，再正向生成两个 `git diff`。结果�
 **顺序是硬性的**：主 → SLIM-ARC → KVMem。KVMem 的 `src/llama-context.cpp` 改动相对**叠了 SLIM-ARC 之后**的版本写，
 直接叠在主补丁上会在 `src/llama-context.cpp:14` 冲突（已实测 `git apply --check` 失败）。「主 + KVMem」**不是**合法组合。
 
-两者是叠加关系，主补丁可单独用：
-
 ```bash
 git worktree add /tmp/v1 5676dfbe0 && cd /tmp/v1
 git apply docs/llamacpp-split.patch        # 纯分段，无 SLIM-ARC
@@ -105,11 +103,6 @@ tree hash 不再相等。静默错，属于「验收命令跑了、也过了、�
   单跑两次都过）；组 10 的 dflash 十项里九条红，`taps_dflash_chain.log` 只有 `dflash-taps.exe: Device or
   resource busy`（整模那趟刚退出、文件锁未释放）。run2 同一份二进制得到 44/0。判据是「日志里有没有数值
   不一致」，不是「这一趟绿不绿」。
-- 叠加两个补丁后 `git write-tree` = `61781c712`（fork HEAD 的树），这是「拆分没有改动任何内容」的唯一判据，
-  比「能 apply」更强。
-- SLIM-ARC 与分段链零耦合：那 10 个文件只 include 彼此和上游 `ggml-backend.h`，不碰本 fork 新增的任何头；
-  6 处钩子摘掉后，`llama-context.cpp` / `llama-model-loader.cpp` 的对应片段与上游逐字节相同（重导时用字符串
-  精确匹配摘除，每处断言「恰好出现一次」）。
 
 **历史全文**：`docs/llamacpp-qlh-slimarc.patch`（27 文件 / 4014 行），基提交更早，只到第三代；保留作第一 / 二代对照，不能正向应用。
 
@@ -223,9 +216,6 @@ v2.2 升到 **v10**：帧尾 `rows` 段逐行带 `seq_id`、回复可带 N 行 l
 v2.1：fork 从 `e0f142d` 整体 rebase 到上游 193 个提交之后的 `09338b85e`（193 个提交 / 659 文件）。把改动 `git apply --3way`
 打到新基底后剩 54 文件 / +18773 −240；17 个文件因上游已含对应提交而退出变更集（16 个与上游逐字节相同，`src/models/dflash.cpp`
 因 device-buffer 诊断行重新进入）。冲突分布、上游提交对应关系、两处「上游基线漂移」与验收见 [`PATCHES-DETAIL.md`](PATCHES-DETAIL.md) §4。
-
-v2.2：上游再进 31 个提交（`09338b85e` → `5676dfbe0`，tag `b12342`），把 staging API 转正进 `include/llama.h`；
-主补丁因此重导（见「重导沿革」⑤），改动面 +20345 → +21788。
 
 ## 与 llama.cpp 原生 RPC 的分界
 

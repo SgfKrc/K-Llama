@@ -237,4 +237,4 @@ worker 协议往返比直调只多 **0.31 ms**（`MEASUREMENTS.md` §8.2）、�
 - `[实测]` 两边的机制、行号、结构体成员、代码规模均逐行核对；**未运行** prima.cpp。
 - **未细读**：prima `src/llama.cpp` 中其余 40+ 个 `build_*`；本项目 Python 控制面实现（只读了 `docs/` 与 `topology-*.toml`）。
 - 参考：`H:\prima.cpp\README.md`、ICLR 2026 abstract（`https://iclr.cc/virtual/2026/poster/10008093`）、
-  `docs/{design/ARCHITECTURE,deploy/PATCHES,measure/MEASUREMENTS}.md`、`README.md`。
+  `docs/{design/ARCHITECTURE,deploy/PATCHES,legacy/MEASUREMENTS}.md`、`README.md`。

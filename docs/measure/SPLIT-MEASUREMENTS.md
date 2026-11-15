@@ -50,8 +50,7 @@ CPU、L3 与带宽）。本机的负数不能外推；跨机的正确答案是�
 | 本地链上下文 checkpoint 大小 | **19.266 MiB** @1806 token（`checkpoint 1 of 32`） | `.qlh_tmp/issue1_after_final.log`、`issue1_before_ub2048.log` |
 | 远程段 state blob（2B 的 8 层段、`--rs-seq 8`） | **6,733,996 B = 6.42 MiB**，与历史长度无关（`pos_max` 17 与 59 同值） | `stage{816,1624}.log` 的 `OP_STATE_SAVE` |
 
-**19.85 s 与 0.71 s 是同一份日志里的两件事，不是一次 A/B**：前者是 3103 token 整段重算的成本，后者是只算 38 个新 token。修复前的失败形态在
-`kill_ckpt_9415/9416` 里是**报错**，不是「慢 19.85 s」——链首恢复了、尾段停在旧位置，下一次截断式 `seq_rm` 在尾段失败。35B 段的 12.56 MiB 与盈亏平衡
+修复前的失败形态在 `kill_ckpt_9415/9416` 里是**报错**，不是「慢 19.85 s」——链首恢复了、尾段停在旧位置，下一次截断式 `seq_rm` 在尾段失败。35B 段的 12.56 MiB 与盈亏平衡
 见[`SEGMENTED-LIMITS.md`](../limits/SEGMENTED-LIMITS.md) §2.5。
 
 ## 2. MTP（2B 链）
@@ -83,7 +82,7 @@ CPU、L3 与带宽）。本机的负数不能外推；跨机的正确答案是�
 | 项 | np=2 | np=4 | 出处 |
 | --- | ---: | ---: | --- |
 | 10 个不同长度请求 | 10/10 200，存活 | 10/10 200，存活 | `build-split/multislot_{np2,np4}.out` |
-| prefix cache 复用（round1/round0） | 0.115（408.1 → 47.0 ms） | 0.145（406.6 → 59.0 ms） | 同上（早先两轮是 0.100 / 0.117） |
+| prefix cache 复用（round1/round0） | 0.115（408.1 → 47.0 ms） | 0.145（406.6 → 59.0 ms） | 同上 |
 | 串行 / 并发输出逐字节一致 | PASS | — | `.qlh_tmp/accept_np.py --np 2` |
 | tail 的 logits 缓冲 | 1 行 → 0.95 MiB | 4 行 → 3.79 MiB | 缓冲 = `4 B × n_vocab × 行数`，行数 = `n_seq_max × (1+n_max)` |
 
@@ -110,7 +109,7 @@ ubatch 的 prefill 顺带快 27%，因为不再申请 / 清零那 1.7 GiB。
 | `verify/mtp_remeasure.sh`；`verify/verify_seq_rm_exact.py --expect-known-fail`；`verify/verify_seq_rm_shared.py` | §2 的三负载；`seq_rm` 删尾部精度（A/B/C 三形态，无 split 无 server）；shared-prefix 误伤 | 三负载 ×（off / k=2）× 3 次；**1 pass / 5 known-fail / 0 unexpected**，退出 0；shared-prefix 两条 completion 逐字节相同、`[INFO] injection never fired` |
 
 判据全部是逐位 / 逐字节（`split-smoke`、`split-rows`、`dflash-taps` 三个目标，组 11 直接跑产品路径），不看生成文字；组 9/10/11 需要 35B +
-DFlash 权重。**项数以脚本逐项计数为准**：组 1–8 = 22 项，全十五组 = 95 项（44 + 组 11 的 8 项 + 组 12 的 1 项 + 组 13 的 4 项 + 组 14 的 20 项 + 组 15 的 18 项，组 13 = KVMem 的 KV 虚拟化、组 14 = per-seq 投机、组 15 = 多序列基础语义）。`verify/verify.sh` 默认先跑一次增量构建，`PASS`
+DFlash 权重。**项数以脚本逐项计数为准**：组 1–8 = 22 项，全十五组 = 95 项。`verify/verify.sh` 默认先跑一次增量构建，`PASS`
 里会多出「三目标构建完成」这一项（`PASS=96`）；`--skip-build` 跑出来就是纯验收的 **95**，两种跑法的失败数都是 0，那一行不算进 95 项。
 
 **纯分段树上的独立验收**：`09338b85e` + 主补丁 = 树 `0c307d82a`（44 文件，不含 SLIM-ARC），`--clean-first` 全量构建（385 个编译单元）后
@@ -174,10 +173,7 @@ v7 验证通道单帧回复 **993,312 B → 48 B（20,694×）**；v8 的 `OP_MT
 
 ### 9.7 正确性验收
 
-`verify/verify_mtp.sh`（6 项）：同一行 h 与整模 `h_nextn` 逐位相同、远程 tail 递归 3 步与「整模 + MTP」逐个相同（11751 / 13 / 271）；
-`verify/verify_mtp_e2e.sh`（6 项）：远程链三组输出逐字节相同。全套 `verify/verify.sh` 15 组 95 项、
-`verify/verify_chain_death.py` 36、`verify/verify_seq_id.py` 9、`verify/verify_grammar_spec.sh` 23、
-`verify/verify_rbudget_spec.sh` 36 在 v9 之后全过。
+`verify/verify_mtp.sh`（6 项）：同一行 h 与整模 `h_nextn` 逐位相同、远程 tail 递归 3 步与「整模 + MTP」逐个相同；`verify/verify_mtp_e2e.sh`（6 项）：远程链三组输出逐字节相同。全套 `verify/verify.sh` 15 组 95 项、`verify/verify_chain_death.py` 36、`verify/verify_seq_id.py` 9、`verify/verify_grammar_spec.sh` 23、`verify/verify_rbudget_spec.sh` 36 在 v9 之后全过。
 
 ## 10. `seq_rm` 的精确性
 
@@ -189,12 +185,7 @@ probe」见 [`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §5。
 ## 11. 换模型：从蒸馏版到官方版（2026-11-08）
 
 两份权重：官方 `UD-Q4_K_M` 21.11 GiB（5.10 BPW）vs 蒸馏版 21.87 GiB（5.29 BPW）；官方 `block_count` 41、`nextn` 1、trunk 40、
-`ssm.inner_size` 4096、`expert_count` 256 / 8，代码零改动；DFlash / DSpark / NextN 头与官方文件逐字节相同（人工比对、未落盘）。
-
-官方整模 k=1..8 的甜点仍是 2：k=2 接受率 **0.9098**、mean len **2.81**、gen 10.54 tok/s；k=3 起接受率掉到 0.859、mean len 4.05
-只换来 0.79。官方 vs 蒸馏在 k=2 / 4 / 8 上提升 **+30% / +46% / +76%**；pos0 两边接近、pos1 起分叉——差的是 hidden 分布一致性，所以蒸馏版的接受率
-不能拿来做容量规划。代码回归用 2B（`verify/verify.sh` 24/24、`verify/verify_mtp.sh` 6/6；当时套件 24 项，现为 95 项），新模型验收走「本地双段链 vs 整模逐字节」。**口径提醒：35B
-的「整模 0.910 / 链上 0.688」是官方版上的数，本文 §3 与 §9 的 35B 数字是旧蒸馏版上的数，两份权重不能混用。** 全部细节见
+`ssm.inner_size` 4096、`expert_count` 256 / 8，代码零改动；DFlash / DSpark / NextN 头与官方文件逐字节相同（人工比对、未落盘）。官方整模 k=1..8 的甜点仍是 2（k=2 接受率 **0.9098**、mean len **2.81**、gen 10.54 tok/s）；官方 vs 蒸馏在 k=2 / 4 / 8 上提升 **+30% / +46% / +76%**；pos0 两边接近、pos1 起分叉——差的是 hidden 分布一致性，所以蒸馏版的接受率不能拿来做容量规划。**口径提醒：35B 的「整模 0.910 / 链上 0.688」是官方版上的数，本文 §3 与 §9 的 35B 数字是旧蒸馏版上的数，两份权重不能混用。** 代码回归 / 新模型验收的分界见
 [`MODEL-SWAP.md`](MODEL-SWAP.md)。
 
 ### 11.4 链上接受率低 24%
@@ -218,13 +209,7 @@ MTP 走 nextn 通道，链上被 `!is_chain` 压到 0.6879；DFlash（0.8298）�
 
 ### 12.3 传输量：大头是 prefill 而不是 draft
 
-| 帧 | DFlash（2 路 tap） | DSpark（1 路） |
-| --- | ---: | ---: |
-| 1 行 decode | 16 KB | 8 KB |
-| k=2 verify（3 行） | 48 KB | 24 KB |
-| prefill 一个 512 行 ubatch | **8 MB** | **4 MB** |
-
-回环 1192 token 差 **0.2%**，真跨机 1102 token 多 **3.05 s**。
+DFlash（2 路 tap）/ DSpark（1 路）：1 行 decode 16 KB / 8 KB、k=2 verify（3 行）48 KB / 24 KB、prefill 一个 512 行 ubatch **8 MB** / **4 MB**。回环 1192 token 差 **0.2%**，真跨机 1102 token 多 **3.05 s**。
 
 ### 12.4 容错与验收
 
@@ -238,30 +223,9 @@ token 8/8、tap 字节数 245760 B。
 
 ## 13. 投机选型的实测矩阵：markov 头的收益是「可抄写性」
 
-### 13.1 k=2 的四个头（`n_predict 64`）
+k=2（`n_predict 64`）四个头（accept_rate / mean len）：MTP **0.9098** / 2.820、DSpark-6L 0.8357 / 2.671、DFlash 0.8298 / 2.660、DSpark-5L 0.7986 / 2.597；6L DSpark 的 base 是 NVFP4 而非官方 BF16，比较只在「这份文件 vs 那份文件」这一层成立。
 
-| 头 | accept_rate | mean len |
-| --- | ---: | ---: |
-| MTP | **0.9098** | 2.820 |
-| DSpark-6L | 0.8357 | 2.671 |
-| DFlash | 0.8298 | 2.660 |
-| DSpark-5L | 0.7986 | 2.597 |
-
-6L DSpark 的 base 是 NVFP4 而非官方 BF16，比较只在「这份文件 vs 那份文件」这一层成立。
-
-### 13.2 k=8 的四档差值（`n_predict 256`）
-
-short +2.9、mid（1146）**+15.3**、long（3154）**+14.5**、hard（1157，中文改写）**+4.1** 点；mid 与 hard 长度几乎相同而差值差近 4 倍。
-
-### 13.3 per-position
-
-mid 档 pos6 **+20.2**、pos7 **+21.6**，hard 档 pos0 **−0.3**、pos1 **−3.2**，k=2 上 −0.5 ~ −0.9 点（markov 的价值从
-pos2 才开始）。文档问答档的 accept 从 0.71 涨到 0.92，两种头都受益（DFlash 0.33 → 0.62）——抄写红利，不能记在 markov 头上。
-
-### 13.4 结论：放大的是可抄写性，不是长度
-
-`n_predict` 不可跨比（同一对草稿源 `n=64` 差 +0.59 点、`n=256` 差 −0.94 点）；基座不是同一个 BF16。报 accept 必须带 `n_predict` 与 k，且只
-能说「这份文件比那份文件高」。矩阵见[`SPECULATION-DATA.md`](SPECULATION-DATA.md) §3。
+k=8（`n_predict 256`）四档差值：short +2.9、mid（1146）**+15.3**、long（3154）**+14.5**、hard（1157，中文改写）**+4.1** 点——mid 与 hard 长度几乎相同而差值差近 4 倍，放大的是可抄写性，不是长度。per-position（markov 的价值从 pos2 才开始）、`n_predict` 跨比坑（`n=64` 差 +0.59 点、`n=256` 差 −0.94 点）与基座差异见 [`SPECULATION-DATA.md`](SPECULATION-DATA.md) §3。
 
 ## 14. 跨机实测：Tailscale → Surface，第一次拿到零损失（2026-11-09）
 

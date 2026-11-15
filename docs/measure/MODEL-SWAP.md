@@ -3,7 +3,7 @@
 > 状态：**现行**
 > 更新日期：2026-11-12
 > 适用范围：35B target 从蒸馏版换到官方 `UD-Q4_K_M` 的全部结论——两份权重的 metadata、形状核对、接受率基线、官方 vs 蒸馏
-> 的差距、链上 13% 折扣的根因，以及「代码回归」与「新模型验收」的分界。`build-split/accept_baseline.md` 是原始记录，两份不一致时以日志为准（下文标出两处小出入）。投机矩
+> 的差距、链上 13% 折扣的根因，以及「代码回归」与「新模型验收」的分界。`build-split/accept_baseline.md` 是原始记录，两份不一致时以日志为准。投机矩
 > 阵与 k 扫描归 [`SPECULATION-DATA.md`](SPECULATION-DATA.md)，协议归[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md)。
 
 ## 11.1 两份权重、为什么换
@@ -26,10 +26,6 @@
 （[`THREE-SEGMENT.md`](../deploy/THREE-SEGMENT.md) §2），蒸馏版最大的一块是 **IQ4_XS 8.367 GiB（38.3%）**，Q6_K 只有
 **7.294 GiB（33.4%）**、Q5_K **5.156 GiB（23.6%）**、Q8_0 0.960（4.4%）——是 **IQ4_XS / Q6_K / Q5_K 三档混合**，不是 Q6_K 主。
 所以「Q6_K」只能当模型卡标签用，不能拿它算每层重量或估算显存（**以逐张量清点为准**）。
-
-> **与 `accept_baseline.md` 的一处出入**：那份记录写 `quantize.imatrix.file = /home/mudder/autoresearch-quant/...`。日
-> 志里这是两条不同的 key——`imatrix.file` 指 `/home/ubuntu/work/apex/...`，`/home/mudler/autoresearch-quant/...` 是
-> `imatrix.dataset`（作者名是 `mudler`，不是 `mudder`）。本节按日志写。
 
 **新模型的形状与代码假设全部吻合**（`llama_model_loader` / `print_info` 段）：
 
@@ -77,12 +73,9 @@ llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -c 4096 -b 512 -t 8 -ngl 0 --no-w
 `official_clean_k2.json` 里 8.39 / 11.24 / 11.99 → 10.54）。
 
 **这一列受同机负载影响**，只在同一时段内相对可比：空闲时整模 k=2 单 prompt 到 13.99–16.86 tok/s（这一对只在当天的测量记录里，`acc/*.json` 复算不到，按「未落盘」
-看），表里的 10.54 是有背景负载时的数。
+看）。
 
-**k 的甜点仍是 2**：k=2 接受率还有 0.910（mean len 2.81，上限 3），k=3 起每多一个 draft 就多一份 verify 成本，而接受率掉到 0.859、k=4 的 mean
-len 4.05 只换来 0.79。**这个结论与模型无关，换模型不必重扫 k**：官方与蒸馏两版都落在 k=2（蒸馏版 k=2 是 0.699 / 2.39，k=4 掉到 0.545，k=8 掉到
-0.321，衰减更快，更不可能往大 k 走）。甜点由「每轮 draft 的边际成本 / 每轮 verify 的边际收益」的比值决定（CPU 上 verify 是 k+1 行的批前向，draft 是 k 次单行前
-向），这个比值对模型不敏感；只有当接受率水平整体移动（例如将来换更好的 MTP 头）时才需要重扫。
+**k 的甜点仍是 2**：k=2 接受率还有 0.910（mean len 2.81，上限 3），k=3 起每多一个 draft 就多一份 verify 成本，而接受率与 mean len 同时变差（见上表）。**这个结论与模型无关，换模型不必重扫 k**：官方与蒸馏两版都落在 k=2（蒸馏版衰减更快，见 §11.3，更不可能往大 k 走）。甜点由「每轮 draft 的边际成本 / 每轮 verify 的边际收益」的比值决定（CPU 上 verify 是 k+1 行的批前向，draft 是 k 次单行前向），这个比值对模型不敏感；只有当接受率水平整体移动（例如将来换更好的 MTP 头）时才需要重扫。
 
 ## 11.3 官方 vs 蒸馏：差的是 hidden 分布的一致性
 
@@ -159,8 +152,7 @@ masked `embeddings_nextn` 一行一个 server batch 行，batch 仍带 token id�
 mode 2 的批末尾会越过被拒的草稿行，catch-up 不覆盖它——写错会让 mode 2 掉到 0.70，实测过）。失败只降级：`llama_process` 返回非 0 时清该 seq 的草稿 KV
 并 WARN，请求继续——草稿是加分项，不是必需品。
 
-**成本（安静机器，A/B 交替两轮；`B−A` = 整模+MTP 减整模不投机的 `prompt_ms`）**：N=100/500/2000 = **+2215 / +2100 / +4467 ms**，两
-轮同号（上一轮的 +1013/+936/−1679 作废：19% 机器漂移，A 的 2000 从 55 s 掉到 46 s，压过了真实值）。消掉 draft ctx 的固定建仓（~2.1 s，
+**成本（安静机器，A/B 交替两轮；`B−A` = 整模+MTP 减整模不投机的 `prompt_ms`）**：N=100/500/2000 = **+2215 / +2100 / +4467 ms**，两轮同号。消掉 draft ctx 的固定建仓（~2.1 s，
 `graphs reused=0`，keep-KV 路径本来也要付）后每行 **1.19 ms**，2000 行 ≈ 2.4 s；生成侧 mode 2 每轮多一次 1 行 decode（~5–10 ms 调度开
 销）。收益：64 档 `gen_ms` −4.2%（mode 1）/ −8.8%（mode 2）；512 档 −0.3% / +5.5%（mode 2 的每轮开销与轮数减少相抵，落在噪声内——512 档真正值
 钱的是 mode 1 的 0.7395 与 mode 2 的 0.7557，两者生成耗时都等于 keep-KV）。
@@ -268,15 +260,12 @@ verify 的 logits 要走 `993 KB/轮`（整行）而不是候选通道的 `48 B/
 
 同一批测量里三种链形态给出的 `chain_kind` 一致：DFlash **0.848**（39/46，mean len 2.70）、DSpark **0.932**（41/44，mean len 2.86）。
 这一点本身是判据——它说明收敛后的 `chain_kind` 在三种链形态上给出了同一个答案。**接受率随 prompt 内容与长度变**
-（0.932 @941 token vs 0.740 @1522 token），不随拓扑变。DSpark 那 6 次重跑的接受率逐位相同（`0.93182 / 41 accepted / 44 generated`），
-所以下面的速度差不是「有时投机没生效」。
+（0.932 @941 token vs 0.740 @1522 token），不随拓扑变。
 
 **Surface 那格的 12.36 是 6 次重跑的中位数**（稳态 5 次：12.04 / 12.25 / 12.36 / 13.07 / 13.45，
 首跑 10.75 是 warmup）。单次测量会给出误导性结果：同一配置在不同时刻量到过 2.27 与 7.54——两次的
 接受率同样是 0.93182，所以那是 Surface 侧的缓存与网络状态，不是代码。**跨机数字必须多跑取中位**，
 一次不够。
-
-**三个反直觉的点**：
 
 1. **DFlash 在 Surface 上 −38%、在 Y700 上 +19%**。同样接受率，差别在 host copies 的相对开销：
    `device buffer unusable on this chain: it holds the head's 6 of 8 extract layers` 让它每轮都

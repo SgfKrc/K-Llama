@@ -69,8 +69,7 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 | `state_write` 只有段数 | 段数 + 每段 `{pos_max, n_bytes, blob}`；保存时各段 `pos_max` 必须等于链首，恢复时不得落后 | `llama_memory_split::state_write()` / `state_read()` |
 | 本地链 prompt cache 只写链首 | `state_seq_*` 走 `get_memory()`（聚合视图）而非链首 `memory` | `state_seq_write_data()` / `state_seq_read_data()` |
 
-最后一条实测：3103 token 历史整段重算 19.85 s，第二轮只算 38 个新 token 是 0.71 s（原记 3137 token，日志是 3103 + 16 生成；出处见
-[`SPLIT-MEASUREMENTS.md`](../measure/SPLIT-MEASUREMENTS.md) §1）。修复前的表现是链首恢复了、尾段停在旧位置，下一次截断式 `seq_rm` 在尾段失败。
+最后一条实测：3103 token 历史整段重算 19.85 s，第二轮只算 38 个新 token 是 0.71 s（出处见 [`SPLIT-MEASUREMENTS.md`](../measure/SPLIT-MEASUREMENTS.md) §1）。修复前的表现是链首恢复了、尾段停在旧位置，下一次截断式 `seq_rm` 在尾段失败。
 
 ### 1.1 段级 offload：`-ngl N` 数「本段最后 N 块」
 
@@ -89,44 +88,15 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 
 ## 1.5 三段链的定位：接近无损扩容，不是速度优化
 
-三段（本机 `0:24` + Surface `24:32` + Y700 `32:40`）常被问「为什么比两段慢」——**因为它本来就不是为了快**。
-把账分成两笔算就清楚了。
+三段（本机 `0:24` + Surface `24:32` + Y700 `32:40`）常被问「为什么比两段慢」——**因为它本来就不是为了快**。把账分成两笔算就清楚了。
 
-### 第一笔：容量（这是三段唯一的目的）
+**第一笔：容量（这是三段唯一的目的）**。35B 整模 **21.11 GiB**，head `0:32` 是 **15.69 GiB**——**8 GB 显存的机器装不下任何一段**。三段把它切成（2026-11-13 逐张量实测，`gguf` 包 753 张量）：head `0:24` **12.271 GiB**（blk 11.768 + `token_embd` 0.503）、relay `24:32` **3.923 GiB**（纯 blk）、tail `32:40` **4.903 GiB**（blk 4.022 + NextN 0.493 + `output` 0.389）；**对照 head `0:32` = 16.193 GiB**（blk 15.690 + `token_embd` 0.503，`CROSS-MACHINE.md` §6 记的 **15.690 是纯 blk 口径**，实际驻留要多 0.503 GiB）。每台机器只驻留自己那一段——**所以三段的对照基线不是「两段 7.46 t/s」，是「装不下 = 0」**，从 0 到 5.85 t/s 是**能跑与不能跑的区别**。
 
-35B 整模 **21.11 GiB**，head `0:32` 是 **15.69 GiB**——**8 GB 显存的机器装不下任何一段**。
-三段把它切成（2026-11-13 逐张量实测，`gguf` 包 753 张量）：
-
-| 段 | 驻留 | 构成 |
-| --- | ---: | --- |
-| **head `0:24`** | **12.271 GiB** | blk 11.768 + `token_embd` 0.503 |
-| **relay `24:32`** | **3.923 GiB** | 纯 blk |
-| **tail `32:40`** | **4.903 GiB** | blk 4.022 + NextN 0.493 + `output` 0.389 |
-
-**对照 head `0:32` = 16.193 GiB**（blk 15.690 + `token_embd` 0.503）——注意 `CROSS-MACHINE.md` §6 记的
-**15.690 是纯 blk 口径**，实际驻留要多 0.503 GiB。每台机器只驻留自己那一段。
-
-**所以三段的对照基线不是「两段 7.46 t/s」，是「装不下 = 0」。** 从 0 到 5.85 t/s 是**能跑与不能跑的区别**。
-
-### 第二笔：速度代价（这是买容量付的价）
-
-同口径（941 token、`-t 8`、客户端本机、direct）实测：
-
-| 拓扑 | 不投机 t/s | DSpark k=2 | 相对不投机 |
-| --- | ---: | ---: | ---: |
-| 两段 `0:32 + 32:40` | **7.46** | **+51%**（1.51×） | 投机有效 |
-| 三段 `0:24 + 24:32 + 32:40` | **5.85** | **−0.4%**（1.00×） | 投机失效 |
-
-- **decode 慢 21.6%**（5.85 vs 7.46），prefill 慢 6.9%
-- **投机在三段上失效**（−0.4%）：DSpark 的 5 个 target `[2,10,20,30,37]` 在两段上只跨线 1 个，在三段上跨线 **2** 个；
-  多一次跨线往返就把投机的收益吃掉了。DFlash 更极端（6 个 target，三段跨线 3 个，**−31%**）
-
-**但 21.6% 是「相对两段」，不是「相对不可用」**——三段仍然是 **5.85 t/s 可用**的，而整模装不下时是 0。
+**第二笔：速度代价（这是买容量付的价）**。同口径（941 token、`-t 8`、客户端本机、direct）实测：两段 `0:32 + 32:40` 不投机 **7.46**、DSpark k=2 **+51%**（1.51×，投机有效）；三段 `0:24 + 24:32 + 32:40` 不投机 **5.85**、DSpark k=2 **−0.4%**（1.00×，投机失效）。**decode 慢 21.6%**（5.85 vs 7.46），prefill 慢 6.9%。**投机在三段上失效**（−0.4%）：DSpark 的 5 个 target `[2,10,20,30,37]` 在两段上只跨线 1 个、在三段上跨线 **2** 个，多一次跨线往返就把投机的收益吃掉了；DFlash 更极端（6 个 target，三段跨线 3 个，**−31%**）。**但 21.6% 是「相对两段」，不是「相对不可用」**——三段仍然是 **5.85 t/s 可用**的，而整模装不下时是 0。
 
 ### 结论
 
-**三段 = 用 21.6% 的 decode 速度换「能跑」**，而且投机失效后**仍有 1.00× 的净吞吐**（不是负收益）。
-这在分段推理里算**接近无损扩容**：容量翻 3 倍，速度只降两成。
+**三段 = 用 21.6% 的 decode 速度换「能跑」**，而且投机失效后**仍有 1.00× 的净吞吐**（不是负收益）。这在分段推理里算**接近无损扩容**：容量翻 3 倍，速度只降两成。
 
 **别把它当速度方案用**——要速度就用两段（`0:32 + 32:40` + DSpark，**1.51×**），要容量才用三段。
 
@@ -156,13 +126,12 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 必须每轮清空 → 即使 catch-up 也读不到 → 跳过 catch-up 是对的。旧路径的代价是接受率封在 0.688。
 
 **现行路线**（`QLH_CHAIN_DRAFT_KEEP_KV=0` 关掉回到旧路径：请求开始时清一次 + 每轮按 target 的接受量 `seq_rm`，让草稿看到本次请求已生成的 token，而非 prompt），2026-11-10
-起是默认：35B 链上 64 档 0.688 → 0.788、512 档 0.582 → 0.724（keep-KV 默认比整模低：64 档 13%、512 档 4%；旧路径 64 档 24%、512 档 23%），生成文本逐字节不变（见 [`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.4）。
+起是默认：35B 链上 64 档 0.688 → 0.788、512 档 0.582 → 0.724，生成文本逐字节不变（见 [`MODEL-SWAP.md`](../measure/MODEL-SWAP.md) §11.4）。
 
 **判据**：llama.cpp 不承诺 batch invariance，CPU + 量化落在上游 `DETERMINISM.md`（llama.cpp 的 `docs/` 下）的覆盖空白里，所以判据是无回退时链上投机 == **整模投机**、逐字节相同（能过）；
 带回退时只保证到漂移翻掉的第一个近似并列处；「投机 == 不投机」降为 INFO。三个 ggml 分界、上游 PR / issue 与 bit-exact 的改造代价见 [`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §4。
 
-**仍然成立的结构事实**：采样投机不做；MTP 只能跟末段；异构弱网上张量并行是纯负收益；ngram 在 chat 模板下全程 0 draft——数字与判据见 [`SPECULATION-DATA.md`](../measure/SPECULATION-DATA.md) §4。35B 这一档内部稳：
-官方版重扫 k=1..8 甜点仍是 2，与蒸馏版同档。
+**仍然成立的结构事实**：采样投机不做；MTP 只能跟末段；异构弱网上张量并行是纯负收益；ngram 在 chat 模板下全程 0 draft——数字与判据见 [`SPECULATION-DATA.md`](../measure/SPECULATION-DATA.md) §4。
 
 **三条判据**：某个 draft 源在某个 prompt 上快，先问 prompt 是否专为它构造；收益必须按部署形态报；判据先问这份代码承诺过什么。
 
@@ -183,46 +152,35 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 
 ### 2.5 远程链的 checkpoint：blob 12.56 MiB 留在 stage 内，v6 起过网 8 字节
 
-- **现象**：35B 的 8 层 qwen35moe 段，每段 blob **13,172,908 B = 12.56 MiB（恒定）**（2B 的 8 层段是
-  6,733,996 B = 6.42 MiB）。**blob 留在 stage 进程内**，与历史长度无关。
-- **过网量**：v5 及更早是整 blob 往返（跨机实测两次 26.3 MiB、1.91 s）；**v6 起每段 8 字节 handle**
-  （`STATE_FLAG_HANDLE`，`src/llama-split-proto.h:224-235`），被消除的是 0.8–1.2 s/次。
+- **现象**：35B 的 8 层 qwen35moe 段，每段 blob **13,172,908 B = 12.56 MiB（恒定）**（2B 的 8 层段是 6,733,996 B = 6.42 MiB）。**blob 留在 stage 进程内**，与历史长度无关。
+- **过网量**：v5 及更早是整 blob 往返（跨机实测两次 26.3 MiB、1.91 s）；**v6 起每段 8 字节 handle**（`STATE_FLAG_HANDLE`，`src/llama-split-proto.h:224-235`），被消除的是 0.8–1.2 s/次。
 - **handle 过期**是 `ST_STALE`，可恢复：stage 在应用前就拒绝，链停在原地，调用方重跑 prompt 即可。
 - **详版与盈亏账**：`report/06-局限与结论.md` §1.9。
 
 ### 2.6 单独层范围的两道检查：边界在「标记由谁置真」
 
-- **现象**：一个层范围单独起 server，两种误配都在加载后、建上下文前报错，判据在 `common_init_from_params()`：范围在模型中间结束又没给 `--split-tail-range` / `--split-remote`；或范围不从 0
-  开始（`20:24` 这种「就是尾巴」）而 `common_params::split_range_is_stage` 为假。
-- **根因**：server 进程内加载本地 tail 时用的正是 `20:24`，区分「合法一环」与「误配」只能靠内部标记（默认 false，只有 llama-server 加载 tail 时置真）。
-  两道检查读从模型读回的范围（`llama_model_layer_range()` / `llama_model_n_layer_src()`），`LLAMA_LAYER_RANGE` 入口一并覆盖。
+- **现象**：一个层范围单独起 server，两种误配都在加载后、建上下文前报错，判据在 `common_init_from_params()`：范围在模型中间结束又没给 `--split-tail-range` / `--split-remote`；或范围不从 0 开始（`20:24` 这种「就是尾巴」）而 `common_params::split_range_is_stage` 为假。
+- **根因**：server 进程内加载本地 tail 时用的正是 `20:24`，区分「合法一环」与「误配」只能靠内部标记（默认 false，只有 llama-server 加载 tail 时置真）。两道检查读从模型读回的范围（`llama_model_layer_range()` / `llama_model_n_layer_src()`），`LLAMA_LAYER_RANGE` 入口一并覆盖。
 - **残留边界**：判据是「本进程是不是在拼链」，不是「范围是否合法」；任何在进程内构造 `common_params` 又把标记置真的调用方都跳过第二道检查。
 - **代价**：修它要把标记换成「范围 + 链身份」的显式描述，是参数 / 协议层重构，现在不值得。
 
 ### 2.7 链路停摆：`/health` 仍 200；链死而进程活
 
-- **现象**：跨机实测（挂起 stage）——`/health` 24 次采样全部 200；`/completion` 精确 120211.65 ms（+120.2 s）失败；head 在 `seq_rm ... recv failed` 之后曾走
-  `GGML_ABORT("failed to remove sequence …")`，进程退出（`seq_rm` 改成 `bool` 后这一行已不存在）。
-- **已改**：失败置 `remote_failure` 而不 abort，`decode_split()` 算之前就查它并返 `-3`（链死后第二个请求 0.01 s 失败）。`/health` 仍 200 是刻意的（存活语义），要看链就问 `?deep=1`：链死快速
-  503、链活真发 1-token 请求、忙时 `200 {"deep":"busy"}`。
-- **自愈**：位置 0 的请求重建（有界 reconnect → 整链 clear → 恢复超时），失败保持 dead + 5 s 节流（`kRebuildThrottleMs`）；重建后唯一一致状态是「全空」，所以「KV 空但接着算」不可能。只重启 stage
-  恢复后输出逐字节相同。
+- **现象**：跨机实测（挂起 stage）——`/health` 24 次采样全部 200；`/completion` 精确 120211.65 ms（+120.2 s）失败；head 在 `seq_rm ... recv failed` 之后曾走 `GGML_ABORT("failed to remove sequence …")`，进程退出（`seq_rm` 改成 `bool` 后这一行已不存在）。
+- **已改**：失败置 `remote_failure` 而不 abort，`decode_split()` 算之前就查它并返 `-3`（链死后第二个请求 0.01 s 失败）。`/health` 仍 200 是刻意的（存活语义），要看链就问 `?deep=1`：链死快速 503、链活真发 1-token 请求、忙时 `200 {"deep":"busy"}`。
+- **自愈**：位置 0 的请求重建（有界 reconnect → 整链 clear → 恢复超时），失败保持 dead + 5 s 节流（`kRebuildThrottleMs`）；重建后唯一一致状态是「全空」，所以「KV 空但接着算」不可能。只重启 stage 恢复后输出逐字节相同。
 - **握手**：`OP_HELLO`（v4，`PROTO_VER` 到 9）区分不了同形状不同权重的 GGUF——不做模型哈希的代价。
 
 ### 2.8 `can_shift=false`：对 qwen35 忠实，对本地纯 KV 链过度保守
 
-聚合 memory 的 `get_can_shift()` 恒返回 false。
-
-- **对 qwen35/qwen35moe 是忠实的**：两者是 IMROPE，`n_pos_per_embd() = 4`，而 `llama_kv_cache::get_can_shift()` 对 `n_pos_per_embd() > 1` 返回 false——
-  整模同样不支持 ctx_shift，差距为 0。
+- **对 qwen35/qwen35moe 是忠实的**：两者是 IMROPE，`n_pos_per_embd() = 4`，而 `llama_kv_cache::get_can_shift()` 对 `n_pos_per_embd() > 1` 返回 false——整模同样不支持 ctx_shift，差距为 0。
 - **欠账在别处**：本地纯 KV 链（`n_pos_per_embd() == 1`）本来可以 shift，聚合视图一律报 false，server 退化到重算前缀。
 - **代价**：`can_shift` 要变成「所有段的与」，且 shift 要真广播到每一段；后者是 `seq_add` 的跨段语义（现在 `reject_remote("seq_add")` 直接拒绝），所以只对本地链有意义。
 
 ### 2.9 `seq_rm` 失败显式化：上游短路、本仓改成 `bool`、两条边界判据
 
 - **现象**：投机评测发现「同一位置回退前后算出的 `h` 不同」，根因是 `seq_rm` 失败被静默忽略——调用方以为行删掉了，继续在「prompt 已回退、KV 没回退」的状态上算下一个 token，不报错、只算错。
-- **根因（上游）**：`llama_memory_hybrid::seq_rm` 先删 recurrent，失败就 `return false`，**attention KV 的删除被整体跳过**；hybrid 在 server 默认 `n_rs_seq = 0` 下
-  partial 分支要求 `rollback <= n_rs_seq` 不成立。上游已有 open PR #28007 与 issue #31656，本仓不提新 issue。本仓原先把失败吞掉了（这一半已修）；能修的是「失败可见 + 每个调用点按场景降级」。
+- **根因（上游）**：`llama_memory_hybrid::seq_rm` 先删 recurrent，失败就 `return false`，**attention KV 的删除被整体跳过**；hybrid 在 server 默认 `n_rs_seq = 0` 下 partial 分支要求 `rollback <= n_rs_seq` 不成立。上游已有 open PR #28007 与 issue #31656，本仓不提新 issue。本仓原先把失败吞掉了（这一半已修）；能修的是「失败可见 + 每个调用点按场景降级」。
 - **改法**：`common_memory::seq_rm` / `common_context_seq_rm` 从 `void` → `bool`，五个调用点按场景退化：
 
 | 场景 | 失败后 |
@@ -235,17 +193,14 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 **边界一：链死时不能结束请求。** 把「链死」也走「失败 → `send_error` + `release`」会让自愈永久失效：`try_rebuild` 只在一次从 pos 0 开始的 decode
 里触发，结束请求会跳过那次 decode，链就永远死。现行做法：链死只记 ERROR、不结束请求。
 
-**边界二：`p0 > pos_max` 是成功。** 让所有 partial `seq_rm`
-返回 false（含空删除），降级调用方在同一位置无限重试、5 次后超时；`llama_kv_cache::seq_rm` 与 `llama_memory_recurrent::seq_rm` 在 `pos_in`
-不匹配时跳过并**无条件 `return true`**（`QLH_FORCE_SEQ_RM_FAIL` 已改成只在 `p0 <= pos_max` 时拒绝）。
+**边界二：`p0 > pos_max` 是成功。** 让所有 partial `seq_rm` 返回 false（含空删除），降级调用方在同一位置无限重试、5 次后超时；`llama_kv_cache::seq_rm` 与 `llama_memory_recurrent::seq_rm` 在 `pos_in` 不匹配时跳过并**无条件 `return true`**（`QLH_FORCE_SEQ_RM_FAIL` 已改成只在 `p0 <= pos_max` 时拒绝）。
 
 **已知未覆盖**：`p0` 退化分支是 code-review-verified, not run；shared-prefix 路径不调用 partial `seq_rm`，`verify/verify_seq_rm_shared.py` 的 `[INFO] injection never fired`
 表示这次跑没测到东西。验收见 [`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §5。
 
 ### 2.10 同机构造测不出 head offload 的收益
 
-- **现象**：head + tail 同机时给 head 加 `-ngl 8`，**head 自己的 plain 图帧反而更慢**：`QLH_SPLIT_TRACE` 逐帧分解 80.30 ms vs 全 CPU 76.01 ms（慢 5.6%），抖动 52~160 vs
-  63~100 ms，端到端 tg 8.44 vs 9.34；同一配置在段级 probe 上是 47.6 vs 63.7 ms，快 25%。
+- **现象**：head + tail 同机时给 head 加 `-ngl 8`，**head 自己的 plain 图帧反而更慢**：`QLH_SPLIT_TRACE` 逐帧分解 80.30 ms vs 全 CPU 76.01 ms（慢 5.6%），抖动 52~160 vs 63~100 ms，端到端 tg 8.44 vs 9.34；同一配置在段级 probe 上是 47.6 vs 63.7 ms，快 25%。
 - **根因**是流水线形态：probe 在单个 range 上连续 decode，GPU kernel launch / sync 能与 CPU 线程池跨步流水；server 每帧一次 decode 再等 TCP 往返，两端争同一批 CPU 线程。
 - **判据**：head offload 的收益只能用部署形态测（head 独占本机、tail 在 LAN），那一档是 `-ngl 8` **+19.6%**（另一次 +34%）、`--ncmoe` + `--moe-cache-mib 1024` **+40.9%**；
   同机构造的数字只能当压力 / 回归数据，方向甚至相反。
@@ -254,8 +209,7 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 
 ### 3.1 跨 ubatch 的「逐位相同」不成立
 
-- **现象**：同一 prompt 装不进 `n_ubatch` 时切成两个 ubatch，GEMM 累加顺序随之改变：head 自己的 tap 与整模的差可以有 4e-4（29 token / `n_ubatch=12`，`tests/dflash-taps.cpp`
-  头注释），同批测量里最大到 1e-1 量级（**未落盘**）。
+- **现象**：同一 prompt 装不进 `n_ubatch` 时切成两个 ubatch，GEMM 累加顺序随之改变：head 自己的 tap 与整模的差可以有 4e-4（29 token / `n_ubatch=12`，`tests/dflash-taps.cpp` 头注释），同批测量里最大到 1e-1 量级（**未落盘**）。
 - **根因**是浮点加法不满足结合律，切 ubatch 就换归约树，是性质不是缺陷。
 - **影响**：所有逐位验收必须在单 ubatch 内做；长 prompt 的逐位对比不控制这一点会稳定给出假阳性。
 - **代价**：不修。容差比较更糟——分段链的正确性判据只能靠逐位；折中是把每次对比的 ubatch 边界写进结论。
@@ -264,8 +218,7 @@ fork 整体 rebase 到上游 193 个提交之后的 `09338b85e`，本仓「自�
 
 **现象**（2026-11-06 实测，贪心，ms/token）：
 
-- MTP k=2 在纯代码 prompt 上 1.33×、中英混合 1.06×、纯中文 1.00×（**未能复现**：真实代码 / 混合 / 中文 prompt 上 k=2 是 0.87× / 0.69× / 0.63×，接受率 47% / 27% / 19%，1.32×
-  只出现在模型能复读的退化 prompt 上——**不要再用这三个数当证据**）。
+- MTP k=2 在纯代码 prompt 上 1.33×、中英混合 1.06×、纯中文 1.00×（**未能复现**：真实代码 / 混合 / 中文 prompt 上 k=2 是 0.87× / 0.69× / 0.63×，接受率 47% / 27% / 19%，1.32× 只出现在模型能复读的退化 prompt 上——**不要再用这三个数当证据**）。
 - DFlash k=3 在 CPU 上 +23.7%（不能外推到 GPU）。
 - 2B 上 k 的拐点复现不出来（k=3 优于 k=2：25.09 vs 28.32 ms/token，早先记的 25.87 **未复现**，接受率只从 97.7% 掉到 96.6%）。
 - `-np > 1` + MTP 明显变慢（整模加 MTP 22.56 → 28.37 ms/token）。
