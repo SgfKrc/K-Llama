@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 540c53614..f87ec9f52 100644
+index a2db28ade..536b0e5d7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5978,6 +5978,15 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
+@@ -6114,6 +6114,15 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
  
  #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
      cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
