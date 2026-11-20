@@ -77,7 +77,7 @@ loopback 上验过 tap 开销可忽略，跨机验的是 wire 上 tap 逐位与�
 | B DSpark | 32840 ms → **~32.8 s** |
 | C MTP | 27499 / 28212 / 29698 / 30783 ms → **~29.05 s**（四次均值 29048 ms） |
 
-**A − C ≈ +3.05 s**，与「25 MB ÷ 9.5 MB/s ≈ 2.6 s」同量级（9.5 MB/s 是旧口径；2026-11-13 用 `iperf3 -P 4` 实测三条路径都是 **100–106 Mbits/s ≈ 12.5 MB/s**，按新值应为 2.0 s——见 `INDEX.md` §6.5）（[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §3.3：prefill 每个 512
+**A − C ≈ +3.05 s**，与「25 MB ÷ 9.5 MB/s ≈ 2.6 s」同量级（9.5 MB/s 是旧口径；2026-11-13 用 `iperf3 -P 4` 实测三条路径都是 **100–106 Mbits/s ≈ 12.5 MB/s**，按新值应为 2.0 s——见 `INDEX.md` §六点五）（[`PROTOCOL-V9.md`](../design/PROTOCOL-V9.md) §3.3：prefill 每个 512
 行 ubatch 是 8 MB，1102 token 约 3 个 ubatch 即 24 MB）。**没有 10 s 级的低效**——如果 tap 是逐 token 往返，1102 个 token 会报出数量
 级更大的差；实测差值与带宽估算同量级，说明 tap 是**成批**走的。与 loopback 对照：1192 token 差 **0.2%**；跨机 1102 token 差 **~3.05 s（9–10%）
 **。

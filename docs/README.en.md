@@ -2,14 +2,14 @@
   <img src="assets/banner.svg" alt="K-Llama — Llama.cpp for Kircheis" width="100%">
 </p>
 
-# K-Llama v2.1
+# K-Llama v2.2
 
 **Non-whole-model (segmented) loading · a customized llama.cpp engine · lightweight large-model inference across edge devices**
 
 [中文](../README.md) | **English**
 
-> Status: **Current**
-> Updated: 2026-11-12
+> Status: **Current development version v2.2**; delivery version v2.1 (frozen)
+> Updated: 2026-11-13
 > Scope: the entry point for the split chain — what it is, what it can do, how to run it, the hard
 > constraints, the measurement baselines, and the documentation index. Mechanism lives in
 > [ARCHITECTURE.md]; boundary costs in [SEGMENTED-LIMITS.md]; patch composition in [PATCHES.md].
@@ -25,9 +25,39 @@ Two generations share the name. v2 is the Python-driven chain (`chain_client.py`
 `stage_worker.py`, `stream.py`; TUI entry `koakuma`) that spreads a model over several machines;
 v2.1 pushes that chain into `llama_context` so the exposed surface matches a whole model.
 
-**v2 is retired** — archived on `slimarc/prototype` — so this branch documents v2.1 only. Its
-throughput numbers stay in [MEASUREMENTS.md], v2.1 criteria live in [SPLIT-MEASUREMENTS.md]; do not
-mix them.
+**v2 is retired** — archived on `slimarc/prototype`. v2.1 is the delivery version and is frozen (repo
+tag `v2.1`); v2.2 is the current development version that tracks upstream. Its throughput numbers
+stay in [MEASUREMENTS.md]; this generation's (v2.1 / v2.2 shared) criteria live in
+[SPLIT-MEASUREMENTS.md]; do not mix them.
+
+## Upstream and versions
+
+On 2026-11-12 upstream advanced 31 commits past `09338b85e` (to `5676dfbe0`, tag `b12342`). The core
+one is PR #30565 "llama : prune" (preparing for the v1.0.0 release): 18 NextN / layer-input /
+embd-row / state-row APIs move from `src/llama-ext.h` (the staging header) into `include/llama.h`,
+and `llama_set_embd_state_src` becomes `llama_set_ctx_state_src`. For this project that is a
+**foundation promotion, not a capability change**: segmented passthrough is built on exactly those
+three channels (the head exports pre-norm hidden, relay / tail consume it through an embd row), so
+the patch no longer adds `extern "C"` to the staging header (`include/llama.h:52` already wraps it);
+the `split_*` protocol layer is ours, not upstream's, and does not move a line. Upstream's API
+targets in-process draft-head combinations and reaches other machines over RPC backend + RDMA, so it
+does not collide with this project's feature passthrough; `3bce8bd50` and `3ba1ce0e2` in the same
+batch also pay off directly.
+
+| Version | Base | Status and caliber |
+| --- | --- | --- |
+| v2.1 | `09338b85e` | **Delivery version, frozen**: code-side tags `v2.1` (`4acf03c8b`, tree `548c3dfb0`) and `v2.1-kvmem` (`3f930466d`, tree `192b2a3d0`); repo tag `v2.1` (`074dea49`, tree `83f31877`) |
+| v2.2 | `5676dfbe0` | **Current development version** (the next one, tracking upstream): capabilities and criteria carry over from v2.1; throughput is un-remeasured, the acceptance suite has been re-run (73/0/1, see below); whether it enters the delivery scope is undecided |
+
+v2.2's goal is to finish **separating prefill from decode**, in three parts: overturn the remote
+chain's single-sequence boundary (v2.1's stated reason was that the remote chain is not multi-tenant);
+introduce batching (`OP_DECODE` carries one `seq_id` per row, so prefill chunks and decode tokens mix
+in one batch); separate the prefill and decode scheduling. For reference, v2.1's multi-sequence run
+gave `-np 2` 0.81× end to end and 0.70× on concurrent prefill. Left for v3: multi-request batching
+(pack the hidden of N requests into one frame, dividing round trips by N) and chained topology (today
+a star, four network one-ways per decode; direct segment-to-segment links save one one-way, 12.5–15
+ms or about 6–7%, but `seq_rm` / checkpoints / error propagation must be redone along the chain,
+15–20 person-days).
 
 ## Capabilities
 
@@ -95,7 +125,7 @@ llama-server -m model.gguf --split-layer-range 0:32 -c 4096 \
    [SPLIT-MEASUREMENTS.md] §7.
 3. **The remote chain is single-sequence.** `llama_split_attach_remote()` rejects `n_seq_max > 1`.
    Concurrency means several servers on the head box, each with its own chain; inside one box use the
-   local chain. See [SEGMENTED-LIMITS.md] §2.4.
+   local chain (v2.2 aims to lift this). See [SEGMENTED-LIMITS.md] §2.4.
 4. **Pick the draft source by channel.** DFlash / DSpark travel as `layer_inp` taps (protocol v9) and
    cost nothing on a remote chain. MTP travels the nextn channel and accepts less on a chain than on
    a whole model; the cause is in the measurements section. See [SEGMENTED-LIMITS.md] §2.2.
@@ -133,14 +163,11 @@ Short prompts therefore lose (the draft context costs ~2.1 s to build, which is 
 long prompts plus DSpark win (fewer taps: 1 of 5 in the head vs 2 of 8 for DFlash).
 
 **Splitting locally is a pure loss** (2B is 26% slower): there is no cross-machine round trip to
-save, and the two processes fight over the same CPU and memory bus. Mechanism: [SPECULATION-DATA.md]
-§4.
+save, and the two processes fight over the same CPU and memory bus. Mechanism: [SPECULATION-DATA.md] §4.
 
 Chain acceptance (local two-stage, `n_predict 64`, 3 prompts, [MODEL-SWAP.md] §11.4): keep-KV
 **0.78767** (115/146), catch-up mode 2 **0.9098** (121/133, bit-identical to the whole model);
 DFlash / DSpark on a remote chain match the whole model prompt by prompt (117/141, 117/140).
-
-**The same `--spec-type draft-mtp` takes two different paths on the whole model and on a chain.**
 
 Caliber traps: acceptance flips sign across `n_predict` (same draft pair: +0.59 pts at n=64, −0.94 at
 n=256); `mean_len = 1 + accept × k`, so it is not comparable across k; DSpark-6L's base is NVFP4
@@ -148,30 +175,29 @@ rather than official BF16, so the comparison holds only between those two files.
 
 ## Code and acceptance
 
-- Fork: `H:\llamacpp-c`, branch `rebase-merge`, a single commit `4acf03c8b` on parent `09338b85e`
-  (current upstream, 193 commits later), tree `548c3dfb0`; against upstream, 55 files /
-  +20345 −245.
-- [llamacpp-split.patch]: 45 files / +16680 −244 / 18749 lines / 982.8 KiB. The complete pure split
-  patch (protocols v7 / v8 / v9 included); the mechanism list is in [PATCHES.md]. No SLIM-ARC; it
+- Fork (v2.2 current): `H:\llamacpp-c`, branch `slimarc/v2.2`, HEAD `6d0fa16c9` (7 commits past base
+  `5676dfbe0`, tag `b12342`), tree `61781c712`; against the base, 55 files / +21788 −238.
+- [llamacpp-split.patch]: 45 files / +18123 −237 / 20238 lines / 1077.2 KiB. The complete pure split
+  patch (protocols v7 / v8 / v9 / v10 included); the mechanism list is in [PATCHES.md]. No SLIM-ARC; it
   compiles and passes the full acceptance run on its own.
 - [llamacpp-slimarc.patch]: 13 files / +3665 −1 / 3790 lines / 164.2 KiB. SLIM-ARC prefetch, off by
   default, installed only with `SLIM_ARC_PREFETCH=1`. Prefetch is the only piece borrowed; expert
   residency, KV eviction and the I/O scheduler stay out of scope — see [SLIM-ARC-接入计划.md].
-- Composition check: `09338b85e` + main patch → tree `586a7e7a1`; adding the increment → tree
-  `548c3dfb0`, identical to HEAD's tree (`git write-tree`; see `scripts/export_patches.sh`).
-- Build: [BUILD.md] gives the measured commands from `09338b85e` + patches to binaries and the build
+- Composition check: `5676dfbe0` + main patch → tree `2541c9d29`; adding the increment → tree
+  `61781c712`, identical to HEAD's tree (`git write-tree`; see `scripts/export_patches.sh`).
+- Build: [BUILD.md] gives the measured commands from `5676dfbe0` + patches to binaries and the build
   switch matrix; changing a `.h` requires `--clean-first`.
-- Against upstream: 16 files are byte-identical to `09338b85e`, against zero before the rebase. The
-  17 file changes that dropped out were lag — upstream already carries those commits;
+- Against upstream (v2.1 rebase basis): 16 files are byte-identical to `09338b85e`, against zero before
+  the rebase. The 17 file changes that dropped out were lag — upstream already carries those commits;
   `src/models/dflash.cpp` re-entered the change set with its device-buffer diagnostic. Inventory in
   the upstream-overlap section of [PATCHES.md].
 
 Every acceptance check compares bit- and byte-identical logits, not generated text; the table below
-records the 2026-11-12 run:
+records the v2.1 delivery run (2026-11-12); v2.2 is un-remeasured:
 
 | Suite | Result | Criterion |
 | --- | ---: | --- |
-| `bash verify/verify.sh` | 57 (thirteen groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11, 1 in 12, 4 in 13) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md`, group 12 checks segment-level offload with a CUDA build, group 13 checks KVMem KV virtualization with the `build-kvmem2` build (`LLAMA_KVMEM=ON`) |
+| `bash verify/verify.sh` | 77 (fourteen groups: 22 in 1–8, 2 in 9, 20 in 10, 8 in 11, 1 in 12, 4 in 13, 20 in 14) | bit / byte identity; group 11 runs the product path `llama-server + chain + -md`, group 12 checks segment-level offload with a CUDA build, group 13 checks KVMem KV virtualization with the `build-kvmem2` build (`LLAMA_KVMEM=ON`), group 14 checks the per-seq speculative channels of a remote chain with `-np 2` (criteria 7–11) |
 | `verify/verify_chain_death.py` | 36 | 120 s read timeout, dead chain with a live process, failures visible |
 | `verify/verify_seq_id.py` | 9 | `seq_id` and positions across segments |
 | `verify/verify_mtp.sh` / `verify/verify_mtp_e2e.sh` | 6 / 6 | chain draft bit-identical to the whole model, end-to-end byte-identical |
@@ -179,58 +205,23 @@ records the 2026-11-12 run:
 | `verify/verify_seq_rm_exact.py --expect-known-fail` | 1 pass / 5 known-fail | the five are upstream hybrid baselines kept as controls |
 | Pure split build (main patch only) | 52 + 36 | built and run independently on tree `586a7e7a1` |
 
-**Current status of the pure split build**: the pure split tree `586a7e7a1` (45 files) was rebuilt
-with `--clean-first` in an independent worktree @ `09338b85e` + main patch (`git write-tree` =
-`586a7e7a1`); `verify.sh` reports **52/0/0**, `verify/verify_chain_death.py` **36/0** (2026-11-11). The
-previous build `0c307d82a` (44 files, 2026-11-09) covers the same acceptance.
-
 The v2 chain was checked by `python checks/verify_*.py` and
 `python -m unittest test_topology test_contract`; those scripts left with v2 (now on
-`slimarc/prototype`). Counts and latest results are in [SPLIT-MEASUREMENTS.md] §6.
+`slimarc/prototype`); v2.1 acceptance lives in `verify/` and v2.2 reuses it. Counts and latest
+results are in [SPLIT-MEASUREMENTS.md] §6.
 
 ## Documentation map
-
-`docs/` groups documents by topic; only entry points stay at the root:
 
 | Directory | Contents |
 | --- | --- |
 | `docs/` | Entry points: `QUICKSTART.md` (first working chain), `REPORT.md` (final report), `OPEN-ISSUES.md` (known open issues), `README.en.md` (this file) |
 | `docs/report/` | The six report chapters: `01-背景与目标.md` … `06-局限与结论.md` |
-| `docs/design/` | Mechanisms, protocols and conventions: ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC integration (plan and obstacles) / LILICORR-轻量头 / EXLLAMAV3-GPU段候选 |
+| `docs/design/` | Mechanisms, protocols and conventions: ARCHITECTURE / PROTOCOL-V9 / STYLE / TESTING / DESIGN / DECISIONS / SLIM-ARC integration (plan and obstacles) / LILICORR-轻量头 / EXLLAMAV3-GPU段候选 / MOE transfer and compute |
 | `docs/deploy/` | Build, deployment and delivery: BUILD / DEPLOYMENT / CROSS-MACHINE / THREE-SEGMENT / PACKAGING / DELIVERY / PATCHES / PATCHES-DETAIL / ANDROID-SURFACE-段接入评估 |
 | `docs/measure/` | Measurements: SPLIT-MEASUREMENTS / MEASUREMENTS / MODEL-SWAP / SPECULATION / SPECULATION-DATA / SPECULATION-MATRIX / SEGMENT-OFFLOAD / MEASUREMENT-PITFALLS / IGPU-SLOWDOWN |
 | `docs/limits/` | Boundaries and costs: SEGMENTED-LIMITS / MEMORY-LIMITS / KV-CACHE / MOE-SPECULATION-ECONOMICS |
 | `docs/issues/` | Defects: the five `ISSUE-*.md` write-ups plus `FIXES.md` (fixed-defect register) |
 | `docs/legacy/` | Retired or archived v2 material: ANTI-ROT / INVENTORY / PRIMA-ANALYSIS / PRIMA-LESSONS / TUI / CHAT-ENGINE / AUTO-ASSIGN-PLAN / BASELINE / PROGRESS / CUT-TOOL / RESPONSES-API / SAMPLING |
-
-Most-queried documents:
-
-| File | Contents |
-| --- | --- |
-| [ARCHITECTURE.md] | The three loading mechanisms, the handoff point, hard constraints, what counts as evidence, the native-RPC boundary |
-| [PATCHES.md] | Patch generations and their differences, the upstream rebase record, full patch text |
-| [BUILD.md] | From patch to executable: measured commands, switch matrix, CPU variants and a fair baseline, MSVC traps, artifact list |
-| [SEGMENTED-LIMITS.md] | Every boundary: root cause, blast radius, what fixing it would cost |
-| [SPLIT-MEASUREMENTS.md] | v2.1 measurements: checkpoints, MTP, DFlash, protocol v9, the selection matrix, the zero-loss cross-machine run |
-| [SPECULATION-DATA.md] | Speculation data: per-prompt, k sweep, DFlash, selection matrix, unlogged numbers |
-| [MODEL-SWAP.md] | 35B model swap: both weight files, acceptance baselines, the 13% chain discount |
-| [PROTOCOL-V9.md] | Protocols v5/v7/v8/v9: candidate channel, verify rows, remote draft, taps, the `seq_rm` probe |
-| [CROSS-MACHINE.md] | Cross-machine runs: ROG, Surface, loopback, Tailscale → Surface |
-| [PATCHES-DETAIL.md] | Patch detail: the fourth-generation mechanism table, the device-buffer fix, upstream overlap |
-| [MEASUREMENTS.md] | v2 Python-chain measurements (toolchain retired; cite the method when reused) |
-| [SPECULATION.md] | Speculation criteria, cost model, k sweep, integration measurements |
-| [DEPLOYMENT.md] | What goes where, how to change the split, how to start remote workers |
-| [TESTING.md] | Test channels: what is measured, how to run it, what counts as a pass |
-| [MEASUREMENT-PITFALLS.md] | Why per-segment timing lies, and how to measure instead |
-| [MEMORY-LIMITS.md] | Memory and VRAM arithmetic, calibration constants, core-pinning discipline |
-| [IGPU-SLOWDOWN.md] | Why the iGPU loses, the `-ngl` sweep and where the crossover sits |
-| [SEGMENT-OFFLOAD.md] | `-ngl` semantics under segmentation, per-stage and end-to-end numbers, MoE cache, VRAM budget |
-| [PROGRESS.md] | Current capability snapshot and optimisations in place |
-| [SAMPLING.md] · [TUI.md] · [RESPONSES-API.md] | Sampling mapping · TUI pages and commands · `/v1/responses` translation layer |
-| [SLIM-ARC-接入计划.md] | When the remaining page-fault work pays off |
-
-Further topics (`LILICORR-轻量头.md`, `ANDROID-SURFACE-段接入评估.md`, `ISSUE-*.md`) sit in the
-subdirectory listed above; retired v2 documents are in `docs/legacy/`.
 
 ## License
 
@@ -244,21 +235,11 @@ the same terms; model weights and other third-party artifacts keep their own lic
 [SPLIT-MEASUREMENTS.md]: measure/SPLIT-MEASUREMENTS.md
 [SPECULATION-DATA.md]: measure/SPECULATION-DATA.md
 [MODEL-SWAP.md]: measure/MODEL-SWAP.md
-[PROTOCOL-V9.md]: design/PROTOCOL-V9.md
-[CROSS-MACHINE.md]: deploy/CROSS-MACHINE.md
-[PATCHES-DETAIL.md]: deploy/PATCHES-DETAIL.md
-[MEASUREMENTS.md]: measure/MEASUREMENTS.md
+[MEASUREMENTS.md]: legacy/MEASUREMENTS.md
 [SPECULATION.md]: measure/SPECULATION.md
 [DEPLOYMENT.md]: deploy/DEPLOYMENT.md
-[TESTING.md]: design/TESTING.md
-[MEASUREMENT-PITFALLS.md]: measure/MEASUREMENT-PITFALLS.md
-[MEMORY-LIMITS.md]: limits/MEMORY-LIMITS.md
 [IGPU-SLOWDOWN.md]: measure/IGPU-SLOWDOWN.md
 [SEGMENT-OFFLOAD.md]: measure/SEGMENT-OFFLOAD.md
-[PROGRESS.md]: legacy/PROGRESS.md
-[SAMPLING.md]: legacy/SAMPLING.md
-[TUI.md]: legacy/TUI.md
-[RESPONSES-API.md]: legacy/RESPONSES-API.md
 [SLIM-ARC-接入计划.md]: design/SLIM-ARC-接入计划.md
 [llamacpp-split.patch]: llamacpp-split.patch
 [llamacpp-slimarc.patch]: llamacpp-slimarc.patch

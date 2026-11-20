@@ -1,12 +1,12 @@
 #!/bin/bash
-# 分段链四组验收，一条命令跑完。
+# 分段链十五组验收，一条命令跑完。
 #
-# 为什么要这个：这四组验证之前只有"上一次某个人手工跑过"的口头结论，没人能重跑。
+# 为什么要这个：这些验证之前只有"上一次某个人手工跑过"的口头结论，没人能重跑。
 # 每次改完 llama.cpp 侧的分段代码，跑这一遍就是验收；任何一组退化都说明改坏了。
 #
 # 用法：
-#   bash verify/verify.sh              # 增量编译 + 全部四组
-#   bash verify/verify.sh --clean      # 全量重编 + 全部四组（改过头文件必须用这个）
+#   bash verify/verify.sh              # 增量编译 + 全部十五组
+#   bash verify/verify.sh --clean      # 全量重编 + 全部十五组（改过头文件必须用这个）
 #   bash verify/verify.sh --skip-build # 只跑验证
 #
 # 注意：上游构建目录的 ninja 依赖记录不可靠（多数对象 deps=0），改头文件不会触发重编，
@@ -21,9 +21,11 @@
 # 上下一个真实请求因此要重新算 prompt；一次两跳链上实测约 80 ms，代价在缓存不在时间。
 # deep=1 用于「已经在怀疑链路」或改完配置后各问一次。
 #
-# 退出码 0 = 四组全过。
+# 退出码 0 = 被测到的组全过（SKIP 不算失败，但也不算通过；逐条见下面「退出码」一节）。
 #
-# 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）。
+# 项数：44 -> 52（2026-11-09 加组 11）-> 53（2026-11-11 加组 12）-> 57（2026-11-12 加组 13）
+#       -> 77（2026-11-13 加组 14：判据 7-11 的 per-seq 投机四通道，20 项）
+#       -> 95（2026-11-14 加组 15：判据 2-6 的多序列基础语义，18 项）。
 # 组 13 的 4 项覆盖 **KVMem 的 KV 虚拟化**（本地双段 + MTP + 驱逐，见下）。组 11 的 8 项覆盖
 # **DFlash 投机的 device-buffer 注入路径**：组 9/10 用的 tests/dflash-taps.cpp 只 link `llama`，
 # 从不调 llama_set_embeddings_layer_inp_dev（ctx_tgt 没有 device buffer），batch 用
@@ -36,8 +38,20 @@
 # 忽略），所以「一段里的前 N 层放 GPU、其余留 CPU」从没被验收过。组 12 用 CUDA 构建跑
 # 「整模 vs --split-layer-range 0:24，都 -ngl 4」，判据是逐字节相同。CUDA 构建不存在时 SKIP。
 #
+# 组 14 的 20 项覆盖**远程链 -np 2 上的 per-seq 投机四通道**（判据 7-11，见 docs/design/V22-PERSEQ-SPEC.md §6）：
+# 组 7 跑远程链但从不给 -np（auto = 1），组 8 的 MTP 投机只跑单序列——「一帧里两个序列、各自的
+# 投机通道参数不同」此前零覆盖。判据逐条的理由见 verify/verify_perspec.py 的模块 docstring。
+#
+# 组 15 的 18 项覆盖**远程链多序列的基础语义**（判据 2-6，见 docs/design/V22-MULTISEQ.md §7.1）：
+# 混合批（一个在 prefill、一个在 decode）、KV 隔离（对 A 做 seq_rm 不影响 B）、多序列下的
+# checkpoint save/restore、身份字段不一致必须干净报错、n_ctx 不被 n_seq_max 整除时可见。
+# 与组 14 分开放的原因：组 14 是 per-seq 的投机四通道（判据 7-11），组 15 是「多序列本身」的
+# 语义，不涉及投机——两者失败的排查方向完全不同，混在一组里会让「20 项里挂了 1 项」说不清是
+# 哪一层坏了。脚手架（端口/链启动/记账）照 verify_perspec.py 那一套写，但另起端口基准 9370。
+# 判据逐条的理由见 verify/verify_multiseq.py 的模块 docstring。
+#
 # 环境变量（都有默认值，一般不用管）：
-#   QLH_VERIFY_FAST=1           只跑 2B 的组（1-8 与 12），组 9/10/11 明确 SKIP（SKIP 不算通过）
+#   QLH_VERIFY_FAST=1           只跑 2B 的组（1-8、12、14 与 15），组 9/10/11 明确 SKIP（SKIP 不算通过）
 #   QLH_VERIFY_MIN_FREE_GB=20   组 9/10 的内存闸门（mmap 的模型不需要全占物理内存，见下文注释）
 #   QLH_VERIFY_SMOKE_TIMEOUT=900 单次 split-smoke / split-rows 的超时（秒）
 #   QLH_VERIFY_PY_TIMEOUT=1800  组 5 python 的超时（秒）
@@ -47,6 +61,8 @@
 #   QLH_VERIFY_NGL_PARTIAL     组 12 的 -ngl 层数（默认 4）
 #   QLH_KVMEM_BUILD_DIR        组 13 的 KVMem 构建目录（默认 H:/llamacpp-c/build-kvmem2）
 #   LLAMA_KVMEM_ROOT           组 13 的 KVMem 源码根（默认 .qlh_tmp/kvmem-probe）
+#   QLH_VERIFY_PORT_PESPEC_BASE 组 14 的端口基准（默认 9380 -> stage 9381-9383 / server 9391-9395）
+#   QLH_VERIFY_PORT_MULTISEQ_BASE 组 15 的端口基准（默认 9370 -> stage 9371-9374 / server 9375-9379）
 # 退出码：0 = 被测到的组全过（SKIP 不算失败，但会显著打印「没测到」）；1 = 有 FAIL；
 #         2 = 另一个 verify.sh 正在跑（并发跑会互抢 93xx、互相强杀，两边都会报假失败）。
 #
@@ -70,7 +86,7 @@ MODE=${1:-}
 
 # ---------------------------------------------------------------- 环境闸门（先于一切）
 # 缺二进制就点名退出（rc=3）。不这么做的话，指错目录会跑出几十条 FAIL，看起来像代码坏了；
-# 静默 skip 更糟——那会让「52 项全过」变成一句谎话。
+# 静默 skip 更糟——那会让「95 项全过」变成一句谎话。
 qlh_show_env
 qlh_require_bins split-smoke.exe split-stage.exe llama-server.exe
 for opt in split-rows.exe dflash-taps.exe; do
@@ -128,7 +144,8 @@ a=""
 n2=""
 
 # 组 9 / 组 10 要独占内存（整模 23.5 GB 起），机器上只要还有别的 35B 进程在跑，跑出来的结果不是失败
-# 就是没意义。QLH_VERIFY_FAST=1 只跑 2B 的组（1-8 与 12，组 12 用 CUDA 构建），用来在别人占着机器时先确认没有回归；
+# 就是没意义。QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12、14 与 15；组 12 用 CUDA 构建，组 14 用 2B 的
+# MTP，组 15 用 2B 跑多序列基础语义），用来在别人占着机器时先确认没有回归；
 # 正式验收必须不带这个变量跑完整的一遍。
 SKIP_BIG=${QLH_VERIFY_FAST:-0}
 
@@ -150,6 +167,30 @@ ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 skip() { echo "  [SKIP] $*"; SKIP=$((SKIP+1)); }
 hdr()  { echo; echo "=== $* ==="; }
+
+# ---------------------------------------------------------------- SKIP 扣减表（项数断言用）
+# 每个组「整组 SKIP 时少记多少项」。数字取自各组实际记账（见下面组 1-15 的 ok/bad 调用）：
+#   组 9 = 2、组 10 = 2 x 10 = 20、组 11 = 8 —— QLH_VERIFY_FAST=1 与内存闸门是**一次跳过这三组**，
+#   所以合起来是 30 项，不是只扣组 9/10 的 22 项；
+#   组 12 = 1、组 13 = 4、组 14 = 20、组 15 = 18。
+# 合计：95 = 组 1-8 的 22 + 30（9/10/11）+ 1（12）+ 4（13）+ 20（14）+ 18（15）。
+# 为什么要这张表：v2.2 上组 13 永远 SKIP（KVMem 构建不在），旧的断言
+# `[ "$SKIP" -eq 0 ] && [ "$PASS" -ne "$EXPECT_PASS" ]` 因此**永不触发**——「某组静默少跑」
+# 在带 SKIP 的跑法里完全测不出来。SKIP 时按表扣减再比较，这条断言才真的守得住。
+SKIP_ITEMS_91011=30
+SKIP_ITEMS_12=1
+SKIP_ITEMS_13=4
+SKIP_ITEMS_14=20
+SKIP_ITEMS_15=18
+SKIPPED_ITEMS=0
+# 记一条 SKIP，并把它对应的项数记进 SKIPPED_ITEMS：skip_n <项数> <消息...>
+# 项数写错会立刻被结果段的断言抓到（PASS 比扣减后的期望多或少），不会变成假绿。
+skip_n() {
+    local n=${1:?skip_n 需要一个项数参数}
+    shift
+    SKIPPED_ITEMS=$((SKIPPED_ITEMS + n))
+    skip "$@"
+}
 
 # ---------------------------------------------------------------- 清理（第一件事，先于一切）
 # 旧的 kill_ours 只杀 93xx 上 LISTENING 的 PID，漏掉的恰好是最常见的三种残留：
@@ -347,12 +388,12 @@ else
     SMOKE_OUT=$QLH_TMP/smoke_group1.log
     if run_limited "$SMOKE_TIMEOUT" "$SMOKE_OUT" "$SMOKE"; then
         out=$(cat "$SMOKE_OUT")
-        echo "$out" | grep -q "=== ARGMAX 一致 ===" && ok "双段 argmax 一致" || bad "双段 argmax 不一致"
-        echo "$out" | grep -q "\[A\] vs \[B\] hidden 2048 维逐位相同" && ok "head hidden 与整模层输入逐位相同" || bad "head hidden 与基线不同"
-        echo "$out" | grep -q "广播生效" && ok "seq_rm 广播到两段" || bad "seq_rm 未广播"
-        echo "$out" | grep -q "\[E\] 三段链与整模 logits 逐位相同" && ok "三段链逐位相同" || bad "三段链不一致"
+        echo "$out" | grep -q "=== ARGMAX match ===" && ok "双段 argmax 一致" || bad "双段 argmax 不一致"
+        echo "$out" | grep -q "\[A\] vs \[B\] hidden 2048 dims bit-identical" && ok "head hidden 与整模层输入逐位相同" || bad "head hidden 与基线不同"
+        echo "$out" | grep -q "broadcast applied" && ok "seq_rm 广播到两段" || bad "seq_rm 未广播"
+        echo "$out" | grep -q "\[E\] 3-stage chain and whole-model logits bit-identical" && ok "三段链逐位相同" || bad "三段链不一致"
         echo "$out" | grep -q "\[F\] n_stages after rejected attaches = 0" && ok "不衔接的链被拒（-1）" || bad "衔接校验没生效"
-        if [ -s "$SMOKE_OUT" ] && ! grep -q "=== ARGMAX 一致 ===" "$SMOKE_OUT"; then
+        if [ -s "$SMOKE_OUT" ] && ! grep -q "=== ARGMAX match ===" "$SMOKE_OUT"; then
             echo "  （smoke 输出尾部，见 .qlh_tmp/verify/smoke_group1.log）"
             tail -8 "$SMOKE_OUT" | sed 's/^/    /'
         fi
@@ -366,8 +407,14 @@ cleanup_ours 组1
 
 # ---------------------------------------------------------------- 组 2：N=1 直通
 hdr "组 2  N=1 直通（整模 vs --split-layer-range 0:24）"
-start_server $PORT_BASE
-start_server $PORT_N1 --split-layer-range 0:24
+# [QLH-SPLIT] 后端必须一致，否则「逐字节相同」比的是两个后端 kernel 的舍入差：
+# 整模 server 不是链（split_role=false），op_offload 用上游默认 on；0:24 单段同样是
+# split_role=false 也是 on；组 3 的双段链是 split_role=true，默认 off（见
+# src/qlh-split-defaults.h）。实测（2026-11-15，build-vulkan-new）：整模 on 与双段链 off
+# 生成 512 token 后在第 316 字符分叉（541 vs 529 字符），两个都钉 --no-op-offload 后逐字节相同。
+# 这里三处显式钉住，判据仍是「逐字节相同」，不放宽。
+start_server $PORT_BASE --no-op-offload
+start_server $PORT_N1 --split-layer-range 0:24 --no-op-offload
 if wait_health $PORT_BASE && wait_health $PORT_N1; then
     a=$(ask $PORT_BASE)
     n1=$(ask $PORT_N1)
@@ -476,8 +523,8 @@ SMOKE6=$QLH_TMP/smoke_group6.log
 if run_limited "$SMOKE_TIMEOUT" "$SMOKE6" \
         env QLH_SPLIT_REMOTE2=127.0.0.1:$PORT_RELAY,127.0.0.1:$PORT_TAIL "$SMOKE"; then
     out6=$(cat "$SMOKE6")
-    if echo "$out6" | grep -q "logits 全 .* 维: 逐位相同"; then
-        ok "三段链全 vocab 逐位相同（$(echo "$out6" | grep -o 'logits 全 [0-9]* 维' | head -1)）"
+    if echo "$out6" | grep -q "logits all .* dims: bit-identical"; then
+        ok "三段链全 vocab 逐位相同（$(echo "$out6" | grep -o 'logits all [0-9]* dims' | head -1)）"
     else
         bad "三段链不一致"
         echo "$out6" | grep -E "^\[G\]" | head -5
@@ -493,9 +540,9 @@ if run_limited "$SMOKE_TIMEOUT" "$SMOKE6" \
 
     # [G2]：checkpoint 往返（只在 QLH_SPLIT_REMOTE2 下跑）。这一组比 [E]/[G] 的 1~3 token
     # 更重要——它跑 20+ token，而 1 token 的逐位对比曾经掩盖过 M-RoPE 位置分叉（p>0 才暴露）。
-    echo "$out6" | grep -qE "\[G2\] local: .*逐位相同" && ok "本地链 checkpoint save→restore→重算逐位相同" || bad "本地链 checkpoint 往返不一致"
-    echo "$out6" | grep -qE "\[G2\] whole: .*逐位相同" && ok "整模 checkpoint 往返逐位相同（对照）" || bad "整模 checkpoint 往返不一致"
-    echo "$out6" | grep -q "remote chain vs whole after checkpoint restore: 逐位相同" && ok "远程链 checkpoint 恢复后与整模逐位相同" || bad "远程链 checkpoint 恢复后与整模不同"
+    echo "$out6" | grep -qE "\[G2\] local: .*bit-identical" && ok "本地链 checkpoint save→restore→重算逐位相同" || bad "本地链 checkpoint 往返不一致"
+    echo "$out6" | grep -qE "\[G2\] whole: .*bit-identical" && ok "整模 checkpoint 往返逐位相同（对照）" || bad "整模 checkpoint 往返不一致"
+    echo "$out6" | grep -q "remote chain vs whole after checkpoint restore: bit-identical" && ok "远程链 checkpoint 恢复后与整模逐位相同" || bad "远程链 checkpoint 恢复后与整模不同"
     echo "$out6" | grep -q "restore a .* -> 0 (expect 0)" && ok "清空后恢复被拒（漂移检测）" || bad "漂移检测没生效"
 else
     # 超时/崩溃时输出是残缺的，逐个 grep 会刷出 8 条假 FAIL。报一条、贴尾巴。
@@ -558,8 +605,8 @@ hdr "组 8  MTP 投机（链上投机 · 链上 MTP 与整模 MTP 逐位）"
 if [ -x "$BIN/split-rows.exe" ]; then
     if run_limited "$SMOKE_TIMEOUT" "$QLH_TMP/smoke_group8.log" "$BIN/split-rows.exe"; then
         out8=$(cat "$QLH_TMP/smoke_group8.log")
-        echo "$out8" | grep -q "链上每一行 logits 与整模逐位相同" && ok "链上逐行 logits 与整模逐位相同" || bad "链上逐行 logits 与整模不同"
-        echo "$out8" | grep -q "链上 MTP draft 与整模 MTP 逐位相同" && ok "链上 MTP draft 与整模 MTP 逐位相同" || bad "链上 MTP draft 与整模 MTP 不同"
+        echo "$out8" | grep -q "every chain logits row matches the whole model bit for bit" && ok "链上逐行 logits 与整模逐位相同" || bad "链上逐行 logits 与整模不同"
+        echo "$out8" | grep -q "chain MTP draft matches whole-model MTP bit for bit" && ok "链上 MTP draft 与整模 MTP 逐位相同" || bad "链上 MTP draft 与整模 MTP 不同"
     else
         bad "split-rows 没跑完（rc=$?），见 .qlh_tmp/verify/smoke_group8.log"
         tail -6 "$QLH_TMP/smoke_group8.log" | sed 's/^/    /'
@@ -578,16 +625,16 @@ cleanup_ours 组8
 # ---------------------------------------------------------------- 组 9：DFlash
 if [ "$SKIP_BIG" = "1" ]; then
     echo
-    echo "=== 组 9 / 组 10 / 组 11 没测：QLH_VERIFY_FAST=1 只跑 2B 的组（1-8 与 12）==="
-    echo "  [SKIP] 不计入 PASS、不算通过：这一轮没有测 35B 的 DFlash / DSpark 两组。"
-    skip "组 9/10 没测（QLH_VERIFY_FAST=1），不是 PASS"
+    echo "=== 组 9 / 组 10 / 组 11 没测：QLH_VERIFY_FAST=1 只跑 2B 的组（1-8、12、14 与 15）==="
+    echo "  [SKIP] 不计入 PASS、不算通过：这一轮没有测 35B 的 DFlash / DSpark / 产品路径三组。"
+    skip_n $SKIP_ITEMS_91011 "组 9/10/11 没测（QLH_VERIFY_FAST=1），不是 PASS"
 else
 AVAIL_GB=$(qlh_available_gb_settled)
 if [ "$AVAIL_GB" -lt "$MIN_FREE_GB" ]; then
     hdr "组 9 / 组 10 没测：可用内存不足"
-    skip "组 9/10 没测：可用 ${AVAIL_GB} GB < 闸门 ${MIN_FREE_GB} GB —— 这不是 PASS，这一轮没有测到 35B（DFlash / DSpark）"
+    skip_n $SKIP_ITEMS_91011 "组 9/10/11 没测：可用 ${AVAIL_GB} GB < 闸门 ${MIN_FREE_GB} GB —— 这不是 PASS，这一轮没有测到 35B（DFlash / DSpark）"
     echo "  想真测：关掉占内存的进程再跑；或按实际情况调 QLH_VERIFY_MIN_FREE_GB=${MIN_FREE_GB}。"
-    echo "  只想确认 2B 的组没有回归：QLH_VERIFY_FAST=1（组 1-8 与 12 照样全跑）。"
+    echo "  只想确认 2B 的组没有回归：QLH_VERIFY_FAST=1（组 1-8、12、14 与 15 照样全跑）。"
 else
 echo "  [mem] 可用 ${AVAIL_GB} GB ≥ ${MIN_FREE_GB} GB，组 9/10 照跑"
 hdr "组 9  DFlash 草稿模型（8 路 tap 跨两段 · 单 ubatch 逐位）"
@@ -595,7 +642,13 @@ hdr "组 9  DFlash 草稿模型（8 路 tap 跨两段 · 单 ubatch 逐位）"
 # 这个测试直接证明「跨 context 拼出来的 8 路 tap」与整模逐位相同——拼错了会静默喂坏
 # draft，而 draft 喂坏了只是接受率下降，不会报错。
 if [ -x "$BIN/dflash-taps.exe" ]; then
-    if run_limited "$BIG_TIMEOUT" "$QLH_TMP/taps_group9.log" \
+    # GGML_VK_VISIBLE_DEVICES= (empty) makes the Vulkan backend discover zero
+    # devices, so the 21.87 GiB whole model lands in system memory. Without it,
+    # llama_model_default_params() offloads layers and the 8 GB dGPU answers
+    # ErrorOutOfDeviceMemory while allocating a 1 GB buffer -- measured
+    # 2026-11-14. These groups test tap stitching and chain semantics, both
+    # device-independent, so running them on the CPU changes nothing they assert.
+    if GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$QLH_TMP/taps_group9.log" \
             "$BIN/dflash-taps.exe" "$MODEL_DFLASH"; then
         out9=$(cat "$QLH_TMP/taps_group9.log")
         echo "$out9" | grep -q "ALL PASS" && ok "8 路 tap 与 logits 全部逐位相同" || bad "DFlash tap 不一致"
@@ -633,7 +686,10 @@ remote_tap_group() {
     fi
     # 不能用 `if ! run_limited ...`：`$?` 在 `!` 之后是取反值（恒 0），超时（124）会被
     # 报成 rc=0，日志里就看不出是超时还是崩溃。先存真实退出码再判。
-    run_limited "$BIG_TIMEOUT" "$log_w" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" \
+    # Same reason as group 9: the whole model is 21.87 GiB and must stay in system
+    # memory. The tail stage below keeps Vulkan on purpose -- it only holds
+    # --layer-range 32:40, about 4.3 GiB, which the 8 GB dGPU does accommodate.
+    GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_w" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" \
         --draft "$draft" --whole-save "$dump"
     local rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -660,32 +716,32 @@ remote_tap_group() {
         cleanup_ours "$name-stage"
         return
     fi
-    run_limited "$BIG_TIMEOUT" "$log_c" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" --draft "$draft" \
+    GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_c" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" --draft "$draft" \
         --remote-compare "$dump" --endpoint "127.0.0.1:$PORT_STAGE"
     rc=$?
-    grep -q "^\[PASS\] $taps 路 tap 全部与整模逐位相同" "$log_c" \
-        && ok "$name: $taps 路 tap 全部与整模逐位相同（$(sed -n 's/.*(\([0-9]*\/[0-9]*\)；.*/\1/p' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] $taps taps all bit-identical to the whole model" "$log_c" \
+        && ok "$name: $taps 路 tap 全部与整模逐位相同（$(sed -n 's/.*(\([0-9]*\/[0-9]*\);.*/\1/p' "$log_c" | head -1)）" \
         || bad "$name: tap 拼接与整模不同，见 $(basename "$log_c")"
-    grep -q "^\[PASS\] wire 上的 $wire 路 tap 与整模逐位相同" "$log_c" \
+    grep -q "^\[PASS\] $wire taps over the wire bit-identical to the whole model" "$log_c" \
         && ok "$name: $wire 路 tap 经 wire 取回后与整模逐位相同" \
         || bad "$name: wire 上的 tap 与整模不同"
-    grep -q "^\[PASS\] 远程链 vs 整模 logits 逐位相同" "$log_c" \
-        && ok "$name: 远程链 logits 与整模逐位相同（$(grep -o '([0-9]*/[0-9]* 个位置)' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] remote chain vs whole-model logits bit-identical" "$log_c" \
+        && ok "$name: 远程链 logits 与整模逐位相同（$(grep -o '([0-9]*/[0-9]* positions)' "$log_c" | head -1)）" \
         || bad "$name: 远程链 logits 与整模不同"
-    grep -q "^\[PASS\] 远程链续写 token 与整模逐 token 相同" "$log_c" \
+    grep -q "^\[PASS\] remote chain continuation tokens match the whole model token by token" "$log_c" \
         && ok "$name: 远程链续写 token 与整模逐 token 相同（$(grep -o '([0-9]*/[0-9]*)' "$log_c" | tail -1)）" \
         || bad "$name: 远程链续写 token 与整模不同"
-    grep -q "^\[PASS\] 续写每一步的" "$log_c" \
-        && ok "$name: 1 行帧的 tap 也与整模逐位相同（$(sed -n 's/.*逐位相同 (\([0-9]*\) 步)/\1 步/p' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] every continuation step's" "$log_c" \
+        && ok "$name: 1 行帧的 tap 也与整模逐位相同（$(sed -n 's/.* (\([0-9]*\) steps)/\1 steps/p' "$log_c" | head -1)）" \
         || bad "$name: 1 行帧的 tap 与整模不同"
-    grep -q "^\[PASS\] verify 形状帧（" "$log_c" \
+    grep -q "^\[PASS\] verify-shaped frame (" "$log_c" \
         && ok "$name: k=2 verify 帧（3 行）逐行 argmax 与整模相同" \
         || bad "$name: verify 形状帧的逐行 argmax 与整模不同"
-    grep -q "^\[PASS\] verify 形状帧的 3 行 x" "$log_c" \
+    grep -q "^\[PASS\] verify-shaped frame's 3 rows x" "$log_c" \
         && ok "$name: k=2 verify 帧的 3 行 x $taps 路 tap 逐位相同" \
         || bad "$name: verify 形状帧的 tap 与整模不同"
-    grep -q "^\[PASS\] tap 传输量" "$log_c" \
-        && ok "$name: tap 传输字节数与预期一致（$(grep -o '[0-9]* B，实测 [0-9]* B' "$log_c" | head -1)）" \
+    grep -q "^\[PASS\] tap bytes" "$log_c" \
+        && ok "$name: tap 传输字节数与预期一致（$(grep -o '[0-9]* B, measured [0-9]* B' "$log_c" | head -1)）" \
         || bad "$name: tap 传输字节数不符"
     grep -q "layer-input request" "$log_s" \
         && ok "$name: stage 收到了 layer-input 请求（$(grep -o '[0-9]* ids, [0-9]* owned' "$log_s" | head -1)）" \
@@ -762,7 +818,7 @@ hdr "组 12  段级 offload 正确性（CUDA 构建：整模 vs --split-layer-ra
 # 二进制必须来自 CUDA 构建；构建不存在、或构建在但设备不可用，都记 SKIP 并明说「这不是 PASS」。
 CUDA_SERVER=$CUDA_BIN/llama-server.exe
 if [ ! -x "$CUDA_SERVER" ]; then
-    skip "组 12 没测：缺 $CUDA_SERVER（CUDA 构建不存在，QLH_CUDA_BUILD_DIR=$CUDA_BUILD）—— 这不是 PASS，段级 offload 没有覆盖"
+    skip_n $SKIP_ITEMS_12 "组 12 没测：缺 $CUDA_SERVER（CUDA 构建不存在，QLH_CUDA_BUILD_DIR=$CUDA_BUILD）—— 这不是 PASS，段级 offload 没有覆盖"
 else
     CUDA_BIN_WIN=$(win_path "$CUDA_BIN")
     CUDA_LOG_W=$QLH_TMP/cuda_whole.log
@@ -793,7 +849,7 @@ else
     elif grep -qiE 'no CUDA-capable device|CUDA error|failed to initialize CUDA|no usable GPU|out of memory' \
             "$CUDA_LOG_W" "$CUDA_LOG_N1" 2>/dev/null; then
         # 构建在、但驱动/显存不允许：这是环境，不是代码，按 SKIP 记（照组 9/10 的写法，SKIP 不算通过）。
-        skip "组 12 没测：CUDA 构建在，但设备不可用（见 cuda_whole.log / cuda_split024.log）—— 这不是 PASS"
+        skip_n $SKIP_ITEMS_12 "组 12 没测：CUDA 构建在，但设备不可用（见 cuda_whole.log / cuda_split024.log）—— 这不是 PASS"
         grep -hiE 'no CUDA-capable device|CUDA error|failed to initialize CUDA|no usable GPU|out of memory' \
             "$CUDA_LOG_W" "$CUDA_LOG_N1" 2>/dev/null | head -2 | sed 's/^/    /'
     else
@@ -813,9 +869,9 @@ hdr "组 13  KVMem 的 KV 虚拟化（本地双段 + MTP + 驱逐）"
 KVMEM_BUILD=${QLH_KVMEM_BUILD_DIR:-H:/llamacpp-c/build-kvmem2}
 KVMEM_ROOT=${LLAMA_KVMEM_ROOT:-$QLH_VERIFY_DIR/../.qlh_tmp/kvmem-probe}
 if [ ! -x "$KVMEM_BUILD/bin/llama-server.exe" ]; then
-    skip "组 13 没测：缺 $KVMEM_BUILD/bin/llama-server.exe（带 LLAMA_KVMEM=ON 的构建不存在）—— 这不是 PASS，KVMem 没有覆盖"
+    skip_n $SKIP_ITEMS_13 "组 13 没测：缺 $KVMEM_BUILD/bin/llama-server.exe（带 LLAMA_KVMEM=ON 的构建不存在）—— 这不是 PASS，KVMem 没有覆盖"
 elif [ ! -d "$KVMEM_ROOT" ]; then
-    skip "组 13 没测：LLAMA_KVMEM_ROOT 不存在（$KVMEM_ROOT）—— 这不是 PASS，KVMem 没有覆盖"
+    skip_n $SKIP_ITEMS_13 "组 13 没测：LLAMA_KVMEM_ROOT 不存在（$KVMEM_ROOT）—— 这不是 PASS，KVMem 没有覆盖"
 else
     KVMEM_LOG=$QLH_TMP/kvmem_group13.log
     QLH_KVMEM_BUILD_DIR="$KVMEM_BUILD" LLAMA_KVMEM_ROOT="$KVMEM_ROOT" \
@@ -847,19 +903,115 @@ else
     cleanup_cuda 组13
 fi
 
+# ---------------------------------------------------------------- 组 14：per-seq 投机四通道（判据 7–11）
+hdr "组 14  远程链 -np 2 的 per-seq 投机四通道（判据 7–11）"
+# 为什么单独一组：组 7 跑远程链但从不给 -np（auto = 1），组 8 的 MTP 投机只跑单序列。于是
+# 「一帧里两个序列、各自的投机通道参数不同」这一层从来没有被端到端跑过，而判据 7–11 正是它
+# （docs/design/V22-PERSEQ-SPEC.md §6 与 docs/design/V22-MULTISEQ.md §7.1）。逐条判据的理由见
+# verify/verify_perspec.py 的模块 docstring。
+# 端口用独立基准 9380（-> stage 9381-9383 / server 9391-9395）：脚本的默认 9361 与组 13 的 KVMem
+# 同号，串行跑虽然不撞，但独立跑本组时不该踩别人的端口。
+PESPEC_BASE=${QLH_VERIFY_PORT_PESPEC_BASE:-9380}
+PESPEC_LOG=$QLH_TMP/perspec_group14.log
+if [ ! -x "$BIN/split-stage.exe" ]; then
+    # 这个分支保留是**防御性**的，不是死代码：开头的 qlh_require_bins 在正常情况下已经先
+    # exit 3（它检查的正是同一个 split-stage.exe），所以正常路径到不了这里；但如果 $BIN 在
+    # 跑的过程中被换掉（重编、切换构建目录、有人删了 bin/），这里就兜住了——比让它跑到组 14
+    # 内部再炸成一堆 traceback 干净。
+    # 它也不会制造假绿：skip_n 把组 14 的 20 项从期望里扣掉，结果段的项数断言照样对得上。
+    skip_n $SKIP_ITEMS_14 "组 14 没测：缺 $BIN/split-stage.exe —— 这不是 PASS，判据 7–11 没有覆盖"
+elif [ ! -f "$MODEL" ]; then
+    skip_n $SKIP_ITEMS_14 "组 14 没测：缺 MTP 模型（$MODEL，判据 7–11 靠它跑 draft-mtp）—— 这不是 PASS，判据 7–11 没有覆盖"
+else
+    # run_limited 的签名是 <秒> <输出文件> <命令...>：输出文件必须在第二参数位。实测本组约 50 s，
+    # 3600 是照组 13 留的余量（机器被挤时 stage 的 ready 会明显变慢）。
+    run_limited 3600 "$PESPEC_LOG" python "$QLH_VERIFY_DIR/verify_perspec.py" \
+        --model "$MODEL" --port-base "$PESPEC_BASE"
+    PESPEC_RC=$?
+    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 95
+    while IFS= read -r line; do
+        case "$line" in
+            *"[PASS]"*) ok "$(echo "$line" | sed 's/^ *\[PASS\] *//')" ;;
+            *"[FAIL]"*) bad "$(echo "$line" | sed 's/^ *\[FAIL\] *//')" ;;
+        esac
+    done < "$PESPEC_LOG"
+    # 防假绿：脚本必须真的打出 PASS/FAIL 记账，否则说明它中途崩了（起不来 stage/server 时是
+    # traceback + 非零 rc，一条记账都没有）。
+    PESPEC_LINES=$(grep -cE '\[(PASS|FAIL)\]' "$PESPEC_LOG" 2>/dev/null || true)
+    [ -n "$PESPEC_LINES" ] || PESPEC_LINES=0
+    if [ "$PESPEC_LINES" -eq 0 ]; then
+        bad "组 14：脚本没打出任何 [PASS]/[FAIL]（rc=$PESPEC_RC），见 .qlh_tmp/verify/perspec_group14.log"
+        tail -8 "$PESPEC_LOG" | sed 's/^/    /'
+    elif [ "$PESPEC_RC" -ne 0 ] && [ "$(grep -c '\[FAIL\]' "$PESPEC_LOG")" -eq 0 ]; then
+        bad "组 14：脚本退出码 $PESPEC_RC 但没打出 [FAIL]（中途崩了）"
+        tail -8 "$PESPEC_LOG" | sed 's/^/    /'
+    fi
+    cleanup_ours 组14
+fi
+
+# ---------------------------------------------------------------- 组 15：多序列基础语义（判据 2–6）
+hdr "组 15  远程链多序列的基础语义（判据 2–6）"
+# 为什么单独一组、不并进组 14：组 14 是「一帧里两个序列、各自的投机通道参数不同」（判据 7–11），
+# 组 15 是「多序列本身」的语义——混合批、KV 隔离、checkpoint、身份校验、n_ctx 取整，一条投机都
+# 不涉及。两者失败的排查方向完全不同，混在一组里「20 项挂 1 项」说不清是哪一层坏了。
+# 判据 1（两个请求并发与串行逐字节相同）2026-11-14 三机实测通过，不在本组里；判据 2–6 此前从未跑过
+# （docs/design/V22-MULTISEQ.md §7.1 的「#2–#6 未做」）。
+# 端口用独立基准 9370（-> stage 9371-9374 / server 9375-9379），避开组 13 的 KVMem 9361、组 14 的
+# 9381-9395、CUDA 组的 9357/9358 与主用的 9331/9332/9341-9343；全部落在 93xx 段内，所以
+# cleanup_ours 的 listen_93xx 兜底也能覆盖到。
+MULTISEQ_BASE=${QLH_VERIFY_PORT_MULTISEQ_BASE:-9370}
+MULTISEQ_LOG=$QLH_TMP/multiseq_group15.log
+if [ ! -x "$BIN/split-stage.exe" ]; then
+    # 与组 14 同一个理由：qlh_require_bins 正常情况下已经先 exit 3，这里是「跑的过程中 $BIN 被换掉」
+    # 的兜底。skip_n 把 18 项从期望里扣掉，结果段的项数断言照样对得上。
+    skip_n $SKIP_ITEMS_15 "组 15 没测：缺 $BIN/split-stage.exe —— 这不是 PASS，判据 2–6 没有覆盖"
+elif [ ! -f "$MODEL" ]; then
+    skip_n $SKIP_ITEMS_15 "组 15 没测：缺模型（$MODEL，判据 2–6 用它跑 -np 2 的远程链）—— 这不是 PASS，判据 2–6 没有覆盖"
+else
+    # run_limited 的签名是 <秒> <输出文件> <命令...>：输出文件必须在第二参数位。本组实测约 5 分钟
+    # （判据 4 要起三条链、每条链 4 个请求），3600 是照组 13/14 留的余量。
+    run_limited 3600 "$MULTISEQ_LOG" python "$QLH_VERIFY_DIR/verify_multiseq.py" \
+        --model "$MODEL" --port-base "$MULTISEQ_BASE"
+    MULTISEQ_RC=$?
+    # 逐条转记账：脚本自己打 [PASS]/[FAIL]，这里按行转成 ok/bad，项数才对得上 95
+    while IFS= read -r line; do
+        case "$line" in
+            *"[PASS]"*) ok "$(echo "$line" | sed 's/^ *\[PASS\] *//')" ;;
+            *"[FAIL]"*) bad "$(echo "$line" | sed 's/^ *\[FAIL\] *//')" ;;
+        esac
+    done < "$MULTISEQ_LOG"
+    # 防假绿：脚本必须真的打出 PASS/FAIL 记账，否则说明它中途崩了（起不来 stage/server 时是
+    # traceback + 非零 rc，一条记账都没有）。
+    MULTISEQ_LINES=$(grep -cE '\[(PASS|FAIL)\]' "$MULTISEQ_LOG" 2>/dev/null || true)
+    [ -n "$MULTISEQ_LINES" ] || MULTISEQ_LINES=0
+    if [ "$MULTISEQ_LINES" -eq 0 ]; then
+        bad "组 15：脚本没打出任何 [PASS]/[FAIL]（rc=$MULTISEQ_RC），见 .qlh_tmp/verify/multiseq_group15.log"
+        tail -8 "$MULTISEQ_LOG" | sed 's/^/    /'
+    elif [ "$MULTISEQ_RC" -ne 0 ] && [ "$(grep -c '\[FAIL\]' "$MULTISEQ_LOG")" -eq 0 ]; then
+        bad "组 15：脚本退出码 $MULTISEQ_RC 但没打出 [FAIL]（中途崩了）"
+        tail -8 "$MULTISEQ_LOG" | sed 's/^/    /'
+    fi
+    cleanup_ours 组15
+fi
+
 hdr "结果"
-# 项数断言：「57 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
+# 项数断言：「95 项」这个数字被 docs/deploy/BUILD.md、docs/deploy/PATCHES.md、docs/REPORT.md 引用，
 # 但以前没有任何地方守它——某条判据因日志措辞改动而静默不匹配时，总数会变少，而
-# 「57 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4；
-# 不带 --skip-build 时另有「三目标构建完成」1 项（58）。
-# 只在**没有 SKIP** 的完整跑上断言：SKIP 时少跑的是整组（组 9/10/11/12），
-# 与 skip() 记的 1 条不是一比一，硬算会误报。
-EXPECT_PASS=57
+# 「95 项全过」照样成立。期望值：组 1-8 = 22、组 9/10 = 2+20、组 11 = 8、组 12 = 1、组 13 = 4、
+# 组 14 = 20、组 15 = 18；不带 --skip-build 时另有「三目标构建完成」1 项（96）。
+#
+# SKIP 的处理（旧版在这里失效）：以前是 `[ "$SKIP" -eq 0 ] && ...`，而 v2.2 上组 13 永远 SKIP，
+# 所以这条断言**永不触发**——「某组静默少跑」在带 SKIP 的跑法里完全测不出来。
+# 现在 SKIP 时按上面的 SKIP 扣减表把整组的项数减掉，再比较：
+#   PASS 必须 == EXPECT_PASS - SKIPPED_ITEMS。
+# 例：完整验收里只有组 13 SKIP -> 期望 95-4 = 91；加 --skip-build 则是 92。
+EXPECT_PASS=95
 [ "$MODE" = "--skip-build" ] || EXPECT_PASS=$((EXPECT_PASS + 1))
-# 只在「全绿且无 SKIP」时断言：环境缺失（已 FAIL）时不再叠一条噪声；
+EXPECT_NOW=$((EXPECT_PASS - SKIPPED_ITEMS))
+# 只在 FAIL=0 时断言：已经有真失败时不再叠一条噪声（失败本身会让人去看日志）；
 # 而「某组静默少跑」的特征恰好是 FAIL=0 且 PASS 变少，这条正是抓它的。
-if [ "$SKIP" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$EXPECT_PASS" ]; then
-    bad "项数变了：PASS=$PASS，期望 $EXPECT_PASS（有判据漏跑，或被测日志的措辞改了）"
+if [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$EXPECT_NOW" ]; then
+    bad "项数变了：PASS=$PASS，期望 $EXPECT_NOW（= $EXPECT_PASS - SKIP 扣减 $SKIPPED_ITEMS；有判据漏跑，或被测日志的措辞改了）"
 fi
 echo "  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
 if [ "$SKIP" -gt 0 ]; then

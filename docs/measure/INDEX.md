@@ -36,14 +36,14 @@
 
 | 指标 | **现行值** | 口径 | 出处 | 历史值（口径） |
 | --- | ---: | --- | --- | --- |
-| 本机→Y700，DSpark k=2 | **+12.4% ~ +17.2%** | 1522 token；accept **0.740**（37/50）；8.70 / 9.79 vs 基线 7.42 / 8.71 | `CROSS-MACHINE.md:234` | **+51%**（941 token；accept **0.932**；11.35 vs 10.77）`MODEL-SWAP.md:258` |
+| 本机→Y700，DSpark k=2 | **+12.4% ~ +17.2%** | 1522 token；accept **0.740**（37/50）；8.70 / 9.79 vs 基线 7.42 / 8.71 | `CROSS-MACHINE.md:234` | **+51%**（941 token；accept **0.932**；11.35 vs 10.77）`MODEL-SWAP.md:250` |
 | 本机→Surface，DSpark k=2 | **+15%** | 941 token；accept **0.93182**（41/44）；**6 次重跑中位 12.36** vs 基线 10.77 | `MODEL-SWAP.md` §11.8 | **+5%**（单次 11.30，已作废——单次测量会给出 2.27 / 7.54 这种离谱值） |
 | 本机→Surface，DFlash | **−38%** | 941 token；accept 0.848（39/46） | `MODEL-SWAP.md` §11.8 | — |
 | 三段链，DSpark | **−0.4%**（等于没收益） | 941 token | `MODEL-SWAP.md` §11.8 | — |
 | 三段链，DFlash | **−31%** | 941 token | `MODEL-SWAP.md` §11.8 | — |
 
 **「接受率与拓扑无关」这句话不成立**：同一草稿源在 Surface（1102 token）是 0.8357、Y700（1522 token）是 0.7400、
-§11.8 那批（941 token）是 0.93182。**接受率随 prompt 内容与长度变**，不随拓扑变——两件事要分开说。
+11.8 那批（941 token）是 0.93182。**接受率随 prompt 内容与长度变**，不随拓扑变——两件事要分开说。
 
 ## 三、模型与权重
 
@@ -52,8 +52,8 @@
 | 35B 整模（官方 UD-Q4_K_M） | **21.11 GiB** | `print_info` 口径；`block_count` 41、`nextn` 1、trunk 40 | `SPLIT-MEASUREMENTS.md` §0 | **21.10**（GGUF 头逐张量累加，同文件，舍入差）；**21.87**（蒸馏版）；**20.82**（`Q4_K_XL`） |
 | head `0:32` | **15.690 GiB** | 同上，逐张量累加 | `CROSS-MACHINE.md` §6 | — |
 | tail `32:40` | **4.90 GiB**（驻留） | 4.022 权重 + 0.493 + 0.389 缓冲 | `CROSS-MACHINE.md` §6 | — |
-| **head `0:24`** | **12.271 GiB** | blk 11.768 + `token_embd` 0.503（2026-11-13 逐张量实测） | 本表 §3 | 曾估「约 11.8」（漏了 token_embd） |
-| **relay `24:32`** | **3.923 GiB** | 纯 blk（同上实测） | 本表 §3 | 曾估「约 3.9」 |
+| **head `0:24`** | **12.271 GiB** | blk 11.768 + `token_embd` 0.503（2026-11-13 逐张量实测） | 本表 §三 | 曾估「约 11.8」（漏了 token_embd） |
+| **relay `24:32`** | **3.923 GiB** | 纯 blk（同上实测） | 本表 §三 | 曾估「约 3.9」 |
 | `token_embd` | **515 MiB** | 248320×2048，**Q8_0** | `ARCHITECTURE.md:42` | — |
 | `output`（lm_head） | **398 MiB（0.389 GiB）** | 248320×2048，**Q6_K** | `CROSS-MACHINE.md:132` | **515 MiB**（错——那是 `token_embd` 的 Q8_0 尺寸；由此「中段省 1030.62 MiB」应为 **~913 MiB**） |
 | `src/models/` 实现数 | **176** | `ls src/models/*.cpp \| wc -l` | `report/02:101` | **171**（错，对不上任何口径）；`llm_arch` 条目 173/174（含 UNKNOWN） |
@@ -72,19 +72,19 @@
 
 | 指标 | **现行值** | 口径 | 出处 | 历史值（口径） |
 | --- | ---: | --- | --- | --- |
-| `verify.sh --skip-build` | **57 项** | 13 组；组 13 = KVMem | 2026-11-12（`verify_g13b.log`，`PASS=57 FAIL=0 SKIP=0`） | **53**（12 组，组 12 = 段级 offload，2026-11-11 `verify_final53.log`）；**52**（11 组，2026-11-09 `verify_full.log`） |
-| `verify.sh`（含构建） | **58 项** | 上面 57 + 「三目标构建完成」1 项 | 同上 | 54（12 组时代） |
-| `verify_chain_death.py` | **36 项** | 独立脚本 | `report/04` §4 | — |
+| `verify.sh --skip-build` | **95 项** | 15 组；组 13 = KVMem，组 14 = per-seq 投机（判据 7–11），组 15 = 多序列基础语义（判据 2–6） | 2026-11-14（组 15 加入后的记账验证：`QLH_VERIFY_FAST=1` + `--skip-build`，`PASS=60 FAIL=0 SKIP=3`，60 = 95 − (30+1+4) 对上；组 15 单独跑 18/0） | **57**（13 组，组 13 = KVMem，2026-11-12 `verify_g13b.log`）；**53**（12 组，组 12 = 段级 offload，2026-11-11 `verify_final53.log`）；**52**（11 组，2026-11-09 `verify_full.log`） |
+| `verify.sh`（含构建） | **96 项** | 上面 95 + 「三目标构建完成」1 项 | 同上 | 58（13 组时代）；54（12 组时代） |
+| `verify_chain_death.py` | **36 项** | 独立脚本 | `report/04-验证.md` §4 | — |
 
-**注意**：`README.md` 与 `docs/README.en.md` 的项数必须同步；英文镜像曾滞后（停在 52）。
+**注意**：`README.md` 与 `docs/README.en.md` 的项数必须同步。
 
 ## 六、其它
 
 | 指标 | **现行值** | 口径 | 出处 | 历史值（口径） |
 | --- | ---: | --- | --- | --- |
 | MoE 专家缓存 tg 提升 | **+95%** | 31.99 vs 纯 CPU 16.37 | `SEGMENT-OFFLOAD.md:100` | **+99%**（错，对不上任何基线） |
-| 链上 MTP 接受率折扣（64 档） | **13%** | keep-KV 默认 | `MODEL-SWAP.md:123` | **24%**（旧路径） |
-| 链上 MTP 接受率折扣（512 档） | **4.2%** | 0.7236 vs 0.7557（keep-KV 默认） | `MODEL-SWAP.md:123-126` | **20%**（旧路径 0.5823 vs 0.7557；曾误挂到现行默认上） |
+| 链上 MTP 接受率折扣（64 档） | **13%** | keep-KV 默认 | `MODEL-SWAP.md:118` | **24%**（旧路径） |
+| 链上 MTP 接受率折扣（512 档） | **4.2%** | 0.7236 vs 0.7557（keep-KV 默认） | `MODEL-SWAP.md:118-121` | **20%**（旧路径 0.5823 vs 0.7557；曾误挂到现行默认上） |
 | 本机→Y700 数据面路径 | **direct** | `tailscale status` 的 `CurAddr` 非空 + tx/rx 真实增长 | 2026-11-12 | — |
 
 **`tailscale ping` 的坑**：它可能回 `via DERP(tok)`，那是**控制面探测**，不代表数据面。判 direct/relay 一律以
@@ -132,9 +132,6 @@ server、本机当 client（出站不受限）。
 里 A 组记录的 0.848（39/46，mean len 2.70）**逐位相同**；A 组的另两种链形态（两段→Surface、
 两段→Y700）也是 0.848。
 
-所以准确的表述是：**同一 prompt 下接受率不随拓扑变，但随 prompt 内容变**。「接受率与拓扑无关」
-这句话本身对，错在它被当成三拓扑通用值。
-
 **三组内部重复性极好**：每个 prompt 的 `draft_n/draft_n_accepted` 三次逐位相同，t/s 波动 <8%——
 所以接受率数字不是噪声。
 
@@ -160,19 +157,6 @@ server、本机当 client（出站不受限）。
 | zh | 198 | **0.6792**（36/53） | 2.36 | 4.763 | — |
 
 **6 层与 5 层在 prose 上只差 1 个 accepted token**——两个头基本等价。
-
-### 配错的代价（这 3 行已作废）
-
-用 **DFlash 的 6 层头**（`dflash/qwen36-35b-a3b-dflash-Q4_K_M.gguf`）去跑 `--spec-type draft-dspark`：
-
-| prompt | 错配 accept | 正确 accept | 差 |
-| --- | ---: | ---: | ---: |
-| prose | 0.1758 | 0.9091 | **5.2×** |
-| code | 0.2785 | 0.8696 | 3.1× |
-| zh | 0.1868 | 0.6792 | 3.6× |
-
-日志里会出现 `the remote tail answered no h_nextn rows; MTP drafting is unavailable on this chain`——
-**DFlash 头没有 Markov 头**，`draft-dspark` 的 MTP 通路接不上。**这不是 DSpark 的降级，是配错模型。**
 
 ### 速度：6 层 DSpark 没赢过 DFlash
 

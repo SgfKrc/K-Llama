@@ -26,12 +26,12 @@
 
 ### 2.2 取源码并叠补丁
 
-基底是上游 `ggml-org/llama.cpp` 的 `09338b85e`（fork HEAD `4acf03c8b` 的父提交）。
+基底是上游 `ggml-org/llama.cpp` 的 `5676dfbe0`（v2.2 基底，fork HEAD `6d0fa16c9` 之前 7 个提交；tag `b12342`）。
 
 本机 fork 的等价取法（不碰 fork 自己的 checkout）：
 
 ```bash
-git -C H:/llamacpp-c worktree add --detach H:/llamacpp-src 09338b85e
+git -C H:/llamacpp-c worktree add --detach H:/llamacpp-src 5676dfbe0
 ```
 
 陌生人从上游取：
@@ -39,7 +39,7 @@ git -C H:/llamacpp-c worktree add --detach H:/llamacpp-src 09338b85e
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git llamacpp
 cd llamacpp
-git checkout 09338b85e
+git checkout 5676dfbe0
 ```
 
 叠补丁（顺序不能反；实测命令，`--whitespace=nowarn` 只是压掉行尾空白告警）：
@@ -49,15 +49,15 @@ git apply --whitespace=nowarn /path/to/K-Llama/docs/llamacpp-split.patch
 git apply --whitespace=nowarn /path/to/K-Llama/docs/llamacpp-slimarc.patch
 ```
 
-校验叠加结果（overlay 判据）：叠完的树必须等于 fork HEAD 的树 `548c3dfb0`，不等就说明补丁
+校验叠加结果（overlay 判据）：叠完的树必须等于 fork HEAD 的树 `61781c712`，不等就说明补丁
 被改过或顺序错了：
 
 ```bash
-git add -A -f && git write-tree      # 期望 548c3dfb0e833860cc8f49040bad3c187d42daa9
+git add -A -f && git write-tree      # 期望 61781c7126be39f54d1499f83f782f2406612615
 ```
 
-`scripts/export_patches.sh` 把这条判据脚本化：`09338b85e` + 主补丁 = 树 A（`586a7e7a1`），
-再叠增量 = 树 B（`548c3dfb0`）；B 与 HEAD 树不符时脚本 exit 1 且不写任何文件。
+`scripts/export_patches.sh` 把这条判据脚本化：`5676dfbe0` + 主补丁 = 树 A（`2541c9d29`），
+再叠增量 = 树 B（`61781c712`）；B 与 HEAD 树不符时脚本 exit 1 且不写任何文件。
 只叠主补丁会得到树 A（不含 SLIM-ARC）；本文的编译验证只对两个补丁都叠的树做过。
 
 ### 2.3 配置与编译
@@ -88,7 +88,7 @@ cmake --build build-split --target split-stage llama-server llama-cli llama-benc
 
 ```bash
 cd build-split/bin
-./llama-cli.exe --version      # version: 0.9.0-dev (build 195, commit 4acf03c8b)
+./llama-cli.exe --version      # version: 0.9.0-dev (build N, commit 6d0fa16c9)
 ./split-stage.exe              # 打印 usage，退出码 0
 ```
 
@@ -105,7 +105,7 @@ cd build-split/bin
 
 | 目录 | ALL_VARIANTS | NATIVE | CUDA | VULKAN | RPC | BACKEND_DL | OPENMP | TESTS | 用途 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `build-split` | OFF | ON | OFF | OFF | OFF | OFF | ON | ON | v2.1 CPU 验收（52 项；组 12 需 CUDA 构建，合计 53；组 13 需 KVMem 构建 `build-kvmem2`，合计 57） |
+| `build-split` | OFF | ON | OFF | OFF | OFF | OFF | ON | ON | v2.1 CPU 验收（52 项；组 12 需 CUDA 构建，合计 53；组 13 需 KVMem 构建 `build-kvmem2`，合计 57；组 14 只需 2B MTP 权重，合计 77） |
 | `build-cuda` | OFF | ON | ON | OFF | OFF | OFF | **OFF** | OFF | CUDA 实验；`CMAKE_CUDA_ARCHITECTURES=89` |
 | `build-vulkan` | ON | OFF | OFF | ON | OFF | **ON** | ON | ON | 核显实验：多 CPU 变体 + 动态后端 |
 | `build-vulkan-new` | ON | OFF | OFF | ON | OFF | ON | ON | ON | 与 `build-vulkan` 开关完全相同（cache 逐行 diff 只差目录名），重建副本 |
@@ -139,6 +139,55 @@ cd build-split/bin
    （[FIXES.md](../issues/FIXES.md) 记录了这条日志）。两侧这一行必须指向同一类变体。
 3. **核对 dll 清单**：两边 bin 里 `ggml-cpu*` 的文件名集合必须一致。`build-cpu` 只有
    `ggml-cpu.dll` 一个，`build-vulkan` 有 9 个 `ggml-cpu-*.dll`——这本身就是「不同级」的证据。
+
+### 4.1 `NATIVE` 与 `BACKEND_DL` 互斥，「多变体 + 原生优化」不存在
+
+`ggml-cpu/CMakeLists.txt:415` 在 `NATIVE=ON` 且 `BACKEND_DL=ON` 时直接
+`FATAL_ERROR`（"GGML_NATIVE is not compatible with GGML_BACKEND_DL, consider using
+GGML_CPU_ALL_VARIANTS"），而 `ALL_VARIANTS` 又要求 `BACKEND_DL=ON`
+（`ggml/src/CMakeLists.txt:491`）。所以只能这么组合：
+
+| 想开 | 必须同时 | 代价 |
+| --- | --- | --- |
+| `NATIVE=ON` | `BACKEND_DL=OFF` | 二进制不可移植（换 ISA 就 SIGILL） |
+| `ALL_VARIANTS=ON` | `BACKEND_DL=ON` | `NATIVE` 被挤掉，走固定特性变体 |
+
+**`NATIVE` 被挤掉不是无害的。** 2026-11-14 实测：`build-vulkan-new` 在
+`NATIVE=OFF + ALL_VARIANTS=ON` 下，组 11（DFlash 整模 vs 远程链）**整模 137 字符 /
+链 114 字符**，判据「逐字节相同」红；改成 `NATIVE=ON + BACKEND_DL=OFF` 后
+**137 / 137 一致**，组 11 恢复 8/0/0。变的不是整模（一直是 137），是链——多变体构建让
+「head 32 层 + stage 8 层」的双进程路径与单进程整模走了不同的向量化路径，浮点累加顺序
+不同，T=0 下 argmax 在临界 token 上翻转。
+
+**推论（2026-11-14 用户确认）**：**数值一致性在异构场景下本来就会被破坏**——不同设备硬件不同、
+数据流完全不一样，这是异构集群的本质，不是缺陷。用户判断这是**值得的取舍**，大多数情况下不会
+引起质量退化。**所以测试与分发各自维护一套完整构建**，每套都含纯 CPU + Vulkan + 可选 CUDA：
+
+| 用途 | CPU 侧 | 理由 |
+| --- | --- | --- |
+| **测试** | `NATIVE=ON` + `BACKEND_DL=OFF` | 分段/多设备路径在同一 ISA 下可比，「逐字节相同」在这里才有效 |
+| **分发** | `ALL_VARIANTS=ON` + `BACKEND_DL=ON` | 一份二进制跨 x86-64 机器，Surface（Gen11）/ Y700 都能跑 |
+
+**「逐字节相同」只在「同一构建 + 同一 ISA」下是有效判据**；跨设备、跨构建、跨后端都不该用它，
+那时的正确性判据是「质量不退化」（token 序列一致或容差），不是位级相等。这条不是妥协——
+异构集群里两条数据流本来就不同，要求位级相等等于要求它们走同一条路径。
+
+v2.1 从没暴露这个问题，因为它不碰 Vulkan、没必要开 `BACKEND_DL`，等于一直待在
+`NATIVE=ON` 的配置上。
+
+### 4.2 「异构」是两层：设备与构建
+
+| 层 | 是什么 | v2 / v2.1 | v2.2 |
+| --- | --- | --- | --- |
+| **异构设备** | 跨机器：Surface（Gen11）/ Y700（ARM）/ 本机（i9） | **已经存在**；判据 1（三机拓扑）只要求「能跑通」 | 同左 |
+| **异构构建** | 同一台机器内不同编译配置（`NATIVE` vs `ALL_VARIANTS`） | **不存在**（每台机器只有一个构建） | **新出现**；组 11 在同机上就分叉 |
+
+**v2.1 能玩字节一致，是因为它「设备异构但构建同构」**：同一台机器上整模和链用同一批代码、
+同一 ISA；跨设备那一层它从不要求位级相等（判据 1 只要通）。v2.2 把第二层也打破了——而且
+**没有任何报错**，只有组 11 突然变红才暴露。
+
+**所以 v3 的判据要分两层**：跨设备比 token 序列或容差，只有「同构建 + 同 ISA」才比字节。
+这两层不要混——把「跨设备不可保」当成「构建也可以随便混」，或者反过来，都会得出错误结论。
 
 ## 5. Windows / MSVC 的构建边界
 
@@ -209,11 +258,17 @@ cmake --build build-split --clean-first -- -j 8                               # 
 
 ## 7. 验收
 
-验收脚本是 `bash verify/verify.sh`（十三组共 57 项），用 `QLH_BUILD_DIR` 指向构建目录：默认增量
+验收脚本是 `bash verify/verify.sh`（十五组共 95 项），用 `QLH_BUILD_DIR` 指向构建目录：默认增量
 编译后全跑，`--clean` 全量重编，`--skip-build` 只跑验证。组 9/10 需要 35B 与 DFlash 权重及显存/内存
 闸门；组 12 需要 CUDA 构建（`QLH_CUDA_BUILD_DIR`），组 13 需要 KVMem 构建（`QLH_KVMEM_BUILD_DIR`，
-默认 `H:/llamacpp-c/build-kvmem2`）与 KVMem 源码根（`LLAMA_KVMEM_ROOT`），缺任一条该组记 SKIP。
-脚本随仓库分发（`verify/README.md`），新编一个目录也能跑。
+默认 `H:/llamacpp-c/build-kvmem2`）与 KVMem 源码根（`LLAMA_KVMEM_ROOT`），组 14 需要 2B 的 MTP
+权重与 `split-stage.exe`，组 15（判据 2–6 的多序列基础语义）只需要 2B 与 `split-stage.exe`，
+缺任一条该组记 SKIP。脚本随仓库分发（`verify/README.md`），新编一个目录也能跑。
+
+项数与端口：`EXPECT_PASS=95` = 组 1–8 的 22 + 组 9/10/11 的 30 + 组 12 的 1 + 组 13 的 4 +
+组 14 的 20 + 组 15 的 18；每组整组 SKIP 时按 `SKIP_ITEMS_*` 从期望里扣掉再断言。
+端口基准：组 14 用 `QLH_VERIFY_PORT_PESPEC_BASE`（默认 9380），组 15 用
+`QLH_VERIFY_PORT_MULTISEQ_BASE`（默认 9370），其余组用 `QLH_VERIFY_PORT_*`。
 
 ## 8. 这份说明还缺什么
 

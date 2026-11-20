@@ -108,7 +108,7 @@ hybrid 模型（Qwen3.5/3.6 的 `LLL F` 交替结构）上，`llama_memory_seq_r
 时续用增量 KV 与从头重放逐位相同（23/23 token）；`spec_k=1/2` 时出现措辞分叉
 （`first_diff` 9~11，上下文 100+ token），答案仍对，但已经不是同一条计算。这 ~2e-2
 会随上下文累积，长上下文里足以翻一个 argmax。判据与数据见
-`slimarc/prototype:checks/verify_multiturn.py` 的 R4 与 `checks/_multiturn-35b-spec{1,2}.json`。
+`slimarc/prototype:checks/verify_multiturn.py` 的 R4 与 `slimarc/prototype:checks/_multiturn-35b-spec{1,2}.json`。
 
 ## 代价与限制
 
