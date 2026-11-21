@@ -169,7 +169,7 @@ fi
 
 # ---------------------------------------------------------------- 第 1 半：整模仍走 device buffer
 hdr "第 1 半  整模 + DFlash（device buffer 必须仍然被选中）"
-"$BIN/llama-server.exe" -m "$MODEL" --host 127.0.0.1 --port "$PORT_WHOLE" -c 4096 -ngl 0 --no-warmup \
+CUDA_VISIBLE_DEVICES=-1 "$BIN/llama-server.exe" -m "$MODEL" --host 127.0.0.1 --port "$PORT_WHOLE" -c 4096 -ngl 0 --no-warmup \
       -md "$DRAFT" --spec-type draft-dflash --spec-draft-n-max 2 > "$LOG_WHOLE" 2>&1 &
 srv_whole=$!
 if wait_health "$PORT_WHOLE" "$srv_whole"; then
@@ -191,7 +191,7 @@ cleanup_ours 整模
 
 # ---------------------------------------------------------------- 第 2 半：远程链默认路径不崩
 hdr "第 2 半  远程链 + DFlash（不设 LLAMA_DFLASH_DEV，必须回退且结果与整模逐字节相同）"
-"$BIN/split-stage.exe" -m "$MODEL" --layer-range 32:40 --role tail --rs-seq "$QLH_RS_SEQ" \
+CUDA_VISIBLE_DEVICES=-1 "$BIN/split-stage.exe" -m "$MODEL" --layer-range 32:40 --role tail --rs-seq "$QLH_RS_SEQ" \
       --port "$PORT_STAGE" -c 8192 -b 512 > "$LOG_STAGE" 2>&1 &
 srv_stage=$!
 # [v11] 等的是 split-stage 的 ready:，不是 listening：v10 之后 bind 在加载之前，端口绑上只说明
@@ -208,7 +208,7 @@ if ! grep -q "ready:" "$LOG_STAGE" 2>/dev/null; then
     exit 1
 fi
 
-"$BIN/llama-server.exe" -m "$MODEL" --host 127.0.0.1 --port "$PORT_CHAIN" -c 4096 -ngl 0 --no-warmup \
+CUDA_VISIBLE_DEVICES=-1 "$BIN/llama-server.exe" -m "$MODEL" --host 127.0.0.1 --port "$PORT_CHAIN" -c 4096 -ngl 0 --no-warmup \
       --split-layer-range 0:32 --split-remote "127.0.0.1:$PORT_STAGE" \
       -md "$DRAFT" --spec-type draft-dflash --spec-draft-n-max 2 > "$LOG_CHAIN" 2>&1 &
 srv_chain=$!

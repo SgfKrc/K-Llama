@@ -642,13 +642,19 @@ hdr "组 9  DFlash 草稿模型（8 路 tap 跨两段 · 单 ubatch 逐位）"
 # 这个测试直接证明「跨 context 拼出来的 8 路 tap」与整模逐位相同——拼错了会静默喂坏
 # draft，而 draft 喂坏了只是接受率下降，不会报错。
 if [ -x "$BIN/dflash-taps.exe" ]; then
-    # GGML_VK_VISIBLE_DEVICES= (empty) makes the Vulkan backend discover zero
-    # devices, so the 21.87 GiB whole model lands in system memory. Without it,
-    # llama_model_default_params() offloads layers and the 8 GB dGPU answers
-    # ErrorOutOfDeviceMemory while allocating a 1 GB buffer -- measured
-    # 2026-11-14. These groups test tap stitching and chain semantics, both
-    # device-independent, so running them on the CPU changes nothing they assert.
-    if GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$QLH_TMP/taps_group9.log" \
+    # Both GPUs must be *gone*, not just not-offloaded:
+    #   GGML_VK_VISIBLE_DEVICES= (empty) drops the Vulkan backend, which is what
+    #     keeps the 21.87 GiB whole model out of Vulkan's device memory;
+    #   CUDA_VISIBLE_DEVICES=-1 drops CUDA, and it is NOT redundant: an empty
+    #     value is ignored on Windows (still "found 1 CUDA devices"), and
+    #     n_gpu_layers = 0 only stops *offloading layers* -- the backend stays
+    #     registered, ggml_backend_sched can still answer a host-mapped tensor on
+    #     it, and the whole model then differs from the CPU-only stage by one
+    #     f32 ulp (2^-20 at value 8-16, first seen on full-attention layer 35).
+    #     Measured 2026-11-21: without -1 the group-10 taps miss by 9.5e-07.
+    # These groups test tap stitching and chain semantics, both device-independent,
+    # so running both sides on the CPU changes nothing they assert.
+    if CUDA_VISIBLE_DEVICES=-1 GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$QLH_TMP/taps_group9.log" \
             "$BIN/dflash-taps.exe" "$MODEL_DFLASH"; then
         out9=$(cat "$QLH_TMP/taps_group9.log")
         echo "$out9" | grep -q "ALL PASS" && ok "8 路 tap 与 logits 全部逐位相同" || bad "DFlash tap 不一致"
@@ -689,7 +695,7 @@ remote_tap_group() {
     # Same reason as group 9: the whole model is 21.87 GiB and must stay in system
     # memory. The tail stage below keeps Vulkan on purpose -- it only holds
     # --layer-range 32:40, about 4.3 GiB, which the 8 GB dGPU does accommodate.
-    GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_w" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" \
+    CUDA_VISIBLE_DEVICES=-1 GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_w" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" \
         --draft "$draft" --whole-save "$dump"
     local rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -701,7 +707,7 @@ remote_tap_group() {
     ok "$name: 整模 $taps 路 tap 已落盘（$(basename "$dump")）"
 
     # 同组 6：直接后台 + 记 pid，不用 `( ... & )` 双层 fork（脱离 job control，中断后留孤儿）。
-    "$BIN/split-stage.exe" -m "$MODEL_DFLASH" --layer-range 32:40 --role tail --rs-seq $RS_SEQ \
+    CUDA_VISIBLE_DEVICES=-1 "$BIN/split-stage.exe" -m "$MODEL_DFLASH" --layer-range 32:40 --role tail --rs-seq $RS_SEQ \
           --port $PORT_STAGE -c 512 -b 256 > "$log_s" 2>&1 &
     local stage_pid=$!
     local up=0
@@ -716,7 +722,7 @@ remote_tap_group() {
         cleanup_ours "$name-stage"
         return
     fi
-    GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_c" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" --draft "$draft" \
+    CUDA_VISIBLE_DEVICES=-1 GGML_VK_VISIBLE_DEVICES= run_limited "$BIG_TIMEOUT" "$log_c" "$BIN/dflash-taps.exe" "$MODEL_DFLASH" --draft "$draft" \
         --remote-compare "$dump" --endpoint "127.0.0.1:$PORT_STAGE"
     rc=$?
     grep -q "^\[PASS\] $taps taps all bit-identical to the whole model" "$log_c" \
